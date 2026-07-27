@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     env: str = "development"
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
-    database_url: str | None = None
+    database_url: str = "sqlite+aiosqlite:///./tripchord.db"
     redis_url: str | None = None
     amadeus_client_id: str | None = Field(default=None, validation_alias="AMADEUS_CLIENT_ID")
     amadeus_client_secret: str | None = Field(

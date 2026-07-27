@@ -36,6 +36,8 @@ class TravelTime(DomainModel):
     origin_id: str
     destination_id: str
     minutes: int = Field(ge=0, le=1440)
+    source_ref: str | None = None
+    estimated: bool = False
 
 
 class PlanningProblem(DomainModel):

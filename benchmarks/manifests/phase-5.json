@@ -1,0 +1,13 @@
+{
+  "run_id": "phase-5-persistent-full-stack-workspace",
+  "tripchord_version": "0.1.0",
+  "source_mode": "replay",
+  "evidence": {
+    "python_tests": 47,
+    "web_tests": 1,
+    "browser_flow": "form -> persisted workspace -> SSE planning -> v1 -> closure event -> v2 diff",
+    "browser_console_errors": 0,
+    "migration_check": "no new upgrade operations detected"
+  },
+  "notes": "Browser flow used replay places, synthetic replay route estimates, and replay offers; no live supplier claim."
+}

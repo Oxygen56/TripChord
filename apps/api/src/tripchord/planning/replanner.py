@@ -116,6 +116,13 @@ class LocalReplanner:
             verification_context,
         )
         restored = self._restore_locks(workflow.final_plan, original)
+        restored = restored.model_copy(
+            update={
+                "id": f"{plan.trip_id}:plan:v{plan.version + 1}",
+                "version": plan.version + 1,
+                "parent_version_id": plan.id,
+            }
+        )
         if not self._unaffected_preserved(plan, restored, impact):
             return self._result(
                 ReplanStatus.BLOCKED,

@@ -6,6 +6,8 @@ from tripchord.domain.itinerary import ItineraryItem, PlanVersion, Violation
 from tripchord.domain.offers import TravelOffer
 from tripchord.domain.travel_data import RouteMode
 from tripchord.domain.trip import TripSpec
+from tripchord.jobs import JobSnapshot
+from tripchord.persistence.repository import WorkspaceSnapshot
 from tripchord.planning import ChineseRequirementParser, ItineraryOptimizer, PlanVerifier
 from tripchord.planning.impact import PlanDependency
 from tripchord.planning.problem import OptimizationResult, PlanningProblem
@@ -88,6 +90,44 @@ class ReplanRequest(ApiModel):
     dependencies: tuple[PlanDependency, ...] | None = None
     replacements: dict[str, ItineraryItem] = Field(default_factory=dict)
     max_iterations: int = 3
+
+
+class CreateWorkspaceRequest(ApiModel):
+    spec: TripSpec
+    title: str | None = None
+
+
+class SavePlanRequest(ApiModel):
+    plan: PlanVersion
+
+
+class WorkspaceReplanRequest(ApiModel):
+    event: PlanEvent
+    context: VerificationContext = VerificationContext()
+    dependencies: tuple[PlanDependency, ...] | None = None
+    replacements: dict[str, ItineraryItem] = Field(default_factory=dict)
+    max_iterations: int = 3
+
+
+class WorkspaceReplanResponse(ApiModel):
+    result: LocalReplanResult
+    workspace: WorkspaceSnapshot
+
+
+class CreatePlanningJobRequest(ApiModel):
+    problem: PlanningProblem
+
+
+class StartTripPlanningRequest(ApiModel):
+    spec: TripSpec
+    title: str | None = None
+
+
+class StartTripPlanningResponse(ApiModel):
+    workspace: WorkspaceSnapshot
+    job: JobSnapshot
+    data_mode: str
+    candidate_count: int
 
 
 def verify_plan(request: VerifyRequest) -> VerifyResponse:
