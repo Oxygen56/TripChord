@@ -1,0 +1,17 @@
+{
+  "run_id": "phase-2-requirements-and-optimizer",
+  "tripchord_version": "0.1.0",
+  "scenario_files": [
+    "benchmarks/scenarios/verifier-v0.jsonl",
+    "benchmarks/scenarios/optimizer-v0.jsonl"
+  ],
+  "source_mode": "replay",
+  "solver": {
+    "name": "OR-Tools CP-SAT",
+    "workers": 1,
+    "random_seed": 0,
+    "time_limit_seconds": 10
+  },
+  "notes": "Synthetic deterministic constraint scenarios; no claim about user preference quality."
+}
+

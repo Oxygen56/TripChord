@@ -18,6 +18,7 @@ jobs:
       - run: uv run mypy apps/api/src
       - run: uv run pytest
       - run: uv run python benchmarks/evaluate.py
+      - run: uv run python benchmarks/evaluate_planning.py
 
   web:
     runs-on: ubuntu-latest
@@ -30,4 +31,3 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
-

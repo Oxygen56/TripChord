@@ -47,6 +47,7 @@ class TripSpec(DomainModel):
     party: TravelParty = Field(default_factory=TravelParty)
     budget: Money | None = None
     pace: Pace = Pace.BALANCED
+    max_main_activities_per_day: int = Field(default=3, ge=1, le=8)
     daily_window: DailyWindow = Field(default_factory=DailyWindow)
     preferred_transport: tuple[TransportMode, ...] = ()
     interests: tuple[str, ...] = ()
@@ -65,4 +66,3 @@ class TripSpec(DomainModel):
     @property
     def day_count(self) -> int:
         return (self.end_date - self.start_date).days + 1
-

@@ -4,9 +4,10 @@ TripChord is a price-aware, constraint-checked planning system for independent
 leisure travel. It combines traceable travel data, deterministic scheduling,
 Planner–Verifier–Repair, and event-driven local replanning.
 
-> Status: active development. The clean-room foundation and provider data layer
-> are implemented and contract-tested. Production supplier credentials and
-> planning-quality improvements remain unverified, so neither is claimed yet.
+> Status: active development. The clean-room foundation, provider data layer,
+> typed requirements, and deterministic activity scheduler are implemented and
+> tested. Production supplier credentials and end-to-end planning-quality
+> improvements remain unverified, so neither is claimed yet.
 
 ## Why it exists
 

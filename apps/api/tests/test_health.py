@@ -35,3 +35,18 @@ async def test_replay_offer_search_endpoint() -> None:
     body = response.json()
     assert len(body["offers"]) == 1
     assert body["offers"][0]["source"]["mode"] == "replay"
+
+
+@pytest.mark.asyncio
+async def test_trip_parse_endpoint_returns_missing_questions() -> None:
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/v1/trips/parse",
+            json={"text": "想从上海去北京看历史建筑", "default_year": 2026},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["missing_fields"] == ["start_date", "end_date"]

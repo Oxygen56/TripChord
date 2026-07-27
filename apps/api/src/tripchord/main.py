@@ -6,12 +6,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from tripchord import __version__
 from tripchord.api import (
     GeocodeRequest,
+    OptimizePlanRequest,
+    OptimizePlanResponse,
+    ParseTripRequest,
     PlaceSearchRequest,
     RouteRequest,
     VerifyRequest,
     VerifyResponse,
     WeatherRequest,
     create_user_quote,
+    optimize_plan,
+    parse_trip_request,
     revalidate_offer,
     search_offers,
     verify_plan,
@@ -20,6 +25,8 @@ from tripchord.config import get_settings
 from tripchord.domain.common import Coordinates
 from tripchord.domain.offers import TravelOffer
 from tripchord.domain.travel_data import Place, RouteLeg, WeatherWindow
+from tripchord.planning.problem import PlanningInfeasible
+from tripchord.planning.requirements import RequirementParseResult
 from tripchord.providers.amap import AmapTravelDataProvider
 from tripchord.providers.base import OfferSearchQuery, OfferSearchResult
 from tripchord.providers.factory import build_amap_provider, build_provider_registry
@@ -66,6 +73,19 @@ async def offer_revalidate_endpoint(offer: TravelOffer) -> TravelOffer:
 @app.post("/api/v1/offers/user-snapshot", response_model=TravelOffer)
 async def user_quote_endpoint(quote: UserQuoteInput) -> TravelOffer:
     return create_user_quote(quote)
+
+
+@app.post("/api/v1/trips/parse", response_model=RequirementParseResult)
+async def parse_trip_endpoint(request: ParseTripRequest) -> RequirementParseResult:
+    return parse_trip_request(request)
+
+
+@app.post("/api/v1/plans/optimize", response_model=OptimizePlanResponse)
+async def optimize_plan_endpoint(request: OptimizePlanRequest) -> OptimizePlanResponse:
+    try:
+        return optimize_plan(request)
+    except PlanningInfeasible as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def require_amap() -> AmapTravelDataProvider:

@@ -5,7 +5,9 @@ from tripchord.domain.itinerary import PlanVersion, Violation
 from tripchord.domain.offers import TravelOffer
 from tripchord.domain.travel_data import RouteMode
 from tripchord.domain.trip import TripSpec
-from tripchord.planning import PlanVerifier
+from tripchord.planning import ChineseRequirementParser, ItineraryOptimizer, PlanVerifier
+from tripchord.planning.problem import OptimizationResult, PlanningProblem
+from tripchord.planning.requirements import RequirementParseResult
 from tripchord.providers.base import OfferSearchQuery, OfferSearchResult, ProviderRegistry
 from tripchord.providers.user_snapshot import UserQuoteInput, import_user_quote
 
@@ -48,6 +50,23 @@ class WeatherRequest(ApiModel):
     coordinates: Coordinates
 
 
+class ParseTripRequest(ApiModel):
+    text: str
+    default_year: int
+
+
+class OptimizePlanRequest(ApiModel):
+    problem: PlanningProblem
+    trip_id: str
+    plan_id: str
+    version: int = 1
+
+
+class OptimizePlanResponse(ApiModel):
+    result: OptimizationResult
+    plan: PlanVersion
+
+
 def verify_plan(request: VerifyRequest) -> VerifyResponse:
     violations = PlanVerifier().verify(request.spec, request.plan)
     valid = not any(item.severity == "error" for item in violations)
@@ -70,3 +89,20 @@ async def revalidate_offer(
 
 def create_user_quote(quote: UserQuoteInput) -> TravelOffer:
     return import_user_quote(quote)
+
+
+def parse_trip_request(request: ParseTripRequest) -> RequirementParseResult:
+    return ChineseRequirementParser().parse(request.text, default_year=request.default_year)
+
+
+def optimize_plan(request: OptimizePlanRequest) -> OptimizePlanResponse:
+    optimizer = ItineraryOptimizer()
+    result = optimizer.solve(request.problem)
+    plan = optimizer.to_plan(
+        result,
+        request.problem,
+        trip_id=request.trip_id,
+        plan_id=request.plan_id,
+        version=request.version,
+    )
+    return OptimizePlanResponse(result=result, plan=plan)
