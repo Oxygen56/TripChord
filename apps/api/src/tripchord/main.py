@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,6 +45,7 @@ from tripchord.domain.common import Coordinates
 from tripchord.domain.offers import TravelOffer
 from tripchord.domain.travel_data import Place, RouteLeg, WeatherWindow
 from tripchord.jobs import (
+    JobConflictError,
     JobNotFoundError,
     JobRepository,
     JobSnapshot,
@@ -87,6 +88,7 @@ replan_policy = ReplanPolicySelector.from_path(
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await database.create_schema()
+    await job_runner.recover()
     yield
     await database.dispose()
 
@@ -177,10 +179,14 @@ async def create_workspace_endpoint(
     request: CreateWorkspaceRequest,
     session: SessionDep,
     principal: PrincipalDep,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> WorkspaceSnapshot:
-    return await WorkspaceRepository(session, principal.tenant_id).create(
-        request.spec, request.title
-    )
+    try:
+        return await WorkspaceRepository(session, principal.tenant_id).create(
+            request.spec, request.title, idempotency_key
+        )
+    except WorkspaceConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/workspaces/{workspace_id}", response_model=WorkspaceSnapshot)
@@ -288,6 +294,7 @@ async def create_planning_job_endpoint(
     session: SessionDep,
     runner: RunnerDep,
     principal: PrincipalDep,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> JobSnapshot:
     try:
         workspace = await WorkspaceRepository(session, principal.tenant_id).get(workspace_id)
@@ -295,7 +302,12 @@ async def create_planning_job_endpoint(
         raise HTTPException(status_code=404, detail="workspace not found") from exc
     if request.problem.trip != workspace.spec:
         raise HTTPException(status_code=409, detail="planning problem trip differs from workspace")
-    job = await JobRepository(session, principal.tenant_id).create(workspace_id, request.problem)
+    try:
+        job = await JobRepository(session, principal.tenant_id).create(
+            workspace_id, request.problem, idempotency_key
+        )
+    except JobConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     runner.enqueue(job.id, workspace_id, request.problem, principal.tenant_id)
     return job
 
@@ -310,15 +322,21 @@ async def start_trip_planning_endpoint(
     session: SessionDep,
     runner: RunnerDep,
     principal: PrincipalDep,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> StartTripPlanningResponse:
     try:
         problem = planning_assembler.assemble(request.spec)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    workspace = await WorkspaceRepository(session, principal.tenant_id).create(
-        request.spec, request.title
-    )
-    job = await JobRepository(session, principal.tenant_id).create(workspace.id, problem)
+    try:
+        workspace = await WorkspaceRepository(session, principal.tenant_id).create(
+            request.spec, request.title, idempotency_key
+        )
+        job = await JobRepository(session, principal.tenant_id).create(
+            workspace.id, problem, idempotency_key
+        )
+    except (WorkspaceConflictError, JobConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     runner.enqueue(job.id, workspace.id, problem, principal.tenant_id)
     return StartTripPlanningResponse(
         workspace=workspace,

@@ -7,7 +7,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 from tripchord.domain.trip import TripSpec
-from tripchord.jobs import JobRepository, JobStatus, PlanningJobRunner
+from tripchord.jobs import JobConflictError, JobRepository, JobStatus, PlanningJobRunner
 from tripchord.main import app, get_job_runner, get_session
 from tripchord.persistence.database import Database
 from tripchord.persistence.repository import WorkspaceRepository
@@ -154,3 +154,68 @@ async def test_start_trip_endpoint_assembles_and_persists_a_plan(tmp_path: Path)
     finally:
         app.dependency_overrides.clear()
         await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_job_idempotency_and_single_claim(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'idempotency.db'}")
+    await database.create_schema()
+    async with database.sessions() as session:
+        workspace = await WorkspaceRepository(session).create(
+            problem().trip,
+            idempotency_key="workspace-request-1",
+        )
+        repeated_workspace = await WorkspaceRepository(session).create(
+            problem().trip,
+            idempotency_key="workspace-request-1",
+        )
+        repository = JobRepository(session)
+        job = await repository.create(
+            workspace.id,
+            problem(),
+            idempotency_key="planning-request-1",
+        )
+        repeated_job = await repository.create(
+            workspace.id,
+            problem(),
+            idempotency_key="planning-request-1",
+        )
+        first_claim = await repository.claim(job.id)
+        duplicate_claim = await repository.claim(job.id)
+
+        assert repeated_workspace.id == workspace.id
+        assert repeated_job.id == job.id
+        assert first_claim is not None
+        assert first_claim.attempts == 1
+        assert duplicate_claim is None
+        with pytest.raises(JobConflictError):
+            changed = problem().model_copy(update={"solver_time_limit_seconds": 3})
+            await repository.create(
+                workspace.id,
+                changed,
+                idempotency_key="planning-request-1",
+            )
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_runner_recovers_persisted_queued_job(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'recovery.db'}")
+    await database.create_schema()
+    async with database.sessions() as session:
+        workspace = await WorkspaceRepository(session).create(problem().trip)
+        job = await JobRepository(session).create(workspace.id, problem())
+
+    runner = PlanningJobRunner(database)
+    assert await runner.recover() == 1
+    latest = job
+    for _ in range(100):
+        latest = await runner.get(job.id)
+        if latest.status in {JobStatus.SUCCEEDED, JobStatus.FAILED}:
+            break
+        await asyncio.sleep(0.02)
+
+    assert latest.status == JobStatus.SUCCEEDED
+    assert latest.attempts == 1
+    assert latest.lease_expires_at is None
+    await database.dispose()

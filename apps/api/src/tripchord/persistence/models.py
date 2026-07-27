@@ -17,9 +17,13 @@ class Base(DeclarativeBase):
 
 class WorkspaceRow(Base):
     __tablename__ = "workspaces"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_workspace_tenant_idempotency"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(100), index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
     title: Mapped[str] = mapped_column(String(200))
     spec: Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -72,13 +76,23 @@ class EventRow(Base):
 
 class JobRow(Base):
     __tablename__ = "jobs"
-    __table_args__ = (Index("ix_job_workspace_created", "workspace_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_job_workspace_created", "workspace_id", "created_at"),
+        UniqueConstraint("workspace_id", "idempotency_key", name="uq_job_workspace_idempotency"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"))
     status: Mapped[str] = mapped_column(String(30))
     stage: Mapped[str] = mapped_column(String(80))
     progress: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    trace_id: Mapped[str] = mapped_column(String(36), index=True)
     request: Mapped[dict[str, Any]] = mapped_column(JSON)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(String(2000), nullable=True)

@@ -43,12 +43,33 @@ class WorkspaceRepository:
         self._session = session
         self._tenant_id = tenant_id
 
-    async def create(self, spec: TripSpec, title: str | None = None) -> WorkspaceSnapshot:
+    async def create(
+        self,
+        spec: TripSpec,
+        title: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> WorkspaceSnapshot:
+        resolved_title = title or f"{spec.destinations[0]} {spec.day_count} 日自由行"
+        if idempotency_key is not None:
+            existing = await self._session.scalar(
+                select(WorkspaceRow).where(
+                    WorkspaceRow.tenant_id == self._tenant_id,
+                    WorkspaceRow.idempotency_key == idempotency_key,
+                )
+            )
+            if existing is not None:
+                same_spec = existing.spec == spec.model_dump(mode="json")
+                if not same_spec or existing.title != resolved_title:
+                    raise WorkspaceConflictError(
+                        "idempotency key was already used with different workspace data"
+                    )
+                return await self.get(existing.id)
         workspace_id = str(uuid4())
         row = WorkspaceRow(
             id=workspace_id,
             tenant_id=self._tenant_id,
-            title=title or f"{spec.destinations[0]} {spec.day_count} 日自由行",
+            idempotency_key=idempotency_key,
+            title=resolved_title,
             spec=spec.model_dump(mode="json"),
         )
         self._session.add(row)
