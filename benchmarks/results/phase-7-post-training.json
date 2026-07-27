@@ -1,0 +1,28 @@
+{
+  "label_source": "synthetic weighted policy oracle; not human preference data",
+  "metrics": {
+    "test": {
+      "always_local_accuracy": 0.7166666666666667,
+      "examples": 60,
+      "mean_oracle_regret": 0.0,
+      "oracle_local_rate": 0.7166666666666667,
+      "top1_accuracy": 0.95
+    },
+    "train": {
+      "always_local_accuracy": 0.6875,
+      "examples": 240,
+      "mean_oracle_regret": 0.0004839275317762307,
+      "oracle_local_rate": 0.6875,
+      "top1_accuracy": 0.9625
+    },
+    "validation": {
+      "always_local_accuracy": 0.7,
+      "examples": 60,
+      "mean_oracle_regret": 0.0,
+      "oracle_local_rate": 0.7,
+      "top1_accuracy": 0.9666666666666667
+    }
+  },
+  "model_sha256": "3fbc95f69529164865522d6adf62c95c5ea805d54b856f81d608849ddd69f272",
+  "split_policy": "destination city group; no city group crosses splits"
+}

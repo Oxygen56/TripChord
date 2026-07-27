@@ -23,7 +23,7 @@ def preservation_ratio(before: PlanVersion, after: PlanVersion) -> float:
     return preserved / len(before_items) if before_items else 1.0
 
 
-def evaluate(path: Path = SCENARIOS) -> dict[str, Any]:
+def evaluate_rows(path: Path = SCENARIOS) -> list[dict[str, Any]]:
     scenarios = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     optimizer = ItineraryOptimizer()
     rows: list[dict[str, Any]] = []
@@ -69,6 +69,8 @@ def evaluate(path: Path = SCENARIOS) -> dict[str, Any]:
         initial_utility = sum(item.utility for item in before.items)
         rows.append(
             {
+                "id": scenario["id"],
+                "city_group": problem.trip.destinations[0],
                 "local_ready": local.status == ReplanStatus.READY,
                 "local_preservation": local.overall_preservation_ratio,
                 "unaffected_preservation": local.unaffected_preservation_ratio,
@@ -81,6 +83,11 @@ def evaluate(path: Path = SCENARIOS) -> dict[str, Any]:
                 ),
             }
         )
+    return rows
+
+
+def evaluate(path: Path = SCENARIOS) -> dict[str, Any]:
+    rows = evaluate_rows(path)
     return {
         "scenario_count": len(rows),
         "local_recovery_rate": mean(row["local_ready"] for row in rows),

@@ -1,0 +1,31 @@
+{
+  "files": {
+    "dpo_test.jsonl": {
+      "records": 40,
+      "sha256": "a19e79dfd2d7f528529047a65d8b71ba0fd98f916d685ec0fd8e1ef79ec217d7"
+    },
+    "dpo_train.jsonl": {
+      "records": 146,
+      "sha256": "676865d913b38937a1a193c40ce12346ff6e0d2921d93d9d3347be69ad759486"
+    },
+    "dpo_validation.jsonl": {
+      "records": 36,
+      "sha256": "03252ebb9da887fe42d63d91432db1b667eb785b7e203fbf22d1bb889ed1f743"
+    },
+    "sft_test.jsonl": {
+      "records": 20,
+      "sha256": "ac31247b9c3b14247a7e74268e7ca4dde8b07347a91b6608d24b933c9c9dd74e"
+    },
+    "sft_train.jsonl": {
+      "records": 80,
+      "sha256": "5d7249ae579de11636ea53139a20f83dd0620578a2421b5f087b4dbaeebcddc8"
+    },
+    "sft_validation.jsonl": {
+      "records": 20,
+      "sha256": "95975b86b9e89394b747fa2faa4b2f9e3796f9ae9f44009006aab20900439b0c"
+    }
+  },
+  "label_source": "deterministic synthetic oracle; no human preference labels",
+  "source": "benchmarks/scenarios/planning-scale-v1.jsonl",
+  "split_policy": "destination city group; groups 0-7 train, 8-9 validation, 10-11 test"
+}

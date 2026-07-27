@@ -1,0 +1,16 @@
+{
+  "run_id": "phase-7-post-training-and-policy-reranking",
+  "source_scenarios": "benchmarks/scenarios/planning-scale-v1.jsonl",
+  "source_scenario_count": 120,
+  "source_seed": 20260727,
+  "split_policy": {
+    "unit": "destination city group",
+    "train_groups": [0, 1, 2, 3, 4, 5, 6, 7],
+    "validation_groups": [8, 9],
+    "test_groups": [10, 11]
+  },
+  "data_manifest": "training/data/manifest.json",
+  "reranker_artifact": "training/artifacts/replan-policy.json",
+  "results": "benchmarks/results/phase-7-post-training.json",
+  "claim_boundary": "SFT and DPO labels use deterministic synthetic oracles. Reranker metrics measure a synthetic policy simulator, not human preference or production quality. No LLM adapter improvement is claimed."
+}

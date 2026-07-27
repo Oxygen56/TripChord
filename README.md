@@ -8,7 +8,9 @@ Planner–Verifier–Repair, and event-driven local replanning.
 > typed requirements, deterministic scheduler, bounded Planner–Verifier–Repair
 > loop, event-scoped local replanning, persistent workspaces, asynchronous
 > planning jobs, SSE progress, and the interactive React workspace are
-> implemented and tested.
+> implemented and tested. Frozen post-training traces, city-group-isolated
+> splits, LoRA SFT/DPO launch paths, and a CPU-trained replan-policy reranker are
+> also checked in with held-out evidence.
 > Production supplier credentials and end-to-end planning-quality improvements
 > remain unverified, so neither is claimed yet.
 
@@ -35,6 +37,7 @@ apps/api/          FastAPI application and planning domain
 apps/web/          React planning workspace
 benchmarks/        Frozen scenarios, evaluators, and run manifests
 docs/              Architecture, source policy, roadmap, and phase reviews
+training/          SFT/DPO traces, trainer entrypoints, and policy reranker
 ```
 
 ## Quick start
