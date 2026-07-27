@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tripchord.domain.common import DomainModel
 from tripchord.persistence.database import Database
-from tripchord.persistence.models import JobRow, utc_now
+from tripchord.persistence.models import JobRow, WorkspaceRow, utc_now
 from tripchord.persistence.repository import WorkspaceRepository
 from tripchord.planning.optimizer import ItineraryOptimizer
 from tripchord.planning.problem import PlanningProblem
@@ -42,10 +42,19 @@ class JobNotFoundError(LookupError):
 
 
 class JobRepository:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, tenant_id: str = "anonymous") -> None:
         self._session = session
+        self._tenant_id = tenant_id
 
     async def create(self, workspace_id: str, problem: PlanningProblem) -> JobSnapshot:
+        workspace = await self._session.scalar(
+            select(WorkspaceRow).where(
+                WorkspaceRow.id == workspace_id,
+                WorkspaceRow.tenant_id == self._tenant_id,
+            )
+        )
+        if workspace is None:
+            raise JobNotFoundError(workspace_id)
         row = JobRow(
             id=str(uuid4()),
             workspace_id=workspace_id,
@@ -60,7 +69,12 @@ class JobRepository:
         return self._snapshot(row)
 
     async def get(self, job_id: str) -> JobSnapshot:
-        row = await self._session.scalar(select(JobRow).where(JobRow.id == job_id))
+        row = await self._session.scalar(
+            select(JobRow).where(
+                JobRow.id == job_id,
+                JobRow.workspace.has(tenant_id=self._tenant_id),
+            )
+        )
         if row is None:
             raise JobNotFoundError(job_id)
         return self._snapshot(row)
@@ -68,7 +82,10 @@ class JobRepository:
     async def latest_problem(self, workspace_id: str) -> PlanningProblem | None:
         row = await self._session.scalar(
             select(JobRow)
-            .where(JobRow.workspace_id == workspace_id)
+            .where(
+                JobRow.workspace_id == workspace_id,
+                JobRow.workspace.has(tenant_id=self._tenant_id),
+            )
             .order_by(JobRow.created_at.desc())
             .limit(1)
         )
@@ -84,7 +101,12 @@ class JobRepository:
         result: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> JobSnapshot:
-        row = await self._session.scalar(select(JobRow).where(JobRow.id == job_id))
+        row = await self._session.scalar(
+            select(JobRow).where(
+                JobRow.id == job_id,
+                JobRow.workspace.has(tenant_id=self._tenant_id),
+            )
+        )
         if row is None:
             raise JobNotFoundError(job_id)
         row.status = status
@@ -116,18 +138,30 @@ class PlanningJobRunner:
         self._database = database
         self._tasks: set[asyncio.Task[None]] = set()
 
-    def enqueue(self, job_id: str, workspace_id: str, problem: PlanningProblem) -> None:
-        task = asyncio.create_task(self._run(job_id, workspace_id, problem))
+    def enqueue(
+        self,
+        job_id: str,
+        workspace_id: str,
+        problem: PlanningProblem,
+        tenant_id: str = "anonymous",
+    ) -> None:
+        task = asyncio.create_task(self._run(job_id, workspace_id, problem, tenant_id))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def get(self, job_id: str) -> JobSnapshot:
+    async def get(self, job_id: str, tenant_id: str = "anonymous") -> JobSnapshot:
         async with self._database.sessions() as session:
-            return await JobRepository(session).get(job_id)
+            return await JobRepository(session, tenant_id).get(job_id)
 
-    async def _run(self, job_id: str, workspace_id: str, problem: PlanningProblem) -> None:
+    async def _run(
+        self,
+        job_id: str,
+        workspace_id: str,
+        problem: PlanningProblem,
+        tenant_id: str,
+    ) -> None:
         async with self._database.sessions() as session:
-            jobs = JobRepository(session)
+            jobs = JobRepository(session, tenant_id)
             try:
                 await jobs.update(
                     job_id,
@@ -135,7 +169,7 @@ class PlanningJobRunner:
                     stage="optimizing",
                     progress=35,
                 )
-                workspace = await WorkspaceRepository(session).get(workspace_id)
+                workspace = await WorkspaceRepository(session, tenant_id).get(workspace_id)
                 version = len(workspace.plans) + 1
                 parent = workspace.plans[-1].id if workspace.plans else None
                 optimizer = ItineraryOptimizer()
@@ -166,7 +200,7 @@ class PlanningJobRunner:
                         "parent_version_id": parent,
                     }
                 )
-                await WorkspaceRepository(session).save_plan(workspace_id, final_plan)
+                await WorkspaceRepository(session, tenant_id).save_plan(workspace_id, final_plan)
                 await jobs.update(
                     job_id,
                     status=JobStatus.SUCCEEDED,

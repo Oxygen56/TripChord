@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +17,8 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
     database_url: str = "sqlite+aiosqlite:///./tripchord.db"
     redis_url: str | None = None
+    auth_required: bool = False
+    auth_tokens: dict[str, str] = Field(default_factory=dict)
     amadeus_client_id: str | None = Field(default=None, validation_alias="AMADEUS_CLIENT_ID")
     amadeus_client_secret: str | None = Field(
         default=None,
@@ -28,6 +32,14 @@ class Settings(BaseSettings):
     )
     booking_environment: str = Field(default="sandbox", validation_alias="BOOKING_ENVIRONMENT")
     amap_api_key: str | None = Field(default=None, validation_alias="AMAP_API_KEY")
+
+    @model_validator(mode="after")
+    def validate_security(self) -> Settings:
+        if self.auth_required and not self.auth_tokens:
+            raise ValueError("auth_tokens must be configured when auth_required is true")
+        if self.auth_required and "*" in self.cors_origins:
+            raise ValueError("wildcard CORS is forbidden when authentication is required")
+        return self
 
 
 @lru_cache

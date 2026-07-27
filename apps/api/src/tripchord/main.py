@@ -39,6 +39,7 @@ from tripchord.api import (
     search_offers,
     verify_plan,
 )
+from tripchord.auth import Principal, get_principal
 from tripchord.config import get_settings
 from tripchord.domain.common import Coordinates
 from tripchord.domain.offers import TravelOffer
@@ -96,6 +97,7 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+PrincipalDep = Annotated[Principal, Depends(get_principal)]
 
 
 def get_job_runner() -> PlanningJobRunner:
@@ -174,17 +176,21 @@ async def replan_endpoint(request: ReplanRequest) -> LocalReplanResult:
 async def create_workspace_endpoint(
     request: CreateWorkspaceRequest,
     session: SessionDep,
+    principal: PrincipalDep,
 ) -> WorkspaceSnapshot:
-    return await WorkspaceRepository(session).create(request.spec, request.title)
+    return await WorkspaceRepository(session, principal.tenant_id).create(
+        request.spec, request.title
+    )
 
 
 @app.get("/api/v1/workspaces/{workspace_id}", response_model=WorkspaceSnapshot)
 async def get_workspace_endpoint(
     workspace_id: str,
     session: SessionDep,
+    principal: PrincipalDep,
 ) -> WorkspaceSnapshot:
     try:
-        return await WorkspaceRepository(session).get(workspace_id)
+        return await WorkspaceRepository(session, principal.tenant_id).get(workspace_id)
     except WorkspaceNotFoundError as exc:
         raise HTTPException(status_code=404, detail="workspace not found") from exc
 
@@ -194,9 +200,12 @@ async def save_workspace_plan_endpoint(
     workspace_id: str,
     request: SavePlanRequest,
     session: SessionDep,
+    principal: PrincipalDep,
 ) -> WorkspaceSnapshot:
     try:
-        return await WorkspaceRepository(session).save_plan(workspace_id, request.plan)
+        return await WorkspaceRepository(session, principal.tenant_id).save_plan(
+            workspace_id, request.plan
+        )
     except WorkspaceNotFoundError as exc:
         raise HTTPException(status_code=404, detail="workspace not found") from exc
     except WorkspaceConflictError as exc:
@@ -212,9 +221,10 @@ async def compare_workspace_plans_endpoint(
     from_version: int,
     to_version: int,
     session: SessionDep,
+    principal: PrincipalDep,
 ) -> PlanDiff:
     try:
-        workspace = await WorkspaceRepository(session).get(workspace_id)
+        workspace = await WorkspaceRepository(session, principal.tenant_id).get(workspace_id)
     except WorkspaceNotFoundError as exc:
         raise HTTPException(status_code=404, detail="workspace not found") from exc
     plans = {plan.version: plan for plan in workspace.plans}
@@ -231,15 +241,16 @@ async def persisted_replan_endpoint(
     workspace_id: str,
     request: WorkspaceReplanRequest,
     session: SessionDep,
+    principal: PrincipalDep,
 ) -> WorkspaceReplanResponse:
-    repository = WorkspaceRepository(session)
+    repository = WorkspaceRepository(session, principal.tenant_id)
     try:
         workspace = await repository.get(workspace_id)
     except WorkspaceNotFoundError as exc:
         raise HTTPException(status_code=404, detail="workspace not found") from exc
     if not workspace.plans:
         raise HTTPException(status_code=409, detail="workspace has no plan to replan")
-    problem = await JobRepository(session).latest_problem(workspace_id)
+    problem = await JobRepository(session, principal.tenant_id).latest_problem(workspace_id)
     result = AdaptiveReplanner(
         replan_policy,
         max_repair_iterations=request.max_iterations,
@@ -276,15 +287,16 @@ async def create_planning_job_endpoint(
     request: CreatePlanningJobRequest,
     session: SessionDep,
     runner: RunnerDep,
+    principal: PrincipalDep,
 ) -> JobSnapshot:
     try:
-        workspace = await WorkspaceRepository(session).get(workspace_id)
+        workspace = await WorkspaceRepository(session, principal.tenant_id).get(workspace_id)
     except WorkspaceNotFoundError as exc:
         raise HTTPException(status_code=404, detail="workspace not found") from exc
     if request.problem.trip != workspace.spec:
         raise HTTPException(status_code=409, detail="planning problem trip differs from workspace")
-    job = await JobRepository(session).create(workspace_id, request.problem)
-    runner.enqueue(job.id, workspace_id, request.problem)
+    job = await JobRepository(session, principal.tenant_id).create(workspace_id, request.problem)
+    runner.enqueue(job.id, workspace_id, request.problem, principal.tenant_id)
     return job
 
 
@@ -297,14 +309,17 @@ async def start_trip_planning_endpoint(
     request: StartTripPlanningRequest,
     session: SessionDep,
     runner: RunnerDep,
+    principal: PrincipalDep,
 ) -> StartTripPlanningResponse:
     try:
         problem = planning_assembler.assemble(request.spec)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    workspace = await WorkspaceRepository(session).create(request.spec, request.title)
-    job = await JobRepository(session).create(workspace.id, problem)
-    runner.enqueue(job.id, workspace.id, problem)
+    workspace = await WorkspaceRepository(session, principal.tenant_id).create(
+        request.spec, request.title
+    )
+    job = await JobRepository(session, principal.tenant_id).create(workspace.id, problem)
+    runner.enqueue(job.id, workspace.id, problem, principal.tenant_id)
     return StartTripPlanningResponse(
         workspace=workspace,
         job=job,
@@ -321,9 +336,10 @@ async def get_planning_job_endpoint(
     workspace_id: str,
     job_id: str,
     runner: RunnerDep,
+    principal: PrincipalDep,
 ) -> JobSnapshot:
     try:
-        job = await runner.get(job_id)
+        job = await runner.get(job_id, principal.tenant_id)
     except JobNotFoundError as exc:
         raise HTTPException(status_code=404, detail="job not found") from exc
     if job.workspace_id != workspace_id:
@@ -336,12 +352,13 @@ async def stream_planning_job_endpoint(
     workspace_id: str,
     job_id: str,
     runner: RunnerDep,
+    principal: PrincipalDep,
 ) -> StreamingResponse:
     async def events() -> AsyncIterator[str]:
         last_payload = ""
         while True:
             try:
-                job = await runner.get(job_id)
+                job = await runner.get(job_id, principal.tenant_id)
             except JobNotFoundError:
                 yield 'event: error\ndata: {"detail":"job not found"}\n\n'
                 return

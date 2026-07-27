@@ -21,6 +21,8 @@ services:
       TRIPCHORD_ENV: production
       TRIPCHORD_DATABASE_URL: postgresql+asyncpg://tripchord:tripchord@postgres:5432/tripchord
       TRIPCHORD_CORS_ORIGINS: '["http://localhost:8080"]'
+      TRIPCHORD_AUTH_REQUIRED: "true"
+      TRIPCHORD_AUTH_TOKENS: '${TRIPCHORD_AUTH_TOKENS:-{}}'
     env_file:
       - path: .env
         required: false

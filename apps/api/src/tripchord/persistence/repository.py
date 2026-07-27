@@ -39,13 +39,15 @@ class WorkspaceConflictError(RuntimeError):
 
 
 class WorkspaceRepository:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, tenant_id: str = "anonymous") -> None:
         self._session = session
+        self._tenant_id = tenant_id
 
     async def create(self, spec: TripSpec, title: str | None = None) -> WorkspaceSnapshot:
         workspace_id = str(uuid4())
         row = WorkspaceRow(
             id=workspace_id,
+            tenant_id=self._tenant_id,
             title=title or f"{spec.destinations[0]} {spec.day_count} 日自由行",
             spec=spec.model_dump(mode="json"),
         )
@@ -161,7 +163,10 @@ class WorkspaceRepository:
     async def _get_row(self, workspace_id: str) -> WorkspaceRow:
         statement = (
             select(WorkspaceRow)
-            .where(WorkspaceRow.id == workspace_id)
+            .where(
+                WorkspaceRow.id == workspace_id,
+                WorkspaceRow.tenant_id == self._tenant_id,
+            )
             .options(selectinload(WorkspaceRow.plans), selectinload(WorkspaceRow.events))
         )
         row = await self._session.scalar(statement)
