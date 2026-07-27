@@ -9,9 +9,9 @@ from tripchord.domain.offers import (
     OfferSource,
     PriceBreakdown,
     PriceState,
-    SourceMode,
     TravelOffer,
 )
+from tripchord.domain.source import SourceMode
 
 
 def price() -> PriceBreakdown:
@@ -59,4 +59,3 @@ def test_complete_components_must_sum_to_total() -> None:
             total=Money(amount=Decimal("120"), currency="CNY"),
             components_complete=True,
         )
-

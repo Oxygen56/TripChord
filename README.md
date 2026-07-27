@@ -4,9 +4,9 @@ TripChord is a price-aware, constraint-checked planning system for independent
 leisure travel. It combines traceable travel data, deterministic scheduling,
 Planner–Verifier–Repair, and event-driven local replanning.
 
-> Status: active development. The repository currently contains the clean-room
-> foundation and frozen baseline harness. It does **not** yet claim production
-> supplier coverage or benchmark improvements.
+> Status: active development. The clean-room foundation and provider data layer
+> are implemented and contract-tested. Production supplier credentials and
+> planning-quality improvements remain unverified, so neither is claimed yet.
 
 ## Why it exists
 
@@ -46,10 +46,13 @@ npm run dev
 The API is served on `http://localhost:8000`; the web workspace defaults to
 `http://localhost:5173`.
 
+Without external credentials the offer API runs against explicit replay data.
+Provider readiness and production-verification boundaries are recorded in
+`docs/providers.md`.
+
 ## Upstream comparison boundary
 
 The original tutorial reference is Datawhale's HelloAgents repository at
 commit `6c616938c521c89bc4b2bf001bf237d259f1726b`. It is licensed CC BY-NC-SA
 4.0. TripChord does not copy its source; the commit is retained only as a
 reproducible comparison baseline. See `docs/upstream-baseline.md`.
-
