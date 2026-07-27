@@ -29,11 +29,14 @@ class ActivityCandidateBuilder:
                 utility += round(place.rating * 10)
             if must_visit:
                 utility += 500
-            duration = place.expected_visit_minutes or {
-                Pace.RELAXED: 150,
-                Pace.BALANCED: 120,
-                Pace.INTENSIVE: 90,
-            }[trip.pace]
+            duration = (
+                place.expected_visit_minutes
+                or {
+                    Pace.RELAXED: 150,
+                    Pace.BALANCED: 120,
+                    Pace.INTENSIVE: 90,
+                }[trip.pace]
+            )
             cost_cents = 0
             if place.estimated_cost is not None and place.estimated_cost.currency == "CNY":
                 cost_cents = int(place.estimated_cost.amount * Decimal("100"))
@@ -46,9 +49,7 @@ class ActivityCandidateBuilder:
                     utility=utility,
                     must_visit=must_visit,
                     availability=self._availability(trip, place),
-                    source_refs=(
-                        f"{place.source.provider}:{place.source.request_id or place.id}",
-                    ),
+                    source_refs=(f"{place.source.provider}:{place.source.request_id or place.id}",),
                     location_name=place.address or place.name,
                 )
             )
@@ -59,9 +60,7 @@ class ActivityCandidateBuilder:
         current = trip.start_date
         while current <= trip.end_date:
             windows = [
-                window
-                for window in place.opening_windows
-                if window.weekday == current.weekday()
+                window for window in place.opening_windows if window.weekday == current.weekday()
             ]
             if windows:
                 for window in windows:

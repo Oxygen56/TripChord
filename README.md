@@ -5,9 +5,10 @@ leisure travel. It combines traceable travel data, deterministic scheduling,
 Planner–Verifier–Repair, and event-driven local replanning.
 
 > Status: active development. The clean-room foundation, provider data layer,
-> typed requirements, and deterministic activity scheduler are implemented and
-> tested. Production supplier credentials and end-to-end planning-quality
-> improvements remain unverified, so neither is claimed yet.
+> typed requirements, deterministic scheduler, and bounded
+> Planner–Verifier–Repair loop are implemented and tested. Production supplier
+> credentials and end-to-end planning-quality improvements remain unverified,
+> so neither is claimed yet.
 
 ## Why it exists
 

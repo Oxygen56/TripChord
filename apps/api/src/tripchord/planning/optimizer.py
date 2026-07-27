@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 from itertools import combinations
 from zoneinfo import ZoneInfo
 
 from ortools.sat.python import cp_model
 
+from tripchord.domain.common import Money
 from tripchord.domain.itinerary import ItemKind, ItineraryItem, PlanVersion
 from tripchord.planning.problem import (
     ActivityAvailability,
@@ -64,17 +66,13 @@ class ItineraryOptimizer:
                 else:
                     window_choices: list[cp_model.IntVar] = []
                     for index, window in enumerate(windows):
-                        window_selected = model.new_bool_var(
-                            f"window_{activity.id}_{day}_{index}"
-                        )
+                        window_selected = model.new_bool_var(f"window_{activity.id}_{day}_{index}")
                         model.add(start >= window.start_minute).only_enforce_if(window_selected)
                         model.add(end <= window.end_minute).only_enforce_if(window_selected)
                         window_choices.append(window_selected)
                     model.add(sum(window_choices) == presence)
             model.add(
-                sum(activity_choices) == 1
-                if activity.must_visit
-                else sum(activity_choices) <= 1
+                sum(activity_choices) == 1 if activity.must_visit else sum(activity_choices) <= 1
             )
 
         for day in days:
@@ -97,12 +95,10 @@ class ItineraryOptimizer:
                 first_to_second = travel.get((first.id, second.id), 0)
                 second_to_first = travel.get((second.id, first.id), 0)
                 model.add(
-                    starts[(second.id, day)]
-                    >= ends[(first.id, day)] + first_to_second
+                    starts[(second.id, day)] >= ends[(first.id, day)] + first_to_second
                 ).only_enforce_if(first_before)
                 model.add(
-                    starts[(first.id, day)]
-                    >= ends[(second.id, day)] + second_to_first
+                    starts[(first.id, day)] >= ends[(second.id, day)] + second_to_first
                 ).only_enforce_if(second_before)
                 route_penalties.extend(
                     [
@@ -192,7 +188,13 @@ class ItineraryOptimizer:
                 ends_at=datetime.combine(item.date, time.min, tzinfo=timezone)
                 + timedelta(minutes=item.end_minute),
                 location_name=item.location_name,
+                cost=(
+                    Money(amount=Decimal(item.cost_cents) / 100, currency="CNY")
+                    if item.cost_cents
+                    else None
+                ),
                 source_refs=item.source_refs,
+                utility=item.utility,
             )
             for item in result.scheduled
         )

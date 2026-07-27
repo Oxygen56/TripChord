@@ -31,4 +31,3 @@ def group_comparable_offers(offers: tuple[TravelOffer, ...]) -> tuple[Comparable
             )
         )
     return tuple(sorted(result, key=lambda group: (group.currency, group.lowest_total)))
-

@@ -87,4 +87,3 @@ def test_optimizer_reports_infeasible_must_visit() -> None:
 
     with pytest.raises(PlanningInfeasible, match="no feasible schedule"):
         ItineraryOptimizer().solve(problem)
-

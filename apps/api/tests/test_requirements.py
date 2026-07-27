@@ -38,4 +38,3 @@ def test_parser_asks_instead_of_inventing_missing_dates() -> None:
     assert len(result.clarifying_questions) == 2
     with pytest.raises(ValueError, match="missing fields"):
         result.to_spec()
-

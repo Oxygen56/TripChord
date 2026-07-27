@@ -27,9 +27,7 @@ def amadeus_handler(request: httpx.Request) -> httpx.Response:
                 ]
             }
         ],
-        "travelerPricings": [
-            {"fareDetailsBySegment": [{"includedCheckedBags": {"quantity": 1}}]}
-        ],
+        "travelerPricings": [{"fareDetailsBySegment": [{"includedCheckedBags": {"quantity": 1}}]}],
     }
     if request.url.path.endswith("/flight-offers"):
         assert request.headers["authorization"] == "Bearer token"

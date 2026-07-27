@@ -10,6 +10,7 @@ from tripchord.api import (
     OptimizePlanResponse,
     ParseTripRequest,
     PlaceSearchRequest,
+    RepairPlanRequest,
     RouteRequest,
     VerifyRequest,
     VerifyResponse,
@@ -17,6 +18,7 @@ from tripchord.api import (
     create_user_quote,
     optimize_plan,
     parse_trip_request,
+    repair_plan,
     revalidate_offer,
     search_offers,
     verify_plan,
@@ -27,6 +29,7 @@ from tripchord.domain.offers import TravelOffer
 from tripchord.domain.travel_data import Place, RouteLeg, WeatherWindow
 from tripchord.planning.problem import PlanningInfeasible
 from tripchord.planning.requirements import RequirementParseResult
+from tripchord.planning.workflow import WorkflowResult
 from tripchord.providers.amap import AmapTravelDataProvider
 from tripchord.providers.base import OfferSearchQuery, OfferSearchResult
 from tripchord.providers.factory import build_amap_provider, build_provider_registry
@@ -86,6 +89,11 @@ async def optimize_plan_endpoint(request: OptimizePlanRequest) -> OptimizePlanRe
         return optimize_plan(request)
     except PlanningInfeasible as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/plans/repair", response_model=WorkflowResult)
+async def repair_plan_endpoint(request: RepairPlanRequest) -> WorkflowResult:
+    return repair_plan(request)
 
 
 def require_amap() -> AmapTravelDataProvider:

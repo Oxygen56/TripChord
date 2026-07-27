@@ -1,8 +1,12 @@
 from collections import defaultdict
 from datetime import date
 from decimal import Decimal
+from enum import StrEnum
 from itertools import pairwise
 
+from pydantic import Field
+
+from tripchord.domain.common import DomainModel
 from tripchord.domain.itinerary import (
     ItemKind,
     ItineraryItem,
@@ -11,19 +15,46 @@ from tripchord.domain.itinerary import (
     ViolationCode,
     ViolationSeverity,
 )
+from tripchord.domain.offers import TravelOffer
 from tripchord.domain.trip import TripSpec
+
+
+class VerificationMode(StrEnum):
+    DRAFT = "draft"
+    CONFIRMATION = "confirmation"
+
+
+class TravelRequirement(DomainModel):
+    from_item_id: str
+    to_item_id: str
+    minimum_minutes: int = Field(ge=0, le=1440)
+
+
+class VerificationContext(DomainModel):
+    mode: VerificationMode = VerificationMode.DRAFT
+    offers: tuple[TravelOffer, ...] = ()
+    travel_requirements: tuple[TravelRequirement, ...] = ()
 
 
 class PlanVerifier:
     """Deterministic checks that must never be delegated to an LLM judge."""
 
-    def verify(self, spec: TripSpec, plan: PlanVersion) -> tuple[Violation, ...]:
+    def verify(
+        self,
+        spec: TripSpec,
+        plan: PlanVersion,
+        context: VerificationContext | None = None,
+    ) -> tuple[Violation, ...]:
+        verification_context = context or VerificationContext()
         violations: list[Violation] = []
         violations.extend(self._check_trip_dates(spec, plan))
         violations.extend(self._check_daily_windows(spec, plan))
         violations.extend(self._check_overlaps(plan))
         violations.extend(self._check_budget(spec, plan))
         violations.extend(self._check_provenance(plan))
+        violations.extend(self._check_must_visit(spec, plan))
+        violations.extend(self._check_travel_gaps(plan, verification_context))
+        violations.extend(self._check_offers(plan, verification_context))
         return tuple(violations)
 
     def _check_trip_dates(self, spec: TripSpec, plan: PlanVersion) -> list[Violation]:
@@ -112,13 +143,99 @@ class PlanVerifier:
     def _check_provenance(self, plan: PlanVersion) -> list[Violation]:
         result: list[Violation] = []
         for item in plan.items:
-            if item.kind in {ItemKind.TRANSPORT, ItemKind.LODGING} and not item.source_refs:
+            if (
+                item.kind in {ItemKind.TRANSPORT, ItemKind.LODGING}
+                and not item.source_refs
+                and item.offer_id is None
+            ):
                 result.append(
                     Violation(
                         code=ViolationCode.MISSING_PROVENANCE,
                         severity=ViolationSeverity.ERROR,
                         message=f"{item.title} has no traceable source",
                         item_ids=(item.id,),
+                    )
+                )
+        return result
+
+    def _check_must_visit(self, spec: TripSpec, plan: PlanVersion) -> list[Violation]:
+        searchable = " ".join(f"{item.title} {item.location_name or ''}" for item in plan.items)
+        return [
+            Violation(
+                code=ViolationCode.MUST_VISIT_MISSING,
+                severity=ViolationSeverity.ERROR,
+                message=f"must-visit item is missing: {term}",
+                details={"term": term},
+            )
+            for term in spec.must_visit
+            if term not in searchable
+        ]
+
+    def _check_travel_gaps(
+        self,
+        plan: PlanVersion,
+        context: VerificationContext,
+    ) -> list[Violation]:
+        items = {item.id: item for item in plan.items}
+        result: list[Violation] = []
+        for requirement in context.travel_requirements:
+            previous = items.get(requirement.from_item_id)
+            current = items.get(requirement.to_item_id)
+            if previous is None or current is None:
+                continue
+            actual = int((current.starts_at - previous.ends_at).total_seconds() / 60)
+            if actual < requirement.minimum_minutes:
+                result.append(
+                    Violation(
+                        code=ViolationCode.TRAVEL_GAP,
+                        severity=ViolationSeverity.ERROR,
+                        message=(
+                            f"{previous.title} to {current.title} needs "
+                            f"{requirement.minimum_minutes} travel minutes"
+                        ),
+                        item_ids=(previous.id, current.id),
+                        details={
+                            "required_minutes": requirement.minimum_minutes,
+                            "actual_minutes": actual,
+                        },
+                    )
+                )
+        return result
+
+    def _check_offers(
+        self,
+        plan: PlanVersion,
+        context: VerificationContext,
+    ) -> list[Violation]:
+        offers = {offer.id: offer for offer in context.offers}
+        severity = (
+            ViolationSeverity.ERROR
+            if context.mode == VerificationMode.CONFIRMATION
+            else ViolationSeverity.WARNING
+        )
+        result: list[Violation] = []
+        for item in plan.items:
+            if item.offer_id is None:
+                continue
+            offer = offers.get(item.offer_id)
+            if offer is None:
+                result.append(
+                    Violation(
+                        code=ViolationCode.MISSING_PROVENANCE,
+                        severity=ViolationSeverity.ERROR,
+                        message=f"{item.title} references an unavailable offer",
+                        item_ids=(item.id,),
+                    )
+                )
+                continue
+            if offer.requires_revalidation or not offer.source.is_fresh():
+                result.append(
+                    Violation(
+                        code=ViolationCode.STALE_OR_UNVERIFIED_OFFER,
+                        severity=severity,
+                        message=f"{item.title} must be repriced before confirmation",
+                        item_ids=(item.id,),
+                        details={"offer_id": offer.id},
                     )
                 )
         return result

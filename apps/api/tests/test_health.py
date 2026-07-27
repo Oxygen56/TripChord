@@ -50,3 +50,52 @@ async def test_trip_parse_endpoint_returns_missing_questions() -> None:
 
     assert response.status_code == 200
     assert response.json()["missing_fields"] == ["start_date", "end_date"]
+
+
+@pytest.mark.asyncio
+async def test_repair_endpoint_returns_a_versioned_diff() -> None:
+    request = {
+        "spec": {
+            "origin": "上海",
+            "destinations": ["北京"],
+            "start_date": "2026-10-02",
+            "end_date": "2026-10-02",
+        },
+        "plan": {
+            "id": "trip-1:plan:v1",
+            "trip_id": "trip-1",
+            "version": 1,
+            "items": [
+                {
+                    "id": "a",
+                    "kind": "activity",
+                    "title": "故宫",
+                    "starts_at": "2026-10-02T09:00:00+08:00",
+                    "ends_at": "2026-10-02T10:00:00+08:00",
+                },
+                {
+                    "id": "b",
+                    "kind": "activity",
+                    "title": "景山",
+                    "starts_at": "2026-10-02T10:00:00+08:00",
+                    "ends_at": "2026-10-02T11:00:00+08:00",
+                },
+            ],
+        },
+        "context": {
+            "travel_requirements": [
+                {"from_item_id": "a", "to_item_id": "b", "minimum_minutes": 30}
+            ]
+        },
+    }
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/api/v1/plans/repair", json=request)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["final_plan"]["version"] == 2
+    assert body["traces"][0]["diff"]["changed_items"][0]["item_id"] == "b"

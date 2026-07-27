@@ -32,6 +32,7 @@ class ItineraryItem(DomainModel):
     cost: Money | None = None
     offer_id: str | None = None
     source_refs: tuple[str, ...] = ()
+    utility: int = Field(default=0, ge=0, le=10000)
     locked: bool = False
 
     @field_validator("starts_at", "ends_at")
@@ -61,6 +62,8 @@ class ViolationCode(StrEnum):
     CURRENCY_MISMATCH = "currency_mismatch"
     MISSING_PROVENANCE = "missing_provenance"
     STALE_OR_UNVERIFIED_OFFER = "stale_or_unverified_offer"
+    MUST_VISIT_MISSING = "must_visit_missing"
+    TRAVEL_GAP = "travel_gap"
 
 
 class Violation(DomainModel):
@@ -79,4 +82,3 @@ class PlanVersion(DomainModel):
     items: tuple[ItineraryItem, ...] = ()
     parent_version_id: str | None = None
     explanation: str | None = None
-

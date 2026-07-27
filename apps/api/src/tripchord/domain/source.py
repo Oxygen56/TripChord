@@ -36,4 +36,3 @@ class SourceRecord(DomainModel):
     def is_fresh(self, now: datetime | None = None) -> bool:
         reference = now or datetime.now(UTC)
         return self.expires_at is None or reference < self.expires_at
-

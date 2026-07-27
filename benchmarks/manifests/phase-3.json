@@ -1,0 +1,16 @@
+{
+  "run_id": "phase-3-planner-verifier-repair",
+  "tripchord_version": "0.1.0",
+  "scenario_files": [
+    "benchmarks/scenarios/verifier-v0.jsonl",
+    "benchmarks/scenarios/optimizer-v0.jsonl",
+    "benchmarks/scenarios/repair-v0.jsonl"
+  ],
+  "source_mode": "replay",
+  "repair": {
+    "max_iterations": 3,
+    "confirmation_requires_fresh_offer": true,
+    "unresolved_missing_sources_are_blocking": true
+  },
+  "notes": "Deterministic synthetic scenarios; no production or preference-quality claim."
+}

@@ -29,4 +29,3 @@ class PlanEvent(DomainModel):
         if value.tzinfo is None:
             raise ValueError("event timestamps must be timezone-aware")
         return value
-

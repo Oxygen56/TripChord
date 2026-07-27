@@ -14,9 +14,7 @@ def place(name: str, tags: tuple[str, ...]) -> Place:
         name=name,
         kind=PlaceKind.ATTRACTION,
         coordinates=Coordinates(latitude=39.9, longitude=116.4),
-        opening_windows=(
-            OpeningWindow(weekday=4, opens_at=time(10), closes_at=time(16)),
-        ),
+        opening_windows=(OpeningWindow(weekday=4, opens_at=time(10), closes_at=time(16)),),
         expected_visit_minutes=120,
         estimated_cost=Money(amount=Decimal("50"), currency="CNY"),
         rating=4.8,
@@ -55,4 +53,3 @@ def test_candidate_builder_applies_preferences_opening_hours_and_avoid_list() ->
     assert candidate.availability[0].start_minute == 10 * 60
     assert candidate.availability[0].end_minute == 16 * 60
     assert candidate.utility > 600
-

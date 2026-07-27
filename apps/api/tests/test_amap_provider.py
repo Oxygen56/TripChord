@@ -100,4 +100,3 @@ async def test_amap_normalizes_places_routes_weather_and_coordinates() -> None:
     assert route.distance_meters == 1500
     assert weather[0].kind == WeatherKind.RAIN
     assert weather[0].temperature_low_c == 10
-

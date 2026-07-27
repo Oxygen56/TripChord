@@ -8,6 +8,8 @@ from tripchord.domain.trip import TripSpec
 from tripchord.planning import ChineseRequirementParser, ItineraryOptimizer, PlanVerifier
 from tripchord.planning.problem import OptimizationResult, PlanningProblem
 from tripchord.planning.requirements import RequirementParseResult
+from tripchord.planning.verifier import VerificationContext
+from tripchord.planning.workflow import PlanningWorkflow, WorkflowResult
 from tripchord.providers.base import OfferSearchQuery, OfferSearchResult, ProviderRegistry
 from tripchord.providers.user_snapshot import UserQuoteInput, import_user_quote
 
@@ -19,6 +21,7 @@ class ApiModel(BaseModel):
 class VerifyRequest(ApiModel):
     spec: TripSpec
     plan: PlanVersion
+    context: VerificationContext = VerificationContext()
 
 
 class VerifyResponse(ApiModel):
@@ -67,8 +70,15 @@ class OptimizePlanResponse(ApiModel):
     plan: PlanVersion
 
 
+class RepairPlanRequest(ApiModel):
+    spec: TripSpec
+    plan: PlanVersion
+    context: VerificationContext = VerificationContext()
+    max_iterations: int = 3
+
+
 def verify_plan(request: VerifyRequest) -> VerifyResponse:
-    violations = PlanVerifier().verify(request.spec, request.plan)
+    violations = PlanVerifier().verify(request.spec, request.plan, request.context)
     valid = not any(item.severity == "error" for item in violations)
     return VerifyResponse(valid=valid, violations=violations)
 
@@ -106,3 +116,8 @@ def optimize_plan(request: OptimizePlanRequest) -> OptimizePlanResponse:
         version=request.version,
     )
     return OptimizePlanResponse(result=result, plan=plan)
+
+
+def repair_plan(request: RepairPlanRequest) -> WorkflowResult:
+    workflow = PlanningWorkflow(max_repair_iterations=request.max_iterations)
+    return workflow.run(request.spec, request.plan, request.context)

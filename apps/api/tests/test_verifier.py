@@ -1,11 +1,20 @@
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from tripchord.domain.common import Money
 from tripchord.domain.itinerary import ItemKind, ItineraryItem, PlanVersion, ViolationCode
+from tripchord.domain.offers import (
+    OfferKind,
+    OfferSource,
+    PriceBreakdown,
+    PriceState,
+    TravelOffer,
+)
+from tripchord.domain.source import SourceMode
 from tripchord.domain.trip import TripSpec
 from tripchord.planning import PlanVerifier
+from tripchord.planning.verifier import VerificationContext, VerificationMode
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -81,3 +90,42 @@ def test_verifier_accepts_feasible_plan() -> None:
 
     assert PlanVerifier().verify(spec(), plan) == ()
 
+
+def test_confirmation_requires_offer_revalidation() -> None:
+    plan = PlanVersion(
+        id="plan-1",
+        trip_id="trip-1",
+        version=1,
+        items=(
+            ItineraryItem(
+                id="flight",
+                kind=ItemKind.TRANSPORT,
+                title="航班",
+                starts_at=datetime(2026, 10, 2, 8, tzinfo=SHANGHAI),
+                ends_at=datetime(2026, 10, 2, 10, tzinfo=SHANGHAI),
+                offer_id="offer-1",
+            ),
+        ),
+    )
+    offer = TravelOffer(
+        id="offer-1",
+        kind=OfferKind.FLIGHT,
+        title="航班报价",
+        source=OfferSource(
+            provider="replay",
+            mode=SourceMode.REPLAY,
+            captured_at=datetime.now(UTC),
+        ),
+        price_state=PriceState.ESTIMATED,
+        price=PriceBreakdown(
+            base=Money(amount=Decimal("500"), currency="CNY"),
+            total=Money(amount=Decimal("500"), currency="CNY"),
+            components_complete=True,
+        ),
+        comparison_key="flight-1",
+    )
+    context = VerificationContext(mode=VerificationMode.CONFIRMATION, offers=(offer,))
+
+    violations = PlanVerifier().verify(spec(), plan, context)
+
+    assert {violation.code for violation in violations} == {ViolationCode.STALE_OR_UNVERIFIED_OFFER}

@@ -10,9 +10,7 @@ from tripchord.providers.replay import ReplayOfferProvider
 
 
 def build_provider_registry(settings: Settings, root: Path) -> ProviderRegistry:
-    providers: list[OfferProvider] = [
-        ReplayOfferProvider(root / "data" / "replay" / "offers.json")
-    ]
+    providers: list[OfferProvider] = [ReplayOfferProvider(root / "data" / "replay" / "offers.json")]
 
     if settings.amadeus_client_id and settings.amadeus_client_secret:
         production = settings.amadeus_environment == "production"
@@ -22,9 +20,7 @@ def build_provider_registry(settings: Settings, root: Path) -> ProviderRegistry:
                     client_id=settings.amadeus_client_id,
                     client_secret=settings.amadeus_client_secret,
                     base_url=(
-                        "https://api.amadeus.com"
-                        if production
-                        else "https://test.api.amadeus.com"
+                        "https://api.amadeus.com" if production else "https://test.api.amadeus.com"
                     ),
                     source_mode=SourceMode.PRODUCTION if production else SourceMode.SANDBOX,
                 )

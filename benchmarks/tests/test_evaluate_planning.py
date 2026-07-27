@@ -6,4 +6,3 @@ def test_frozen_optimizer_scenarios_pass() -> None:
 
     assert result["scenario_count"] >= 3
     assert result["pass_rate"] == 1
-

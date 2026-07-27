@@ -251,9 +251,7 @@ class BookingAccommodationProvider:
         if not isinstance(cancellation, list) or not cancellation:
             return None
         return any(
-            item.get("free_cancellation_until")
-            for item in cancellation
-            if isinstance(item, dict)
+            item.get("free_cancellation_until") for item in cancellation if isinstance(item, dict)
         )
 
     def _cancellation_summary(self, cancellation: Any) -> str | None:
