@@ -1,0 +1,20 @@
+{
+  "run_id": "phase-6-scale-ablation-and-faults",
+  "scenario_files": [
+    "benchmarks/scenarios/planning-scale-v1.jsonl",
+    "benchmarks/scenarios/events-v0.jsonl",
+    "benchmarks/scenarios/optimizer-v0.jsonl",
+    "benchmarks/scenarios/repair-v0.jsonl",
+    "benchmarks/scenarios/verifier-v0.jsonl"
+  ],
+  "planning_scale_seed": 20260727,
+  "planning_scale_count": 120,
+  "comparisons": [
+    "CP-SAT versus deterministic earliest-fit greedy",
+    "full planner versus no travel-time constraints",
+    "full planner versus no budget constraint",
+    "local event replan versus full regeneration"
+  ],
+  "results": "benchmarks/results/phase-6-scale.json",
+  "claim_boundary": "Synthetic frozen replay benchmark; not live user traffic or production supplier latency."
+}

@@ -1,0 +1,38 @@
+{
+  "run_id": "phase-6-scale-ablation-and-faults",
+  "source_mode": "frozen_replay",
+  "planning": {
+    "scenario_count": 120,
+    "cp_valid_rate": 1.0,
+    "greedy_valid_rate": 1.0,
+    "cp_mean_utility": 1249.5833333333333,
+    "greedy_mean_utility": 1239.3583333333333,
+    "utility_lift_over_greedy": 0.008250237017811468,
+    "no_travel_valid_rate": 0.0,
+    "no_budget_valid_rate": 0.30833333333333335,
+    "cp_latency_ms": {
+      "run_1_p50": 47.6055,
+      "run_1_p95": 136.567,
+      "run_2_p50": 40.499,
+      "run_2_p95": 121.58
+    },
+    "deterministic_schedule_sha256_run_1": "2ed88466112e0f4bd701e9ba5e72d5c03271756f628378c7ae664501dbd75b91",
+    "deterministic_schedule_sha256_run_2": "2ed88466112e0f4bd701e9ba5e72d5c03271756f628378c7ae664501dbd75b91"
+  },
+  "replanning": {
+    "scenario_count": 120,
+    "local_recovery_rate": 1.0,
+    "local_mean_preservation": 0.8338359788359788,
+    "local_unaffected_preservation": 1.0,
+    "global_mean_preservation": 0.17276785714285714,
+    "local_mean_utility_retention": 0.8230433639754767,
+    "global_mean_utility_retention": 0.9166246218217127
+  },
+  "provider_faults": {
+    "concurrent_query_count": 100,
+    "healthy_provider_partial_success_rate": 1.0,
+    "failure_isolation_rate": 1.0,
+    "timeout_classification_rate": 1.0,
+    "note": "In-memory replay and injected providers; throughput is not a network-provider claim."
+  }
+}

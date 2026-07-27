@@ -15,4 +15,18 @@ uv run python benchmarks/evaluate.py
 uv run python benchmarks/evaluate_planning.py
 uv run python benchmarks/evaluate_repair.py
 uv run python benchmarks/evaluate_events.py
+uv run python -m benchmarks.evaluate_scale
+uv run python -m benchmarks.evaluate_replanning_scale
+uv run python -m benchmarks.evaluate_faults
 ```
+
+`planning-scale-v1.jsonl` is generated once from seed `20260727` and checked in.
+Regenerate it only when creating a new benchmark version:
+
+```bash
+uv run python benchmarks/generate_scale_scenarios.py
+```
+
+Scale metrics are synthetic replay measurements. They establish deterministic
+constraint and recovery behaviour, not production traffic, preference quality,
+or supplier-network latency.

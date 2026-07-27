@@ -76,8 +76,14 @@ class ProviderError(RuntimeError):
 
 
 class ProviderRegistry:
-    def __init__(self, providers: Iterable[OfferProvider] = ()) -> None:
+    def __init__(
+        self,
+        providers: Iterable[OfferProvider] = (),
+        *,
+        provider_timeout_seconds: float = 8,
+    ) -> None:
         self._providers = {provider.name: provider for provider in providers}
+        self._provider_timeout_seconds = provider_timeout_seconds
 
     def register(self, provider: OfferProvider) -> None:
         if provider.name in self._providers:
@@ -91,7 +97,7 @@ class ProviderRegistry:
             if query.kind in provider.supported_kinds
         ]
         settled = await asyncio.gather(
-            *(provider.search(query) for provider in providers),
+            *(self._search_one(provider, query) for provider in providers),
             return_exceptions=True,
         )
         offers: list[TravelOffer] = []
@@ -123,6 +129,24 @@ class ProviderRegistry:
             offers=tuple(offers),
             failures=tuple(failures),
         )
+
+    async def _search_one(
+        self,
+        provider: OfferProvider,
+        query: OfferSearchQuery,
+    ) -> tuple[TravelOffer, ...]:
+        try:
+            return await asyncio.wait_for(
+                provider.search(query),
+                timeout=self._provider_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise ProviderError(
+                provider.name,
+                "provider_timeout",
+                f"provider exceeded {self._provider_timeout_seconds:g}s deadline",
+                retryable=True,
+            ) from exc
 
     async def revalidate(self, offer: TravelOffer) -> TravelOffer:
         provider = self._providers.get(offer.source.provider)
