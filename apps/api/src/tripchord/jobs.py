@@ -65,6 +65,15 @@ class JobRepository:
             raise JobNotFoundError(job_id)
         return self._snapshot(row)
 
+    async def latest_problem(self, workspace_id: str) -> PlanningProblem | None:
+        row = await self._session.scalar(
+            select(JobRow)
+            .where(JobRow.workspace_id == workspace_id)
+            .order_by(JobRow.created_at.desc())
+            .limit(1)
+        )
+        return PlanningProblem.model_validate(row.request) if row is not None else None
+
     async def update(
         self,
         job_id: str,

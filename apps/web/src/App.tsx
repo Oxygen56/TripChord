@@ -66,6 +66,9 @@ function App() {
   const [replanResult, setReplanResult] = useState<ReplanResult | null>(null);
   const [eventKind, setEventKind] = useState("place_closed");
   const [eventTarget, setEventTarget] = useState("");
+  const [replanPreference, setReplanPreference] = useState<
+    "minimum_change" | "balanced" | "quality_first"
+  >("minimum_change");
   const [submitting, setSubmitting] = useState(false);
 
   const plan = useMemo(
@@ -157,6 +160,7 @@ function App() {
       const response = await replanWorkspace(workspace.id, {
         targetId: eventTarget,
         kind: eventKind,
+        preference: replanPreference,
         payload,
       });
       setWorkspace(response.workspace);
@@ -226,8 +230,8 @@ function App() {
 
                   {groupedItems.map(([date, items], index) => <div className="day-block" key={date}><div className="day-heading"><span>DAY {index + 1}</span><strong>{date}</strong></div><div className="timeline">{items.map((item) => <article className="timeline-item" key={item.id}><time>{formatTime(item.starts_at)}–{formatTime(item.ends_at)}</time><span className={`timeline-dot ${item.kind}`} /><div><strong>{item.title}</strong><p>{item.location_name ?? "位置待导航确认"} · {item.source_refs[0] ?? "用户偏好项"}</p></div></article>)}</div></div>)}
 
-                  <div className="event-lab"><div><p className="eyebrow">EVENT INJECTION LAB</p><h3>模拟异常，只重排受影响部分</h3></div><select value={eventTarget} onChange={(e) => setEventTarget(e.target.value)}>{plan.items.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select><select value={eventKind} onChange={(e) => setEventKind(e.target.value)}><option value="place_closed">临时闭园</option><option value="weather_alert">天气预警</option><option value="transport_delayed">延误 60 分钟</option><option value="price_changed">价格变为 ¥300</option></select><button type="button" onClick={injectEvent}>注入并重规划</button></div>
-                  {replanResult && <div className={`replan-result ${replanResult.status}`}><strong>{replanResult.status === "ready" ? "局部恢复完成" : "自动恢复已阻塞"}</strong><p>{replanResult.message}</p><span>未受影响项保留率 {(replanResult.unaffected_preservation_ratio * 100).toFixed(0)}%</span></div>}
+                  <div className="event-lab"><div><p className="eyebrow">EVENT INJECTION LAB</p><h3>模拟异常，在合格候选中选择恢复策略</h3></div><select value={eventTarget} onChange={(e) => setEventTarget(e.target.value)}>{plan.items.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select><select value={eventKind} onChange={(e) => setEventKind(e.target.value)}><option value="place_closed">临时闭园</option><option value="weather_alert">天气预警</option><option value="transport_delayed">延误 60 分钟</option><option value="price_changed">价格变为 ¥300</option></select><select value={replanPreference} onChange={(e) => setReplanPreference(e.target.value as typeof replanPreference)}><option value="minimum_change">最少改动</option><option value="balanced">平衡策略</option><option value="quality_first">质量优先</option></select><button type="button" onClick={injectEvent}>注入并重规划</button></div>
+                  {replanResult && <div className={`replan-result ${replanResult.status}`}><strong>{replanResult.status === "ready" ? `${replanResult.selected_mode === "local" ? "局部修复" : "全局重优化"}完成` : "自动恢复已阻塞"}</strong><p>{replanResult.message}</p><span>未受影响项保留率 {(replanResult.unaffected_preservation_ratio * 100).toFixed(0)}% · {replanResult.candidates.length} 个候选通过策略比较</span></div>}
 
                   <div className="verification-bar"><div><span>✓</span><p><strong>确定性 Verifier 已检查</strong><small>日期、时间窗、移动间隔、预算、必去项与来源</small></p></div><em>{plan.status}</em></div>
                 </>

@@ -80,6 +80,8 @@ async def test_persisted_workspace_plan_replan_and_diff_flow() -> None:
             assert replanned.status_code == 200
             body = replanned.json()
             assert body["result"]["status"] == "ready"
+            assert body["result"]["selected_mode"] == "local"
+            assert body["result"]["policy"]["fallback_reason"]
             assert len(body["workspace"]["plans"]) == 2
             assert len(body["workspace"]["events"]) == 1
 

@@ -72,6 +72,14 @@ export type ReplanResult = {
   overall_preservation_ratio: number;
   unaffected_preservation_ratio: number;
   diff: PlanDiff;
+  preference: "minimum_change" | "balanced" | "quality_first";
+  selected_mode: "local" | "global";
+  candidates: Array<{
+    mode: "local" | "global";
+    hard_valid: boolean;
+    preservation_ratio: number;
+    utility_retention: number;
+  }>;
 };
 
 type StartPlanningResponse = {
@@ -136,11 +144,17 @@ export async function searchOffers(spec: TripSpec): Promise<Offer[]> {
 
 export function replanWorkspace(
   workspaceId: string,
-  input: { targetId: string; kind: string; payload?: Record<string, string | number> },
+  input: {
+    targetId: string;
+    kind: string;
+    preference: "minimum_change" | "balanced" | "quality_first";
+    payload?: Record<string, string | number>;
+  },
 ): Promise<{ result: ReplanResult; workspace: Workspace }> {
   return request(`/api/v1/workspaces/${workspaceId}/events/replan`, {
     method: "POST",
     body: JSON.stringify({
+      preference: input.preference,
       event: {
         id: `ui-${input.kind}-${crypto.randomUUID()}`,
         trip_id: workspaceId,

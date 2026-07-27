@@ -9,7 +9,9 @@ from tripchord.domain.trip import TripSpec
 from tripchord.jobs import JobSnapshot
 from tripchord.persistence.repository import WorkspaceSnapshot
 from tripchord.planning import ChineseRequirementParser, ItineraryOptimizer, PlanVerifier
+from tripchord.planning.adaptive import AdaptiveReplanResult
 from tripchord.planning.impact import PlanDependency
+from tripchord.planning.policy import ReplanPreference
 from tripchord.planning.problem import OptimizationResult, PlanningProblem
 from tripchord.planning.replanner import LocalReplanner, LocalReplanResult
 from tripchord.planning.requirements import RequirementParseResult
@@ -107,10 +109,11 @@ class WorkspaceReplanRequest(ApiModel):
     dependencies: tuple[PlanDependency, ...] | None = None
     replacements: dict[str, ItineraryItem] = Field(default_factory=dict)
     max_iterations: int = 3
+    preference: ReplanPreference = ReplanPreference.MINIMUM_CHANGE
 
 
 class WorkspaceReplanResponse(ApiModel):
-    result: LocalReplanResult
+    result: AdaptiveReplanResult
     workspace: WorkspaceSnapshot
 
 

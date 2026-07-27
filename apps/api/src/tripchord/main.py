@@ -56,10 +56,12 @@ from tripchord.persistence.repository import (
     WorkspaceNotFoundError,
     WorkspaceSnapshot,
 )
+from tripchord.planning.adaptive import AdaptiveReplanner
 from tripchord.planning.assembler import PlanningProblemAssembler, ReplayPlaceCatalog
+from tripchord.planning.policy import ReplanPolicySelector
 from tripchord.planning.problem import PlanningInfeasible
 from tripchord.planning.repair import PlanDiff, diff_plans
-from tripchord.planning.replanner import LocalReplanner, LocalReplanResult
+from tripchord.planning.replanner import LocalReplanResult
 from tripchord.planning.requirements import RequirementParseResult
 from tripchord.planning.workflow import WorkflowResult
 from tripchord.providers.amap import AmapTravelDataProvider
@@ -75,6 +77,9 @@ database = Database(settings.database_url)
 job_runner = PlanningJobRunner(database)
 planning_assembler = PlanningProblemAssembler(
     ReplayPlaceCatalog(root / "data" / "replay" / "places.json")
+)
+replan_policy = ReplanPolicySelector.from_path(
+    root / "training" / "artifacts" / "replan-policy.json"
 )
 
 
@@ -234,10 +239,16 @@ async def persisted_replan_endpoint(
         raise HTTPException(status_code=404, detail="workspace not found") from exc
     if not workspace.plans:
         raise HTTPException(status_code=409, detail="workspace has no plan to replan")
-    result = LocalReplanner(max_repair_iterations=request.max_iterations).replan(
+    problem = await JobRepository(session).latest_problem(workspace_id)
+    result = AdaptiveReplanner(
+        replan_policy,
+        max_repair_iterations=request.max_iterations,
+    ).replan(
         workspace.spec,
         workspace.plans[-1],
         request.event,
+        request.preference,
+        problem,
         request.context,
         request.dependencies,
         request.replacements,

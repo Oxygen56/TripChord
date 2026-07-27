@@ -8,6 +8,7 @@ RUN uv sync --frozen --no-dev
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY data ./data
+COPY training/artifacts ./training/artifacts
 
 ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8000
