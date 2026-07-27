@@ -4,15 +4,16 @@ TripChord is a price-aware, constraint-checked planning system for independent
 leisure travel. It combines traceable travel data, deterministic scheduling,
 Planner–Verifier–Repair, and event-driven local replanning.
 
-> Status: active development. The clean-room foundation, provider data layer,
+> Status: final-form reference implementation. The clean-room foundation, provider data layer,
 > typed requirements, deterministic scheduler, bounded Planner–Verifier–Repair
 > loop, event-scoped local replanning, persistent workspaces, asynchronous
 > planning jobs, SSE progress, and the interactive React workspace are
 > implemented and tested. Frozen post-training traces, city-group-isolated
 > splits, LoRA SFT/DPO launch paths, and a CPU-trained replan-policy reranker are
 > also checked in with held-out evidence.
-> Production supplier credentials and end-to-end planning-quality improvements
-> remain unverified, so neither is claimed yet.
+> Tenant isolation, recoverable jobs, runtime metrics, rate limiting, and the
+> verifier-gated adaptive recovery policy are implemented. Production supplier
+> credentials and LLM adapter gains remain separate, unverified gates.
 
 ## Why it exists
 
@@ -58,16 +59,21 @@ Without external credentials the offer API runs against explicit replay data.
 Provider readiness and production-verification boundaries are recorded in
 `docs/providers.md`.
 
-The default local database is SQLite. To run the PostgreSQL-backed deployment
-profile with the API, migrated database, and Nginx-served web app:
+The default local database is SQLite. To run the authenticated PostgreSQL/Redis
+deployment profile with the API, migrated database, and Nginx-served web app:
 
 ```bash
+export TRIPCHORD_AUTH_TOKENS='{"replace-with-random-token":"demo-tenant"}'
 docker compose up --build
 ```
 
 Open `http://localhost:8080`. The checked-in Beijing catalog and prices are
 explicit replay fixtures for deterministic development; they are never labelled
 as live inventory.
+
+Architecture, operations, demo, evidence boundaries, and the Chinese resume
+project are in `docs/architecture.md`, `docs/operations.md`, `docs/demo.md`,
+`docs/claim-ledger.md`, and `docs/resume-project.md`.
 
 ## Upstream comparison boundary
 

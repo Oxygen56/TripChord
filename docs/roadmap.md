@@ -13,6 +13,10 @@
 | 8 | SFT, preference optimisation, reranking | Held-out improvement with cost accounting |
 | 9 | Reliability, deployment, docs, evidence-backed resume | CI, observability, demo, and claim ledger |
 
+Implementation status: all local product phases are complete. External supplier
+production verification, a completed LLM adapter experiment, remote CI results,
+and a clean-network container build remain separate evidence gates rather than
+unfinished hidden scope.
+
 Each phase produces a run manifest, metrics, failure cases, and a phase review.
 The only review outcomes are pass, conditional pass, rework, or plan change.
-

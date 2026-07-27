@@ -1,0 +1,17 @@
+{
+  "run_id": "phase-8-final-form-reliability-and-product-integration",
+  "evidence": [
+    "58 Python tests",
+    "Ruff and strict mypy",
+    "React production build and Vitest",
+    "Chrome end-to-end planning and two recovery preferences",
+    "three Alembic migrations and autogenerate check",
+    "Docker Compose config",
+    "npm production audit",
+    "pip-audit default runtime dependencies",
+    "tenant isolation, job idempotency/claim/recovery, rate-limit tests",
+    "verifier-gated adaptive replan test"
+  ],
+  "results": "benchmarks/results/phase-8-final.json",
+  "claim_boundary": "External supplier production credentials are absent. Local Docker image build depends on the host Docker network and is reported separately from CI configuration."
+}

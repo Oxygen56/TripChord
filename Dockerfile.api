@@ -1,9 +1,12 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 WORKDIR /app
+ENV UV_HTTP_TIMEOUT=120 \
+    UV_HTTP_RETRIES=10 \
+    PYTHONPATH=/app/apps/api/src
 COPY pyproject.toml uv.lock README.md ./
 COPY apps/api ./apps/api
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --no-install-project
 
 COPY alembic.ini ./
 COPY migrations ./migrations

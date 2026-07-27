@@ -120,7 +120,17 @@ function App() {
       setDiff(null);
       return;
     }
-    void comparePlans(workspace.id, selectedVersion - 1, selectedVersion).then(setDiff);
+    let active = true;
+    void comparePlans(workspace.id, selectedVersion - 1, selectedVersion)
+      .then((comparison) => {
+        if (active) setDiff(comparison);
+      })
+      .catch(() => {
+        if (active) setDiff(null);
+      });
+    return () => {
+      active = false;
+    };
   }, [selectedVersion, workspace?.id]);
 
   async function handlePlan(event: FormEvent<HTMLFormElement>) {
@@ -128,6 +138,8 @@ function App() {
     setSubmitting(true);
     setError("");
     setWorkspace(null);
+    setSelectedVersion(1);
+    setDiff(null);
     setReplanResult(null);
     setApiCredential(apiKey);
     const spec: TripSpec = {

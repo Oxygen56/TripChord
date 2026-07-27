@@ -1,0 +1,35 @@
+{
+  "python": {
+    "tests_passed": 58,
+    "ruff": "passed",
+    "mypy_strict": "passed"
+  },
+  "web": {
+    "vitest_passed": 1,
+    "production_build": "passed",
+    "npm_production_vulnerabilities": 0,
+    "browser_e2e": {
+      "planning_progress": "100%",
+      "minimum_change_selected": "local",
+      "minimum_change_unaffected_preservation": 1.0,
+      "quality_first_selected": "global",
+      "console_errors_after_race_fix": 0
+    }
+  },
+  "database": {
+    "alembic_migrations": 3,
+    "upgrade_to_head": "passed",
+    "autogenerate_check": "passed"
+  },
+  "security": {
+    "pip_audit_known_vulnerabilities": 0,
+    "pip_audit_note": "local editable TripChord package is not on PyPI and was skipped",
+    "tenant_isolation_test": "passed",
+    "rate_limit_test": "passed"
+  },
+  "deployment": {
+    "compose_config": "passed",
+    "local_image_build": "not_yet_passed_host_docker_network",
+    "ci_container_build_job": "configured_not_observed_remotely"
+  }
+}
