@@ -11,6 +11,7 @@ from tripchord.api import (
     ParseTripRequest,
     PlaceSearchRequest,
     RepairPlanRequest,
+    ReplanRequest,
     RouteRequest,
     VerifyRequest,
     VerifyResponse,
@@ -19,6 +20,7 @@ from tripchord.api import (
     optimize_plan,
     parse_trip_request,
     repair_plan,
+    replan_after_event,
     revalidate_offer,
     search_offers,
     verify_plan,
@@ -28,6 +30,7 @@ from tripchord.domain.common import Coordinates
 from tripchord.domain.offers import TravelOffer
 from tripchord.domain.travel_data import Place, RouteLeg, WeatherWindow
 from tripchord.planning.problem import PlanningInfeasible
+from tripchord.planning.replanner import LocalReplanResult
 from tripchord.planning.requirements import RequirementParseResult
 from tripchord.planning.workflow import WorkflowResult
 from tripchord.providers.amap import AmapTravelDataProvider
@@ -94,6 +97,11 @@ async def optimize_plan_endpoint(request: OptimizePlanRequest) -> OptimizePlanRe
 @app.post("/api/v1/plans/repair", response_model=WorkflowResult)
 async def repair_plan_endpoint(request: RepairPlanRequest) -> WorkflowResult:
     return repair_plan(request)
+
+
+@app.post("/api/v1/plans/replan", response_model=LocalReplanResult)
+async def replan_endpoint(request: ReplanRequest) -> LocalReplanResult:
+    return replan_after_event(request)
 
 
 def require_amap() -> AmapTravelDataProvider:

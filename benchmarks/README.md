@@ -14,4 +14,5 @@ Run the current deterministic verifier baseline:
 uv run python benchmarks/evaluate.py
 uv run python benchmarks/evaluate_planning.py
 uv run python benchmarks/evaluate_repair.py
+uv run python benchmarks/evaluate_events.py
 ```

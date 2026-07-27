@@ -20,6 +20,7 @@ jobs:
       - run: uv run python benchmarks/evaluate.py
       - run: uv run python benchmarks/evaluate_planning.py
       - run: uv run python benchmarks/evaluate_repair.py
+      - run: uv run python benchmarks/evaluate_events.py
 
   web:
     runs-on: ubuntu-latest

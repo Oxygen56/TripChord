@@ -1,0 +1,21 @@
+{
+  "run_id": "phase-4-event-driven-local-replanning",
+  "tripchord_version": "0.1.0",
+  "scenario_files": [
+    "benchmarks/scenarios/events-v0.jsonl"
+  ],
+  "source_mode": "replay",
+  "event_contract": {
+    "kinds": [
+      "price_changed",
+      "sold_out",
+      "weather_alert",
+      "place_closed",
+      "transport_delayed",
+      "user_changed_requirement"
+    ],
+    "idempotent_by_event_id": true,
+    "unaffected_items_must_be_identical": true
+  },
+  "notes": "Synthetic deterministic events; no claim about real provider push coverage."
+}

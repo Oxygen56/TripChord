@@ -82,3 +82,4 @@ class PlanVersion(DomainModel):
     items: tuple[ItineraryItem, ...] = ()
     parent_version_id: str | None = None
     explanation: str | None = None
+    applied_event_ids: tuple[str, ...] = ()

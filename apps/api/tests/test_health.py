@@ -99,3 +99,55 @@ async def test_repair_endpoint_returns_a_versioned_diff() -> None:
     assert body["status"] == "ready"
     assert body["final_plan"]["version"] == 2
     assert body["traces"][0]["diff"]["changed_items"][0]["item_id"] == "b"
+
+
+@pytest.mark.asyncio
+async def test_event_replan_endpoint_reports_preservation() -> None:
+    request = {
+        "spec": {
+            "origin": "上海",
+            "destinations": ["北京"],
+            "start_date": "2026-10-02",
+            "end_date": "2026-10-02",
+        },
+        "plan": {
+            "id": "trip-1:plan:v1",
+            "trip_id": "trip-1",
+            "version": 1,
+            "items": [
+                {
+                    "id": "museum",
+                    "kind": "activity",
+                    "title": "博物馆",
+                    "starts_at": "2026-10-02T09:00:00+08:00",
+                    "ends_at": "2026-10-02T10:00:00+08:00",
+                },
+                {
+                    "id": "park",
+                    "kind": "activity",
+                    "title": "公园",
+                    "starts_at": "2026-10-02T11:00:00+08:00",
+                    "ends_at": "2026-10-02T12:00:00+08:00",
+                },
+            ],
+        },
+        "event": {
+            "id": "event-1",
+            "trip_id": "trip-1",
+            "kind": "place_closed",
+            "occurred_at": "2026-10-01T08:00:00+08:00",
+            "target_refs": ["museum"],
+        },
+        "dependencies": [],
+    }
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/api/v1/plans/replan", json=request)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["diff"]["removed_item_ids"] == ["museum"]
+    assert body["unaffected_preservation_ratio"] == 1.0
