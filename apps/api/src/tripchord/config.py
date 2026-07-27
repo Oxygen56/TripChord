@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
     database_url: str = "sqlite+aiosqlite:///./tripchord.db"
     redis_url: str | None = None
+    rate_limit_requests: int = Field(default=30, ge=1, le=10000)
+    rate_limit_window_seconds: int = Field(default=60, ge=1, le=3600)
+    log_level: str = "INFO"
     auth_required: bool = False
     auth_tokens: dict[str, str] = Field(default_factory=dict)
     amadeus_client_id: str | None = Field(default=None, validation_alias="AMADEUS_CLIENT_ID")

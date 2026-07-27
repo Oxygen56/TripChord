@@ -13,6 +13,15 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   api:
     build:
       context: .
@@ -20,6 +29,7 @@ services:
     environment:
       TRIPCHORD_ENV: production
       TRIPCHORD_DATABASE_URL: postgresql+asyncpg://tripchord:tripchord@postgres:5432/tripchord
+      TRIPCHORD_REDIS_URL: redis://redis:6379/0
       TRIPCHORD_CORS_ORIGINS: '["http://localhost:8080"]'
       TRIPCHORD_AUTH_REQUIRED: "true"
       TRIPCHORD_AUTH_TOKENS: '${TRIPCHORD_AUTH_TOKENS:-{}}'
@@ -28,6 +38,8 @@ services:
         required: false
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]

@@ -7,7 +7,8 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tripchord import __version__
@@ -52,6 +53,7 @@ from tripchord.jobs import (
     JobStatus,
     PlanningJobRunner,
 )
+from tripchord.observability import configure_logging, metrics, observe_request
 from tripchord.persistence import Database, WorkspaceRepository
 from tripchord.persistence.repository import (
     WorkspaceConflictError,
@@ -70,13 +72,20 @@ from tripchord.providers.amap import AmapTravelDataProvider
 from tripchord.providers.base import OfferSearchQuery, OfferSearchResult
 from tripchord.providers.factory import build_amap_provider, build_provider_registry
 from tripchord.providers.user_snapshot import UserQuoteInput
+from tripchord.rate_limit import RateLimiter
 
 settings = get_settings()
+configure_logging(settings.log_level)
 root = Path(__file__).resolve().parents[4]
 providers = build_provider_registry(settings, root)
 amap = build_amap_provider(settings)
 database = Database(settings.database_url)
 job_runner = PlanningJobRunner(database)
+rate_limiter = RateLimiter(
+    limit=settings.rate_limit_requests,
+    window_seconds=settings.rate_limit_window_seconds,
+    redis_url=settings.redis_url,
+)
 planning_assembler = PlanningProblemAssembler(
     ReplayPlaceCatalog(root / "data" / "replay" / "places.json")
 )
@@ -90,6 +99,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await database.create_schema()
     await job_runner.recover()
     yield
+    await rate_limiter.close()
     await database.dispose()
 
 
@@ -120,11 +130,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.middleware("http")(observe_request)
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "tripchord", "version": __version__}
+
+
+@app.get("/ready")
+async def ready() -> dict[str, str]:
+    try:
+        async with database.sessions() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="database is not ready") from exc
+    return {
+        "status": "ready",
+        "database": "ok",
+        "rate_limit_backend": rate_limiter.backend,
+    }
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def metrics_endpoint() -> str:
+    return metrics.render()
 
 
 @app.post("/api/v1/plans/verify", response_model=VerifyResponse)
@@ -133,17 +163,29 @@ async def verify_endpoint(request: VerifyRequest) -> VerifyResponse:
 
 
 @app.post("/api/v1/offers/search", response_model=OfferSearchResult)
-async def offer_search_endpoint(query: OfferSearchQuery) -> OfferSearchResult:
+async def offer_search_endpoint(
+    query: OfferSearchQuery,
+    principal: PrincipalDep,
+) -> OfferSearchResult:
+    await rate_limiter.check(principal.tenant_id, "offer-search")
     return await search_offers(query, providers)
 
 
 @app.post("/api/v1/offers/revalidate", response_model=TravelOffer)
-async def offer_revalidate_endpoint(offer: TravelOffer) -> TravelOffer:
+async def offer_revalidate_endpoint(
+    offer: TravelOffer,
+    principal: PrincipalDep,
+) -> TravelOffer:
+    await rate_limiter.check(principal.tenant_id, "offer-revalidate")
     return await revalidate_offer(offer, providers)
 
 
 @app.post("/api/v1/offers/user-snapshot", response_model=TravelOffer)
-async def user_quote_endpoint(quote: UserQuoteInput) -> TravelOffer:
+async def user_quote_endpoint(
+    quote: UserQuoteInput,
+    principal: PrincipalDep,
+) -> TravelOffer:
+    await rate_limiter.check(principal.tenant_id, "user-quote")
     return create_user_quote(quote)
 
 
@@ -249,6 +291,7 @@ async def persisted_replan_endpoint(
     session: SessionDep,
     principal: PrincipalDep,
 ) -> WorkspaceReplanResponse:
+    await rate_limiter.check(principal.tenant_id, "replan")
     repository = WorkspaceRepository(session, principal.tenant_id)
     try:
         workspace = await repository.get(workspace_id)
@@ -296,6 +339,7 @@ async def create_planning_job_endpoint(
     principal: PrincipalDep,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> JobSnapshot:
+    await rate_limiter.check(principal.tenant_id, "planning-job")
     try:
         workspace = await WorkspaceRepository(session, principal.tenant_id).get(workspace_id)
     except WorkspaceNotFoundError as exc:
@@ -324,6 +368,7 @@ async def start_trip_planning_endpoint(
     principal: PrincipalDep,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> StartTripPlanningResponse:
+    await rate_limiter.check(principal.tenant_id, "trip-plan")
     try:
         problem = planning_assembler.assemble(request.spec)
     except ValueError as exc:

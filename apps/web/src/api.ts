@@ -89,10 +89,22 @@ type StartPlanningResponse = {
   candidate_count: number;
 };
 
+let apiCredential = sessionStorage.getItem("tripchord-api-key") ?? "";
+
+export function setApiCredential(credential: string): void {
+  apiCredential = credential.trim();
+  if (apiCredential) sessionStorage.setItem("tripchord-api-key", apiCredential);
+  else sessionStorage.removeItem("tripchord-api-key");
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    headers: {
+      "Content-Type": "application/json",
+      ...(apiCredential ? { Authorization: `Bearer ${apiCredential}` } : {}),
+      ...init?.headers,
+    },
   });
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as { detail?: string } | null;
@@ -173,19 +185,26 @@ export function subscribeToJob(
   onJob: (job: Job) => void,
   onError: (message: string) => void,
 ): () => void {
-  const source = new EventSource(
-    `/api/v1/workspaces/${workspaceId}/jobs/${jobId}/events`,
-  );
-  source.addEventListener("job", (event) => {
-    const job = JSON.parse((event as MessageEvent<string>).data) as Job;
-    onJob(job);
-    if (job.status === "succeeded" || job.status === "failed") {
-      source.close();
+  let active = true;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const poll = async () => {
+    try {
+      const job = await request<Job>(
+        `/api/v1/workspaces/${workspaceId}/jobs/${jobId}`,
+      );
+      if (!active) return;
+      onJob(job);
+      if (job.status !== "succeeded" && job.status !== "failed") {
+        timer = setTimeout(poll, 300);
+      }
+    } catch (caught) {
+      if (!active) return;
+      onError(caught instanceof Error ? caught.message : "进度查询中断，请稍后重试");
     }
-  });
-  source.addEventListener("error", () => {
-    if (source.readyState === EventSource.CLOSED) return;
-    onError("进度连接中断，请稍后重试");
-  });
-  return () => source.close();
+  };
+  void poll();
+  return () => {
+    active = false;
+    if (timer) clearTimeout(timer);
+  };
 }

@@ -9,6 +9,7 @@ import {
   type PlanItem,
   type ReplanResult,
   replanWorkspace,
+  setApiCredential,
   searchOffers,
   startPlanning,
   subscribeToJob,
@@ -57,6 +58,9 @@ function App() {
   const [interests, setInterests] = useState("历史，博物馆，胡同");
   const [mustVisit, setMustVisit] = useState("故宫");
   const [maxActivities, setMaxActivities] = useState(2);
+  const [apiKey, setApiKey] = useState(
+    () => sessionStorage.getItem("tripchord-api-key") ?? "",
+  );
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [job, setJob] = useState<Job | null>(null);
   const [offers, setOffers] = useState<Offer[]>([]);
@@ -125,6 +129,7 @@ function App() {
     setError("");
     setWorkspace(null);
     setReplanResult(null);
+    setApiCredential(apiKey);
     const spec: TripSpec = {
       origin,
       destinations: [destination],
@@ -201,6 +206,7 @@ function App() {
             </div>
             <label>兴趣偏好<input value={interests} onChange={(e) => setInterests(e.target.value)} /></label>
             <label>必须安排<input value={mustVisit} onChange={(e) => setMustVisit(e.target.value)} /></label>
+            <label>部署 API Key（本地演示可留空）<input type="password" autoComplete="off" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="仅保存在当前浏览器会话" /></label>
             <button type="submit" disabled={submitting}>{submitting ? "正在创建工作区…" : "开始可验证规划 →"}</button>
           </form>
           <div className="truth-banner"><strong>当前演示数据边界</strong><p>景点与路线使用明确标注的离线回放场景；配置授权供应商密钥后，报价与地点接口可切换到生产数据。回放价不是可预订实时价。</p></div>

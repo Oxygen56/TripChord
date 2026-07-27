@@ -9,10 +9,15 @@ async def test_health() -> None:
         transport=ASGITransport(app=app),
         base_url="http://test",
     ) as client:
-        response = await client.get("/health")
+        response = await client.get("/health", headers={"X-Request-ID": "test-request-1"})
+        metrics = await client.get("/metrics")
 
     assert response.status_code == 200
     assert response.json()["service"] == "tripchord"
+    assert response.headers["X-Request-ID"] == "test-request-1"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert "tripchord_http_requests_total" in metrics.text
+    assert 'route="/health"' in metrics.text
 
 
 @pytest.mark.asyncio

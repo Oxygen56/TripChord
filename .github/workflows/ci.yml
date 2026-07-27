@@ -17,6 +17,13 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy apps/api/src
       - run: uv run pytest
+      - run: uv run python -m training.train_sft --validate-only
+      - run: uv run python -m training.train_dpo --validate-only
+      - run: uv run python -m training.policy_reranker
+      - run: git diff --exit-code -- training/artifacts/replan-policy.json benchmarks/results/phase-7-post-training.json
+      - run: |
+          uv export --frozen --no-dev --no-hashes --output-file /tmp/tripchord-requirements.txt
+          uvx pip-audit -r /tmp/tripchord-requirements.txt
       - run: |
           migration_db=$(mktemp /tmp/tripchord-migration-XXXXXX.db)
           TRIPCHORD_DATABASE_URL="sqlite+aiosqlite:///$migration_db" uv run alembic upgrade head
@@ -37,6 +44,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      - run: npm audit --omit=dev --audit-level=high
 
   containers:
     runs-on: ubuntu-latest

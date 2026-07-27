@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from tripchord.domain.common import DomainModel
+from tripchord.observability import metrics
 from tripchord.persistence.database import Database
 from tripchord.persistence.models import JobRow, WorkspaceRow, utc_now
 from tripchord.persistence.repository import WorkspaceRepository
@@ -353,8 +354,12 @@ class PlanningJobRunner:
                         "optimization": solved.model_dump(mode="json"),
                     },
                 )
+                metrics.observe_job("succeeded")
             except Exception as exc:
                 await session.rollback()
                 retry = await jobs.schedule_retry(job_id, str(exc))
                 if retry.status == JobStatus.QUEUED:
+                    metrics.observe_job("retry_scheduled")
                     self.enqueue(job_id, workspace_id, problem, tenant_id)
+                else:
+                    metrics.observe_job("failed")
