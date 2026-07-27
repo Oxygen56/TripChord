@@ -1,0 +1,13 @@
+{
+  "run_id": "phase-0-foundation",
+  "tripchord_version": "0.1.0",
+  "upstream": {
+    "repository": "https://github.com/datawhalechina/hello-agents",
+    "commit": "6c616938c521c89bc4b2bf001bf237d259f1726b",
+    "subproject": "code/chapter13/helloagents-trip-planner"
+  },
+  "scenario_file": "benchmarks/scenarios/verifier-v0.jsonl",
+  "source_mode": "replay",
+  "notes": "Foundation contract tests only; no model or live provider claims."
+}
+
