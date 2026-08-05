@@ -1,0 +1,28 @@
+{
+  "schema_version": "tripchord-live-evidence-v4",
+  "requirement": {
+    "text": "出发地：杭州\n目的地：马累\n去程：2026-8月\n返程：玩5-8天\n人数：2名成人\n酒店：1间房\n偏好：提供几个方案对比一下预算、早餐无要求、星级无要求、无行李、接受中转",
+    "reference_date": "2026-07-30"
+  },
+  "calendars": [],
+  "coverage_mode": "strict",
+  "max_pairs": 3,
+  "timeout_seconds": 120,
+  "total_timeout_seconds": 3600,
+  "done_gate_profile": {
+    "maximum_quote_age_minutes": 15,
+    "minimum_recommendable_options": 2
+  },
+  "stay_plan_profile": {
+    "profile_id": "tripchord:maldives-free-travel:live-v4",
+    "source": "system_frozen_live_v4",
+    "expected_candidate_set_sha256": "677bc3fee8111f7d4a4b3e375b6a8943c105c8a9e97adb23d46605a3c254fcc6",
+    "required_stay_plan_ids": [
+      "maafushi_icom",
+      "maafushi_split_hulhumale",
+      "hulhumale_continuous"
+    ],
+    "scan_limit_per_platform": 12,
+    "minimum_exact_providers_per_selected_segment": 2
+  }
+}

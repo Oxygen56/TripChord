@@ -1,0 +1,194 @@
+{
+  "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "runs": [
+    {
+      "domain": "orchestration",
+      "phase": "sft",
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "adapter_path": "training/runs/orchestration-sft-lora",
+      "adapter_bytes": 19593064,
+      "adapter_sha256": "f9a02bd80b2213df6d016103a0b6d0dd7016419ef8fcff2887467adacae499ab",
+      "tensor_count": 420,
+      "reload_passed": true,
+      "peft_type": "PeftType.LORA",
+      "base_model_reference": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "train_records": 192,
+      "validation_records": 24,
+      "train_data_sha256": "82c3ce83773f075b9be0f3243f50090e5c2df29ebc422d4e34e63fd688364f90",
+      "validation_data_sha256": "2d236e0725299133207641aa328d2210eac055a18a05b281896add0d0d6d0ccb",
+      "metrics": {
+        "max_steps": 3,
+        "epoch": 0.125,
+        "validation": {
+          "epoch": 0.125,
+          "eval_entropy": 2.9589136242866516,
+          "eval_loss": 3.27670955657959,
+          "eval_mean_token_accuracy": 0.40369560942053795,
+          "eval_num_tokens": 9826.0,
+          "eval_runtime": 3.3001,
+          "eval_samples_per_second": 7.272,
+          "eval_steps_per_second": 7.272,
+          "step": 3
+        },
+        "legacy_run_note": "run predates automatic TripChord metrics file"
+      }
+    },
+    {
+      "domain": "orchestration",
+      "phase": "sft_plus_dpo",
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "adapter_path": "training/runs/orchestration-sft-dpo-lora",
+      "adapter_bytes": 19593064,
+      "adapter_sha256": "cd172c3fff78f5587badb8f3a29e5d3a750a5d465759d815ed002eb4a0221315",
+      "tensor_count": 420,
+      "reload_passed": true,
+      "peft_type": "PeftType.LORA",
+      "base_model_reference": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "train_records": 192,
+      "validation_records": 24,
+      "train_data_sha256": "45acfdc5f5710df425d897aee4a2e0b45fdb6a3a1fe431f3ca72d69af5a69a03",
+      "validation_data_sha256": "e23c5176e9b2ba45e40f5d6d98bd8d63652a0edc3bcf294d1e875dddeb03f768",
+      "metrics": {
+        "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+        "sft_adapter": "training/runs/orchestration-sft-lora",
+        "train_records": 192,
+        "validation_records": 24,
+        "max_length": 512,
+        "max_steps": 3,
+        "device": "auto",
+        "prompt_completion_separator": "\n\n### TripChord assistant JSON\n",
+        "train": {
+          "train_runtime": 98.9168,
+          "train_samples_per_second": 0.243,
+          "train_steps_per_second": 0.03,
+          "total_flos": 12911904907776.0,
+          "train_loss": 0.6813320318857828,
+          "epoch": 0.125
+        },
+        "validation": {
+          "eval_loss": 0.6963703036308289,
+          "eval_runtime": 15.2777,
+          "eval_samples_per_second": 1.571,
+          "eval_steps_per_second": 1.571,
+          "eval_entropy": 3.726469268401464,
+          "eval_num_tokens": 18556.0,
+          "eval_logits/chosen": 17.903907126196323,
+          "eval_logits/rejected": 17.916189333237458,
+          "eval_mean_token_accuracy": 0.35394858072201413,
+          "eval_rewards/chosen": -0.010641606505184123,
+          "eval_rewards/rejected": -0.005486997465292613,
+          "eval_rewards/accuracies": 0.4166666666666667,
+          "eval_rewards/margins": -0.0051546092533196015,
+          "eval_logps/chosen": -268.2554848988851,
+          "eval_logps/rejected": -269.8106918334961,
+          "epoch": 0.125
+        }
+      }
+    },
+    {
+      "domain": "itinerary_generation_repair",
+      "phase": "sft",
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "adapter_path": "training/runs/itinerary-compact-sft-lora",
+      "adapter_bytes": 19593064,
+      "adapter_sha256": "971aeeabdb86404ec5db378a8564683a7b5c3f8ec400ae9f523d88608117c021",
+      "tensor_count": 420,
+      "reload_passed": true,
+      "peft_type": "PeftType.LORA",
+      "base_model_reference": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "train_records": 80,
+      "validation_records": 20,
+      "train_data_sha256": "742bdc9d7de9460c2ba660c36f031dcb02f92c0789cfdebad20813687a7778d2",
+      "validation_data_sha256": "03686509a46f9c89ca0a08655fed84b819c234b76facf56006868a0bacbfcc5e",
+      "metrics": {
+        "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+        "train_records": 80,
+        "validation_records": 20,
+        "max_length": 1024,
+        "max_steps": 3,
+        "device": "auto",
+        "train": {
+          "train_runtime": 77.357,
+          "train_samples_per_second": 0.31,
+          "train_steps_per_second": 0.039,
+          "total_flos": 14988873028608.0,
+          "train_loss": 2.1387853622436523,
+          "epoch": 0.3
+        },
+        "validation": {
+          "eval_loss": 2.0947721004486084,
+          "eval_runtime": 13.4525,
+          "eval_samples_per_second": 1.487,
+          "eval_steps_per_second": 1.487,
+          "eval_entropy": 2.194283056259155,
+          "eval_num_tokens": 22488.0,
+          "eval_mean_token_accuracy": 0.525656932592392,
+          "epoch": 0.3
+        }
+      }
+    },
+    {
+      "domain": "itinerary_generation_repair",
+      "phase": "sft_plus_dpo",
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "adapter_path": "training/runs/itinerary-compact-sft-dpo-lora",
+      "adapter_bytes": 19593064,
+      "adapter_sha256": "ac05c51de227087f105a63f9b2a831ac6be0d9b4979ddc1105f964e115dfe35a",
+      "tensor_count": 420,
+      "reload_passed": true,
+      "peft_type": "PeftType.LORA",
+      "base_model_reference": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "train_records": 146,
+      "validation_records": 36,
+      "train_data_sha256": "1b6441b0da5356f3c26dea4ff202ebd7f4bdaa650b5146ad1ba00df93101d2cf",
+      "validation_data_sha256": "076eb780df063847013576a7fa14e93349a442dada8923d11570a9a49b3d5ac3",
+      "metrics": {
+        "base_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+        "sft_adapter": "training/runs/itinerary-compact-sft-lora",
+        "train_records": 146,
+        "validation_records": 36,
+        "max_length": 1024,
+        "max_steps": 3,
+        "device": "auto",
+        "prompt_completion_separator": "\n\n### TripChord assistant JSON\n",
+        "train": {
+          "train_runtime": 232.8433,
+          "train_samples_per_second": 0.103,
+          "train_steps_per_second": 0.013,
+          "total_flos": 30694651287552.0,
+          "train_loss": 0.6750916639963785,
+          "epoch": 0.1643835616438356
+        },
+        "validation": {
+          "eval_loss": 0.6869590878486633,
+          "eval_runtime": 80.3642,
+          "eval_samples_per_second": 0.448,
+          "eval_steps_per_second": 0.448,
+          "eval_entropy": 2.310500694645776,
+          "eval_num_tokens": 43150.0,
+          "eval_logits/chosen": 17.834012996758716,
+          "eval_logits/rejected": 18.16105162587364,
+          "eval_mean_token_accuracy": 0.5361325740814209,
+          "eval_rewards/chosen": -0.014795433109005293,
+          "eval_rewards/rejected": -0.045039198057363845,
+          "eval_rewards/accuracies": 0.6388888888888888,
+          "eval_rewards/margins": 0.030243766804536183,
+          "eval_logps/chosen": -698.7317691379124,
+          "eval_logps/rejected": -853.0740983751085,
+          "epoch": 0.1643835616438356
+        }
+      }
+    }
+  ],
+  "all_adapters_reload": true,
+  "domains_trained": [
+    "itinerary_generation_repair",
+    "orchestration"
+  ],
+  "phases_completed": [
+    "sft",
+    "sft_plus_dpo"
+  ],
+  "quality_claim": false,
+  "claim_boundary": "Actual bounded LoRA optimization and reload are verified. The 135M smoke runs do not establish production Chinese itinerary quality; held-out safety/accuracy claims come from the separately reported lightweight policies."
+}

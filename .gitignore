@@ -34,5 +34,5 @@ coverage/
 /benchmarks/results/tongcheng-*
 /benchmarks/results/zhixing-*
 /benchmarks/results/ui-e2e-*
-/benchmarks/results/lora-training-evidence.json
-/benchmarks/scenarios/live-*
+# Deterministic scenario contracts and compact LoRA summaries remain public;
+# only their raw provider executions and screenshots stay local.

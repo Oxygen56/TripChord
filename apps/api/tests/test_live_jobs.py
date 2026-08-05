@@ -73,7 +73,9 @@ async def _wait_for_state(
         snapshot = await registry.get(job_id, tenant_id)
         if snapshot is not None and snapshot.state == state:
             return
-        await asyncio.sleep(0)
+        # Let wall-clock based asyncio timeouts advance on both macOS and the
+        # slower Linux CI event loop instead of spinning only ready callbacks.
+        await asyncio.sleep(0.001)
     raise AssertionError(f"job did not reach {state}")
 
 
