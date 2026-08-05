@@ -8,11 +8,10 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
-from benchmarks.evaluate_replanning_scale import evaluate_rows
-
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "training" / "artifacts" / "replan-policy.json"
 RESULTS = ROOT / "benchmarks" / "results" / "phase-7-post-training.json"
+FROZEN_INPUT = ROOT / "training" / "data" / "replan_policy_examples_v1.json"
 PROFILES = {
     "minimum_change": (0.9, 0.1),
     "balanced": (0.5, 0.5),
@@ -61,8 +60,16 @@ def action_features(example: PolicyExample, action: str) -> tuple[float, ...]:
 
 
 def build_examples() -> list[PolicyExample]:
+    payload = json.loads(FROZEN_INPUT.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != "tripchord-replan-policy-examples-v1":
+        raise ValueError("unsupported frozen replan policy input schema")
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("frozen replan policy input must contain rows")
     examples: list[PolicyExample] = []
-    for row in evaluate_rows():
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("frozen replan policy row must be an object")
         for profile, (stability_weight, quality_weight) in PROFILES.items():
             local_score = (
                 stability_weight * row["local_preservation"]
@@ -167,6 +174,7 @@ def metrics(weights: list[float], examples: list[PolicyExample], split: str) -> 
 def run() -> dict[str, Any]:
     examples = build_examples()
     weights = train(examples)
+    frozen_input_sha256 = hashlib.sha256(FROZEN_INPUT.read_bytes()).hexdigest()
     artifact = {
         "model": "pairwise-logistic-linear",
         "feature_order": [
@@ -195,6 +203,7 @@ def run() -> dict[str, Any]:
         "semantic_template_holdout": False,
         "oracle_feature_coupling": True,
         "production_runtime_loaded": True,
+        "frozen_input_sha256": frozen_input_sha256,
         "claim_boundary": (
             "top1 accuracy is not learned preference quality or unseen-task generalization; "
             "the closed-form oracle is the appropriate upper baseline"

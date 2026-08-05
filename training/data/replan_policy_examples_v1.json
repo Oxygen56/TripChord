@@ -1,0 +1,1209 @@
+{
+  "derivation_boundary": "The rows are a versioned training input snapshot. Regeneration may select a different equal-objective CP-SAT solution across OR-Tools platforms and must be reviewed as a dataset change rather than silently accepted by CI.",
+  "rows": [
+    {
+      "city_group": "冻结城市-0",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.9752770673486786,
+      "id": "planning-scale-0000",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8729752770673487,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-1",
+      "global_preservation": 0.4,
+      "global_utility_retention": 0.9116925592804579,
+      "id": "planning-scale-0001",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.8152085036794767,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-2",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.952442996742671,
+      "id": "planning-scale-0002",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8547231270358306,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-3",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9658385093167702,
+      "id": "planning-scale-0003",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.860248447204969,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-4",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.7960893854748603,
+      "id": "planning-scale-0004",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.6657355679702048,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-5",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.96,
+      "id": "planning-scale-0005",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.7388888888888889,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-6",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.7260536398467433,
+      "id": "planning-scale-0006",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7260536398467433,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-7",
+      "global_preservation": 0.14285714285714285,
+      "global_utility_retention": 0.9502407704654896,
+      "id": "planning-scale-0007",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8908507223113965,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-8",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.9515449438202247,
+      "id": "planning-scale-0008",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8497191011235955,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-9",
+      "global_preservation": 0.0,
+      "global_utility_retention": 1.0302800908402725,
+      "id": "planning-scale-0009",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.9015897047691143,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-10",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.8290113452188006,
+      "id": "planning-scale-0010",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.6709886547811994,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-11",
+      "global_preservation": 0.6,
+      "global_utility_retention": 0.8857442348008385,
+      "id": "planning-scale-0011",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.8134171907756813,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-0",
+      "global_preservation": 0.25,
+      "global_utility_retention": 1.0021008403361344,
+      "id": "planning-scale-0012",
+      "local_preservation": 0.75,
+      "local_ready": true,
+      "local_utility_retention": 0.7563025210084033,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-1",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9525244913338358,
+      "id": "planning-scale-0013",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8764129615674454,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-2",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8280821917808219,
+      "id": "planning-scale-0014",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7047945205479452,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-3",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9211502782931354,
+      "id": "planning-scale-0015",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8339517625231911,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-4",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8558014755197854,
+      "id": "planning-scale-0016",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7256874580818243,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-5",
+      "global_preservation": 0.4,
+      "global_utility_retention": 0.9580193756727664,
+      "id": "planning-scale-0017",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.8665231431646933,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-6",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.9248826291079812,
+      "id": "planning-scale-0018",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8294209702660407,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-7",
+      "global_preservation": 0.14285714285714285,
+      "global_utility_retention": 0.8620928620928621,
+      "id": "planning-scale-0019",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8620928620928621,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-8",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8930530164533821,
+      "id": "planning-scale-0020",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.7449725776965265,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-9",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9007569386038689,
+      "id": "planning-scale-0021",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8317914213624895,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-10",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.8507718696397941,
+      "id": "planning-scale-0022",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8507718696397941,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-11",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9914263445050663,
+      "id": "planning-scale-0023",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8581449727201871,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-0",
+      "global_preservation": 0.5,
+      "global_utility_retention": 0.8511548331907614,
+      "id": "planning-scale-0024",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7476475620188195,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-1",
+      "global_preservation": 0.2,
+      "global_utility_retention": 0.9559082892416225,
+      "id": "planning-scale-0025",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.8756613756613757,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-2",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.7216216216216216,
+      "id": "planning-scale-0026",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7216216216216216,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-3",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8931133428981348,
+      "id": "planning-scale-0027",
+      "local_preservation": 0.875,
+      "local_ready": true,
+      "local_utility_retention": 0.8988522238163558,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-4",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9090909090909091,
+      "id": "planning-scale-0028",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8098415346121768,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-5",
+      "global_preservation": 0.2857142857142857,
+      "global_utility_retention": 0.9845474613686535,
+      "id": "planning-scale-0029",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8807947019867549,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-6",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9097938144329897,
+      "id": "planning-scale-0030",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.8298969072164949,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-7",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.9748020158387329,
+      "id": "planning-scale-0031",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8718502519798416,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-8",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8341168569509738,
+      "id": "planning-scale-0032",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7132303559435863,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-9",
+      "global_preservation": 0.14285714285714285,
+      "global_utility_retention": 0.9304054054054054,
+      "id": "planning-scale-0033",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8466216216216216,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-10",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.9982978723404256,
+      "id": "planning-scale-0034",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8697872340425532,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-11",
+      "global_preservation": 0.6,
+      "global_utility_retention": 0.9503484320557491,
+      "id": "planning-scale-0035",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.8597560975609756,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-0",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.8808724832214765,
+      "id": "planning-scale-0036",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7625838926174496,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-1",
+      "global_preservation": 0.125,
+      "global_utility_retention": 0.9749830966869506,
+      "id": "planning-scale-0037",
+      "local_preservation": 0.875,
+      "local_ready": true,
+      "local_utility_retention": 0.8492224475997295,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-2",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.9465056082830026,
+      "id": "planning-scale-0038",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8490077653149266,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-3",
+      "global_preservation": 0.2857142857142857,
+      "global_utility_retention": 0.9584171696847753,
+      "id": "planning-scale-0039",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8725687458081824,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-4",
+      "global_preservation": 0.5,
+      "global_utility_retention": 0.9754157628344179,
+      "id": "planning-scale-0040",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.841648590021692,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-5",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.9381520119225037,
+      "id": "planning-scale-0041",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.875558867362146,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-6",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.9448559670781893,
+      "id": "planning-scale-0042",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8460905349794239,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-7",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.9388280746941404,
+      "id": "planning-scale-0043",
+      "local_preservation": 0.8888888888888888,
+      "local_ready": true,
+      "local_utility_retention": 0.9388280746941404,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-8",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8588328075709779,
+      "id": "planning-scale-0044",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8588328075709779,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-9",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.9820402298850575,
+      "id": "planning-scale-0045",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8283045977011494,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-10",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8932584269662921,
+      "id": "planning-scale-0046",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8202247191011236,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-11",
+      "global_preservation": 0.125,
+      "global_utility_retention": 0.9728506787330317,
+      "id": "planning-scale-0047",
+      "local_preservation": 0.875,
+      "local_ready": true,
+      "local_utility_retention": 0.9327731092436975,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-0",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8670295489891136,
+      "id": "planning-scale-0048",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7589424572317263,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-1",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9691516709511568,
+      "id": "planning-scale-0049",
+      "local_preservation": 0.8888888888888888,
+      "local_ready": true,
+      "local_utility_retention": 0.9158097686375322,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-2",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.776595744680851,
+      "id": "planning-scale-0050",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.7145390070921985,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-3",
+      "global_preservation": 0.5,
+      "global_utility_retention": 0.8928255093002657,
+      "id": "planning-scale-0051",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8299379982285208,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-4",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 1.0118953211736716,
+      "id": "planning-scale-0052",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8675654242664552,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-5",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.928169014084507,
+      "id": "planning-scale-0053",
+      "local_preservation": 0.875,
+      "local_ready": true,
+      "local_utility_retention": 0.8528169014084507,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-6",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.9549418604651163,
+      "id": "planning-scale-0054",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8335755813953488,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-7",
+      "global_preservation": 0.8,
+      "global_utility_retention": 0.9976708074534162,
+      "id": "planning-scale-0055",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.8136645962732919,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-8",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9976340694006309,
+      "id": "planning-scale-0056",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8249211356466877,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-9",
+      "global_preservation": 0.2,
+      "global_utility_retention": 1.0264765784114054,
+      "id": "planning-scale-0057",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.8126272912423625,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-10",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8188539741219963,
+      "id": "planning-scale-0058",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7199630314232902,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-11",
+      "global_preservation": 0.25,
+      "global_utility_retention": 0.849802371541502,
+      "id": "planning-scale-0059",
+      "local_preservation": 0.875,
+      "local_ready": true,
+      "local_utility_retention": 0.849802371541502,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-0",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9049373618275608,
+      "id": "planning-scale-0060",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7582903463522476,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-1",
+      "global_preservation": 0.14285714285714285,
+      "global_utility_retention": 0.9470149253731344,
+      "id": "planning-scale-0061",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8940298507462686,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-2",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.9552364864864865,
+      "id": "planning-scale-0062",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8648648648648649,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-3",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9544198895027625,
+      "id": "planning-scale-0063",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8888121546961326,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-4",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.957680250783699,
+      "id": "planning-scale-0064",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8393416927899686,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-5",
+      "global_preservation": 0.42857142857142855,
+      "global_utility_retention": 0.9450867052023122,
+      "id": "planning-scale-0065",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8815028901734104,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-6",
+      "global_preservation": 0.25,
+      "global_utility_retention": 0.8123569794050344,
+      "id": "planning-scale-0066",
+      "local_preservation": 0.75,
+      "local_ready": true,
+      "local_utility_retention": 0.6510297482837528,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-7",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9432815665091154,
+      "id": "planning-scale-0067",
+      "local_preservation": 0.875,
+      "local_ready": true,
+      "local_utility_retention": 0.9432815665091154,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-8",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.9583333333333334,
+      "id": "planning-scale-0068",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8355654761904762,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-9",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.952215464813206,
+      "id": "planning-scale-0069",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8583840139009556,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-10",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9021526418786693,
+      "id": "planning-scale-0070",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.9021526418786693,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-11",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9298245614035088,
+      "id": "planning-scale-0071",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8761609907120743,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-0",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9227053140096618,
+      "id": "planning-scale-0072",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7884057971014493,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-1",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.9623397435897436,
+      "id": "planning-scale-0073",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8573717948717948,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-2",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.835285505124451,
+      "id": "planning-scale-0074",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7159590043923866,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-3",
+      "global_preservation": 0.42857142857142855,
+      "global_utility_retention": 0.9858630952380952,
+      "id": "planning-scale-0075",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.9375,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-4",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.7638453500522466,
+      "id": "planning-scale-0076",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.6875653082549634,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-5",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9136752136752136,
+      "id": "planning-scale-0077",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8854700854700854,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-6",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.931129476584022,
+      "id": "planning-scale-0078",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.830119375573921,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-7",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.9508856682769726,
+      "id": "planning-scale-0079",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8413848631239935,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-8",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9731219848380427,
+      "id": "planning-scale-0080",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8642315644383184,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-9",
+      "global_preservation": 0.0,
+      "global_utility_retention": 1.00711743772242,
+      "id": "planning-scale-0081",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.8167259786476868,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-10",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8249279538904899,
+      "id": "planning-scale-0082",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.6909221902017291,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-11",
+      "global_preservation": 0.125,
+      "global_utility_retention": 0.940793754066363,
+      "id": "planning-scale-0083",
+      "local_preservation": 0.875,
+      "local_ready": true,
+      "local_utility_retention": 0.8484059856864021,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-0",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.9788961038961039,
+      "id": "planning-scale-0084",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8433441558441559,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-1",
+      "global_preservation": 0.2,
+      "global_utility_retention": 0.9548936170212766,
+      "id": "planning-scale-0085",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.8127659574468085,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-2",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8752212389380531,
+      "id": "planning-scale-0086",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.7353982300884956,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-3",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.9297629499561019,
+      "id": "planning-scale-0087",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8674275680421423,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-4",
+      "global_preservation": 0.5,
+      "global_utility_retention": 0.9704830053667263,
+      "id": "planning-scale-0088",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8729874776386404,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-5",
+      "global_preservation": 0.25,
+      "global_utility_retention": 0.9806835066864784,
+      "id": "planning-scale-0089",
+      "local_preservation": 0.875,
+      "local_ready": true,
+      "local_utility_retention": 0.9167904903417533,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-6",
+      "global_preservation": 0.25,
+      "global_utility_retention": 0.875,
+      "id": "planning-scale-0090",
+      "local_preservation": 0.75,
+      "local_ready": true,
+      "local_utility_retention": 0.6584158415841584,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-7",
+      "global_preservation": 0.6,
+      "global_utility_retention": 0.982066609735269,
+      "id": "planning-scale-0091",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.8112724167378309,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-8",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.9311969839773798,
+      "id": "planning-scale-0092",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8473138548539114,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-9",
+      "global_preservation": 0.2857142857142857,
+      "global_utility_retention": 0.9140866873065016,
+      "id": "planning-scale-0093",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8668730650154799,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-10",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8017777777777778,
+      "id": "planning-scale-0094",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7084444444444444,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-11",
+      "global_preservation": 0.42857142857142855,
+      "global_utility_retention": 0.9536973047684866,
+      "id": "planning-scale-0095",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8845888044229441,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-0",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8672427336999214,
+      "id": "planning-scale-0096",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7604084838963079,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-1",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.8558704453441296,
+      "id": "planning-scale-0097",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8518218623481781,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-2",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.8760180995475113,
+      "id": "planning-scale-0098",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7565610859728507,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-3",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.9682733374008542,
+      "id": "planning-scale-0099",
+      "local_preservation": 0.8888888888888888,
+      "local_ready": true,
+      "local_utility_retention": 0.8999389871873094,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-4",
+      "global_preservation": 0.2,
+      "global_utility_retention": 0.68762278978389,
+      "id": "planning-scale-0100",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.6777996070726916,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-5",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.910234899328859,
+      "id": "planning-scale-0101",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8003355704697986,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-6",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.8178036605657238,
+      "id": "planning-scale-0102",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.6805324459234608,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-7",
+      "global_preservation": 0.125,
+      "global_utility_retention": 0.9575208913649025,
+      "id": "planning-scale-0103",
+      "local_preservation": 0.875,
+      "local_ready": true,
+      "local_utility_retention": 0.924791086350975,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-8",
+      "global_preservation": 0.3333333333333333,
+      "global_utility_retention": 0.8619153674832962,
+      "id": "planning-scale-0104",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7305122494432071,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-9",
+      "global_preservation": 0.6,
+      "global_utility_retention": 0.9146341463414634,
+      "id": "planning-scale-0105",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.9146341463414634,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-10",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.949244060475162,
+      "id": "planning-scale-0106",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.7721382289416847,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-11",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9293008641005499,
+      "id": "planning-scale-0107",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8562450903377847,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-0",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9814814814814815,
+      "id": "planning-scale-0108",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8518518518518519,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-1",
+      "global_preservation": 0.25,
+      "global_utility_retention": 0.8290468986384266,
+      "id": "planning-scale-0109",
+      "local_preservation": 0.875,
+      "local_ready": true,
+      "local_utility_retention": 0.8229954614220878,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-2",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.7621359223300971,
+      "id": "planning-scale-0110",
+      "local_preservation": 0.75,
+      "local_ready": true,
+      "local_utility_retention": 0.5497572815533981,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-3",
+      "global_preservation": 0.125,
+      "global_utility_retention": 0.9227467811158798,
+      "id": "planning-scale-0111",
+      "local_preservation": 0.875,
+      "local_ready": true,
+      "local_utility_retention": 0.9227467811158798,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-4",
+      "global_preservation": 0.2,
+      "global_utility_retention": 0.9745958429561201,
+      "id": "planning-scale-0112",
+      "local_preservation": 0.8,
+      "local_ready": true,
+      "local_utility_retention": 0.8198614318706697,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-5",
+      "global_preservation": 0.25,
+      "global_utility_retention": 0.980528511821975,
+      "id": "planning-scale-0113",
+      "local_preservation": 0.875,
+      "local_ready": true,
+      "local_utility_retention": 0.9068150208623088,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-6",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.8286151491966335,
+      "id": "planning-scale-0114",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.7146136189747513,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-7",
+      "global_preservation": 0.6666666666666666,
+      "global_utility_retention": 0.8606010016694491,
+      "id": "planning-scale-0115",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.820534223706177,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-8",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.963620230700976,
+      "id": "planning-scale-0116",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.9423247559893523,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-9",
+      "global_preservation": 0.14285714285714285,
+      "global_utility_retention": 0.8847771236333053,
+      "id": "planning-scale-0117",
+      "local_preservation": 0.8571428571428571,
+      "local_ready": true,
+      "local_utility_retention": 0.8233809924306139,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-10",
+      "global_preservation": 0.16666666666666666,
+      "global_utility_retention": 0.9579554822753503,
+      "id": "planning-scale-0118",
+      "local_preservation": 0.8333333333333334,
+      "local_ready": true,
+      "local_utility_retention": 0.8384171475680132,
+      "unaffected_preservation": 1.0
+    },
+    {
+      "city_group": "冻结城市-11",
+      "global_preservation": 0.0,
+      "global_utility_retention": 0.9870349492671928,
+      "id": "planning-scale-0119",
+      "local_preservation": 0.8888888888888888,
+      "local_ready": true,
+      "local_utility_retention": 0.9464487034949267,
+      "unaffected_preservation": 1.0
+    }
+  ],
+  "schema_version": "tripchord-replan-policy-examples-v1",
+  "source": "frozen CP-SAT replanning feature rows",
+  "source_scenarios": "benchmarks/scenarios/planning-scale-v1.jsonl",
+  "source_scenarios_sha256": "c179d14dcbc6124383f48d69bd35750841458167040aae1ab4c74c833c1aa8f3"
+}

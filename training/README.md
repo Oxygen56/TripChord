@@ -30,6 +30,12 @@ uv run python -m training.policy_reranker
 uv run python -m training.orchestration_policy
 ```
 
+`policy_reranker` 从版本化的
+`training/data/replan_policy_examples_v1.json` 读取冻结特征行，而不是在每次
+CI 中重新求解 CP-SAT 场景。即使固定单线程和随机种子，不同 OR-Tools 平台也可能
+在同分最优解之间作出不同选择；因此重新生成该输入必须显式运行
+`uv run python -m training.freeze_replan_policy_inputs`，并把差异作为数据集变更审查。
+
 轻量策略结果只属于合成 oracle-imitation regression：编排城市组 held-out 为 24 条，且
 标签相关语义模板跨 split；行程恢复 reranker 的 test Top-1 为 95%，但直接执行标签生成
 公式为 100%。它们不能解释为 LLM 能力、未见任务泛化、真人满意度或生产收益。

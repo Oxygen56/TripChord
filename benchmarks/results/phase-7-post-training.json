@@ -1,6 +1,7 @@
 {
   "claim_boundary": "top1 accuracy is not learned preference quality or unseen-task generalization; the closed-form oracle is the appropriate upper baseline",
   "evaluation_scope": "oracle-formula distillation on synthetic scenarios; candidate score terms used to create labels are also model inputs",
+  "frozen_input_sha256": "1204af8e99d56103b3969154d7ea09d2b59358c6c543c94475cbea4ed154c122",
   "label_source": "synthetic weighted policy oracle; not human preference data",
   "metrics": {
     "test": {
