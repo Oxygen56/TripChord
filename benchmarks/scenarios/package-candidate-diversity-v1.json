@@ -1,0 +1,37 @@
+{
+  "benchmark_version": "package-candidate-diversity-v1",
+  "scenario_id": "three-synthetic-platforms-two-package-kinds-small-cap",
+  "input_classification": {
+    "kind": "synthetic_normalized_quotes",
+    "live": false,
+    "bookability_verified": false
+  },
+  "candidate_cap": 3,
+  "flights": [
+    {
+      "id": "fixture-flight-a",
+      "provider": "fixture-platform-a",
+      "total_for_party_cents": 938400
+    },
+    {
+      "id": "fixture-flight-b",
+      "provider": "fixture-platform-b",
+      "total_for_party_cents": 938500
+    },
+    {
+      "id": "fixture-flight-c",
+      "provider": "fixture-platform-c",
+      "total_for_party_cents": 938600
+    }
+  ],
+  "expected": {
+    "full_candidate_count": 6,
+    "bounded_candidate_count": 3,
+    "provider_count": 3,
+    "flight_count": 3,
+    "package_kind_count": 2,
+    "raw_structural_candidate_upper_bound": 6,
+    "prescreened_structural_candidate_upper_bound": 6
+  },
+  "scenario_sha256": "cb92d8a5eaa321746a0686a3190b3578da291d3c97bb1b531d6b9b3085c49265"
+}

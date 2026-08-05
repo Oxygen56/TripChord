@@ -1,0 +1,64 @@
+[
+  {
+    "id": "replay:flight:sha-pek-1",
+    "kind": "flight",
+    "title": "上海 → 北京 · replay flight",
+    "source": {
+      "provider": "replay",
+      "mode": "replay",
+      "request_id": "fixture-flight-1",
+      "captured_at": "2026-07-27T12:00:00Z",
+      "expires_at": "2026-07-27T12:05:00Z"
+    },
+    "price_state": "estimated",
+    "price": {
+      "base": {"amount": "720", "currency": "CNY"},
+      "taxes": {"amount": "120", "currency": "CNY"},
+      "fees": {"amount": "0", "currency": "CNY"},
+      "total": {"amount": "840", "currency": "CNY"},
+      "components_complete": true
+    },
+    "terms": {
+      "refundable": false,
+      "cancellation_summary": "fixture only",
+      "baggage_summary": "1 checked bag",
+      "meal_summary": null,
+      "eligibility": "public fixture"
+    },
+    "comparison_key": "flight:MU5101:2026-10-01T08:00+08:00:economy:adult=1",
+    "revalidation_token": "fixture-flight-1",
+    "booking_url": null,
+    "metadata": {"origin": "上海", "destination": "北京", "fixture": true}
+  },
+  {
+    "id": "replay:hotel:beijing-1",
+    "kind": "lodging",
+    "title": "北京示例酒店 · 标准大床房",
+    "source": {
+      "provider": "replay",
+      "mode": "replay",
+      "request_id": "fixture-hotel-1",
+      "captured_at": "2026-07-27T12:00:00Z",
+      "expires_at": "2026-07-27T12:05:00Z"
+    },
+    "price_state": "estimated",
+    "price": {
+      "base": {"amount": "1200", "currency": "CNY"},
+      "taxes": {"amount": "120", "currency": "CNY"},
+      "fees": {"amount": "0", "currency": "CNY"},
+      "total": {"amount": "1320", "currency": "CNY"},
+      "components_complete": true
+    },
+    "terms": {
+      "refundable": true,
+      "cancellation_summary": "入住前两天免费取消",
+      "baggage_summary": null,
+      "meal_summary": "不含早餐",
+      "eligibility": "public fixture"
+    },
+    "comparison_key": "lodging:beijing-1:room-standard:2026-10-01:2026-10-04:adult=1:no-breakfast:refundable",
+    "revalidation_token": "fixture-hotel-1",
+    "booking_url": null,
+    "metadata": {"destination": "北京", "fixture": true}
+  }
+]

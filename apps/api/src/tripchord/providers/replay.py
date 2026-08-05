@@ -5,6 +5,7 @@ from pydantic import TypeAdapter
 
 from tripchord.domain.offers import OfferKind, PriceState, TravelOffer
 from tripchord.domain.source import SourceMode
+from tripchord.package_data import read_replay_offers
 from tripchord.providers.base import OfferSearchQuery, ProviderError
 
 
@@ -14,8 +15,9 @@ class ReplayOfferProvider:
     name = "replay"
     supported_kinds = frozenset(OfferKind)
 
-    def __init__(self, fixture_path: Path) -> None:
-        self._offers = TypeAdapter(tuple[TravelOffer, ...]).validate_json(fixture_path.read_text())
+    def __init__(self, fixture_path: Path | None = None) -> None:
+        payload = fixture_path.read_text(encoding="utf-8") if fixture_path else read_replay_offers()
+        self._offers = TypeAdapter(tuple[TravelOffer, ...]).validate_json(payload)
 
     async def search(self, query: OfferSearchQuery) -> tuple[TravelOffer, ...]:
         return tuple(

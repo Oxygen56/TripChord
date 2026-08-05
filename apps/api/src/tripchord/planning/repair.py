@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 
+from pydantic import Field
+
 from tripchord.domain.common import DomainModel
 from tripchord.domain.itinerary import (
     ItineraryItem,
@@ -18,6 +20,22 @@ from tripchord.domain.trip import TripSpec
 class RepairDisposition(StrEnum):
     APPLIED = "applied"
     UNRESOLVED = "unresolved"
+
+
+class RepairStrategy(StrEnum):
+    NO_ACTION = "no_action"
+    IN_PLACE_REPAIR = "in_place_repair"
+    EXPAND_LOCAL_CANDIDATE_POOL = "expand_local_candidate_pool"
+    GLOBAL_REPLAN = "global_replan"
+    HUMAN_BLOCK = "human_block"
+
+
+class RepairStepKind(StrEnum):
+    PRESERVE = "preserve"
+    MUTATE = "mutate"
+    FETCH_CANDIDATES = "fetch_candidates"
+    REVERIFY = "reverify"
+    ESCALATE = "escalate"
 
 
 class ItemChange(DomainModel):
@@ -42,11 +60,34 @@ class RepairAction(DomainModel):
     item_ids: tuple[str, ...] = ()
 
 
+class RepairStep(DomainModel):
+    order: int = Field(ge=1)
+    kind: RepairStepKind
+    target_item_ids: tuple[str, ...] = ()
+    dependency_item_ids: tuple[str, ...] = ()
+    required_inputs: tuple[str, ...] = ()
+    success_invariant: str
+
+
+class StructuredRepairPlan(DomainModel):
+    strategy: RepairStrategy
+    trigger_violation_codes: tuple[ViolationCode, ...] = ()
+    direct_item_ids: tuple[str, ...] = ()
+    cascade_item_ids: tuple[str, ...] = ()
+    preserve_item_ids: tuple[str, ...] = ()
+    candidate_pool_expansion_required: bool = False
+    requested_candidate_count: int = Field(default=0, ge=0)
+    steps: tuple[RepairStep, ...] = ()
+    fallback_strategy: RepairStrategy | None = None
+    rationale: str
+
+
 class RepairOutcome(DomainModel):
     plan: PlanVersion
     diff: PlanDiff
     actions: tuple[RepairAction, ...]
     unresolved: tuple[Violation, ...]
+    repair_plan: StructuredRepairPlan
 
 
 def diff_plans(before: PlanVersion, after: PlanVersion) -> PlanDiff:
@@ -123,6 +164,99 @@ class RepairEngine:
             diff=diff,
             actions=tuple(actions),
             unresolved=tuple(unresolved),
+            repair_plan=self._structured_plan(
+                plan,
+                violations,
+                tuple(actions),
+                tuple(unresolved),
+            ),
+        )
+
+    def _structured_plan(
+        self,
+        plan: PlanVersion,
+        violations: tuple[Violation, ...],
+        actions: tuple[RepairAction, ...],
+        unresolved: tuple[Violation, ...],
+    ) -> StructuredRepairPlan:
+        direct = tuple(
+            sorted({item_id for violation in violations for item_id in violation.item_ids})
+        )
+        preserve = tuple(sorted({item.id for item in plan.items} - set(direct)))
+        requires_candidates = bool(unresolved)
+        global_codes = {
+            ViolationCode.MUST_VISIT_MISSING,
+            ViolationCode.CURRENCY_MISMATCH,
+        }
+        if any(item.code in global_codes for item in unresolved):
+            strategy = RepairStrategy.GLOBAL_REPLAN
+        elif requires_candidates:
+            strategy = RepairStrategy.EXPAND_LOCAL_CANDIDATE_POOL
+        elif any(action.disposition == RepairDisposition.APPLIED for action in actions):
+            strategy = RepairStrategy.IN_PLACE_REPAIR
+        else:
+            strategy = RepairStrategy.NO_ACTION
+        steps: list[RepairStep] = []
+        if preserve:
+            steps.append(
+                RepairStep(
+                    order=len(steps) + 1,
+                    kind=RepairStepKind.PRESERVE,
+                    target_item_ids=preserve,
+                    success_invariant="未受影响项目的全部字段保持逐值相等",
+                )
+            )
+        if requires_candidates:
+            steps.append(
+                RepairStep(
+                    order=len(steps) + 1,
+                    kind=RepairStepKind.FETCH_CANDIDATES,
+                    target_item_ids=direct,
+                    required_inputs=("带来源的新候选", "新鲜度", "可用性", "价格与条款"),
+                    success_invariant="候选来自可追溯来源且能直接响应 Verifier 拒绝原因",
+                )
+            )
+        elif direct:
+            steps.append(
+                RepairStep(
+                    order=len(steps) + 1,
+                    kind=RepairStepKind.MUTATE,
+                    target_item_ids=direct,
+                    success_invariant="只修改违规项及其显式依赖项",
+                )
+            )
+        if strategy != RepairStrategy.NO_ACTION:
+            steps.append(
+                RepairStep(
+                    order=len(steps) + 1,
+                    kind=RepairStepKind.REVERIFY,
+                    target_item_ids=direct,
+                    required_inputs=("修复后方案", "原方案 diff", "声明式不变量"),
+                    success_invariant="确定性 Verifier 与异构不变量复核均通过",
+                )
+            )
+        return StructuredRepairPlan(
+            strategy=strategy,
+            trigger_violation_codes=tuple(violation.code for violation in violations),
+            direct_item_ids=direct,
+            preserve_item_ids=preserve,
+            candidate_pool_expansion_required=requires_candidates,
+            requested_candidate_count=5 if requires_candidates else 0,
+            steps=tuple(steps),
+            fallback_strategy=(
+                RepairStrategy.HUMAN_BLOCK
+                if strategy
+                in {
+                    RepairStrategy.EXPAND_LOCAL_CANDIDATE_POOL,
+                    RepairStrategy.GLOBAL_REPLAN,
+                }
+                else None
+            ),
+            rationale=(
+                "现有候选无法修复硬错误，输出扩大候选池及失败升级信号"
+                if requires_candidates
+                else "现有证据足以执行有界局部修复"
+            ),
         )
 
     def _repair_gap(

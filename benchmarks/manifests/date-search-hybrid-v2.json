@@ -1,0 +1,676 @@
+{
+  "policy_version": "coverage-guarded-hybrid-v2",
+  "status": "frozen_calibration_candidate",
+  "calibration_input_sha256": "b7d8dfde0c4995fcd1b451e65e5eaec6adaa68475a25e41c1511898c23e59b95",
+  "calibration_scenario_count": 16,
+  "threshold_grid": [
+    "0.30",
+    "0.35",
+    "0.40",
+    "0.45",
+    "0.50",
+    "0.55",
+    "0.60",
+    "0.65"
+  ],
+  "fixed_engineering_guards": {
+    "minimum_exploration_budget": 5,
+    "coarse_guard_observations": 3
+  },
+  "selection_rule": "只在每个预算的 Recall 不降、平均 regret 不升、失败率不升时入围；在 calibration score 并列时选择更低覆盖阈值，减少探索触发面。",
+  "selected_config": {
+    "policy_version": "coverage-guarded-hybrid-v2",
+    "maximum_mean_platform_coverage_for_exploration": "0.40",
+    "minimum_exploration_budget": 5,
+    "coarse_guard_observations": 3
+  },
+  "window_contract": {
+    "calibration_night_counts": [
+      5,
+      6,
+      7,
+      8
+    ],
+    "target_user_request_days": [
+      5,
+      6,
+      7,
+      8
+    ],
+    "target_night_counts": [
+      4,
+      5,
+      6,
+      7
+    ],
+    "day_to_night_rule": "lodging_nights = calendar_travel_days - 1",
+    "generalization_note": "策略参数在一般化 5–8 晚 calibration 上冻结；4–7 晚案例窗口只在冻结后的 sealed holdout 中评估，不参与参数选择。"
+  },
+  "candidate_rows": [
+    {
+      "threshold": "0.30",
+      "qualifies": true,
+      "calibration_score": 0.0,
+      "budget_rows": [
+        {
+          "budget": 3,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 16
+          },
+          "recall_delta": 0.0,
+          "price_regret_delta_cents": 0.0,
+          "failure_rate_delta": 0.0
+        },
+        {
+          "budget": 5,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3125,
+            "mean_price_regret_cents": 36708.9375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3125,
+            "mean_price_regret_cents": 36708.9375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 16
+          },
+          "recall_delta": 0.0,
+          "price_regret_delta_cents": 0.0,
+          "failure_rate_delta": 0
+        },
+        {
+          "budget": 8,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.35416666666666663,
+            "mean_price_regret_cents": 24434.375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.35416666666666663,
+            "mean_price_regret_cents": 24434.375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 16
+          },
+          "recall_delta": 0.0,
+          "price_regret_delta_cents": 0.0,
+          "failure_rate_delta": 0
+        }
+      ]
+    },
+    {
+      "threshold": "0.35",
+      "qualifies": true,
+      "calibration_score": 0.072180375,
+      "budget_rows": [
+        {
+          "budget": 3,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 16
+          },
+          "recall_delta": 0.0,
+          "price_regret_delta_cents": 0.0,
+          "failure_rate_delta": 0.0
+        },
+        {
+          "budget": 5,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3333333333333333,
+            "mean_price_regret_cents": 31529.75,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3125,
+            "mean_price_regret_cents": 36708.9375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 14,
+            "coarse_guard_then_adaptive_exploration": 2
+          },
+          "recall_delta": 0.020833333333333315,
+          "price_regret_delta_cents": -5179.1875,
+          "failure_rate_delta": 0
+        },
+        {
+          "budget": 8,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3958333333333333,
+            "mean_price_regret_cents": 19933.1875,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.35416666666666663,
+            "mean_price_regret_cents": 24434.375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 14,
+            "coarse_guard_then_adaptive_exploration": 2
+          },
+          "recall_delta": 0.041666666666666685,
+          "price_regret_delta_cents": -4501.1875,
+          "failure_rate_delta": 0
+        }
+      ]
+    },
+    {
+      "threshold": "0.40",
+      "qualifies": true,
+      "calibration_score": 0.0747124375,
+      "budget_rows": [
+        {
+          "budget": 3,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 16
+          },
+          "recall_delta": 0.0,
+          "price_regret_delta_cents": 0.0,
+          "failure_rate_delta": 0.0
+        },
+        {
+          "budget": 5,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3333333333333333,
+            "mean_price_regret_cents": 31808.8125,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3125,
+            "mean_price_regret_cents": 36708.9375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 12,
+            "coarse_guard_then_adaptive_exploration": 4
+          },
+          "recall_delta": 0.020833333333333315,
+          "price_regret_delta_cents": -4900.125,
+          "failure_rate_delta": 0
+        },
+        {
+          "budget": 8,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3958333333333333,
+            "mean_price_regret_cents": 17122.0625,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.35416666666666663,
+            "mean_price_regret_cents": 24434.375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 12,
+            "coarse_guard_then_adaptive_exploration": 4
+          },
+          "recall_delta": 0.041666666666666685,
+          "price_regret_delta_cents": -7312.3125,
+          "failure_rate_delta": 0
+        }
+      ]
+    },
+    {
+      "threshold": "0.45",
+      "qualifies": true,
+      "calibration_score": 0.0747124375,
+      "budget_rows": [
+        {
+          "budget": 3,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 16
+          },
+          "recall_delta": 0.0,
+          "price_regret_delta_cents": 0.0,
+          "failure_rate_delta": 0.0
+        },
+        {
+          "budget": 5,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3333333333333333,
+            "mean_price_regret_cents": 31808.8125,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3125,
+            "mean_price_regret_cents": 36708.9375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 12,
+            "coarse_guard_then_adaptive_exploration": 4
+          },
+          "recall_delta": 0.020833333333333315,
+          "price_regret_delta_cents": -4900.125,
+          "failure_rate_delta": 0
+        },
+        {
+          "budget": 8,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3958333333333333,
+            "mean_price_regret_cents": 17122.0625,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.35416666666666663,
+            "mean_price_regret_cents": 24434.375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 12,
+            "coarse_guard_then_adaptive_exploration": 4
+          },
+          "recall_delta": 0.041666666666666685,
+          "price_regret_delta_cents": -7312.3125,
+          "failure_rate_delta": 0
+        }
+      ]
+    },
+    {
+      "threshold": "0.50",
+      "qualifies": true,
+      "calibration_score": 0.0747124375,
+      "budget_rows": [
+        {
+          "budget": 3,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 16
+          },
+          "recall_delta": 0.0,
+          "price_regret_delta_cents": 0.0,
+          "failure_rate_delta": 0.0
+        },
+        {
+          "budget": 5,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3333333333333333,
+            "mean_price_regret_cents": 31808.8125,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3125,
+            "mean_price_regret_cents": 36708.9375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 12,
+            "coarse_guard_then_adaptive_exploration": 4
+          },
+          "recall_delta": 0.020833333333333315,
+          "price_regret_delta_cents": -4900.125,
+          "failure_rate_delta": 0
+        },
+        {
+          "budget": 8,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3958333333333333,
+            "mean_price_regret_cents": 17122.0625,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.35416666666666663,
+            "mean_price_regret_cents": 24434.375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 12,
+            "coarse_guard_then_adaptive_exploration": 4
+          },
+          "recall_delta": 0.041666666666666685,
+          "price_regret_delta_cents": -7312.3125,
+          "failure_rate_delta": 0
+        }
+      ]
+    },
+    {
+      "threshold": "0.55",
+      "qualifies": false,
+      "calibration_score": 0.05176425416666669,
+      "budget_rows": [
+        {
+          "budget": 3,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 16
+          },
+          "recall_delta": 0.0,
+          "price_regret_delta_cents": 0.0,
+          "failure_rate_delta": 0.0
+        },
+        {
+          "budget": 5,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3333333333333333,
+            "mean_price_regret_cents": 30556.6,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3125,
+            "mean_price_regret_cents": 36708.9375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 10,
+            "coarse_guard_then_adaptive_exploration": 6
+          },
+          "recall_delta": 0.020833333333333315,
+          "price_regret_delta_cents": -6152.3375000000015,
+          "failure_rate_delta": 0.0625
+        },
+        {
+          "budget": 8,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.375,
+            "mean_price_regret_cents": 20489.125,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.35416666666666663,
+            "mean_price_regret_cents": 24434.375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 10,
+            "coarse_guard_then_adaptive_exploration": 6
+          },
+          "recall_delta": 0.02083333333333337,
+          "price_regret_delta_cents": -3945.25,
+          "failure_rate_delta": 0
+        }
+      ]
+    },
+    {
+      "threshold": "0.60",
+      "qualifies": false,
+      "calibration_score": -0.0009330583333333343,
+      "budget_rows": [
+        {
+          "budget": 3,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 16
+          },
+          "recall_delta": 0.0,
+          "price_regret_delta_cents": 0.0,
+          "failure_rate_delta": 0.0
+        },
+        {
+          "budget": 5,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3125,
+            "mean_price_regret_cents": 37998.933333333334,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3125,
+            "mean_price_regret_cents": 36708.9375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 8,
+            "coarse_guard_then_adaptive_exploration": 8
+          },
+          "recall_delta": 0.0,
+          "price_regret_delta_cents": 1289.9958333333343,
+          "failure_rate_delta": 0.0625
+        },
+        {
+          "budget": 8,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.35416666666666663,
+            "mean_price_regret_cents": 24077.4375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.35416666666666663,
+            "mean_price_regret_cents": 24434.375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 8,
+            "coarse_guard_then_adaptive_exploration": 8
+          },
+          "recall_delta": 0.0,
+          "price_regret_delta_cents": -356.9375,
+          "failure_rate_delta": 0
+        }
+      ]
+    },
+    {
+      "threshold": "0.65",
+      "qualifies": false,
+      "calibration_score": -0.04439766666666668,
+      "budget_rows": [
+        {
+          "budget": 3,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.22916666666666666,
+            "mean_price_regret_cents": 51158.26666666667,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.024193548387096774
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 16
+          },
+          "recall_delta": 0.0,
+          "price_regret_delta_cents": 0.0,
+          "failure_rate_delta": 0.0
+        },
+        {
+          "budget": 5,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.29166666666666663,
+            "mean_price_regret_cents": 39403,
+            "failure_rate": 0.0625,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3125,
+            "mean_price_regret_cents": 36708.9375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.04032258064516129
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 7,
+            "coarse_guard_then_adaptive_exploration": 9
+          },
+          "recall_delta": -0.02083333333333337,
+          "price_regret_delta_cents": 2694.0625,
+          "failure_rate_delta": 0.0625
+        },
+        {
+          "budget": 8,
+          "hybrid": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.3333333333333333,
+            "mean_price_regret_cents": 24471.3125,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "coarse_cheapest": {
+            "scenario_count": 16,
+            "mean_recall_at_k": 0.35416666666666663,
+            "mean_price_regret_cents": 24434.375,
+            "failure_rate": 0,
+            "mean_exact_search_coverage": 0.06451612903225806
+          },
+          "acquisition_mode_counts": {
+            "coarse_cheapest_guardrail": 7,
+            "coarse_guard_then_adaptive_exploration": 9
+          },
+          "recall_delta": -0.020833333333333315,
+          "price_regret_delta_cents": 36.9375,
+          "failure_rate_delta": 0
+        }
+      ]
+    }
+  ],
+  "test_split_read_during_calibration": false,
+  "boundary": "该 manifest 只使用独立 calibration 文件；冻结后不得根据 test/holdout 改参数。",
+  "policy_manifest_sha256": "ec2e7c8494cb935f36a85a31de3b8dba8df8bf3b4a1365430124d9a8cf1835f7"
+}

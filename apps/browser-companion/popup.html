@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TripChord Companion</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <h1>TripChord 只读查询</h1>
+      <p class="boundary">
+        仅搜索、筛选和读取可见报价；不登录、不使用优惠券、不下单、不支付。
+      </p>
+
+      <label>
+        本地桥地址
+        <input
+          id="bridge-url"
+          value="http://127.0.0.1:8000/browser-bridge"
+          spellcheck="false"
+        >
+      </label>
+      <label>
+        本次会话配对令牌
+        <input id="bridge-token" type="password" autocomplete="off" spellcheck="false">
+      </label>
+
+      <button id="grant" class="secondary">授权三个平台查询域名</button>
+      <button id="connect">连接只读查询</button>
+      <button id="disconnect" class="danger">断开并清除令牌</button>
+
+      <p id="status" role="status">尚未连接</p>
+      <p class="fine-print">
+        遇到验证码、登录失效或页面变化时会暂停并报告，不会尝试绕过。
+      </p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

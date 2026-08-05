@@ -1,0 +1,100 @@
+[
+  {
+    "city": "北京",
+    "place": {
+      "id": "replay:beijing:forbidden-city",
+      "name": "故宫博物院",
+      "kind": "attraction",
+      "coordinates": {"latitude": 39.916345, "longitude": 116.397155},
+      "address": "北京市东城区景山前街4号",
+      "expected_visit_minutes": 240,
+      "estimated_cost": {"amount": "60", "currency": "CNY"},
+      "rating": 4.9,
+      "raw_opening_hours": "回放场景开放时间，出行前须从官方来源复核",
+      "tags": ["历史", "博物馆", "建筑"],
+      "source": {"provider": "tripchord-replay", "mode": "replay", "request_id": "poi-bj-001", "captured_at": "2026-07-27T00:00:00Z"},
+      "provider_url": "https://www.dpm.org.cn/"
+    }
+  },
+  {
+    "city": "北京",
+    "place": {
+      "id": "replay:beijing:national-museum",
+      "name": "中国国家博物馆",
+      "kind": "attraction",
+      "coordinates": {"latitude": 39.903572, "longitude": 116.401565},
+      "address": "北京市东城区东长安街16号",
+      "expected_visit_minutes": 240,
+      "estimated_cost": {"amount": "0", "currency": "CNY"},
+      "rating": 4.8,
+      "raw_opening_hours": "回放场景开放时间，预约与开放状态须复核",
+      "tags": ["历史", "博物馆", "文化"],
+      "source": {"provider": "tripchord-replay", "mode": "replay", "request_id": "poi-bj-002", "captured_at": "2026-07-27T00:00:00Z"},
+      "provider_url": "https://www.chnmuseum.cn/"
+    }
+  },
+  {
+    "city": "北京",
+    "place": {
+      "id": "replay:beijing:temple-of-heaven",
+      "name": "天坛公园",
+      "kind": "attraction",
+      "coordinates": {"latitude": 39.882208, "longitude": 116.406605},
+      "address": "北京市东城区天坛东里甲1号",
+      "expected_visit_minutes": 180,
+      "estimated_cost": {"amount": "34", "currency": "CNY"},
+      "rating": 4.8,
+      "raw_opening_hours": "回放场景开放时间，季节票价与开放状态须复核",
+      "tags": ["历史", "公园", "建筑"],
+      "source": {"provider": "tripchord-replay", "mode": "replay", "request_id": "poi-bj-003", "captured_at": "2026-07-27T00:00:00Z"}
+    }
+  },
+  {
+    "city": "北京",
+    "place": {
+      "id": "replay:beijing:summer-palace",
+      "name": "颐和园",
+      "kind": "attraction",
+      "coordinates": {"latitude": 39.999976, "longitude": 116.275481},
+      "address": "北京市海淀区新建宫门路19号",
+      "expected_visit_minutes": 240,
+      "estimated_cost": {"amount": "30", "currency": "CNY"},
+      "rating": 4.8,
+      "raw_opening_hours": "回放场景开放时间，季节票价与开放状态须复核",
+      "tags": ["园林", "历史", "公园"],
+      "source": {"provider": "tripchord-replay", "mode": "replay", "request_id": "poi-bj-004", "captured_at": "2026-07-27T00:00:00Z"}
+    }
+  },
+  {
+    "city": "北京",
+    "place": {
+      "id": "replay:beijing:shichahai",
+      "name": "什刹海历史文化街区",
+      "kind": "attraction",
+      "coordinates": {"latitude": 39.94143, "longitude": 116.38515},
+      "address": "北京市西城区地安门西大街",
+      "expected_visit_minutes": 150,
+      "estimated_cost": {"amount": "0", "currency": "CNY"},
+      "rating": 4.7,
+      "raw_opening_hours": "开放街区，具体场馆单独复核",
+      "tags": ["历史街区", "胡同", "步行"],
+      "source": {"provider": "tripchord-replay", "mode": "replay", "request_id": "poi-bj-005", "captured_at": "2026-07-27T00:00:00Z"}
+    }
+  },
+  {
+    "city": "北京",
+    "place": {
+      "id": "replay:beijing:798",
+      "name": "798艺术区",
+      "kind": "attraction",
+      "coordinates": {"latitude": 39.984142, "longitude": 116.494514},
+      "address": "北京市朝阳区酒仙桥路2号",
+      "expected_visit_minutes": 180,
+      "estimated_cost": {"amount": "0", "currency": "CNY"},
+      "rating": 4.6,
+      "raw_opening_hours": "园区与展馆开放状态分别复核",
+      "tags": ["艺术", "展览", "街区"],
+      "source": {"provider": "tripchord-replay", "mode": "replay", "request_id": "poi-bj-006", "captured_at": "2026-07-27T00:00:00Z"}
+    }
+  }
+]

@@ -40,8 +40,7 @@ def evaluate(path: Path = SCENARIOS) -> dict[str, Any]:
             outcome.status == expected["status"]
             and changed == sorted(expected["changed"])
             and removed == sorted(expected["removed"])
-            and outcome.unaffected_preservation_ratio
-            == expected["unaffected_preservation_ratio"]
+            and outcome.unaffected_preservation_ratio == expected["unaffected_preservation_ratio"]
         )
         results.append(
             {

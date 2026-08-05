@@ -1,18 +1,21 @@
-# Five-minute demo script
+# 五分钟演示脚本
 
-1. Start the local profile and open the React workspace.
-2. Submit Shanghai → Beijing, two days, budget ¥5,000, history/museum interests,
-   and Forbidden City as must-visit.
-3. Show persisted job progress, the plan timeline, source refs, and replay price
-   labels. Explain that replay prices are deliberately not called live.
-4. Select one activity, inject a closure, and choose **minimum change**. Show the
-   new plan version, diff, and unaffected-item preservation.
-5. Return to the previous version, inject the same class of event with
-   **quality first**, and show that TripChord can choose a verifier-approved
-   global candidate when it recovers more utility.
-6. Open the metrics endpoint and show request/job counters plus request IDs.
-7. Finish with `docs/claim-ledger.md`: distinguish frozen benchmark evidence,
-   provider contract tests, and unverified production credentials.
+1. 启动本地 API 与 React 工作区，选择上海 → 北京、两天、预算 ¥5,000。
+2. 将“酒店早餐”设为 **必须满足**，说明用户明示偏好覆盖 Agent 推断和默认风险分。
+3. 提交规划，展示 4 路专家并发、动态任务数、证据数、trace 与回放真值边界。
+4. 指出回放住宿不含早餐，主控最终显示 **重新规划或暂停**，没有把偏好违规静默包装成可接受。
+5. 展开 Agent 轨迹：交通/住宿/景点/天气并发取证，证据仲裁与偏好守卫先完成，神经与 CP-SAT
+   并发出候选，Critic/Verifier 拒绝后 Repair 动态加入，Orchestrator 最终裁决。
+6. 在已有计划中选择“中国国家博物馆”，注入 **临时闭园**；展示 v1 → v2 差异、局部修复、
+   未受影响项保留率 100%，以及两个通过验证的候选被策略比较。
+7. 打开 `benchmarks/results/agent-suite-v1.json`：说明 240 条/12 类冻结机制回归、44.04% 本机
+   并发 p50 等待重叠和公开的 5ms 模拟等待；同时明确历史 75% 是“单候选确定性代理”消融，
+   不是公平单 LLM Agent。再打开 `docs/benchmark-agent-architectures.md`，说明同条件 scripted
+   single/multi 都是 100%，不宣称多 Agent 质量更高。
+8. 打开 `benchmarks/results/live-canary-2026-07-30.json` 和 `docs/claim-ledger.md`：明确真实线上
+   只读证据与机酒库存、全网最低价、真人用户效果之间的边界。
+9. 最后展示 `docs/done-gate.md`、当前全量回归门与 LoRA adapter 重载边界，不冻结容易陈旧的
+   测试数量，也不用讲稿替代代码/测试。
 
-The interview story is not “an LLM wrote a route.” It is “a planning system made
-constraints, evidence, recovery trade-offs, and failure boundaries measurable.”
+面试主线不是“LLM 写了一条路线”，而是“多个 Agent 在可控权限下取证、规划、互相拒绝、
+返工并交付可验证结果；用户偏好和确定性安全门始终高于模型自信”。

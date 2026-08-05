@@ -47,9 +47,7 @@ def split_for_city(city_group: str) -> str:
 
 def action_features(example: PolicyExample, action: str) -> tuple[float, ...]:
     is_local = float(action == "local")
-    preservation = (
-        example.local_preservation if action == "local" else example.global_preservation
-    )
+    preservation = example.local_preservation if action == "local" else example.global_preservation
     utility = example.local_utility if action == "local" else example.global_utility
     return (
         example.stability_weight * preservation,
@@ -149,10 +147,18 @@ def metrics(weights: list[float], examples: list[PolicyExample], split: str) -> 
     return {
         "examples": len(rows),
         "top1_accuracy": mean(
-            prediction == expected
-            for prediction, expected in zip(predictions, oracle, strict=True)
+            prediction == expected for prediction, expected in zip(predictions, oracle, strict=True)
         ),
         "always_local_accuracy": mean(expected == "local" for expected in oracle),
+        "closed_form_oracle_accuracy": mean(
+            (
+                "local"
+                if action_score(example, "local") >= action_score(example, "global")
+                else "global"
+            )
+            == expected
+            for example, expected in zip(rows, oracle, strict=True)
+        ),
         "mean_oracle_regret": mean(regrets),
         "oracle_local_rate": mean(expected == "local" for expected in oracle),
     }
@@ -182,10 +188,20 @@ def run() -> dict[str, Any]:
     results = {
         "label_source": "synthetic weighted policy oracle; not human preference data",
         "split_policy": "destination city group; no city group crosses splits",
+        "evaluation_scope": (
+            "oracle-formula distillation on synthetic scenarios; candidate score terms used "
+            "to create labels are also model inputs"
+        ),
+        "semantic_template_holdout": False,
+        "oracle_feature_coupling": True,
+        "production_runtime_loaded": True,
+        "claim_boundary": (
+            "top1 accuracy is not learned preference quality or unseen-task generalization; "
+            "the closed-form oracle is the appropriate upper baseline"
+        ),
         "model_sha256": hashlib.sha256(serialized.encode()).hexdigest(),
         "metrics": {
-            split: metrics(weights, examples, split)
-            for split in ("train", "validation", "test")
+            split: metrics(weights, examples, split) for split in ("train", "validation", "test")
         },
     }
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)

@@ -10,6 +10,7 @@ from tripchord.planning.optimizer import ItineraryOptimizer
 from tripchord.planning.problem import OptimizationResult, PlanningProblem
 
 from benchmarks.baselines import GreedyPlanner, validate_result
+from training.data_contracts import CONTRACT_VERSION, audit_split_contract
 
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS = ROOT / "benchmarks" / "scenarios" / "planning-scale-v1.jsonl"
@@ -88,8 +89,7 @@ def planning_prompt(problem: PlanningProblem) -> str:
         ],
         "travel_columns": ["origin_id", "destination_id", "minutes"],
         "travel_times": [
-            [item.origin_id, item.destination_id, item.minutes]
-            for item in problem.travel_times
+            [item.origin_id, item.destination_id, item.minutes] for item in problem.travel_times
         ],
         "contract": {
             "hard_constraints": [
@@ -115,9 +115,10 @@ def sft_record(
 ) -> dict[str, Any]:
     answer = {
         "plan": serialize_result(chosen),
-        "verification": {
-            "hard_constraint_failures": list(validate_result(problem, chosen)),
-            "verdict": "pass",
+        "verification_handoff": {
+            "required": True,
+            "authoritative_component": "deterministic_verifier",
+            "candidate_status": "unverified",
         },
         "claim_boundary": "synthetic deterministic oracle; reverify volatile facts before booking",
     }
@@ -154,7 +155,6 @@ def dpo_record(
 ) -> dict[str, Any]:
     chosen_payload = serialize_result(chosen)
     rejected_payload = serialize_result(rejected)
-    rejected_payload["rejection"] = {"variant": variant, "reasons": list(reasons)}
     return {
         "id": f"{scenario_id}:{variant}",
         "scenario_id": scenario_id,
@@ -175,9 +175,10 @@ def build(path: Path = SCENARIOS) -> dict[str, list[dict[str, Any]]]:
     scenarios = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     optimizer = ItineraryOptimizer()
     greedy = GreedyPlanner()
-    datasets: dict[str, list[dict[str, Any]]] = {
-        f"sft_{split}": [] for split in SPLIT_GROUPS
-    } | {f"dpo_{split}": [] for split in SPLIT_GROUPS}
+    datasets: dict[str, list[dict[str, Any]]] = {}
+    for split in SPLIT_GROUPS:
+        datasets[f"sft_{split}"] = []
+        datasets[f"dpo_{split}"] = []
 
     for scenario in scenarios:
         scenario_id = str(scenario["id"])
@@ -237,6 +238,16 @@ def build(path: Path = SCENARIOS) -> dict[str, list[dict[str, Any]]]:
 
 def write(datasets: dict[str, list[dict[str, Any]]], output: Path = OUTPUT) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True)
+    split_audits = {
+        kind: audit_split_contract(
+            {
+                split: datasets[f"{kind}_{split}"]
+                for split in ("train", "validation", "test")
+            },
+            kind=kind,
+        )
+        for kind in ("sft", "dpo")
+    }
     files: dict[str, dict[str, Any]] = {}
     for name, records in datasets.items():
         payload = "".join(
@@ -250,9 +261,16 @@ def write(datasets: dict[str, list[dict[str, Any]]], output: Path = OUTPUT) -> d
             "sha256": hashlib.sha256(payload.encode()).hexdigest(),
         }
     manifest = {
+        "contract_version": CONTRACT_VERSION,
         "source": str(SCENARIOS.relative_to(ROOT)),
+        "source_sha256": hashlib.sha256(SCENARIOS.read_bytes()).hexdigest(),
         "label_source": "deterministic synthetic oracle; no human preference labels",
         "split_policy": "destination city group; groups 0-7 train, 8-9 validation, 10-11 test",
+        "split_audits": split_audits,
+        "claim_boundary": (
+            "city-group isolation is not semantic-template holdout and does not establish "
+            "unseen-task model generalization"
+        ),
         "files": files,
     }
     (output / "manifest.json").write_text(

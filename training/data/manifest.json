@@ -1,31 +1,66 @@
 {
+  "claim_boundary": "city-group isolation is not semantic-template holdout and does not establish unseen-task model generalization",
+  "contract_version": "post-training-data-v2",
   "files": {
     "dpo_test.jsonl": {
       "records": 40,
-      "sha256": "a19e79dfd2d7f528529047a65d8b71ba0fd98f916d685ec0fd8e1ef79ec217d7"
+      "sha256": "4d7a4983421f55cdb7498808e9c6ff7a83bd4a1acb7f5fcb215291f1784d27eb"
     },
     "dpo_train.jsonl": {
       "records": 146,
-      "sha256": "676865d913b38937a1a193c40ce12346ff6e0d2921d93d9d3347be69ad759486"
+      "sha256": "994b7e6e33cd21cd72751fb09b6d1b13092f0ce11f6c69bd0fca4b454d4d073b"
     },
     "dpo_validation.jsonl": {
       "records": 36,
-      "sha256": "03252ebb9da887fe42d63d91432db1b667eb785b7e203fbf22d1bb889ed1f743"
+      "sha256": "2f31000cee7a6aaec418524a4bb7490616e6d3a478611721230c37e13cd9133e"
     },
     "sft_test.jsonl": {
       "records": 20,
-      "sha256": "ac31247b9c3b14247a7e74268e7ca4dde8b07347a91b6608d24b933c9c9dd74e"
+      "sha256": "f92b13f0dd126e685ac3ad81889012fd9645fee914a0e1f7ae0576846b612940"
     },
     "sft_train.jsonl": {
       "records": 80,
-      "sha256": "5d7249ae579de11636ea53139a20f83dd0620578a2421b5f087b4dbaeebcddc8"
+      "sha256": "dc7bf9b54985b45534b1a47584fd65f1bcc4af8a89a2f2de4ebcbe7cde435067"
     },
     "sft_validation.jsonl": {
       "records": 20,
-      "sha256": "95975b86b9e89394b747fa2faa4b2f9e3796f9ae9f44009006aab20900439b0c"
+      "sha256": "a35aaeddabd792bb4840ab49a5d19e24947268802ab4f3c6155b7bfb26a62e61"
     }
   },
   "label_source": "deterministic synthetic oracle; no human preference labels",
   "source": "benchmarks/scenarios/planning-scale-v1.jsonl",
+  "source_sha256": "c179d14dcbc6124383f48d69bd35750841458167040aae1ab4c74c833c1aa8f3",
+  "split_audits": {
+    "dpo": {
+      "blocking_violations": [],
+      "city_group_overlap_count": 0,
+      "contract_version": "post-training-data-v2",
+      "exact_prompt_overlap_count": 0,
+      "kind": "dpo",
+      "record_id_overlap_count": 0,
+      "semantic_template_holdout": false,
+      "semantic_template_overlap_count": 0,
+      "splits": {
+        "test": 40,
+        "train": 146,
+        "validation": 36
+      }
+    },
+    "sft": {
+      "blocking_violations": [],
+      "city_group_overlap_count": 0,
+      "contract_version": "post-training-data-v2",
+      "exact_prompt_overlap_count": 0,
+      "kind": "sft",
+      "record_id_overlap_count": 0,
+      "semantic_template_holdout": false,
+      "semantic_template_overlap_count": 0,
+      "splits": {
+        "test": 20,
+        "train": 80,
+        "validation": 20
+      }
+    }
+  },
   "split_policy": "destination city group; groups 0-7 train, 8-9 validation, 10-11 test"
 }

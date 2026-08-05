@@ -7,6 +7,7 @@ from pathlib import Path
 from pydantic import Field
 
 from tripchord.domain.common import DomainModel
+from tripchord.package_data import read_replan_policy
 
 
 class ReplanPreference(StrEnum):
@@ -54,9 +55,17 @@ class ReplanPolicySelector:
 
     @classmethod
     def from_path(cls, path: Path) -> ReplanPolicySelector:
+        payload = path.read_text(encoding="utf-8")
+        return cls.from_json(payload)
+
+    @classmethod
+    def from_package_data(cls) -> ReplanPolicySelector:
+        return cls.from_json(read_replan_policy())
+
+    @classmethod
+    def from_json(cls, payload: str) -> ReplanPolicySelector:
         import hashlib
 
-        payload = path.read_text()
         model = json.loads(payload)
         return cls(
             feature_order=tuple(model["feature_order"]),

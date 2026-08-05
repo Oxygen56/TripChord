@@ -6,6 +6,7 @@ from tripchord.domain.events import EventKind, PlanEvent
 from tripchord.domain.itinerary import ItemKind, ItineraryItem, PlanVersion
 from tripchord.domain.trip import TripSpec
 from tripchord.planning.impact import DependencyKind, PlanDependency
+from tripchord.planning.repair import RepairStrategy
 from tripchord.planning.replanner import LocalReplanner, ReplanStatus
 
 ZONE = ZoneInfo("Asia/Shanghai")
@@ -85,6 +86,9 @@ def test_delay_changes_only_direct_and_downstream_items() -> None:
     assert next(entry for entry in result.final_plan.items if entry.id == "breakfast") == before
     museum = next(entry for entry in result.final_plan.items if entry.id == "museum")
     assert museum.starts_at.minute == 30
+    assert result.repair_plan.strategy == RepairStrategy.IN_PLACE_REPAIR
+    assert result.repair_plan.direct_item_ids == ("train",)
+    assert result.repair_plan.cascade_item_ids == ("museum",)
 
 
 def test_sold_out_item_can_be_replaced_locally() -> None:
@@ -151,6 +155,9 @@ def test_locked_direct_target_blocks_automatic_replan() -> None:
 
     assert result.status == ReplanStatus.BLOCKED
     assert result.final_plan == plan
+    assert result.repair_plan.strategy == RepairStrategy.EXPAND_LOCAL_CANDIDATE_POOL
+    assert result.repair_plan.candidate_pool_expansion_required
+    assert result.repair_plan.requested_candidate_count == 5
 
 
 def test_unmatched_event_is_an_auditable_noop() -> None:
@@ -234,3 +241,63 @@ def test_replaying_the_same_delay_event_is_idempotent() -> None:
     assert second.status == ReplanStatus.NO_EFFECT
     assert second.final_plan == first.final_plan
     assert not second.diff.changed
+
+
+def test_same_price_event_is_a_noop_and_does_not_create_a_plan_version() -> None:
+    priced = item("hotel", 9, 10).model_copy(
+        update={"cost": Money(amount="100", currency="CNY")}
+    )
+    plan = PlanVersion(
+        id="trip-1:plan:v1",
+        trip_id="trip-1",
+        version=1,
+        items=(priced,),
+    )
+
+    result = LocalReplanner().replan(
+        spec(),
+        plan,
+        event(
+            EventKind.PRICE_CHANGED,
+            "hotel",
+            old_amount="100",
+            new_amount="100",
+            currency="CNY",
+        ),
+        dependencies=(),
+    )
+
+    assert result.status == ReplanStatus.NO_EFFECT
+    assert result.final_plan == plan
+    assert not result.diff.changed
+    assert result.repair_plan.strategy == RepairStrategy.NO_ACTION
+
+
+def test_stale_old_price_blocks_event_instead_of_overwriting_newer_state() -> None:
+    priced = item("hotel", 9, 10).model_copy(
+        update={"cost": Money(amount="120", currency="CNY")}
+    )
+    plan = PlanVersion(
+        id="trip-1:plan:v2",
+        trip_id="trip-1",
+        version=2,
+        items=(priced,),
+    )
+
+    result = LocalReplanner().replan(
+        spec(),
+        plan,
+        event(
+            EventKind.PRICE_CHANGED,
+            "hotel",
+            old_amount="100",
+            new_amount="130",
+            currency="CNY",
+        ),
+        dependencies=(),
+    )
+
+    assert result.status == ReplanStatus.BLOCKED
+    assert result.final_plan == plan
+    assert "stale" in result.message
+    assert result.repair_plan.strategy == RepairStrategy.HUMAN_BLOCK

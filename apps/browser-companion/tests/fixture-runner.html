@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <title>TripChord parser fixture tests</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 32px; }
+      .pass { color: #176b37; }
+      .fail { color: #a32136; }
+      pre { padding: 12px; background: #f4f6fa; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>TripChord parser fixture tests</h1>
+    <p>Buildless, local-only test. No network requests are made.</p>
+    <ol id="results"></ol>
+    <pre id="summary">Running…</pre>
+    <script src="../src/parser.js?h2-contract=3"></script>
+    <script src="../src/content.js?resume-contract=3"></script>
+    <script src="../fixtures/quotes.js?captcha-contract=1"></script>
+    <script src="fixture-runner.js?resume-contract=5"></script>
+  </body>
+</html>

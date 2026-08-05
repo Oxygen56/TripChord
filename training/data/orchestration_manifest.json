@@ -1,0 +1,66 @@
+{
+  "claim_boundary": "city groups are isolated, but label-relevant semantic templates cross splits; metrics are oracle-imitation regression, not unseen-task generalization",
+  "contract_version": "post-training-data-v2",
+  "files": {
+    "orchestration_dpo_test.jsonl": {
+      "records": 24,
+      "sha256": "80df267f46af4e1830c67f6a71f39d2dc05a4b7a642757b9a4a6973d90b41dac"
+    },
+    "orchestration_dpo_train.jsonl": {
+      "records": 192,
+      "sha256": "6bb54e7359f8cd2d39f265fde0c57154fb8cc16fd207c7a6700c0bfe4a387293"
+    },
+    "orchestration_dpo_validation.jsonl": {
+      "records": 24,
+      "sha256": "63ca44f9f78375ab39df811dcaa99d4d6cff3b56488e20aef13424f30a2d712a"
+    },
+    "orchestration_sft_test.jsonl": {
+      "records": 24,
+      "sha256": "9833e0bf1d1126ac1428e624bab9e22f9146fb69fef465dfa5cee22725a4d7b3"
+    },
+    "orchestration_sft_train.jsonl": {
+      "records": 192,
+      "sha256": "4b8611040cd9dc4f0bf6d889c95316accd82a8c101d41e4a1fb3f2729fb93608"
+    },
+    "orchestration_sft_validation.jsonl": {
+      "records": 24,
+      "sha256": "833df81702891f47ffa3a57d264f1de1bd8f4964ca41653606c28509007e228f"
+    }
+  },
+  "label_source": "frozen deterministic orchestration oracle; no human preference labels",
+  "source": "benchmarks/scenarios/agent-suite-v1.jsonl",
+  "source_sha256": "12e0c45a7aee8401915e80f2e3ea5e9f4813ac488ed1b876827b86c028f07b0c",
+  "split_audits": {
+    "dpo": {
+      "blocking_violations": [],
+      "city_group_overlap_count": 0,
+      "contract_version": "post-training-data-v2",
+      "exact_prompt_overlap_count": 0,
+      "kind": "dpo",
+      "record_id_overlap_count": 0,
+      "semantic_template_holdout": false,
+      "semantic_template_overlap_count": 3,
+      "splits": {
+        "test": 24,
+        "train": 192,
+        "validation": 24
+      }
+    },
+    "sft": {
+      "blocking_violations": [],
+      "city_group_overlap_count": 0,
+      "contract_version": "post-training-data-v2",
+      "exact_prompt_overlap_count": 0,
+      "kind": "sft",
+      "record_id_overlap_count": 0,
+      "semantic_template_holdout": false,
+      "semantic_template_overlap_count": 3,
+      "splits": {
+        "test": 24,
+        "train": 192,
+        "validation": 24
+      }
+    }
+  },
+  "split_policy": "destination city group; groups 0-7 train, 8-9 validation, 10-11 test"
+}

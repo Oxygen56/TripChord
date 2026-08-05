@@ -88,9 +88,7 @@ async def test_repair_endpoint_returns_a_versioned_diff() -> None:
             ],
         },
         "context": {
-            "travel_requirements": [
-                {"from_item_id": "a", "to_item_id": "b", "minimum_minutes": 30}
-            ]
+            "travel_requirements": [{"from_item_id": "a", "to_item_id": "b", "minimum_minutes": 30}]
         },
     }
     async with AsyncClient(
@@ -156,3 +154,45 @@ async def test_event_replan_endpoint_reports_preservation() -> None:
     assert body["status"] == "ready"
     assert body["diff"]["removed_item_ids"] == ["museum"]
     assert body["unaffected_preservation_ratio"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_replay_multi_agent_endpoint_exposes_decision_evidence_and_trace() -> None:
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/v1/agents/plan",
+            json={
+                "spec": {
+                    "origin": "上海",
+                    "destinations": ["北京"],
+                    "start_date": "2026-10-02",
+                    "end_date": "2026-10-03",
+                    "budget": {"amount": "3000", "currency": "CNY"},
+                    "interests": ["历史"],
+                    "must_visit": ["故宫博物院"],
+                },
+                "preferences": {
+                    "rules": [
+                        {
+                            "key": "hotel_breakfast",
+                            "mode": "required",
+                            "weight": 1,
+                            "source": "explicit_current_trip",
+                            "reason": "用户明确需要早餐",
+                        }
+                    ]
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "replay"
+    assert "不代表实时" in body["claim_boundary"]
+    assert body["run"]["decision"]["state"] == "replan_or_block"
+    assert body["run"]["decision"]["verifier_violations"] == ["preference:hotel_breakfast"]
+    assert body["run"]["scheduler"]["max_parallel_tasks"] == 4
+    assert any(event["kind"] == "task_started" for event in body["run"]["scheduler"]["trace"])

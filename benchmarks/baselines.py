@@ -89,8 +89,7 @@ class GreedyPlanner:
             if previous is not None:
                 earliest = max(
                     earliest,
-                    previous.end_minute
-                    + travel.get((previous.activity_id, candidate.id), 0),
+                    previous.end_minute + travel.get((previous.activity_id, candidate.id), 0),
                 )
             if earliest + candidate.duration_minutes > window.end_minute:
                 continue
@@ -110,9 +109,7 @@ class GreedyPlanner:
 
 def validate_result(problem: PlanningProblem, result: OptimizationResult) -> tuple[str, ...]:
     activities = {item.id: item for item in problem.activities}
-    travel = {
-        (item.origin_id, item.destination_id): item.minutes for item in problem.travel_times
-    }
+    travel = {(item.origin_id, item.destination_id): item.minutes for item in problem.travel_times}
     failures: set[str] = set()
     selected_ids = {item.activity_id for item in result.scheduled}
     if any(item.must_visit and item.id not in selected_ids for item in problem.activities):

@@ -1,0 +1,43 @@
+{
+  "suite": "agent-suite-v1",
+  "scenario_count": 240,
+  "category_count": 12,
+  "category_distribution": {
+    "standard": 20,
+    "budget_tight": 20,
+    "must_visit": 20,
+    "tight_window": 20,
+    "required_preference_satisfied": 20,
+    "required_preference_conflict": 20,
+    "forbidden_preference_conflict": 20,
+    "neural_repair": 20,
+    "orchestrator_invalid_fallback": 20,
+    "transient_tool_recovery": 20,
+    "evidence_conflict": 20,
+    "weighted_preference": 20
+  },
+  "replay_sha256": "12e0c45a7aee8401915e80f2e3ea5e9f4813ac488ed1b876827b86c028f07b0c",
+  "quality": {
+    "deterministic_expected_accuracy": 0.8333333333333334,
+    "single_agent_expected_accuracy": 0.75,
+    "multi_agent_expected_accuracy": 1,
+    "silent_hard_violation_count": 0,
+    "explicit_preference_silent_violation_count": 0,
+    "evidence_traceability_rate": 1,
+    "stale_evidence_used_as_current_count": 0
+  },
+  "reliability": {
+    "structured_tool_task_success_rate": 1,
+    "autonomous_recovery_rate": 1,
+    "dead_loop_count": 0,
+    "unauthorised_l3_execution_count": 0
+  },
+  "concurrency": {
+    "sample_count": 48,
+    "simulated_model_delay_seconds": 0.005,
+    "parallel_p50_seconds": 0.04962999949930236,
+    "serial_p50_seconds": 0.08868689544033259,
+    "p50_speedup": 0.4403908350507907,
+    "same_quality": true
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "actions": [
+    "accept",
+    "repair",
+    "block"
+  ],
+  "benchmark_categories": [
+    "standard",
+    "budget_tight",
+    "must_visit",
+    "tight_window",
+    "required_preference_satisfied",
+    "required_preference_conflict",
+    "forbidden_preference_conflict",
+    "neural_repair",
+    "orchestrator_invalid_fallback",
+    "transient_tool_recovery",
+    "evidence_conflict",
+    "weighted_preference"
+  ],
+  "feature_contract": "runtime-observable signals only; benchmark category labels are excluded",
+  "feature_count": 8,
+  "model": "multiclass-linear-orchestration-policy",
+  "safety_contract": "advisory only; Preference Guard and deterministic Verifier remain mandatory",
+  "weights": [
+    [
+      2.3515938095066806,
+      -4.816027020092684,
+      -2.8423772325870478,
+      -3.1262799764038127,
+      -3.1259571519392924,
+      -0.3708342164454817,
+      -2.8423772325870478,
+      0.900869137253983
+    ],
+    [
+      1.8479381560467163,
+      -0.3714521924620254,
+      -0.4316162977014703,
+      3.569046164251137,
+      3.568723339786616,
+      -0.8041294523296713,
+      -0.4316162977014703,
+      -0.37374520666023847
+    ],
+    [
+      -4.199531965553433,
+      5.187479212554709,
+      3.2739935302885113,
+      -0.44276618784732297,
+      -0.44276618784732297,
+      1.1749636687751461,
+      3.2739935302885113,
+      -0.5271239305937466
+    ]
+  ]
+}

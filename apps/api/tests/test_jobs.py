@@ -94,12 +94,10 @@ async def test_planning_job_api_streams_terminal_progress(tmp_path: Path) -> Non
             assert created.status_code == 202
             job_id = created.json()["id"]
 
-            streamed = await client.get(
-                f"/api/v1/workspaces/{workspace.id}/jobs/{job_id}/events"
-            )
+            streamed = await client.get(f"/api/v1/workspaces/{workspace.id}/jobs/{job_id}/events")
             assert streamed.status_code == 200
             assert "event: job" in streamed.text
-            assert '\"status\": \"succeeded\"' in streamed.text
+            assert '"status": "succeeded"' in streamed.text
     finally:
         app.dependency_overrides.clear()
         await database.dispose()
@@ -143,10 +141,8 @@ async def test_start_trip_endpoint_assembles_and_persists_a_plan(tmp_path: Path)
             assert body["data_mode"] == "replay"
             assert body["candidate_count"] >= 3
 
-            terminal = await client.get(
-                f"/api/v1/workspaces/{workspace_id}/jobs/{job_id}/events"
-            )
-            assert '\"status\": \"succeeded\"' in terminal.text
+            terminal = await client.get(f"/api/v1/workspaces/{workspace_id}/jobs/{job_id}/events")
+            assert '"status": "succeeded"' in terminal.text
             workspace = await client.get(f"/api/v1/workspaces/{workspace_id}")
             assert len(workspace.json()["plans"]) == 1
             titles = [item["title"] for item in workspace.json()["plans"][0]["items"]]

@@ -38,9 +38,7 @@ def evaluate_rows(path: Path = SCENARIOS) -> list[dict[str, Any]]:
         )
         candidates = {item.id: item for item in problem.activities}
         target = next(
-            item
-            for item in initial_result.scheduled
-            if not candidates[item.activity_id].must_visit
+            item for item in initial_result.scheduled if not candidates[item.activity_id].must_visit
         )
         event = PlanEvent(
             id=f"closure-{index}",
@@ -92,16 +90,10 @@ def evaluate(path: Path = SCENARIOS) -> dict[str, Any]:
         "scenario_count": len(rows),
         "local_recovery_rate": mean(row["local_ready"] for row in rows),
         "local_mean_preservation": mean(row["local_preservation"] for row in rows),
-        "local_unaffected_preservation": mean(
-            row["unaffected_preservation"] for row in rows
-        ),
+        "local_unaffected_preservation": mean(row["unaffected_preservation"] for row in rows),
         "global_mean_preservation": mean(row["global_preservation"] for row in rows),
-        "local_mean_utility_retention": mean(
-            row["local_utility_retention"] for row in rows
-        ),
-        "global_mean_utility_retention": mean(
-            row["global_utility_retention"] for row in rows
-        ),
+        "local_mean_utility_retention": mean(row["local_utility_retention"] for row in rows),
+        "global_mean_utility_retention": mean(row["global_utility_retention"] for row in rows),
     }
 
 

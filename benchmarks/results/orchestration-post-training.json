@@ -1,0 +1,28 @@
+{
+  "artifact_sha256": "488fff726e277d80411a48c71b42f6718f5ce55081c50109b91ace5f9dad6657",
+  "claim_boundary": "accuracy does not establish LLM capability, unseen-task generalization, or production travel quality",
+  "evaluation_scope": "city-group-held-out oracle imitation; semantic templates repeat across splits",
+  "held_out_test": {
+    "base": {
+      "accuracy": 0.6666666666666666,
+      "examples": 24,
+      "unsafe_accept_rate": 1
+    },
+    "sft": {
+      "accuracy": 1,
+      "examples": 24,
+      "unsafe_accept_rate": 0
+    },
+    "sft_plus_dpo": {
+      "accuracy": 1,
+      "examples": 24,
+      "unsafe_accept_rate": 0
+    }
+  },
+  "label_source": "frozen deterministic orchestration oracle; no human preference labels",
+  "production_runtime_loaded": false,
+  "safety_regression": false,
+  "semantic_template_holdout": false,
+  "source_sha256": "12e0c45a7aee8401915e80f2e3ea5e9f4813ac488ed1b876827b86c028f07b0c",
+  "split_policy": "destination city group; every split contains all 12 categories"
+}

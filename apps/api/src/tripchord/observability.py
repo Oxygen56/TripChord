@@ -57,9 +57,7 @@ class MetricsRegistry:
                 lines.append(
                     f"tripchord_http_request_duration_seconds_sum{{{labels}}} {duration:.9f}"
                 )
-                lines.append(
-                    f"tripchord_http_request_duration_seconds_count{{{labels}}} {count}"
-                )
+                lines.append(f"tripchord_http_request_duration_seconds_count{{{labels}}} {count}")
             lines.extend(
                 [
                     "# HELP tripchord_planning_jobs_total Planning job terminal/retry events.",
@@ -73,9 +71,7 @@ class MetricsRegistry:
         return "\n".join(lines) + "\n"
 
     def _labels(self, **labels: str) -> str:
-        return ",".join(
-            f'{name}="{self._escape(value)}"' for name, value in labels.items()
-        )
+        return ",".join(f'{name}="{self._escape(value)}"' for name, value in labels.items())
 
     def _escape(self, value: str) -> str:
         return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")

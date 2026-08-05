@@ -18,3 +18,21 @@ coverage/
 .idea/
 .vscode/
 .artifacts/
+/training/runs/
+/tripchord.db
+/.runtime/
+/apps/browser-companion/.tripchord-release-seal.json
+
+# Local/private live evidence. These files may contain real trip parameters,
+# provider URLs, screenshots, runtime identifiers, or large raw traces. Keep
+# only deliberately redacted synthetic/public summaries in Git.
+/benchmarks/results/live-*
+/benchmarks/results/model-runtime-smoke-*
+/benchmarks/results/model-explanation-smoke-*
+/benchmarks/results/browser-companion-*
+/benchmarks/results/icom-live-*
+/benchmarks/results/tongcheng-*
+/benchmarks/results/zhixing-*
+/benchmarks/results/ui-e2e-*
+/benchmarks/results/lora-training-evidence.json
+/benchmarks/scenarios/live-*

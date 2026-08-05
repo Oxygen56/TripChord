@@ -85,9 +85,7 @@ async def test_persisted_workspace_plan_replan_and_diff_flow() -> None:
             assert len(body["workspace"]["plans"]) == 2
             assert len(body["workspace"]["events"]) == 1
 
-            compared = await client.get(
-                f"/api/v1/workspaces/{workspace_id}/plans/1/diff/2"
-            )
+            compared = await client.get(f"/api/v1/workspaces/{workspace_id}/plans/1/diff/2")
             assert compared.status_code == 200
             assert compared.json()["removed_item_ids"] == ["museum"]
 

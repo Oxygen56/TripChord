@@ -112,10 +112,7 @@ class JobRepository:
                     (JobRow.status == JobStatus.QUEUED)
                     | (
                         (JobRow.status == JobStatus.RUNNING)
-                        & (
-                            JobRow.lease_expires_at.is_(None)
-                            | (JobRow.lease_expires_at < now)
-                        )
+                        & (JobRow.lease_expires_at.is_(None) | (JobRow.lease_expires_at < now))
                     )
                 ),
             )
@@ -161,10 +158,7 @@ class JobRepository:
                     (JobRow.status == JobStatus.QUEUED)
                     | (
                         (JobRow.status == JobStatus.RUNNING)
-                        & (
-                            JobRow.lease_expires_at.is_(None)
-                            | (JobRow.lease_expires_at < now)
-                        )
+                        & (JobRow.lease_expires_at.is_(None) | (JobRow.lease_expires_at < now))
                     )
                 )
                 .options(selectinload(JobRow.workspace))

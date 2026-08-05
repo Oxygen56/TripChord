@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "TripChord Read-only Browser Companion",
+  "version": "0.1.16",
+  "description": "Runs user-authorised, read-only flight and lodging searches in the current Chrome profile.",
+  "permissions": [
+    "alarms",
+    "offscreen",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "optional_host_permissions": [
+    "https://*.ctrip.com/*",
+    "https://*.qunar.com/*",
+    "https://*.ly.com/*",
+    "https://*.elong.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "action": {
+    "default_title": "TripChord Browser Companion",
+    "default_popup": "popup.html"
+  }
+}

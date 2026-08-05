@@ -8,6 +8,7 @@ from pydantic import TypeAdapter
 from tripchord.domain.common import DomainModel
 from tripchord.domain.travel_data import Place
 from tripchord.domain.trip import TripSpec
+from tripchord.package_data import read_replay_places
 from tripchord.planning.candidates import ActivityCandidateBuilder
 from tripchord.planning.problem import PlanningProblem, TravelTime
 
@@ -18,8 +19,9 @@ class PlaceCatalogEntry(DomainModel):
 
 
 class ReplayPlaceCatalog:
-    def __init__(self, path: Path) -> None:
-        self._entries = TypeAdapter(tuple[PlaceCatalogEntry, ...]).validate_json(path.read_text())
+    def __init__(self, path: Path | None = None) -> None:
+        payload = path.read_text(encoding="utf-8") if path else read_replay_places()
+        self._entries = TypeAdapter(tuple[PlaceCatalogEntry, ...]).validate_json(payload)
 
     def search(self, city: str, terms: tuple[str, ...]) -> tuple[Place, ...]:
         city_places = tuple(entry.place for entry in self._entries if entry.city == city)
@@ -28,10 +30,7 @@ class ReplayPlaceCatalog:
         matched = tuple(
             place
             for place in city_places
-            if any(
-                term in f"{place.name} {' '.join(place.tags)}"
-                for term in terms
-            )
+            if any(term in f"{place.name} {' '.join(place.tags)}" for term in terms)
         )
         return matched or city_places
 

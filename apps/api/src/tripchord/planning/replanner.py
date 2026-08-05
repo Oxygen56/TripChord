@@ -14,7 +14,14 @@ from tripchord.planning.impact import (
     PlanDependency,
     build_plan_dependencies,
 )
-from tripchord.planning.repair import PlanDiff, diff_plans
+from tripchord.planning.repair import (
+    PlanDiff,
+    RepairStep,
+    RepairStepKind,
+    RepairStrategy,
+    StructuredRepairPlan,
+    diff_plans,
+)
 from tripchord.planning.verifier import VerificationContext
 from tripchord.planning.workflow import PlanningWorkflow, WorkflowResult, WorkflowStatus
 
@@ -32,6 +39,7 @@ class LocalReplanResult(DomainModel):
     final_plan: PlanVersion
     diff: PlanDiff
     workflow: WorkflowResult | None = None
+    repair_plan: StructuredRepairPlan
     overall_preservation_ratio: float
     unaffected_preservation_ratio: float
     message: str
@@ -97,6 +105,27 @@ class LocalReplanner:
                 None,
                 f"directly affected items are locked: {', '.join(locked_targets)}",
             )
+
+        if event.kind == EventKind.PRICE_CHANGED:
+            price_error, price_unchanged = self._validate_price_change(plan, impact, event)
+            if price_error is not None:
+                return self._result(
+                    ReplanStatus.BLOCKED,
+                    event,
+                    impact,
+                    plan,
+                    None,
+                    price_error,
+                )
+            if price_unchanged:
+                return self._result(
+                    ReplanStatus.NO_EFFECT,
+                    event,
+                    impact,
+                    plan,
+                    None,
+                    "observed price equals the current value; no plan version was created",
+                )
 
         event_plan, error = self._apply_event(plan, event, impact, replacements or {})
         if error is not None:
@@ -213,6 +242,37 @@ class LocalReplanner:
         )
         return candidate, None
 
+    def _validate_price_change(
+        self,
+        plan: PlanVersion,
+        impact: ImpactScope,
+        event: PlanEvent,
+    ) -> tuple[str | None, bool]:
+        try:
+            new_amount = Decimal(str(event.payload["new_amount"]))
+        except (KeyError, InvalidOperation):
+            return "price change event requires a numeric new_amount", False
+        currency = str(event.payload.get("currency", "CNY")).upper()
+        old_amount_raw = event.payload.get("old_amount")
+        try:
+            declared_old = (
+                Decimal(str(old_amount_raw)) if old_amount_raw is not None else None
+            )
+        except InvalidOperation:
+            return "price change event old_amount must be numeric when provided", False
+        items = {item.id: item for item in plan.items}
+        current_costs = [items[item_id].cost for item_id in impact.direct_item_ids]
+        if any(cost is None for cost in current_costs):
+            return "price change cannot be verified for an item without a current price", False
+        concrete_costs = [cost for cost in current_costs if cost is not None]
+        if any(cost.currency != currency for cost in concrete_costs):
+            return "price change currency does not match the current item price", False
+        if declared_old is not None and any(
+            cost.amount != declared_old for cost in concrete_costs
+        ):
+            return "price change old_amount is stale relative to the current plan", False
+        return None, all(cost.amount == new_amount for cost in concrete_costs)
+
     def _lock_unaffected(self, plan: PlanVersion, impact: ImpactScope) -> PlanVersion:
         unaffected = set(impact.unaffected_item_ids)
         return plan.model_copy(
@@ -280,9 +340,94 @@ class LocalReplanner:
             final_plan=plan,
             diff=diff,
             workflow=workflow,
+            repair_plan=self._repair_plan(status, event, impact, message),
             overall_preservation_ratio=preserved / len(before_items) if before_items else 1.0,
             unaffected_preservation_ratio=(
                 unaffected_preserved / len(unaffected) if unaffected else 1.0
             ),
             message=message,
+        )
+
+    def _repair_plan(
+        self,
+        status: ReplanStatus,
+        event: PlanEvent,
+        impact: ImpactScope,
+        message: str,
+    ) -> StructuredRepairPlan:
+        if status == ReplanStatus.NO_EFFECT:
+            strategy = RepairStrategy.NO_ACTION
+        elif status == ReplanStatus.READY:
+            strategy = RepairStrategy.IN_PLACE_REPAIR
+        elif event.kind == EventKind.USER_CHANGED_REQUIREMENT:
+            strategy = RepairStrategy.GLOBAL_REPLAN
+        elif event.kind in {
+            EventKind.SOLD_OUT,
+            EventKind.PLACE_CLOSED,
+            EventKind.WEATHER_ALERT,
+        }:
+            strategy = RepairStrategy.EXPAND_LOCAL_CANDIDATE_POOL
+        else:
+            strategy = RepairStrategy.HUMAN_BLOCK
+        steps: list[RepairStep] = []
+        if impact.unaffected_item_ids:
+            steps.append(
+                RepairStep(
+                    order=len(steps) + 1,
+                    kind=RepairStepKind.PRESERVE,
+                    target_item_ids=impact.unaffected_item_ids,
+                    success_invariant="未受影响项目保持逐值相等",
+                )
+            )
+        if strategy == RepairStrategy.EXPAND_LOCAL_CANDIDATE_POOL:
+            steps.append(
+                RepairStep(
+                    order=len(steps) + 1,
+                    kind=RepairStepKind.FETCH_CANDIDATES,
+                    target_item_ids=impact.direct_item_ids,
+                    dependency_item_ids=impact.downstream_item_ids,
+                    required_inputs=("同类可用候选", "来源证据", "新鲜度", "兼容性字段"),
+                    success_invariant="新候选与直接目标兼容且不会破坏下游依赖",
+                )
+            )
+        elif strategy in {RepairStrategy.IN_PLACE_REPAIR, RepairStrategy.GLOBAL_REPLAN}:
+            steps.append(
+                RepairStep(
+                    order=len(steps) + 1,
+                    kind=RepairStepKind.MUTATE,
+                    target_item_ids=impact.direct_item_ids,
+                    dependency_item_ids=impact.downstream_item_ids,
+                    success_invariant="变更范围不超出显式影响子图",
+                )
+            )
+        if strategy not in {RepairStrategy.NO_ACTION, RepairStrategy.HUMAN_BLOCK}:
+            steps.append(
+                RepairStep(
+                    order=len(steps) + 1,
+                    kind=RepairStepKind.REVERIFY,
+                    target_item_ids=impact.affected_item_ids,
+                    required_inputs=("修复后方案", "方案差异", "声明式不变量"),
+                    success_invariant="硬约束与级联依赖全部复核通过",
+                )
+            )
+        return StructuredRepairPlan(
+            strategy=strategy,
+            direct_item_ids=impact.direct_item_ids,
+            cascade_item_ids=impact.downstream_item_ids,
+            preserve_item_ids=impact.unaffected_item_ids,
+            candidate_pool_expansion_required=(
+                strategy == RepairStrategy.EXPAND_LOCAL_CANDIDATE_POOL
+            ),
+            requested_candidate_count=(
+                5 if strategy == RepairStrategy.EXPAND_LOCAL_CANDIDATE_POOL else 0
+            ),
+            steps=tuple(steps),
+            fallback_strategy=(
+                RepairStrategy.GLOBAL_REPLAN
+                if strategy == RepairStrategy.EXPAND_LOCAL_CANDIDATE_POOL
+                else RepairStrategy.HUMAN_BLOCK
+                if strategy == RepairStrategy.GLOBAL_REPLAN
+                else None
+            ),
+            rationale=message,
         )

@@ -1,0 +1,91 @@
+{
+  "benchmark_version": "package-candidate-diversity-v1",
+  "scenario_id": "three-synthetic-platforms-two-package-kinds-small-cap",
+  "input_sha256": "158163c146d89e62f0fdc4a0b5f37cc18e966d2ba4e9fd37210c77acc941eb9c",
+  "scenario_sha256": "cb92d8a5eaa321746a0686a3190b3578da291d3c97bb1b531d6b9b3085c49265",
+  "input_classification": {
+    "kind": "synthetic_normalized_quotes",
+    "live": false,
+    "bookability_verified": false
+  },
+  "boundary": "固定 synthetic 规范化报价只验证 package-candidate-beam-v3 在一个小上限场景中的确定性候选选择性质；不证明真实 OTA 可订性、平台质量、全量穷举、线上召回或 SLA。",
+  "policy_version": "package-candidate-beam-v3",
+  "selection_policy_version": "provider-flight-kind-reservation-v1",
+  "candidate_cap": 3,
+  "complete_pool": {
+    "candidate_count": 6,
+    "globally_best_candidate_id": "fixture-hgh-mle-20260823:package:split_airport_island:9dd79eb99fe2:v1",
+    "candidate_ids": [
+      "fixture-hgh-mle-20260823:package:split_airport_island:9dd79eb99fe2:v1",
+      "fixture-hgh-mle-20260823:package:split_airport_island:6f4324caee3a:v1",
+      "fixture-hgh-mle-20260823:package:split_airport_island:12d221f802dd:v1",
+      "fixture-hgh-mle-20260823:package:continuous_island:2c00e68fe2ba:v1",
+      "fixture-hgh-mle-20260823:package:continuous_island:2ace49b7a4b3:v1",
+      "fixture-hgh-mle-20260823:package:continuous_island:117b4a50ceca:v1"
+    ]
+  },
+  "bounded_pool": {
+    "candidate_count": 3,
+    "candidate_ids": [
+      "fixture-hgh-mle-20260823:package:split_airport_island:9dd79eb99fe2:v1",
+      "fixture-hgh-mle-20260823:package:split_airport_island:12d221f802dd:v1",
+      "fixture-hgh-mle-20260823:package:continuous_island:2ace49b7a4b3:v1"
+    ],
+    "flight_providers": [
+      "fixture-platform-a",
+      "fixture-platform-b",
+      "fixture-platform-c"
+    ],
+    "flight_ids": [
+      "fixture-flight-a",
+      "fixture-flight-b",
+      "fixture-flight-c"
+    ],
+    "package_kinds": [
+      "continuous_island",
+      "split_airport_island"
+    ]
+  },
+  "audit": {
+    "raw_structural_candidate_upper_bound": 6,
+    "prescreened_structural_candidate_upper_bound": 6,
+    "structurally_joined_candidate_count": 6,
+    "generated_candidate_count": 3,
+    "generation_candidate_cap": 3,
+    "generation_stopped_at_cap": true,
+    "prescreen_structure_scan_completed": true,
+    "input_prescreen_pruned": false,
+    "generation_proof_sha256": "c8950e4afbf9116646d8d984c0cdd7912b4d5879c29e4060d3acd74bab9bb19e"
+  },
+  "reordered_input": {
+    "candidate_ids": [
+      "fixture-hgh-mle-20260823:package:split_airport_island:9dd79eb99fe2:v1",
+      "fixture-hgh-mle-20260823:package:split_airport_island:12d221f802dd:v1",
+      "fixture-hgh-mle-20260823:package:continuous_island:2ace49b7a4b3:v1"
+    ],
+    "generation_proof_sha256": "c8950e4afbf9116646d8d984c0cdd7912b4d5879c29e4060d3acd74bab9bb19e"
+  },
+  "checks": {
+    "global_best_retained": true,
+    "bounded_candidates_are_from_complete_pool": true,
+    "provider_coverage_met": true,
+    "flight_coverage_met": true,
+    "package_kind_coverage_met": true,
+    "input_reordering_stable": true,
+    "candidate_cap_respected": true,
+    "small_cap_truncation_exercised": true,
+    "structural_upper_bound_respected": true,
+    "bounded_structure_scan_completed": true,
+    "audited_ids_match_output": true,
+    "non_exhaustive_boundary_preserved": true
+  },
+  "passed": true,
+  "claim_boundary": {
+    "small_cap_selection_claim_allowed": true,
+    "live_ota_quality_claim_allowed": false,
+    "bookability_claim_allowed": false,
+    "platform_superiority_claim_allowed": false,
+    "exhaustive_search_claim_allowed": false
+  },
+  "result_sha256": "2dcd2897d830d8f40298d73c74c0028ae68b3a29505df3214bf15dcfeb0c4f68"
+}

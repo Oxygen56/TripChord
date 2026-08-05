@@ -1,0 +1,211 @@
+{
+  "benchmark_id": "adaptive-agent-budget-v1",
+  "input_classification": {
+    "kind": "synthetic_controller_state",
+    "live": false,
+    "model_calls": false,
+    "browser_calls": false
+  },
+  "scenarios": [
+    {
+      "id": "simple",
+      "class": "simple",
+      "description": "A bounded direct search that needs only the fixed core Agent loop.",
+      "input": {
+        "D": 6,
+        "C": 16,
+        "G": 0,
+        "R": false,
+        "E": false,
+        "strict_mode": true,
+        "provider_health": [
+          {
+            "provider": "ctrip",
+            "vertical": "lodging",
+            "required": true,
+            "status": "healthy"
+          },
+          {
+            "provider": "qunar",
+            "vertical": "lodging",
+            "required": true,
+            "status": "healthy"
+          },
+          {
+            "provider": "ctrip",
+            "vertical": "flight",
+            "required": true,
+            "status": "healthy"
+          }
+        ]
+      },
+      "expected": {
+        "date_shards": 1,
+        "date_mergers": 0,
+        "candidate_shards": 1,
+        "background_batches": 1,
+        "raw_logical_agents": 8,
+        "logical_agent_cap": 8,
+        "logical_saturated": false,
+        "raw_model_concurrency": 2,
+        "desired_model_concurrency": 2,
+        "health_adjusted_model_concurrency": 2,
+        "browser_concurrency": 6,
+        "qunar_lodging_concurrency": 1,
+        "theoretical_browser_task_count": 78,
+        "theoretical_icom_task_count": 24,
+        "state_fingerprint": "066bc85f45ea497e9ab94c07897c4c6cf2c70569f9dddd1b6e21b76c38a5dcd2"
+      }
+    },
+    {
+      "id": "standard",
+      "class": "standard",
+      "description": "A month-scale search that adds date, candidate, evidence, and repair Agents.",
+      "input": {
+        "D": 24,
+        "C": 96,
+        "G": 4,
+        "R": true,
+        "E": false,
+        "strict_mode": true,
+        "provider_health": [
+          {
+            "provider": "ctrip",
+            "vertical": "lodging",
+            "required": true,
+            "status": "healthy"
+          },
+          {
+            "provider": "qunar",
+            "vertical": "lodging",
+            "required": true,
+            "status": "healthy"
+          },
+          {
+            "provider": "ctrip",
+            "vertical": "flight",
+            "required": true,
+            "status": "healthy"
+          }
+        ]
+      },
+      "expected": {
+        "date_shards": 2,
+        "date_mergers": 1,
+        "candidate_shards": 3,
+        "background_batches": 3,
+        "raw_logical_agents": 19,
+        "logical_agent_cap": 19,
+        "logical_saturated": false,
+        "raw_model_concurrency": 3,
+        "desired_model_concurrency": 6,
+        "health_adjusted_model_concurrency": 6,
+        "browser_concurrency": 6,
+        "qunar_lodging_concurrency": 1,
+        "theoretical_browser_task_count": 312,
+        "theoretical_icom_task_count": 96,
+        "state_fingerprint": "bf90b88514f8bf9777bc250be3ffaab1c0504c394699e4dfe5e43faae757e17f"
+      }
+    },
+    {
+      "id": "complex",
+      "class": "complex",
+      "description": "A broad free-travel search with event and repair pressure but no cap saturation.",
+      "input": {
+        "D": 192,
+        "C": 384,
+        "G": 16,
+        "R": true,
+        "E": true,
+        "strict_mode": true,
+        "provider_health": [
+          {
+            "provider": "ctrip",
+            "vertical": "lodging",
+            "required": true,
+            "status": "healthy"
+          },
+          {
+            "provider": "qunar",
+            "vertical": "lodging",
+            "required": true,
+            "status": "healthy"
+          },
+          {
+            "provider": "ctrip",
+            "vertical": "flight",
+            "required": true,
+            "status": "healthy"
+          }
+        ]
+      },
+      "expected": {
+        "date_shards": 16,
+        "date_mergers": 3,
+        "candidate_shards": 12,
+        "background_batches": 24,
+        "raw_logical_agents": 57,
+        "logical_agent_cap": 57,
+        "logical_saturated": false,
+        "raw_model_concurrency": 7,
+        "desired_model_concurrency": 8,
+        "health_adjusted_model_concurrency": 8,
+        "browser_concurrency": 6,
+        "qunar_lodging_concurrency": 1,
+        "theoretical_browser_task_count": 2496,
+        "theoretical_icom_task_count": 768,
+        "state_fingerprint": "29eaca611f0d35a2b3b2392f008cf0ade4eeebe142da0ad2039b126e9dc1a47e"
+      }
+    },
+    {
+      "id": "audit",
+      "class": "audit",
+      "description": "The maximum admitted input proves fail-closed logical saturation at 96 Agents.",
+      "input": {
+        "D": 400,
+        "C": 2000,
+        "G": 32,
+        "R": true,
+        "E": true,
+        "strict_mode": true,
+        "provider_health": [
+          {
+            "provider": "ctrip",
+            "vertical": "lodging",
+            "required": true,
+            "status": "healthy"
+          },
+          {
+            "provider": "qunar",
+            "vertical": "lodging",
+            "required": true,
+            "status": "healthy"
+          },
+          {
+            "provider": "ctrip",
+            "vertical": "flight",
+            "required": true,
+            "status": "healthy"
+          }
+        ]
+      },
+      "expected": {
+        "date_shards": 34,
+        "date_mergers": 4,
+        "candidate_shards": 63,
+        "background_batches": 50,
+        "raw_logical_agents": 143,
+        "logical_agent_cap": 96,
+        "logical_saturated": true,
+        "raw_model_concurrency": 11,
+        "desired_model_concurrency": 12,
+        "health_adjusted_model_concurrency": 12,
+        "browser_concurrency": 6,
+        "qunar_lodging_concurrency": 1,
+        "theoretical_browser_task_count": 5200,
+        "theoretical_icom_task_count": 1600,
+        "state_fingerprint": "607a31bd8deaf46bcac785d6b17823c25bca561a2014777abf8dab5a9e79d7ac"
+      }
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "contract_version": "post-training-data-v2",
+  "source_manifest": "training/data/manifest.json",
+  "claim_boundary": "compact synthetic traces preserve scheduling inputs, but city-group isolation is not evidence of real-user or unseen-template generalization",
+  "split_audits": {
+    "sft": {
+      "contract_version": "post-training-data-v2",
+      "kind": "sft",
+      "splits": {
+        "test": 20,
+        "train": 80,
+        "validation": 20
+      },
+      "city_group_overlap_count": 0,
+      "record_id_overlap_count": 0,
+      "exact_prompt_overlap_count": 0,
+      "semantic_template_overlap_count": 0,
+      "semantic_template_holdout": false,
+      "blocking_violations": []
+    },
+    "dpo": {
+      "contract_version": "post-training-data-v2",
+      "kind": "dpo",
+      "splits": {
+        "test": 40,
+        "train": 146,
+        "validation": 36
+      },
+      "city_group_overlap_count": 0,
+      "record_id_overlap_count": 0,
+      "exact_prompt_overlap_count": 0,
+      "semantic_template_overlap_count": 0,
+      "semantic_template_holdout": false,
+      "blocking_violations": []
+    }
+  },
+  "files": {
+    "sft_train": {
+      "records": 80,
+      "sha256": "fd5180a7d4de65786796c9023eaa4edaef98ecc40544303ffc1e97593c51091c"
+    },
+    "dpo_train": {
+      "records": 146,
+      "sha256": "06d299a6ffc258e4200878e0d9638ccd58df6b304ded775465a3934887a1b623"
+    },
+    "sft_validation": {
+      "records": 20,
+      "sha256": "ebcc179381a45289bb7319fedf3a70095099c1f6350612fccb9b031e5d7ae2b1"
+    },
+    "dpo_validation": {
+      "records": 36,
+      "sha256": "e87349ce06c503989b2809cddbb15948edd461b1ef7a038f47a1a953833061ed"
+    },
+    "sft_test": {
+      "records": 20,
+      "sha256": "d00e0ac047e004a9ee4a4d8ebb553e81cc4bc6019aecacdaebf5469a03c5f1b7"
+    },
+    "dpo_test": {
+      "records": 40,
+      "sha256": "7e7cbfcbe0cc881af2a2ca9492be5d5d9827b0bfd17f30bb7a8fb4a77cbede82"
+    }
+  }
+}

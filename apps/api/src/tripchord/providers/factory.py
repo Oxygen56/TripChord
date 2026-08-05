@@ -9,8 +9,9 @@ from tripchord.providers.booking import BookingAccommodationProvider, BookingCon
 from tripchord.providers.replay import ReplayOfferProvider
 
 
-def build_provider_registry(settings: Settings, root: Path) -> ProviderRegistry:
-    providers: list[OfferProvider] = [ReplayOfferProvider(root / "data" / "replay" / "offers.json")]
+def build_provider_registry(settings: Settings, root: Path | None = None) -> ProviderRegistry:
+    fixture_path = root / "data" / "replay" / "offers.json" if root is not None else None
+    providers: list[OfferProvider] = [ReplayOfferProvider(fixture_path)]
 
     if settings.amadeus_client_id and settings.amadeus_client_secret:
         production = settings.amadeus_environment == "production"

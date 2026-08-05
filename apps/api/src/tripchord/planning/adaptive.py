@@ -112,9 +112,7 @@ class AdaptiveReplanner:
             selected_mode=decision.selected_mode,
             policy=decision,
             candidates=tuple(
-                candidate
-                for candidate in (local_metrics, global_metrics)
-                if candidate is not None
+                candidate for candidate in (local_metrics, global_metrics) if candidate is not None
             ),
             final_plan=selected,
             diff=diff_plans(plan, selected),

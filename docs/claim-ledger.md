@@ -1,24 +1,114 @@
-# Evidence and claim ledger
+# TripChord 声明—证据账本
 
-| Claim | Reproducible evidence | Allowed wording | Boundary |
+这份账本的用途不是堆亮点，而是规定每句话最多能说到哪里。面试时要把“代码存在、测试通过、
+本机复现、一次真实只读运行、生产长期验证”分开。
+
+## 当前运行事实
+
+| 声明 | 可复现证据 | 允许表述 | 禁止升级 |
 |---|---|---|---|
-| Hard-constraint planning | `benchmarks/results/phase-6-scale.json` | 120/120 frozen scenarios valid | Synthetic replay, not user trips |
-| Utility versus greedy | Same result file | Mean utility +0.83% versus deterministic earliest-fit | Greedy was also 100% valid |
-| Travel/budget mechanisms matter | Same result file | No-travel 0% valid; no-budget 30.83% valid under original constraints | Scenario-specific ablation |
-| Dynamic recovery | Same result file | 120/120 closure recovery; 100% unaffected-item preservation | Frozen activity-closure events |
-| Local/global trade-off | Same result file | 83.38% versus 17.28% preservation; 82.30% versus 91.66% utility retention | Neither policy dominates both objectives |
-| Provider fault isolation | Same result file | 100/100 concurrent replay queries retained healthy partial results and classified timeout/failure | In-memory fault injection, not network QPS |
-| Post-training data | `training/data/manifest.json` | 120 SFT traces and 222 DPO pairs, split by destination group | Deterministic synthetic labels |
-| Policy reranker | `benchmarks/results/phase-7-post-training.json` | 95% held-out Top-1 versus 71.67% always-local | Synthetic weighted oracle, not human preference |
-| LLM fine-tuning | `training/train_sft.py`, `training/train_dpo.py` | Current TRL/PEFT LoRA launch paths and data preflight implemented | No adapter quality gain claimed |
-| Full-stack reliability | API tests, migrations, Compose, CI | Tenant isolation, idempotency, leases, recovery, Redis limiting, request metrics | Static token auth is a deployment reference, not an OIDC product |
-| External suppliers | Provider contract tests and `docs/providers.md` | Amadeus/Booking/AMap adapters implemented and contract-tested | Production credentials and coverage not verified |
+| 默认模型 | `apps/api/src/tripchord/config.py`、`apps/api/tests/test_agent_runtime.py` | 默认 `MODEL_PROVIDER=none`，不会自动产生付费调用；可配置 Anthropic 或 OpenAI-compatible 网关 | “克隆后默认就在用 DeepSeek” |
+| 真实模型 smoke | `benchmarks/results/model-runtime-smoke-deepseek-v4-flash-2026-08-04.json`、`benchmarks/results/model-runtime-smoke-deepseek-v4-flash-2026-08-05.json`；`scripts/run_model_runtime_smoke.py`；mock 合同测试 | DeepSeek V4 Flash 在当前代码再次真实完成固定 3 请求，结构化 JSON 与有界工具循环通过；报告只含 hash/trace/usage | 把网关 smoke 说成完整 Chrome OTA 模型 E2E、模型优越性或生产稳定性 |
+| required-model Chrome canary | `benchmarks/results/live-deepseek-v4-flash-canary-2026-08-04.md`、同名 JSON；私有 `.runtime/live-deepseek-v4-flash-canary-2026-08-04.json` | 真实进入 10 个模型 Agent 阶段、20 次逻辑请求、49960 tokens；需求与日期策略生效，最终因模型阶段失败和严格平台覆盖不完整而 `HUMAN_BLOCK`；恢复后无模型常驻服务与三平台 Companion 正常 | “DeepSeek 全链路 Done-Gate 已通过”；把 `job=succeeded` 混同为方案 `ACCEPT`；忽略阶段失败或平台 DOM 漂移 |
+| 当前三日期 strict Round 17 | `benchmarks/results/live-done-gate-v4-round17-async-v13.json` | Companion `0.1.13` 的异步 job 达到 `succeeded/complete`，三个 checkpoint 为 completed/failed/completed，job-bound DeepSeek 回执为 47/47 成功；runner 为 `done_gate_failed`。中间 pair 因 Evidence Arbiter policy 冲突被隔离，另两 pair 的住宿精确平台均为 1/2 | “Round 17 Done-Gate 已通过”；把 HTTP job 成功、checkpoint 齐全或模型 47/47 成功等同于业务 gate 通过 |
+| Evidence Arbiter policy 修复聚焦运行 | 2026-08-04 job `live-job-_tjHGWHE2TDG-cEnIESeYA`；`apps/api/src/tripchord/agents/live_advisory.py` 及回归测试 | 与 Round 17 失败 pair 相同的 2026-08-21 至 2026-08-26 真实运行中，normalization、Evidence Arbiter 与 publication 均成功，23/23 模型调用成功，不再触发 `RuntimeError`；住宿仍为携程 `quote_found`、去哪儿 `bounded_provider_pending`，最终 `HUMAN_BLOCK` | 这是针对性 runtime 诊断，不是 sealed 最终证据包；不得写“修复后 Done-Gate 已通过” |
+| 第二住宿 provider 单路 canary 与范围决策 | Browser task `browser-task-nb6ZXTZc_WBXlw8wJz1efQ`、`browser-task-StqruT_cuwMz6f-fgoFpug` 的本机类型化终态；2026-08-05 用户范围决策 | 同日期 Maafushi 精确查询：去哪儿生成 `bounded_provider_pending` receipt、0 报价；同程生成 `login_required`、0 报价。用户随后明确跳过同程海外酒店，因此该来源不再重试、不是待登录事项，也不贡献第二个 provider price | 不得把 pending/login 说成价格；不得声称同程住宿已生产验证或为了过门放松税费/all-in 合同；不得把“跳过”包装成 gate 通过 |
+| Companion 0.1.16 聚焦真实核价 | 主证据 `benchmarks/results/live-browser-lodging-focused-v16-2026-08-05.sealed.json`；派生摘要 `live-browser-lodging-focused-v16-2026-08-05.json`；`scripts/capture_live_browser_evidence.py` 及 `benchmarks/tests/test_live_browser_focused_evidence.py` | 后台自动升级未聚焦 Chrome；sealed artifact 以 `0600` 保存携程 18 条逐报价脱敏投影、最低 CNY 778/晚、去哪儿官方登录重定向链、`0.1.15 → 0.1.16` applied reload receipt、查询/build/runtime 与 12 个源码产物 hash、input/result SHA；release binding 确认当前固定源码与加载 build 同 SHA，离线 verifier 可重算 1 个精确含税 provider，严格覆盖仍为 1/2 | 不得把携程多房价当多 provider；不得把去哪儿登录重定向说成无房、DOM 解析失败或第二个报价；摘要必须由 sealed artifact 派生，不能反向充当机器证据；未触发 Publication Gate |
+| 历史三日期 strict Round 14 | `benchmarks/results/live-done-gate-v4-round14-strict-v13.json` | Companion `0.1.13` 的三日期运行在旧 1200s 总预算处结构化 HTTP 504，`run_status=failed_before_done_gate`；失败包被原子保留 | “Round 14 Done-Gate 已通过”；把 504 前的局部 Source 结果当最终方案 |
+| required-model 门 | `apps/api/tests/test_model_gateway_runtime.py`、`apps/api/tests/test_live_advisory.py` | `MODEL_AGENTS_REQUIRED=true` 时必需模型阶段失败会阻塞发布 | “模型挂了会无感自动完成同等 Agent 决策” |
+| 独立运行 | `apps/api/tests/test_runtime_independence.py`、package data、`benchmarks/tests/test_wheel_runtime.py`、`/api/v1/agents/runtime` | dependency lock 与 runtime import 审计无 Codex/ChatGPT/provider SDK；wheel 可在无源码目录的隔离 cwd import 并响应 `/health` | “只填 LLM API key 就能实时查 OTA”；“Chrome Companion 已打进 wheel” |
+| 真实 OTA 前置 | `README.md`、`docs/operations.md`、Browser Companion 合同 | 还需本地 API/browser bridge、Chrome 扩展、用户域名授权、有效登录、网络和兼容 DOM | “服务器拿模型 key 后无需浏览器/登录即可搜携程” |
+| Companion 后台自动重载 | `apps/browser-companion/manifest.json`、`src/build-meta.js`、`.tripchord-release-seal.json`、`apps/api/src/tripchord/agents/companion_control_tools.py`、reload contract tests、v16 sealed evidence | 当前 build `0.1.16`；同一 API 进程内已从 `0.1.15` 真实后台升级，applied receipt 绑定 old/target build SHA、old/new runtime instance 与 1586ms 时序；协议不打开或聚焦 Chrome 页面 | 不能安装/启用扩展、扩大 host permission、恢复登录、绕验证码或任意重载未封板代码；无 fresh control companion 时失败关闭 |
 
-## Never claim
+## Agent、上下文与安全边界
 
-- “Prices are the cheapest across all travel apps.” TripChord can normalise the
-  sources it is authorised to query; it cannot prove universal lowest price.
-- “12306 real-time inventory” without a documented authorised API.
-- “Fine-tuning improved planning quality” before a concrete base model,
-  completed run, cost report, and unseen-city comparison.
-- “Production QPS” from replay or injected in-memory providers.
+| 声明 | 可复现证据 | 允许表述 | 边界 |
+|---|---|---|---|
+| 模型 Agent 真正影响执行 | `apps/api/src/tripchord/agents/flexible_live_system.py`、`apps/api/src/tripchord/agents/live_system.py`、相关 Agent tests | Query Strategist 改变精查顺序；Search Supervisor 改变 Source waves/dependencies；Candidate Curator 或 Candidate Scouts + 唯一 Merger、Repair Strategist、Event Diagnoser 可改变候选或返工路径 | 提案须经确定性 envelope；不能创造日期、Source、报价或 candidate ID |
+| Search Supervisor | `apps/api/src/tripchord/agents/search_supervisor.py`、`apps/api/tests/test_search_supervisor.py` | 先读只读 capability tool，再提出 waves；校验后物化为真实 DAG 依赖；非法提案原子拒绝 | 不能修改查询、扩大预算、读取 Cookie、绕验证码或交易 |
+| Agent / 硬规则分工 | `apps/api/src/tripchord/agents/live_system.py`、`apps/api/src/tripchord/planning/package.py`、`apps/api/src/tripchord/agents/tools.py` | Agent 负责语义、工具计划、取舍、软风险和修复策略；确定性代码负责事实、金额、权限、Verifier/ReVerifier、Repair Executor 和 Safety Gate | 不能包装“所有逻辑都由 LLM 自主完成” |
+| 上下文预算 | `apps/api/src/tripchord/agents/context_budget.py`、`apps/api/tests/test_memory_rag_context.py` | Query/Planner/Repair 分别使用 1600/4000/3000 token 预算，工具回执与历史记忆共用预算；关键证据放不下时失败关闭 | token 近似估算不是供应商精确 tokenizer 证明 |
+| 记忆隔离与撤销 | `apps/api/src/tripchord/agents/memory.py`、`apps/api/src/tripchord/agents/persistent_memory.py`、memory API tests | tenant/user/session/trip、TTL、隐私与角色隔离；长期偏好必须显式确认，可按 record id 撤销 | 单进程 JSON 快照不是分布式生产记忆服务 |
+| RAG | `apps/api/src/tripchord/agents/rag.py`、`apps/api/tests/test_memory_rag_context.py` | BM25 词法 RAG，只检索偏好、历史决策、平台能力和非实时证据 | 不是向量 RAG；实时价格/库存绝不从 RAG 恢复 |
+| 外部模型数据边界 | `apps/api/src/tripchord/agents/model_gateway.py`、`apps/api/src/tripchord/agents/live_system.py`、`apps/api/src/tripchord/agents/model_agent.py` | 启用外部 endpoint 时，预算化用户需求、结构化证据摘要和允许的工具回执会发给该 endpoint；TripChord 不把浏览器 Cookie、登录凭据或 profile 交给模型，内部 trace 只存 prompt digest | 不提供企业级 DLP、数据驻留或地域合规承诺；模型供应商自己的日志/保留策略由用户选择并审核 |
+| 工具安全 | `apps/api/src/tripchord/agents/model_agent.py`、`apps/api/src/tripchord/agents/tools.py`、工具安全 tests | schema、角色 allowlist、L0–L4 权限、轮数上限；工具文本按不可信输入回灌 | 当前 live 默认只读 L0/L1；不自动下单 |
+| 受控动态 Agent 预算 | `apps/api/src/tripchord/main.py`、`agents/package_request.py`、`adaptive_control.py`、`agent_templates.py`、`agent_budget.py`、`flexible_live_system.py`；相关 budget/Flexible/API tests | 自然语言文本入口创建或复用 request-wide ledger，Requirement Agent 在模型提案前以 `CONTEXT` 角色准入；Flexible 初始 ScaleDirective 计划日期与 pipeline，Planner 后用实际 `C` 生成 candidate-stage directive；`dynamic_candidate_agent_additions` 对账已审计 Scout 增量，scope start 将规划实际增量与整个请求累计分开校验，累计硬上限 96 | candidate-stage directive 只针对单个精确日期的有界 Planner 池，不是重写全请求指令；96 是安全 guardrail，不是实测最优；计划、准入、model request、HTTP attempt 与 Source worker 不能混计 |
+| Publication fallback 动态预算 | `adaptive_control.py`、`agent_templates.py`、`flexible_live_system.py`、`test_flexible_adaptive_scaling.py`、`test_adaptive_control.py`、`test_agent_templates.py` | 首批及每个额外发布刷新前，按累计尝试数重派生 `ScaleDirective + AgentTemplatePlan`；每次计 8 个基础模型 Agent，最多 `exact_pair_budget=8`，加上已审计 Candidate Scout 增量对账 scope 与 request-wide 96 硬门；下一次预算不足时在副作用前写 shortfall 并 `HUMAN_BLOCK` | 代码与本地 fixture 证据：3 次逐次 refreeze、第 2 次预算不足时无新副作用、最大 8 次 schema/模板容量；尚无真实 OTA 连续 fallback 封存证据 |
+| ReAct 日期分片与树形归并 | `apps/api/src/tripchord/agents/flexible_live_system.py`、`apps/api/tests/test_flexible_adaptive_scaling.py` | 每 12 行一个只读 Query shard；400 日期为 34 scout + 3 中间 merger + 1 最终 merger，每个节点最多观察 12 行，最终精查仍为 1–8 对 | 只证明当前日期执行与测试；不证明比单 Agent 更准，也不把旧 adaptive 日期算法改写为胜出 |
+| 分离的并发资源池 | `apps/api/src/tripchord/agents/model_http_runtime.py`、`adaptive_control.py`、`apps/api/tests/test_model_http_runtime.py`、`test_adaptive_control.py` | 模型 HTTP pool 为进程生命周期共享且最多 12；请求级门从 1–2 起步、成功加一、失败减半；Chrome 固定 6、去哪儿住宿固定 1、日期对固定 1 | 没有生产吞吐/SLA 结论；模型扩容不会扩大浏览器或 Provider lease |
+| Provider 与模型健康分离 | `apps/api/src/tripchord/agents/adaptive_control.py`、`flexible_live_system.py`、相关健康/并发 tests | `provider_health` 只描述 OTA 来源/垂类与 strict 覆盖可达性，`model_endpoint_health` 才能降低模型 ceiling；执行前未观测 OTA 状态保持 `unknown` | pending/日历缺失不是模型故障，模型失败也不是无库存；当前未声称有独立生产健康探针 |
+| Candidate Scout 分片与唯一 Merger | `apps/api/src/tripchord/agents/live_system.py`、`adaptive_control.py`、`agent_budget.py`、`flexible_live_system.py`、`apps/api/tests/test_live_candidate_sharding.py`、`test_flexible_adaptive_scaling.py` | Planner 有界池最大 256；`C>32` 按 32 分为 `ceil(C/32)` 个服务端绑定只读 Scout，最多 8 个可并发任务；确定性 Collector 产生 `<=32` decision frontier，Evidence Arbiter 审核后只有一个 `candidate_merger` 能更新 Planner 初案；scope/pool/frontier hash、动态并发、fallback 与 Agent admission 可审计 | 证据是代码和本地结构化模型/fixture 测试，包括 65 候选 32/32/1 分片与反例；尚无真实 OTA 运行触发 `C>32` 的封存证据；2,000 只是离线 synthetic 预算算术，不是 Planner 池或全网穷举 |
+
+## 搜索、报价与组合空间
+
+| 声明 | 可复现证据 | 允许表述 | 边界 |
+|---|---|---|---|
+| 完整日期宇宙 | `apps/api/src/tripchord/planning/flexible_dates.py`、`docs/date-search-benchmark.md` | 8 月“玩 5–8 天”确定性换算为住 4–7 晚，共 124 对；先完整粗枚举，再对最多 1–8 对精查 | 不能把粗枚举说成 124 对 × 全平台实时精查 |
+| 日期 adaptive 负结果 | `benchmarks/results/date-search-full-universe-v1.json` | 旧 5–8 晚 synthetic v1 中，预算 3/5/8 的 adaptive Recall@3 为 0.115/0.229/0.302，低于粗价 Top-K 的 0.240/0.323/0.406；regret 也更高 | v1 不是用户真实 4–7 晚合同；不得说 adaptive 优于 Top-K |
+| guarded hybrid 停止结论 | `benchmarks/results/date-search-hybrid-v2.json`、`docs/date-search-hybrid-v2.md` | 新 4–7 晚 sealed holdout 中 hybrid 未通过预冻结不退化门，`accepted_as_planning_candidate=false` | 不得反复调参后把该 holdout 当新盲测 |
+| live 默认日期策略 | `apps/api/src/tripchord/planning/adaptive_dates.py`、`apps/api/src/tripchord/agents/flexible_live_system.py`、日期 tests | Query Strategist 重排后按 bounded Top-K 精查；旧 adaptive 仅显式注入实验 | synthetic 基线不证明 Top-K 在真实 OTA 上更优 |
+| 精确报价缓存 | `apps/api/src/tripchord/providers/browser_bridge.py`、`apps/api/tests/test_browser_bridge.py` | 仅同 tenant/user 分区、同查询、显式允许、10 分钟半开 TTL 内复用；事件刷新绕过缓存 | 不是跨用户共享价格仓，也不保证缓存期内价格未变 |
+| single-flight | 同上 | 相同在途查询共享一个 bridge task；单个等待者超时不取消其他消费者；跨分区不共享 | 进程内机制，不是分布式 single-flight |
+| 住宿库存四态 | `apps/api/src/tripchord/planning/stay_plans.py`、`providers/browser_bridge.py`、receipt tests | `QUOTE_FOUND`=精确报价；`CONFIRMED_EMPTY`=同查询/同 lineage 的 receipt-v2 双观测确认空结果；`BOUNDED_NO_EXACT_QUOTE`=冻结上限内未命中；`BOUNDED_PROVIDER_PENDING`=平台仍搜索 | 只有 `QUOTE_FOUND` 贡献可比价格；后三态都不能冒充第二个平台报价或全平台永久无库存 |
+| 执行完整性与比价覆盖分离 | `apps/api/src/tripchord/agents/live_system.py`、`apps/api/src/tripchord/agents/live_done_gate_v4.py`、专项 tests | required Source 均有类型化终态可使 execution complete；选中住宿每分段仍必须有至少 2 个不同 provider `QUOTE_FOUND` 才能 publication complete | `confirmed_empty`/pending 可以完成 Source 证据分类，但不能让 exact quote coverage 通过 |
+| 报价抓取时差 | `apps/api/src/tripchord/planning/package.py`、`apps/api/tests/test_package_planning.py` | 整包组件捕获时间差默认超过 20 分钟触发 `QUOTE_CAPTURE_SKEW` | 20 分钟是产品门，不代表市场价格 20 分钟稳定 |
+| 多平台混搭 | `apps/api/tests/test_package_planning.py`、2026-08-03 evidence | 可组合平台 A 机票、平台 B 酒店和 iCom 接驳 | 当前不支持去返程 split-ticket；不同权益未知时不强行横比 |
+| 稳定报价身份 | `apps/api/src/tripchord/planning/offer_semantics.py`、`apps/api/tests/test_offer_semantics.py` | product identity 与 offer identity 分离，价格变化或 DOM ID 变化不会自动冒充新产品 | 稳定身份不是库存锁定或官方 SKU 保证 |
+| 候选空间审计 | `apps/api/src/tripchord/planning/package.py`、`apps/api/tests/test_package_planning.py`、`benchmarks/results/package-candidate-diversity-v1.json`、对应 benchmark test | 默认 flight 12、每住宿段 8、transfer beam 64、candidate cap 256；输出 raw/prescreen 数量、结构上界、ID hash、截断状态；固定 synthetic 小上限回归中保留全局最优并覆盖 3 provider/3 flight/2 种方案，输入反序结果稳定 | 明确不是全量穷举；结构上界不是可行候选数；单个 synthetic fixture 不证明 live OTA、可订性、一般召回、平台优劣或 SLA |
+| Candidate decision frontier | `apps/api/src/tripchord/agents/live_system.py`、`apps/api/tests/test_live_candidate_sharding.py` | `C<=32` 使用原多样性 shortlist；`C>32` 时每个 Scout 最多检查自己的 32 候选，Collector 将 Planner anchor、合法提名和原 shortlist 确定性收敛为最多 32 个交给 Evidence Arbiter/Merger | 最终 frontier 省略候选不代表无效；Scout 覆盖的是 Planner 最大 256 有界池，不是所有原始组合或全网候选 |
+
+## 规划、验证、修复与事件
+
+| 声明 | 可复现证据 | 允许表述 | 边界 |
+|---|---|---|---|
+| 严格交接链 | `apps/api/tests/test_live_agent_system.py`、`apps/api/tests/test_live_candidate_sharding.py`、`apps/api/tests/test_package_planning.py` | 小池 Candidate Curator，或大池 Candidate Scouts→Collector→Evidence Arbiter→唯一 Candidate Merger，随后进入 Hard Verifier→Risk Critic→Repair Strategist→deterministic Executor→ReVerifier→ReCritic→Orchestrator→Safety Gate；handoff 绑定 ID/版本/组件/错误码 | 代码与本机测试证据；Candidate 分片尚无真实 OTA `C>32` 封存运行，不等于所有线上异常已覆盖 |
+| Repair Strategist | `apps/api/src/tripchord/agents/live_advisory.py`、`apps/api/src/tripchord/agents/live_system.py` | 在 schema 内选择 `SWITCH_CANDIDATE / EXPAND_SEARCH / ASK_USER / KEEP`；换选可真实改变最终候选 | 不能指向未展示/不存在候选，不能自行宣布验证通过 |
+| 异构 ReVerifier | `apps/api/src/tripchord/planning/package_reverification.py`、`apps/api/tests/test_package_reverification.py`、`apps/api/src/tripchord/agents/live_system.py` | 不用 LLM，也不调用主 `PackageVerifier`/`diff_packages`；独立重算 13 类不变量，缺失或失败均由 Safety Gate 阻塞；主 Verifier 被 stub 通过时金额/父链/diff/空接驳/硬偏好篡改反例仍被拦截 | 共享业务语义的异构实现，不是形式化证明；不能说“再问一次模型检查” |
+| ReCritic 与 Safety Gate | `apps/api/src/tripchord/agents/live_system.py`、软风险反例 tests | ReCritic 二次检查修复后软风险；Safety Gate 可拒绝主控接受建议 | ReCritic 通过也不能覆盖 hard violation |
+| 当前事件 local/global 执行与预算合同 | `apps/api/src/tripchord/agents/live_system.py`、`apps/api/src/tripchord/agents/live_advisory.py`、`apps/api/tests/test_live_agent_system.py`、`apps/api/tests/test_live_advisory.py` | browser local/iCom 只有一个可调用模型的 Event Diagnoser，局部 directive 为 `E=true、R=false、raw=1`；Repair、主 Verifier、异构 ReVerifier、事件安全门确定性执行。只有 global 才关闭近期报价复用并重跑完整正常模型 pipeline；`replan_after_event` 与 nested global 共用 request-wide 96 ledger，全局浏览器 fan-out 前按 `C=256、E=true、R=false、raw=18` 预检，容量不足结构化 `HUMAN_BLOCK`；`AgenticRunSummary.combine` 保留两段 stage/request/HTTP 与模型并发审计 | 当前证据是代码和本机 structured-model/fixture；没有真实 OTA event 触发当前共享 ledger/global preflight 的封存运行。18 是最坏容量 guardrail，不是每次 local event 实际 Agent 数；一个 Agent 的 tool loop 可有多次模型请求 |
+| 历史 v3/canary 注入事件页面重查 | `benchmarks/results/live-flight-only-final-done-gate-2026-08-03.json` | 旧合同下由验收器注入携程住宿 `price_changed` 后仅重查一个精确住宿 Source，候选 v1→v2，保留率 75% | 不是平台自然涨价 push，也没有走当前 request-wide event ledger、global preflight 与 summary-combine 合同；不能作为当前事件预算链的真实 OTA 验证 |
+| synthetic `sold_out` 严格闭环 | `apps/api/tests/test_live_agent_system.py`、`benchmarks/tests/test_live_done_gate_v4_runner.py` | 离线测试覆盖排除原商品、同 provider 替换、确定性 Repair 删除 1/新增 1、主 Verifier、`EVENT_REVERIFICATION`、独立审计和事件安全门；contract 明示 `platform_sold_out_observed=false` | 不是平台售罄证据；当前 live strict 尚无可推荐初案，未进入该 live 事件阶段 |
+| 周期重核价 monitor | `apps/api/src/tripchord/agents/live_monitor.py`、`apps/api/tests/test_live_monitor.py`、`apps/api/tests/test_live_api.py` | 用户显式开启；进程内、租户隔离、有界、可取消；每轮重查一个组件并进入事件闭环 | 代码/测试层；不是供应商推送、后台常驻或生产监控 |
+| live 长任务控制面 | `apps/api/src/tripchord/agents/live_jobs.py`、`apps/api/tests/test_live_jobs.py`、`apps/api/tests/test_live_job_api.py`、`apps/web/src/api.test.ts` | POST 202、GET、SSE、DELETE；五态、tenant 隔离、容量/TTL、错误脱敏、取消传播；同 tenant 相同 key+payload 幂等复用，不同 payload 409 | 进程内，重启不恢复；不是持久化生产队列或交付 SLA |
+
+## 评测与真实数据
+
+| 声明 | 可复现证据 | 允许表述 | 边界 |
+|---|---|---|---|
+| 240 条 Agent suite | `benchmarks/results/agent-suite-v1.json` | 12 类固定种子合成回放中多 Agent 100%，静默硬约束/明确偏好违规、过期事实、未授权 L3 和死循环均为 0 | 历史 75% 是“单候选确定性代理”，不是单 LLM Agent；合成数据不代表真人满意度 |
+| 并发等待重叠 | 同上 | 固定 5ms scripted-model 等待下，同质量本机并发 p50 较串行低 44.04% | 不是生产吞吐、QPS 或真实网络延迟 |
+| 公平 single-vs-multi harness | `benchmarks/evaluate_agent_architectures.py`、`benchmarks/scenarios/agent-architecture-v1.jsonl`、benchmark tests | 同任务、同工具、同模型标识、同预算与共同最终审计的 scripted 12 场景中两者均 100%；多 Agent 消耗更多调用、token、成本和延迟 | `winner_claim_allowed=false`；不能声称多 Agent 质量更高，未完成付费真实模型统计比较 |
+| 动态 Agent 冻结预算基准 | `benchmarks/results/adaptive-agent-budget-v1.json`、`benchmarks/scenarios/adaptive-agent-budget-v1.json`、`benchmarks/tests/test_adaptive_agent_budget.py` | 四类 synthetic controller state 的 Flexible 计划量为 8/19/57/143、hard-cap 后为 8/19/57/96，模型 ceiling 为 2/6/8/12；同输入复现，Chrome 6、去哪儿住宿 1 不随规模变化 | `model_calls=false`、`browser_calls=false`、`live=false`，且不含文本 Requirement admission；不证明全请求 Agent 数、模型质量、真实 OTA 覆盖、延迟收益、价格质量或 Done-Gate |
+| 经典规划器 | `benchmarks/results/phase-6-scale.json` | 120/120 合成场景有效；CP-SAT 平均效用较 greedy +0.83% | greedy 也 100% 有效，不能包装巨大算法优势 |
+| 经典动态恢复 | 同上 | 120/120 固定闭园恢复；局部修复保留率 83.38%，全局 17.28%；效用保留 82.30% vs 91.66% | 固定事件分布；局部/全局不存在单一支配 |
+| 历史 v3/canary Chrome Done-Gate | `benchmarks/results/live-flight-only-final-done-gate-2026-08-03.json` | 一次用户授权的携程/去哪儿/同程旧能力矩阵只读运行形成 2 个推荐日期，并完成一次注入事件单源重查 | 早于当前 frozen-stay、required-model、两精确住宿 provider 与 receipt-v2 合同；不能证明当前 strict gate 通过 |
+| 线上公共数据 | `benchmarks/results/live-canary-2026-07-30.json`、`benchmarks/results/icom-live-smoke-2026-07-30.json` | Open-Meteo、故宫官网和四路 iCom 公共读取通过 | iCom 是税费/换汇/库存未知的公开基础价 |
+| 来源任务图 | `apps/api/tests/test_live_agent_system.py`、`docs/done-gate.md` | 当前 frozen-stay 每日期对 17 个逻辑 Source：13 浏览器 + 4 iCom；浏览器最多 6 个任务并发 | 不是 17 个浏览器标签同时打开；历史 v3 的 11+4 不能当当前任务图 |
+| 当前 live 长任务传输 | `benchmarks/run_live_done_gate_v4.py`、`benchmarks/scenarios/live-hgh-mle-aug-2026-v4.json`、`benchmarks/results/live-done-gate-v4-round17-async-v13.json`、runner/API tests | Round 17 已在真实三日期运行中完成异步 202 job、3600 秒预算、三个绑定 checkpoint 和 47/47 job-scoped 模型回执；旧长 HTTP 超时未再出现 | 只证明该次控制面完成；不证明持久队列、生产 SLA 或业务 Done-Gate，后者仍为 `done_gate_failed` |
+| Round 15/16 失败 lineage | `benchmarks/results/live-done-gate-v4-round15-async-v13.json`、`benchmarks/results/live-done-gate-v4-round16-async-v13.json` | Round 15 为 33/33 模型成功但旧 waiter/lease 唤醒问题；Round 16 为 32/32 成功、首 checkpoint 封存，第二 pair 暴露最终方案 lineage 校验问题；两处代码根因均已修复 | 两轮均为 `failed_before_done_gate`，仅作根因演进证据；不能替代 Round 17 或当前业务 gate |
+
+## 后训练与全栈工程
+
+| 声明 | 可复现证据 | 允许表述 | 边界 |
+|---|---|---|---|
+| 编排策略 SFT/DPO | `benchmarks/results/orchestration-post-training.json` | 合成未见城市组 Base/SFT/SFT+DPO 为 66.67%/100%/100%，不安全接受 1/0/0 | 样本小、合成标签；DPO 没证明高于 SFT |
+| 恢复 reranker | `benchmarks/results/phase-7-post-training.json`、`docs/post-training-boundaries.md` | 合成加权 oracle 下 Top-1 95% vs always-local 71.67% | oracle/任务分布耦合，不能升级为真实用户效果 |
+| LoRA 链路 | `benchmarks/results/lora-training-evidence.json` | SmolLM2-135M-Instruct 的 3-step SFT→DPO 与 4 个 adapter reload 通过 | 离线 smoke、未接入 live；不声明中文规划质量提升 |
+| 全栈 | Python/Web/Browser Companion tests、Ruff、Mypy、Web build | FastAPI + React 控制面、Agent trace、证据与模型/上下文回执、Chrome 只读 Companion 均有本机验证 | Compose 是本地部署配置，不是生产多 worker/SLA 证据 |
+
+## 永远不要这样说
+
+- “TripChord 找到了全月或所有 App 的最低价。”
+- “现在默认运行 DeepSeek，或者只填一个 LLM key 就能实时查询携程。”
+- “RAG 使用向量数据库保存实时机酒价格。”
+- “启用外部 LLM 也不会发送任何行程内容，或者项目已经提供企业级 DLP/数据驻留合规。”
+- “所有逻辑都交给 Agent，Verifier 也是 LLM。”
+- “自适应日期搜索比 Top-K 更好。”
+- “公平评测证明多 Agent 比单 Agent 准确。”
+- “系统监听到了平台自然涨价推送。”
+- “2026-08-03 Done-Gate 是 DeepSeek 驱动的完整 OTA E2E。”
+- “历史 v3/canary 通过，所以当前 strict v4 也已经通过。”
+- “Source execution complete 就等于有足够平台报价可推荐。”
+- “离线 synthetic sold_out 通过就是监听到了平台真实售罄。”
+- “LoRA 已接入实时路径并提升中文行程质量。”
+- “三平台已经生产长期稳定运行，或浏览器可以自动下单。”

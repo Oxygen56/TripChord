@@ -1,0 +1,358 @@
+{
+  "benchmark_id": "adaptive-agent-budget-v1",
+  "checks": {
+    "all_expected_budgets_match": true,
+    "audit_input_is_capped_at_96": true,
+    "browser_concurrency_is_always_6": true,
+    "four_frozen_requirement_classes": true,
+    "logical_agent_budget_never_exceeds_96": true,
+    "model_concurrency_ladder_is_2_6_8_12": true,
+    "qunar_lodging_concurrency_is_always_1": true,
+    "same_input_is_reproducible": true
+  },
+  "claim_boundary": {
+    "browser_throughput_claim_allowed": false,
+    "deterministic_budget_regression_claim_allowed": true,
+    "live_travel_quality_claim_allowed": false,
+    "model_quality_claim_allowed": false,
+    "production_sla_claim_allowed": false
+  },
+  "input_classification": {
+    "browser_calls": false,
+    "kind": "synthetic_controller_state",
+    "live": false,
+    "model_calls": false
+  },
+  "passed": true,
+  "policy_version": "adaptive-control-v1",
+  "result_sha256": "f04907cc1fcf637dd12f34e5b158d49617242a193d21e5d435c9637e03b9fcb0",
+  "rows": [
+    {
+      "actual": {
+        "background_batches": 1,
+        "browser_concurrency": 6,
+        "candidate_shards": 1,
+        "date_mergers": 0,
+        "date_shards": 1,
+        "desired_model_concurrency": 2,
+        "health_adjusted_model_concurrency": 2,
+        "logical_agent_cap": 8,
+        "logical_saturated": false,
+        "qunar_lodging_concurrency": 1,
+        "raw_logical_agents": 8,
+        "raw_model_concurrency": 2,
+        "state_fingerprint": "066bc85f45ea497e9ab94c07897c4c6cf2c70569f9dddd1b6e21b76c38a5dcd2",
+        "theoretical_browser_task_count": 78,
+        "theoretical_icom_task_count": 24
+      },
+      "checks": {
+        "browser_concurrency_fixed": true,
+        "cap_behavior_expected": true,
+        "expected_budget": true,
+        "logical_agent_cap_enforced": true,
+        "model_concurrency_level_expected": true,
+        "qunar_lodging_concurrency_fixed": true,
+        "same_input_reproducible": true
+      },
+      "class": "simple",
+      "expected": {
+        "background_batches": 1,
+        "browser_concurrency": 6,
+        "candidate_shards": 1,
+        "date_mergers": 0,
+        "date_shards": 1,
+        "desired_model_concurrency": 2,
+        "health_adjusted_model_concurrency": 2,
+        "logical_agent_cap": 8,
+        "logical_saturated": false,
+        "qunar_lodging_concurrency": 1,
+        "raw_logical_agents": 8,
+        "raw_model_concurrency": 2,
+        "state_fingerprint": "066bc85f45ea497e9ab94c07897c4c6cf2c70569f9dddd1b6e21b76c38a5dcd2",
+        "theoretical_browser_task_count": 78,
+        "theoretical_icom_task_count": 24
+      },
+      "id": "simple",
+      "input": {
+        "candidate_count": 16,
+        "date_pair_count": 6,
+        "direct_final_pair_count": 0,
+        "event_active": false,
+        "evidence_gap_count": 0,
+        "exploration_pair_count": 1,
+        "model_endpoint_health": [],
+        "provider_health": [
+          {
+            "provider": "ctrip",
+            "required": true,
+            "status": "healthy",
+            "vertical": "lodging"
+          },
+          {
+            "provider": "qunar",
+            "required": true,
+            "status": "healthy",
+            "vertical": "lodging"
+          },
+          {
+            "provider": "ctrip",
+            "required": true,
+            "status": "healthy",
+            "vertical": "flight"
+          }
+        ],
+        "publication_pair_count": 0,
+        "repair_required": false,
+        "strict_mode": true
+      },
+      "passed": true,
+      "repeat_count": 5
+    },
+    {
+      "actual": {
+        "background_batches": 3,
+        "browser_concurrency": 6,
+        "candidate_shards": 3,
+        "date_mergers": 1,
+        "date_shards": 2,
+        "desired_model_concurrency": 6,
+        "health_adjusted_model_concurrency": 6,
+        "logical_agent_cap": 19,
+        "logical_saturated": false,
+        "qunar_lodging_concurrency": 1,
+        "raw_logical_agents": 19,
+        "raw_model_concurrency": 3,
+        "state_fingerprint": "bf90b88514f8bf9777bc250be3ffaab1c0504c394699e4dfe5e43faae757e17f",
+        "theoretical_browser_task_count": 312,
+        "theoretical_icom_task_count": 96
+      },
+      "checks": {
+        "browser_concurrency_fixed": true,
+        "cap_behavior_expected": true,
+        "expected_budget": true,
+        "logical_agent_cap_enforced": true,
+        "model_concurrency_level_expected": true,
+        "qunar_lodging_concurrency_fixed": true,
+        "same_input_reproducible": true
+      },
+      "class": "standard",
+      "expected": {
+        "background_batches": 3,
+        "browser_concurrency": 6,
+        "candidate_shards": 3,
+        "date_mergers": 1,
+        "date_shards": 2,
+        "desired_model_concurrency": 6,
+        "health_adjusted_model_concurrency": 6,
+        "logical_agent_cap": 19,
+        "logical_saturated": false,
+        "qunar_lodging_concurrency": 1,
+        "raw_logical_agents": 19,
+        "raw_model_concurrency": 3,
+        "state_fingerprint": "bf90b88514f8bf9777bc250be3ffaab1c0504c394699e4dfe5e43faae757e17f",
+        "theoretical_browser_task_count": 312,
+        "theoretical_icom_task_count": 96
+      },
+      "id": "standard",
+      "input": {
+        "candidate_count": 96,
+        "date_pair_count": 24,
+        "direct_final_pair_count": 0,
+        "event_active": false,
+        "evidence_gap_count": 4,
+        "exploration_pair_count": 1,
+        "model_endpoint_health": [],
+        "provider_health": [
+          {
+            "provider": "ctrip",
+            "required": true,
+            "status": "healthy",
+            "vertical": "lodging"
+          },
+          {
+            "provider": "qunar",
+            "required": true,
+            "status": "healthy",
+            "vertical": "lodging"
+          },
+          {
+            "provider": "ctrip",
+            "required": true,
+            "status": "healthy",
+            "vertical": "flight"
+          }
+        ],
+        "publication_pair_count": 0,
+        "repair_required": true,
+        "strict_mode": true
+      },
+      "passed": true,
+      "repeat_count": 5
+    },
+    {
+      "actual": {
+        "background_batches": 24,
+        "browser_concurrency": 6,
+        "candidate_shards": 12,
+        "date_mergers": 3,
+        "date_shards": 16,
+        "desired_model_concurrency": 8,
+        "health_adjusted_model_concurrency": 8,
+        "logical_agent_cap": 57,
+        "logical_saturated": false,
+        "qunar_lodging_concurrency": 1,
+        "raw_logical_agents": 57,
+        "raw_model_concurrency": 7,
+        "state_fingerprint": "29eaca611f0d35a2b3b2392f008cf0ade4eeebe142da0ad2039b126e9dc1a47e",
+        "theoretical_browser_task_count": 2496,
+        "theoretical_icom_task_count": 768
+      },
+      "checks": {
+        "browser_concurrency_fixed": true,
+        "cap_behavior_expected": true,
+        "expected_budget": true,
+        "logical_agent_cap_enforced": true,
+        "model_concurrency_level_expected": true,
+        "qunar_lodging_concurrency_fixed": true,
+        "same_input_reproducible": true
+      },
+      "class": "complex",
+      "expected": {
+        "background_batches": 24,
+        "browser_concurrency": 6,
+        "candidate_shards": 12,
+        "date_mergers": 3,
+        "date_shards": 16,
+        "desired_model_concurrency": 8,
+        "health_adjusted_model_concurrency": 8,
+        "logical_agent_cap": 57,
+        "logical_saturated": false,
+        "qunar_lodging_concurrency": 1,
+        "raw_logical_agents": 57,
+        "raw_model_concurrency": 7,
+        "state_fingerprint": "29eaca611f0d35a2b3b2392f008cf0ade4eeebe142da0ad2039b126e9dc1a47e",
+        "theoretical_browser_task_count": 2496,
+        "theoretical_icom_task_count": 768
+      },
+      "id": "complex",
+      "input": {
+        "candidate_count": 384,
+        "date_pair_count": 192,
+        "direct_final_pair_count": 0,
+        "event_active": true,
+        "evidence_gap_count": 16,
+        "exploration_pair_count": 1,
+        "model_endpoint_health": [],
+        "provider_health": [
+          {
+            "provider": "ctrip",
+            "required": true,
+            "status": "healthy",
+            "vertical": "lodging"
+          },
+          {
+            "provider": "qunar",
+            "required": true,
+            "status": "healthy",
+            "vertical": "lodging"
+          },
+          {
+            "provider": "ctrip",
+            "required": true,
+            "status": "healthy",
+            "vertical": "flight"
+          }
+        ],
+        "publication_pair_count": 0,
+        "repair_required": true,
+        "strict_mode": true
+      },
+      "passed": true,
+      "repeat_count": 5
+    },
+    {
+      "actual": {
+        "background_batches": 50,
+        "browser_concurrency": 6,
+        "candidate_shards": 63,
+        "date_mergers": 4,
+        "date_shards": 34,
+        "desired_model_concurrency": 12,
+        "health_adjusted_model_concurrency": 12,
+        "logical_agent_cap": 96,
+        "logical_saturated": true,
+        "qunar_lodging_concurrency": 1,
+        "raw_logical_agents": 143,
+        "raw_model_concurrency": 11,
+        "state_fingerprint": "607a31bd8deaf46bcac785d6b17823c25bca561a2014777abf8dab5a9e79d7ac",
+        "theoretical_browser_task_count": 5200,
+        "theoretical_icom_task_count": 1600
+      },
+      "checks": {
+        "browser_concurrency_fixed": true,
+        "cap_behavior_expected": true,
+        "expected_budget": true,
+        "logical_agent_cap_enforced": true,
+        "model_concurrency_level_expected": true,
+        "qunar_lodging_concurrency_fixed": true,
+        "same_input_reproducible": true
+      },
+      "class": "audit",
+      "expected": {
+        "background_batches": 50,
+        "browser_concurrency": 6,
+        "candidate_shards": 63,
+        "date_mergers": 4,
+        "date_shards": 34,
+        "desired_model_concurrency": 12,
+        "health_adjusted_model_concurrency": 12,
+        "logical_agent_cap": 96,
+        "logical_saturated": true,
+        "qunar_lodging_concurrency": 1,
+        "raw_logical_agents": 143,
+        "raw_model_concurrency": 11,
+        "state_fingerprint": "607a31bd8deaf46bcac785d6b17823c25bca561a2014777abf8dab5a9e79d7ac",
+        "theoretical_browser_task_count": 5200,
+        "theoretical_icom_task_count": 1600
+      },
+      "id": "audit",
+      "input": {
+        "candidate_count": 2000,
+        "date_pair_count": 400,
+        "direct_final_pair_count": 0,
+        "event_active": true,
+        "evidence_gap_count": 32,
+        "exploration_pair_count": 1,
+        "model_endpoint_health": [],
+        "provider_health": [
+          {
+            "provider": "ctrip",
+            "required": true,
+            "status": "healthy",
+            "vertical": "lodging"
+          },
+          {
+            "provider": "qunar",
+            "required": true,
+            "status": "healthy",
+            "vertical": "lodging"
+          },
+          {
+            "provider": "ctrip",
+            "required": true,
+            "status": "healthy",
+            "vertical": "flight"
+          }
+        ],
+        "publication_pair_count": 0,
+        "repair_required": true,
+        "strict_mode": true
+      },
+      "passed": true,
+      "repeat_count": 5
+    }
+  ],
+  "scenario_count": 4,
+  "scenario_file": "benchmarks/scenarios/adaptive-agent-budget-v1.json",
+  "scenario_sha256": "62c8c8f0cc9977fcdca61361bd47183a0617ab3effa3e1875844a919c1416157"
+}

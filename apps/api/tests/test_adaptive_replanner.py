@@ -24,9 +24,7 @@ def test_adaptive_replanner_selects_verified_policy_tradeoff() -> None:
     solved = optimizer.solve(problem)
     plan = optimizer.to_plan(solved, problem, trip_id="trip", plan_id="trip:plan:v1")
     candidates = {item.id: item for item in problem.activities}
-    target = next(
-        item for item in solved.scheduled if not candidates[item.activity_id].must_visit
-    )
+    target = next(item for item in solved.scheduled if not candidates[item.activity_id].must_visit)
     event = PlanEvent(
         id="closure",
         trip_id="trip",

@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 from tripchord.domain.common import Money
 from tripchord.domain.itinerary import ItemKind, ItineraryItem, PlanVersion, ViolationCode
 from tripchord.domain.trip import TripSpec
+from tripchord.planning.repair import RepairStrategy
 from tripchord.planning.verifier import TravelRequirement, VerificationContext
 from tripchord.planning.workflow import PlanningWorkflow, WorkflowStatus
 
@@ -61,6 +62,13 @@ def test_workflow_repairs_travel_gap_and_emits_diff() -> None:
     assert (repaired.starts_at.hour, repaired.starts_at.minute) == (10, 30)
     assert result.traces[0].diff.changed_items[0].item_id == "b"
     assert result.traces[0].actions[0].violation_code == ViolationCode.TRAVEL_GAP
+    assert result.traces[0].repair_plan.strategy == RepairStrategy.IN_PLACE_REPAIR
+    assert result.traces[0].repair_plan.steps[-1].success_invariant.startswith(
+        "确定性 Verifier"
+    )
+    assert result.traces[0].reverification.engine == "declarative-plan-invariants-v1"
+    assert result.traces[0].reverification.passed
+    assert result.final_reverification == result.traces[0].reverification
 
 
 def test_workflow_repairs_budget_by_removing_lowest_utility_optional_item() -> None:
