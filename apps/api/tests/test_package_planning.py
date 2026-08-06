@@ -2062,3 +2062,45 @@ def test_split_selects_connectable_schedule_and_rejects_only_too_early_one() -> 
     assert PackageViolationCode.TRANSFER_CONNECTION_INFEASIBLE in {
         item.code for item in PackageVerifier().errors(request, invalid, now=VERIFY_AT)
     }
+
+
+def test_platform_input_order_does_not_change_deterministic_result() -> None:
+    """v0.4 exit gate: shuffling provider return order leaves the comparison identical."""
+    request = intent()
+    base = golden_inventory()
+
+    def selected_key(inventory: PackageInventory) -> tuple[str, ...]:
+        candidates = PackagePlanner().generate(request, inventory)
+        best = min(candidates, key=lambda c: c.computed_total_cents)
+        return (best.flight.provider, *tuple(sorted(s.provider for s in best.lodgings)))
+
+    forward = selected_key(base)
+    # Reverse the provider order of the lodging list (provider order must not matter).
+    reversed_inventory = base.model_copy(
+        update={"lodgings": tuple(reversed(base.lodgings))}
+    )
+    backward = selected_key(reversed_inventory)
+    assert forward == backward
+    assert forward[0] == "ctrip"
+
+
+def test_price_tax_scope_mismatch_is_not_silently_compared() -> None:
+    """v0.4 exit gate: offers with different tax scope must not be mixed as equal."""
+    request = intent()
+    base = golden_inventory()
+    # Take one lodging and mark its taxes as NOT included — an incomparable scope.
+    lodgings = list(base.lodgings)
+    altered = lodgings[0].model_copy(update={"taxes_and_fees_included": False})
+    lodgings[0] = altered
+    inventory = base.model_copy(update={"lodgings": tuple(lodgings)})
+
+    candidates = PackagePlanner().generate(request, inventory)
+    for candidate in candidates:
+        tax_mismatch = len(
+            {stay.taxes_and_fees_included for stay in candidate.lodgings}
+        ) > 1
+        if tax_mismatch:
+            # The verifier must surface the incomparable tax scope rather than
+            # treating per-component totals as equivalent.
+            violations = PackageVerifier().errors(request, candidate, now=VERIFY_AT)
+            assert violations, "mixing tax-included and tax-excluded offers must fail"
