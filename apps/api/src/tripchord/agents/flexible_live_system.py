@@ -48,7 +48,6 @@ from tripchord.agents.live_system import (
     LiveRunPurpose,
     SourceExecutionCompleteness,
 )
-from tripchord.platform.terminal import SearchRun
 from tripchord.agents.memory import MemoryAccessContext, MemoryStore
 from tripchord.agents.model_gateway import ModelRouter
 from tripchord.agents.models import AgentRole, AgentTask, PreferenceMode, ToolPermission
@@ -96,6 +95,7 @@ from tripchord.planning.package import (
     TransferOption,
 )
 from tripchord.planning.stay_plans import StayPlanCandidateSet, StayPlanId
+from tripchord.platform.terminal import SearchRun
 from tripchord.providers.browser_bridge import (
     BrowserProvider,
     BrowserSearchQuery,
