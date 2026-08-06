@@ -36,6 +36,12 @@
 - 测试：`test_provider_sdk.py` 6 项。
 - 未接入 registry/selector 的实际使用（现有 v0.2 registry 内核已就绪，SDK 作为外部契约层）。
 
+## v0.8 本地产品体验 — 部分（secret 门已落地）
+
+- `security/secrets.py`：确定性 `redact_secrets` / `contains_secret` / `SecretRedactionPolicy`；main.py 持久化失败日志已脱敏；done-gate 层 1 跑 secret-redaction 测试。
+- 测试：`test_secret_redaction.py` 4 项。
+- 未做：启动器/安装器、首次设置向导、WCAG 审查（待 v0.8 后续）。
+
 ## v1.0 最终产品 Done-Gate — 机器可执行门已落地
 
 - `scripts/run_product_done_gate.py`：六层分门（1 可复现、2 replay、3 干净 Chrome fixture、4 授权模型 smoke、5 真实 canary、6 全平台 E2E），原子输出 `benchmarks/results/product-v1-done-gate.json`。

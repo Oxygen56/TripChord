@@ -10,7 +10,7 @@
 - **当前分支**：`productization/v1.0`
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
-- **最后完成的最小任务**：`scripts/run_product_done_gate.py` 六层机器门 + 原子输出 `benchmarks/results/product-v1-done-gate.json`
+- **最后完成的最小任务**：v0.8 secret-redaction 门 + `scripts/run_product_done_gate.py` 六层机器门 + 原子输出 `benchmarks/results/product-v1-done-gate.json`
 
 ## 版本状态
 
@@ -22,7 +22,7 @@
 | v0.5 官方预订跳转 | 核心已落地 | 每个 handoff 可回链；危险 URL 零放行；旧 receipt 不可用 | `platform/handoff.py` + `test_official_handoff.py`（17 项）；待接入 live 重核价 API |
 | v0.6 已预订保护 | 核心已落地 | 未解除保护组件修改率 0；解除保护显式确认留痕 | `platform/booking.py` + `test_booking_protection.py`（5 项）；待接入 planning/replan 消费 |
 | v0.7 Provider SDK | 核心已落地 | 新 provider 只改 adapter+profile；未认证不进默认选择 | `platform/sdk.py` + `test_provider_sdk.py`（6 项）；未接入 registry/selector 实际使用 |
-| v0.8 本地产品体验 | 未开始 | 全新机器按公开说明完成 replay；秘密不进入日志 | — |
+| v0.8 本地产品体验 | 部分（secret 门已落地） | 全新机器按公开说明完成 replay；秘密不进入日志 | `security/secrets.py` + `test_secret_redaction.py`（redact/contains/policy）；启动器/安装器、向导、WCAG 未做 |
 | v0.9 公测可靠性 | 未开始 | Python/Web/Companion/迁移/benchmark/E2E/安全全入 CI | — |
 | v1.0 最终产品 | 脚本已落地，门未过 | `run_product_done_gate.py` 六层分门真实通过 | `scripts/run_product_done_gate.py` + `benchmarks/results/product-v1-done-gate.json`；本机层 1/2/3 PASS，层 5/6 `pending user authorization`，`passed=false` |
 
@@ -30,7 +30,7 @@
 
 | 命令 | 结果 |
 |---|---|
-| `uv run pytest apps/api/tests/` | 782 passed |
+| `uv run pytest apps/api/tests/` | 786 passed |
 | `npm run build` + `npm test` | build 通过；22 Vitest passed |
 | `uv run ruff check .` | All checks passed |
 | `uv run mypy apps/api/src` | 101 files, no issues |
