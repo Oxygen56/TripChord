@@ -79,9 +79,12 @@ def validate_capability_profile(capability: ProviderCapability) -> None:
             raise CapabilityProfileValidationError(
                 "certified-active capability requires official domains"
             )
-        if not capability.host_permissions:
+        # A public-API scope (no login precheck, no browser automation) needs no
+        # host permissions; a browser scope must declare the audited allowlist.
+        if not capability.host_permissions and capability.login_precheck_required:
             raise CapabilityProfileValidationError(
-                "certified-active capability requires host permissions"
+                "certified-active capability requires host permissions "
+                "when browser login precheck is required"
             )
         has_locator = (
             capability.supports_stable_detail_page

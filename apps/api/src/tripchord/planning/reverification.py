@@ -20,6 +20,7 @@ class PlanInvariantCode(StrEnum):
     BUDGET_ARITHMETIC = "budget_arithmetic"
     REQUIRED_PROVENANCE = "required_provenance"
     TRAVEL_GAPS = "travel_gaps"
+    PROTECTED_COMPONENTS_PRESERVED = "protected_components_preserved"
 
 
 class PlanInvariantCheck(DomainModel):
@@ -66,6 +67,7 @@ class DeclarativePlanReVerifier:
             self._budget(spec, after),
             self._provenance(after),
             self._travel_gaps(after, verification_context),
+            self._protected_components(before, after, diff, verification_context),
         )
         return PlanReverificationReport(
             before_plan_id=before.id,
@@ -265,6 +267,59 @@ class DeclarativePlanReVerifier:
             not invalid,
             "显式交通间隔必须在独立重算后仍满足",
             tuple(sorted(invalid)),
+        )
+
+    def _protected_components(
+        self,
+        before: PlanVersion,
+        after: PlanVersion,
+        diff: PlanDiff,
+        context: VerificationContext,
+    ) -> PlanInvariantCheck:
+        """v0.6 invariant: no protected component may be removed or changed
+        without an explicitly applied override."""
+        ledger = context.booking_ledger
+        if ledger is None:
+            return self._check(
+                PlanInvariantCode.PROTECTED_COMPONENTS_PRESERVED,
+                True,
+                "没有已预订约束，保护不变量通过",
+            )
+        protected_ids = {fact.component_id for fact in ledger.facts}
+        if not protected_ids:
+            return self._check(
+                PlanInvariantCode.PROTECTED_COMPONENTS_PRESERVED,
+                True,
+                "无已预订组件，保护不变量通过",
+            )
+        changed_ids = {item.item_id for item in diff.changed_items}
+        touched = set(diff.removed_item_ids) | changed_ids
+        after_ids = {item.id for item in after.items}
+        # An applied override explicitly un-protects a component for this round.
+        applied_override_ids = {
+            override.component_id
+            for override in ledger.overrides
+            if override.state.value == "applied"
+        }
+        violations: set[str] = set()
+        for component_id in sorted(protected_ids):
+            if component_id in applied_override_ids:
+                continue
+            if component_id in touched or component_id not in after_ids:
+                violations.add(component_id)
+        if violations:
+            return self._check(
+                PlanInvariantCode.PROTECTED_COMPONENTS_PRESERVED,
+                False,
+                "已预订组件被删除或修改而未应用解除保护: "
+                + ", ".join(sorted(violations)),
+                tuple(sorted(violations)),
+            )
+        return self._check(
+            PlanInvariantCode.PROTECTED_COMPONENTS_PRESERVED,
+            True,
+            "所有已预订组件均被保留且未静默修改",
+            tuple(sorted(protected_ids)),
         )
 
     def _check(

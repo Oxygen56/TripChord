@@ -17,6 +17,7 @@ from tripchord.domain.itinerary import (
 )
 from tripchord.domain.offers import TravelOffer
 from tripchord.domain.trip import TripSpec
+from tripchord.platform.booking import BookingLedger
 
 
 class VerificationMode(StrEnum):
@@ -34,6 +35,9 @@ class VerificationContext(DomainModel):
     mode: VerificationMode = VerificationMode.DRAFT
     offers: tuple[TravelOffer, ...] = ()
     travel_requirements: tuple[TravelRequirement, ...] = ()
+    # v0.6 wiring: when a plan has a booking ledger, the verifier must not
+    # silently drop a protected component.
+    booking_ledger: BookingLedger | None = None
 
 
 class PlanVerifier:
@@ -55,6 +59,7 @@ class PlanVerifier:
         violations.extend(self._check_must_visit(spec, plan))
         violations.extend(self._check_travel_gaps(plan, verification_context))
         violations.extend(self._check_offers(plan, verification_context))
+        violations.extend(self._check_protected_components(plan, verification_context))
         return tuple(violations)
 
     def _check_trip_dates(self, spec: TripSpec, plan: PlanVersion) -> list[Violation]:
@@ -236,6 +241,40 @@ class PlanVerifier:
                         message=f"{item.title} must be repriced before confirmation",
                         item_ids=(item.id,),
                         details={"offer_id": offer.id},
+                    )
+                )
+        return result
+
+    def _check_protected_components(
+        self,
+        plan: PlanVersion,
+        context: VerificationContext,
+    ) -> list[Violation]:
+        """A protected (booked) component must still be present in the plan.
+
+        The full before/after modification invariant lives in the ReVerifier
+        (which sees the diff); here we fail closed on the simplest violation a
+        single-plan verifier can prove: a protected component that vanished.
+        """
+        ledger = context.booking_ledger
+        if ledger is None:
+            return []
+        protected_ids = {fact.component_id for fact in ledger.facts}
+        if not protected_ids:
+            return []
+        present_ids = {item.id for item in plan.items}
+        result: list[Violation] = []
+        for component_id in sorted(protected_ids):
+            if component_id not in present_ids:
+                result.append(
+                    Violation(
+                        code=ViolationCode.MISSING_PROVENANCE,
+                        severity=ViolationSeverity.ERROR,
+                        message=(
+                            f"protected component {component_id!r} is missing from "
+                            "the plan; booked components may not be dropped"
+                        ),
+                        item_ids=(component_id,),
                     )
                 )
         return result

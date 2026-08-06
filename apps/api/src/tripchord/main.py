@@ -184,6 +184,7 @@ from tripchord.platform.adapters import (
 )
 from tripchord.platform.api import guard_live_start
 from tripchord.platform.api import router as provider_api_router
+from tripchord.platform.wiring_api import router as wiring_api_router
 from tripchord.platform.capability import ProviderVertical
 from tripchord.platform.registry import build_default_registry
 from tripchord.platform.search_run_builder import build_search_run, derive_scope_from_task_id
@@ -1036,7 +1037,18 @@ app.state.context_builder = context_builder
 app.state.live_planning_job_registry = live_planning_job_registry
 app.state.database = database
 app.state.provider_registry = build_default_registry()
+from tripchord.persistence.booking_ledger import BookingLedgerStore
+from tripchord.persistence.handoff_store import HandoffStore
+
+app.state.handoff_store = HandoffStore()
+app.state.booking_ledger_store = BookingLedgerStore()
+app.state.provider_cooldown_overlay: dict[str, dict] = {}
+app.state.provider_adapter_registry: dict[str, object] = {}
+# Inject a quote-source factory in tests/fixtures to exercise the reprice chain
+# without a real OTA session; absent it, the endpoint reports live-unavailable.
+app.state.reprice_quote_source_factory = None
 app.include_router(provider_api_router)
+app.include_router(wiring_api_router)
 browser_task_bridge, live_package_agent_system = _install_browser_bridge(
     app,
     settings,
