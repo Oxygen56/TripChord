@@ -154,6 +154,20 @@ class ContextPack(DomainModel):
     built_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class DependencyPolicy(StrEnum):
+    """How a task's dependencies must finish before it becomes runnable.
+
+    ``ALL_SUCCEEDED`` is the historical semantics: every dependency must
+    succeed.  ``ALL_TERMINAL`` (v0.3) releases the barrier (settle node) once
+    every dependency reached a typed terminal result — success or a real typed
+    failure such as ``login_required`` / ``timed_out`` / ``cancelled`` — but
+    never for a ``dependency_blocked`` placeholder that never actually ran.
+    """
+
+    ALL_SUCCEEDED = "all_succeeded"
+    ALL_TERMINAL = "all_terminal"
+
+
 class AgentTask(DomainModel):
     id: str = Field(min_length=1)
     role: AgentRole
@@ -161,6 +175,7 @@ class AgentTask(DomainModel):
     context_topics: tuple[str, ...] = ()
     allowed_tools: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
+    dependency_policy: DependencyPolicy = DependencyPolicy.ALL_SUCCEEDED
     input: dict[str, JsonValue] = Field(default_factory=dict)
     priority: int = Field(default=0, ge=-100, le=100)
     max_attempts: int = Field(default=2, ge=1, le=10)
@@ -201,6 +216,11 @@ class TaskGraph(DomainModel):
         return self
 
 
+# Failure classes that mean a task never actually executed, so they are NOT a
+# real terminal state and must not release an ALL_TERMINAL barrier.
+_NON_TERMINAL_FAILURE_CLASSES: frozenset[str] = frozenset({"dependency_blocked"})
+
+
 class AgentTaskResult(DomainModel):
     task_id: str
     agent_role: AgentRole
@@ -219,6 +239,21 @@ class AgentTaskResult(DomainModel):
         if not self.success and not self.failure_class:
             raise ValueError("failed task results require a failure_class")
         return self
+
+    @property
+    def terminal(self) -> bool:
+        """Whether this result is a real typed terminal state.
+
+        A successful result is always terminal.  A failed result is terminal
+        only when it carries a real typed failure (login_required, timed_out,
+        cancelled, dom_drift, ...) — never for a ``dependency_blocked``
+        placeholder that never actually executed.
+        """
+        if self.success:
+            return True
+        if self.failure_class is None:
+            return False
+        return self.failure_class not in _NON_TERMINAL_FAILURE_CLASSES
 
 
 class TraceEvent(DomainModel):

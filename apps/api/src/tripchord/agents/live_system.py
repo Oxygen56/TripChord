@@ -66,6 +66,7 @@ from tripchord.agents.models import (
     AgentRole,
     AgentTask,
     AgentTaskResult,
+    DependencyPolicy,
     EvidenceRecord,
     TaskGraph,
     ToolPermission,
@@ -1313,6 +1314,7 @@ class _RunState:
     stay_plan_candidate_set: StayPlanCandidateSet | None = None
     public_transfer_requested: bool = False
     public_transfer_task_ids: tuple[str, ...] = ()
+    barrier_released_at: datetime | None = None
     search_supervisor_proposal: SearchSupervisorProposal | None = None
     search_schedule: AppliedSearchSchedule | None = None
     source_schedule_started_monotonic: float | None = None
@@ -1579,6 +1581,18 @@ class LivePackageAgentSystem:
                 search_supervisor_task,
                 *scheduled_source_tasks,
                 AgentTask(
+                    id="settle-source-barrier",
+                    role=AgentRole.EXECUTOR,
+                    goal=(
+                        "确定性 ALL_TERMINAL 屏障：等待全部已选 Source 进入类型化"
+                        "终态（含登录、验证码、DOM 漂移、超时与取消），随后放行 Normalizer；"
+                        "不把失败来源伪装成 success"
+                    ),
+                    dependencies=all_source_ids,
+                    dependency_policy=DependencyPolicy.ALL_TERMINAL,
+                    max_attempts=1,
+                ),
+                AgentTask(
                     id="normalize-browser-quotes",
                     role=AgentRole.RECEIPT_VERIFIER,
                     goal=(
@@ -1586,7 +1600,7 @@ class LivePackageAgentSystem:
                         f"{len(browser_source_tasks)} 路浏览器报价，"
                         "并合并不升级价格真值的官方接驳证据"
                     ),
-                    dependencies=all_source_ids,
+                    dependencies=("settle-source-barrier",),
                     max_attempts=1,
                 ),
                 AgentTask(
@@ -4540,6 +4554,12 @@ class LivePackageAgentSystem:
         registry.register(FunctionAgent(AgentRole.LODGING, source))
         registry.register(
             FunctionAgent(
+                AgentRole.EXECUTOR,
+                self._settle_executor(state),
+            )
+        )
+        registry.register(
+            FunctionAgent(
                 AgentRole.RECEIPT_VERIFIER,
                 self._normalize_executor(state),
             )
@@ -5056,6 +5076,47 @@ class LivePackageAgentSystem:
                         task,
                         topic=topic,
                         subject=subject,
+                        payload=output,
+                    ),
+                ),
+            )
+
+        return execute
+
+    def _settle_executor(
+        self,
+        state: _RunState,
+    ) -> AgentFunction:
+        async def execute(
+            task: AgentTask,
+            _: ContextEngine,
+            __: ToolRegistry,
+        ) -> AgentTaskResult:
+            now = self._utc_now()
+            state.barrier_released_at = now
+            terminal_source_ids = tuple(
+                task_id for task_id in state.source_task_ids
+            )
+            output: dict[str, JsonValue] = {
+                "barrier": "released",
+                "terminal_source_ids": list(terminal_source_ids),
+                "source_error_count": len(state.source_errors),
+            }
+            summary = (
+                f"全部 {len(terminal_source_ids)} 个已选 Source 已进入类型化终态；"
+                f"登录/验证码/DOM 漂移/超时/取消按原终态保留，不伪装为 success"
+            )
+            return AgentTaskResult(
+                task_id=task.id,
+                agent_role=task.role,
+                success=True,
+                summary=summary,
+                output=output,
+                evidence=(
+                    self._evidence(
+                        task,
+                        topic="completion_barrier",
+                        subject=task.id,
                         payload=output,
                     ),
                 ),

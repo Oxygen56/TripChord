@@ -12,11 +12,19 @@ from tripchord.agents.models import (
     AgentRole,
     AgentTask,
     AgentTaskResult,
+    DependencyPolicy,
     TaskGraph,
     TraceEvent,
 )
 from tripchord.agents.tools import ToolRegistry
 from tripchord.domain.common import DomainModel
+
+
+def _dependency_met(result: AgentTaskResult, policy: DependencyPolicy) -> bool:
+    """Whether one dependency result releases a task under a dependency policy."""
+    if policy is DependencyPolicy.ALL_TERMINAL:
+        return result.terminal
+    return result.success
 
 
 class AgentExecutor(Protocol):
@@ -196,7 +204,8 @@ class DynamicTaskScheduler:
                     for task_id, task in tasks.items()
                     if task_id not in results
                     and all(
-                        dependency in results and results[dependency].success
+                        dependency in results
+                        and _dependency_met(results[dependency], task.dependency_policy)
                         for dependency in task.dependencies
                     )
                 )
@@ -396,7 +405,8 @@ class DynamicTaskScheduler:
                 task
                 for task in pending
                 if all(
-                    dependency in results and results[dependency].success
+                    dependency in results
+                    and _dependency_met(results[dependency], task.dependency_policy)
                     for dependency in task.dependencies
                 )
             ]
@@ -406,7 +416,8 @@ class DynamicTaskScheduler:
                     failed_dependencies = [
                         dependency
                         for dependency in task.dependencies
-                        if dependency in results and not results[dependency].success
+                        if dependency in results
+                        and not _dependency_met(results[dependency], task.dependency_policy)
                     ]
                     result = AgentTaskResult(
                         task_id=task.id,

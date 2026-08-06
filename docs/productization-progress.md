@@ -6,18 +6,19 @@
 
 ## 当前状态
 
-- **当前版本**：v0.2 已完成（有条件通过），v0.3 待开始
+- **当前版本**：v0.3 实施中（核心屏障机制已完成并测试；SSE 屏障前 gating 未做）
 - **当前分支**：`productization/v1.0`
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
-- **最后完成的最小任务**：v0.2 全量交付并提交（platform 内核 + API 矩阵 + Companion 心跳 + 前端矩阵 UI + 动态 DAG 测试 + phase review）
+- **最后完成的最小任务**：v0.3 ALL_TERMINAL 调度依赖 + 终态模型 + settle 节点接入 live DAG
 
 ## 版本状态
 
 | 版本 | 状态 | 退出门摘要 | 证据/说明 |
 |---|---|---|---|
 | v0.2 动态平台内核 | 有条件通过 | 0/1/2/3/4 平台回放正确 DAG；关闭 scope 零访问；伪造 snapshot 原子拒绝；旧三平台兼容不回退 | `docs/phase-reviews/product-v0.2.md`；deviation：provider selection 未落 DB（v0.9 补）、真实 Companion 授权未本机验证 |
-| v0.3 全来源终态屏障 | 未开始 | Planner 严格晚于最后 Source 终态；无 queued/running 发布路径；零报价无预算 | — |
+| v0.3 全来源终态屏障 | 实现中 | Planner 严格晚于最后 Source 终态；无 queued/running 发布路径；零报价无预算 | 调度器 `ALL_TERMINAL` + `AgentTaskResult.terminal` + SearchRun/SourceAttempt/TerminalReceipt/CompletionBarrier + settle 节点入 live DAG；SSE 屏障前 gating 待完成 |
+| v0.4 跨平台最终方案 | 未开始 | A 平台机票 + B 平台酒店；金额/权益无错配；Repair 后 ReVerifier 重算 | — |
 | v0.4 跨平台最终方案 | 未开始 | A 平台机票 + B 平台酒店；金额/权益无错配；Repair 后 ReVerifier 重算 | — |
 | v0.5 官方预订跳转 | 未开始 | 每个 handoff 可回链；危险 URL 零放行；旧 receipt 不可用 | — |
 | v0.6 已预订保护 | 未开始 | 未解除保护组件修改率 0；解除保护显式确认留痕 | — |
