@@ -6,11 +6,11 @@
 
 ## 当前状态
 
-- **当前版本**：v1.0 Done-Gate 脚本已落地（六层机器门，层 5/6 待用户授权）；本次运行收尾
-- **当前分支**：`productization/v1.0`
+- **当前版本**：v1.0 Done-Gate 持续推进（第三轮收尾）；六层机器门层 1/2/3 PASS、层 4 因未授权模型成本 SKIP、层 5/6 待用户授权
+- **当前分支**：`productization/v1.0`（未 push）
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
-- **最后完成的最小任务**：v0.8 secret-redaction 门 + `scripts/run_product_done_gate.py` 六层机器门 + 原子输出 `benchmarks/results/product-v1-done-gate.json`
+- **最后完成的最小任务**：v0.5/v0.6/v0.7 接入生产路径（reprice 服务 + 预订保护 gate + SDK 冷却/一致性 API + 前端两步 handoff 流）+ v0.8 启动器/向导 + v0.9 CI/可观测性 + 五类反表面验收基准
 
 ## 版本状态
 
@@ -19,39 +19,43 @@
 | v0.2 动态平台内核 | 有条件通过 | 0/1/2/3/4 平台回放正确 DAG；关闭 scope 零访问；伪造 snapshot 原子拒绝；旧三平台兼容不回退 | `docs/phase-reviews/product-v0.2.md`；deviation：provider selection 已补 DB 迁移（migration `20260806_0002` + `ProviderSelectionRepository`，JSON 降级保留）；真实 Companion 授权本机验证待用户授权 |
 | v0.3 全来源终态屏障 | 通过 | Planner 严格晚于最后 Source 终态；无 queued/running 发布路径；零报价无预算 | `docs/phase-reviews/product-v0.3.md` 已更新为「通过」；三项遗留已补 |
 | v0.4 跨平台最终方案 | 通过 | A 平台机票 + B 平台酒店；金额/权益无错配；Repair 后 ReVerifier 重算 | 方案 UI 覆盖解释已落地；确定性/税口门保持 |
-| v0.5 官方预订跳转 | 核心已落地 | 每个 handoff 可回链；危险 URL 零放行；旧 receipt 不可用 | `platform/handoff.py` + `test_official_handoff.py`（17 项）；待接入 live 重核价 API |
-| v0.6 已预订保护 | 核心已落地 | 未解除保护组件修改率 0；解除保护显式确认留痕 | `platform/booking.py` + `test_booking_protection.py`（5 项）；待接入 planning/replan 消费 |
-| v0.7 Provider SDK | 核心已落地 | 新 provider 只改 adapter+profile；未认证不进默认选择 | `platform/sdk.py` + `test_provider_sdk.py`（6 项）；未接入 registry/selector 实际使用 |
-| v0.8 本地产品体验 | 部分（secret 门已落地） | 全新机器按公开说明完成 replay；秘密不进入日志 | `security/secrets.py` + `test_secret_redaction.py`（redact/contains/policy）；启动器/安装器、向导、WCAG 未做 |
-| v0.9 公测可靠性 | 未开始 | Python/Web/Companion/迁移/benchmark/E2E/安全全入 CI | — |
-| v1.0 最终产品 | 脚本已落地，门未过 | `run_product_done_gate.py` 六层分门真实通过 | `scripts/run_product_done_gate.py` + `benchmarks/results/product-v1-done-gate.json`；本机层 1/2/3 PASS，层 5/6 `pending user authorization`，`passed=false` |
+| v0.5 官方预订跳转 | 生产路径已接入 | 每个 handoff 可回链；危险 URL 零放行；旧 receipt 不可用；无稳定 deep-link 安全降级 | `platform/reprice.py`（ComponentRepriceService 接 live 重核价）+ `persistence/handoff_store.py` + `platform/wiring_api.py` reprice/consume 端点 + 前端 `HandoffActionBar` 两步流；`test_reprice_service.py`（9 项）+ `test_wiring_api.py`；真实 OTA 重核价仍需授权 Companion 会话 |
+| v0.6 已预订保护 | 生产路径已接入 | 未解除保护组件修改率 0；解除保护显式确认留痕 | `platform/booking_gate.py`（BookingProtectionGate/BookingService）+ `persistence/booking_ledger.py` + acknowledge/override/resolve/ledger 端点；PlanVerifier `_check_protected_components` + ReVerifier `PROTECTED_COMPONENTS_PRESERVED` 不变量；`test_booking_gate.py`（11 项）+ `test_booking_planning_integration.py`（5 项） |
+| v0.7 Provider SDK | 接线完成 | 新 provider 只改 adapter+profile；未认证不进默认选择 | SDK 一致性 runner 接 registry；`POST /providers/{scope}/cooldown` 一键冷却 + `GET /providers/sdk/conformance`；certified-active 公共 API scope 不再强制 host_permissions |
+| v0.8 本地产品体验 | 部分（secret 门 + 启动器/向导已落地） | 全新机器按公开说明完成 replay；秘密不进入日志 | `security/secrets.py` + `scripts/tripchord_launcher.py`（check/setup/wizard/api/web）+ `docs/wcag-audit.md`（键盘/焦点/非颜色已补；字号/aria-live 为已知缺口）；首次设置向导逐平台权限与登录健康需真实 Companion 授权后确认 |
+| v0.9 公测可靠性 | 部分（CI/安全/可观测性已接入） | Python/Web/Companion/迁移/benchmark/E2E/安全全入 CI | CI 新增 `companion` release-gate job、`security`（gitleaks + pip-audit）、acceptance/faults benchmark；`GET /api/v1/observability/summary`；job 已 DB 化；monitor 进程内（重启需重开，已知） |
+| v1.0 最终产品 | 脚本持续推进，门未过 | `run_product_done_gate.py` 六层分门真实通过 | 本机层 1/2/3 PASS；层 4 SKIP（`TRIPCHORD_ACK_MODEL_COST` 未授权，不发起付费模型调用）；层 5/6 `pending user authorization`；`passed=false` 如实；`benchmarks/evaluate_acceptance.py` 五类反表面全 PASS |
 
 ## 本次运行验证结果（精确）
 
 | 命令 | 结果 |
 |---|---|
-| `uv run pytest apps/api/tests/` | 786 passed |
-| `npm run build` + `npm test` | build 通过；22 Vitest passed |
+| `uv run pytest apps/api/tests/ scripts/tests/` | 840 passed |
+| `npm run build` + `npm test` | build 通过；24 Vitest passed |
 | `uv run ruff check .` | All checks passed |
-| `uv run mypy apps/api/src` | 101 files, no issues |
+| `uv run mypy apps/api/src` | 101+ files, no issues |
 | `uv run python benchmarks/evaluate.py` 等 4 个 | exit 0 |
+| `uv run python benchmarks/evaluate_acceptance.py` | 五类反表面全 PASS（原子输出 `benchmarks/results/product-acceptance.json`） |
+| `uv run python scripts/tripchord_launcher.py check/wizard` | 通过；不访问真实 OTA、不发起付费模型调用 |
 | `uv run python scripts/browser_companion_release_gate.py` | PASS（build SHA `6261fdb1…`） |
 | `train_sft/train_dpo/policy_reranker --validate-only` | exit 0 |
 | `alembic upgrade head` / `alembic check`（临时 DB） | 通过 / No new upgrade operations |
 | `npm audit --omit=dev --audit-level=high` | 0 vulnerabilities |
 | `git diff --check` | 通过 |
-| `scripts/run_product_done_gate.py` | `passed=false`（层 5/6 待用户授权），退出码 2 |
+| `scripts/run_product_done_gate.py` | 层 1/2/3 PASS；层 4 SKIP（未授权模型成本）；层 5/6 `pending user authorization`；`passed=false`，退出码 2（如实） |
 
 ## 当前可对外声明
 
-- v0.3 三项遗留、v0.4 收尾、v0.2 provider-selection DB 迁移、v0.5/v0.6/v0.7 确定性核心、v1.0 Done-Gate 机器门脚本。
+- v0.5/v0.6/v0.7 接入生产路径：reprice/handoff 端点 + 前端两步 handoff 流；预订保护 gate 被 Verifier/ReVerifier 消费；SDK 冷却/一致性 API 接线。
+- v0.8 启动器/向导、v0.9 CI（Companion release gate + 安全扫描 + acceptance/faults benchmark）、本地可观测性端点。
+- 五类反表面端到端验收全 PASS（`benchmarks/evaluate_acceptance.py`）。
 - 不做任何 Done-Gate 通过 / 双平台住宿精确报价 / 完整 OTA 闭环声明。
 
 ## 绝对不能声明
 
 - 任何"Done-Gate 已通过""双平台住宿精确报价""完整 OTA 闭环"。
 - 任何把 login/captcha/pending/empty/timed_out 包装成报价的行为。
-- 任何"代码完成=已验证"的表述（v0.5/v0.6/v0.7 仅确定性核心，未接生产路径）。
+- 任何"代码完成=已验证"的表述：真实 OTA 重核价、真实 canary、全平台 E2E 均未执行（需用户授权官方域名并保持登录态）。
 
 ## 下一条可直接执行的命令
 
@@ -59,7 +63,7 @@
 cd /Users/oxygen/Documents/个人项目/tripchord
 uv run python scripts/run_product_done_gate.py
 ```
-（设置 `TRIPCHORD_BROWSER_BRIDGE_TOKEN` 并保持官方 OTA 域名登录后，层 5/6 才会实际执行。）
+（设置 `TRIPCHORD_BROWSER_BRIDGE_TOKEN` 并保持官方 OTA 域名登录后，层 5/6 才会实际执行；设置 `TRIPCHORD_ACK_MODEL_COST=1` 且提供可解析模型端点后，层 4 才会实际运行。）
 
 ## 基线记录（业务代码修改前）
 
