@@ -5,6 +5,7 @@ import {
   cancelLiveFlexiblePlanningJob,
   checkLiveMonitorNow,
   checkLiveBridgeHealth,
+  consumeHandoff,
   getLiveFlexiblePlanningJob,
   getAgenticMetricsPresentation,
   getBreakfastPreferenceApplication,
@@ -13,6 +14,7 @@ import {
   normalizeBreakfastWeight,
   requireLiveBridgeAvailability,
   replanLivePackage,
+  repriceComponent,
   revokeAgentPreferenceMemory,
   resolveFlexibleOption,
   runLiveFlexiblePlanningFromText,
@@ -804,5 +806,68 @@ describe("real multi-platform API boundary", () => {
       "/api/v1/agents/memory/memory%2Fuser%2Fpreference%2Fhotel_breakfast",
     );
     expect(init.method).toBe("DELETE");
+  });
+});
+
+describe("v0.5 official-handoff API", () => {
+  it("repriceComponent posts to the per-component reprice endpoint", async () => {
+    const fetchMock = vi.fn(async (_path: string, _init?: RequestInit) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => ({
+          run_id: "run-1",
+          component_id: "comp-1",
+          plan_version: "run-1",
+          scope_key: "ctrip:flight",
+          outcome: "unchanged",
+          live_mode: "fixture",
+          revalidation_receipt: {
+            receipt_id: "receipt-1",
+            outcome: "unchanged",
+            total_for_party_cents: 120000,
+          },
+          checklist: {
+            component_id: "comp-1",
+            suggested_next_step: "go_to_official",
+            official_handoff: { handoff_id: "handoff-1", url: "https://flights.ctrip.com/x" },
+          },
+        }),
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await repriceComponent("run-1", "comp-1");
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+
+    expect(response.outcome).toBe("unchanged");
+    expect(response.checklist?.suggested_next_step).toBe("go_to_official");
+    expect(path).toBe("/api/v1/agents/live-plans/run-1/components/comp-1/reprice");
+    expect(init.method).toBe("POST");
+  });
+
+  it("consumeHandoff posts handoff id and never marks booked", async () => {
+    const fetchMock = vi.fn(async (_path: string, _init?: RequestInit) =>
+      Promise.resolve({
+        ok: true,
+        json: async () => ({
+          handoff_id: "handoff-1",
+          consumed: true,
+          state: "used",
+          booked: false,
+        }),
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await consumeHandoff("run-1", "comp-1", "handoff-1");
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+
+    expect(response.consumed).toBe(true);
+    expect(response.booked).toBe(false);
+    expect(path).toBe(
+      "/api/v1/agents/live-plans/run-1/components/comp-1/handoff/consume",
+    );
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({ handoff_id: "handoff-1" });
   });
 });

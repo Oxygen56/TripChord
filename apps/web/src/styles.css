@@ -376,6 +376,18 @@ h1 { font-family: "Noto Sans SC", sans-serif; margin: 0; font-size: clamp(40px, 
 .freshness-grid em.fresh { background: #e8f5ec; color: #27734e; }
 .freshness-grid em.expired { background: #ffebe6; color: #9a4e43; }
 .freshness-grid em.unknown { background: #f0f1ee; color: #6f7c76; }
+
+/* v0.5 two-step official-handoff action bar */
+.handoff-actions { display: flex; flex-direction: column; gap: 6px; margin-top: 9px; padding-top: 9px; border-top: 1px dashed #d8ded7; }
+.handoff-actions button { border: none; border-radius: 8px; padding: 7px 10px; font-size: 8px; font-weight: 800; cursor: pointer; }
+.handoff-actions button:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+.handoff-actions .reprice-btn { background: #eef3fb; color: #234d8f; }
+.handoff-actions .reprice-btn:disabled { opacity: 0.55; cursor: progress; }
+.handoff-actions .official-btn { background: #234d8f; color: #ffffff; }
+.handoff-actions .reprice-outcome { font-size: 7px; font-weight: 700; color: #6f7c76; }
+.handoff-actions .reprice-outcome.unchanged { color: #27734e; }
+.handoff-actions .reprice-outcome.changed { color: #b0602f; }
+.handoff-actions .reprice-error { font-size: 7px; color: #9a4e43; }
 .freshness-grid p { margin: 8px 0 4px; overflow: hidden; color: #50685e; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .freshness-grid small { display: block; color: #89958f; font-size: 7px; line-height: 1.45; }
 .evidence-ledger { margin-top: 10px; padding: 11px 12px; border: 1px solid #dfe5df; border-radius: 11px; font-size: 9px; }

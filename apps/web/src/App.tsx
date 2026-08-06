@@ -9,7 +9,10 @@ import {
   checkLiveBridgeHealth,
   comparePlans,
   confirmAgentPreferenceMemory,
+  consumeHandoff,
   fetchProviderCapabilities,
+  repriceComponent,
+  type RepriceComponentResponse,
   getAgenticMetricsPresentation,
   getBreakfastPreferenceApplication,
   getLiveMonitor,
@@ -856,6 +859,87 @@ function FlexiblePlanningSummary({
   );
 }
 
+function HandoffActionBar({
+  runId,
+  componentId,
+}: {
+  runId: string;
+  componentId: string;
+}) {
+  const [state, setState] = useState<"idle" | "repricing" | "ready" | "error">("idle");
+  const [result, setResult] = useState<RepriceComponentResponse | null>(null);
+  const [error, setError] = useState("");
+  const [consumed, setConsumed] = useState(false);
+
+  async function startReprice() {
+    setState("repricing");
+    setError("");
+    try {
+      const response = await repriceComponent(runId, componentId);
+      setResult(response);
+      setState("ready");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "重核价失败");
+      setState("error");
+    }
+  }
+
+  async function goToOfficial(handoffId: string, url: string) {
+    // Two-step flow: the user explicitly clicks "去官方页面". Opening the
+    // official page never creates a booked state and never focuses the tab
+    // automatically beyond this one user action.
+    const consume = await consumeHandoff(runId, componentId, handoffId).catch(
+      () => null,
+    );
+    if (consume) setConsumed(consume.consumed);
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+
+  const checklist = result?.checklist ?? null;
+  const handoff = checklist?.official_handoff ?? null;
+  const receipt = result?.revalidation_receipt ?? null;
+  const canGo = checklist?.suggested_next_step === "go_to_official" && handoff && !consumed;
+
+  return (
+    <div className="handoff-actions">
+      <button
+        type="button"
+        className="reprice-btn"
+        disabled={state === "repricing"}
+        onClick={() => void startReprice()}
+      >
+        {state === "repricing" ? "重核价中…" : "重核价并查看差异"}
+      </button>
+      {canGo && (
+        <button
+          type="button"
+          className="official-btn"
+          onClick={() => void goToOfficial(handoff.handoff_id, handoff.url)}
+        >
+          去官方页面
+        </button>
+      )}
+      {result && (
+        <small className={`reprice-outcome ${result.outcome}`}>
+          {result.outcome === "unchanged" && receipt
+            ? `价格未变 · ${formatCents(receipt.total_for_party_cents ?? 0, "CNY")}`
+            : result.outcome === "changed"
+              ? "价格有变化，旧 handoff 已失效"
+              : result.outcome === "not_found"
+                ? "该组件暂无法重核价"
+                : result.outcome === "live_unavailable"
+                  ? "需要授权 Companion 会话才能实时重核价"
+                  : result.blocked_reason ?? "无法重核价"}
+        </small>
+      )}
+      {handoff && !canGo && result?.outcome === "unchanged" && (
+        <small className="reprice-outcome unchanged">handoff 已使用（单次有效）</small>
+      )}
+      {error && <small className="reprice-error">{error}</small>}
+    </div>
+  );
+}
+
 function LivePackageConsole({
   run,
   runId,
@@ -1288,6 +1372,7 @@ function LivePackageConsole({
                     </div>
                     <p>{formatCents(quote.total_for_party_cents, quote.currency)} · {quote.id}</p>
                     <small>采集 {formatDateTime(quote.captured_at)} · 到期 {formatDateTime(quote.expires_at)}</small>
+                    <HandoffActionBar runId={runId} componentId={quote.id} />
                   </article>
                 );
               })}

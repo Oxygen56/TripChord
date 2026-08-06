@@ -1511,3 +1511,92 @@ export function subscribeToJob(
     if (timer) clearTimeout(timer);
   };
 }
+
+// ---------------------------------------------------------------------------
+// v0.5 official-handoff two-step flow (reprice -> go to official page)
+// ---------------------------------------------------------------------------
+
+export type RevalidationReceiptDTO = {
+  receipt_id: string;
+  plan_version: string;
+  component_id: string;
+  scope: { provider: string; vertical: string };
+  quote_id: string;
+  revalidated_at: string;
+  expires_at: string;
+  outcome: "unchanged" | "changed" | "not_found";
+  total_for_party_cents: number | null;
+};
+
+export type OfficialHandoffDTO = {
+  handoff_id: string;
+  plan_version: string;
+  component_id: string;
+  scope: { provider: string; vertical: string };
+  url: string;
+  query_fingerprint_sha256: string;
+  revalidation_receipt_sha256: string;
+  created_at: string;
+  expires_at: string;
+  state: string;
+  hops: number;
+};
+
+export type ComponentHandoffChecklistDTO = {
+  component_id: string;
+  plan_version: string;
+  scope: { provider: string; vertical: string };
+  reprice_url: string | null;
+  official_handoff: OfficialHandoffDTO | null;
+  revalidation_receipt: RevalidationReceiptDTO | null;
+  suggested_next_step: string;
+};
+
+export type RepriceComponentResponse = {
+  run_id: string;
+  component_id: string;
+  plan_version: string;
+  scope_key: string;
+  outcome: string;
+  live_mode: string;
+  revalidation_receipt: RevalidationReceiptDTO | null;
+  checklist: ComponentHandoffChecklistDTO | null;
+  blocked_reason: string | null;
+};
+
+export type ConsumeHandoffResponse = {
+  handoff_id: string;
+  consumed: boolean;
+  state: string;
+  booked: boolean;
+};
+
+/** Re-price exactly one component (same provider x component) and build the
+ * two-step official-handoff checklist.  Never re-runs the whole trip and never
+ * creates a booked state. */
+export function repriceComponent(
+  runId: string,
+  componentId: string,
+): Promise<RepriceComponentResponse> {
+  return request(
+    `/api/v1/agents/live-plans/${encodeURIComponent(runId)}/components/${encodeURIComponent(
+      componentId,
+    )}/reprice`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+}
+
+/** Mark an official handoff single-used.  This is the only transition to
+ * ``used`` — it never produces a booked state. */
+export function consumeHandoff(
+  runId: string,
+  componentId: string,
+  handoffId: string,
+): Promise<ConsumeHandoffResponse> {
+  return request(
+    `/api/v1/agents/live-plans/${encodeURIComponent(runId)}/components/${encodeURIComponent(
+      componentId,
+    )}/handoff/consume`,
+    { method: "POST", body: JSON.stringify({ handoff_id: handoffId }) },
+  );
+}
