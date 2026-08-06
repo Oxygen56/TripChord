@@ -315,6 +315,61 @@ export type LivePlatformSearchCoverage = {
   complete: boolean;
 };
 
+export type LiveSourceExecutionCompleteness = {
+  expected_provider_count: number;
+  complete_provider_count: number;
+  expected_source_ids: string[];
+  terminal_source_ids: string[];
+  incomplete_source_ids: string[];
+  complete: boolean;
+};
+
+export type LiveLodgingProviderQuoteEvidence = {
+  provider: string;
+  source_task_id: string;
+  inventory_state: string | null;
+  quote_ids: string[];
+  evidence_refs: string[];
+  source_execution_terminal: boolean;
+};
+
+export type LiveLodgingSegmentQuoteComparisonCoverage = {
+  segment_id: string;
+  exact_place_key: string | null;
+  check_in: string;
+  check_out: string;
+  required_distinct_provider_count: number;
+  provider_evidence: LiveLodgingProviderQuoteEvidence[];
+  distinct_exact_quote_provider_count: number;
+  complete: boolean;
+};
+
+export type LiveExactQuoteComparisonCoverage = {
+  selected_stay_plan_id: string | null;
+  required_distinct_providers_per_segment: number;
+  segments: LiveLodgingSegmentQuoteComparisonCoverage[];
+  complete: boolean;
+  partial_evidence_only: boolean;
+  evidence_boundary: string;
+};
+
+export type LiveFlightSearchOutcome = {
+  source_task_id: string;
+  provider: string;
+  state: "quote_found" | "comparison_price_only" | "bounded_no_exact_quote";
+  raw_snapshot_id: string;
+  quote_ids: string[];
+  normalization_result_refs: string[];
+  raw_quote_evidence_sha256s: string[];
+  flight_search_receipt_sha256: string | null;
+  scan_limit: number | null;
+  scanned_count: number | null;
+  price_bearing_candidate_count: number;
+  evidence_refs: string[];
+  reason: string;
+  evidence_boundary: string;
+};
+
 export type LivePackageAgentRun = {
   run_purpose: LiveRunPurpose;
   finalization_state: LiveFinalizationState;
@@ -326,6 +381,9 @@ export type LivePackageAgentRun = {
   decision: LiveDecision;
   claim_boundary: string;
   all_platforms_complete: boolean;
+  source_execution_completeness: LiveSourceExecutionCompleteness;
+  exact_quote_comparison_coverage: LiveExactQuoteComparisonCoverage | null;
+  flight_search_outcomes: LiveFlightSearchOutcome[];
   coverage: LivePlatformSearchCoverage[];
   public_transfer_coverage: {
     provider: "icom-public-transfer";

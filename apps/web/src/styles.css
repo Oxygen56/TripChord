@@ -581,3 +581,29 @@ h1 { font-family: "Noto Sans SC", sans-serif; margin: 0; font-size: clamp(40px, 
   line-height: 1.4;
   margin-top: 0.2rem;
 }
+
+/* v0.4 方案 UI 覆盖解释 */
+.coverage-explanation { margin-top: 12px; border-top: 1px dashed #dce6de; padding-top: 10px; }
+.coverage-explanation .stage-title { margin-bottom: 8px; }
+.coverage-stats { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.coverage-stats span { padding: 6px 9px; border: 1px solid #e0e5df; border-radius: 9px; background: #fafbf9; color: #74847d; font-size: 8px; }
+.coverage-stats strong { color: #39735a; font-size: 11px; }
+.segment-coverage-list { display: grid; gap: 7px; margin: 8px 0; }
+.segment-coverage-list article { padding: 9px; border: 1px solid #e0e5df; border-radius: 9px; background: #fafbf9; }
+.segment-coverage-list article > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.segment-coverage-list strong { font-size: 8px; }
+.segment-coverage-list span { font-size: 8px; font-weight: 800; }
+.segment-coverage-list span.coverage-ok { color: #27734e; }
+.segment-coverage-list span.coverage-warn { color: #a06a1f; }
+.segment-coverage-list small { display: block; color: #89958f; font-size: 7px; line-height: 1.45; margin-top: 4px; }
+.component-coverage-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin-top: 8px; }
+.component-coverage-grid article { padding: 9px; border: 1px solid #e0e5df; border-radius: 9px; background: #fafbf9; }
+.component-coverage-grid article > div { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.component-coverage-grid strong { font-size: 8px; }
+.component-coverage-grid span { color: #89958f; font-size: 7px; }
+.component-coverage-grid em { display: block; margin-top: 5px; padding: 3px 6px; border-radius: 5px; font-size: 7px; font-style: normal; font-weight: 800; background: #eef2f0; color: #50685e; }
+.component-coverage-grid small { display: block; margin-top: 4px; color: #a6b0ab; font-size: 6.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.component-coverage-grid ul { margin: 5px 0 0; padding-left: 14px; color: #95594e; font-size: 7px; line-height: 1.45; }
+.tradeoff-list { margin-top: 8px; padding: 8px 10px; border: 1px solid #e0e5df; border-radius: 9px; background: #fafbf9; }
+.tradeoff-list em { display: block; color: #74847d; font-size: 7px; font-style: normal; font-weight: 800; }
+.tradeoff-list ul { margin: 5px 0 0; padding-left: 15px; color: #50685e; font-size: 8px; line-height: 1.5; }

@@ -50,7 +50,13 @@ import {
   type TripSpec,
   type Workspace,
 } from "./api";
-import { priceLabel, type PriceState } from "./domain";
+import {
+  componentCoverageExplanations,
+  priceLabel,
+  taskProviderOf,
+  taskVerticalOf,
+  type PriceState,
+} from "./domain";
 
 const stageLabels: Record<string, string> = {
   queued: "任务已入队",
@@ -1174,6 +1180,16 @@ function LivePackageConsole({
               <span>解释 Agent</span>
               <strong>{run.explanation.summary}</strong>
               <small>{run.explanation.uncertainties.join("；") || "未声明额外不确定性"}</small>
+              {run.explanation.tradeoffs.length > 0 && (
+                <div className="tradeoff-list">
+                  <em>取舍说明（仅展示有证据支持的比较）</em>
+                  <ul>
+                    {run.explanation.tradeoffs.map((tradeoff) => (
+                      <li key={tradeoff}>{tradeoff}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -1275,6 +1291,95 @@ function LivePackageConsole({
                   </article>
                 );
               })}
+            </div>
+            <div className="coverage-explanation">
+              <div className="stage-title">
+                <div><span>04b</span><h3>覆盖来源与逐组件解释</h3></div>
+                <strong>Source 终态 · 精确报价 · 可比组件分开统计</strong>
+              </div>
+              <div className="coverage-stats">
+                <span>
+                  来源执行终态{" "}
+                  <strong>
+                    {run.source_execution_completeness.terminal_source_ids.length}/
+                    {run.source_execution_completeness.expected_source_ids.length}
+                  </strong>
+                </span>
+                <span>
+                  精确报价分段{" "}
+                  <strong>
+                    {run.exact_quote_comparison_coverage
+                      ? `${run.exact_quote_comparison_coverage.segments.filter(
+                          (segment) => segment.complete,
+                        ).length}/${run.exact_quote_comparison_coverage.segments.length}`
+                      : "0/0"}
+                  </strong>
+                </span>
+                <span>
+                  跨平台可比组件{" "}
+                  <strong>{finalCandidate ? finalQuotes.length : 0}</strong>
+                </span>
+              </div>
+              {run.exact_quote_comparison_coverage && (
+                <details className="evidence-ledger">
+                  <summary>
+                    查看 {run.exact_quote_comparison_coverage.segments.length} 个住宿分段的精确报价比价
+                  </summary>
+                  <div className="segment-coverage-list">
+                    {run.exact_quote_comparison_coverage.segments.map((segment) => (
+                      <article key={segment.segment_id}>
+                        <div>
+                          <strong>{segment.segment_id}</strong>
+                          <span
+                            className={segment.complete ? "coverage-ok" : "coverage-warn"}
+                          >
+                            {segment.distinct_exact_quote_provider_count}/
+                            {segment.required_distinct_provider_count} 家精确报价
+                          </span>
+                        </div>
+                        <small>
+                          {segment.provider_evidence
+                            .map(
+                              (evidence) =>
+                                `${evidence.provider} ${
+                                  evidence.inventory_state ?? "无精确报价"
+                                }`,
+                            )
+                            .join(" · ")}
+                        </small>
+                      </article>
+                    ))}
+                  </div>
+                  <p className="memory-boundary">{run.exact_quote_comparison_coverage.evidence_boundary}</p>
+                </details>
+              )}
+              <div className="component-coverage-grid">
+                {componentCoverageExplanations(run).map((explanation) => {
+                  const sourceLabel = {
+                    exact_quote: "精确报价",
+                    comparison_price_only: "仅比较价",
+                    bounded_no_exact_quote: "有界未命中",
+                    failure_terminal: "失败终态",
+                  }[explanation.coverage_source];
+                  return (
+                    <article key={explanation.component_id}>
+                      <div>
+                        <strong>{taskProviderOf(explanation.component_id)}</strong>
+                        <span>{taskVerticalOf(explanation.component_id)}</span>
+                      </div>
+                      <em>{sourceLabel}</em>
+                      <small>{explanation.component_id}</small>
+                      {explanation.failure_terminal_states.length > 0 && (
+                        <ul>
+                          {explanation.failure_terminal_states.map((reason) => (
+                            <li key={reason}>{reason}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </article>
+                  );
+                })}
+              </div>
             </div>
             <details className="evidence-ledger">
               <summary>查看 {evidenceRefs.length} 条证据引用</summary>
