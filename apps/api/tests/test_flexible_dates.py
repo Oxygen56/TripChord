@@ -334,3 +334,71 @@ def test_exact_pair_budget_prunes_shortlist_without_hiding_coverage() -> None:
     assert plan.search_metrics.shortlist_pair_count == 6
     assert plan.search_metrics.exact_search_budget_pairs == 2
     assert plan.search_metrics.exact_search_coverage == Decimal(2) / Decimal(124)
+
+
+def _policy_for_platforms(platforms: tuple[TravelPlatform, ...]) -> QueryPlanPolicy:
+    return QueryPlanPolicy(
+        include_split_stays=True,
+        max_total_tasks=90,
+        platform_rates=tuple(
+            PlatformRatePolicy(platform=platform, minimum_interval_ms=1_000, max_tasks=30)
+            for platform in platforms
+        ),
+    )
+
+
+_SYNTHETIC_TASKS_PER_FULL_PLATFORM_PER_PAIR = 5
+_TONGCHENG_FLIGHT_ONLY_TASKS_PER_PAIR = 1
+
+
+def _expected_tasks_per_pair(platforms: tuple[TravelPlatform, ...]) -> int:
+    total = 0
+    for platform in platforms:
+        total += (
+            _TONGCHENG_FLIGHT_ONLY_TASKS_PER_PAIR
+            if platform is TravelPlatform.TONGCHENG
+            else _SYNTHETIC_TASKS_PER_FULL_PLATFORM_PER_PAIR
+        )
+    return total
+
+
+@pytest.mark.parametrize(
+    "platforms",
+    [
+        (TravelPlatform.CTRIP,),
+        (TravelPlatform.CTRIP, TravelPlatform.QUNAR),
+        (TravelPlatform.CTRIP, TravelPlatform.QUNAR, TravelPlatform.TONGCHENG),
+        (
+            TravelPlatform.CTRIP,
+            TravelPlatform.QUNAR,
+            TravelPlatform.TONGCHENG,
+            TravelPlatform.FLIGGY,
+        ),
+    ],
+)
+def test_dynamic_provider_count_builds_correct_task_set(
+    platforms: tuple[TravelPlatform, ...],
+) -> None:
+    """v0.2 exit gate: 1/2/3/4 provider replays build a correct task DAG."""
+    window = august_window(max_pairs=2)
+    explorer = FlexibleDateExplorer(platforms)
+    exploration = explorer.explore(window, now=NOW)
+    assert exploration.candidates, "expected at least one date pair candidate"
+    plan = FlexibleQueryPlanBuilder(platforms).build(
+        window, exploration, _policy_for_platforms(platforms)
+    )
+    assert plan.tasks
+    assert set(plan.task_count_by_platform) == {platform.value for platform in platforms}
+    expected_per_pair = _expected_tasks_per_pair(platforms)
+    for pair_id in plan.selected_pair_ids:
+        pair_tasks = [item for item in plan.tasks if item.date_pair_id == pair_id]
+        assert len(pair_tasks) == expected_per_pair
+    assert all(item.platform in platforms for item in plan.tasks)
+
+
+def test_zero_provider_query_plan_refuses_cleanly() -> None:
+    """v0.2 exit gate: zero eligible scopes refuse before any task is built."""
+    with pytest.raises(ValueError):
+        FlexibleDateExplorer(())
+    with pytest.raises(ValueError):
+        FlexibleQueryPlanBuilder(())
