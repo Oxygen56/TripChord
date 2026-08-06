@@ -17,6 +17,7 @@ from tripchord.agents.live_jobs import (
     LivePlanningJobState,
     LivePlanningPairCheckpoint,
     LivePlanningPairCheckpointState,
+    LiveSourceTerminalEvent,
 )
 
 REQUEST_SHA256 = "a" * 64
@@ -859,4 +860,94 @@ async def test_capacity_eviction_removes_idempotency_mapping_with_terminal_job()
     assert replayed is False
     assert replacement.id != first.id
     await registry.cancel(replacement.id, "tenant-a")
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_source_terminal_events_and_barrier_release_survive_success() -> None:
+    registry = LivePlanningJobRegistry()
+
+    async def operation(report: Any) -> dict[str, Any]:
+        await report.report_source_terminal_events(
+            (
+                LiveSourceTerminalEvent(
+                    source_task_id="source-ctrip-flight",
+                    provider="ctrip",
+                    vertical="flight",
+                    terminal_state="quote_found",
+                    occurred_at=datetime(2026, 8, 4, 8, 1, tzinfo=UTC),
+                ),
+                LiveSourceTerminalEvent(
+                    source_task_id="source-qunar-lodging-full",
+                    provider="qunar",
+                    vertical="lodging",
+                    terminal_state="bounded_no_exact_quote",
+                    occurred_at=datetime(2026, 8, 4, 8, 2, tzinfo=UTC),
+                ),
+            )
+        )
+        await report.report_barrier_released(datetime(2026, 8, 4, 8, 3, tzinfo=UTC))
+        return {"ok": True}
+
+    job = await registry.start(
+        tenant_id="tenant-a",
+        operation=operation,
+        request_digest=REQUEST_SHA256,
+    )
+    await _wait_for_state(registry, job.id, "tenant-a", LivePlanningJobState.SUCCEEDED)
+    done = await registry.get(job.id, "tenant-a")
+    assert done is not None
+    assert done.barrier_released_at == datetime(2026, 8, 4, 8, 3, tzinfo=UTC)
+    assert len(done.source_terminal_events) == 2
+    assert done.source_terminal_events[0].source_task_id == "source-ctrip-flight"
+    assert done.source_terminal_events[0].terminal_state == "quote_found"
+    assert done.source_terminal_events[1].terminal_state == "bounded_no_exact_quote"
+    assert done.source_terminal_events[1].detail is None
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_barrier_release_is_idempotent_and_terminal_events_are_unique() -> None:
+    registry = LivePlanningJobRegistry()
+    released_at = datetime(2026, 8, 4, 8, 5, tzinfo=UTC)
+
+    async def operation(report: Any) -> dict[str, Any]:
+        await report.report_barrier_released(released_at)
+        await report.report_barrier_released(released_at)
+        await report.report_source_terminal_events(
+            (
+                LiveSourceTerminalEvent(
+                    source_task_id="source-ctrip-flight",
+                    provider="ctrip",
+                    vertical="flight",
+                    terminal_state="timed_out",
+                    occurred_at=released_at,
+                ),
+            )
+        )
+        with pytest.raises(ValueError):
+            await report.report_source_terminal_events(
+                (
+                    LiveSourceTerminalEvent(
+                        source_task_id="source-ctrip-flight",
+                        provider="ctrip",
+                        vertical="flight",
+                        terminal_state="quote_found",
+                        occurred_at=released_at,
+                    ),
+                )
+            )
+        return {"ok": True}
+
+    job = await registry.start(
+        tenant_id="tenant-a",
+        operation=operation,
+        request_digest=REQUEST_SHA256,
+    )
+    await _wait_for_state(registry, job.id, "tenant-a", LivePlanningJobState.SUCCEEDED)
+    done = await registry.get(job.id, "tenant-a")
+    assert done is not None
+    assert done.barrier_released_at == released_at
+    assert len(done.source_terminal_events) == 1
+    assert done.source_terminal_events[0].terminal_state == "timed_out"
     await registry.close()

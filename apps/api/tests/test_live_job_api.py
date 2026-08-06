@@ -15,6 +15,7 @@ from tripchord.agents.live_jobs import (
     LivePlanningJobRegistry,
     LivePlanningPairCheckpoint,
     LivePlanningPairCheckpointState,
+    LiveSourceTerminalEvent,
 )
 from tripchord.agents.live_system import LivePackageAgentSystem
 from tripchord.agents.model_gateway import (
@@ -697,4 +698,56 @@ async def test_async_post_idempotency_prevents_duplicate_live_search_and_is_tena
             )
             assert stopped.status_code == 200
             assert stopped.json()["state"] == "cancelled"
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_sse_stream_gates_result_until_after_barrier_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = LivePlanningJobRegistry(capacity=4)
+    monkeypatch.setattr(app.state, "live_planning_job_registry", registry)
+    monkeypatch.setattr(app.state, "package_requirement_agent", package_requirement_agent)
+    monkeypatch.setattr(app.state, "flexible_live_agent_system", None)
+    monkeypatch.setattr(app.state, "live_run_cache", LiveRunCache())
+    monkeypatch.setattr(settings, "browser_bridge_require_all_providers", True)
+
+    released_at = datetime(2026, 7, 30, 9, 2, tzinfo=UTC)
+
+    async def operation(report: Any) -> dict[str, Any]:
+        await report.report_source_terminal_events(
+            (
+                LiveSourceTerminalEvent(
+                    source_task_id="source-ctrip-flight",
+                    provider="ctrip",
+                    vertical="flight",
+                    terminal_state="quote_found",
+                    occurred_at=datetime(2026, 7, 30, 9, 1, tzinfo=UTC),
+                ),
+            )
+        )
+        await report.report_barrier_released(released_at)
+        return {"done": True}
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+        base_url="http://test",
+    ) as client:
+        # Admit a job directly against the same registry the endpoint reads.
+        job = await registry.start(
+            tenant_id="anonymous",
+            operation=operation,
+            request_digest="d" * 64,
+        )
+        await _terminal_job(client, job.id)
+        streamed = await client.get(
+            f"/api/v1/agents/live-flexible-plan-from-text/jobs/{job.id}/events"
+        )
+        assert streamed.status_code == 200
+        assert "event: barrier" in streamed.text
+        assert f'"barrier_released_at": "{released_at.isoformat()}"' in streamed.text
+        assert "event: source_terminal" not in streamed.text  # not a distinct SSE type
+        assert '"source_terminal_events"' in streamed.text
+        assert '"done": true' in streamed.text
+        assert "event: result" in streamed.text
     await registry.close()

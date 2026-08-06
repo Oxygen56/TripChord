@@ -7050,3 +7050,65 @@ async def test_august_3_same_price_refetch_does_not_create_a_fake_plan_version()
     assert replanned.package.final_candidate.version == current.version
     assert replanned.package.event_handoff == run.package.event_handoff
     assert replanned.source_task_ids == ("event-source-ctrip-lodging-middle",)
+
+
+@pytest.mark.asyncio
+async def test_source_executor_suppresses_tombstoned_scope_without_external_call() -> None:
+    from tripchord.agents.tools import ToolCall, ToolReceipt
+    from tripchord.platform.capability import ProviderScopeKey, ProviderVertical
+    from tripchord.platform.terminal import (
+        ScopeCancellationTombstone,
+        ScopeCancellationTombstoneRegistry,
+    )
+
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+    called: list[str] = []
+
+    class RecordingTools(ToolRegistry):
+        async def invoke(self, call: ToolCall) -> ToolReceipt:
+            called.append(call.tool_name)
+            raise AssertionError("tombstoned scope must never reach a tool")
+
+    flight_scope = ProviderScopeKey(provider="ctrip", vertical=ProviderVertical.FLIGHT)
+    state = _RunState(
+        source_task_ids=("source-ctrip-flight",),
+        cancellation_tombstones=ScopeCancellationTombstoneRegistry(
+            run_id="tombstone-run",
+            tombstones=(
+                ScopeCancellationTombstone(
+                    run_id="tombstone-run",
+                    scope=flight_scope,
+                    cancelled_generation=0,
+                    cancelled_at=NOW,
+                    reason="user disabled scope mid-run",
+                ),
+            ),
+        ),
+    )
+    task = AgentTask(
+        id="source-ctrip-flight",
+        role=AgentRole.TRANSPORT,
+        goal="read-only flight search",
+        allowed_tools=("browser_bridge_search",),
+        input={
+            "submission": {
+                "provider": "ctrip",
+                "kind": "flight",
+                "query": query().model_dump(mode="json"),
+                "timeout_seconds": 15,
+                "max_attempts": 1,
+            }
+        },
+    )
+    executor = system._source_executor(state)
+    result = await executor(task, ContextEngine(EvidenceBlackboard()), RecordingTools())
+    assert result.success is True
+    assert result.output.get("scope_cancelled") is True
+    assert result.output.get("external_tool_called") is False
+    assert called == []
+    # The suppressed attempt must not produce a usable quote source in coverage.
+    assert not any(
+        "source-ctrip-flight" in item.usable_quote_source_ids
+        for item in system._coverage(state)
+    )

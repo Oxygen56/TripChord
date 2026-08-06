@@ -48,6 +48,7 @@ from tripchord.agents.live_system import (
     LiveRunPurpose,
     SourceExecutionCompleteness,
 )
+from tripchord.platform.terminal import SearchRun
 from tripchord.agents.memory import MemoryAccessContext, MemoryStore
 from tripchord.agents.model_gateway import ModelRouter
 from tripchord.agents.models import AgentRole, AgentTask, PreferenceMode, ToolPermission
@@ -617,6 +618,19 @@ class LiveDatePairRunner(Protocol):
     ) -> LivePackageAgentRun: ...
 
 
+class SearchRunRecorder(Protocol):
+    """Async persistence hook for a completed pair :class:`SearchRun`.
+
+    The tenant is captured by the caller's closure so the flexible system never
+    needs to know who is running the search.
+    """
+
+    async def __call__(
+        self,
+        run: LivePackageAgentRun,
+    ) -> SearchRun: ...
+
+
 class FlexibleLiveAgentSystem:
     """Bounded flexible-date controller over the strict fifteen-source live system."""
 
@@ -674,6 +688,7 @@ class FlexibleLiveAgentSystem:
         publication_refresh_minimum_options: int = 0,
         pair_checkpoint_reporter: PairCheckpointReporter | None = None,
         checkpoint_request_sha256: str | None = None,
+        search_run_recorder: SearchRunRecorder | None = None,
     ) -> FlexibleLiveAgentRun:
         budget_ledger = current_agent_budget()
         if budget_ledger is None:  # pragma: no cover - decorator invariant
@@ -931,6 +946,8 @@ class FlexibleLiveAgentSystem:
                         request_sha256=cast(str, checkpoint_request_sha256),
                     )
                 )
+            if search_run_recorder is not None and execution.run is not None:
+                await search_run_recorder(execution.run)
             live_run = execution.run
             package = live_run.package if live_run is not None else None
             exact_observations.append(

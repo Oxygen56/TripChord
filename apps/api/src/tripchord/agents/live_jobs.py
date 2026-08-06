@@ -386,6 +386,35 @@ class LivePlanningPairCheckpoint(DomainModel):
         ).hexdigest()
 
 
+class LiveSourceTerminalEvent(DomainModel):
+    """A typed terminal state for one source task, surfaced before the barrier.
+
+    Before the settle barrier releases, the SSE stream is only allowed to carry
+    progress/terminal events — never partial quotes or plans.  Each event binds
+    one source task id to its typed terminal state so the UI can show
+    per-platform/vertical progress and reasons without leaking intermediate
+    prices.
+    """
+
+    schema_version: str = "live-source-terminal-event-v1"
+    source_task_id: str = Field(min_length=1, max_length=200)
+    provider: str = Field(min_length=1, max_length=64)
+    vertical: str = Field(min_length=1, max_length=40)
+    terminal_state: str = Field(min_length=1, max_length=40)
+    occurred_at: datetime
+    detail: str | None = Field(default=None, max_length=400)
+
+    _validate_occurred_at = field_validator("occurred_at")(
+        lambda value: _aware(value, "occurred_at")
+    )
+
+    @model_validator(mode="after")
+    def validate_terminal_event(self) -> Self:
+        if self.schema_version != "live-source-terminal-event-v1":
+            raise ValueError("unsupported live source terminal event schema")
+        return self
+
+
 class LivePlanningJobSnapshot(DomainModel):
     id: str = Field(min_length=1)
     state: LivePlanningJobState
@@ -407,6 +436,11 @@ class LivePlanningJobSnapshot(DomainModel):
         default=(),
         max_length=8,
     )
+    source_terminal_events: tuple[LiveSourceTerminalEvent, ...] = Field(
+        default=(),
+        max_length=64,
+    )
+    barrier_released_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
     deadline_at: datetime
@@ -427,6 +461,9 @@ class LivePlanningJobSnapshot(DomainModel):
     )
     _validate_expires_at = field_validator("expires_at")(
         lambda value: None if value is None else _aware(value, "expires_at")
+    )
+    _validate_barrier_released_at = field_validator("barrier_released_at")(
+        lambda value: None if value is None else _aware(value, "barrier_released_at")
     )
 
     @model_validator(mode="after")
@@ -533,6 +570,13 @@ class LiveJobProgressReporter(Protocol):
         failure_count: int,
     ) -> None: ...
 
+    async def report_source_terminal_events(
+        self,
+        events: tuple[LiveSourceTerminalEvent, ...],
+    ) -> None: ...
+
+    async def report_barrier_released(self, barrier_released_at: datetime) -> None: ...
+
 
 LiveJobOperation = Callable[[LiveJobProgressReporter], Awaitable[dict[str, Any]]]
 
@@ -588,6 +632,23 @@ class _RegistryProgressReporter:
             trace_count=trace_count,
             success_count=success_count,
             failure_count=failure_count,
+            generation=self._generation,
+        )
+
+    async def report_source_terminal_events(
+        self,
+        events: tuple[LiveSourceTerminalEvent, ...],
+    ) -> None:
+        await self._registry._update_source_terminal_events(
+            self._runtime,
+            events,
+            generation=self._generation,
+        )
+
+    async def report_barrier_released(self, barrier_released_at: datetime) -> None:
+        await self._registry._mark_barrier_released(
+            self._runtime,
+            barrier_released_at,
             generation=self._generation,
         )
 
@@ -1029,6 +1090,59 @@ class LivePlanningJobRegistry:
                 }
             )
             runtime.model_trace_summary_reported = True
+            self._changed.notify_all()
+
+    async def _update_source_terminal_events(
+        self,
+        runtime: _RuntimeJob,
+        events: tuple[LiveSourceTerminalEvent, ...],
+        *,
+        generation: int,
+    ) -> None:
+        if not events:
+            return
+        validated = tuple(
+            LiveSourceTerminalEvent.model_validate(event) for event in events
+        )
+        if len(validated) > 64:
+            raise ValueError("live source terminal events exceed the capacity bound")
+        async with self._changed:
+            self._ensure_active_locked(runtime, generation)
+            existing = runtime.snapshot.source_terminal_events
+            existing_by_id = {item.source_task_id for item in existing}
+            if any(item.source_task_id in existing_by_id for item in validated):
+                raise ValueError("live source terminal events must be unique per source task")
+            merged = (*existing, *validated)
+            if len(merged) > 64:
+                raise ValueError("live source terminal events exceed the capacity bound")
+            runtime.snapshot = runtime.snapshot.model_copy(
+                update={
+                    "source_terminal_events": merged,
+                    "revision": runtime.snapshot.revision + 1,
+                    "updated_at": self._utc_now(),
+                }
+            )
+            self._changed.notify_all()
+
+    async def _mark_barrier_released(
+        self,
+        runtime: _RuntimeJob,
+        barrier_released_at: datetime,
+        *,
+        generation: int,
+    ) -> None:
+        _aware(barrier_released_at, "barrier_released_at")
+        async with self._changed:
+            self._ensure_active_locked(runtime, generation)
+            if runtime.snapshot.barrier_released_at is not None:
+                return
+            runtime.snapshot = runtime.snapshot.model_copy(
+                update={
+                    "barrier_released_at": barrier_released_at,
+                    "revision": runtime.snapshot.revision + 1,
+                    "updated_at": self._utc_now(),
+                }
+            )
             self._changed.notify_all()
 
     async def _finish(

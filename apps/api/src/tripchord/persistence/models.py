@@ -15,6 +15,70 @@ class Base(DeclarativeBase):
     pass
 
 
+class SearchRunRow(Base):
+    """One persisted :class:`tripchord.platform.terminal.SearchRun`.
+
+    ``payload`` keeps the full typed run (snapshot SHA + attempts) so a stored
+    run can be revalidated; the relational columns let a tenant list and page
+    runs without decoding every payload.
+    """
+
+    __tablename__ = "search_runs"
+    __table_args__ = (Index("ix_search_runs_tenant_created", "tenant_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(100), index=True)
+    snapshot_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    attempts: Mapped[list[SourceAttemptRow]] = relationship(
+        back_populates="search_run",
+        cascade="all, delete-orphan",
+        order_by="SourceAttemptRow.attempt_id",
+    )
+    receipts: Mapped[list[TerminalReceiptRow]] = relationship(
+        back_populates="search_run",
+        cascade="all, delete-orphan",
+        order_by="TerminalReceiptRow.attempt_id",
+    )
+
+
+class SourceAttemptRow(Base):
+    __tablename__ = "source_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("search_runs.id", ondelete="CASCADE"), index=True
+    )
+    attempt_id: Mapped[str] = mapped_column(String(120))
+    scope_key: Mapped[str] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(20))
+    terminal_state: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, default=0)
+    failure_class: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    detail: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    search_run: Mapped[SearchRunRow] = relationship(back_populates="attempts")
+
+
+class TerminalReceiptRow(Base):
+    __tablename__ = "terminal_receipts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("search_runs.id", ondelete="CASCADE"), index=True
+    )
+    attempt_id: Mapped[str] = mapped_column(String(120))
+    scope_key: Mapped[str] = mapped_column(String(160))
+    terminal_state: Mapped[str] = mapped_column(String(40))
+    terminal_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    generation: Mapped[int] = mapped_column(Integer)
+    evidence_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    receipt_sha256: Mapped[str] = mapped_column(String(64))
+    search_run: Mapped[SearchRunRow] = relationship(back_populates="receipts")
+
+
 class WorkspaceRow(Base):
     __tablename__ = "workspaces"
     __table_args__ = (

@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import stat
@@ -48,6 +49,7 @@ from tripchord.agents.live_jobs import (
     LivePlanningJobIdempotencyConflictError,
     LivePlanningJobRegistry,
     LivePlanningJobSnapshot,
+    LiveSourceTerminalEvent,
 )
 from tripchord.agents.live_monitor import (
     LiveMonitorCheck,
@@ -184,6 +186,8 @@ from tripchord.platform.api import guard_live_start
 from tripchord.platform.api import router as provider_api_router
 from tripchord.platform.capability import ProviderVertical
 from tripchord.platform.registry import build_default_registry
+from tripchord.platform.search_run_builder import build_search_run, derive_scope_from_task_id
+from tripchord.platform.terminal import SearchRun
 from tripchord.providers.amap import AmapTravelDataProvider
 from tripchord.providers.base import OfferSearchQuery, OfferSearchResult
 from tripchord.providers.browser_bridge import (
@@ -805,6 +809,8 @@ def _build_live_run_cache(
         ),
     )
 
+
+logger = logging.getLogger("tripchord.api")
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -1668,12 +1674,101 @@ live_quote_monitor_registry = LiveQuoteMonitorRegistry(_perform_live_monitor_che
 app.state.live_quote_monitor_registry = live_quote_monitor_registry
 
 
+async def _persist_search_run(
+    tenant_id: str,
+    run: LivePackageAgentRun,
+) -> SearchRun | None:
+    """Persist one completed live run as a :class:`SearchRun` (v0.3).
+
+    Persistence is best-effort at the storage boundary: the live planning
+    response must not be held hostage by an unavailable/migrating database, but
+    any actual write failure is surfaced through ``logger.warning`` rather than
+    silently swallowed.  When the database is ready the run is persisted
+    tenant-scoped and recoverable via :class:`SearchRunRepository`.
+    """
+    from tripchord.persistence.search_runs import SearchRunRepository
+
+    built = build_search_run(run=run)
+    try:
+        async with database.sessions() as session:
+            repository = SearchRunRepository(session, tenant_id=tenant_id)
+            await repository.save(built)
+    except Exception as exc:  # pragma: no cover - storage-boundary guard
+        logger.warning(
+            "search run persistence failed for run_id=%s: %s: %s",
+            built.run_id,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    return built
+
+
+def _source_terminal_events_from_run(
+    run: FlexibleLiveAgentRun,
+    now: datetime,
+) -> tuple[LiveSourceTerminalEvent, ...]:
+    """Reduce the flexible run's pair coverage into typed source events.
+
+    Each event records one source task's typed terminal state.  Only events for
+    sources that actually reached a terminal outcome are emitted; running or
+    skipped sources stay out so the pre-barrier SSE stream never leaks a
+    ``quote_found`` that did not really happen.
+    """
+    events: list[LiveSourceTerminalEvent] = []
+    for execution in run.pair_runs:
+        live_run = execution.run or execution.exploration_run
+        if live_run is None:
+            continue
+        usable = set(live_run.source_execution_completeness.terminal_source_ids or ())
+        for item in live_run.coverage:
+            for source_id in item.terminal_outcome_source_ids or item.successful_source_ids:
+                scope = derive_scope_from_task_id(source_id)
+                if scope is None:
+                    continue
+                if source_id in usable and source_id in (
+                    item.usable_quote_source_ids or item.successful_source_ids
+                ):
+                    terminal_state = "quote_found"
+                elif item.failed_source_ids and source_id in item.failed_source_ids:
+                    terminal_state = _terminal_state_from_reasons(item.failure_reasons)
+                else:
+                    terminal_state = "bounded_no_exact_quote"
+                events.append(
+                    LiveSourceTerminalEvent(
+                        source_task_id=source_id,
+                        provider=scope.provider,
+                        vertical=scope.vertical.value,
+                        terminal_state=terminal_state,
+                        occurred_at=now,
+                    )
+                )
+    return tuple(dict.fromkeys(events))
+
+
+def _terminal_state_from_reasons(reasons: tuple[str, ...]) -> str:
+    joined = " ".join(reasons).lower()
+    if "login" in joined or "login_required" in joined:
+        return "login_required"
+    if "captcha" in joined:
+        return "captcha_required"
+    if "dom_drift" in joined or "dom drift" in joined:
+        return "dom_drift"
+    if "timed_out" in joined or "timeout" in joined:
+        return "timed_out"
+    if "cancelled" in joined:
+        return "cancelled"
+    return "provider_error"
+
+
 async def _cache_flexible_pair_runs(
     run: FlexibleLiveAgentRun,
     cache: LiveRunCache,
     tenant_id: str,
     *,
     ensure_active: Callable[[], Awaitable[None]] | None = None,
+    search_run_recorder: Callable[[LivePackageAgentRun], Awaitable[SearchRun | None]]
+    | None = None,
 ) -> tuple[LiveFlexiblePairRunHandle, ...]:
     handles: list[LiveFlexiblePairRunHandle] = []
     for pair_run in run.pair_runs:
@@ -1682,6 +1777,8 @@ async def _cache_flexible_pair_runs(
         if ensure_active is not None:
             await ensure_active()
         run_id, expires_at = await cache.put(tenant_id, pair_run.run)
+        if search_run_recorder is not None:
+            await search_run_recorder(pair_run.run)
         handles.append(
             LiveFlexiblePairRunHandle(
                 date_pair_id=pair_run.date_pair.id,
@@ -1919,11 +2016,20 @@ async def _execute_live_flexible_from_text_body(
             detail=str(exc),
         ) from exc
     await report("caching_pair_runs", 90)
+    if report_progress is not None:
+        barrier_released_at = datetime.now(UTC)
+        events = _source_terminal_events_from_run(run, barrier_released_at)
+        if events:
+            await report_progress.report_source_terminal_events(events)
+        await report_progress.report_barrier_released(barrier_released_at)
     handles = await _cache_flexible_pair_runs(
         run,
         cache,
         principal.tenant_id,
         ensure_active=(report_progress.ensure_active if report_progress is not None else None),
+        search_run_recorder=(
+            lambda live_run: _persist_search_run(principal.tenant_id, live_run)
+        ),
     )
     execution_boundary = LIVE_FLEXIBLE_FROM_TEXT_EXECUTION_BOUNDARY
     if model_enabled:
@@ -2140,6 +2246,7 @@ async def stream_live_flexible_from_text_job_endpoint(
 
     async def events() -> AsyncIterator[str]:
         revision = 0
+        barrier_announced = False
         while True:
             job = await registry.wait_for_change(
                 job_id,
@@ -2153,8 +2260,26 @@ async def stream_live_flexible_from_text_job_endpoint(
             if job.revision == revision:
                 yield "event: heartbeat\ndata: {}\n\n"
                 continue
-            # The status stream intentionally excludes the potentially large quote result.
-            # Clients fetch the result once from the tenant-scoped GET endpoint.
+            if job.barrier_released_at is not None and not barrier_announced:
+                # v0.3 barrier gating: before this point the stream carried only
+                # progress/terminal events; the barrier release is the first
+                # signal that the final result is about to become available.
+                barrier_announced = True
+                barrier_payload = json.dumps(
+                    {"barrier_released_at": job.barrier_released_at.isoformat()},
+                    ensure_ascii=False,
+                )
+                yield f"event: barrier\ndata: {barrier_payload}\n\n"
+            # The status stream intentionally excludes the potentially large quote result
+            # before the barrier.  Once the barrier has released AND the job reached a
+            # terminal state, the result is delivered exactly once as its own event.
+            if (
+                job.state in TERMINAL_LIVE_PLANNING_JOB_STATES
+                and job.barrier_released_at is not None
+            ):
+                payload = json.dumps(job.model_dump(mode="json"), ensure_ascii=False)
+                yield f"event: result\ndata: {payload}\n\n"
+                return
             payload = json.dumps(
                 job.model_dump(mode="json", exclude={"result"}),
                 ensure_ascii=False,

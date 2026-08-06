@@ -26,6 +26,8 @@ from tripchord.agents.tools import ToolRegistry
 from tripchord.platform.capability import ProviderScopeKey, ProviderVertical
 from tripchord.platform.terminal import (
     CompletionBarrier,
+    ScopeCancellationTombstone,
+    ScopeCancellationTombstoneRegistry,
     SourceAttempt,
     SourceAttemptStatus,
     SourceTerminalState,
@@ -348,3 +350,43 @@ def test_receipt_hash_is_deterministic() -> None:
     )
     assert receipt.receipt_sha256() == receipt.receipt_sha256()
     assert len(receipt.receipt_sha256()) == 64
+
+
+def test_scope_cancellation_tombstone_rejects_late_attempts() -> None:
+    scope = ProviderScopeKey(provider="ctrip", vertical=ProviderVertical.FLIGHT)
+    tombstone = ScopeCancellationTombstone(
+        run_id="r1",
+        scope=scope,
+        cancelled_generation=2,
+        cancelled_at=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+        reason="user disabled scope mid-run",
+    )
+    # Any attempt at or below the cancelled generation is late and rejected.
+    assert tombstone.rejects(0)
+    assert tombstone.rejects(2)
+    # A brand-new attempt with a strictly newer generation is not late.
+    assert not tombstone.rejects(3)
+
+
+def test_scope_cancellation_registry_partitions_scopes() -> None:
+    flight = ProviderScopeKey(provider="ctrip", vertical=ProviderVertical.FLIGHT)
+    lodging = ProviderScopeKey(provider="ctrip", vertical=ProviderVertical.LODGING)
+    registry = ScopeCancellationTombstoneRegistry(
+        run_id="r1",
+        tombstones=(
+            ScopeCancellationTombstone(
+                run_id="r1",
+                scope=flight,
+                cancelled_generation=1,
+                cancelled_at=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+                reason="flight scope cancelled",
+            ),
+        ),
+    )
+    assert registry.rejects(flight, 0)
+    assert registry.rejects(flight, 1)
+    assert not registry.rejects(flight, 2)
+    assert not registry.rejects(lodging, 0)
+    assert registry.cancelled_scopes() == (flight,)
+    assert registry.tombstone_for(flight) is not None
+    assert registry.tombstone_for(lodging) is None

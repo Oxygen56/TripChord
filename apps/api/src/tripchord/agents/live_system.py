@@ -145,6 +145,11 @@ from tripchord.planning.stay_plans import (
     StayPlanVerificationHandoff,
     stay_plan_for_candidate,
 )
+from tripchord.platform.capability import ProviderScopeKey, ProviderVertical
+from tripchord.platform.terminal import (
+    ScopeCancellationTombstone,
+    ScopeCancellationTombstoneRegistry,
+)
 from tripchord.providers.base import ProviderError
 from tripchord.providers.browser_bridge import (
     LIVE_V5_BROWSER_PROVIDERS,
@@ -1392,6 +1397,9 @@ class _RunState:
     publication_failover_tasks_by_vertical: dict[BrowserVertical, tuple[AgentTask, ...]] = field(
         default_factory=dict
     )
+    cancellation_tombstones: ScopeCancellationTombstoneRegistry = field(
+        default_factory=lambda: ScopeCancellationTombstoneRegistry(run_id="pending")
+    )
 
 
 def _json_object(value: object) -> dict[str, JsonValue]:
@@ -1400,6 +1408,55 @@ def _json_object(value: object) -> dict[str, JsonValue]:
 
 def _json_value(value: object) -> JsonValue:
     return cast(JsonValue, value)
+
+
+def _source_task_scope(task: AgentTask) -> ProviderScopeKey | None:
+    """Derive the frozen scope for one source task, or None when unmappable."""
+    raw = task.input.get("submission")
+    if isinstance(raw, dict):
+        provider = raw.get("provider")
+        kind = raw.get("kind")
+        if isinstance(provider, str) and isinstance(kind, str):
+            vertical = kind if kind in {"flight", "lodging"} else None
+            if vertical is not None:
+                return ProviderScopeKey(provider=provider, vertical=ProviderVertical(vertical))
+    if "icom_query" in task.input:
+        return ProviderScopeKey(provider="icom", vertical=ProviderVertical.TRANSFER)
+    return None
+
+
+def _record_scope_cancellation(
+    state: _RunState,
+    scope: ProviderScopeKey,
+    *,
+    generation: int,
+    reason: str,
+) -> None:
+    """Append a scope cancellation tombstone for the current run.
+
+    Every later retry / publication refresh / failover / delayed wake-up /
+    event replan that would reintroduce this scope must check
+    ``state.cancellation_tombstones``; the source executor already gates on it.
+    """
+    now = datetime.now(UTC)
+    run_id = state.cancellation_tombstones.run_id
+    if run_id == "pending":
+        run_id = f"run-{now.timestamp()}"
+    state.cancellation_tombstones = state.cancellation_tombstones.model_copy(
+        update={
+            "run_id": run_id,
+            "tombstones": (
+                *state.cancellation_tombstones.tombstones,
+                ScopeCancellationTombstone(
+                    run_id=run_id,
+                    scope=scope,
+                    cancelled_generation=generation,
+                    cancelled_at=now,
+                    reason=reason,
+                ),
+            ),
+        }
+    )
 
 
 class IComTransferSearcher(Protocol):
@@ -4982,6 +5039,43 @@ class LivePackageAgentSystem:
                             ),
                         ),
                     )
+            scope = _source_task_scope(task)
+            if scope is not None:
+                raw_generation = task.input.get("__tripchord_attempt_generation", 0)
+                attempt_generation = raw_generation if isinstance(raw_generation, int) else 0
+                if state.cancellation_tombstones.rejects(scope, attempt_generation):
+                    # A scope was cancelled earlier in this run (or carried over
+                    # from a previous generation).  This attempt is late: it must
+                    # not produce a browser/model/network access and its result
+                    # must never enter the Planner.
+                    tombstone_output: dict[str, JsonValue] = {
+                        "scope_cancelled": True,
+                        "scope": scope.key,
+                        "attempt_generation": attempt_generation,
+                        "external_tool_called": False,
+                    }
+                    summary = f"{task.id} suppressed by scope cancellation tombstone"
+                    topic = (
+                        "public_transfer_result"
+                        if "icom_query" in task.input
+                        else "browser_result"
+                    )
+                    return AgentTaskResult(
+                        task_id=task.id,
+                        agent_role=task.role,
+                        success=True,
+                        summary=summary,
+                        output=tombstone_output,
+                        evidence=(
+                            self._evidence(
+                                task,
+                                topic=topic,
+                                subject=task.id,
+                                payload=tombstone_output,
+                                source="tripchord:scope-cancellation-tombstone",
+                            ),
+                        ),
+                    )
             try:
                 raw_delay = task.input.get("start_delay_ms", 0)
                 if not isinstance(raw_delay, int) or isinstance(raw_delay, bool):
@@ -5097,10 +5191,45 @@ class LivePackageAgentSystem:
             terminal_source_ids = tuple(
                 task_id for task_id in state.source_task_ids
             )
+            # Record a tombstone for every source that reached a typed
+            # ``cancelled`` terminal state.  Later retry / publication refresh /
+            # failover / delayed wake-up / event replan attempts for that scope
+            # are then rejected by the source executor gate, so a cancelled
+            # scope's late result can never re-enter the Planner.
+            for task_id in terminal_source_ids:
+                snapshot = state.snapshots.get(task_id)
+                if snapshot is None or snapshot.state is not BrowserTaskState.CANCELLED:
+                    continue
+                scope = _source_task_scope(
+                    AgentTask(
+                        id=task_id,
+                        role=AgentRole.TRANSPORT,
+                        goal="settle cancellation audit",
+                        input={
+                            "submission": _json_value(
+                                {
+                                    "provider": snapshot.provider.value,
+                                    "kind": snapshot.kind.value,
+                                }
+                            )
+                        },
+                    )
+                )
+                if scope is None:
+                    continue
+                _record_scope_cancellation(
+                    state,
+                    scope,
+                    generation=0,
+                    reason=f"source task {task_id} reached a cancelled terminal state",
+                )
             output: dict[str, JsonValue] = {
                 "barrier": "released",
                 "terminal_source_ids": list(terminal_source_ids),
                 "source_error_count": len(state.source_errors),
+                "cancelled_scope_count": len(
+                    state.cancellation_tombstones.tombstones
+                ),
             }
             summary = (
                 f"全部 {len(terminal_source_ids)} 个已选 Source 已进入类型化终态；"

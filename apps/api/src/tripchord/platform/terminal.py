@@ -27,6 +27,17 @@ from tripchord.domain.common import DomainModel
 from tripchord.platform.capability import ProviderScopeKey
 
 
+def _canonical_utc_iso(value: datetime) -> str:
+    """Normalise a datetime to UTC for canonical hashing.
+
+    SQLite-backed persistence returns naive datetimes; treating a naive value
+    as UTC keeps the receipt hash stable across a save/load round trip.
+    """
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat()
+
+
 class SourceTerminalState(StrEnum):
     """Typed terminal state for any source attempt, across all verticals."""
 
@@ -94,7 +105,7 @@ class TerminalReceipt(DomainModel):
             "attempt_id": self.attempt_id,
             "scope": self.scope.key,
             "terminal_state": self.terminal_state.value,
-            "terminal_at": self.terminal_at.isoformat(),
+            "terminal_at": _canonical_utc_iso(self.terminal_at),
             "generation": self.generation,
             "evidence_sha256": self.evidence_sha256,
         }
@@ -118,6 +129,56 @@ class SearchRun(DomainModel):
 
     def queued_count(self) -> int:
         return sum(1 for a in self.attempts if a.status is SourceAttemptStatus.QUEUED)
+
+
+class ScopeCancellationTombstone(DomainModel):
+    """A tombstone proving one scope was cancelled at a run generation.
+
+    Once a scope is cancelled mid-run, ordinary retries, publication refresh,
+    failover, delayed wake-up and event replan must all check the tombstone:
+    a result whose attempt generation is at or below the tombstone generation
+    is late and must never reach the Planner.  Only a brand-new attempt with a
+    strictly newer generation (a genuinely fresh, newly authorised execution)
+    may be reconsidered, and only when the scope was re-selected by the user.
+    """
+
+    run_id: str = Field(min_length=1)
+    scope: ProviderScopeKey
+    cancelled_generation: int = Field(ge=0)
+    cancelled_at: datetime
+    reason: str = Field(min_length=1, max_length=400)
+
+    def rejects(self, attempt_generation: int) -> bool:
+        """A late attempt from at or below the cancelled generation is stale."""
+        return attempt_generation <= self.cancelled_generation
+
+
+class ScopeCancellationTombstoneRegistry(DomainModel):
+    """Append-only registry of per-scope cancellation tombstones for one run."""
+
+    run_id: str = Field(min_length=1)
+    tombstones: tuple[ScopeCancellationTombstone, ...] = ()
+
+    def tombstone_for(self, scope: ProviderScopeKey) -> ScopeCancellationTombstone | None:
+        matches = [
+            tombstone
+            for tombstone in self.tombstones
+            if tombstone.scope.key == scope.key
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda item: item.cancelled_generation)
+
+    def rejects(self, scope: ProviderScopeKey, attempt_generation: int) -> bool:
+        tombstone = self.tombstone_for(scope)
+        if tombstone is None:
+            return False
+        return tombstone.rejects(attempt_generation)
+
+    def cancelled_scopes(self) -> tuple[ProviderScopeKey, ...]:
+        return tuple(
+            dict.fromkeys(tombstone.scope for tombstone in self.tombstones)
+        )
 
 
 class CompletionBarrier(DomainModel):
