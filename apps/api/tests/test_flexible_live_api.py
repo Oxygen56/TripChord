@@ -235,7 +235,7 @@ async def test_flexible_live_plan_enforces_strict_server_policy(
         )
 
     assert response.status_code == 422
-    assert "strict three-platform coverage" in response.json()["detail"]
+    assert "strict full-coverage mode" in response.json()["detail"]
     assert pair_runner.calls == 0
 
 

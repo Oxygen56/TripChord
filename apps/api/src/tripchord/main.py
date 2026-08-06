@@ -94,6 +94,13 @@ from tripchord.agents.persistent_memory import (
 )
 from tripchord.agents.rag import EvidenceRagRetriever
 from tripchord.agents.stay_area import system_stay_area_search_profile
+from tripchord.platform.adapters import (
+    default_browser_providers_from_registry,
+    default_platforms_from_registry,
+)
+from tripchord.platform.api import guard_live_start, router as provider_api_router
+from tripchord.platform.capability import ProviderVertical
+from tripchord.platform.registry import build_default_registry
 from tripchord.api import (
     LIVE_FLEXIBLE_FROM_TEXT_EXECUTION_BOUNDARY,
     AgentMemoryListResponse,
@@ -674,12 +681,12 @@ def _install_browser_bridge(
         model_agents_required=configured_settings.model_agents_required,
         context_builder=selected_context_builder,
         memory_store=selected_memory_store,
-        providers=LIVE_V5_BROWSER_PROVIDERS,
+        providers=default_browser_providers_from_registry(),
     )
     flexible_system = FlexibleLiveAgentSystem(
         cast(LiveDatePairRunner, live_system),
-        explorer=FlexibleDateExplorer(LIVE_V5_PLATFORMS),
-        query_planner=FlexibleQueryPlanBuilder(LIVE_V5_PLATFORMS),
+        explorer=FlexibleDateExplorer(default_platforms_from_registry()),
+        query_planner=FlexibleQueryPlanBuilder(default_platforms_from_registry()),
         minimum_departure_lead_days=7,
         model_router=model_router,
         model_agents_required=configured_settings.model_agents_required,
@@ -1020,6 +1027,8 @@ app.state.model_trace_sink = model_trace_sink
 app.state.memory_store = memory_store
 app.state.context_builder = context_builder
 app.state.live_planning_job_registry = live_planning_job_registry
+app.state.provider_registry = build_default_registry()
+app.include_router(provider_api_router)
 browser_task_bridge, live_package_agent_system = _install_browser_bridge(
     app,
     settings,
@@ -1689,18 +1698,23 @@ async def _cache_flexible_pair_runs(
 )
 async def live_flexible_agent_plan_endpoint(
     request: LiveFlexibleAgentPlanningRequest,
+    http_request: Request,
     flexible_system: FlexibleLiveSystemDep,
     cache: LiveRunCacheDep,
     principal: PrincipalDep,
 ) -> LiveFlexibleAgentPlanningResponse:
     await rate_limiter.check(principal.tenant_id, "live-flexible-agent-plan")
+    guard_live_start(
+        http_request,
+        (ProviderVertical.FLIGHT, ProviderVertical.LODGING),
+    )
     if (
         settings.browser_bridge_require_all_providers
         and request.coverage_mode != LiveCoverageMode.STRICT
     ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="server policy requires strict three-platform coverage",
+            detail="server policy requires strict full-coverage mode across all selected provider scopes",
         )
     pair_timeout_seconds = _live_timeout_seconds(request.timeout_seconds)
     total_timeout_seconds = _flexible_total_timeout_seconds(request.total_timeout_seconds)
@@ -1772,7 +1786,7 @@ async def _preflight_live_flexible_from_text(
     ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="server policy requires strict three-platform coverage",
+            detail="server policy requires strict full-coverage mode across all selected provider scopes",
         )
 
 
@@ -2187,7 +2201,7 @@ async def live_agent_plan_endpoint(
     ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="server policy requires strict three-platform coverage",
+            detail="server policy requires strict full-coverage mode across all selected provider scopes",
         )
     try:
         if isinstance(live_system, LivePackageAgentSystem):

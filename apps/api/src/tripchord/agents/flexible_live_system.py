@@ -2214,8 +2214,8 @@ class FlexibleLiveAgentSystem:
         v4_provider_bases: dict[TravelPlatform, int] = {}
         if len(tasks) in {13, 18}:
             platforms = tuple(dict.fromkeys(task.platform for task in tasks))
-            if len(platforms) != 3:
-                raise ValueError("live-v4/v5 requires exactly three providers")
+            if not platforms:
+                raise ValueError("live-v4/v5 requires at least one provider")
             for platform in platforms:
                 platform_offsets = [
                     task.scheduled_offset_ms for task in tasks if task.platform == platform

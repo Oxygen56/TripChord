@@ -1425,8 +1425,8 @@ class LivePackageAgentSystem:
     ) -> None:
         if max_concurrency < 15:
             raise ValueError("max_concurrency must be at least fifteen for platform fan-out")
-        if len(providers) != 3 or len(set(providers)) != 3:
-            raise ValueError("live package system requires exactly three unique providers")
+        if not providers or len(set(providers)) != len(providers):
+            raise ValueError("live package system requires at least one unique provider")
         self._bridge = bridge
         self._normalizer = normalizer or BrowserQuoteNormalizer()
         self._icom_provider = icom_provider

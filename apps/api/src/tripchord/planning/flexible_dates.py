@@ -285,12 +285,8 @@ class QueryPlanPolicy(DomainModel):
         platforms = tuple(item.platform for item in self.platform_rates)
         if len(platforms) != len(set(platforms)):
             raise ValueError("platform rate policies must be unique")
-        supported = {
-            frozenset(LEGACY_V4_PLATFORMS),
-            frozenset(LIVE_V5_PLATFORMS),
-        }
-        if frozenset(platforms) not in supported:
-            raise ValueError("query plans require one frozen three-platform provider profile")
+        if not platforms:
+            raise ValueError("query plans require at least one provider platform")
         return self
 
 
@@ -334,8 +330,8 @@ class FlexibleDateExplorer:
         self,
         platforms: tuple[TravelPlatform, ...] = EXPECTED_PLATFORMS,
     ) -> None:
-        if len(platforms) != 3 or len(set(platforms)) != 3:
-            raise ValueError("date explorer requires exactly three unique platforms")
+        if not platforms or len(set(platforms)) != len(platforms):
+            raise ValueError("date explorer requires at least one unique platform")
         self._platforms = platforms
 
     def explore(
@@ -717,8 +713,8 @@ class FlexibleQueryPlanBuilder:
         self,
         platforms: tuple[TravelPlatform, ...] = EXPECTED_PLATFORMS,
     ) -> None:
-        if len(platforms) != 3 or len(set(platforms)) != 3:
-            raise ValueError("query planner requires exactly three unique platforms")
+        if not platforms or len(set(platforms)) != len(platforms):
+            raise ValueError("query planner requires at least one unique platform")
         self._platforms = platforms
 
     def build(
@@ -766,7 +762,8 @@ class FlexibleQueryPlanBuilder:
             pair_capacity = min(pair_capacity, effective_policy.max_exact_pairs)
         if pair_capacity < 1:
             raise ValueError(
-                "query task limits are too small for one complete three-platform date pair"
+                "query task limits are too small for one complete date pair "
+                f"across {len(self._platforms)} provider(s)"
             )
         selected = exploration.candidates[:pair_capacity]
         omitted = exploration.candidates[pair_capacity:]

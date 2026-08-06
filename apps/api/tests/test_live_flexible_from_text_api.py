@@ -552,7 +552,7 @@ async def test_from_text_endpoint_enforces_strict_policy_before_search(
         )
 
     assert response.status_code == 422
-    assert "strict three-platform coverage" in response.json()["detail"]
+    assert "strict full-coverage mode" in response.json()["detail"]
     assert not pair_runner.calls
 
 
