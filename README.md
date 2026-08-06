@@ -199,6 +199,7 @@ Agent 数量不是无限增加，也不是由 LLM 随口决定。确定性预算
 相关设计与评测：
 
 - [系统架构](docs/architecture.md)
+- [v0.2 → v1.0 产品化路线图](docs/roadmap.md)
 - [Agent 架构基准](docs/benchmark-agent-architectures.md)
 - [日期搜索基准](docs/date-search-benchmark.md)
 - [Done-Gate](docs/done-gate.md)
@@ -216,6 +217,9 @@ Agent 数量不是无限增加，也不是由 LLM 随口决定。确定性预算
 ## 让 AI 帮你理解和运行本项目
 
 仓库根目录的 [AGENTS.md](AGENTS.md) 是给 AI 编程助手的项目合同。你可以把下面这段提示词直接发给 Claude Code、Codex、Cursor 或其他能读取本地仓库的 AI：
+
+如果希望 AI 不只运行当前版本，而是持续实施 v0.2 至 v1.0 产品化路线图，请使用
+[Claude Code 自治实施总提示词](docs/claude-code-v1-implementation-prompt.md)。
 
 ```text
 请先完整阅读 README.md、AGENTS.md、docs/architecture.md、docs/providers.md 和
