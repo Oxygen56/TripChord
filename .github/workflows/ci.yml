@@ -32,6 +32,58 @@ jobs:
       - run: uv run python benchmarks/evaluate_planning.py
       - run: uv run python benchmarks/evaluate_repair.py
       - run: uv run python benchmarks/evaluate_events.py
+      - run: uv run python benchmarks/evaluate_acceptance.py
+      - run: uv run python benchmarks/evaluate_faults.py
+
+  companion:
+    # v0.9: the Browser Companion release gate now runs in remote CI, not only
+    # locally. It validates build-meta, the release seal, host permissions and
+    # the JS/Python contract suites in a key-free environment.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: uv sync --locked --all-groups
+      - run: uv run python scripts/browser_companion_release_gate.py
+        env:
+          ANTHROPIC_API_KEY: ""
+          MODEL_API_KEY: ""
+          TRIPCHORD_ANTHROPIC_API_KEY: ""
+          TRIPCHORD_BROWSER_BRIDGE_CONTROL_TOKEN: ""
+          TRIPCHORD_BROWSER_BRIDGE_TOKEN: ""
+          TRIPCHORD_MODEL_API_KEY: ""
+
+  security:
+    # v0.9: secret scanning + Python SAST stay cheap and fail closed. The
+    # gitleaks action scans the push/PR diff for committed secrets.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ""
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --all-groups
+      - run: uv run ruff check .
+      - name: dependency audit
+        run: |
+          uv export --frozen --no-dev --no-hashes --output-file /tmp/tripchord-requirements.txt
+          uvx pip-audit -r /tmp/tripchord-requirements.txt
 
   web:
     runs-on: ubuntu-latest

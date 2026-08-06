@@ -164,6 +164,7 @@ def layer2_replay() -> LayerResult:
         ("benchmarks.evaluate_planning", "benchmark_planning"),
         ("benchmarks.evaluate_repair", "benchmark_repair"),
         ("benchmarks.evaluate_events", "benchmark_events"),
+        ("benchmarks.evaluate_acceptance", "acceptance_surfaces"),
     )
     for module, label in commands:
         code, out = _run(["uv", "run", "python", "-m", module], timeout=600)
@@ -181,7 +182,8 @@ def layer2_replay() -> LayerResult:
 
 
 def layer3_clean_chrome_fixtures() -> LayerResult:
-    """Clean-Chrome malicious fixture gates (browser bridge + handoff URL policy)."""
+    """Clean-Chrome malicious fixture gates (browser bridge + handoff URL policy
+    + booking protection + reprice wiring fixtures)."""
     checks: list[dict[str, Any]] = []
     code, out = _run(
         ["uv", "run", "pytest", "apps/api/tests/test_official_handoff.py", "-q"],
@@ -209,18 +211,83 @@ def layer3_clean_chrome_fixtures() -> LayerResult:
             "detail": out2[-300:] if code2 else "",
         }
     )
+    wiring_tests = (
+        "apps/api/tests/test_reprice_service.py",
+        "apps/api/tests/test_booking_gate.py",
+        "apps/api/tests/test_booking_planning_integration.py",
+        "apps/api/tests/test_wiring_api.py",
+    )
+    for module in wiring_tests:
+        code3, out3 = _run(
+            ["uv", "run", "pytest", module, "-q"],
+            timeout=600,
+        )
+        checks.append(
+            {
+                "name": Path(module).stem,
+                "passed": code3 == 0,
+                "detail": out3[-300:] if code3 else "",
+            }
+        )
     passed = all(item["passed"] for item in checks)
     return LayerResult(
         name="3_clean_chrome_fixtures",
         passed=passed,
-        detail="handoff URL policy + browser bridge permission fixtures",
+        detail=(
+            "handoff URL policy + browser bridge permission + booking/reprice "
+            "wiring fixtures"
+        ),
         sub_checks=checks,
     )
 
 
+def _resolve_model_smoke_args() -> tuple[list[str], str] | None:
+    """Resolve the required-model smoke invocation from the environment.
+
+    Returns ``(argv, api_key_env)`` when the model endpoint is fully resolvable
+    and the user has explicitly acknowledged bounded live model cost, else None.
+    """
+    if os.environ.get("TRIPCHORD_ACK_MODEL_COST") != "1":
+        return None
+    api_key_env = "MODEL_API_KEY"
+    api_key = os.environ.get(api_key_env) or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    model = os.environ.get("TRIPCHORD_MODEL_NAME") or os.environ.get("ANTHROPIC_MODEL")
+    base_url = os.environ.get("TRIPCHORD_MODEL_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL")
+    if not model or not base_url:
+        return None
+    provider = "anthropic" if "anthropic" in (base_url or "").lower() else "openai_compatible"
+    argv = [
+        "uv",
+        "run",
+        "python",
+        "scripts/run_model_runtime_smoke.py",
+        "--ack-live-cost",
+        "--provider",
+        provider,
+        "--model",
+        model,
+        "--base-url",
+        base_url,
+        "--api-key-env",
+        api_key_env,
+        "--output",
+        str(ROOT / "benchmarks" / "results" / "model-runtime-smoke-done-gate.json"),
+    ]
+    return argv, api_key_env
+
+
 def layer4_model_smoke() -> LayerResult:
-    """OpenAI-compatible required-model smoke when a key is authorised."""
+    """OpenAI-compatible required-model smoke when a key is authorised.
+
+    The smoke makes a bounded live model call, so it only runs when the user
+    has explicitly acknowledged model cost (``TRIPCHORD_ACK_MODEL_COST=1``) and
+    the endpoint is resolvable.  Without that acknowledgement the layer is
+    *skipped*, never failed — the gate stays honest about the boundary.
+    """
     authorized = any(os.environ.get(var) for var in _MODEL_ENV_VARS)
+    resolved = _resolve_model_smoke_args()
     if not authorized:
         return LayerResult(
             name="4_model_smoke",
@@ -228,10 +295,19 @@ def layer4_model_smoke() -> LayerResult:
             skipped=True,
             detail="no model API key authorised in environment; skipped (not failed)",
         )
-    code, out = _run(
-        ["uv", "run", "python", "scripts/run_model_runtime_smoke.py"],
-        timeout=600,
-    )
+    if resolved is None:
+        return LayerResult(
+            name="4_model_smoke",
+            passed=False,
+            skipped=True,
+            detail=(
+                "model key present but bounded live model cost not acknowledged; "
+                "set TRIPCHORD_ACK_MODEL_COST=1 (and a resolvable model endpoint) "
+                "to run the required-model smoke"
+            ),
+        )
+    argv, _ = resolved
+    code, out = _run(argv, timeout=600)
     return LayerResult(
         name="4_model_smoke",
         passed=code == 0,

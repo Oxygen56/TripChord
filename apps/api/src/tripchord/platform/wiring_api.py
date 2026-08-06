@@ -523,6 +523,58 @@ class ProviderConformanceView(BaseModel):
     conformance: str
 
 
+class ObservabilitySummaryView(BaseModel):
+    planning_jobs_by_terminal_state: dict[str, int]
+    handoff_count: int
+    booking_fact_count: int
+    protected_component_count: int
+    boundary: str
+
+
+@router.get("/observability/summary", response_model=ObservabilitySummaryView)
+async def observability_summary_endpoint(request: Request) -> ObservabilitySummaryView:
+    """Local observability summary (v0.9).
+
+    Separately counts terminal job states, issued official handoffs and booking
+    facts so a local panel can track the product surfaces without touching real
+    OTA data.  This is a process-local summary; it does not claim platform-wide
+    availability.
+    """
+    from tripchord.observability import metrics as runtime_metrics
+
+    job_counts = dict(runtime_metrics._job_counts)
+    handoff_store = getattr(request.app.state, "handoff_store", None)
+    booking_store = getattr(request.app.state, "booking_ledger_store", None)
+    handoff_count = 0
+    booking_fact_count = 0
+    protected_component_count = 0
+    if handoff_store is not None:
+        handoff_count = len(handoff_store._used_ids)
+    if booking_store is not None:
+        from pathlib import Path
+
+        root = booking_store._root
+        facts = 0
+        protected = 0
+        for ledger_file in Path(root).glob("*.json"):
+            ledger = booking_store.load(ledger_file.stem)
+            if ledger is None:
+                continue
+            facts += len(ledger.facts)
+            protected += len(ledger.constraints)
+        booking_fact_count = facts
+        protected_component_count = protected
+    return ObservabilitySummaryView(
+        planning_jobs_by_terminal_state=job_counts,
+        handoff_count=handoff_count,
+        booking_fact_count=booking_fact_count,
+        protected_component_count=protected_component_count,
+        boundary=(
+            "本地可观测汇总；真实平台 canary/覆盖需授权 Companion 会话，不在此汇总中伪造"
+        ),
+    )
+
+
 @router.get("/providers/sdk/conformance", response_model=tuple[ProviderConformanceView, ...])
 async def provider_sdk_conformance_endpoint(
     request: Request,
