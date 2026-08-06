@@ -203,6 +203,7 @@ from tripchord.providers.factory import build_amap_provider, build_provider_regi
 from tripchord.providers.icom_transfer import IComTransferProvider
 from tripchord.providers.user_snapshot import UserQuoteInput
 from tripchord.rate_limit import RateLimiter
+from tripchord.security.secrets import redact_secrets
 
 _BROWSER_BRIDGE_MOUNT = "/browser-bridge"
 _LIVE_RUN_CACHE_CAPACITY = 64
@@ -1699,7 +1700,7 @@ async def _persist_search_run(
             "search run persistence failed for run_id=%s: %s: %s",
             built.run_id,
             type(exc).__name__,
-            exc,
+            redact_secrets(str(exc)),
         )
         return None
     return built

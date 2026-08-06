@@ -134,11 +134,24 @@ def layer1_reproducibility() -> LayerResult:
         checks.append({"name": "web_build", "passed": code3 == 0, "detail": out3[-200:]})
         code4, _ = _run(["uv", "run", "python", "-c", "import tripchord.main"])
         checks.append({"name": "api_import", "passed": code4 == 0})
+        code5, _ = _run(
+            [
+                "uv",
+                "run",
+                "python",
+                "-m",
+                "pytest",
+                "apps/api/tests/test_secret_redaction.py",
+                "-q",
+            ],
+            timeout=600,
+        )
+        checks.append({"name": "secret_redaction", "passed": code5 == 0})
     passed = all(item["passed"] for item in checks)
     return LayerResult(
         name="1_reproducibility",
         passed=passed,
-        detail="migration upgrade/check, web build, API import",
+        detail="migration upgrade/check, web build, API import, secret redaction",
         sub_checks=checks,
     )
 
