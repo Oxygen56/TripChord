@@ -1033,6 +1033,7 @@ app.state.model_trace_sink = model_trace_sink
 app.state.memory_store = memory_store
 app.state.context_builder = context_builder
 app.state.live_planning_job_registry = live_planning_job_registry
+app.state.database = database
 app.state.provider_registry = build_default_registry()
 app.include_router(provider_api_router)
 browser_task_bridge, live_package_agent_system = _install_browser_bridge(
@@ -1801,7 +1802,7 @@ async def live_flexible_agent_plan_endpoint(
     principal: PrincipalDep,
 ) -> LiveFlexibleAgentPlanningResponse:
     await rate_limiter.check(principal.tenant_id, "live-flexible-agent-plan")
-    guard_live_start(
+    await guard_live_start(
         http_request,
         (ProviderVertical.FLIGHT, ProviderVertical.LODGING),
     )

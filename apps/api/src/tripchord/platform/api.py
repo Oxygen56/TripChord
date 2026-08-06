@@ -13,6 +13,7 @@ import stat
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -82,7 +83,13 @@ class ProviderSelectionResponse(BaseModel):
 
 
 class _UserScopeSelectionStore:
-    """Local-first persisted user selection (single writer, atomic JSON)."""
+    """Local-first persisted user selection.
+
+    The v0.2 deviation moves the canonical store to the database
+    (``provider_selection`` table, tenant-scoped).  The JSON file remains a
+    read fallback so pre-migration local installs and tests without the table
+    keep working; every write goes through the DB when a session is available.
+    """
 
     def __init__(self, path: Path | None = None) -> None:
         self._path = path or Path(".runtime/provider-selection.json")
@@ -106,6 +113,12 @@ class _UserScopeSelectionStore:
         self._persist()
         return dict(self._entries)
 
+    async def load_async(self) -> dict[str, bool]:
+        return self.load()
+
+    async def set_enabled_async(self, scope_key: str, enabled: bool) -> dict[str, bool]:
+        return self.set_enabled(scope_key, enabled)
+
     def _persist(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         canonical = json.dumps(
@@ -122,6 +135,66 @@ class _UserScopeSelectionStore:
 
 
 _store = _UserScopeSelectionStore()
+
+
+async def _db_selection_store(request: Request) -> _UserScopeSelectionStore | None:
+    """Return a DB-backed selection store bound to the request tenant.
+
+    The store is resolved lazily from ``app.state.provider_selection_store`` so
+    tests that only swap the module-level JSON store keep working.  When the
+    database is not wired up (or the provider_selection table is missing), the
+    JSON fallback store is used unchanged.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    from tripchord.persistence.database import Database
+    from tripchord.persistence.provider_selection import ProviderSelectionRepository
+
+    raw_database = getattr(request.app.state, "database", None)
+    if raw_database is None:
+        return None
+    database = cast(Database, raw_database)
+    tenant_id = getattr(request.state, "tenant_id", "anonymous")
+
+    class _DbBackedStore(_UserScopeSelectionStore):
+        async def load_async(self) -> dict[str, bool]:
+            try:
+                async with database.sessions() as session:
+                    repository = ProviderSelectionRepository(session, tenant_id=tenant_id)
+                    return await repository.load_all()
+            except OperationalError:
+                return super().load()
+
+        async def set_enabled_async(self, scope_key: str, enabled: bool) -> dict[str, bool]:
+            try:
+                async with database.sessions() as session:
+                    repository = ProviderSelectionRepository(session, tenant_id=tenant_id)
+                    return await repository.set_enabled(scope_key, enabled)
+            except OperationalError:
+                return super().set_enabled(scope_key, enabled)
+
+    return _DbBackedStore(path=_store._path)
+
+
+async def _user_selection_set(request: Request) -> UserScopeSelectionSet:
+    store = await _db_selection_store(request)
+    entries: list[UserScopeSelection] = []
+    if store is not None:
+        raw = await store.load_async()
+    else:
+        raw = _store.load()
+    for key, enabled in raw.items():
+        try:
+            provider, vertical = key.split(":", 1)
+            scope = ProviderScopeKey(
+                provider=provider, vertical=ProviderVertical(vertical)
+            )
+        except (ValueError, KeyError):
+            continue
+        entries.append(
+            UserScopeSelection(scope=scope, enabled=enabled)
+        )
+    return UserScopeSelectionSet(entries=tuple(entries))
 
 
 def _runtime_input() -> EligibilityInput:
@@ -148,22 +221,6 @@ def _runtime_input() -> EligibilityInput:
         cooldown_scope_keys=frozenset(),
         known_blocking_scope_keys=frozenset(),
     )
-
-
-def _user_selection_set() -> UserScopeSelectionSet:
-    entries = []
-    for key, enabled in _store.load().items():
-        try:
-            provider, vertical = key.split(":", 1)
-            scope = ProviderScopeKey(
-                provider=provider, vertical=ProviderVertical(vertical)
-            )
-        except (ValueError, KeyError):
-            continue
-        entries.append(
-            UserScopeSelection(scope=scope, enabled=enabled)
-        )
-    return UserScopeSelectionSet(entries=tuple(entries))
 
 
 def _to_view(
@@ -203,9 +260,9 @@ def _registry_from_state(request: Request) -> ProviderRegistry:
     return registry
 
 
-def _snapshot_for(request: Request) -> SelectionSnapshot:
+async def _snapshot_for(request: Request) -> SelectionSnapshot:
     registry = _registry_from_state(request)
-    user = _user_selection_set()
+    user = await _user_selection_set(request)
     runtime = _runtime_input()
     return build_selection_snapshot(
         run_key=f"capabilities-{datetime.now(UTC).isoformat()}",
@@ -225,7 +282,7 @@ async def provider_capabilities_endpoint(
     request: Request,
 ) -> ProviderCapabilitiesResponse:
     registry = _registry_from_state(request)
-    snapshot = _snapshot_for(request)
+    snapshot = await _snapshot_for(request)
     eligible = frozenset(key.key for key in snapshot.selected_scope_keys())
     views = tuple(_to_view(entry, eligible) for entry in snapshot.scopes)
     return ProviderCapabilitiesResponse(
@@ -255,8 +312,12 @@ async def provider_selection_endpoint(
     request: Request,
     selection: ProviderSelectionRequest,
 ) -> ProviderSelectionResponse:
-    _store.set_enabled(selection.scope, selection.enabled)
-    snapshot = _snapshot_for(request)
+    store = await _db_selection_store(request)
+    if store is not None:
+        await store.set_enabled_async(selection.scope, selection.enabled)
+    else:
+        _store.set_enabled(selection.scope, selection.enabled)
+    snapshot = await _snapshot_for(request)
     eligible = frozenset(key.key for key in snapshot.selected_scope_keys())
     views = tuple(_to_view(entry, eligible) for entry in snapshot.scopes)
     return ProviderSelectionResponse(updated=views, snapshot_sha256=snapshot.snapshot_sha256)
@@ -281,14 +342,14 @@ def require_eligible_scope_for_verticals(
         )
 
 
-def guard_live_start(
+async def guard_live_start(
     request: Request,
     verticals: tuple[ProviderVertical, ...],
 ) -> SelectionSnapshot:
     """Build the current selection snapshot and refuse to start if any required
     vertical has no eligible scope.  Returns the snapshot for downstream use."""
     registry = _registry_from_state(request)
-    user = _user_selection_set()
+    user = await _user_selection_set(request)
     runtime = _runtime_input()
     snapshot = build_selection_snapshot(
         run_key=f"guard-{datetime.now(UTC).isoformat()}",

@@ -79,6 +79,27 @@ class TerminalReceiptRow(Base):
     search_run: Mapped[SearchRunRow] = relationship(back_populates="receipts")
 
 
+class ProviderSelectionRow(Base):
+    """Persisted per-scope user selection (v0.2 deviation: DB-backed store)."""
+
+    __tablename__ = "provider_selection"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "scope_key",
+            name="uq_provider_selection_tenant_scope",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(100), index=True)
+    scope_key: Mapped[str] = mapped_column(String(160))
+    enabled: Mapped[bool] = mapped_column(default=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
 class WorkspaceRow(Base):
     __tablename__ = "workspaces"
     __table_args__ = (
