@@ -1785,6 +1785,9 @@ class BrowserCompanionReloadRequestSnapshot(DomainModel):
 class ClaimBrowserTasksRequest(DomainModel):
     companion_id: str = Field(min_length=1, max_length=128)
     providers: tuple[BrowserProvider, ...] = ()
+    authorized_scope_keys: tuple[str, ...] = ()
+    adapter_version: str | None = None
+    contract_version: str | None = None
     limit: int = Field(default=6, ge=1, le=6)
     build_identity: BrowserCompanionBuildIdentity | None = None
     runtime_instance_id: str | None = Field(
@@ -1824,6 +1827,10 @@ class ClaimBrowserTasksResponse(DomainModel):
 class BrowserCompanionHeartbeatRequest(DomainModel):
     companion_id: str = Field(min_length=1, max_length=128)
     providers: tuple[BrowserProvider, ...] = Field(min_length=1)
+    authorized_scope_keys: tuple[str, ...] = ()
+    adapter_version: str | None = None
+    contract_version: str | None = None
+    runtime_instance_id: str | None = None
 
 
 class BrowserCompanionHeartbeat(DomainModel):
@@ -1832,6 +1839,9 @@ class BrowserCompanionHeartbeat(DomainModel):
     last_seen: datetime
     age_seconds: float = Field(ge=0)
     is_fresh: bool
+    authorized_scope_keys: tuple[str, ...] = ()
+    adapter_version: str | None = None
+    contract_version: str | None = None
     build_identity: BrowserCompanionBuildIdentity | None = None
     runtime_instance_id: str | None = None
 
@@ -1896,6 +1906,9 @@ class _CompanionHeartbeatRecord:
     companion_id: str
     providers: tuple[BrowserProvider, ...]
     last_seen: datetime
+    authorized_scope_keys: tuple[str, ...] = ()
+    adapter_version: str | None = None
+    contract_version: str | None = None
     build_identity: BrowserCompanionBuildIdentity | None = None
     runtime_instance_id: str | None = None
 
@@ -2200,6 +2213,9 @@ class BrowserTaskBridge:
         *,
         providers: Iterable[BrowserProvider] = (),
         limit: int = 6,
+        authorized_scope_keys: tuple[str, ...] = (),
+        adapter_version: str | None = None,
+        contract_version: str | None = None,
         build_identity: BrowserCompanionBuildIdentity | None = None,
         runtime_instance_id: str | None = None,
         reload_receipt: BrowserCompanionReloadReceipt | None = None,
@@ -2221,6 +2237,9 @@ class BrowserTaskBridge:
             self._record_companion_heartbeat(
                 companion_id,
                 requested_providers or tuple(BrowserProvider),
+                authorized_scope_keys=authorized_scope_keys,
+                adapter_version=adapter_version,
+                contract_version=contract_version,
                 build_identity=build_identity,
                 runtime_instance_id=runtime_instance_id,
             )
@@ -2325,6 +2344,10 @@ class BrowserTaskBridge:
         companion_id: str,
         *,
         providers: Iterable[BrowserProvider],
+        authorized_scope_keys: tuple[str, ...] = (),
+        adapter_version: str | None = None,
+        contract_version: str | None = None,
+        runtime_instance_id: str | None = None,
     ) -> BrowserCompanionHeartbeat:
         requested_providers = tuple(dict.fromkeys(providers))
         if not companion_id or len(companion_id) > 128:
@@ -2332,7 +2355,14 @@ class BrowserTaskBridge:
         if not requested_providers:
             raise ValueError("heartbeat requires at least one provider")
         async with self._changed:
-            self._record_companion_heartbeat(companion_id, requested_providers)
+            self._record_companion_heartbeat(
+                companion_id,
+                requested_providers,
+                authorized_scope_keys=authorized_scope_keys,
+                adapter_version=adapter_version,
+                contract_version=contract_version,
+                runtime_instance_id=runtime_instance_id,
+            )
             record = self._companion_heartbeats[companion_id]
             return self._heartbeat_snapshot(record, self._utc_now())
 
@@ -2684,6 +2714,9 @@ class BrowserTaskBridge:
         companion_id: str,
         providers: tuple[BrowserProvider, ...],
         *,
+        authorized_scope_keys: tuple[str, ...] = (),
+        adapter_version: str | None = None,
+        contract_version: str | None = None,
         build_identity: BrowserCompanionBuildIdentity | None = None,
         runtime_instance_id: str | None = None,
     ) -> None:
@@ -2692,6 +2725,21 @@ class BrowserTaskBridge:
             companion_id=companion_id,
             providers=providers,
             last_seen=self._utc_now(),
+            authorized_scope_keys=(
+                authorized_scope_keys
+                if authorized_scope_keys
+                else previous.authorized_scope_keys if previous is not None else ()
+            ),
+            adapter_version=(
+                adapter_version
+                if adapter_version is not None
+                else previous.adapter_version if previous is not None else None
+            ),
+            contract_version=(
+                contract_version
+                if contract_version is not None
+                else previous.contract_version if previous is not None else None
+            ),
             build_identity=(
                 build_identity
                 if build_identity is not None
@@ -2716,6 +2764,9 @@ class BrowserTaskBridge:
             last_seen=record.last_seen,
             age_seconds=age_seconds,
             is_fresh=age_seconds <= COMPANION_HEARTBEAT_STALE_AFTER_SECONDS,
+            authorized_scope_keys=record.authorized_scope_keys,
+            adapter_version=record.adapter_version,
+            contract_version=record.contract_version,
             build_identity=record.build_identity,
             runtime_instance_id=record.runtime_instance_id,
         )
@@ -3519,6 +3570,9 @@ def create_browser_bridge_app(
                 payload.companion_id,
                 providers=payload.providers,
                 limit=payload.limit,
+                authorized_scope_keys=payload.authorized_scope_keys,
+                adapter_version=payload.adapter_version,
+                contract_version=payload.contract_version,
                 build_identity=payload.build_identity,
                 runtime_instance_id=payload.runtime_instance_id,
                 reload_receipt=payload.reload_receipt,
@@ -3552,6 +3606,10 @@ def create_browser_bridge_app(
         return await task_bridge.heartbeat(
             payload.companion_id,
             providers=payload.providers,
+            authorized_scope_keys=payload.authorized_scope_keys,
+            adapter_version=payload.adapter_version,
+            contract_version=payload.contract_version,
+            runtime_instance_id=payload.runtime_instance_id,
         )
 
     @app.post(

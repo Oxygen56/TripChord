@@ -94,13 +94,6 @@ from tripchord.agents.persistent_memory import (
 )
 from tripchord.agents.rag import EvidenceRagRetriever
 from tripchord.agents.stay_area import system_stay_area_search_profile
-from tripchord.platform.adapters import (
-    default_browser_providers_from_registry,
-    default_platforms_from_registry,
-)
-from tripchord.platform.api import guard_live_start, router as provider_api_router
-from tripchord.platform.capability import ProviderVertical
-from tripchord.platform.registry import build_default_registry
 from tripchord.api import (
     LIVE_FLEXIBLE_FROM_TEXT_EXECUTION_BOUNDARY,
     AgentMemoryListResponse,
@@ -172,7 +165,6 @@ from tripchord.persistence.repository import (
 from tripchord.planning.adaptive import AdaptiveReplanner
 from tripchord.planning.assembler import PlanningProblemAssembler, ReplayPlaceCatalog
 from tripchord.planning.flexible_dates import (
-    LIVE_V5_PLATFORMS,
     FlexibleDateExplorer,
     FlexibleQueryPlanBuilder,
 )
@@ -184,6 +176,14 @@ from tripchord.planning.replanner import LocalReplanResult
 from tripchord.planning.requirements import RequirementParseResult
 from tripchord.planning.stay_plans import system_stay_plan_candidate_set
 from tripchord.planning.workflow import WorkflowResult
+from tripchord.platform.adapters import (
+    default_browser_providers_from_registry,
+    default_platforms_from_registry,
+)
+from tripchord.platform.api import guard_live_start
+from tripchord.platform.api import router as provider_api_router
+from tripchord.platform.capability import ProviderVertical
+from tripchord.platform.registry import build_default_registry
 from tripchord.providers.amap import AmapTravelDataProvider
 from tripchord.providers.base import OfferSearchQuery, OfferSearchResult
 from tripchord.providers.browser_bridge import (
@@ -1714,7 +1714,7 @@ async def live_flexible_agent_plan_endpoint(
     ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="server policy requires strict full-coverage mode across all selected provider scopes",
+            detail="server policy requires strict full-coverage mode across selected scopes",
         )
     pair_timeout_seconds = _live_timeout_seconds(request.timeout_seconds)
     total_timeout_seconds = _flexible_total_timeout_seconds(request.total_timeout_seconds)
@@ -1786,7 +1786,7 @@ async def _preflight_live_flexible_from_text(
     ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="server policy requires strict full-coverage mode across all selected provider scopes",
+            detail="server policy requires strict full-coverage mode across selected scopes",
         )
 
 
@@ -2201,7 +2201,7 @@ async def live_agent_plan_endpoint(
     ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="server policy requires strict full-coverage mode across all selected provider scopes",
+            detail="server policy requires strict full-coverage mode across selected scopes",
         )
     try:
         if isinstance(live_system, LivePackageAgentSystem):

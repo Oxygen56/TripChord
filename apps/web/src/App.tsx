@@ -9,6 +9,7 @@ import {
   checkLiveBridgeHealth,
   comparePlans,
   confirmAgentPreferenceMemory,
+  fetchProviderCapabilities,
   getAgenticMetricsPresentation,
   getBreakfastPreferenceApplication,
   getLiveMonitor,
@@ -22,6 +23,7 @@ import {
   type LivePackageAgentRun,
   type LivePlanningJobSnapshot,
   type LiveProvider,
+  type ProviderCapabilitiesResponse,
   loadWorkspace,
   type Offer,
   type PlanDiff,
@@ -36,6 +38,7 @@ import {
   resolveFlexibleOption,
   runAgentPlanning,
   setApiCredential,
+  setProviderSelection,
   startLiveFlexiblePlanningFromTextJob,
   startLiveMonitor,
   stopLiveMonitor,
@@ -384,9 +387,122 @@ function LiveSetupPanel({
       )}
       {available && (
         <div className="setup-ready-note">
-          桥服务可达，但尚未代表 3/3 平台核价成功。提交后必须以能力矩阵实际生成的源任务、终态覆盖率与报价证据为准。
+          桥服务可达，但尚未代表全部已选平台核价成功。提交后必须以能力矩阵实际生成的源任务、终态覆盖率与报价证据为准。
         </div>
       )}
+    </div>
+  );
+}
+
+function ProviderMatrix() {
+  const [capabilities, setCapabilities] = useState<ProviderCapabilitiesResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  async function refresh() {
+    setLoading(true);
+    setError(null);
+    try {
+      const next = await fetchProviderCapabilities();
+      setCapabilities(next);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "读取平台能力矩阵失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  async function toggleScope(scope: string, enabled: boolean) {
+    setError(null);
+    try {
+      const result = await setProviderSelection(scope, enabled);
+      setCapabilities((previous) =>
+        previous ? { ...previous, scopes: result.updated } : previous,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "更新平台选择失败");
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="provider-matrix">
+        <h3>平台 × 垂类能力矩阵</h3>
+        <p className="bridge-message">正在读取能力矩阵…</p>
+      </div>
+    );
+  }
+
+  if (!capabilities) {
+    return (
+      <div className="provider-matrix">
+        <h3>平台 × 垂类能力矩阵</h3>
+        <p className="bridge-message unavailable">{error ?? "无法读取能力矩阵"}</p>
+        <button type="button" onClick={() => void refresh()}>重新读取</button>
+      </div>
+    );
+  }
+
+  const flight = capabilities.scopes.filter((scope) => scope.vertical === "flight");
+  const lodging = capabilities.scopes.filter((scope) => scope.vertical === "lodging");
+
+  return (
+    <div className="provider-matrix">
+      <h3>平台 × 垂类能力矩阵</h3>
+      <p className="bridge-message">
+        profile {capabilities.profile_version} · 默认勾选全部当前合格项，可逐项关闭；关闭项不会产生浏览器任务、模型工具调用或网络访问。
+      </p>
+      {error && <p className="bridge-message unavailable">{error}</p>}
+      {capabilities.missing_verticals.length > 0 && (
+        <p className="bridge-message unavailable">
+          下列垂类无合格来源，无法启动搜索：{capabilities.missing_verticals.join("、")}
+        </p>
+      )}
+      <table className="capability-table">
+        <thead>
+          <tr>
+            <th>平台</th>
+            <th>垂类</th>
+            <th>认证阶段</th>
+            <th>适配器版本</th>
+            <th>选择</th>
+          </tr>
+        </thead>
+        <tbody>
+          {[...flight, ...lodging].map((scope) => (
+            <tr key={scope.key}>
+              <td>{scope.display_name || scope.provider}</td>
+              <td>{verticalLabels[scope.vertical as keyof typeof verticalLabels] ?? scope.vertical}</td>
+              <td>
+                <span className={`stage-pill ${scope.certification_stage}`}>
+                  {scope.certification_stage}
+                </span>
+              </td>
+              <td><code>{scope.adapter_version}</code></td>
+              <td>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={scope.user_enabled}
+                    disabled={scope.certification_stage !== "certified_active"}
+                    onChange={(event) =>
+                      void toggleScope(scope.key, event.target.checked)
+                    }
+                  />
+                  {scope.eligible ? "已选" : "未选"}
+                </label>
+                {scope.exclusion_reason && (
+                  <small className="exclusion-reason">{scope.exclusion_reason}</small>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -714,7 +830,7 @@ function FlexiblePlanningSummary({
                   <p>{option.departure_date} → {option.return_date}</p>
                   <small>
                     {pair?.date_pair.night_count ?? "?"} 晚 ·{" "}
-                    {option.all_platforms_complete ? "3/3 平台完整" : "平台覆盖不完整"} ·
+                    {option.all_platforms_complete ? "全部已选平台完整" : "平台覆盖不完整"} ·
                     证据 {(Number(option.evidence_completeness) * 100).toFixed(0)}%
                   </small>
                   <em>{option.recommendable ? "可推荐，查看完整闭环" : "主控未接受"}</em>
@@ -1852,7 +1968,7 @@ function App() {
                   </label>
                   <div className="live-policy-card">
                     <span>覆盖策略</span>
-                    <strong>严格 3/3 平台 · 来源数按能力矩阵生成</strong>
+                    <strong>严格覆盖全部已选平台 · 来源数按能力矩阵生成</strong>
                     <small>同程当前只查国际机票；单个平台的必需来源未终态时主控不会伪造完整结果。</small>
                   </div>
                 </div>
@@ -1870,7 +1986,7 @@ function App() {
                   />
                 </label>
                 <small className="field-note">
-                  默认使用确定性优先解析，不调用付费模型。桥健康只代表本地服务可达，不代表三平台核价成功。
+                  默认使用确定性优先解析，不调用付费模型。桥健康只代表本地服务可达，不代表全部已选平台核价成功。
                 </small>
               </>
             ) : (
@@ -1937,7 +2053,7 @@ function App() {
           {planningMode === "replay" ? (
             <div className="truth-banner replay"><strong>回放演示数据边界</strong><p>景点、路线与 Agent 轨迹使用明确标注的离线回放场景。这里出现的报价不是可预订实时价，也不会被包装成真实多平台核价。</p></div>
           ) : (
-            <div className={`truth-banner live ${liveBridgeHealth?.available ? "connected" : ""}`}><strong>真实模式授权边界</strong><p>只读搜索、筛选并打开报价详情；禁止下单、支付、使用优惠券、修改账号或导出登录凭据。桥可达不等于 3/3 平台任务已成功。</p></div>
+            <div className={`truth-banner live ${liveBridgeHealth?.available ? "connected" : ""}`}><strong>真实模式授权边界</strong><p>只读搜索、筛选并打开报价详情；禁止下单、支付、使用优惠券、修改账号或导出登录凭据。桥可达不等于全部已选平台任务已成功。</p></div>
           )}
         </section>
 
@@ -1999,11 +2115,14 @@ function App() {
                 ) : null}
               </>
             ) : (
-              <LiveSetupPanel
-                health={liveBridgeHealth}
-                checking={liveHealthChecking}
-                onRefresh={() => void refreshLiveHealth()}
-              />
+              <>
+                <LiveSetupPanel
+                  health={liveBridgeHealth}
+                  checking={liveHealthChecking}
+                  onRefresh={() => void refreshLiveHealth()}
+                />
+                <ProviderMatrix />
+              </>
             )
           ) : !workspace ? (
             <div className="empty-state"><span>⌁</span><h2>等待一组旅行约束</h2><p>提交后可以看到求解进度、报价真实性、逐日安排、版本差异和事件恢复。</p></div>

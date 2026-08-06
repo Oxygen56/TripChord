@@ -520,3 +520,64 @@ h1 { font-family: "Noto Sans SC", sans-serif; margin: 0; font-size: clamp(40px, 
   width: auto;
   padding: 0.55rem 0.85rem;
 }
+
+.provider-matrix {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid rgba(24, 119, 242, 0.22);
+  border-radius: 14px;
+  background: rgba(235, 245, 255, 0.72);
+  display: grid;
+  gap: 0.6rem;
+}
+
+.provider-matrix h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.capability-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.capability-table th,
+.capability-table td {
+  text-align: left;
+  padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid rgba(24, 119, 242, 0.14);
+  vertical-align: top;
+}
+
+.capability-table th {
+  color: #526171;
+  font-weight: 600;
+}
+
+.stage-pill {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  background: rgba(24, 119, 242, 0.12);
+  color: #1f3b5c;
+}
+
+.stage-pill.certified_active {
+  background: rgba(34, 160, 88, 0.14);
+  color: #175c36;
+}
+
+.stage-pill.disabled,
+.stage-pill.cooldown {
+  background: rgba(200, 60, 50, 0.12);
+  color: #8a2b22;
+}
+
+.exclusion-reason {
+  display: block;
+  color: #8a2b22;
+  line-height: 1.4;
+  margin-top: 0.2rem;
+}

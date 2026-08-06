@@ -302,6 +302,9 @@ async def test_empty_claim_records_privacy_minimal_heartbeat_and_expires() -> No
         "last_seen",
         "age_seconds",
         "is_fresh",
+        "authorized_scope_keys",
+        "adapter_version",
+        "contract_version",
         "build_identity",
         "runtime_instance_id",
     }

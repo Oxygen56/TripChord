@@ -3228,6 +3228,28 @@ async function hasProviderPermission(provider) {
   );
 }
 
+// Scope map mirrors the backend capability profile (tripchord-capability-v1).
+// Each provider grants all its declared scopes when the official origins are
+// authorised; the heartbeat reports only the scopes actually granted so the
+// backend never assumes a provider is available without evidence.
+const PROVIDER_SCOPES = {
+  ctrip: ["ctrip:flight", "ctrip:lodging"],
+  qunar: ["qunar:flight", "qunar:lodging"],
+  tongcheng: ["tongcheng:flight", "tongcheng:lodging"],
+  fliggy: ["fliggy:flight", "fliggy:lodging"],
+  zhixing: ["zhixing:flight", "zhixing:lodging"],
+};
+
+async function authorizedScopeKeys() {
+  const result = [];
+  for (const [provider, scopes] of Object.entries(PROVIDER_SCOPES)) {
+    if (await hasProviderPermission(provider)) {
+      result.push(...scopes);
+    }
+  }
+  return result;
+}
+
 function waitForTabComplete(tabId, timeoutMs) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -11078,9 +11100,13 @@ async function pollOnce() {
     // is queued. The bridge records only this extension id, provider set, and
     // last-seen timestamp; it never receives Chrome profile or account data.
     const reloadReceipt = await reloadReceiptForClaim();
+    const authorized = await authorizedScopeKeys();
     const claimBody = {
       companion_id: COMPANION_ID,
-      providers: ["ctrip", "qunar", "tongcheng"],
+      providers: [...new Set(authorized.map((scope) => scope.split(":")[0]))],
+      authorized_scope_keys: authorized,
+      adapter_version: "0.2.0",
+      contract_version: "tripchord-capability-v1",
       limit: MAX_CONCURRENT_LEASES,
       build_identity: currentBuildIdentity(),
       runtime_instance_id: RUNTIME_INSTANCE_ID,
@@ -11134,11 +11160,17 @@ async function heartbeatOnce() {
   assertChromeExecutionRuntime();
   const config = await sessionConfig();
   if (!config.connected) return null;
+  const authorized = await authorizedScopeKeys();
+  const providers = [...new Set(authorized.map((scope) => scope.split(":")[0]))];
   return bridgeFetch("/v1/companions/heartbeat", {
     method: "POST",
     body: JSON.stringify({
       companion_id: COMPANION_ID,
-      providers: ["ctrip", "qunar", "tongcheng"],
+      providers,
+      authorized_scope_keys: authorized,
+      adapter_version: "0.2.0",
+      contract_version: "tripchord-capability-v1",
+      runtime_instance_id: RUNTIME_INSTANCE_ID,
     }),
     timeoutMs: 5000,
   });

@@ -1054,6 +1054,45 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export type ProviderScopeView = {
+  key: string;
+  provider: string;
+  display_name: string;
+  vertical: string;
+  certification_stage: string;
+  adapter_version: string;
+  capability_version: string;
+  selector_contract_version: string;
+  official_domains: string[];
+  host_permissions: string[];
+  excluded_reason: string | null;
+  eligible: boolean;
+  state: string | null;
+  user_enabled: boolean;
+  exclusion_reason: string | null;
+};
+
+export type ProviderCapabilitiesResponse = {
+  profile_version: string;
+  registry_sha256: string;
+  scopes: ProviderScopeView[];
+  missing_verticals: string[];
+};
+
+export function fetchProviderCapabilities(): Promise<ProviderCapabilitiesResponse> {
+  return request("/api/v1/providers/capabilities");
+}
+
+export function setProviderSelection(
+  scope: string,
+  enabled: boolean,
+): Promise<{ updated: ProviderScopeView[]; snapshot_sha256: string | null }> {
+  return request("/api/v1/preferences/provider-selection", {
+    method: "PUT",
+    body: JSON.stringify({ scope, enabled }),
+  });
+}
+
 export function startPlanning(spec: TripSpec): Promise<StartPlanningResponse> {
   return request("/api/v1/trips/plan", {
     method: "POST",
