@@ -6,6 +6,7 @@ import secrets
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from typing import Protocol
 
 from pydantic import Field, field_validator
 
@@ -49,7 +50,9 @@ class LiveMonitorStatus(DomainModel):
     last_error: str | None = None
     boundary: str = (
         "用户显式开启后的本机周期性只读重核价；每轮只重查一个当前整包组件，"
-        "不是供应商推送、库存锁定、后台常驻服务或自动下单。进程重启后监控需重新开启。"
+        "不是供应商推送、库存锁定、后台常驻服务或自动下单。"
+        "状态与检查历史已持久化；进程重启后查询仍可恢复，"
+        "运行上下文可恢复的监控自动续跑，不可恢复的如实标记失败。"
     )
 
     _validate_created_at = field_validator("created_at")(
@@ -64,6 +67,24 @@ class LiveMonitorStatus(DomainModel):
 
 
 MonitorCheckCallback = Callable[[LiveMonitorStatus, str], Awaitable[LiveMonitorCheck]]
+
+
+class LiveMonitorPersistence(Protocol):
+    """Durable store for monitor status and check history.
+
+    Implementations are expected to be tenant-scoped for writes and reads and
+    to make ACTIVE records queryable across tenants so the registry can
+    rehydrate them after a process restart.
+    """
+
+    async def save_status(self, tenant_id: str, status: LiveMonitorStatus) -> None: ...
+    async def append_check(
+        self,
+        tenant_id: str,
+        monitor_id: str,
+        check: LiveMonitorCheck,
+    ) -> None: ...
+    async def list_active(self) -> tuple[tuple[str, LiveMonitorStatus], ...]: ...
 
 
 class _RuntimeMonitor:
@@ -92,6 +113,7 @@ class LiveQuoteMonitorRegistry:
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         max_monitors: int = 64,
+        store: LiveMonitorPersistence | None = None,
     ) -> None:
         if max_monitors < 1:
             raise ValueError("max_monitors must be positive")
@@ -101,6 +123,7 @@ class LiveQuoteMonitorRegistry:
         self._max_monitors = max_monitors
         self._records: dict[str, _RuntimeMonitor] = {}
         self._lock = asyncio.Lock()
+        self._store = store
 
     async def start(
         self,
@@ -137,8 +160,7 @@ class LiveQuoteMonitorRegistry:
         )
         async with self._lock:
             active = sum(
-                item.status.state == LiveMonitorState.ACTIVE
-                for item in self._records.values()
+                item.status.state == LiveMonitorState.ACTIVE for item in self._records.values()
             )
             if active >= self._max_monitors:
                 raise RuntimeError("live quote monitor capacity exceeded")
@@ -147,6 +169,7 @@ class LiveQuoteMonitorRegistry:
                 self._run(runtime),
                 name=f"tripchord:{monitor_id}",
             )
+        await self._persist_status(runtime)
         return runtime.status
 
     async def get(self, monitor_id: str, tenant_id: str) -> LiveMonitorStatus | None:
@@ -172,6 +195,7 @@ class LiveQuoteMonitorRegistry:
                         "updated_at": now,
                     }
                 )
+            await self._persist_status(runtime)
             return runtime.status
 
     async def check_now(
@@ -196,6 +220,54 @@ class LiveQuoteMonitorRegistry:
             *(runtime.task for runtime in records if runtime.task is not None),
             return_exceptions=True,
         )
+
+    def attach_store(self, store: LiveMonitorPersistence) -> None:
+        """Bind a durable store; persistence and restart recovery then apply."""
+        self._store = store
+
+    async def recover(
+        self,
+        resolvable: Callable[[str, LiveMonitorStatus], Awaitable[bool]],
+    ) -> int:
+        """Rehydrate persisted ACTIVE monitors after a process restart.
+
+        ``resolvable(tenant_id, status)`` returns whether the referenced run
+        context can still be recovered (e.g. the live-run cache still holds the
+        run).  Recoverable monitors resume their asyncio loop from their
+        persisted state; a monitor whose run is gone is marked FAILED with an
+        explicit reason instead of silently staying ACTIVE without a task.
+        """
+        if self._store is None:
+            return 0
+        async with self._lock:
+            active = await self._store.list_active()
+            recovered = 0
+            for tenant_id, status in active:
+                if status.id in self._records:
+                    continue
+                if not await resolvable(tenant_id, status):
+                    failed = status.model_copy(
+                        update={
+                            "state": LiveMonitorState.FAILED,
+                            "next_check_at": None,
+                            "updated_at": self._utc_now(),
+                            "last_error": "planning run is not recoverable after process restart",
+                        }
+                    )
+                    await self._store.save_status(tenant_id, failed)
+                    continue
+                runtime = _RuntimeMonitor(
+                    tenant_id=tenant_id,
+                    tenant_partition=self._tenant_partition(tenant_id),
+                    status=status,
+                )
+                self._records[status.id] = runtime
+                runtime.task = asyncio.create_task(
+                    self._run(runtime),
+                    name=f"tripchord:{status.id}",
+                )
+                recovered += 1
+            return recovered
 
     async def _run(self, runtime: _RuntimeMonitor) -> None:
         try:
@@ -223,15 +295,14 @@ class LiveQuoteMonitorRegistry:
                         "last_error": f"{type(exc).__name__}: {str(exc)[:500]}",
                     }
                 )
+                await self._persist_status(runtime)
                 return
             count = runtime.status.check_count + 1
             complete = count >= runtime.status.max_checks
             now = self._utc_now()
             runtime.status = runtime.status.model_copy(
                 update={
-                    "state": (
-                        LiveMonitorState.COMPLETED if complete else LiveMonitorState.ACTIVE
-                    ),
+                    "state": (LiveMonitorState.COMPLETED if complete else LiveMonitorState.ACTIVE),
                     "check_count": count,
                     "next_check_at": (
                         None
@@ -243,6 +314,10 @@ class LiveQuoteMonitorRegistry:
                     "last_error": None,
                 }
             )
+            await self._persist_status(runtime)
+            store = self._store
+            if store is not None:
+                await store.append_check(runtime.tenant_id, runtime.status.id, check)
 
     async def _owned(
         self,
@@ -258,6 +333,11 @@ class LiveQuoteMonitorRegistry:
             ):
                 return None
             return runtime
+
+    async def _persist_status(self, runtime: _RuntimeMonitor) -> None:
+        store = self._store
+        if store is not None:
+            await store.save_status(runtime.tenant_id, runtime.status)
 
     def _utc_now(self) -> datetime:
         return _timezone_aware(self._now(), "monitor clock").astimezone(UTC)
@@ -277,6 +357,7 @@ def _timezone_aware(value: datetime, field_name: str) -> datetime:
 
 __all__ = [
     "LiveMonitorCheck",
+    "LiveMonitorPersistence",
     "LiveMonitorState",
     "LiveMonitorStatus",
     "LiveQuoteMonitorRegistry",

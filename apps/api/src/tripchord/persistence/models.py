@@ -3,7 +3,17 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -186,3 +196,56 @@ class JobRow(Base):
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
     workspace: Mapped[WorkspaceRow] = relationship(back_populates="jobs")
+
+
+class LiveMonitorRow(Base):
+    """Persisted :class:`tripchord.agents.live_monitor.LiveMonitorStatus`.
+
+    The status payload (relational columns plus ``boundary`` text) lets a later
+    context recover an opt-in live-quote monitor after a process restart; check
+    history is stored in :class:`LiveMonitorCheckRow`.  ``boundary`` is stored
+    verbatim so a reconstructed status stays faithful to the policy text that
+    was in force when the monitor ran.
+    """
+
+    __tablename__ = "live_monitors"
+    __table_args__ = (Index("ix_live_monitors_tenant_created", "tenant_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(100), index=True)
+    run_id: Mapped[str] = mapped_column(String(100), index=True)
+    state: Mapped[str] = mapped_column(String(20))
+    interval_seconds: Mapped[int] = mapped_column(Integer)
+    max_checks: Mapped[int] = mapped_column(Integer)
+    timeout_seconds: Mapped[int] = mapped_column(Integer)
+    check_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    boundary: Mapped[str] = mapped_column(Text, default="")
+    checks: Mapped[list[LiveMonitorCheckRow]] = relationship(
+        back_populates="monitor",
+        cascade="all, delete-orphan",
+        order_by="LiveMonitorCheckRow.sequence",
+    )
+
+
+class LiveMonitorCheckRow(Base):
+    __tablename__ = "live_monitor_checks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    monitor_id: Mapped[str] = mapped_column(
+        ForeignKey("live_monitors.id", ondelete="CASCADE"), index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    target_component_id: Mapped[str] = mapped_column(String(200))
+    event_id: Mapped[str] = mapped_column(String(200))
+    applied_disposition: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    decision_state: Mapped[str] = mapped_column(String(60))
+    package_changed: Mapped[bool] = mapped_column(Boolean, default=False)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    monitor: Mapped[LiveMonitorRow] = relationship(back_populates="checks")

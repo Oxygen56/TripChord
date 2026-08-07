@@ -161,6 +161,7 @@ from tripchord.observability import configure_logging, metrics, observe_request
 from tripchord.persistence import Database, WorkspaceRepository
 from tripchord.persistence.booking_ledger import BookingLedgerStore
 from tripchord.persistence.handoff_store import HandoffStore
+from tripchord.persistence.live_monitors import DbLiveMonitorStore, LiveMonitorNotFoundError
 from tripchord.persistence.repository import (
     WorkspaceConflictError,
     WorkspaceNotFoundError,
@@ -228,9 +229,7 @@ _PROVIDER_CAPABILITY_SEEDS = (
         ProviderCapabilitySeed(
             provider=provider.value,
             verticals=(
-                ("flight", "lodging")
-                if provider.value in {"ctrip", "qunar"}
-                else ("flight",)
+                ("flight", "lodging") if provider.value in {"ctrip", "qunar"} else ("flight",)
             ),
             read_only=True,
             requires_authenticated_browser_session=True,
@@ -614,8 +613,7 @@ class LiveRunCache:
     def _quarantine_corrupt_snapshot(self) -> None:
         state_path = self._required_state_path()
         quarantine_path = state_path.with_name(
-            f"{state_path.name}.corrupt-"
-            f"{self._utc_now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex}"
+            f"{state_path.name}.corrupt-{self._utc_now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex}"
         )
         try:
             os.replace(state_path, quarantine_path)
@@ -702,8 +700,7 @@ def _install_browser_bridge(
         context_builder=selected_context_builder,
         memory_store=selected_memory_store,
         adaptive_agent_scaling_enabled=(
-            configured_settings.adaptive_agent_scaling_enabled
-            and model_router is not None
+            configured_settings.adaptive_agent_scaling_enabled and model_router is not None
         ),
     )
     target_app.mount(
@@ -809,9 +806,7 @@ def _build_live_run_cache(
         state_path = (runtime_base or Path.cwd()) / state_path
     return LiveRunCache(
         state_path=state_path,
-        corruption_policy=CorruptionPolicy(
-            configured_settings.live_run_cache_corruption_policy
-        ),
+        corruption_policy=CorruptionPolicy(configured_settings.live_run_cache_corruption_policy),
     )
 
 
@@ -837,15 +832,14 @@ context_builder = BudgetedAgentContextBuilder(EvidenceRagRetriever(memory_store)
 providers = build_provider_registry(settings)
 amap = build_amap_provider(settings)
 database = Database(settings.database_url)
+live_monitor_store = DbLiveMonitorStore(database)
 job_runner = PlanningJobRunner(database)
 rate_limiter = RateLimiter(
     limit=settings.rate_limit_requests,
     window_seconds=settings.rate_limit_window_seconds,
     redis_url=settings.redis_url,
 )
-planning_assembler = PlanningProblemAssembler(
-    ReplayPlaceCatalog()
-)
+planning_assembler = PlanningProblemAssembler(ReplayPlaceCatalog())
 replan_policy = ReplanPolicySelector.from_package_data()
 live_run_cache = _build_live_run_cache(settings)
 package_requirement_agent = HybridPackageRequirementAgent(model_router=model_router)
@@ -876,10 +870,44 @@ async def _close_lifespan_resources(
         raise ExceptionGroup("multiple TripChord lifespan resources failed to close", failures)
 
 
+async def _recover_live_monitors(target_app: FastAPI) -> int:
+    """Rehydrate persisted ACTIVE live monitors after a process restart.
+
+    The store is attached to whichever registry the app currently exposes
+    (tests may swap the state slot with a recording resource), then ACTIVE
+    records whose run context is still resolvable resume their loop while
+    unrecoverable ones are marked FAILED honestly.
+    """
+    registry = cast(
+        LiveQuoteMonitorRegistry | None,
+        getattr(target_app.state, "live_quote_monitor_registry", None),
+    )
+    if not isinstance(registry, LiveQuoteMonitorRegistry):
+        return 0
+    registry.attach_store(live_monitor_store)
+    cache = cast(
+        LiveRunCache,
+        getattr(target_app.state, "live_run_cache", live_run_cache),
+    )
+
+    async def resolvable(tenant_id: str, status: LiveMonitorStatus) -> bool:
+        live_system = cast(
+            LivePackageAgentSystem | None,
+            getattr(target_app.state, "live_package_agent_system", None),
+        )
+        if live_system is None:
+            return False
+        entry = await cache.get(status.run_id, tenant_id)
+        return entry is not None
+
+    return await registry.recover(resolvable)
+
+
 @asynccontextmanager
 async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
     await database.create_schema()
     await job_runner.recover()
+    await _recover_live_monitors(target_app)
     shared_model_http = cast(
         ManagedModelHTTPRuntime | None,
         getattr(target_app.state, "model_http_runtime", None),
@@ -1252,19 +1280,13 @@ async def agent_runtime_status_endpoint(
             companion_supervisor.running if companion_supervisor is not None else False
         ),
         browser_companion_supervisor_outcome=(
-            companion_supervisor.last_outcome
-            if companion_supervisor is not None
-            else None
+            companion_supervisor.last_outcome if companion_supervisor is not None else None
         ),
         browser_companion_supervisor_attempt_count=(
-            companion_supervisor.attempt_count
-            if companion_supervisor is not None
-            else 0
+            companion_supervisor.attempt_count if companion_supervisor is not None else 0
         ),
         browser_companion_last_reconcile=(
-            companion_supervisor.last_reconcile_result
-            if companion_supervisor is not None
-            else None
+            companion_supervisor.last_reconcile_result if companion_supervisor is not None else None
         ),
     )
 
@@ -1492,11 +1514,7 @@ def _memory_access(principal: Principal, trip_id: str) -> MemoryAccessContext:
         # There is no stable user subject in development-anonymous mode.  Using
         # the shared literal "anonymous" would mix long-term preferences across
         # people, so user/trip/session memory is disabled for that principal.
-        user_id=(
-            None
-            if principal.auth_mode == "development-anonymous"
-            else principal.tenant_id
-        ),
+        user_id=(None if principal.auth_mode == "development-anonymous" else principal.tenant_id),
         session_id=trip_id,
         trip_id=trip_id,
     )
@@ -1547,9 +1565,7 @@ def _advance_cached_live_run(
             *replanned.source_task_ids,
         )[-_MAX_CACHED_SOURCE_TASK_IDS:]
         public_transfer_task_ids = previous.public_transfer_task_ids
-    combined_agentic = AgenticRunSummary.combine(
-        (previous.agentic, replanned.agentic)
-    )
+    combined_agentic = AgenticRunSummary.combine((previous.agentic, replanned.agentic))
     return previous.model_copy(
         update={
             "decision": replanned.decision,
@@ -1798,8 +1814,7 @@ async def _cache_flexible_pair_runs(
     tenant_id: str,
     *,
     ensure_active: Callable[[], Awaitable[None]] | None = None,
-    search_run_recorder: Callable[[LivePackageAgentRun], Awaitable[SearchRun | None]]
-    | None = None,
+    search_run_recorder: Callable[[LivePackageAgentRun], Awaitable[SearchRun | None]] | None = None,
 ) -> tuple[LiveFlexiblePairRunHandle, ...]:
     handles: list[LiveFlexiblePairRunHandle] = []
     for pair_run in run.pair_runs:
@@ -2058,9 +2073,7 @@ async def _execute_live_flexible_from_text_body(
         cache,
         principal.tenant_id,
         ensure_active=(report_progress.ensure_active if report_progress is not None else None),
-        search_run_recorder=(
-            lambda live_run: _persist_search_run(principal.tenant_id, live_run)
-        ),
+        search_run_recorder=(lambda live_run: _persist_search_run(principal.tenant_id, live_run)),
     )
     execution_boundary = LIVE_FLEXIBLE_FROM_TEXT_EXECUTION_BOUNDARY
     if model_enabled:
@@ -2101,8 +2114,7 @@ async def _execute_live_flexible_from_text(
     report_pair_checkpoint: PairCheckpointReporter | None = None,
     expected_request_sha256: str | None = None,
     model_trace_scope_id: str | None = None,
-    report_model_trace_summary: Callable[[str, str, int, int, int], Awaitable[None]]
-    | None = None,
+    report_model_trace_summary: Callable[[str, str, int, int, int], Awaitable[None]] | None = None,
 ) -> LiveFlexibleFromTextPlanningResponse:
     request_sha256 = _live_flexible_from_text_request_sha256(payload)
     if expected_request_sha256 is not None and not hmac.compare_digest(
@@ -2198,9 +2210,7 @@ async def start_live_flexible_from_text_job_endpoint(
     )
     target_app = http_request.app
     request_digest = _live_flexible_from_text_request_sha256(payload)
-    effective_total_timeout_seconds = _flexible_total_timeout_seconds(
-        payload.total_timeout_seconds
-    )
+    effective_total_timeout_seconds = _flexible_total_timeout_seconds(payload.total_timeout_seconds)
 
     async def operation(report: LiveJobProgressReporter) -> dict[str, Any]:
         response = await _execute_live_flexible_from_text(
@@ -2215,6 +2225,7 @@ async def start_live_flexible_from_text_job_endpoint(
             report_model_trace_summary=report.report_model_trace_summary,
         )
         return response.model_dump(mode="json")
+
     try:
         job, replayed = await registry.start_idempotent(
             tenant_id=principal.tenant_id,
@@ -2559,6 +2570,13 @@ async def get_live_monitor_endpoint(
 ) -> LiveMonitorResponse:
     await rate_limiter.check(principal.tenant_id, "live-monitor-get")
     monitor = await live_quote_monitor_registry.get(monitor_id, principal.tenant_id)
+    if monitor is None:
+        # A monitor whose process is gone is still recoverable from the durable
+        # store (v0.9): history and status survive a restart.
+        try:
+            monitor = await live_monitor_store.get_status(principal.tenant_id, monitor_id)
+        except LiveMonitorNotFoundError:
+            monitor = None
     if monitor is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
