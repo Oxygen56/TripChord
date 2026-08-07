@@ -1,0 +1,2861 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {
+      "bom-ref": "npm:@emnapi/core@1.11.1",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "RSvbQmHzdKzNsLYa/wHrbc3KN4sYLKAdPZxqiM2HATqv/SBk2/ENSHpvXGaLOMcsAyz0poEGqkmmKYG3OWiJEQ=="
+        }
+      ],
+      "name": "@emnapi/core",
+      "purl": "pkg:npm/%40emnapi/core@1.11.1",
+      "type": "library",
+      "version": "1.11.1"
+    },
+    {
+      "bom-ref": "npm:@emnapi/runtime@1.11.1",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "vgj7R3y3Wgx24IQaGPA/R6YFXLHVMOZ0uVEyIQPaWs+rd1AzfEMXlAC22FYwO1XkKR6NPsq7mUandH8oIRdZFw=="
+        }
+      ],
+      "name": "@emnapi/runtime",
+      "purl": "pkg:npm/%40emnapi/runtime@1.11.1",
+      "type": "library",
+      "version": "1.11.1"
+    },
+    {
+      "bom-ref": "npm:@emnapi/wasi-threads@1.2.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "c95qOXkHdydNKhscBTebqEC1CVAZpyqOfVfBzQ1qgzyl3gfeldUjIggDbIZgDKsHLgnsM+igH7TJ/eAasaVuMA=="
+        }
+      ],
+      "name": "@emnapi/wasi-threads",
+      "purl": "pkg:npm/%40emnapi/wasi-threads@1.2.2",
+      "type": "library",
+      "version": "1.2.2"
+    },
+    {
+      "bom-ref": "npm:@jridgewell/sourcemap-codec@1.5.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og=="
+        }
+      ],
+      "name": "@jridgewell/sourcemap-codec",
+      "purl": "pkg:npm/%40jridgewell/sourcemap-codec@1.5.5",
+      "type": "library",
+      "version": "1.5.5"
+    },
+    {
+      "bom-ref": "npm:@napi-rs/wasm-runtime@1.1.6",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "ZLv/JdUfkvOy9eCnnBaGfiO+XimbjebAeO+MRQqD/B+FR1tnRN0tpKSJHRbE8sFfS6aqsXZ67TQjfwfsxULVbg=="
+        }
+      ],
+      "name": "@napi-rs/wasm-runtime",
+      "purl": "pkg:npm/%40napi-rs/wasm-runtime@1.1.6",
+      "type": "library",
+      "version": "1.1.6"
+    },
+    {
+      "bom-ref": "npm:@oxc-project/types@0.139.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "r9gHphtCs+1M7J0pw6Sn/hh/Wpa/iQrOOkrNAlVLF/gHq+/CJmHIWKKUUhdWjcD6CIa8idarspCsASiXCXvFUw=="
+        }
+      ],
+      "name": "@oxc-project/types",
+      "purl": "pkg:npm/%40oxc-project/types@0.139.0",
+      "type": "library",
+      "version": "0.139.0"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-android-arm64@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "lZg8fqIv2v7FF237bwMgzGZEJvGL79/s5knJ/i6FmsGF4XXlzccZ4jb+TrFIxtSSxFtIpdsgrPZeMk1I9AFcyQ=="
+        }
+      ],
+      "name": "@rolldown/binding-android-arm64",
+      "purl": "pkg:npm/%40rolldown/binding-android-arm64@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-darwin-arm64@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "51Bnx9pNiMRKSUNtBfySkNJ9vMU9Hh3I1ozDd6gyPPYzaXCfnptUcEZxXGYFn+ul2dtcMUiqGR1Yai2K10uoTw=="
+        }
+      ],
+      "name": "@rolldown/binding-darwin-arm64",
+      "purl": "pkg:npm/%40rolldown/binding-darwin-arm64@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-darwin-x64@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "Tm+gbfC0aHu1tBA/JvKQh32S0K6YgCHkiAF4/W6xX0K0RmNuc94VeK419dJoE65R5aRxmo+noZQSWrAMF6yb6g=="
+        }
+      ],
+      "name": "@rolldown/binding-darwin-x64",
+      "purl": "pkg:npm/%40rolldown/binding-darwin-x64@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-freebsd-x64@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "JMzDKCCXq93YccG5gz3hvOs1oXRKAf0XYpfOS88e+wZrC8Iugj6j68867vrYZkvpDDpKn/KoKORThmchMpF6TA=="
+        }
+      ],
+      "name": "@rolldown/binding-freebsd-x64",
+      "purl": "pkg:npm/%40rolldown/binding-freebsd-x64@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-linux-arm-gnueabihf@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "uML21j2K5TfPGutKxub+M+nLjZIrWjXQ5Grx4lCe/nimTj9B4L63zHpjXLl4y0L3mcm2htEQIb06oCG/szerNw=="
+        }
+      ],
+      "name": "@rolldown/binding-linux-arm-gnueabihf",
+      "purl": "pkg:npm/%40rolldown/binding-linux-arm-gnueabihf@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-linux-arm64-gnu@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "navSiuTMogvnQoZoM/v+l3ZWo50/NTwSHSzheABx/RCnmUPaKwq9qSo4Br2OYRs21+Fz8uFqITZM3H4opOB0/Q=="
+        }
+      ],
+      "name": "@rolldown/binding-linux-arm64-gnu",
+      "purl": "pkg:npm/%40rolldown/binding-linux-arm64-gnu@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-linux-arm64-musl@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "lAryqH7IteztmCXQXk0etKj4wBQ7Gx5S6LjKhsgp9zb8I5bsuvU/2llH1hDQcjsFeqIsovMVN339/8pUDDBXxA=="
+        }
+      ],
+      "name": "@rolldown/binding-linux-arm64-musl",
+      "purl": "pkg:npm/%40rolldown/binding-linux-arm64-musl@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-linux-ppc64-gnu@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "fsK/sNBnxzBlL4O1JNrZakVQxPspqpED5dLtNsZS9oOKmtSpdNIzxH2kkol5HYTWJN47sE20ztMJPxfZ89qGOg=="
+        }
+      ],
+      "name": "@rolldown/binding-linux-ppc64-gnu",
+      "purl": "pkg:npm/%40rolldown/binding-linux-ppc64-gnu@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-linux-s390x-gnu@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "gLYb4BIadlfTOYT5gO503n8zQjXflgzpD0FcyKh0Mzx3rqCZKnHoJWV9xe1KXUJ5lx2JfcSHr/mhzS0PC/McAA=="
+        }
+      ],
+      "name": "@rolldown/binding-linux-s390x-gnu",
+      "purl": "pkg:npm/%40rolldown/binding-linux-s390x-gnu@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-linux-x64-gnu@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "FjcpEKUyJygHgs1o50VYNvkt5+7Le/VEdYt0AkRpkL33MnyQfwr8l5mXwMmfmTbyMPr5vJLC+8/Gd9gXnwU1QQ=="
+        }
+      ],
+      "name": "@rolldown/binding-linux-x64-gnu",
+      "purl": "pkg:npm/%40rolldown/binding-linux-x64-gnu@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-linux-x64-musl@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "Me+PfPI2TMeOQk0gYWfLQZtTktrmzbr8cDboqX83XKc7UrgAi55gF+2dUkWdxd19n55Essp2yeca+O9N5rBxHg=="
+        }
+      ],
+      "name": "@rolldown/binding-linux-x64-musl",
+      "purl": "pkg:npm/%40rolldown/binding-linux-x64-musl@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-openharmony-arm64@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "yc5WrLzXks6zCQfn9Oxr8pORKyl/pF+QjHmW/Qx3qu0oyrrNC+y2JLTU1E2rcWYAmzlnqngWXHQjy51VzW70Vw=="
+        }
+      ],
+      "name": "@rolldown/binding-openharmony-arm64",
+      "purl": "pkg:npm/%40rolldown/binding-openharmony-arm64@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-wasm32-wasi@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "VbQGPX2b4r48TAMIM2cjgluIM1HYutm4pcTEJsle7iEP7sB1dFqtPLBVbdLAZCxy1txCcPxf4QFf4v8uvltPqA=="
+        }
+      ],
+      "name": "@rolldown/binding-wasm32-wasi",
+      "purl": "pkg:npm/%40rolldown/binding-wasm32-wasi@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-win32-arm64-msvc@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "gHv82k63z4qpV5+Q1y/12KrK0ltWBukVDI8nZcbT7Tt/ZlOIVwppazneq0F93oDxTo3IgAMEDIoQh3E2n6mVsw=="
+        }
+      ],
+      "name": "@rolldown/binding-win32-arm64-msvc",
+      "purl": "pkg:npm/%40rolldown/binding-win32-arm64-msvc@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/binding-win32-x64-msvc@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "tTZuDBPw85tEN5PQi1pnEBzDy0Z49HtScLAbD5t6hyeU92A95pRWaSMw1GZZi/RwgSgUIl0xrSlXIT/9QzvYSA=="
+        }
+      ],
+      "name": "@rolldown/binding-win32-x64-msvc",
+      "purl": "pkg:npm/%40rolldown/binding-win32-x64-msvc@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:@rolldown/pluginutils@1.0.1",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw=="
+        }
+      ],
+      "name": "@rolldown/pluginutils",
+      "purl": "pkg:npm/%40rolldown/pluginutils@1.0.1",
+      "type": "library",
+      "version": "1.0.1"
+    },
+    {
+      "bom-ref": "npm:@standard-schema/spec@1.1.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w=="
+        }
+      ],
+      "name": "@standard-schema/spec",
+      "purl": "pkg:npm/%40standard-schema/spec@1.1.0",
+      "type": "library",
+      "version": "1.1.0"
+    },
+    {
+      "bom-ref": "npm:@tybys/wasm-util@0.10.3",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "F3fo1MYrRJYL3zER0OUOmkutjr1Vp23m7OsSgp7nq4SP6OqX6C/56XFIPAl5bt3zaBRjmW7SGz3u/6LwFpYcOg=="
+        }
+      ],
+      "name": "@tybys/wasm-util",
+      "purl": "pkg:npm/%40tybys/wasm-util@0.10.3",
+      "type": "library",
+      "version": "0.10.3"
+    },
+    {
+      "bom-ref": "npm:@types/chai@5.2.3",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "Mw558oeA9fFbv65/y4mHtXDs9bPnFMZAL/jxdPFUpOHHIXX91mcgEHbS5Lahr+pwZFR8A7GQleRWeI6cGFC2UA=="
+        }
+      ],
+      "name": "@types/chai",
+      "purl": "pkg:npm/%40types/chai@5.2.3",
+      "type": "library",
+      "version": "5.2.3"
+    },
+    {
+      "bom-ref": "npm:@types/deep-eql@4.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "c9h9dVVMigMPc4bwTvC5dxqtqJZwQPePsWjPlpSOnojbor6pGqdk541lfA7AqFQr5pB1BRdq0juY9db81BwyFw=="
+        }
+      ],
+      "name": "@types/deep-eql",
+      "purl": "pkg:npm/%40types/deep-eql@4.0.2",
+      "type": "library",
+      "version": "4.0.2"
+    },
+    {
+      "bom-ref": "npm:@types/estree@1.0.9",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg=="
+        }
+      ],
+      "name": "@types/estree",
+      "purl": "pkg:npm/%40types/estree@1.0.9",
+      "type": "library",
+      "version": "1.0.9"
+    },
+    {
+      "bom-ref": "npm:@types/react-dom@19.2.3",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "jp2L/eY6fn+KgVVQAOqYItbF0VY/YApe5Mz2F0aykSO8gx31bYCZyvSeYxCHKvzHG5eZjc+zyaS5BrBWya2+kQ=="
+        }
+      ],
+      "name": "@types/react-dom",
+      "purl": "pkg:npm/%40types/react-dom@19.2.3",
+      "type": "library",
+      "version": "19.2.3"
+    },
+    {
+      "bom-ref": "npm:@types/react@19.2.17",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "MXfmqaVPEVgkBT/aY0aGCkRWWtByiYQXo3xdQ8r5RzuFrPiRn8Gar2tQdXSUQ2GKV3bkXckek89V8wQBY2Q/Aw=="
+        }
+      ],
+      "name": "@types/react",
+      "purl": "pkg:npm/%40types/react@19.2.17",
+      "type": "library",
+      "version": "19.2.17"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-aix-ppc64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "MTKKkWB7p/0E9xi1d1tHtZ5PiLkGEMIq88pK2CubZjOsLtYTLqhgIgi6zepFa+9GHZ6h05NMCkQxGKiPXMxXtQ=="
+        }
+      ],
+      "name": "@typescript/typescript-aix-ppc64",
+      "purl": "pkg:npm/%40typescript/typescript-aix-ppc64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-darwin-arm64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "gowzar9MwS/aRWp6f3a4KUqzRjAZjOsmGNCM6LcTgXum+dBfgsBVMN+AgvOCCbguXyick6LJhpBszxMebJ8syA=="
+        }
+      ],
+      "name": "@typescript/typescript-darwin-arm64",
+      "purl": "pkg:npm/%40typescript/typescript-darwin-arm64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-darwin-x64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "SZ9xZInqApNlNGc9s0W1VSsktYSOe9cFqNOIqmN1Gs8SmkjKZYFt017G4VwPxASInODuAdbTW7sXiFUf893RgA=="
+        }
+      ],
+      "name": "@typescript/typescript-darwin-x64",
+      "purl": "pkg:npm/%40typescript/typescript-darwin-x64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-freebsd-arm64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "W5NH4y/J0plIIS5b2xvTEkU7JFxyqdMAOgf+Ilhl0vHQXKO5dZoxd+C/jEtq56c4F3wk71RB4BMRQ2XdI+bwYQ=="
+        }
+      ],
+      "name": "@typescript/typescript-freebsd-arm64",
+      "purl": "pkg:npm/%40typescript/typescript-freebsd-arm64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-freebsd-x64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "UMGDx5sTpzNw3WiPebH7l90IWfJggEd+egHt/q6p7/Cm3zqoV7VxkGXt+3DxPIw8CcmvAB0j3sVVfbhX+M4Tpw=="
+        }
+      ],
+      "name": "@typescript/typescript-freebsd-x64",
+      "purl": "pkg:npm/%40typescript/typescript-freebsd-x64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-linux-arm64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "Qh4eU4/y3yDjnfjjyPYihMj5/ODIlmt+Bzu17OI+fiSRDW57QmU5SiN63exPRNJPKUzcc1INa1NXdrJ+MqHjUQ=="
+        }
+      ],
+      "name": "@typescript/typescript-linux-arm64",
+      "purl": "pkg:npm/%40typescript/typescript-linux-arm64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-linux-arm@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "gffT3xPz9sR7j/YJExkyPntrI0P2EP9XbOyWzth2/Gs0RstK+90RBcO0ncXoXy/beYll1SXw846Nf2zdnEz0QQ=="
+        }
+      ],
+      "name": "@typescript/typescript-linux-arm",
+      "purl": "pkg:npm/%40typescript/typescript-linux-arm@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-linux-loong64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "uEHck9i8hoAzXPiYRib1O7miOnz23SxIeVl6F4LXox+qov1K35jHcEW6VHKvZI+pyvl7fZEP4MCU5LYvIq1GuQ=="
+        }
+      ],
+      "name": "@typescript/typescript-linux-loong64",
+      "purl": "pkg:npm/%40typescript/typescript-linux-loong64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-linux-mips64el@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "R4KvAMnE43W5Qeqb0Ly56O3mWMWIAgsMyz36DCaycd5nbg/9kzm0liw3JocfRqyJY0KPmzFjbswozXyW0DnIYA=="
+        }
+      ],
+      "name": "@typescript/typescript-linux-mips64el",
+      "purl": "pkg:npm/%40typescript/typescript-linux-mips64el@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-linux-ppc64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "DORx5b3sd/4S7eayxm4FQv+A7CrkUIGRaHiwI8oiHTAI1fAPWhF4J0vAlkC8biAlHSVVwxMQ3tjZ2/DVbnQiiA=="
+        }
+      ],
+      "name": "@typescript/typescript-linux-ppc64",
+      "purl": "pkg:npm/%40typescript/typescript-linux-ppc64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-linux-riscv64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "wf0jqEDOjrPRnKwYRyyJDRo11KMbvMFrU+q4zqKyChODBzvlkbhNQfKvLxQCcwTpdDaXSHZTVuh0JoCrKCUMHQ=="
+        }
+      ],
+      "name": "@typescript/typescript-linux-riscv64",
+      "purl": "pkg:npm/%40typescript/typescript-linux-riscv64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-linux-s390x@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "IkwJc3L7yhytWd/ewjyxNDfOmswCm9GWMJT/ue/dU4aZNbwZeYAetq42VyLmsmSjvoX7z74X6ZaYCtzAr0EuGw=="
+        }
+      ],
+      "name": "@typescript/typescript-linux-s390x",
+      "purl": "pkg:npm/%40typescript/typescript-linux-s390x@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-linux-x64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "EYdf2cNg7rgCWJnxCdJ+F3V39O8ihb37eHAu1LK8oAFizgTQbPOK7zHHXbPt8rX24COqODXeI3sIf0fCXG7H/A=="
+        }
+      ],
+      "name": "@typescript/typescript-linux-x64",
+      "purl": "pkg:npm/%40typescript/typescript-linux-x64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-netbsd-arm64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "+polYF4MF04aPpO5FTkHran9yUQDSXqy5GiSDKpsll5jy3l3+g9QLhpf39T+ePtefhXLOGrLl0QIjkQP6VnelA=="
+        }
+      ],
+      "name": "@typescript/typescript-netbsd-arm64",
+      "purl": "pkg:npm/%40typescript/typescript-netbsd-arm64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-netbsd-x64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "8YIT0EHM/3dq10ZOVF/A7pc/YSMtbcecct4rWtexrnSCHOPcpC2KTLXfTCR6vDpnSiY12heNb1GiN/wu+T/FyA=="
+        }
+      ],
+      "name": "@typescript/typescript-netbsd-x64",
+      "purl": "pkg:npm/%40typescript/typescript-netbsd-x64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-openbsd-arm64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "APT8+ClYnuYm1u9+kgGXoMj2VzWzcymwh2gNSQVySHfkRDGOTVkoWLjCmOQSaO+PoqQ57B0flRp9SA+7GnnkzQ=="
+        }
+      ],
+      "name": "@typescript/typescript-openbsd-arm64",
+      "purl": "pkg:npm/%40typescript/typescript-openbsd-arm64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-openbsd-x64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "yX7s+Q0Dln0Dt9tEzZsAjXXR/+ytBM7AlglaqyeMPxQszJ1JhlJdZ6jLA+IzldHtflX81em7lDao1xXu+aRRkg=="
+        }
+      ],
+      "name": "@typescript/typescript-openbsd-x64",
+      "purl": "pkg:npm/%40typescript/typescript-openbsd-x64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-sunos-x64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "dLJDGaLZ1D4HPQn62u1n8mBDkJREwMsAkCdkwd4Ieqw+x3TUyTsqY0YiBCtE6H6OzzgGk3iuZ3vFWRS+E8/d1g=="
+        }
+      ],
+      "name": "@typescript/typescript-sunos-x64",
+      "purl": "pkg:npm/%40typescript/typescript-sunos-x64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-win32-arm64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "Gyl1Vy6OsWesLzmq+EP0Fb7b4Nid5232AvcA2SFcdYreldpNtYFFofPjnt62y9hQy7VTaZp65ICJjuAQRaVcIQ=="
+        }
+      ],
+      "name": "@typescript/typescript-win32-arm64",
+      "purl": "pkg:npm/%40typescript/typescript-win32-arm64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@typescript/typescript-win32-x64@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g=="
+        }
+      ],
+      "name": "@typescript/typescript-win32-x64",
+      "purl": "pkg:npm/%40typescript/typescript-win32-x64@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:@vitejs/plugin-react@6.0.4",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "XcCQz0TBpBgljhj0gMuuDj49i6Ytqh5q1osT/Gp5uAVJUCTWxyskk/l1jwYYiu2xcNHHipdMz40EGfM1VdamVg=="
+        }
+      ],
+      "name": "@vitejs/plugin-react",
+      "purl": "pkg:npm/%40vitejs/plugin-react@6.0.4",
+      "type": "library",
+      "version": "6.0.4"
+    },
+    {
+      "bom-ref": "npm:@vitest/expect@4.1.10",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "YsCn+qAk1GWjQOWFEsEcL2gNQ0zmVmQu3T03qP6UyjhtmdtwtbuI+DASn/7iQB3HGTXkdBwGddzxPlmiql5vlA=="
+        }
+      ],
+      "name": "@vitest/expect",
+      "purl": "pkg:npm/%40vitest/expect@4.1.10",
+      "type": "library",
+      "version": "4.1.10"
+    },
+    {
+      "bom-ref": "npm:@vitest/mocker@4.1.10",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "v0xaezt+DKEmKfaxg133ldzADrwLGd7Ze1MfQQTYfvs8OqZIwbxyxaYURivwV7sWy5fqn3rH5uOrSp07bp44Ow=="
+        }
+      ],
+      "name": "@vitest/mocker",
+      "purl": "pkg:npm/%40vitest/mocker@4.1.10",
+      "type": "library",
+      "version": "4.1.10"
+    },
+    {
+      "bom-ref": "npm:@vitest/pretty-format@4.1.10",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "W1HsjSH4MXQ9YfmmhLAoIYf1HRfekQCGngeIgcei6MP5QQGWUe0gkopdZQaVCFO+JDJMrAJGwa5pRpNpvy4P8Q=="
+        }
+      ],
+      "name": "@vitest/pretty-format",
+      "purl": "pkg:npm/%40vitest/pretty-format@4.1.10",
+      "type": "library",
+      "version": "4.1.10"
+    },
+    {
+      "bom-ref": "npm:@vitest/runner@4.1.10",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "IKI6kpIH+LmpROplyLwBBaCfMgOZOMsygVa6BARD6ahA04VRuJSa6OaVG7kRvSEMD870Vd91rSSw0eegtWyLGg=="
+        }
+      ],
+      "name": "@vitest/runner",
+      "purl": "pkg:npm/%40vitest/runner@4.1.10",
+      "type": "library",
+      "version": "4.1.10"
+    },
+    {
+      "bom-ref": "npm:@vitest/snapshot@4.1.10",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "xRkfOT1qpTAi/Ti4Y1LtfRc3kEuqxGw59eN2jN9pRWMtS/XDevekhcFSqvQqjUNGksfjMJu3Y+oJ+4Ypn2OaJw=="
+        }
+      ],
+      "name": "@vitest/snapshot",
+      "purl": "pkg:npm/%40vitest/snapshot@4.1.10",
+      "type": "library",
+      "version": "4.1.10"
+    },
+    {
+      "bom-ref": "npm:@vitest/spy@4.1.10",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "PLf/Ugvoq5wO/b4rwYCR1h2PSIdXz7wnkQFMiUpLdtM7l6pqVFcQIBEHyT1+l+cj7mNwAfZHzqXqDyjvOuwbDw=="
+        }
+      ],
+      "name": "@vitest/spy",
+      "purl": "pkg:npm/%40vitest/spy@4.1.10",
+      "type": "library",
+      "version": "4.1.10"
+    },
+    {
+      "bom-ref": "npm:@vitest/utils@4.1.10",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "fy9am/HWxbaGt/Sawrp90vt6Y6jQwf1RX77cz3uwoJwJVMli/e1IEwRPnMNJ7vKfPTwo0diXifkpPvwH9v7nGA=="
+        }
+      ],
+      "name": "@vitest/utils",
+      "purl": "pkg:npm/%40vitest/utils@4.1.10",
+      "type": "library",
+      "version": "4.1.10"
+    },
+    {
+      "bom-ref": "npm:assertion-error@2.0.1",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "Izi8RQcffqCeNVgFigKli1ssklIbpHnCYc6AknXGYoB6grJqyeby7jv12JUQgmTAnIDnbck1uxksT4dzN3PWBA=="
+        }
+      ],
+      "name": "assertion-error",
+      "purl": "pkg:npm/assertion-error@2.0.1",
+      "type": "library",
+      "version": "2.0.1"
+    },
+    {
+      "bom-ref": "npm:chai@6.2.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "NUPRluOfOiTKBKvWPtSD4PhFvWCqOi0BGStNWs57X9js7XGTprSmFoz5F0tWhR4WPjNeR9jXqdC7/UpSJTnlRg=="
+        }
+      ],
+      "name": "chai",
+      "purl": "pkg:npm/chai@6.2.2",
+      "type": "library",
+      "version": "6.2.2"
+    },
+    {
+      "bom-ref": "npm:convert-source-map@2.0.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg=="
+        }
+      ],
+      "name": "convert-source-map",
+      "purl": "pkg:npm/convert-source-map@2.0.0",
+      "type": "library",
+      "version": "2.0.0"
+    },
+    {
+      "bom-ref": "npm:csstype@3.2.3",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ=="
+        }
+      ],
+      "name": "csstype",
+      "purl": "pkg:npm/csstype@3.2.3",
+      "type": "library",
+      "version": "3.2.3"
+    },
+    {
+      "bom-ref": "npm:detect-libc@2.1.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ=="
+        }
+      ],
+      "name": "detect-libc",
+      "purl": "pkg:npm/detect-libc@2.1.2",
+      "type": "library",
+      "version": "2.1.2"
+    },
+    {
+      "bom-ref": "npm:es-module-lexer@2.3.1",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "shc1dbU90Yl/xq1QrC7QRtfcwURZuVRfPhZbDoldJ1cn1gzDvBaBWlv0eFolj5+0znnPJz5TXLxsN77X/12KTA=="
+        }
+      ],
+      "name": "es-module-lexer",
+      "purl": "pkg:npm/es-module-lexer@2.3.1",
+      "type": "library",
+      "version": "2.3.1"
+    },
+    {
+      "bom-ref": "npm:estree-walker@3.0.3",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "7RUKfXgSMMkzt6ZuXmqapOurLGPPfgj6l9uRZ7lRGolvk0y2yocc35LdcxKC5PQZdn2DMqioAQ2NoWcrTKmm6g=="
+        }
+      ],
+      "name": "estree-walker",
+      "purl": "pkg:npm/estree-walker@3.0.3",
+      "type": "library",
+      "version": "3.0.3"
+    },
+    {
+      "bom-ref": "npm:expect-type@1.4.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "KfYbmpRm0VbLjEvVa9yGwCi9GI34xvi7A/HXYWQO65CSD2u3MczUJSuwXKFIxlGsgBQizV9q5J9NHj4VG0n+pA=="
+        }
+      ],
+      "name": "expect-type",
+      "purl": "pkg:npm/expect-type@1.4.0",
+      "type": "library",
+      "version": "1.4.0"
+    },
+    {
+      "bom-ref": "npm:fdir@6.5.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "tIbYtZbucOs0BRGqPJkshJUYdL+SDH7dVM8gjy+ERp3WAUjLEFJE+02kanyHtwjWOnwrKYBiwAmM0p4kLJAnXg=="
+        }
+      ],
+      "name": "fdir",
+      "purl": "pkg:npm/fdir@6.5.0",
+      "type": "library",
+      "version": "6.5.0"
+    },
+    {
+      "bom-ref": "npm:fsevents@2.3.3",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw=="
+        }
+      ],
+      "name": "fsevents",
+      "purl": "pkg:npm/fsevents@2.3.3",
+      "type": "library",
+      "version": "2.3.3"
+    },
+    {
+      "bom-ref": "npm:lightningcss-android-arm64@1.33.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "gEpRTalKdosp4Bb8qWtc2iOgE5SeIHlpS1up9bFq2wAyYhl1UdTObYiHe98zEM9SQvSoqQZ1IQD0JNpg3Ml5pg=="
+        }
+      ],
+      "name": "lightningcss-android-arm64",
+      "purl": "pkg:npm/lightningcss-android-arm64@1.33.0",
+      "type": "library",
+      "version": "1.33.0"
+    },
+    {
+      "bom-ref": "npm:lightningcss-darwin-arm64@1.33.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "Sciaz8eenNTKn9b3t7+xr0ipTp9YxKQY4npwQ3mrRuL0BAVHBLyZxofhaKBAVtzmtRZ/zTyo0/to4B1uWG/Djg=="
+        }
+      ],
+      "name": "lightningcss-darwin-arm64",
+      "purl": "pkg:npm/lightningcss-darwin-arm64@1.33.0",
+      "type": "library",
+      "version": "1.33.0"
+    },
+    {
+      "bom-ref": "npm:lightningcss-darwin-x64@1.33.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "Z5UPAxzrjlWNNyGy6i65cJzzvgJ5D3T6wMvs+gWpY9d7qRhANrxqAp6LhxIgZhWEw18RfJTGcRxjuLIBr+m8XQ=="
+        }
+      ],
+      "name": "lightningcss-darwin-x64",
+      "purl": "pkg:npm/lightningcss-darwin-x64@1.33.0",
+      "type": "library",
+      "version": "1.33.0"
+    },
+    {
+      "bom-ref": "npm:lightningcss-freebsd-x64@1.33.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "QQM/Ti/hQajJwCY+RiWuCZ9sdtI/XQk7nDK5vC8kkdwixezOlDgvDx7+RT+QjK6FcFT4MpsuoBnHIo/O3StRRg=="
+        }
+      ],
+      "name": "lightningcss-freebsd-x64",
+      "purl": "pkg:npm/lightningcss-freebsd-x64@1.33.0",
+      "type": "library",
+      "version": "1.33.0"
+    },
+    {
+      "bom-ref": "npm:lightningcss-linux-arm-gnueabihf@1.33.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "N7FVBe6iS24MlM6R/4RBTxGhQheZGs7tiQ9U32UtF75NzP5Q7xWPRqLBCKxlRQRk3rY1jCIPLzx7WzOhuUIRLQ=="
+        }
+      ],
+      "name": "lightningcss-linux-arm-gnueabihf",
+      "purl": "pkg:npm/lightningcss-linux-arm-gnueabihf@1.33.0",
+      "type": "library",
+      "version": "1.33.0"
+    },
+    {
+      "bom-ref": "npm:lightningcss-linux-arm64-gnu@1.33.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "j2v/itmy4HlNxlc6voKXYgBqNi0Ng2LShg4z7GufpEgs05P+2suBVyi9I6YHq5uoVFx9ETin3eCEhLVyXGQnKg=="
+        }
+      ],
+      "name": "lightningcss-linux-arm64-gnu",
+      "purl": "pkg:npm/lightningcss-linux-arm64-gnu@1.33.0",
+      "type": "library",
+      "version": "1.33.0"
+    },
+    {
+      "bom-ref": "npm:lightningcss-linux-arm64-musl@1.33.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "yiO5ROMuYQgXbC60yjZU5CYSFZGKXL0HFATXt9mHJn1+zW55oCtMI9NfcVhYLMFDL7gV7oBPon/EmMMGg2OvtQ=="
+        }
+      ],
+      "name": "lightningcss-linux-arm64-musl",
+      "purl": "pkg:npm/lightningcss-linux-arm64-musl@1.33.0",
+      "type": "library",
+      "version": "1.33.0"
+    },
+    {
+      "bom-ref": "npm:lightningcss-linux-x64-gnu@1.33.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "ar+Ju7LmcN0Jo4FpL4hpFybwNG9/3A/Br5KW2n2jyODg3MEZXaDYADdemoNS+BDNfMgKvylJLj4S5tyRActuAg=="
+        }
+      ],
+      "name": "lightningcss-linux-x64-gnu",
+      "purl": "pkg:npm/lightningcss-linux-x64-gnu@1.33.0",
+      "type": "library",
+      "version": "1.33.0"
+    },
+    {
+      "bom-ref": "npm:lightningcss-linux-x64-musl@1.33.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "RYiYbkokw0trfKqqzfF55lginwEPrD3OJDfTuJzFs1MK6iFnDenaz1fqLLtX4ITG3OktJQXOeTaw1awrBAlZPw=="
+        }
+      ],
+      "name": "lightningcss-linux-x64-musl",
+      "purl": "pkg:npm/lightningcss-linux-x64-musl@1.33.0",
+      "type": "library",
+      "version": "1.33.0"
+    },
+    {
+      "bom-ref": "npm:lightningcss-win32-arm64-msvc@1.33.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "1K+MPfLSFVpphzpdbfkhlWk6wBrTObBzS2T6db10PNOZgR9GoVsAWzwNyuhUYYbTp23j+4RrncfujZ4uAzXvwA=="
+        }
+      ],
+      "name": "lightningcss-win32-arm64-msvc",
+      "purl": "pkg:npm/lightningcss-win32-arm64-msvc@1.33.0",
+      "type": "library",
+      "version": "1.33.0"
+    },
+    {
+      "bom-ref": "npm:lightningcss-win32-x64-msvc@1.33.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "OlEICDx/Xl0FqSp4bry8zFnCvGpig3Gl4gCquvYwHuqJKEC1+n9NgDniFvqHGmMv1ZkqDJrDqKKSykTDX+ehuA=="
+        }
+      ],
+      "name": "lightningcss-win32-x64-msvc",
+      "purl": "pkg:npm/lightningcss-win32-x64-msvc@1.33.0",
+      "type": "library",
+      "version": "1.33.0"
+    },
+    {
+      "bom-ref": "npm:lightningcss@1.33.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "WkUDrojuJs0xkgGf2udWxa3yGBRxPtxUkB79i6aCZLRgc7PM8fZe9TosfPDcvEpQZbuFASnHYmRLBLUbmLOIIA=="
+        }
+      ],
+      "name": "lightningcss",
+      "purl": "pkg:npm/lightningcss@1.33.0",
+      "type": "library",
+      "version": "1.33.0"
+    },
+    {
+      "bom-ref": "npm:magic-string@0.30.21",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "vd2F4YUyEXKGcLHoq+TEyCjxueSeHnFxyyjNp80yg0XV4vUhnDer/lvvlqM/arB5bXQN5K2/3oinyCRyx8T2CQ=="
+        }
+      ],
+      "name": "magic-string",
+      "purl": "pkg:npm/magic-string@0.30.21",
+      "type": "library",
+      "version": "0.30.21"
+    },
+    {
+      "bom-ref": "npm:nanoid@3.3.16",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "bzlKTyNJ7+LdGIIwy8ijFpIqEQIvafahV7eYykJ8Cvh42EdJeODoJ6gUJXpQJvej1BddH8OqTXZNE/KfbWAu8Q=="
+        }
+      ],
+      "name": "nanoid",
+      "purl": "pkg:npm/nanoid@3.3.16",
+      "type": "library",
+      "version": "3.3.16"
+    },
+    {
+      "bom-ref": "npm:obug@2.1.4",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "4a+OsYv9UktOJKE+l1A4OufDgdRF9PifWj+tJnHURo/P+WOxpG4GzUFL9qCalmWauao6ogiG+QvnCovwPoyAWA=="
+        }
+      ],
+      "name": "obug",
+      "purl": "pkg:npm/obug@2.1.4",
+      "type": "library",
+      "version": "2.1.4"
+    },
+    {
+      "bom-ref": "npm:pathe@2.0.3",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "WUjGcAqP1gQacoQe+OBJsFA7Ld4DyXuUIjZ5cc75cLHvJ7dtNsTugphxIADwspS+AraAUePCKrSVtPLFj/F88w=="
+        }
+      ],
+      "name": "pathe",
+      "purl": "pkg:npm/pathe@2.0.3",
+      "type": "library",
+      "version": "2.0.3"
+    },
+    {
+      "bom-ref": "npm:picocolors@1.1.1",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA=="
+        }
+      ],
+      "name": "picocolors",
+      "purl": "pkg:npm/picocolors@1.1.1",
+      "type": "library",
+      "version": "1.1.1"
+    },
+    {
+      "bom-ref": "npm:picomatch@4.0.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "RvwwcruNjI1ncT5xRakeyS9Lf8lcItv34KD+aif+VH9kduAyfYBipGh12274xtenIPZ119/R9BdTBa8gAwSh0A=="
+        }
+      ],
+      "name": "picomatch",
+      "purl": "pkg:npm/picomatch@4.0.5",
+      "type": "library",
+      "version": "4.0.5"
+    },
+    {
+      "bom-ref": "npm:postcss@8.5.23",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "g50586zr4bZmwFiTlflMu8E0bDTb5I5gertgwAKmsdUlTQIhZtunzUlD1WSzwcVWPoAVpsrA6vlfCD7oXvRwgg=="
+        }
+      ],
+      "name": "postcss",
+      "purl": "pkg:npm/postcss@8.5.23",
+      "type": "library",
+      "version": "8.5.23"
+    },
+    {
+      "bom-ref": "npm:react-dom@19.2.8",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "rVprimfGBG3DR+Tq0IQG2DT5PxKth1WIGDmj5yPmlzr4YBe7uyE+Du4oVqTDXZSHGGGXRtTJEGSSePyQCMBglQ=="
+        }
+      ],
+      "name": "react-dom",
+      "purl": "pkg:npm/react-dom@19.2.8",
+      "type": "library",
+      "version": "19.2.8"
+    },
+    {
+      "bom-ref": "npm:react@19.2.8",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "PWaYA1L/q9u2u7xYQi+Y3L3Yfnie7XyLeaJICV1MGD6LprsBxcAqGjYyr0eY3p+QdsA+x/Irkt4Qif8D63+Sbw=="
+        }
+      ],
+      "name": "react",
+      "purl": "pkg:npm/react@19.2.8",
+      "type": "library",
+      "version": "19.2.8"
+    },
+    {
+      "bom-ref": "npm:rolldown@1.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "t9z29cJjXf/vxQ8dyhCSpt6H6aSwHTk8cT5I3iy6SMXuFpk5mB6PL6XfC8PCwrPTx93udwKUm9HRteAlTGBLiA=="
+        }
+      ],
+      "name": "rolldown",
+      "purl": "pkg:npm/rolldown@1.1.5",
+      "type": "library",
+      "version": "1.1.5"
+    },
+    {
+      "bom-ref": "npm:scheduler@0.27.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q=="
+        }
+      ],
+      "name": "scheduler",
+      "purl": "pkg:npm/scheduler@0.27.0",
+      "type": "library",
+      "version": "0.27.0"
+    },
+    {
+      "bom-ref": "npm:siginfo@2.0.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "ybx0WO1/8bSBLEWXZvEd7gMW3Sn3JFlW3TvX1nREbDLRNQNaeNN8WK0meBwPdAaOI7TtRRRJn/Es1zhrrCHu7g=="
+        }
+      ],
+      "name": "siginfo",
+      "purl": "pkg:npm/siginfo@2.0.0",
+      "type": "library",
+      "version": "2.0.0"
+    },
+    {
+      "bom-ref": "npm:source-map-js@1.2.1",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA=="
+        }
+      ],
+      "name": "source-map-js",
+      "purl": "pkg:npm/source-map-js@1.2.1",
+      "type": "library",
+      "version": "1.2.1"
+    },
+    {
+      "bom-ref": "npm:stackback@0.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "1XMJE5fQo1jGH6Y/7ebnwPOBEkIEnT4QF32d5R1+VXdXveM0IBMJt8zfaxX1P3QhVwrYe+576+jkANtSS2mBbw=="
+        }
+      ],
+      "name": "stackback",
+      "purl": "pkg:npm/stackback@0.0.2",
+      "type": "library",
+      "version": "0.0.2"
+    },
+    {
+      "bom-ref": "npm:std-env@4.2.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "oCUKSupKTHX53EyjDtuZQ64pjLJ6yYCtpmEw0goYxtjG9KpbRe8KAsl2tBUGU9DyMcJ0RwJ8GqJAFzMXcXW1Rw=="
+        }
+      ],
+      "name": "std-env",
+      "purl": "pkg:npm/std-env@4.2.0",
+      "type": "library",
+      "version": "4.2.0"
+    },
+    {
+      "bom-ref": "npm:tinybench@2.9.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "0+DUvqWMValLmha6lr4kD8iAMK1HzV0/aKnCtWb9v9641TnP/MFb7Pc2bxoxQjTXAErryXVgUOfv2YqNllqGeg=="
+        }
+      ],
+      "name": "tinybench",
+      "purl": "pkg:npm/tinybench@2.9.0",
+      "type": "library",
+      "version": "2.9.0"
+    },
+    {
+      "bom-ref": "npm:tinyexec@1.2.4",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "SHf/r48b7vOrjve9PxJo3MN5v5yuyjHvdUcrQffT3WXMUfnGmHDVbC4k3sHJaJTgZCwpUplIaAo5ANtMyp3YHg=="
+        }
+      ],
+      "name": "tinyexec",
+      "purl": "pkg:npm/tinyexec@1.2.4",
+      "type": "library",
+      "version": "1.2.4"
+    },
+    {
+      "bom-ref": "npm:tinyglobby@0.2.17",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "wXR/dYpcqKmfWpEdZjiKJOwCNFndD0DMnrW/cYjVGttEkBfVgcLFHoNrlj47mjOVic9yyNu65alsgF4NQyTa2g=="
+        }
+      ],
+      "name": "tinyglobby",
+      "purl": "pkg:npm/tinyglobby@0.2.17",
+      "type": "library",
+      "version": "0.2.17"
+    },
+    {
+      "bom-ref": "npm:tinyrainbow@3.1.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "Bf+ILmBgretUrdJxzXM0SgXLZ3XfiaUuOj/IKQHuTXip+05Xn+uyEYdVg0kYDipTBcLrCVyUzAPz7QmArb0mmw=="
+        }
+      ],
+      "name": "tinyrainbow",
+      "purl": "pkg:npm/tinyrainbow@3.1.0",
+      "type": "library",
+      "version": "3.1.0"
+    },
+    {
+      "bom-ref": "npm:tslib@2.8.1",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w=="
+        }
+      ],
+      "name": "tslib",
+      "purl": "pkg:npm/tslib@2.8.1",
+      "type": "library",
+      "version": "2.8.1"
+    },
+    {
+      "bom-ref": "npm:typescript@7.0.2",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "8FYau96o3NKOhbjKi/qNvG/W5jhzxkbdm5sj9AbZ/5T5sWqn3hJgLfGx27sRKZWTvyzCP8dLRBTf5tBTSRVUNA=="
+        }
+      ],
+      "name": "typescript",
+      "purl": "pkg:npm/typescript@7.0.2",
+      "type": "library",
+      "version": "7.0.2"
+    },
+    {
+      "bom-ref": "npm:vite@8.1.5",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "7ULLwsCdYx/nRyrpiEwvqb5TFHrMVZyBt+rg/OAXT7rgj/z+DtTDyKFeLAdDkubDVDKD8jOsndmy7m55XcfUsw=="
+        }
+      ],
+      "name": "vite",
+      "purl": "pkg:npm/vite@8.1.5",
+      "type": "library",
+      "version": "8.1.5"
+    },
+    {
+      "bom-ref": "npm:vitest@4.1.10",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "R9jUTe5S4Qb0HCd4TNqpC7oGcrMssMRGXLW80ubjWsW9VH5GF8y1Y0SFLY9AbqSk6nt0PnOx4H4WNJYZ13GUPw=="
+        }
+      ],
+      "name": "vitest",
+      "purl": "pkg:npm/vitest@4.1.10",
+      "type": "library",
+      "version": "4.1.10"
+    },
+    {
+      "bom-ref": "npm:why-is-node-running@2.3.0",
+      "hashes": [
+        {
+          "alg": "SHA-512",
+          "content": "hUrmaWBdVDcxvYqnyh09zunKzROWjbZTiNy8dBEjkS7ehEDQibXJ7XvlmtbwuTclUiIyN+CyXQD4Vmko8fNm8w=="
+        }
+      ],
+      "name": "why-is-node-running",
+      "purl": "pkg:npm/why-is-node-running@2.3.0",
+      "type": "library",
+      "version": "2.3.0"
+    },
+    {
+      "bom-ref": "pypi:absl-py@2.5.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "0c996f25c0490700fadabe6351630f6111534fa0ae252cc6d2014ea3b141135f"
+        }
+      ],
+      "name": "absl-py",
+      "purl": "pkg:pypi/absl-py@2.5.0",
+      "type": "library",
+      "version": "2.5.0"
+    },
+    {
+      "bom-ref": "pypi:accelerate@1.14.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "41b9c4377a54e0b460a959b0defa1b736e4ca0a2373252d9a539964c2afe3c8d"
+        }
+      ],
+      "name": "accelerate",
+      "purl": "pkg:pypi/accelerate@1.14.0",
+      "type": "library",
+      "version": "1.14.0"
+    },
+    {
+      "bom-ref": "pypi:aiohappyeyeballs@2.7.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "065665c041c42a5938ed220bdcd7230f22527fbec085e1853d2402c8a3615d9d"
+        }
+      ],
+      "name": "aiohappyeyeballs",
+      "purl": "pkg:pypi/aiohappyeyeballs@2.7.1",
+      "type": "library",
+      "version": "2.7.1"
+    },
+    {
+      "bom-ref": "pypi:aiohttp@3.14.3",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "9491196535a88924a60afd5b5f434b5b203b6cc616250878dbdb223a8f7844bc"
+        }
+      ],
+      "name": "aiohttp",
+      "purl": "pkg:pypi/aiohttp@3.14.3",
+      "type": "library",
+      "version": "3.14.3"
+    },
+    {
+      "bom-ref": "pypi:aiosignal@1.4.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f47eecd9468083c2029cc99945502cb7708b082c232f9aca65da147157b251c7"
+        }
+      ],
+      "name": "aiosignal",
+      "purl": "pkg:pypi/aiosignal@1.4.0",
+      "type": "library",
+      "version": "1.4.0"
+    },
+    {
+      "bom-ref": "pypi:aiosqlite@0.22.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "043e0bd78d32888c0a9ca90fc788b38796843360c855a7262a532813133a0650"
+        }
+      ],
+      "name": "aiosqlite",
+      "purl": "pkg:pypi/aiosqlite@0.22.1",
+      "type": "library",
+      "version": "0.22.1"
+    },
+    {
+      "bom-ref": "pypi:alembic@1.18.5",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "1554982221dd17e9a749b53902407578eb305e453f71999e8c7f0a48389fff8e"
+        }
+      ],
+      "name": "alembic",
+      "purl": "pkg:pypi/alembic@1.18.5",
+      "type": "library",
+      "version": "1.18.5"
+    },
+    {
+      "bom-ref": "pypi:annotated-doc@0.0.4",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "fbcda96e87e9c92ad167c2e53839e57503ecfda18804ea28102353485033faa4"
+        }
+      ],
+      "name": "annotated-doc",
+      "purl": "pkg:pypi/annotated-doc@0.0.4",
+      "type": "library",
+      "version": "0.0.4"
+    },
+    {
+      "bom-ref": "pypi:annotated-types@0.8.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "13b2beaad985e05e2d6407ee4c4f35590b11f8d693a258a561055cac8f64cab7"
+        }
+      ],
+      "name": "annotated-types",
+      "purl": "pkg:pypi/annotated-types@0.8.0",
+      "type": "library",
+      "version": "0.8.0"
+    },
+    {
+      "bom-ref": "pypi:anyio@4.14.2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "cfa139f3ed1a23ee8f88a145ddb5ac7605b8bbfd8592baacd7ce3d8bb4313c7f"
+        }
+      ],
+      "name": "anyio",
+      "purl": "pkg:pypi/anyio@4.14.2",
+      "type": "library",
+      "version": "4.14.2"
+    },
+    {
+      "bom-ref": "pypi:ast-serialize@0.6.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "aadd3ffcf4858c9726bf3515f7b199c7eadbe504f96028e4a87172c0da65a8fe"
+        }
+      ],
+      "name": "ast-serialize",
+      "purl": "pkg:pypi/ast-serialize@0.6.0",
+      "type": "library",
+      "version": "0.6.0"
+    },
+    {
+      "bom-ref": "pypi:asyncpg@0.31.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c989386c83940bfbd787180f2b1519415e2d3d6277a70d9d0f0145ac73500735"
+        }
+      ],
+      "name": "asyncpg",
+      "purl": "pkg:pypi/asyncpg@0.31.0",
+      "type": "library",
+      "version": "0.31.0"
+    },
+    {
+      "bom-ref": "pypi:attrs@26.1.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d03ceb89cb322a8fd706d4fb91940737b6642aa36998fe130a9bc96c985eff32"
+        }
+      ],
+      "name": "attrs",
+      "purl": "pkg:pypi/attrs@26.1.0",
+      "type": "library",
+      "version": "26.1.0"
+    },
+    {
+      "bom-ref": "pypi:certifi@2026.7.22",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "741e2c3b351ddf169a738da9f2c048608ff7f2c5cc02f1ebc6b118bb090d5d55"
+        }
+      ],
+      "name": "certifi",
+      "purl": "pkg:pypi/certifi@2026.7.22",
+      "type": "library",
+      "version": "2026.7.22"
+    },
+    {
+      "bom-ref": "pypi:charset-normalizer@3.4.9",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "673611bbd43f0810bec0b0f028ddeaaa501190339cac411f347ac76917c3ae7b"
+        }
+      ],
+      "name": "charset-normalizer",
+      "purl": "pkg:pypi/charset-normalizer@3.4.9",
+      "type": "library",
+      "version": "3.4.9"
+    },
+    {
+      "bom-ref": "pypi:click@8.4.2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "9a6cea6e60b17ebe0a44c5cc636d94f09bd66142c1cd7d8b4cd731c4917a15f6"
+        }
+      ],
+      "name": "click",
+      "purl": "pkg:pypi/click@8.4.2",
+      "type": "library",
+      "version": "8.4.2"
+    },
+    {
+      "bom-ref": "pypi:colorama@0.4.6",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44"
+        }
+      ],
+      "name": "colorama",
+      "purl": "pkg:pypi/colorama@0.4.6",
+      "type": "library",
+      "version": "0.4.6"
+    },
+    {
+      "bom-ref": "pypi:cuda-bindings@13.3.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c7855c4868aabc0cfae28abbe83d56734bdfbd08f08fc234ac1912a12858bf49"
+        }
+      ],
+      "name": "cuda-bindings",
+      "purl": "pkg:pypi/cuda-bindings@13.3.1",
+      "type": "library",
+      "version": "13.3.1"
+    },
+    {
+      "bom-ref": "pypi:cuda-pathfinder@1.6.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "1503af579d8379c24bdd65528379bc57039b0455be9f5f9686cf8e473a1fce51"
+        }
+      ],
+      "name": "cuda-pathfinder",
+      "purl": "pkg:pypi/cuda-pathfinder@1.6.0",
+      "type": "library",
+      "version": "1.6.0"
+    },
+    {
+      "bom-ref": "pypi:cuda-toolkit@13.0.3.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d693caaa261214ddd7dbb60d68e71cbed884e68c2be7509778f3051da0b91c3f"
+        }
+      ],
+      "name": "cuda-toolkit",
+      "purl": "pkg:pypi/cuda-toolkit@13.0.3.0",
+      "type": "library",
+      "version": "13.0.3.0"
+    },
+    {
+      "bom-ref": "pypi:datasets@5.0.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "83dbbbdb07a33b82192b8c419deb18739b138ee2ce1a322d55ce6b100954ec1a"
+        }
+      ],
+      "name": "datasets",
+      "purl": "pkg:pypi/datasets@5.0.0",
+      "type": "library",
+      "version": "5.0.0"
+    },
+    {
+      "bom-ref": "pypi:dill@0.4.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "423092df4182177d4d8ba8290c8a5b640c66ab35ec7da59ccfa00f6fa3eea5fa"
+        }
+      ],
+      "name": "dill",
+      "purl": "pkg:pypi/dill@0.4.1",
+      "type": "library",
+      "version": "0.4.1"
+    },
+    {
+      "bom-ref": "pypi:fastapi@0.140.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "8c10f75cf17c46f9d27c512a6f9bcc3643ffef2029a9ac956f8bf821ef47ceea"
+        }
+      ],
+      "name": "fastapi",
+      "purl": "pkg:pypi/fastapi@0.140.1",
+      "type": "library",
+      "version": "0.140.1"
+    },
+    {
+      "bom-ref": "pypi:filelock@3.32.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "7be2ad23a14607ccc71808e68fe30848aeace7058ace17852f68e2a68e310402"
+        }
+      ],
+      "name": "filelock",
+      "purl": "pkg:pypi/filelock@3.32.0",
+      "type": "library",
+      "version": "3.32.0"
+    },
+    {
+      "bom-ref": "pypi:frozenlist@1.8.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3ede829ed8d842f6cd48fc7081d7a41001a56f1f38603f9d49bf3020d59a31ad"
+        }
+      ],
+      "name": "frozenlist",
+      "purl": "pkg:pypi/frozenlist@1.8.0",
+      "type": "library",
+      "version": "1.8.0"
+    },
+    {
+      "bom-ref": "pypi:fsspec@2026.4.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "301d8ac70ae90ef3ad05dcf94d6c3754a097f9b5fe4667d2787aa359ec7df7e4"
+        }
+      ],
+      "name": "fsspec",
+      "purl": "pkg:pypi/fsspec@2026.4.0",
+      "type": "library",
+      "version": "2026.4.0"
+    },
+    {
+      "bom-ref": "pypi:greenlet@3.5.4",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "0232ae1de90a8e07867bb127d7a6ba2301e859145489f25cda8a6096dabe1d20"
+        }
+      ],
+      "name": "greenlet",
+      "purl": "pkg:pypi/greenlet@3.5.4",
+      "type": "library",
+      "version": "3.5.4"
+    },
+    {
+      "bom-ref": "pypi:h11@0.16.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "4e35b956cf45792e4caa5885e69fba00bdbc6ffafbfa020300e549b208ee5ff1"
+        }
+      ],
+      "name": "h11",
+      "purl": "pkg:pypi/h11@0.16.0",
+      "type": "library",
+      "version": "0.16.0"
+    },
+    {
+      "bom-ref": "pypi:hf-xet@1.5.2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "73044bd31bae33c984af832d19c752a0dffb67518fee9ddbd91d616e1101cf47"
+        }
+      ],
+      "name": "hf-xet",
+      "purl": "pkg:pypi/hf-xet@1.5.2",
+      "type": "library",
+      "version": "1.5.2"
+    },
+    {
+      "bom-ref": "pypi:httpcore@1.0.9",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8"
+        }
+      ],
+      "name": "httpcore",
+      "purl": "pkg:pypi/httpcore@1.0.9",
+      "type": "library",
+      "version": "1.0.9"
+    },
+    {
+      "bom-ref": "pypi:httptools@0.8.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "6b2a32f18d97e16e90827d7a819ffa8dbd8cc245fc4e1fa9d1095b54ef4bd999"
+        }
+      ],
+      "name": "httptools",
+      "purl": "pkg:pypi/httptools@0.8.0",
+      "type": "library",
+      "version": "0.8.0"
+    },
+    {
+      "bom-ref": "pypi:httpx@0.28.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc"
+        }
+      ],
+      "name": "httpx",
+      "purl": "pkg:pypi/httpx@0.28.1",
+      "type": "library",
+      "version": "0.28.1"
+    },
+    {
+      "bom-ref": "pypi:huggingface-hub@1.25.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "21129595ca7a753be479b319913e22cc8808361ac118bd76cc413db831b28a99"
+        }
+      ],
+      "name": "huggingface-hub",
+      "purl": "pkg:pypi/huggingface-hub@1.25.1",
+      "type": "library",
+      "version": "1.25.1"
+    },
+    {
+      "bom-ref": "pypi:idna@3.18",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848"
+        }
+      ],
+      "name": "idna",
+      "purl": "pkg:pypi/idna@3.18",
+      "type": "library",
+      "version": "3.18"
+    },
+    {
+      "bom-ref": "pypi:immutabledict@4.3.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f844a669106cfdc73f47b1a9da003782fb17dc955a54c80972e0d93d1c63c514"
+        }
+      ],
+      "name": "immutabledict",
+      "purl": "pkg:pypi/immutabledict@4.3.1",
+      "type": "library",
+      "version": "4.3.1"
+    },
+    {
+      "bom-ref": "pypi:iniconfig@2.3.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730"
+        }
+      ],
+      "name": "iniconfig",
+      "purl": "pkg:pypi/iniconfig@2.3.0",
+      "type": "library",
+      "version": "2.3.0"
+    },
+    {
+      "bom-ref": "pypi:jinja2@3.1.6",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d"
+        }
+      ],
+      "name": "jinja2",
+      "purl": "pkg:pypi/jinja2@3.1.6",
+      "type": "library",
+      "version": "3.1.6"
+    },
+    {
+      "bom-ref": "pypi:librt@0.13.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "1d2a610c14ac0d0750ee0a3ab8548e83155258387891caaca04def4bf7289781"
+        }
+      ],
+      "name": "librt",
+      "purl": "pkg:pypi/librt@0.13.0",
+      "type": "library",
+      "version": "0.13.0"
+    },
+    {
+      "bom-ref": "pypi:mako@1.3.12",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "9f778e93289bd410bb35daadeb4fc66d95a746f0b75777b942088b7fd7af550a"
+        }
+      ],
+      "name": "mako",
+      "purl": "pkg:pypi/mako@1.3.12",
+      "type": "library",
+      "version": "1.3.12"
+    },
+    {
+      "bom-ref": "pypi:markdown-it-py@4.2.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49"
+        }
+      ],
+      "name": "markdown-it-py",
+      "purl": "pkg:pypi/markdown-it-py@4.2.0",
+      "type": "library",
+      "version": "4.2.0"
+    },
+    {
+      "bom-ref": "pypi:markupsafe@3.0.3",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "722695808f4b6457b320fdc131280796bdceb04ab50fe1795cd540799ebe1698"
+        }
+      ],
+      "name": "markupsafe",
+      "purl": "pkg:pypi/markupsafe@3.0.3",
+      "type": "library",
+      "version": "3.0.3"
+    },
+    {
+      "bom-ref": "pypi:mdurl@0.1.2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba"
+        }
+      ],
+      "name": "mdurl",
+      "purl": "pkg:pypi/mdurl@0.1.2",
+      "type": "library",
+      "version": "0.1.2"
+    },
+    {
+      "bom-ref": "pypi:mpmath@1.3.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "7a28eb2a9774d00c7bc92411c19a89209d5da7c4c9a9e227be8330a23a25b91f"
+        }
+      ],
+      "name": "mpmath",
+      "purl": "pkg:pypi/mpmath@1.3.0",
+      "type": "library",
+      "version": "1.3.0"
+    },
+    {
+      "bom-ref": "pypi:multidict@6.7.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "ec6652a1bee61c53a3e5776b6049172c53b6aaba34f18c9ad04f82712bac623d"
+        }
+      ],
+      "name": "multidict",
+      "purl": "pkg:pypi/multidict@6.7.1",
+      "type": "library",
+      "version": "6.7.1"
+    },
+    {
+      "bom-ref": "pypi:multiprocess@0.70.19",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "952021e0e6c55a4a9fe4cd787895b86e239a40e76802a789d6305398d3975897"
+        }
+      ],
+      "name": "multiprocess",
+      "purl": "pkg:pypi/multiprocess@0.70.19",
+      "type": "library",
+      "version": "0.70.19"
+    },
+    {
+      "bom-ref": "pypi:mypy-extensions@1.1.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "52e68efc3284861e772bbcd66823fde5ae21fd2fdb51c62a211403730b916558"
+        }
+      ],
+      "name": "mypy-extensions",
+      "purl": "pkg:pypi/mypy-extensions@1.1.0",
+      "type": "library",
+      "version": "1.1.0"
+    },
+    {
+      "bom-ref": "pypi:mypy@2.3.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "465965d41cd9a2726694e983e8ce7113259327bec798115d1e1dfa2a52fb666e"
+        }
+      ],
+      "name": "mypy",
+      "purl": "pkg:pypi/mypy@2.3.0",
+      "type": "library",
+      "version": "2.3.0"
+    },
+    {
+      "bom-ref": "pypi:networkx@3.6.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "26b7c357accc0c8cde558ad486283728b65b6a95d85ee1cd66bafab4c8168509"
+        }
+      ],
+      "name": "networkx",
+      "purl": "pkg:pypi/networkx@3.6.1",
+      "type": "library",
+      "version": "3.6.1"
+    },
+    {
+      "bom-ref": "pypi:numpy@2.5.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "a48a113e6afea91f5608793bafa7ef2ad481fefbda87ec5069f483de61cb9fa3"
+        }
+      ],
+      "name": "numpy",
+      "purl": "pkg:pypi/numpy@2.5.1",
+      "type": "library",
+      "version": "2.5.1"
+    },
+    {
+      "bom-ref": "pypi:nvidia-cublas@13.1.1.3",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "b7a210458267ac818974c53038fbec2e969d5c99f305ab15c72522fa9f001dd5"
+        }
+      ],
+      "name": "nvidia-cublas",
+      "purl": "pkg:pypi/nvidia-cublas@13.1.1.3",
+      "type": "library",
+      "version": "13.1.1.3"
+    },
+    {
+      "bom-ref": "pypi:nvidia-cuda-cupti@13.0.85",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "796bd679890ee55fb14a94629b698b6db54bcfd833d391d5e94017dd9d7d3151"
+        }
+      ],
+      "name": "nvidia-cuda-cupti",
+      "purl": "pkg:pypi/nvidia-cuda-cupti@13.0.85",
+      "type": "library",
+      "version": "13.0.85"
+    },
+    {
+      "bom-ref": "pypi:nvidia-cuda-nvrtc@13.0.88",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575"
+        }
+      ],
+      "name": "nvidia-cuda-nvrtc",
+      "purl": "pkg:pypi/nvidia-cuda-nvrtc@13.0.88",
+      "type": "library",
+      "version": "13.0.88"
+    },
+    {
+      "bom-ref": "pypi:nvidia-cuda-runtime@13.0.96",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "ef9bcbe90493a2b9d810e43d249adb3d02e98dd30200d86607d8d02687c43f55"
+        }
+      ],
+      "name": "nvidia-cuda-runtime",
+      "purl": "pkg:pypi/nvidia-cuda-runtime@13.0.96",
+      "type": "library",
+      "version": "13.0.96"
+    },
+    {
+      "bom-ref": "pypi:nvidia-cudnn-cu13@9.20.0.48",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "e31454ae00094b0c55319d9d15b6fa2fc50a9e1c0f5c8c80fb75258234e731e1"
+        }
+      ],
+      "name": "nvidia-cudnn-cu13",
+      "purl": "pkg:pypi/nvidia-cudnn-cu13@9.20.0.48",
+      "type": "library",
+      "version": "9.20.0.48"
+    },
+    {
+      "bom-ref": "pypi:nvidia-cufft@12.0.0.61",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "2708c852ef8cd89d1d2068bdbece0aa188813a0c934db3779b9b1faa8442e5f5"
+        }
+      ],
+      "name": "nvidia-cufft",
+      "purl": "pkg:pypi/nvidia-cufft@12.0.0.61",
+      "type": "library",
+      "version": "12.0.0.61"
+    },
+    {
+      "bom-ref": "pypi:nvidia-cufile@1.15.1.6",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "08a3ecefae5a01c7f5117351c64f17c7c62efa5fffdbe24fc7d298da19cd0b44"
+        }
+      ],
+      "name": "nvidia-cufile",
+      "purl": "pkg:pypi/nvidia-cufile@1.15.1.6",
+      "type": "library",
+      "version": "1.15.1.6"
+    },
+    {
+      "bom-ref": "pypi:nvidia-curand@10.4.0.35",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "133df5a7509c3e292aaa2b477afd0194f06ce4ea24d714d616ff36439cee349a"
+        }
+      ],
+      "name": "nvidia-curand",
+      "purl": "pkg:pypi/nvidia-curand@10.4.0.35",
+      "type": "library",
+      "version": "10.4.0.35"
+    },
+    {
+      "bom-ref": "pypi:nvidia-cusolver@12.0.4.66",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "02c2457eaa9e39de20f880f4bd8820e6a1cfb9f9a34f820eb12a155aa5bc92d2"
+        }
+      ],
+      "name": "nvidia-cusolver",
+      "purl": "pkg:pypi/nvidia-cusolver@12.0.4.66",
+      "type": "library",
+      "version": "12.0.4.66"
+    },
+    {
+      "bom-ref": "pypi:nvidia-cusparse@12.6.3.3",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "80bcc4662f23f1054ee334a15c72b8940402975e0eab63178fc7e670aa59472c"
+        }
+      ],
+      "name": "nvidia-cusparse",
+      "purl": "pkg:pypi/nvidia-cusparse@12.6.3.3",
+      "type": "library",
+      "version": "12.6.3.3"
+    },
+    {
+      "bom-ref": "pypi:nvidia-cusparselt-cu13@0.8.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "4dca476c50bf4780d46cd0bfbd82e2bc10a08e4fef7950917ce8d7578d22a23f"
+        }
+      ],
+      "name": "nvidia-cusparselt-cu13",
+      "purl": "pkg:pypi/nvidia-cusparselt-cu13@0.8.1",
+      "type": "library",
+      "version": "0.8.1"
+    },
+    {
+      "bom-ref": "pypi:nvidia-nccl-cu13@2.29.7",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "674a12383e3c38a1bcccae7d4f3633b37852230b6047883cb2f4c2d1b36d9bf5"
+        }
+      ],
+      "name": "nvidia-nccl-cu13",
+      "purl": "pkg:pypi/nvidia-nccl-cu13@2.29.7",
+      "type": "library",
+      "version": "2.29.7"
+    },
+    {
+      "bom-ref": "pypi:nvidia-nvjitlink@13.3.33",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "26a6de7fb4c8fdaa7703d3dad720d6d427ddfea5c48a528fd97c11733ad830e5"
+        }
+      ],
+      "name": "nvidia-nvjitlink",
+      "purl": "pkg:pypi/nvidia-nvjitlink@13.3.33",
+      "type": "library",
+      "version": "13.3.33"
+    },
+    {
+      "bom-ref": "pypi:nvidia-nvshmem-cu13@3.4.5",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "6dc2a197f38e5d0376ad52cd1a2a3617d3cdc150fd5966f4aee9bcebb1d68fe9"
+        }
+      ],
+      "name": "nvidia-nvshmem-cu13",
+      "purl": "pkg:pypi/nvidia-nvshmem-cu13@3.4.5",
+      "type": "library",
+      "version": "3.4.5"
+    },
+    {
+      "bom-ref": "pypi:nvidia-nvtx@13.0.85",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "4936d1d6780fbe68db454f5e72a42ff64d1fd6397df9f363ae786930fd5c1cd4"
+        }
+      ],
+      "name": "nvidia-nvtx",
+      "purl": "pkg:pypi/nvidia-nvtx@13.0.85",
+      "type": "library",
+      "version": "13.0.85"
+    },
+    {
+      "bom-ref": "pypi:orjson@3.11.9",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "4fef17e1f8722c11587a6ef18e35902450221da0028e65dbaaa543619e68e48f"
+        }
+      ],
+      "name": "orjson",
+      "purl": "pkg:pypi/orjson@3.11.9",
+      "type": "library",
+      "version": "3.11.9"
+    },
+    {
+      "bom-ref": "pypi:ortools@9.15.6755",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "ae1c6e1fd844b4d756b22eb6c0ed574ea4342ee206d807c4f903039e748228fa"
+        }
+      ],
+      "name": "ortools",
+      "purl": "pkg:pypi/ortools@9.15.6755",
+      "type": "library",
+      "version": "9.15.6755"
+    },
+    {
+      "bom-ref": "pypi:packaging@26.2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "ff452ff5a3e828ce110190feff1178bb1f2ea2281fa2075aadb987c2fb221661"
+        }
+      ],
+      "name": "packaging",
+      "purl": "pkg:pypi/packaging@26.2",
+      "type": "library",
+      "version": "26.2"
+    },
+    {
+      "bom-ref": "pypi:pandas@3.0.5",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "dca3734d6ab7c906e6730f0788b0a1dbb9f2467731f9711f77995c8e9d62d712"
+        }
+      ],
+      "name": "pandas",
+      "purl": "pkg:pypi/pandas@3.0.5",
+      "type": "library",
+      "version": "3.0.5"
+    },
+    {
+      "bom-ref": "pypi:pathspec@1.1.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "17db5ecd524104a120e173814c90367a96a98d07c45b2e10c2f3919fff91bf5a"
+        }
+      ],
+      "name": "pathspec",
+      "purl": "pkg:pypi/pathspec@1.1.1",
+      "type": "library",
+      "version": "1.1.1"
+    },
+    {
+      "bom-ref": "pypi:peft@0.19.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "0d97542fe96dcdaa20d3b81c06f26f988618f416a73544ab23c3618ccb674a40"
+        }
+      ],
+      "name": "peft",
+      "purl": "pkg:pypi/peft@0.19.1",
+      "type": "library",
+      "version": "0.19.1"
+    },
+    {
+      "bom-ref": "pypi:pluggy@1.6.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3"
+        }
+      ],
+      "name": "pluggy",
+      "purl": "pkg:pypi/pluggy@1.6.0",
+      "type": "library",
+      "version": "1.6.0"
+    },
+    {
+      "bom-ref": "pypi:propcache@0.5.2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "01c4fc7480cd0598bb4b57022df55b9ca296da7fc5a8760bd8451a7e63a7d427"
+        }
+      ],
+      "name": "propcache",
+      "purl": "pkg:pypi/propcache@0.5.2",
+      "type": "library",
+      "version": "0.5.2"
+    },
+    {
+      "bom-ref": "pypi:protobuf@6.33.6",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "a6768d25248312c297558af96a9f9c929e8c4cee0659cb07e780731095f38135"
+        }
+      ],
+      "name": "protobuf",
+      "purl": "pkg:pypi/protobuf@6.33.6",
+      "type": "library",
+      "version": "6.33.6"
+    },
+    {
+      "bom-ref": "pypi:psutil@7.2.2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "0746f5f8d406af344fd547f1c8daa5f5c33dbc293bb8d6a16d80b4bb88f59372"
+        }
+      ],
+      "name": "psutil",
+      "purl": "pkg:pypi/psutil@7.2.2",
+      "type": "library",
+      "version": "7.2.2"
+    },
+    {
+      "bom-ref": "pypi:pyarrow@25.0.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d2d697008b5ec06d75952ef260c2e9a8a0f6ccfce24266c04c9c8ade927cb3b4"
+        }
+      ],
+      "name": "pyarrow",
+      "purl": "pkg:pypi/pyarrow@25.0.0",
+      "type": "library",
+      "version": "25.0.0"
+    },
+    {
+      "bom-ref": "pypi:pydantic-core@2.46.4",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "62f875393d7f270851f20523dd2e29f082bcc82292d66db2b64ea71f64b6e1c1"
+        }
+      ],
+      "name": "pydantic-core",
+      "purl": "pkg:pypi/pydantic-core@2.46.4",
+      "type": "library",
+      "version": "2.46.4"
+    },
+    {
+      "bom-ref": "pypi:pydantic-settings@2.14.2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c19dd64b19097f1de80184f0cc7b0272a13ae6e170cbf240a3e27e381ed14a5f"
+        }
+      ],
+      "name": "pydantic-settings",
+      "purl": "pkg:pypi/pydantic-settings@2.14.2",
+      "type": "library",
+      "version": "2.14.2"
+    },
+    {
+      "bom-ref": "pypi:pydantic@2.13.4",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c40756b57adaa8b1efeeced5c196f3f3b7c435f90e84ea7f443901bec8099ef6"
+        }
+      ],
+      "name": "pydantic",
+      "purl": "pkg:pypi/pydantic@2.13.4",
+      "type": "library",
+      "version": "2.13.4"
+    },
+    {
+      "bom-ref": "pypi:pygments@2.20.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f"
+        }
+      ],
+      "name": "pygments",
+      "purl": "pkg:pypi/pygments@2.20.0",
+      "type": "library",
+      "version": "2.20.0"
+    },
+    {
+      "bom-ref": "pypi:pytest-asyncio@1.4.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c6c0d2259945122819f171a32ecea2c349ead889ee28176caaf492143424be42"
+        }
+      ],
+      "name": "pytest-asyncio",
+      "purl": "pkg:pypi/pytest-asyncio@1.4.0",
+      "type": "library",
+      "version": "1.4.0"
+    },
+    {
+      "bom-ref": "pypi:pytest@9.1.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "1088fbde8f2b49d95a549a195707afa7a76a3ce9bcadc26b6d71f0ffda5fe313"
+        }
+      ],
+      "name": "pytest",
+      "purl": "pkg:pypi/pytest@9.1.1",
+      "type": "library",
+      "version": "9.1.1"
+    },
+    {
+      "bom-ref": "pypi:python-dateutil@2.9.0.post0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3"
+        }
+      ],
+      "name": "python-dateutil",
+      "purl": "pkg:pypi/python-dateutil@2.9.0.post0",
+      "type": "library",
+      "version": "2.9.0.post0"
+    },
+    {
+      "bom-ref": "pypi:python-dotenv@1.2.2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3"
+        }
+      ],
+      "name": "python-dotenv",
+      "purl": "pkg:pypi/python-dotenv@1.2.2",
+      "type": "library",
+      "version": "1.2.2"
+    },
+    {
+      "bom-ref": "pypi:python-multipart@0.0.32",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "be54b7f3fa167bb83e4fcd936b887b708f4e57fe75911c02aebf53efaf8d938e"
+        }
+      ],
+      "name": "python-multipart",
+      "purl": "pkg:pypi/python-multipart@0.0.32",
+      "type": "library",
+      "version": "0.0.32"
+    },
+    {
+      "bom-ref": "pypi:pyyaml@6.0.3",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f"
+        }
+      ],
+      "name": "pyyaml",
+      "purl": "pkg:pypi/pyyaml@6.0.3",
+      "type": "library",
+      "version": "6.0.3"
+    },
+    {
+      "bom-ref": "pypi:redis@8.0.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "afc5a7a2f5a084f5b1880dec548dd45be17db7e43c82a30d84f952aefb05cfb0"
+        }
+      ],
+      "name": "redis",
+      "purl": "pkg:pypi/redis@8.0.1",
+      "type": "library",
+      "version": "8.0.1"
+    },
+    {
+      "bom-ref": "pypi:regex@2026.7.19",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "7e77b324909c1617cbb4c668677e2c6ae13f44d7c1de0d4f15f2e3c10f3315b5"
+        }
+      ],
+      "name": "regex",
+      "purl": "pkg:pypi/regex@2026.7.19",
+      "type": "library",
+      "version": "2026.7.19"
+    },
+    {
+      "bom-ref": "pypi:requests@2.34.2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed"
+        }
+      ],
+      "name": "requests",
+      "purl": "pkg:pypi/requests@2.34.2",
+      "type": "library",
+      "version": "2.34.2"
+    },
+    {
+      "bom-ref": "pypi:rich@15.0.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36"
+        }
+      ],
+      "name": "rich",
+      "purl": "pkg:pypi/rich@15.0.0",
+      "type": "library",
+      "version": "15.0.0"
+    },
+    {
+      "bom-ref": "pypi:ruff@0.16.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "e460aafd5495ec89efaa6ced2e4a9a581116451e1c88b9d37ef497e0f8e93982"
+        }
+      ],
+      "name": "ruff",
+      "purl": "pkg:pypi/ruff@0.16.0",
+      "type": "library",
+      "version": "0.16.0"
+    },
+    {
+      "bom-ref": "pypi:safetensors@0.8.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "fabaf3e0f18a6618d9b36560682562157f77c2b71fcffc7b432be2baed9d753d"
+        }
+      ],
+      "name": "safetensors",
+      "purl": "pkg:pypi/safetensors@0.8.0",
+      "type": "library",
+      "version": "0.8.0"
+    },
+    {
+      "bom-ref": "pypi:setuptools@83.0.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "025bccbbf0fa05b6192bc64ae1e7b16e001fd6d6d4d5de03c97b1c1ade523bef"
+        }
+      ],
+      "name": "setuptools",
+      "purl": "pkg:pypi/setuptools@83.0.0",
+      "type": "library",
+      "version": "83.0.0"
+    },
+    {
+      "bom-ref": "pypi:shellingham@1.5.4",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "8dbca0739d487e5bd35ab3ca4b36e11c4078f3a234bfce294b0a0291363404de"
+        }
+      ],
+      "name": "shellingham",
+      "purl": "pkg:pypi/shellingham@1.5.4",
+      "type": "library",
+      "version": "1.5.4"
+    },
+    {
+      "bom-ref": "pypi:six@1.17.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81"
+        }
+      ],
+      "name": "six",
+      "purl": "pkg:pypi/six@1.17.0",
+      "type": "library",
+      "version": "1.17.0"
+    },
+    {
+      "bom-ref": "pypi:socksio@1.0.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f88beb3da5b5c38b9890469de67d0cb0f9d494b78b106ca1845f96c10b91c4ac"
+        }
+      ],
+      "name": "socksio",
+      "purl": "pkg:pypi/socksio@1.0.0",
+      "type": "library",
+      "version": "1.0.0"
+    },
+    {
+      "bom-ref": "pypi:sqlalchemy@2.0.51",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "804dccd8a4a6242c4e30ad961e540e18a588f6527202f2d6791b01845d59fdc9"
+        }
+      ],
+      "name": "sqlalchemy",
+      "purl": "pkg:pypi/sqlalchemy@2.0.51",
+      "type": "library",
+      "version": "2.0.51"
+    },
+    {
+      "bom-ref": "pypi:starlette@1.3.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "05d0213193f2fbaae60e2ecb593b4add4262ad4e46536b54abe36f11a71724e0"
+        }
+      ],
+      "name": "starlette",
+      "purl": "pkg:pypi/starlette@1.3.1",
+      "type": "library",
+      "version": "1.3.1"
+    },
+    {
+      "bom-ref": "pypi:sympy@1.14.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d3d3fe8df1e5a0b42f0e7bdf50541697dbe7d23746e894990c030e2b05e72517"
+        }
+      ],
+      "name": "sympy",
+      "purl": "pkg:pypi/sympy@1.14.0",
+      "type": "library",
+      "version": "1.14.0"
+    },
+    {
+      "bom-ref": "pypi:tokenizers@0.22.2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "473b83b915e547aa366d1eee11806deaf419e17be16310ac0a14077f1e28f917"
+        }
+      ],
+      "name": "tokenizers",
+      "purl": "pkg:pypi/tokenizers@0.22.2",
+      "type": "library",
+      "version": "0.22.2"
+    },
+    {
+      "bom-ref": "pypi:torch@2.13.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "2fe228aba290d14b9f31b049be550dbd469c3fd3013d7a19705b30454da97027"
+        }
+      ],
+      "name": "torch",
+      "purl": "pkg:pypi/torch@2.13.0",
+      "type": "library",
+      "version": "2.13.0"
+    },
+    {
+      "bom-ref": "pypi:tqdm@4.70.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "55b0b0dbd97462d06ebee91e4dac24ed4d4702be82b24f07e6c1d27e08cea220"
+        }
+      ],
+      "name": "tqdm",
+      "purl": "pkg:pypi/tqdm@4.70.0",
+      "type": "library",
+      "version": "4.70.0"
+    },
+    {
+      "bom-ref": "pypi:transformers@5.14.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "60d196c27781eacf8637e2b533f517582907ad6f9ae142046d6b69431a5b2173"
+        }
+      ],
+      "name": "transformers",
+      "purl": "pkg:pypi/transformers@5.14.1",
+      "type": "library",
+      "version": "5.14.1"
+    },
+    {
+      "bom-ref": "pypi:triton@3.7.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "9497f2e696ee368862a181a90b2dcc03ca978cc4f602abd67c7d81022a6988e1"
+        }
+      ],
+      "name": "triton",
+      "purl": "pkg:pypi/triton@3.7.1",
+      "type": "library",
+      "version": "3.7.1"
+    },
+    {
+      "bom-ref": "pypi:trl@1.9.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c92ce832841609f01536739372778c1caa1dc9d46813f6f415746458d3c3143e"
+        }
+      ],
+      "name": "trl",
+      "purl": "pkg:pypi/trl@1.9.1",
+      "type": "library",
+      "version": "1.9.1"
+    },
+    {
+      "bom-ref": "pypi:typer@0.27.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "629bd12ea5d13a17148125d9a264f949eb171fb3f120f9b04d85873cab054fa5"
+        }
+      ],
+      "name": "typer",
+      "purl": "pkg:pypi/typer@0.27.0",
+      "type": "library",
+      "version": "0.27.0"
+    },
+    {
+      "bom-ref": "pypi:typing-extensions@4.16.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5"
+        }
+      ],
+      "name": "typing-extensions",
+      "purl": "pkg:pypi/typing-extensions@4.16.0",
+      "type": "library",
+      "version": "4.16.0"
+    },
+    {
+      "bom-ref": "pypi:typing-inspection@0.4.2",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "ba561c48a67c5958007083d386c3295464928b01faa735ab8547c5692e87f464"
+        }
+      ],
+      "name": "typing-inspection",
+      "purl": "pkg:pypi/typing-inspection@0.4.2",
+      "type": "library",
+      "version": "0.4.2"
+    },
+    {
+      "bom-ref": "pypi:tzdata@2026.3",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "4a1518b8993086a7982523e071643f3c0e5f213e75b21318e78bcabfff9d1415"
+        }
+      ],
+      "name": "tzdata",
+      "purl": "pkg:pypi/tzdata@2026.3",
+      "type": "library",
+      "version": "2026.3"
+    },
+    {
+      "bom-ref": "pypi:urllib3@2.7.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c"
+        }
+      ],
+      "name": "urllib3",
+      "purl": "pkg:pypi/urllib3@2.7.0",
+      "type": "library",
+      "version": "2.7.0"
+    },
+    {
+      "bom-ref": "pypi:uvicorn@0.51.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f6f4b69b657c312f516dd2d268ab9ae6f254b11e4bac504f37b2ab58b24dd0b0"
+        }
+      ],
+      "name": "uvicorn",
+      "purl": "pkg:pypi/uvicorn@0.51.0",
+      "type": "library",
+      "version": "0.51.0"
+    },
+    {
+      "bom-ref": "pypi:uvloop@0.22.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "6c84bae345b9147082b17371e3dd5d42775bddce91f885499017f4607fdaf39f"
+        }
+      ],
+      "name": "uvloop",
+      "purl": "pkg:pypi/uvloop@0.22.1",
+      "type": "library",
+      "version": "0.22.1"
+    },
+    {
+      "bom-ref": "pypi:watchfiles@1.2.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c995fba777f1ea992f090f9236e9284cf7a5d1a0130dd5a3d82c598cacd76838"
+        }
+      ],
+      "name": "watchfiles",
+      "purl": "pkg:pypi/watchfiles@1.2.0",
+      "type": "library",
+      "version": "1.2.0"
+    },
+    {
+      "bom-ref": "pypi:websockets@16.1.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "db234eda965dcce15df96bb9709f587cd87d4d52aaf0e80e2f34ec04c7670c57"
+        }
+      ],
+      "name": "websockets",
+      "purl": "pkg:pypi/websockets@16.1.1",
+      "type": "library",
+      "version": "16.1.1"
+    },
+    {
+      "bom-ref": "pypi:xxhash@3.8.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "b0de4bf3aa66363552d52c6a89003c479911f12098cd48a53d44a0f7a25f7c46"
+        }
+      ],
+      "name": "xxhash",
+      "purl": "pkg:pypi/xxhash@3.8.1",
+      "type": "library",
+      "version": "3.8.1"
+    },
+    {
+      "bom-ref": "pypi:yarl@1.24.5",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "e81b83143bee16329c23db3c1b2d82b29892fcbcb849186d2f6e98a5abe9a57f"
+        }
+      ],
+      "name": "yarl",
+      "purl": "pkg:pypi/yarl@1.24.5",
+      "type": "library",
+      "version": "1.24.5"
+    }
+  ],
+  "metadata": {
+    "component": {
+      "bom-ref": "tripchord",
+      "name": "tripchord",
+      "type": "application",
+      "version": "0.1.0"
+    },
+    "properties": [
+      {
+        "name": "tripchord:commit_sha",
+        "value": "1abcbe5b0d21b9db7db6eee2368dab532e8f72f2"
+      },
+      {
+        "name": "tripchord:committed_at",
+        "value": "2026-08-07T20:14:28+08:00"
+      }
+    ],
+    "timestamp": "2026-08-07T12:15:18Z"
+  },
+  "serialNumber": "urn:uuid:86e3c9ae-03fa-4fa0-bb88-b244f3eaad2a",
+  "specVersion": "1.5",
+  "version": 1
+}

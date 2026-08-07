@@ -147,11 +147,19 @@ def layer1_reproducibility() -> LayerResult:
             timeout=600,
         )
         checks.append({"name": "secret_redaction", "passed": code5 == 0})
+    code6, out6 = _run(["uv", "run", "python", "scripts/generate_sbom.py", "check"])
+    checks.append(
+        {
+            "name": "sbom_drift_check",
+            "passed": code6 == 0,
+            "detail": out6[-200:] if code6 else "",
+        }
+    )
     passed = all(item["passed"] for item in checks)
     return LayerResult(
         name="1_reproducibility",
         passed=passed,
-        detail="migration upgrade/check, web build, API import, secret redaction",
+        detail="migration upgrade/check, web build, API import, secret redaction, sbom drift",
         sub_checks=checks,
     )
 
@@ -169,9 +177,7 @@ def layer2_replay() -> LayerResult:
     for module, label in commands:
         code, out = _run(["uv", "run", "python", "-m", module], timeout=600)
         passed = code == 0
-        checks.append(
-            {"name": label, "passed": passed, "detail": out[-300:] if not passed else ""}
-        )
+        checks.append({"name": label, "passed": passed, "detail": out[-300:] if not passed else ""})
     passed = all(item["passed"] for item in checks)
     return LayerResult(
         name="2_replay",
@@ -233,10 +239,7 @@ def layer3_clean_chrome_fixtures() -> LayerResult:
     return LayerResult(
         name="3_clean_chrome_fixtures",
         passed=passed,
-        detail=(
-            "handoff URL policy + browser bridge permission + booking/reprice "
-            "wiring fixtures"
-        ),
+        detail=("handoff URL policy + browser bridge permission + booking/reprice wiring fixtures"),
         sub_checks=checks,
     )
 
