@@ -36,13 +36,14 @@
 
 **未验证边界**：shadow/testing provider 真实 fixture 接入仍为工程模板，未新增真实 provider。
 
-## v0.8 本地产品体验 — 部分
+## v0.8 本地产品体验 — 完成（第四轮收尾）
 
 - 启动器/安装器：`scripts/tripchord_launcher.py`（check/setup/wizard/api/web），统一管理 API/Web/DB/Bridge，不 push/不发布/不访问真实 OTA。
 - 首次设置向导：LLM Key 存储、模型 smoke 就绪、Companion 配对、逐平台权限与登录健康（登录健康需真实 Companion 授权）。
 - LLM Key 安全：环境变量提供，不写入仓库/日志；secret-redaction 门保持。
-- WCAG 2.2 AA 审查：`docs/wcag-audit.md`；键盘/焦点可见/非颜色状态已补；可读字号（7–9px）、`aria-live`、对比度测量为已知缺口。
-- 未做：首页旅行工作流拆分、默认折叠 Agent DAG（前端大改，记录为下一轮）。
+- 首页旅行工作流拆分：`WorkflowSteps` 步骤条（需求 → 平台 → 进度 → 方案）+ 各面板 `STEP` 标签；回放 Agent 轨迹、live Agent 流水线（Planner → Verifier → Repair → 主控）、模型回执统计默认折叠为 `<details>`，普通用户先看到结果、再展开高技术细节。
+- WCAG 2.2 AA：`docs/wcag-audit.md`；辅助字号 6–11px 全部提到 **≥12px**（150 处）、`aria-live`/`role` 覆盖 SSE 进度/重核价/事件/监控结果、事件注入 `<select>` 补显式 `<label>`、小按钮 `min 24×24` 已补；剩余待办为对比度全量自动化测量与真实浏览器（Lighthouse + NVDA/VoiceOver）人工复核。
+- 未验证边界：首次设置向导逐平台权限与登录健康仍需真实 Companion 授权后确认。
 
 ## v0.9 公测可靠性 — 部分
 
@@ -62,7 +63,7 @@
 
 - 任何 v1.0 Done-Gate 通过、双平台住宿精确报价、完整 OTA 闭环。
 - 真实 OTA 重核价 / 真实 canary / 全平台 E2E（无用户授权）。
-- v0.8 完整产品体验、v0.9 全项（浏览器 E2E、SBOM、Actions 固定等未完成）。
+- v0.9 全项（干净 Chrome + 本地 fixture 浏览器 E2E、SBOM/构建 provenance、Actions SHA 固定、job/monitor 可恢复持久化）与 v1.0 Done-Gate 层 4/5/6。
 
 ## 本轮本地提交（分支 `productization/v1.0`，未 push）
 

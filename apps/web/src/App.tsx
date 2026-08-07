@@ -82,6 +82,57 @@ const liveJobStageLabels: Record<string, string> = {
   failed: "实时规划失败",
 };
 
+const workflowSteps = [
+  { key: "requirement", label: "需求", detail: "模式与行程约束" },
+  { key: "platform", label: "平台", detail: "能力矩阵与授权" },
+  { key: "progress", label: "进度", detail: "搜索与 Agent 调度" },
+  { key: "plan", label: "方案", detail: "候选、事件与预订" },
+] as const;
+
+function deriveWorkflowStep(
+  planningMode: "replay" | "live",
+  workspace: Workspace | null,
+  job: Job | null,
+  livePlanningJob: LivePlanningJobSnapshot | null,
+  liveFlexibleResponse: LiveFlexibleFromTextResponse | null,
+): number {
+  if (planningMode === "live") {
+    if (liveFlexibleResponse) return 3;
+    if (
+      livePlanningJob &&
+      !["succeeded", "failed", "cancelled"].includes(livePlanningJob.state)
+    ) {
+      return 2;
+    }
+    return 1;
+  }
+  if (!workspace) return 0;
+  if (job && job.status !== "succeeded" && job.status !== "failed") return 2;
+  return 3;
+}
+
+function WorkflowSteps({ current }: { current: number }) {
+  return (
+    <nav className="workflow-steps" aria-label="自由行规划工作流步骤">
+      {workflowSteps.map((step, index) => (
+        <div
+          key={step.key}
+          className={`workflow-step ${index === current ? "active" : ""} ${
+            index < current ? "done" : ""
+          }`}
+          aria-current={index === current ? "step" : undefined}
+        >
+          <span className="workflow-step-num">{index + 1}</span>
+          <span className="workflow-step-body">
+            <strong>{step.label}</strong>
+            <small>{step.detail}</small>
+          </span>
+        </div>
+      ))}
+    </nav>
+  );
+}
+
 const decisionLabels = {
   accept: "接受",
   reject_and_replan: "拒绝并重新规划",
@@ -289,6 +340,11 @@ function AgenticRuntimePanel({
               : "确定性路径"}
         </em>
       </div>
+      <details className="agent-runtime-collapse">
+        <summary>
+          查看模型回执与请求统计（{summary.stage_count} 个阶段 ·{" "}
+          {summary.logical_request_count} 轮逻辑请求）
+        </summary>
       <div className="agent-runtime-stats">
         <span>{summary.stage_count} 个 Agent 阶段</span>
         <span>{summary.model_stage_count} 个模型阶段</span>
@@ -357,6 +413,7 @@ function AgenticRuntimePanel({
       )}
       <small className="agent-metrics-boundary">{summary.metrics_boundary}</small>
       <small className="agent-safety-boundary">{summary.safety_boundary}</small>
+      </details>
     </div>
   );
 }
@@ -919,23 +976,31 @@ function HandoffActionBar({
           去官方页面
         </button>
       )}
-      {result && (
-        <small className={`reprice-outcome ${result.outcome}`}>
-          {result.outcome === "unchanged" && receipt
-            ? `价格未变 · ${formatCents(receipt.total_for_party_cents ?? 0, "CNY")}`
-            : result.outcome === "changed"
-              ? "价格有变化，旧 handoff 已失效"
-              : result.outcome === "not_found"
-                ? "该组件暂无法重核价"
-                : result.outcome === "live_unavailable"
-                  ? "需要授权 Companion 会话才能实时重核价"
-                  : result.blocked_reason ?? "无法重核价"}
-        </small>
-      )}
-      {handoff && !canGo && result?.outcome === "unchanged" && (
-        <small className="reprice-outcome unchanged">handoff 已使用（单次有效）</small>
-      )}
-      {error && <small className="reprice-error">{error}</small>}
+      <div className="handoff-status" aria-live="polite">
+        {result && (
+          <small className={`reprice-outcome ${result.outcome}`} role="status">
+            {result.outcome === "unchanged" && receipt
+              ? `价格未变 · ${formatCents(receipt.total_for_party_cents ?? 0, "CNY")}`
+              : result.outcome === "changed"
+                ? "价格有变化，旧 handoff 已失效"
+                : result.outcome === "not_found"
+                  ? "该组件暂无法重核价"
+                  : result.outcome === "live_unavailable"
+                    ? "需要授权 Companion 会话才能实时重核价"
+                    : result.blocked_reason ?? "无法重核价"}
+          </small>
+        )}
+        {handoff && !canGo && result?.outcome === "unchanged" && (
+          <small className="reprice-outcome unchanged" role="status">
+            handoff 已使用（单次有效）
+          </small>
+        )}
+        {error && (
+          <small className="reprice-error" role="alert">
+            {error}
+          </small>
+        )}
+      </div>
     </div>
   );
 }
@@ -1185,6 +1250,8 @@ function LivePackageConsole({
           <div><span>03</span><h3>Planner → Verifier → Repair → 主控裁决</h3></div>
           <strong>{run.scheduler.graph.tasks.length} 个总任务</strong>
         </div>
+        <details className="pipeline-collapse">
+          <summary>展开查看 Agent 流水线（Planner → Verifier → Repair → 主控）</summary>
         <div className="pipeline-grid">
           <article>
             <span className="pipeline-kicker">PLANNER · 初始候选</span>
@@ -1257,6 +1324,7 @@ function LivePackageConsole({
             ))}
           </div>
         )}
+        </details>
         <AgenticRuntimePanel summary={run.agentic} title="整包多 Agent 模型与降级状态" />
         {run.explanation && (
           <div className="agent-runtime-proof" aria-label="解释 Agent 输出">
@@ -1585,7 +1653,11 @@ function LiveEventLab({
         </div>
       )}
       {eventRun && (
-        <div className={`event-run-result decision-${eventRun.decision.state}`}>
+        <div
+          className={`event-run-result decision-${eventRun.decision.state}`}
+          role="status"
+          aria-live="polite"
+        >
           <div>
             <p className="eyebrow">LIVE EVENT REPLAN · 非回放</p>
             <h4>{decisionLabels[eventRun.decision.state]}</h4>
@@ -1807,14 +1879,22 @@ function LiveMonitorPanel({
         <small>只有已通过硬验证并被主控接受的整包，才能开启周期核价。</small>
       )}
       {monitor?.last_check && (
-        <div className="event-result-facts">
+        <div className="event-result-facts" role="status" aria-live="polite">
           <strong>第 {monitor.last_check.sequence} 轮 · {monitor.last_check.decision_state}</strong>
           <span>{monitor.last_check.summary}</span>
           <small>{new Date(monitor.last_check.checked_at).toLocaleString()}</small>
         </div>
       )}
-      {monitor?.last_error && <div className="error-banner">{monitor.last_error}</div>}
-      {error && <div className="error-banner">{error}</div>}
+      {monitor?.last_error && (
+        <div className="error-banner" role="alert">
+          {monitor.last_error}
+        </div>
+      )}
+      {error && (
+        <div className="error-banner" role="alert">
+          {error}
+        </div>
+      )}
     </section>
   );
 }
@@ -2090,9 +2170,19 @@ function App() {
         </div>
       </header>
 
-      <main id="top" className="workspace">
-        <section className="intro-panel">
-          <p className="eyebrow">CONSTRAINT-AWARE TRAVEL PLANNING</p>
+      <main id="top">
+        <WorkflowSteps
+          current={deriveWorkflowStep(
+            planningMode,
+            workspace,
+            job,
+            livePlanningJob,
+            liveFlexibleResponse,
+          )}
+        />
+        <div className="workspace">
+        <section className="intro-panel" aria-label="第一步：需求与模式">
+          <p className="eyebrow">STEP 1 · 需求 · CONSTRAINT-AWARE TRAVEL PLANNING</p>
           <h1>不是生成旅行文案，<br />而是求解一趟可执行的旅行。</h1>
           <p className="lede">交通、住宿、景点、路线、预算和变化事件进入同一条计划链。每次修改都有来源、校验结果和版本差异。</p>
           <form className="trip-form" onSubmit={handlePlan}>
@@ -2248,6 +2338,22 @@ function App() {
         </section>
 
         <section className="plan-panel" aria-label="规划工作区">
+          <p className="plan-panel-step">
+            {planningMode === "live"
+              ? liveFlexibleResponse
+                ? "STEP 4 · 方案 · 最终候选、事件注入与预订"
+                : livePlanningJob &&
+                    !["succeeded", "failed", "cancelled"].includes(
+                      livePlanningJob.state,
+                    )
+                  ? "STEP 3 · 进度 · 搜索与 Agent 调度"
+                  : "STEP 2 · 平台 · 能力矩阵与授权"
+              : !workspace
+                ? "STEP 1 · 需求 · 提交后进入搜索与方案"
+                : job && job.status !== "succeeded" && job.status !== "failed"
+                  ? "STEP 3 · 进度 · 搜索与 Agent 调度"
+                  : "STEP 4 · 方案 · 候选、事件与预订"}
+          </p>
           {error && <div className="error-banner">{error}</div>}
           {planningMode === "live" ? (
             liveFlexibleResponse ? (
@@ -2320,11 +2426,70 @@ function App() {
             <>
               <div className="plan-header">
                 <div><p className="eyebrow">PERSISTED WORKSPACE</p><h2>{workspace.title}</h2><small className="workspace-id">{workspace.id}</small></div>
-                <div className={`job-badge ${job?.status ?? "queued"}`}><strong>{job?.progress ?? 0}%</strong><span>{stageLabels[job?.stage ?? "queued"] ?? job?.stage}</span></div>
+                <div className={`job-badge ${job?.status ?? "queued"}`} role="status"><strong>{job?.progress ?? 0}%</strong><span>{stageLabels[job?.stage ?? "queued"] ?? job?.stage}</span></div>
               </div>
-              {job && job.status !== "succeeded" && job.status !== "failed" && <div className="progress-track"><span style={{ width: `${job.progress}%` }} /></div>}
+              {job && job.status !== "succeeded" && job.status !== "failed" && (
+                <div
+                  className="progress-track"
+                  role="progressbar"
+                  aria-label="规划进度"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={job.progress}
+                >
+                  <span style={{ width: `${job.progress}%` }} />
+                </div>
+              )}
 
-              {agentRun && <section className={`agent-console ${agentRun.decision.state}`}><div className="agent-console-head"><div><p className="eyebrow">REPLAY MULTI-AGENT TRACE · 非实时</p><h3>{agentRun.decision.state === "accept" ? "直接接受" : agentRun.decision.state === "accept_with_exception" ? "确认例外后接受" : "重新规划或暂停"}</h3></div><strong>回放 · {agentRun.scheduler.max_parallel_tasks} 路并发</strong></div><p>{agentRun.decision.summary}</p>{agentRun.decision.verifier_violations.length > 0 && <div className="violation-list">{agentRun.decision.verifier_violations.map((item) => <span key={item}>{item}</span>)}</div>}<div className="agent-facts"><span>{agentRun.scheduler.graph.tasks.length} 个动态任务</span><span>{agentRun.evidence.length} 条证据</span><span>{Math.round(agentRun.scheduler.wall_time_seconds * 1000)} ms 回放耗时</span></div><details><summary>查看回放 Agent 轨迹</summary><ol>{agentRun.scheduler.trace.filter((item) => item.kind === "task_finished" || item.kind === "task_spawned").map((item) => <li key={item.sequence}><b>{item.kind === "task_spawned" ? "动态创建" : "完成"}</b> {item.task_id} · {item.agent_role}</li>)}</ol></details><small>{agentBoundary}</small></section>}
+              {agentRun && (
+                <details className={`agent-console ${agentRun.decision.state}`}>
+                  <summary className="agent-console-head">
+                    <div>
+                      <p className="eyebrow">REPLAY MULTI-AGENT TRACE · 非实时</p>
+                      <h3>
+                        {agentRun.decision.state === "accept"
+                          ? "直接接受"
+                          : agentRun.decision.state === "accept_with_exception"
+                            ? "确认例外后接受"
+                            : "重新规划或暂停"}
+                      </h3>
+                    </div>
+                    <strong>
+                      回放 · {agentRun.scheduler.max_parallel_tasks} 路并发
+                    </strong>
+                  </summary>
+                  <p>{agentRun.decision.summary}</p>
+                  {agentRun.decision.verifier_violations.length > 0 && (
+                    <div className="violation-list">
+                      {agentRun.decision.verifier_violations.map((item) => (
+                        <span key={item}>{item}</span>
+                      ))}
+                    </div>
+                  )}
+                  <div className="agent-facts">
+                    <span>{agentRun.scheduler.graph.tasks.length} 个动态任务</span>
+                    <span>{agentRun.evidence.length} 条证据</span>
+                    <span>{Math.round(agentRun.scheduler.wall_time_seconds * 1000)} ms 回放耗时</span>
+                  </div>
+                  <details>
+                    <summary>查看回放 Agent 轨迹</summary>
+                    <ol>
+                      {agentRun.scheduler.trace
+                        .filter(
+                          (item) =>
+                            item.kind === "task_finished" || item.kind === "task_spawned",
+                        )
+                        .map((item) => (
+                          <li key={item.sequence}>
+                            <b>{item.kind === "task_spawned" ? "动态创建" : "完成"}</b>{" "}
+                            {item.task_id} · {item.agent_role}
+                          </li>
+                        ))}
+                    </ol>
+                  </details>
+                  <small>{agentBoundary}</small>
+                </details>
+              )}
 
               {plan && (
                 <>
@@ -2338,7 +2503,33 @@ function App() {
 
                   {groupedItems.map(([date, items], index) => <div className="day-block" key={date}><div className="day-heading"><span>DAY {index + 1}</span><strong>{date}</strong></div><div className="timeline">{items.map((item) => <article className="timeline-item" key={item.id}><time>{formatTime(item.starts_at)}–{formatTime(item.ends_at)}</time><span className={`timeline-dot ${item.kind}`} /><div><strong>{item.title}</strong><p>{item.location_name ?? "位置待导航确认"} · {item.source_refs[0] ?? "用户偏好项"}</p></div></article>)}</div></div>)}
 
-                  <div className="event-lab"><div><p className="eyebrow">EVENT INJECTION LAB</p><h3>模拟异常，在合格候选中选择恢复策略</h3></div><select value={eventTarget} onChange={(e) => setEventTarget(e.target.value)}>{plan.items.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select><select value={eventKind} onChange={(e) => setEventKind(e.target.value)}><option value="place_closed">临时闭园</option><option value="weather_alert">天气预警</option><option value="transport_delayed">延误 60 分钟</option><option value="price_changed">价格变为 ¥300</option></select><select value={replanPreference} onChange={(e) => setReplanPreference(e.target.value as typeof replanPreference)}><option value="minimum_change">最少改动</option><option value="balanced">平衡策略</option><option value="quality_first">质量优先</option></select><button type="button" onClick={injectEvent}>注入并重规划</button></div>
+                  <div className="event-lab">
+                    <div><p className="eyebrow">EVENT INJECTION LAB</p><h3>模拟异常，在合格候选中选择恢复策略</h3></div>
+                    <label>
+                      受影响活动
+                      <select value={eventTarget} onChange={(e) => setEventTarget(e.target.value)}>
+                        {plan.items.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}
+                      </select>
+                    </label>
+                    <label>
+                      事件类型
+                      <select value={eventKind} onChange={(e) => setEventKind(e.target.value)}>
+                        <option value="place_closed">临时闭园</option>
+                        <option value="weather_alert">天气预警</option>
+                        <option value="transport_delayed">延误 60 分钟</option>
+                        <option value="price_changed">价格变为 ¥300</option>
+                      </select>
+                    </label>
+                    <label>
+                      恢复策略
+                      <select value={replanPreference} onChange={(e) => setReplanPreference(e.target.value as typeof replanPreference)}>
+                        <option value="minimum_change">最少改动</option>
+                        <option value="balanced">平衡策略</option>
+                        <option value="quality_first">质量优先</option>
+                      </select>
+                    </label>
+                    <button type="button" onClick={injectEvent}>注入并重规划</button>
+                  </div>
                   {replanResult && <div className={`replan-result ${replanResult.status}`}><strong>{replanResult.status === "ready" ? `${replanResult.selected_mode === "local" ? "局部修复" : "全局重优化"}完成` : "自动恢复已阻塞"}</strong><p>{replanResult.message}</p><span>未受影响项保留率 {(replanResult.unaffected_preservation_ratio * 100).toFixed(0)}% · {replanResult.candidates.length} 个候选通过策略比较</span></div>}
 
                   <div className="verification-bar"><div><span>✓</span><p><strong>确定性 Verifier 已检查</strong><small>日期、时间窗、移动间隔、预算、必去项与来源</small></p></div><em>{plan.status}</em></div>
@@ -2347,6 +2538,7 @@ function App() {
             </>
           )}
         </section>
+        </div>
       </main>
     </div>
   );
