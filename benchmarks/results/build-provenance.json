@@ -1,14 +1,14 @@
 {
-  "commit_sha": "1abcbe5b0d21b9db7db6eee2368dab532e8f72f2",
-  "committed_at": "2026-08-07T20:14:28+08:00",
+  "commit_sha": "c1f3c884dfb9397e2eba8e256f8f8bed7585441d",
+  "committed_at": "2026-08-07T20:41:30+08:00",
   "component_counts": {
     "npm": 103,
     "pypi": 115,
     "total": 218
   },
-  "generated_at": "2026-08-07T12:15:18Z",
+  "generated_at": "2026-08-07T12:43:10Z",
   "sbom_file": "sbom.cyclonedx.json",
-  "sbom_sha256": "51bfe86b32446ed4fc56d3df9f0164e93b724fce14ed8ec384fca9b0278e64a4",
+  "sbom_sha256": "c9810bb7fa59cea79798702f26eacd7d5b8fa90928f43969b14e1d7c71e0b5aa",
   "schema": "tripchord-build-provenance-v1",
   "source_digests": {
     "package-lock.json": "f5ece09cb2e9a8436ccf5722c3b8aadc4d5e724a677bbb071e624dcb1bb95eb0",

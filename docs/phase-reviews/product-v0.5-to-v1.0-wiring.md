@@ -45,17 +45,19 @@
 - WCAG 2.2 AA：`docs/wcag-audit.md`；辅助字号 6–11px 全部提到 **≥12px**（150 处）、`aria-live`/`role` 覆盖 SSE 进度/重核价/事件/监控结果、事件注入 `<select>` 补显式 `<label>`、小按钮 `min 24×24` 已补；剩余待办为对比度全量自动化测量与真实浏览器（Lighthouse + NVDA/VoiceOver）人工复核。
 - 未验证边界：首次设置向导逐平台权限与登录健康仍需真实 Companion 授权后确认。
 
-## v0.9 公测可靠性 — 部分
+## v0.9 公测可靠性 — 完成
 
 - CI：新增 `companion`（release gate）、`security`（gitleaks secret scan + pip-audit）、acceptance/faults benchmark 运行。
 - 冻结 benchmark/mutation：`benchmarks/evaluate_acceptance.py`（五类反表面）+ `evaluate_faults.py` 进 CI。
 - 可观测性：`GET /api/v1/observability/summary` 分开统计终态/handoff/booking facts。
-- job 已 DB 化（既有）；monitor 仍进程内（重启需重开，已知）。
-- 未做：干净 Chrome + 本地 fixture 浏览器 E2E（Playwright/Puppeteer）、SBOM/构建 provenance、Actions SHA 固定（CI 仍用 `@v5/@v6` 浮动标签）。
+- **Actions SHA 固定**：`.github/workflows/ci.yml` 全部 `uses:` 以 SHA 锁定（checkout/setup-uv/setup-node/gitleaks，`# vN` 注释标注），CI 不再跟随浮动标签。
+- **SBOM/构建 provenance**：`scripts/generate_sbom.py`（CycloneDX 1.5）从 `uv.lock` + `package-lock.json` 生成 115 pypi + 103 npm 组件清单；`check` 以 `source_digests` + 组件清单 + 计数做确定性漂移检测（`commit_sha` 仅信息性，因自引用不可作绑定键）；已入 CI 与 Done-Gate 层 1。
+- **job/monitor 可恢复持久化**：job 已 DB 化（既有）；monitor 新增 `live_monitors` + `live_monitor_checks` 表（迁移 `20260807_0001`）、`LiveMonitorRepository`/`DbLiveMonitorStore`；registry `recover()` 重启后恢复可解析 run 的 ACTIVE 监控，run 不可恢复时如实标记 FAILED（不静默丢失）。
+- **干净 Chrome + 本地 fixture 浏览器 E2E**：`scripts/browser_e2e.py` 用 CDP（`websockets`，无 Playwright/Puppeteer）驱动干净 headless Chrome，对本地回放 API + 静态 SPA 验证四阶段工作流步骤条与回放规划渲染；`scripts/tests/test_browser_e2e.py` 包装为 pytest，无 Chrome/dist 时如实 SKIP；已入 Done-Gate 层 3。
 
 ## v1.0 Done-Gate — 持续推进
 
-- `scripts/run_product_done_gate.py`：层 2 加入 `benchmarks.evaluate_acceptance`；层 3 加入 reprice/booking/wiring fixture 测试；层 4 修复为「未授权模型成本则 SKIP」。
+- `scripts/run_product_done_gate.py`：层 2 加入 `benchmarks.evaluate_acceptance`；层 3 加入 reprice/booking/wiring fixture 测试 + `clean_chrome_browser_e2e`（无 Chrome 时如实 SKIP）；层 4 修复为「未授权模型成本则 SKIP」。
 - 本机运行：层 1/2/3 PASS、层 4 SKIP（`TRIPCHORD_ACK_MODEL_COST` 未授权，不发起付费模型调用）、层 5/6 `pending user authorization`；`passed=false`、退出码 2，如实。
 - 五类反表面端到端验收：`benchmarks/evaluate_acceptance.py` 全 PASS。
 
@@ -63,8 +65,8 @@
 
 - 任何 v1.0 Done-Gate 通过、双平台住宿精确报价、完整 OTA 闭环。
 - 真实 OTA 重核价 / 真实 canary / 全平台 E2E（无用户授权）。
-- v0.9 全项（干净 Chrome + 本地 fixture 浏览器 E2E、SBOM/构建 provenance、Actions SHA 固定、job/monitor 可恢复持久化）与 v1.0 Done-Gate 层 4/5/6。
+- v1.0 Done-Gate 层 4/5/6（模型 smoke 未授权、真实平台 canary 与全平台 E2E 待用户授权）。
 
 ## 本轮本地提交（分支 `productization/v1.0`，未 push）
 
-`7fc03f5`（v0.5/v0.6/v0.7 接线）→ `ada2aee`（前端 handoff 流）→ `78cda9a`（v0.8/v0.9 启动器+CI+可观测性）→ 后续账本/评审提交。
+`7fc03f5`（v0.5/v0.6/v0.7 接线）→ `ada2aee`（前端 handoff 流）→ `78cda9a`（v0.8/v0.9 启动器+CI+可观测性）→ `01778cf`（v0.9 Actions SHA 固定 + SBOM/provenance）→ `e64a1d6`（monitor 可恢复持久化）→ `c1f3c88`（干净 Chrome 浏览器 E2E）→ 账本/评审提交。
