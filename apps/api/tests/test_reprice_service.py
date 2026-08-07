@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from tripchord.platform.capability import ProviderScopeKey, ProviderVertical
@@ -20,7 +20,9 @@ from tripchord.platform.reprice import (
     UnstableHandoffPath,
     build_official_url,
     build_reprice_query_url,
+    compute_query_fingerprint_sha256,
 )
+from tripchord.providers.browser_bridge import BrowserSearchQuery
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 
@@ -60,6 +62,39 @@ class _FixedSource:
     ) -> FreshComponentQuote | None:
         self.requests.append(request)
         return self._quote
+
+
+def _query(**overrides: object) -> BrowserSearchQuery:
+    values = {
+        "origin": "PVG",
+        "destination": "MLE",
+        "start_date": date(2026, 9, 1),
+        "end_date": date(2026, 9, 8),
+        "adults": 2,
+        "rooms": 1,
+    }
+    values.update(overrides)
+    return BrowserSearchQuery(**values)
+
+
+def test_query_fingerprint_is_deterministic_sha256() -> None:
+    fingerprint = compute_query_fingerprint_sha256(_query())
+    assert len(fingerprint) == 64
+    assert fingerprint == compute_query_fingerprint_sha256(_query())
+
+
+def test_query_fingerprint_binds_every_query_parameter() -> None:
+    fingerprint = compute_query_fingerprint_sha256(_query())
+    for changed in (
+        {"start_date": date(2026, 9, 2)},
+        {"end_date": date(2026, 9, 9)},
+        {"adults": 1},
+        {"rooms": 2},
+        {"destination": "CMB"},
+        {"origin": None},
+        {"currency": "USD"},
+    ):
+        assert compute_query_fingerprint_sha256(_query(**changed)) != fingerprint, changed
 
 
 @pytest.mark.asyncio

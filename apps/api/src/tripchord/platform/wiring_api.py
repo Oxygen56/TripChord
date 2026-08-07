@@ -38,6 +38,7 @@ from tripchord.platform.handoff import (
 from tripchord.platform.reprice import (
     ComponentRepriceRequest,
     ComponentRepriceService,
+    compute_query_fingerprint_sha256,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["product-wiring"])
@@ -79,10 +80,15 @@ def _tenant(request: Request) -> str:
     return str(getattr(request.state, "tenant_id", "anonymous"))
 
 
-def _quote_from_run(run: object, component_id: str) -> tuple[str, str, int | None]:
+def _quote_from_run(
+    run: object,
+    component_id: str,
+) -> tuple[str, ProviderVertical, int | None]:
     """Locate a component quote inside a live package run.
 
-    Returns ``(provider, scope_key, total_for_party_cents)`` or raises 404.
+    Returns ``(provider, vertical, total_for_party_cents)`` where ``vertical``
+    is derived from the component's type (flight / lodging / transfer), not from
+    the provider id, or raises 404.
     """
     package = getattr(run, "package", None)
     candidate = getattr(package, "final_candidate", None)
@@ -91,17 +97,27 @@ def _quote_from_run(run: object, component_id: str) -> tuple[str, str, int | Non
             status_code=status.HTTP_404_NOT_FOUND,
             detail="live run has no final candidate to re-price",
         )
-    candidates: list[object] = []
     flight = getattr(candidate, "flight", None)
-    if flight is not None:
-        candidates.append(flight)
-    candidates.extend(getattr(candidate, "lodgings", ()) or ())
-    candidates.extend(getattr(candidate, "transfers", ()) or ())
-    for quote in candidates:
-        if getattr(quote, "id", None) == component_id:
-            provider = str(getattr(quote, "provider", ""))
-            total = getattr(quote, "total_for_party_cents", None)
-            return provider, provider, total
+    if flight is not None and getattr(flight, "id", None) == component_id:
+        return (
+            str(getattr(flight, "provider", "")),
+            ProviderVertical.FLIGHT,
+            getattr(flight, "total_for_party_cents", None),
+        )
+    for lodging in getattr(candidate, "lodgings", ()) or ():
+        if getattr(lodging, "id", None) == component_id:
+            return (
+                str(getattr(lodging, "provider", "")),
+                ProviderVertical.LODGING,
+                getattr(lodging, "total_for_party_cents", None),
+            )
+    for transfer in getattr(candidate, "transfers", ()) or ():
+        if getattr(transfer, "id", None) == component_id:
+            return (
+                str(getattr(transfer, "provider", "")),
+                ProviderVertical.TRANSFER,
+                getattr(transfer, "total_for_party_cents", None),
+            )
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail=f"component {component_id!r} was not found in the live run",
@@ -140,15 +156,16 @@ def _locator_for_scope(request: Request, scope: ProviderScopeKey) -> OfficialDet
     )
 
 
-def _scope_from_provider(provider: str) -> ProviderScopeKey:
+def _scope_from_provider(provider: str, vertical: ProviderVertical) -> ProviderScopeKey:
+    """Map a quote's provider id and its component type to a provider scope.
+
+    The vertical comes from the component type (flight / lodging / transfer);
+    only the provider id is normalised here, so a lodging component of ctrip is
+    never mistaken for ``ctrip:flight``.  Transfer quotes are marked
+    ``icom-public-transfer``; that id normalises to the ``icom`` provider.
+    """
     name = provider.lower().split("-")[0].split("_")[0]
-    if name in {"ctrip", "qunar", "tongcheng", "icom", "fliggy", "zhixing"}:
-        # Transfer quotes are marked "icom-public-transfer"; map them to the
-        # transfer vertical by provider id.
-        if name == "icom":
-            return ProviderScopeKey(provider="icom", vertical=ProviderVertical.TRANSFER)
-        return ProviderScopeKey(provider=name, vertical=ProviderVertical.FLIGHT)
-    return ProviderScopeKey(provider=name, vertical=ProviderVertical.FLIGHT)
+    return ProviderScopeKey(provider=name, vertical=vertical)
 
 
 def _handoff_store(request: Request) -> HandoffStore:
@@ -187,9 +204,10 @@ async def reprice_component_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="live planning run was not found or has expired",
         )
-    provider, provider_key, current_total = _quote_from_run(entry.run, component_id)
-    scope = _scope_from_provider(provider_key)
+    provider, vertical, current_total = _quote_from_run(entry.run, component_id)
+    scope = _scope_from_provider(provider, vertical)
     locator = _locator_for_scope(request, scope)
+    query_fingerprint_sha256 = compute_query_fingerprint_sha256(entry.run.search_query)
 
     quote_source_factory = getattr(request.app.state, "reprice_quote_source_factory", None)
     live_mode = "fixture" if quote_source_factory is not None else "live-unavailable"
@@ -207,7 +225,7 @@ async def reprice_component_endpoint(
         plan_version=run_id,
         component_id=component_id,
         scope=scope,
-        query_fingerprint_sha256="0" * 64,
+        query_fingerprint_sha256=query_fingerprint_sha256,
         current_total_for_party_cents=current_total,
         reprice_url=f"/api/v1/agents/live-plans/{run_id}/components/{component_id}/reprice",
     )
@@ -266,6 +284,30 @@ async def consume_handoff_endpoint(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="handoff id does not match the component's active handoff",
+        )
+    # Bind the handoff to the exact query it was re-priced under: if the run's
+    # query changed since the re-price, the old handoff is invalidated and the
+    # component must be re-priced before the official hop is offered again.
+    cache = getattr(request.app.state, "live_run_cache", None)
+    if cache is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="live run cache is not configured",
+        )
+    entry = await cache.get(run_id, _tenant(request))
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="live planning run was not found or has expired",
+        )
+    current_fingerprint = compute_query_fingerprint_sha256(entry.run.search_query)
+    if current_fingerprint != handoff.query_fingerprint_sha256:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "handoff query binding changed; re-price the component before "
+                "using the official hop"
+            ),
         )
     consumed = store.consume_handoff(handoff)
     return ConsumeHandoffResponse(

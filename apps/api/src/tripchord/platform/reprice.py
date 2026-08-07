@@ -16,6 +16,8 @@ here can never create a booked state.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Protocol
@@ -35,8 +37,34 @@ from tripchord.platform.handoff import (
     RevalidationReceipt,
     build_component_checklist,
 )
+from tripchord.providers.browser_bridge import BrowserSearchQuery
 
 REPRICE_SCHEMA_VERSION = "tripchord-component-reprice-v1"
+QUERY_FINGERPRINT_SCHEMA_VERSION = "tripchord-component-query-fingerprint-v1"
+
+
+def compute_query_fingerprint_sha256(query: BrowserSearchQuery) -> str:
+    """Deterministic SHA-256 over the exact query parameters of a component.
+
+    The official handoff is bound to this fingerprint (see
+    :class:`~tripchord.platform.handoff.OfficialHandoff`), so a later, different
+    query — changed dates, travellers, rooms, route or currency — can never
+    reuse the same official hop.  The fingerprint is computed over the query the
+    whole plan was priced under, which is the conservative binding the handoff
+    contract requires.
+    """
+    canonical = {
+        "schema": QUERY_FINGERPRINT_SCHEMA_VERSION,
+        "origin": query.origin,
+        "destination": query.destination,
+        "start_date": query.start_date.isoformat(),
+        "end_date": query.end_date.isoformat() if query.end_date is not None else None,
+        "adults": query.adults,
+        "rooms": query.rooms,
+        "currency": query.currency,
+    }
+    raw = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 class ComponentRepriceOutcome(StrEnum):
