@@ -1,0 +1,64 @@
+{
+  "schema_version": "tripchord-browser-e2e-v1",
+  "generated_at": "2026-08-07T12:41:17.818081+00:00",
+  "passed": true,
+  "summary": "all browser E2E assertions passed",
+  "checks": [
+    {
+      "name": "workflow_steps_four_stages",
+      "passed": true,
+      "detail": "labels=需求/平台/进度/方案"
+    },
+    {
+      "name": "workflow_nav_aria_label",
+      "passed": true,
+      "detail": "aria-label='自由行规划工作流步骤'"
+    },
+    {
+      "name": "requirement_step_active_initially",
+      "passed": true,
+      "detail": "activeIndex=0"
+    },
+    {
+      "name": "replay_mode_selected",
+      "passed": true,
+      "detail": "statusPill='回放演示 · 证据可追溯'"
+    },
+    {
+      "name": "replay_submit_present",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "plan_stage_active",
+      "passed": true,
+      "detail": "activeIndex=3"
+    },
+    {
+      "name": "plan_panel_step_four",
+      "passed": true,
+      "detail": "panelStep='STEP 4 · 方案 · 候选、事件与预订'"
+    },
+    {
+      "name": "plan_day_blocks",
+      "passed": true,
+      "detail": "dayBlocks=2"
+    },
+    {
+      "name": "plan_timeline_items",
+      "passed": true,
+      "detail": "timelineItems=4"
+    },
+    {
+      "name": "replay_truth_note_visible",
+      "passed": true,
+      "detail": "truthNote='回放/沙箱报价仅用于可重复评测；确认前必须调用供应商复价或由用户回原平台核验。'"
+    },
+    {
+      "name": "no_error_banner",
+      "passed": true,
+      "detail": "error=''"
+    }
+  ],
+  "screenshot": "benchmarks/results/browser-e2e-screenshot.png"
+}

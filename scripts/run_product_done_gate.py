@@ -235,11 +235,31 @@ def layer3_clean_chrome_fixtures() -> LayerResult:
                 "detail": out3[-300:] if code3 else "",
             }
         )
+    code4, out4 = _run(
+        ["uv", "run", "python", "scripts/browser_e2e.py"],
+        timeout=600,
+    )
+    if code4 == 0:
+        e2e_detail = "workflow-steps + replay plan rendered in clean headless Chrome"
+    elif code4 == 2:
+        e2e_detail = "clean Chrome or built SPA not available; skipped"
+    else:
+        e2e_detail = out4[-300:]
+    checks.append(
+        {
+            "name": "clean_chrome_browser_e2e",
+            "passed": code4 in {0, 2},
+            "detail": e2e_detail,
+        }
+    )
     passed = all(item["passed"] for item in checks)
     return LayerResult(
         name="3_clean_chrome_fixtures",
         passed=passed,
-        detail=("handoff URL policy + browser bridge permission + booking/reprice wiring fixtures"),
+        detail=(
+            "handoff URL policy + browser bridge permission + booking/reprice "
+            "wiring fixtures + clean-Chrome browser E2E"
+        ),
         sub_checks=checks,
     )
 
