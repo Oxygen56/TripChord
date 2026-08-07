@@ -39,6 +39,8 @@ from tripchord.planning.package_reverification import (
     DeclarativePackageReVerifier,
     PackageInvariantCode,
 )
+from tripchord.platform.booking import BookingLedger
+from tripchord.platform.booking_gate import BookingService
 from tripchord.providers.browser_bridge import BrowserTaskBridge
 
 NOW = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
@@ -172,6 +174,124 @@ def _candidates() -> tuple[TravelPackageCandidate, TravelPackageCandidate, Packa
     return before, after, diff_packages(before, after)
 
 
+def _ledger_with_protected(component_id: str = "lodging:before") -> BookingLedger:
+    service = BookingService(BookingLedger(plan_version="audit-trip"), now=NOW)
+    ledger, _ = service.acknowledge_component(
+        plan_version="audit-trip",
+        component_id=component_id,
+        checklist_id="checklist-1",
+        acknowledgement_id="ack-1",
+        user_token_sha256="a" * 64,
+    )
+    return ledger
+
+
+def test_reverifier_blocks_removal_of_protected_component() -> None:
+    before, after, _ = _candidates()
+    removed_lodging = after.model_copy(
+        update={
+            "lodgings": (),
+            "declared_total_cents": (
+                after.flight.total_for_party_cents
+                + sum(item.total_for_party_cents for item in after.transfers)
+            ),
+        }
+    )
+
+    report = DeclarativePackageReVerifier().audit(
+        _intent(),
+        before,
+        removed_lodging,
+        diff_packages(before, removed_lodging),
+        now=NOW,
+        booking_ledger=_ledger_with_protected("lodging:before"),
+    )
+
+    check = next(
+        c
+        for c in report.checks
+        if c.code is PackageInvariantCode.PROTECTED_COMPONENTS_PRESERVED
+    )
+    assert check.passed is False
+    assert check.component_ids == ("lodging:before",)
+    assert not report.passed
+
+
+def test_reverifier_blocks_change_of_protected_component() -> None:
+    before, _, _ = _candidates()
+    changed_lodging = before.lodgings[0].model_copy(update={"property_name": "renamed"})
+    changed_before = before.model_copy(update={"lodgings": (changed_lodging,)})
+
+    report = DeclarativePackageReVerifier().audit(
+        _intent(),
+        before,
+        changed_before,
+        diff_packages(before, changed_before),
+        now=NOW,
+        booking_ledger=_ledger_with_protected("lodging:before"),
+    )
+
+    check = next(
+        c
+        for c in report.checks
+        if c.code is PackageInvariantCode.PROTECTED_COMPONENTS_PRESERVED
+    )
+    assert check.passed is False
+    assert "lodging:before" in check.component_ids
+
+
+def test_reverifier_passes_when_protected_component_preserved() -> None:
+    before, after, diff = _candidates()
+
+    report = DeclarativePackageReVerifier().audit(
+        _intent(),
+        before,
+        after,
+        diff,
+        now=NOW,
+        booking_ledger=_ledger_with_protected("flight:v1"),
+    )
+
+    check = next(
+        c
+        for c in report.checks
+        if c.code is PackageInvariantCode.PROTECTED_COMPONENTS_PRESERVED
+    )
+    assert check.passed is True
+    assert report.passed
+
+
+def test_reverifier_passes_when_applied_override_unprotects() -> None:
+    before, after, diff = _candidates()
+    ledger = _ledger_with_protected("lodging:before")
+    service = BookingService(ledger, now=NOW)
+    updated, _ = service.request_override(
+        plan_version="audit-trip",
+        component_id="lodging:before",
+        requested_by_token_sha256="b" * 64,
+        reason="user wants a different hotel",
+        request_id="override-1",
+    )
+    updated, _ = service.resolve_override("override-1", apply=True, resolved_at=NOW)
+
+    report = DeclarativePackageReVerifier().audit(
+        _intent(),
+        before,
+        after,
+        diff,
+        now=NOW,
+        booking_ledger=updated,
+    )
+
+    check = next(
+        c
+        for c in report.checks
+        if c.code is PackageInvariantCode.PROTECTED_COMPONENTS_PRESERVED
+    )
+    assert check.passed is True
+    assert report.passed
+
+
 def test_heterogeneous_package_reverifier_accepts_consistent_repair() -> None:
     before, after, diff = _candidates()
 
@@ -184,7 +304,7 @@ def test_heterogeneous_package_reverifier_accepts_consistent_repair() -> None:
     )
 
     assert report.passed
-    assert len(report.checks) == 13
+    assert len(report.checks) == 14
     assert report.failed_codes == ()
     assert "不调用 PackageVerifier" in report.semantics_boundary
     assert "形式化证明" in report.semantics_boundary

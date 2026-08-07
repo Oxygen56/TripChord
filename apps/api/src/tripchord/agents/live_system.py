@@ -145,6 +145,8 @@ from tripchord.planning.stay_plans import (
     StayPlanVerificationHandoff,
     stay_plan_for_candidate,
 )
+from tripchord.platform.booking import BookingLedger
+from tripchord.platform.booking_gate import BookingProtectionGate, ComponentChangeSet
 from tripchord.platform.capability import ProviderScopeKey, ProviderVertical
 from tripchord.platform.terminal import (
     ScopeCancellationTombstone,
@@ -2567,6 +2569,7 @@ class LivePackageAgentSystem:
         *,
         timeout_seconds: int = 120,
         memory_access: MemoryAccessContext | None = None,
+        booking_ledger: BookingLedger | None = None,
     ) -> LiveEventReplanRun:
         budget_ledger = current_agent_budget()
         if budget_ledger is None:  # pragma: no cover - decorator invariant
@@ -2578,7 +2581,9 @@ class LivePackageAgentSystem:
             timeout_seconds=timeout_seconds,
             memory_access=memory_access,
             agent_budget_scope_start_admitted_count=scope_start,
+            booking_ledger=booking_ledger,
         )
+        draft = self._enforce_event_booking_gate(previous, draft, booking_ledger)
         return self._finalize_event_replan_run(
             draft,
             mode=previous.mode,
@@ -2594,6 +2599,7 @@ class LivePackageAgentSystem:
         timeout_seconds: int,
         memory_access: MemoryAccessContext | None,
         agent_budget_scope_start_admitted_count: int,
+        booking_ledger: BookingLedger | None = None,
     ) -> LiveEventReplanRun:
         if (
             previous.run_purpose != LiveRunPurpose.FINAL_PUBLICATION
@@ -2623,6 +2629,7 @@ class LivePackageAgentSystem:
                 timeout_seconds=timeout_seconds,
                 memory_access=memory_access,
                 agent_budget_scope_start_admitted_count=(agent_budget_scope_start_admitted_count),
+                booking_ledger=booking_ledger,
             )
         browser_provider = BrowserProvider(event.affected_provider.value)
         vertical = (
@@ -2737,6 +2744,7 @@ class LivePackageAgentSystem:
                 local_scheduler=scheduler,
                 local_requeried_providers=(event.affected_provider,),
                 local_source_task_ids=(task.id,),
+                booking_ledger=booking_ledger,
             )
         if replacement is None:
             decision_state = {
@@ -2815,6 +2823,7 @@ class LivePackageAgentSystem:
             current,
             package_event,
             inventory,
+            booking_ledger=booking_ledger,
         )
         package = self._enforce_event_stay_plan(previous, package)
         return LiveEventReplanRun(
@@ -2843,6 +2852,7 @@ class LivePackageAgentSystem:
         timeout_seconds: int,
         memory_access: MemoryAccessContext | None,
         agent_budget_scope_start_admitted_count: int,
+        booking_ledger: BookingLedger | None = None,
     ) -> LiveEventReplanRun:
         if self._icom_provider is None:
             raise ValueError("iCom public transfer event search is not configured")
@@ -2969,6 +2979,7 @@ class LivePackageAgentSystem:
                 local_scheduler=scheduler,
                 local_requeried_providers=(event.affected_provider,),
                 local_source_task_ids=(task.id,),
+                booking_ledger=booking_ledger,
             )
         if applied_disposition != EventDisposition.LOCAL_REPAIR:
             decision = PackageDecision(
@@ -3046,6 +3057,7 @@ class LivePackageAgentSystem:
                 current,
                 package_event,
                 inventory,
+                booking_ledger=booking_ledger,
             )
             package = self._enforce_event_stay_plan(previous, package)
             if attempted_package is None:
@@ -3099,6 +3111,8 @@ class LivePackageAgentSystem:
         current: TravelPackageCandidate,
         event: PackageEvent,
         inventory: PackageInventory,
+        *,
+        booking_ledger: BookingLedger | None = None,
     ) -> tuple[PackageRunResult, PackageReverificationReport | None]:
         repair_outcome = self._repairer.repair_event(
             current,
@@ -3137,6 +3151,7 @@ class LivePackageAgentSystem:
                     repaired,
                     repair_outcome.diff,
                     now=verified_at,
+                    booking_ledger=booking_ledger,
                 )
             except Exception as exc:
                 # This is a publication boundary: an unavailable independent
@@ -3179,6 +3194,62 @@ class LivePackageAgentSystem:
                 }
             )
         return package, independent_audit
+
+    def _enforce_event_booking_gate(
+        self,
+        previous: LivePackageAgentRun,
+        draft: LiveEventReplanRun,
+        booking_ledger: BookingLedger | None,
+    ) -> LiveEventReplanRun:
+        """Block any event replan that silently modifies a booked component.
+
+        The v0.6 gate is applied at the publication boundary of event
+        replanning: a repaired or globally re-planned package may never remove
+        or change a protected (booked) component unless an explicit override
+        has been applied.  A blocked event enters the user-handling state
+        (``HUMAN_BLOCK``) instead of being silently accepted.
+        """
+        if booking_ledger is None or draft.package is None:
+            return draft
+        previous_candidate = (
+            previous.package.final_candidate if previous.package is not None else None
+        )
+        if previous_candidate is None:
+            return draft
+        package = draft.package
+        diff = diff_packages(previous_candidate, package.final_candidate)
+        gate = BookingProtectionGate(booking_ledger, now=self._utc_now())
+        impact = gate.evaluate_diff(
+            ComponentChangeSet(
+                plan_version=booking_ledger.plan_version,
+                removed_component_ids=diff.removed_component_ids,
+                added_component_ids=diff.added_component_ids,
+                changed_component_ids=diff.changed_component_ids,
+                preserved_component_ids=diff.preserved_component_ids,
+                event_id=draft.event.id,
+            )
+        )
+        if not impact.affected_protected_component_ids:
+            return draft
+        blocking = PackageDecision(
+            state=PackageDecisionState.HUMAN_BLOCK,
+            summary=(
+                "事件重规划不得绕过已预订保护："
+                f"{impact.blocked_reason}"
+            ),
+            evidence_refs=package.final_candidate.evidence_refs,
+        )
+        return draft.model_copy(
+            update={
+                "decision": blocking,
+                "package": package.model_copy(
+                    update={
+                        "decisions": (*package.decisions, blocking),
+                        "final_decision": blocking,
+                    }
+                ),
+            }
+        )
 
     def _enforce_event_stay_plan(
         self,
@@ -9243,6 +9314,7 @@ class LivePackageAgentSystem:
         local_scheduler: SchedulerOutcome,
         local_requeried_providers: tuple[LiveDataProvider, ...],
         local_source_task_ids: tuple[str, ...],
+        booking_ledger: BookingLedger | None = None,
     ) -> LiveEventReplanRun:
         budget_ledger = current_agent_budget()
         if budget_ledger is None:  # pragma: no cover - public wrapper invariant

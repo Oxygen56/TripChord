@@ -110,6 +110,8 @@ from tripchord.planning.stay_plans import (
     StayPlanId,
     system_stay_plan_candidate_set,
 )
+from tripchord.platform.booking import BookingLedger
+from tripchord.platform.booking_gate import BookingService
 from tripchord.providers.base import ProviderError
 from tripchord.providers.browser_bridge import (
     LIVE_V5_BROWSER_PROVIDERS,
@@ -4549,6 +4551,123 @@ async def test_icom_sold_out_event_requeries_one_direction_and_replans_locally()
         }
     )
     assert not _check_read_only_graph(damaged_initial, replanned).passed
+
+
+def _booking_ledger_with_protected(component_id: str) -> BookingLedger:
+    service = BookingService(BookingLedger(plan_version="audit-trip"), now=NOW)
+    ledger, _ = service.acknowledge_component(
+        plan_version="audit-trip",
+        component_id=component_id,
+        checklist_id="checklist-1",
+        acknowledgement_id="ack-1",
+        user_token_sha256="a" * 64,
+    )
+    return ledger
+
+
+@pytest.mark.asyncio
+async def test_event_replan_cannot_silently_replace_booked_component() -> None:
+    """An event-triggered replan may never silently drop a booked component.
+
+    The v0.6 gate is applied at the event-replan publication boundary: when the
+    sold-out transfer is protected by a booking fact, the replan must enter the
+    user-handling state (HUMAN_BLOCK) instead of swapping in a replacement.
+    """
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    icom = _FakeIComProvider()
+    system = LivePackageAgentSystem(
+        bridge,
+        icom_provider=icom,
+        now=lambda: NOW,
+    )
+    initial, _ = await asyncio.gather(
+        system.run(
+            intent(),
+            query(),
+            mode=LiveCoverageMode.STRICT,
+            timeout_seconds=15,
+        ),
+        _serve(bridge, 11, _success_without_browser_transfers),
+    )
+    assert initial.package is not None
+    assert initial.decision.state == PackageDecisionState.ACCEPT
+    target = next(
+        item
+        for item in initial.package.final_candidate.transfers
+        if item.destination_place_key == PackagePlaceKey.VELANA_AIRPORT
+    )
+    event = LivePackageEvent(
+        id="icom-booked-sold-out",
+        kind=PackageEventKind.SOLD_OUT,
+        target_component_id=target.id,
+        affected_provider=LiveDataProvider.ICOM_PUBLIC_TRANSFER,
+    )
+
+    replanned = await system.replan_after_event(
+        initial,
+        event,
+        timeout_seconds=15,
+        booking_ledger=_booking_ledger_with_protected(target.id),
+    )
+
+    assert replanned.decision.state == PackageDecisionState.HUMAN_BLOCK
+    if replanned.package is not None:
+        assert (
+            replanned.package.final_decision.state
+            == PackageDecisionState.HUMAN_BLOCK
+        )
+
+
+@pytest.mark.asyncio
+async def test_event_replan_allowed_when_booked_component_preserved() -> None:
+    """An event on an un-booked component stays ACCEPT under the same ledger."""
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    icom = _FakeIComProvider()
+    system = LivePackageAgentSystem(
+        bridge,
+        icom_provider=icom,
+        now=lambda: NOW,
+    )
+    initial, _ = await asyncio.gather(
+        system.run(
+            intent(),
+            query(),
+            mode=LiveCoverageMode.STRICT,
+            timeout_seconds=15,
+        ),
+        _serve(bridge, 11, _success_without_browser_transfers),
+    )
+    assert initial.package is not None
+    target = next(
+        item
+        for item in initial.package.final_candidate.transfers
+        if item.destination_place_key == PackagePlaceKey.VELANA_AIRPORT
+    )
+    # Protect an unrelated component (the inbound transfer) so the outbound
+    # sold-out transfer is still free to be replaced.
+    protected = next(
+        item
+        for item in initial.package.final_candidate.transfers
+        if item.destination_place_key == PackagePlaceKey.MAAFUSHI
+    )
+    event = LivePackageEvent(
+        id="icom-unbooked-sold-out",
+        kind=PackageEventKind.SOLD_OUT,
+        target_component_id=target.id,
+        affected_provider=LiveDataProvider.ICOM_PUBLIC_TRANSFER,
+    )
+
+    replanned = await system.replan_after_event(
+        initial,
+        event,
+        timeout_seconds=15,
+        booking_ledger=_booking_ledger_with_protected(protected.id),
+    )
+
+    assert replanned.package is not None
+    assert replanned.decision.state == PackageDecisionState.ACCEPT
+    assert replanned.package.final_decision.state == PackageDecisionState.ACCEPT
+    assert protected.id in replanned.package.final_candidate.component_ids
 
 
 @pytest.mark.asyncio

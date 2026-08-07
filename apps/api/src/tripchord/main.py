@@ -186,6 +186,7 @@ from tripchord.platform.adapters import (
 )
 from tripchord.platform.api import guard_live_start
 from tripchord.platform.api import router as provider_api_router
+from tripchord.platform.booking import BookingLedger
 from tripchord.platform.capability import ProviderVertical
 from tripchord.platform.registry import build_default_registry
 from tripchord.platform.search_run_builder import build_search_run, derive_scope_from_task_id
@@ -1046,6 +1047,22 @@ app.state.provider_adapter_registry = {}
 # Inject a quote-source factory in tests/fixtures to exercise the reprice chain
 # without a real OTA session; absent it, the endpoint reports live-unavailable.
 app.state.reprice_quote_source_factory = None
+
+
+def _load_booking_ledger_for_run(run_id: str) -> BookingLedger | None:
+    """Load the append-only booking ledger for one live run, if any.
+
+    Booking facts are keyed by the same ``run_id`` used by the live-run
+    booking/acknowledge endpoints (``plan_version=run_id`` in
+    ``platform/wiring_api.py``).  A run without a ledger simply has no
+    protected components; event replanning then proceeds ungated.
+    """
+    store = getattr(app.state, "booking_ledger_store", None)
+    if store is None:
+        return None
+    return cast(BookingLedgerStore, store).load(run_id)
+
+
 app.include_router(provider_api_router)
 app.include_router(wiring_api_router)
 browser_task_bridge, live_package_agent_system = _install_browser_bridge(
@@ -1652,6 +1669,7 @@ async def _perform_live_monitor_check(
                 session_id=entry.run.intent.trip_id,
                 trip_id=entry.run.intent.trip_id,
             ),
+            booking_ledger=_load_booking_ledger_for_run(monitor.run_id),
         )
         updated = _advance_cached_live_run(entry.run, replanned)
         expires_at = await cache.replace(
@@ -2435,12 +2453,14 @@ async def live_agent_event_replan_endpoint(
                 detail=str(exc),
             ) from exc
         try:
+            ledger = _load_booking_ledger_for_run(run_id)
             if isinstance(live_system, LivePackageAgentSystem):
                 run = await live_system.replan_after_event(
                     entry.run,
                     request.event,
                     timeout_seconds=_live_timeout_seconds(request.timeout_seconds),
                     memory_access=_memory_access(principal, entry.run.intent.trip_id),
+                    booking_ledger=ledger,
                 )
             else:
                 run = await live_system.replan_after_event(

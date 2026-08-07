@@ -6,11 +6,11 @@
 
 ## 当前状态
 
-- **当前版本**：v1.0 Done-Gate 持续推进（第三轮收尾）；六层机器门层 1/2/3 PASS、层 4 因未授权模型成本 SKIP、层 5/6 待用户授权
+- **当前版本**：v1.0 Done-Gate 持续推进（第四轮）；六层机器门层 1/2/3 PASS、层 4 因未授权模型成本 SKIP、层 5/6 待用户授权
 - **当前分支**：`productization/v1.0`（未 push）
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
-- **最后完成的最小任务**：v0.5/v0.6/v0.7 接入生产路径（reprice 服务 + 预订保护 gate + SDK 冷却/一致性 API + 前端两步 handoff 流）+ v0.8 启动器/向导 + v0.9 CI/可观测性 + 五类反表面验收基准
+- **最后完成的最小任务**：v0.6 收尾——live_system 事件重规划逐点接入 booking gate（不得绕过已预订保护），与 Verifier/ReVerifier 的 `PROTECTED_COMPONENTS_PRESERVED` 不变量一致；reprice 两处接线缺陷修复（按组件类型推导 vertical scope + 真实 query fingerprint 绑定）
 
 ## 版本状态
 
@@ -20,7 +20,7 @@
 | v0.3 全来源终态屏障 | 通过 | Planner 严格晚于最后 Source 终态；无 queued/running 发布路径；零报价无预算 | `docs/phase-reviews/product-v0.3.md` 已更新为「通过」；三项遗留已补 |
 | v0.4 跨平台最终方案 | 通过 | A 平台机票 + B 平台酒店；金额/权益无错配；Repair 后 ReVerifier 重算 | 方案 UI 覆盖解释已落地；确定性/税口门保持 |
 | v0.5 官方预订跳转 | 生产路径已接入 | 每个 handoff 可回链；危险 URL 零放行；旧 receipt 不可用；无稳定 deep-link 安全降级 | `platform/reprice.py`（ComponentRepriceService 接 live 重核价）+ `persistence/handoff_store.py` + `platform/wiring_api.py` reprice/consume 端点 + 前端 `HandoffActionBar` 两步流；`test_reprice_service.py`（9 项）+ `test_wiring_api.py`；真实 OTA 重核价仍需授权 Companion 会话 |
-| v0.6 已预订保护 | 生产路径已接入 | 未解除保护组件修改率 0；解除保护显式确认留痕 | `platform/booking_gate.py`（BookingProtectionGate/BookingService）+ `persistence/booking_ledger.py` + acknowledge/override/resolve/ledger 端点；PlanVerifier `_check_protected_components` + ReVerifier `PROTECTED_COMPONENTS_PRESERVED` 不变量；`test_booking_gate.py`（11 项）+ `test_booking_planning_integration.py`（5 项） |
+| v0.6 已预订保护 | **完成** | 未解除保护组件修改率 0；解除保护显式确认留痕；事件重规划不得绕过已预订保护 | `platform/booking_gate.py`（BookingProtectionGate/BookingService）+ `persistence/booking_ledger.py` + acknowledge/override/resolve/ledger 端点；PlanVerifier `_check_protected_components` + ReVerifier `PROTECTED_COMPONENTS_PRESERVED` 不变量；**新增** live_system 事件重规划接入 gate：`DeclarativePackageReVerifier` 增补 `PROTECTED_COMPONENTS_PRESERVED` 检查、`replan_after_event` 逐点接入 `BookingProtectionGate.evaluate_diff`、main.py 事件重规划/周期 monitor 均加载 `run_id` 对应账本，被保护组件被移除/改变且无已应用 override 时进入 HUMAN_BLOCK；`test_booking_gate.py`（11 项）+ `test_booking_planning_integration.py`（5 项）+ `test_package_reverification.py` 新增 4 项 + `test_live_agent_system.py` 新增 2 项 |
 | v0.7 Provider SDK | 接线完成 | 新 provider 只改 adapter+profile；未认证不进默认选择 | SDK 一致性 runner 接 registry；`POST /providers/{scope}/cooldown` 一键冷却 + `GET /providers/sdk/conformance`；certified-active 公共 API scope 不再强制 host_permissions |
 | v0.8 本地产品体验 | 部分（secret 门 + 启动器/向导已落地） | 全新机器按公开说明完成 replay；秘密不进入日志 | `security/secrets.py` + `scripts/tripchord_launcher.py`（check/setup/wizard/api/web）+ `docs/wcag-audit.md`（键盘/焦点/非颜色已补；字号/aria-live 为已知缺口）；首次设置向导逐平台权限与登录健康需真实 Companion 授权后确认 |
 | v0.9 公测可靠性 | 部分（CI/安全/可观测性已接入） | Python/Web/Companion/迁移/benchmark/E2E/安全全入 CI | CI 新增 `companion` release-gate job、`security`（gitleaks + pip-audit）、acceptance/faults benchmark；`GET /api/v1/observability/summary`；job 已 DB 化；monitor 进程内（重启需重开，已知） |
@@ -30,10 +30,10 @@
 
 | 命令 | 结果 |
 |---|---|
-| `uv run pytest apps/api/tests/ scripts/tests/` | 840 passed |
+| `uv run pytest apps/api/tests/ scripts/tests/` | 850 passed |
 | `npm run build` + `npm test` | build 通过；24 Vitest passed |
 | `uv run ruff check .` | All checks passed |
-| `uv run mypy apps/api/src` | 101+ files, no issues |
+| `uv run mypy apps/api/src` | 107 files, no issues |
 | `uv run python benchmarks/evaluate.py` 等 4 个 | exit 0 |
 | `uv run python benchmarks/evaluate_acceptance.py` | 五类反表面全 PASS（原子输出 `benchmarks/results/product-acceptance.json`） |
 | `uv run python scripts/tripchord_launcher.py check/wizard` | 通过；不访问真实 OTA、不发起付费模型调用 |
@@ -46,7 +46,7 @@
 
 ## 当前可对外声明
 
-- v0.5/v0.6/v0.7 接入生产路径：reprice/handoff 端点 + 前端两步 handoff 流；预订保护 gate 被 Verifier/ReVerifier 消费；SDK 冷却/一致性 API 接线。
+- v0.5/v0.6/v0.7 接入生产路径：reprice/handoff 端点 + 前端两步 handoff 流；预订保护 gate 被 Verifier/ReVerifier 与 live_system 事件重规划共同消费（v0.6 收尾完成）；SDK 冷却/一致性 API 接线。
 - v0.8 启动器/向导、v0.9 CI（Companion release gate + 安全扫描 + acceptance/faults benchmark）、本地可观测性端点。
 - 五类反表面端到端验收全 PASS（`benchmarks/evaluate_acceptance.py`）。
 - 不做任何 Done-Gate 通过 / 双平台住宿精确报价 / 完整 OTA 闭环声明。

@@ -23,6 +23,7 @@ from tripchord.planning.package import (
     TransferPurchaseScope,
     TravelPackageCandidate,
 )
+from tripchord.platform.booking import BookingLedger
 
 
 class PackageInvariantCode(StrEnum):
@@ -39,6 +40,7 @@ class PackageInvariantCode(StrEnum):
     QUOTE_TRUST_AND_FRESHNESS = "quote_trust_and_freshness"
     QUOTE_CAPTURE_SKEW = "quote_capture_skew"
     TRANSFER_CHAIN_AND_CONNECTIONS = "transfer_chain_and_connections"
+    PROTECTED_COMPONENTS_PRESERVED = "protected_components_preserved"
 
 
 class PackageInvariantCheck(DomainModel):
@@ -94,6 +96,7 @@ class DeclarativePackageReVerifier:
         diff: PackageDiff | None,
         *,
         now: datetime | None = None,
+        booking_ledger: BookingLedger | None = None,
     ) -> PackageReverificationReport:
         reference = now or datetime.now(UTC)
         if reference.tzinfo is None:
@@ -112,6 +115,7 @@ class DeclarativePackageReVerifier:
             self._quote_trust_and_freshness(after, reference),
             self._quote_capture_skew(intent, after),
             self._transfer_chain_and_connections(intent, after),
+            self._protected_components_preserved(after, diff, booking_ledger),
         )
         return PackageReverificationReport(
             before_candidate_id=before.id,
@@ -246,6 +250,59 @@ class DeclarativePackageReVerifier:
             not unexpected,
             "diff 之外的组件必须逐字段保持不变",
             unexpected,
+        )
+
+    def _protected_components_preserved(
+        self,
+        after: TravelPackageCandidate,
+        diff: PackageDiff | None,
+        booking_ledger: BookingLedger | None,
+    ) -> PackageInvariantCheck:
+        """v0.6 invariant: a booked component must never be silently removed or
+        changed by event Repair unless an explicit override has been applied."""
+        if booking_ledger is None:
+            return self._check(
+                PackageInvariantCode.PROTECTED_COMPONENTS_PRESERVED,
+                True,
+                "没有已预订约束，保护不变量通过",
+            )
+        protected_ids = {fact.component_id for fact in booking_ledger.facts}
+        if not protected_ids:
+            return self._check(
+                PackageInvariantCode.PROTECTED_COMPONENTS_PRESERVED,
+                True,
+                "无已预订组件，保护不变量通过",
+            )
+        touched: set[str] = set()
+        if diff is not None:
+            touched.update(diff.removed_component_ids)
+            touched.update(diff.changed_component_ids)
+        after_ids = set(after.component_ids)
+        # An applied override explicitly un-protects a component for this round.
+        applied_override_ids = {
+            override.component_id
+            for override in booking_ledger.overrides
+            if override.state.value == "applied"
+        }
+        violations = {
+            component_id
+            for component_id in protected_ids
+            if component_id not in applied_override_ids
+            and (component_id in touched or component_id not in after_ids)
+        }
+        if violations:
+            return self._check(
+                PackageInvariantCode.PROTECTED_COMPONENTS_PRESERVED,
+                False,
+                "已预订组件被删除或修改而未应用解除保护: "
+                + ", ".join(sorted(violations)),
+                tuple(sorted(violations)),
+            )
+        return self._check(
+            PackageInvariantCode.PROTECTED_COMPONENTS_PRESERVED,
+            True,
+            "所有已预订组件均被保留且未静默修改",
+            tuple(sorted(protected_ids)),
         )
 
     def _intent_date_party_rooms(
