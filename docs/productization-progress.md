@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-- **当前版本**：v0.9 公测可靠性收尾完成；v1.0 Done-Gate 持续推进（第四轮）；六层机器门层 1/2/3 PASS、层 4 因未授权模型成本 SKIP、层 5/6 待用户授权
+- **当前版本**：v0.9 公测可靠性收尾完成；v1.0 Done-Gate 持续推进（第五轮，C-54 返工）；六层机器门层 1/2/3/4 PASS、层 5/6 如实 FAIL（pending user authorization）
 - **当前分支**：`productization/v1.0`（未 push）
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
@@ -24,7 +24,7 @@
 | v0.7 Provider SDK | 接线完成 | 新 provider 只改 adapter+profile；未认证不进默认选择 | SDK 一致性 runner 接 registry；`POST /providers/{scope}/cooldown` 一键冷却 + `GET /providers/sdk/conformance`；certified-active 公共 API scope 不再强制 host_permissions |
 | v0.8 本地产品体验 | **完成** | 全新机器按公开说明完成 replay；秘密不进入日志；首页旅行工作流拆分；高技术细节默认折叠；WCAG 已知缺口（字号/aria-live）已整改 | `security/secrets.py` + `scripts/tripchord_launcher.py`（check/setup/wizard/api/web）；**本轮新增**：首页 `WorkflowSteps`（需求→平台→进度→方案）+ 各面板 `STEP` 标签；回放 Agent 轨迹、live Agent 流水线、模型回执默认折叠为 `<details>`；`styles.css` 全部辅助字号 6–11px → ≥12px（150 处）、小按钮 `min 24×24`、`aria-live`/`role` 覆盖 SSE 进度/重核价/事件/监控结果、事件注入 `<select>` 补显式 `<label>`；`docs/wcag-audit.md` 已更新（对比度自动化测量与真实浏览器人工复核仍为发布前待办）；首次设置向导逐平台权限与登录健康需真实 Companion 授权后确认 |
 | v0.9 公测可靠性 | **完成** | Actions SHA 固定 + SBOM/构建 provenance + job/monitor 可恢复持久化 + 干净 Chrome 浏览器 E2E 全入 CI/Done-Gate | `ci.yml` 全部 `uses:` 以 SHA 锁定；`scripts/generate_sbom.py` CycloneDX（115 pypi + 103 npm）+ 确定性漂移门入层 1；monitor 迁移 `20260807_0001`（`live_monitors`/`live_monitor_checks`）+ `recover()` 重启恢复，run 不可恢复如实 FAILED；`scripts/browser_e2e.py` CDP 驱动干净 headless Chrome 验证四阶段工作流步骤条 + 回放规划渲染（证据 `benchmarks/results/browser-e2e.json` + 截图），入层 3 |
-| v1.0 最终产品 | 脚本持续推进，门未过 | `run_product_done_gate.py` 六层分门真实通过 | 本机层 1/2/3 PASS（层 3 含 `clean_chrome_browser_e2e`）；层 4 SKIP（`TRIPCHORD_ACK_MODEL_COST` 未授权，不发起付费模型调用）；层 5/6 `pending user authorization`；`passed=false` 如实；`benchmarks/evaluate_acceptance.py` 五类反表面全 PASS |
+| v1.0 最终产品 | 脚本持续推进，门未过 | `run_product_done_gate.py` 六层分门真实通过 | 本机层 1/2/3/4 PASS（`TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后层 4 实际运行）；层 5 FAIL——per-scope 认证 OTA canary（6 个 certified scope）5 个浏览器 scope 无 Companion 心跳，`icom:transfer` 真实只读公共 API canary PASS；层 6 FAIL——`run_live_done_gate_v4.py` Companion preflight 失败；`passed=false` 如实；`benchmarks/evaluate_acceptance.py` 五类反表面全 PASS |
 
 ## 本次运行验证结果（精确）
 
@@ -44,7 +44,8 @@
 | `alembic upgrade head` / `alembic check`（临时 DB） | 通过 / No new upgrade operations |
 | `npm audit --omit=dev --audit-level=high` | 0 vulnerabilities |
 | `git diff --check` | 通过 |
-| `scripts/run_product_done_gate.py` | 层 1/2/3 PASS（层 3 含 `clean_chrome_browser_e2e`）；层 4 SKIP（未授权模型成本）；层 5/6 `pending user authorization`；`passed=false`，退出码 2（如实） |
+| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py` | 层 1/2/3/4 PASS（层 4 模型 smoke 实际运行通过）；层 5 FAIL——认证 OTA canary 5/6 scope 待用户授权（`icom:transfer` PASS）；层 6 FAIL——`run_live_done_gate_v4.py` Companion preflight 失败；`passed=false`，退出码 2（如实） |
+| `uv run python benchmarks/live_canary_certified.py --bridge-token <token>` | 退出码 2（如实）；`benchmarks/results/live-canary-certified.json` per-scope 证据（fresh/authorized/read-only）；`icom:transfer` 真实只读公共 API 返回 7 个选项 |
 
 ## 当前可对外声明
 
@@ -52,6 +53,7 @@
 - v0.8 完整本地产品体验：启动器/向导 + 首页旅行工作流拆分 + 高技术细节默认折叠 + WCAG 已知缺口整改（字号 ≥12px / aria-live / 表单标签 / 目标尺寸）；v0.9 CI（Companion release gate + 安全扫描 + acceptance/faults benchmark）、本地可观测性端点。
 - v0.9 收尾完成：第三方 Actions SHA 固定（CI 不再跟随 `@v5/@v6` 浮动标签）、CycloneDX SBOM + 构建 provenance 漂移门（`source_digests` 绑定，避免 `commit_sha` 自引用失效）、job/monitor 可恢复持久化（重启后 ACTIVE 监控自动续跑、run 不可恢复如实 FAILED）、干净 Chrome + 本地 fixture 浏览器 E2E（CDP 驱动，无 Playwright/Puppeteer，验证四阶段工作流步骤条与回放规划渲染）。
 - 五类反表面端到端验收全 PASS（`benchmarks/evaluate_acceptance.py`）。
+- C-54 返工完成：层 5 改为 per-scope 认证 OTA canary（`live_canary_certified.py`，6 个 certified scope 逐项 fresh/authorized/read-only 证据，open-meteo/故宫 仅作公开页面连通性标注）；层 6 接入 `run_live_done_gate_v4.py` 真实 E2E 执行器（删除「gated behind layer 5」误导文案）。本机复跑层 1/2/3/4 PASS、层 5/6 如实 FAIL（pending user authorization）。
 - **当前支持与默认选择的 provider × vertical（certified-active 精确集合，6 scope）**：`ctrip:flight`、`ctrip:lodging`、`qunar:flight`、`qunar:lodging`、`tongcheng:flight`、`icom:transfer`（默认选择按 certified-active 过滤，见 `platform/registry.py` `build_default_registry()`）。`tongcheng:lodging`（用户 2026-08-05 跳过）与 `fliggy:flight/lodging`（2026-08-04 验证门失败移出活跃矩阵，仅存于 `LEGACY_V4_CAPABILITIES`）均为 **DISABLED**，不在活跃矩阵。
 - 不做任何 Done-Gate 通过 / 双平台住宿精确报价 / 完整 OTA 闭环声明。
 
@@ -59,15 +61,15 @@
 
 - 任何"Done-Gate 已通过""双平台住宿精确报价""完整 OTA 闭环"。
 - 任何把 login/captcha/pending/empty/timed_out 包装成报价的行为。
-- 任何"代码完成=已验证"的表述：真实 OTA 重核价、真实 canary、全平台 E2E 均未执行（需用户授权官方域名并保持登录态）。
+- 任何"代码完成=已验证"的表述：真实 OTA 重核价、浏览器 scope 真实 canary、全平台 E2E 均未执行（需用户配对 Companion、授权官方域名并保持登录态）。`icom:transfer` 真实只读公共 API canary 已 PASS，但该单 scope 不构成层 5 通过。
 
 ## 下一条可直接执行的命令
 
 ```bash
 cd /Users/oxygen/Documents/个人项目/tripchord
-uv run python scripts/run_product_done_gate.py
+TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py
 ```
-（设置 `TRIPCHORD_BROWSER_BRIDGE_TOKEN` 并保持官方 OTA 域名登录后，层 5/6 才会实际执行；设置 `TRIPCHORD_ACK_MODEL_COST=1` 且提供可解析模型端点后，层 4 才会实际运行。）
+（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态、并设置 `TRIPCHORD_BROWSER_BRIDGE_TOKEN` 后才会逐 scope 真正 PASS；层 6 在上述条件 + `TRIPCHORD_ACK_MODEL_COST=1` 满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行。）
 
 ## 基线记录（业务代码修改前）
 

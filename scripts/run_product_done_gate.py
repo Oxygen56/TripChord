@@ -111,7 +111,8 @@ def _run(
             timeout=timeout,
             env=env,
         )
-        return result.returncode, result.stdout[-2000:]
+        combined = (result.stdout or "") + (result.stderr or "")
+        return result.returncode, combined[-2000:]
     except subprocess.TimeoutExpired:
         return 124, f"timed out after {timeout}s"
     except FileNotFoundError:
@@ -349,51 +350,185 @@ def layer4_model_smoke() -> LayerResult:
     )
 
 
+def _bridge_token() -> str:
+    """Bridge token from env, falling back to the launcher's token file."""
+    token = os.environ.get("TRIPCHORD_BROWSER_BRIDGE_TOKEN", "")
+    if token:
+        return token
+    token_file = ROOT / ".runtime" / "browser-bridge-token"
+    try:
+        candidate = token_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return candidate if candidate else ""
+
+
 def layer5_real_canary() -> LayerResult:
     """Every declared-certified real provider x vertical needs a live canary.
 
-    This layer cannot pass without a user-authorised, logged-in Companion on the
-    local machine.  When the bridge token is absent we report the precise
-    external gate that is not met rather than forging a pass.
+    The layer verdict is driven by a per-scope certified OTA canary
+    (``benchmarks/live_canary_certified.py``): each of the six certified scopes
+    must show a fresh, authorised, read-only canary — a fresh Companion
+    heartbeat for the browser scopes and a real public API read for
+    ``icom:transfer``.  The open-meteo / dpm.org.cn probes are kept as a
+    separately-labelled public-page connectivity canary that never drives the
+    layer verdict.
     """
-    bridge_token = os.environ.get("TRIPCHORD_BROWSER_BRIDGE_TOKEN")
-    if not bridge_token:
+    sub_checks: list[dict[str, Any]] = []
+
+    # Public-page connectivity canary (open-meteo + dpm.org.cn).  Informational
+    # only — it covers zero certified OTA scopes and never drives layer 5.
+    code_pub, out_pub = _run(
+        ["uv", "run", "python", "benchmarks/live_canary.py"],
+        timeout=600,
+    )
+    sub_checks.append(
+        {
+            "name": "public_page_connectivity",
+            "passed": code_pub == 0,
+            "drives_pass": False,
+            "detail": (
+                "open-meteo + dpm.org.cn read-only connectivity canary (informational)"
+                if code_pub == 0
+                else out_pub[-300:]
+            ),
+        }
+    )
+
+    bridge_token = _bridge_token()
+    if not bridge_token or len(bridge_token) < 32:
         return LayerResult(
             name="5_real_canary",
             passed=False,
             detail=(
-                "pending user authorization: set TRIPCHORD_BROWSER_BRIDGE_TOKEN, "
-                "pair the Companion and keep the official OTA domains logged in; "
-                "then re-run this gate"
+                "pending user authorization: certified OTA canaries require a "
+                "paired Companion (TRIPCHORD_BROWSER_BRIDGE_TOKEN, >=32 chars) "
+                "with ctrip/qunar/tongcheng logged in; re-run once paired"
             ),
+            sub_checks=sub_checks,
         )
+
+    evidence_path = ROOT / "benchmarks" / "results" / "live-canary-certified.json"
     code, out = _run(
-        ["uv", "run", "python", "benchmarks/live_canary.py"],
+        [
+            "uv",
+            "run",
+            "python",
+            "benchmarks/live_canary_certified.py",
+            "--bridge-token",
+            bridge_token,
+        ],
         timeout=900,
     )
+    passed = code == 0
+    try:
+        report = json.loads(evidence_path.read_text(encoding="utf-8"))
+        for entry in report.get("scopes", []):
+            sub_checks.append(
+                {
+                    "name": entry.get("scope", "scope"),
+                    "passed": entry.get("passed", False),
+                    "drives_pass": True,
+                    "detail": entry.get("detail", ""),
+                }
+            )
+        status = report.get("companion_status") or {}
+        if not status.get("error") and "companions" in status:
+            sub_checks.append(
+                {
+                    "name": "companion_status",
+                    "passed": True,
+                    "drives_pass": False,
+                    "detail": "local Browser Bridge companion status endpoint reachable",
+                }
+            )
+    except (OSError, ValueError):
+        sub_checks.append(
+            {
+                "name": "certified_ota_canary",
+                "passed": passed,
+                "drives_pass": True,
+                "detail": out[-300:],
+            }
+        )
     return LayerResult(
         name="5_real_canary",
-        passed=code == 0,
-        detail=out[-500:] if code else "live read-only canary passed",
+        passed=passed,
+        detail=(
+            "all 6 certified OTA scopes have fresh authorised read-only canaries"
+            if passed
+            else (
+                "pending user authorization: not all certified OTA scopes have a "
+                "fresh authorised read-only canary; evidence in "
+                "benchmarks/results/live-canary-certified.json"
+            )
+        ),
+        sub_checks=sub_checks,
     )
 
 
 def layer6_full_e2e() -> LayerResult:
-    """Full-platform real E2E only when every external condition is met."""
-    bridge_token = os.environ.get("TRIPCHORD_BROWSER_BRIDGE_TOKEN")
-    if not bridge_token:
+    """Full-platform real E2E only when every external condition is met.
+
+    Runs ``benchmarks/run_live_done_gate_v4.py`` as the real executor: live job
+    submit / wait / cancel, event replan, and the strict live-v4 gate
+    evaluation.  The executor incurs live model cost (user-authorized via
+    ``TRIPCHORD_ACK_MODEL_COST=1``) and requires the paired Companion; until
+    those gates are met this layer honestly fails as pending user
+    authorization — never forged.
+    """
+    bridge_token = _bridge_token()
+    model_acked = os.environ.get("TRIPCHORD_ACK_MODEL_COST") == "1"
+    if not bridge_token or len(bridge_token) < 32:
         return LayerResult(
             name="6_full_e2e",
             passed=False,
             detail=(
                 "pending user authorization: full real E2E requires the same "
-                "authorised Companion session as layer 5; not attempted"
+                "paired Companion as layer 5 (TRIPCHORD_BROWSER_BRIDGE_TOKEN); "
+                "not attempted"
             ),
         )
+    if not model_acked:
+        return LayerResult(
+            name="6_full_e2e",
+            passed=False,
+            detail=(
+                "pending user authorization: full real E2E runs the configured "
+                "model for Agent stages; set TRIPCHORD_ACK_MODEL_COST=1 to "
+                "authorise the bounded live model cost, then re-run"
+            ),
+        )
+    output_path = ROOT / "benchmarks" / "results" / "live-done-gate-v4.json"
+    code, out = _run(
+        [
+            "uv",
+            "run",
+            "python",
+            "benchmarks/run_live_done_gate_v4.py",
+            "--api-base",
+            "http://127.0.0.1:8000",
+            "--bridge-token",
+            bridge_token,
+            "--require-model-enhancement",
+            "--output",
+            str(output_path),
+        ],
+        timeout=4500,
+    )
+    passed = code == 0
     return LayerResult(
         name="6_full_e2e",
-        passed=False,
-        detail="layer 6 is gated behind layer 5; run after the real canary passes",
+        passed=passed,
+        detail=(
+            f"full-platform real E2E passed; evidence {output_path}"
+            if passed
+            else (
+                "pending user authorization or executor failure: "
+                f"run_live_done_gate_v4.py exited {code}; "
+                f"{out[-300:]}"
+            )
+        ),
     )
 
 

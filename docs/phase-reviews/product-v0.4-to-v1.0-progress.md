@@ -48,6 +48,13 @@
 - 本机运行：层 1/2/3 PASS；层 4 因环境含模型 key 实际运行；层 5/6 如实报告 `pending user authorization`（无 Companion 授权）。
 - `passed=false` 且退出码 2，正确反映真实 canary 未过 —— 未伪造通过。
 
+### C-54 返工：层 5 认证 OTA canary + 层 6 真实 E2E 执行器（第五轮）
+
+- **层 5 改为 per-scope 认证 OTA canary**：新增 `benchmarks/live_canary_certified.py`，对默认注册表的 6 个 `certified_active` scope（`ctrip:flight`、`ctrip:lodging`、`qunar:flight`、`qunar:lodging`、`tongcheng:flight`、`icom:transfer`）逐一要求「未过期、已授权、只读」证据：浏览器 scope 需新鲜 Companion 心跳声明 `authorized_scope_keys` 含该 scope；`icom:transfer` 走真实只读公共 API。`run_product_done_gate.py` 层 5 的 PASS 只由该 canary 驱动；open-meteo/故宫 保留为单独标注的「公开页面连通性 canary」（`public_page_connectivity`，`drives_pass=false`），不再驱动层 5。
+- **层 6 接入真实 E2E 执行器**：`layer6_full_e2e()` 改为运行 `benchmarks/run_live_done_gate_v4.py`（live job 提交/等待/取消 + 合成 sold_out 事件重规划 + `evaluate_live_v4_done_gate`），删除过时的「gated behind layer 5」占位文案；外部门（bridge token + `TRIPCHORD_ACK_MODEL_COST=1` + 新鲜 Companion）未满足时如实 FAIL（pending user authorization）。
+- **本机复跑**（`TRIPCHORD_ACK_MODEL_COST=1`）：层 1/2/3/4 PASS；层 5 FAIL（5 个浏览器 scope 无 Companion 心跳，`icom:transfer` 真实只读 canary PASS）；层 6 FAIL（Companion preflight 失败，未提交实时搜索）；`passed=false` 如实。
+- **证据**：`benchmarks/results/product-v1-done-gate.json`、`benchmarks/results/live-canary-certified.json`、`benchmarks/results/live-done-gate-v4.json`（`failed_before_done_gate` / `companion_preflight`）。
+
 ## 当前仍不能声称
 
 - 任何 v1.0 Done-Gate 通过、双平台住宿精确报价、完整 OTA 闭环。
