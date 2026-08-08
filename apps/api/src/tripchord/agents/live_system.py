@@ -155,6 +155,7 @@ from tripchord.platform.terminal import (
 from tripchord.providers.base import ProviderError
 from tripchord.providers.browser_bridge import (
     LIVE_V5_BROWSER_PROVIDERS,
+    BrowserFailure,
     BrowserFailureCode,
     BrowserProvider,
     BrowserSearchQuery,
@@ -5224,12 +5225,69 @@ class LivePackageAgentSystem:
             except Exception as exc:
                 state.source_errors[task.id] = f"{type(exc).__name__}: {exc}"
                 summary = f"{task.id} isolated failure: {type(exc).__name__}"
-                output = {
-                    "isolated_failure": str(exc),
-                    "source_delay_audit": locals().get("delay_audit", {}),
-                }
+                if "icom_query" in task.input:
+                    output = {
+                        "isolated_failure": str(exc),
+                        "source_delay_audit": locals().get("delay_audit", {}),
+                    }
+                    topic = "public_transfer_result"
+                else:
+                    # A browser source that raises before returning a terminal
+                    # snapshot used to be masked as ``success=True`` with only an
+                    # isolated_failure payload.  That hid the failed source from
+                    # the scheduler and audit trail: the gate then reported a
+                    # missing raw snapshot / Source task result instead of an
+                    # honest terminal failure.  Build a terminal FAILED snapshot
+                    # from the frozen submission so the failure is visible and
+                    # the source can never be mistaken for a skipped scope.
+                    # No quotes or platform receipt are fabricated here — the
+                    # platform result state is unknown, and the coverage /
+                    # four-state outcome layer records it as a failed source.
+                    failed_snapshot = None
+                    try:
+                        submission = BrowserTaskSubmission.model_validate(
+                            task.input.get("submission")
+                        )
+                        failed_at = self._utc_now()
+                        failure_message = f"{type(exc).__name__}: {exc}"
+                        if not failure_message.strip():
+                            failure_message = (
+                                "live source browser search failed without a "
+                                "structured terminal result"
+                            )
+                        failed_snapshot = BrowserTaskSnapshot(
+                            id=f"browser-task-failed-{task.id}",
+                            provider=submission.provider,
+                            kind=submission.kind,
+                            query=submission.query,
+                            state=BrowserTaskState.FAILED,
+                            created_at=failed_at,
+                            updated_at=failed_at,
+                            attempt_count=1,
+                            failure=BrowserFailure(
+                                code=BrowserFailureCode.TIMEOUT,
+                                message=failure_message[:1000],
+                                retryable=True,
+                                captured_at=failed_at,
+                            ),
+                        )
+                        state.snapshots[task.id] = failed_snapshot
+                    except Exception as snapshot_error:  # pragma: no cover
+                        state.source_errors[task.id] += (
+                            f" (failed-snapshot construction error: "
+                            f"{type(snapshot_error).__name__}: {snapshot_error})"
+                        )
+                    output = {
+                        "isolated_failure": str(exc),
+                        "snapshot": (
+                            _json_value(failed_snapshot.model_dump(mode="json"))
+                            if failed_snapshot is not None
+                            else None
+                        ),
+                        "source_delay_audit": locals().get("delay_audit", {}),
+                    }
+                    topic = "browser_result"
                 subject = task.id
-                topic = "public_transfer_result" if "icom_query" in task.input else "browser_result"
             return AgentTaskResult(
                 task_id=task.id,
                 agent_role=task.role,

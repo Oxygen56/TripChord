@@ -1161,7 +1161,7 @@ def _check_selected_plan_handoffs(
         matched = stay_plan_for_candidate(candidate_set, live_run.intent, final)
         if matched != live_run.selected_stay_plan_id:
             errors.append(f"{execution.date_pair.id}: 最终整包与主控声明方案不一致")
-        if handoff.reverification is None:
+        if handoff.repair.repaired_candidate_id is not None and handoff.reverification is None:
             errors.append(f"{execution.date_pair.id}: Repair 输出未经过 ReVerifier")
         evidence.extend(final.evidence_refs)
     if not evidence:
