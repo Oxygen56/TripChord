@@ -6,11 +6,11 @@
 
 ## 当前状态
 
-- **当前版本**：v0.9 公测可靠性收尾完成；v1.0 Done-Gate 持续推进（第五轮，C-54 返工）；六层机器门层 1/2/3/4 PASS、层 5/6 如实 FAIL（pending user authorization）
+- **当前版本**：v0.9 公测可靠性收尾完成；v1.0 Done-Gate 持续推进（第六轮，C-63 证据 commit_sha 刷新 + 层 5/6 真实执行）；六层机器门层 1/2/3/4 PASS、层 5/6 如实 FAIL（pending user authorization）
 - **当前分支**：`productization/v1.0`（未 push）
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
-- **最后完成的最小任务**：v0.9 收尾全项——固定第三方 Actions SHA（CI 不再用 `@v5/@v6` 浮动标签）、SBOM/构建 provenance（`scripts/generate_sbom.py` CycloneDX + 漂移门）、job/monitor 可恢复持久化（monitor 迁入 `live_monitors`/`live_monitor_checks`，重启可恢复）、干净 Chrome + 本地 fixture 浏览器 E2E（`scripts/browser_e2e.py` CDP 驱动，四阶段工作流步骤条 + 回放规划渲染）；此前已完成 v0.8 收尾（首页工作流拆分 + 高技术细节折叠 + WCAG 缺口）、v0.6 收尾（live_system 事件重规划接入 booking gate）与 reprice 两处接线缺陷修复
+- **最后完成的最小任务**：C-63 第六轮——在 HEAD=`25973b1` 用 `TRIPCHORD_ACK_MODEL_COST=1` 重跑完整 done-gate，`product-v1-done-gate.json` 的 `commit_sha` 刷新为 `25973b15a…`（与含层 5/6 修复的提交一致），各层状态不变（1/2/3/4 PASS、5/6 FAIL），`passed=false` 如实，已提交保留可回放证据；层 5/6 仍待用户配对 Companion（浏览器 scope 需 OTA 登录态）
 
 ## 版本状态
 
@@ -24,7 +24,7 @@
 | v0.7 Provider SDK | 接线完成 | 新 provider 只改 adapter+profile；未认证不进默认选择 | SDK 一致性 runner 接 registry；`POST /providers/{scope}/cooldown` 一键冷却 + `GET /providers/sdk/conformance`；certified-active 公共 API scope 不再强制 host_permissions |
 | v0.8 本地产品体验 | **完成** | 全新机器按公开说明完成 replay；秘密不进入日志；首页旅行工作流拆分；高技术细节默认折叠；WCAG 已知缺口（字号/aria-live）已整改 | `security/secrets.py` + `scripts/tripchord_launcher.py`（check/setup/wizard/api/web）；**本轮新增**：首页 `WorkflowSteps`（需求→平台→进度→方案）+ 各面板 `STEP` 标签；回放 Agent 轨迹、live Agent 流水线、模型回执默认折叠为 `<details>`；`styles.css` 全部辅助字号 6–11px → ≥12px（150 处）、小按钮 `min 24×24`、`aria-live`/`role` 覆盖 SSE 进度/重核价/事件/监控结果、事件注入 `<select>` 补显式 `<label>`；`docs/wcag-audit.md` 已更新（对比度自动化测量与真实浏览器人工复核仍为发布前待办）；首次设置向导逐平台权限与登录健康需真实 Companion 授权后确认 |
 | v0.9 公测可靠性 | **完成** | Actions SHA 固定 + SBOM/构建 provenance + job/monitor 可恢复持久化 + 干净 Chrome 浏览器 E2E 全入 CI/Done-Gate | `ci.yml` 全部 `uses:` 以 SHA 锁定；`scripts/generate_sbom.py` CycloneDX（115 pypi + 103 npm）+ 确定性漂移门入层 1；monitor 迁移 `20260807_0001`（`live_monitors`/`live_monitor_checks`）+ `recover()` 重启恢复，run 不可恢复如实 FAILED；`scripts/browser_e2e.py` CDP 驱动干净 headless Chrome 验证四阶段工作流步骤条 + 回放规划渲染（证据 `benchmarks/results/browser-e2e.json` + 截图），入层 3 |
-| v1.0 最终产品 | 脚本持续推进，门未过 | `run_product_done_gate.py` 六层分门真实通过 | 本机层 1/2/3/4 PASS（`TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后层 4 实际运行）；层 5 FAIL——per-scope 认证 OTA canary（6 个 certified scope）5 个浏览器 scope 无 Companion 心跳，`icom:transfer` 真实只读公共 API canary PASS；层 6 FAIL——`run_live_done_gate_v4.py` Companion preflight 失败；`passed=false` 如实；`benchmarks/evaluate_acceptance.py` 五类反表面全 PASS |
+| v1.0 最终产品 | 脚本持续推进，门未过 | `run_product_done_gate.py` 六层分门真实通过 | **第六轮（C-63）**：HEAD=`25973b1` 重跑完整 done-gate（`TRIPCHORD_ACK_MODEL_COST=1`），证据 `commit_sha` 刷新为 `25973b15a…`（与修复提交一致），各层状态不变；层 1/2/3/4 PASS（层 4 模型 smoke 实际运行通过）；层 5 FAIL——per-scope 认证 OTA canary（6 个 certified scope）5 个浏览器 scope 无 Companion 心跳（companion_status=disconnected、0 companions），`icom:transfer` 真实只读公共 API canary PASS（7 个选项）；层 6 FAIL——`run_live_done_gate_v4.py` Companion preflight 失败（stage=companion_preflight）；`passed=false` 退出码 2 如实；`benchmarks/evaluate_acceptance.py` 五类反表面全 PASS |
 
 ## 本次运行验证结果（精确）
 
@@ -44,7 +44,7 @@
 | `alembic upgrade head` / `alembic check`（临时 DB） | 通过 / No new upgrade operations |
 | `npm audit --omit=dev --audit-level=high` | 0 vulnerabilities |
 | `git diff --check` | 通过 |
-| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py` | 层 1/2/3/4 PASS（层 4 模型 smoke 实际运行通过）；层 5 FAIL——认证 OTA canary 5/6 scope 待用户授权（`icom:transfer` PASS）；层 6 FAIL——`run_live_done_gate_v4.py` Companion preflight 失败；`passed=false`，退出码 2（如实） |
+| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py`（第六轮 C-63，HEAD=`25973b1`） | 层 1/2/3/4 PASS（层 4 模型 smoke 实际运行通过）；层 5 FAIL——认证 OTA canary 5/6 scope 待用户授权（`icom:transfer` PASS）；层 6 FAIL——`run_live_done_gate_v4.py` Companion preflight 失败（stage=companion_preflight）；证据 `product-v1-done-gate.json` `commit_sha=25973b15a…` 与 HEAD 一致；`passed=false`，退出码 2（如实） |
 | `uv run python benchmarks/live_canary_certified.py --bridge-token <token>` | 退出码 2（如实）；`benchmarks/results/live-canary-certified.json` per-scope 证据（fresh/authorized/read-only）；`icom:transfer` 真实只读公共 API 返回 7 个选项 |
 
 ## 当前可对外声明
