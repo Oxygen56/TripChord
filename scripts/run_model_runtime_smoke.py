@@ -222,6 +222,12 @@ async def run_smoke(
             arguments=selected_call.arguments,
         )
     )
+    # The final turn deliberately omits the tool declaration: the model has
+    # already observed the receipt in the message history, so redeclaring the
+    # tool only invites a second tool call instead of the structured verdict.
+    # (Observed on deepseek-v4-flash, which re-called inspect_quotes instead of
+    # answering.) The bounded client retry still covers malformed/wrong-value
+    # completions without relaxing the fixed three-call contract.
     final_response = await audited.complete(
         ModelRequest(
             role=AgentRole.EVIDENCE_ARBITER,
@@ -250,7 +256,6 @@ async def run_smoke(
                     ),
                 ),
             ),
-            tools=(tool,),
             response_schema=TOOL_FINAL_SCHEMA,
             max_tokens=256,
         )
@@ -384,7 +389,11 @@ async def execute_from_arguments(
             api_key=api_key,
             base_url=args.base_url,
             timeout_seconds=args.timeout_seconds,
-            retry=ModelRetryPolicy(max_attempts=1),
+            # Retry transient model deviations (a schema-invalid completion is
+            # repaired via one explicit bounded re-request). The strict logical
+            # call contract below still counts one logical call per stage, so a
+            # repair does not relax the fixed three-call bound.
+            retry=ModelRetryPolicy(max_attempts=3),
             pricing=ModelPricing(
                 input_usd_per_million_tokens=args.input_usd_per_million,
                 output_usd_per_million_tokens=args.output_usd_per_million,

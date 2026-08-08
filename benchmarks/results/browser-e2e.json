@@ -1,6 +1,6 @@
 {
   "schema_version": "tripchord-browser-e2e-v1",
-  "generated_at": "2026-08-07T12:56:27.892355+00:00",
+  "generated_at": "2026-08-08T09:26:07.223300+00:00",
   "passed": true,
   "summary": "all browser E2E assertions passed",
   "checks": [

@@ -45,6 +45,15 @@ OUTPUT_PATH = RESULTS_DIR / "product-v1-done-gate.json"
 EVIDENCE_SCHEMA = "tripchord-product-v1-done-gate"
 
 _MODEL_ENV_VARS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "TRIPCHORD_MODEL_API_KEY")
+# Priority order for resolving which environment variable actually holds the
+# model key.  The smoke reads the exact variable name we pass via --api-key-env,
+# so we must hand it the name where the key was found, not a hardcoded one.
+_MODEL_API_KEY_ENV_CANDIDATES = (
+    "MODEL_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "TRIPCHORD_MODEL_API_KEY",
+)
 
 
 @dataclass
@@ -272,9 +281,11 @@ def _resolve_model_smoke_args() -> tuple[list[str], str] | None:
     """
     if os.environ.get("TRIPCHORD_ACK_MODEL_COST") != "1":
         return None
-    api_key_env = "MODEL_API_KEY"
-    api_key = os.environ.get(api_key_env) or os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    api_key_env = next(
+        (var for var in _MODEL_API_KEY_ENV_CANDIDATES if os.environ.get(var)),
+        None,
+    )
+    if api_key_env is None:
         return None
     model = os.environ.get("TRIPCHORD_MODEL_NAME") or os.environ.get("ANTHROPIC_MODEL")
     base_url = os.environ.get("TRIPCHORD_MODEL_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL")
