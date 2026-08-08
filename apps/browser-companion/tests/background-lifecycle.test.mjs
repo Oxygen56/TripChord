@@ -472,7 +472,7 @@ assert.match(
   /Date\.now\(\) \+\s*LODGING_DOM_DRIFT_POLL_INTERVAL_MS \+\s*LODGING_EXTRACTION_RETRY_MIN_BUDGET_MS >=\s*extractionDeadline/,
 );
 assert.equal(hooks.LODGING_EXTRACTION_RETRY_MIN_BUDGET_MS, 15000);
-assert.equal(hooks.LODGING_EXTRACTION_STAGE_CAP_MS, 45000);
+assert.equal(hooks.LODGING_EXTRACTION_STAGE_CAP_MS, 90000);
 assert.equal(hooks.LEASE_COMPLETION_MAX_RESERVE_MS, 20000);
 assert.equal(hooks.dynamicLeaseCompletionReserveMs(120000), 20000);
 {

@@ -104,9 +104,13 @@ const PREPARE_SEARCH_STAGE_CAP_MS = 35000;
 const TRIGGER_SEARCH_STAGE_CAP_MS = 30000;
 const SEARCH_RESULT_BOOTSTRAP_STAGE_CAP_MS = 8000;
 // Qunar can keep its visible `实时搜索中` shell for more than 13 seconds even
-// after the tab reports complete. A 45-second bounded stage leaves room for a
-// second full DOM pass and still fits comfortably inside the 120-second lease.
-const LODGING_EXTRACTION_STAGE_CAP_MS = 45000;
+// after the tab reports complete. Round 9 (Done-Gate 方案 B) extends this
+// bounded stage from 45s to 90s so a realtime search can settle into a quote
+// or a conclusive empty/pending state instead of giving up at ~28s. 90s stays
+// comfortably inside the 120s observed-duration contract ceiling and the
+// 120-second lease (the completion reserve leaves a ~98s work deadline, and
+// extraction starts ~1.5s after claim).
+const LODGING_EXTRACTION_STAGE_CAP_MS = 90000;
 const LODGING_DOM_DRIFT_POLL_INTERVAL_MS = 2000;
 const LODGING_EXTRACTION_RETRY_MIN_BUDGET_MS = 15000;
 const FLIGHT_EXTRACTION_BASE_CAP_MS = 30000;
