@@ -29,6 +29,7 @@ class _WaveBudgetProbeBridge(BrowserTaskBridge):
         super().__init__(now=lambda: NOW)
         self.positions: dict[str, int] = {}
         self.wait_budgets: dict[str, float] = {}
+        self.lease_by_id: dict[str, int] = {}
         self.all_submitted = asyncio.Event()
 
     async def submit_many(
@@ -38,6 +39,8 @@ class _WaveBudgetProbeBridge(BrowserTaskBridge):
         snapshots = await super().submit_many(submissions)
         for snapshot in snapshots:
             self.positions[snapshot.id] = len(self.positions)
+        for submission, snapshot in zip(submissions, snapshots, strict=True):
+            self.lease_by_id[snapshot.id] = submission.timeout_seconds
         if len(self.positions) == 11:
             self.all_submitted.set()
         return snapshots
@@ -54,7 +57,7 @@ class _WaveBudgetProbeBridge(BrowserTaskBridge):
         task_id = ids[0]
         self.wait_budgets[task_id] = timeout_seconds
         wave = self.positions[task_id] // 6 + 1
-        minimum_budget = float(wave * 16)
+        minimum_budget = float(wave * (self.lease_by_id[task_id] + 1))
         if timeout_seconds < minimum_budget:
             raise TimeoutError(f"wave {wave} requires {minimum_budget:g} seconds")
         return await self.cancel_many(
@@ -141,7 +144,10 @@ async def test_eleven_browser_sources_do_not_time_out_while_waiting_for_later_wa
     )
 
     assert len(bridge.wait_budgets) == 11
-    assert set(bridge.wait_budgets.values()) == {32.0}
+    # Flight source tasks keep the request-level 15s lease (2 waves -> 32s),
+    # while lodging source tasks are granted the longer minimum lease
+    # (2 waves -> 482s) so Qunar extraction can seal a terminal receipt.
+    assert set(bridge.wait_budgets.values()) == {32.0, 482.0}
     assert all(
         all("TimeoutError" not in reason for reason in coverage.failure_reasons)
         for coverage in run.coverage

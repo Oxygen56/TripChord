@@ -1955,3 +1955,37 @@ async def test_v4_runner_posts_event_to_the_cached_run_endpoint(
         "json": event_body,
     }
     assert parsed == {"event": "validated-by-test-double"}
+
+
+def test_repo_revision_identifies_committed_revision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import subprocess as _subprocess
+
+    _subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    _subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "gate-test@example.com"],
+        check=True,
+    )
+    _subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Gate Test"],
+        check=True,
+    )
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("baseline\n", encoding="utf-8")
+    _subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    _subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-q", "-m", "baseline"],
+        check=True,
+    )
+
+    monkeypatch.setattr(run_live_done_gate_v4, "_REPO_ROOT", tmp_path)
+    clean = run_live_done_gate_v4._repo_revision()
+    assert clean["worktree_dirty"] is False
+    assert isinstance(clean["commit_sha"], str) and len(clean["commit_sha"]) >= 7
+
+    tracked.write_text("modified\n", encoding="utf-8")
+    dirty = run_live_done_gate_v4._repo_revision()
+    assert dirty["worktree_dirty"] is True
+    assert dirty["commit_sha"] == clean["commit_sha"]

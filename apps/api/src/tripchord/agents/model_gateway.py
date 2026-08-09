@@ -561,7 +561,8 @@ def _parse_structured_json(text: str) -> JsonValue:
     last_error: json.JSONDecodeError | None = None
     for candidate in candidates:
         try:
-            return json.loads(candidate)
+            parsed: JsonValue = json.loads(candidate)
+            return parsed
         except json.JSONDecodeError as exc:
             last_error = exc
     raise StructuredOutputError(

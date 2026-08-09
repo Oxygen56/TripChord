@@ -70,6 +70,7 @@ class GateReport:
     schema_version: str
     generated_at: str
     commit_sha: str | None
+    worktree_dirty: bool
     layers: list[LayerResult]
     passed: bool
     summary: str
@@ -93,6 +94,32 @@ def _commit_sha() -> str | None:
         return result.stdout.strip() or None
     except (subprocess.SubprocessError, FileNotFoundError):
         return None
+
+
+def _worktree_dirty() -> bool:
+    """Whether the repo has uncommitted changes.
+
+    Done-Gate evidence must map 1:1 to a committed revision.  A dirty worktree
+    means the code that actually ran differs from ``HEAD``, so a ``commit_sha``
+    recorded via ``git rev-parse HEAD`` alone (the stale-HEAD bug this replaces)
+    would silently point at code that was never exercised.  When the tree is
+    dirty the gate forces ``passed=false`` and records ``worktree_dirty=true``
+    instead of claiming a pass against an unverifiable revision.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        return bool(result.stdout.strip())
+    except (subprocess.SubprocessError, FileNotFoundError):
+        # Git unavailable means the tree's cleanliness cannot be proven; treat
+        # the revision as unverifiable rather than guess at a pass.
+        return True
 
 
 def _run(
@@ -546,21 +573,35 @@ def run_gate(*, commit: str | None) -> GateReport:
         layer6_full_e2e(),
     ]
     applicable = _applicable(layers)
-    passed = bool(applicable) and all(layer.passed for layer in applicable)
-    summary = (
-        "all applicable Done-Gate layers passed"
-        if passed
-        else "one or more Done-Gate layers are not satisfied"
+    worktree_dirty = _worktree_dirty()
+    passed = (
+        not worktree_dirty
+        and bool(applicable)
+        and all(layer.passed for layer in applicable)
     )
+    if worktree_dirty:
+        summary = (
+            "worktree has uncommitted changes; running code differs from HEAD, "
+            "so commit_sha cannot name the code that was exercised — commit the "
+            "tree and re-run before this evidence can be accepted"
+        )
+    else:
+        summary = (
+            "all applicable Done-Gate layers passed"
+            if passed
+            else "one or more Done-Gate layers are not satisfied"
+        )
     boundary = (
         "本次判定仅覆盖当前发布声明适用的本地工程门；真实平台 canary 与全平台 "
         "E2E 需用户授权官方域名并保持登录态后才能声明通过。"
         "HTTP 任务成功、测试成功、模型调用成功或全部 Source 终态均不单独构成通过。"
+        "证据必须落在干净已提交工作树上；worktree_dirty=true 时 passed 恒为 false。"
     )
     return GateReport(
         schema_version=EVIDENCE_SCHEMA,
         generated_at=_now(),
         commit_sha=commit,
+        worktree_dirty=worktree_dirty,
         layers=layers,
         passed=passed,
         summary=summary,
@@ -607,6 +648,7 @@ def main() -> int:
 
     print(f"TripChord product v1.0 Done-Gate  {report.generated_at}")
     print(f"commit: {report.commit_sha or 'unknown'}")
+    print(f"worktree_dirty: {report.worktree_dirty}")
     for layer in report.layers:
         marker = "PASS" if layer.passed else ("SKIP" if layer.skipped else "FAIL")
         print(f"  [{marker}] {layer.name}  {layer.detail}")

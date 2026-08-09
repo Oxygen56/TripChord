@@ -2534,3 +2534,119 @@ def test_strict_done_gate_rejects_one_exact_provider_configuration() -> None:
             expected_candidate_set=system_stay_plan_candidate_set(),
             minimum_exact_providers_per_selected_segment=1,
         )
+
+
+def _timeout_without_receipt_snapshot(
+    *,
+    provider: BrowserProvider = BrowserProvider.QUNAR,
+    segment: str = "full",
+) -> BrowserTaskSnapshot:
+    task_id = f"source-{provider.value}-lodging-{segment}"
+    options = {
+        "expected_lodging_place_key": "maafushi",
+        "expected_package_area": "destination_island",
+        "segment": segment,
+    }
+    query = BrowserSearchQuery(
+        origin="杭州",
+        destination="Maafushi",
+        start_date=date(2026, 8, 12),
+        end_date=date(2026, 8, 18),
+        adults=2,
+        rooms=1,
+        options=options,
+    )
+    return BrowserTaskSnapshot(
+        id=task_id,
+        provider=provider,
+        kind=BrowserVertical.LODGING,
+        query=query,
+        state=BrowserTaskState.FAILED,
+        created_at=NOW,
+        updated_at=NOW,
+        attempt_count=1,
+        claimed_by="edge-companion-v4",
+        claimed_at=NOW,
+        failure=BrowserFailure(
+            code=BrowserFailureCode.TIMEOUT,
+            message="browser companion did not complete the task before its lease expired",
+            page_url=None,
+            captured_at=NOW,
+            details={},
+        ),
+    )
+
+
+def test_counterexample_timeout_without_receipt_drops_four_state_row() -> None:
+    """Counter-example for the layer-6 defect this round fixes.
+
+    A Qunar lodging task whose lease expired mid-search produced no terminal
+    receipt; _stay_plan_inventory_outcomes therefore emits NO four-state row
+    for that provider/segment, which fails the stay_inventory_four_state_contract
+    (missing outcome).  Fix A grants lodging source tasks a longer lease so the
+    companion can seal a bounded receipt (quote/empty/pending) before expiry.
+    """
+    snapshot = _timeout_without_receipt_snapshot()
+    outcomes = _inventory_outcomes_for_snapshot(snapshot)
+
+    assert outcomes == ()
+    assert snapshot.failure is not None
+    assert snapshot.failure.code == BrowserFailureCode.TIMEOUT
+    assert "inventory_receipt" not in snapshot.failure.details
+
+
+def test_lodging_source_tasks_get_longer_lease_than_request_timeout() -> None:
+    """Regression guard for Fix A.
+
+    Lodging source submissions must carry at least the lodging minimum lease
+    even when the request-level timeout is far shorter, so Qunar extraction
+    outlives landing (~40s) + the 90s extraction cap and seals a terminal
+    receipt.  Flight source submissions keep the exact request lease so the
+    bump never inflates flight wave budgets.
+    """
+    from tripchord.agents.live_system import _LODGING_MINIMUM_SOURCE_TIMEOUT_SECONDS
+
+    system = LivePackageAgentSystem(BrowserTaskBridge())
+    profile = system_stay_area_search_profile("马累")
+    assert profile is not None
+    query = BrowserSearchQuery(
+        origin="杭州",
+        destination="马累",
+        origin_code="HGH",
+        destination_code="MLE",
+        start_date=date(2026, 8, 12),
+        end_date=date(2026, 8, 18),
+        adults=2,
+        rooms=1,
+        options={
+            "gateway_destination": "马累",
+            "stay_area_search_profile": profile.model_dump(mode="json"),
+            "stay_plan_candidate_set": system_stay_plan_candidate_set().model_dump(mode="json"),
+        },
+    )
+
+    for provider in (BrowserProvider.CTRIP, BrowserProvider.QUNAR):
+        for segment in ("full", "first", "middle", "last", "hulhumale-full"):
+            task = system._source_task(
+                provider,
+                BrowserVertical.LODGING,
+                query,
+                120,
+                segment=segment,
+            )
+            submission = BrowserTaskSubmission.model_validate(task.input["submission"])
+            assert (
+                submission.timeout_seconds
+                >= _LODGING_MINIMUM_SOURCE_TIMEOUT_SECONDS
+            ), f"{provider.value}/{segment} kept the short request lease"
+
+    flight_task = system._source_task(
+        BrowserProvider.CTRIP,
+        BrowserVertical.FLIGHT,
+        query,
+        120,
+    )
+    flight_submission = BrowserTaskSubmission.model_validate(
+        flight_task.input["submission"]
+    )
+    assert flight_submission.timeout_seconds == 120

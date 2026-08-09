@@ -8,6 +8,7 @@ import math
 import os
 import re
 import secrets
+import subprocess
 import sys
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -172,6 +173,42 @@ def _canonical_sha256(payload: object) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _repo_revision() -> dict[str, Any]:
+    """Name the repo revision this evidence was produced against.
+
+    Keeps layer-6 evidence cross-checkable against the product Done-Gate
+    report: ``commit_sha`` must equal the revision that actually ran, and a
+    dirty worktree (``worktree_dirty=true``) voids the revision mapping because
+    the running code differs from ``HEAD``.
+    """
+    revision: dict[str, Any] = {"commit_sha": None, "worktree_dirty": True}
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return revision
+    revision["commit_sha"] = head.stdout.strip() or None
+    revision["worktree_dirty"] = bool(status.stdout.strip())
+    return revision
+
+
 def _safe_response_json(response: httpx.Response, label: str) -> dict[str, Any]:
     """Parse successful JSON without copying arbitrary upstream bodies into errors."""
 
@@ -263,6 +300,7 @@ def _failure_evidence_bundle(
         "schema_version": _EVIDENCE_SCHEMA_VERSION,
         "run_status": "failed_before_done_gate",
         "captured_at": captured_at.isoformat(),
+        "repo_revision": _repo_revision(),
         "failure": {
             "stage": stage,
             "type": type(error).__name__,
@@ -294,6 +332,7 @@ def _completed_evidence_bundle(
         "run_status": "completed" if report.passed else "done_gate_failed",
         "captured_at": captured_at.isoformat(),
         "scenario_sha256": _canonical_sha256(request),
+        "repo_revision": _repo_revision(),
         "request": request,
         **context,
         "done_gate": report.model_dump(mode="json"),

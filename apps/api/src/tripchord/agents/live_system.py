@@ -209,6 +209,15 @@ _LODGING_PROVIDERS = frozenset({BrowserProvider.CTRIP, BrowserProvider.QUNAR})
 _MINIMUM_EXACT_LODGING_COMPARISON_PROVIDERS = 2
 _LODGING_SEGMENTS = ("full", "first", "middle", "last")
 _V4_LODGING_SEGMENTS = (*_LODGING_SEGMENTS, "hulhumale-full")
+# Qunar lodging searches need more than the default 120s source lease: landing
+# alone can take up to ~40s and the browser companion's extraction phase is
+# capped at 90s (LODGING_EXTRACTION_STAGE_CAP_MS). A lease that expires before
+# the companion seals a bounded terminal receipt (exact quote / confirmed
+# empty / bounded pending) drops the task with no four-state inventory outcome,
+# which breaks the stay-inventory contract downstream. Lodging source tasks are
+# therefore granted a longer lease than the request-level default, capped at
+# the 300s submission validation limit.
+_LODGING_MINIMUM_SOURCE_TIMEOUT_SECONDS = 240
 
 
 def _candidate_id_sequence_sha256(candidate_ids: tuple[str, ...]) -> str:
@@ -7930,6 +7939,14 @@ class LivePackageAgentSystem:
                     "destination_code": destination_code,
                     "options": options,
                 }
+            )
+        if vertical == BrowserVertical.LODGING:
+            # See _LODGING_MINIMUM_SOURCE_TIMEOUT_SECONDS: lodging leases must
+            # outlive landing + the companion's extraction phase so every task
+            # reaches a terminal receipt instead of expiring mid-search.
+            timeout_seconds = min(
+                300,
+                max(timeout_seconds, _LODGING_MINIMUM_SOURCE_TIMEOUT_SECONDS),
             )
         submission = BrowserTaskSubmission(
             provider=provider,
