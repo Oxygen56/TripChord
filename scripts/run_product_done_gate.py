@@ -564,6 +564,12 @@ def _applicable(layers: list[LayerResult]) -> list[LayerResult]:
 
 
 def run_gate(*, commit: str | None) -> GateReport:
+    # Snapshot the tree state BEFORE any layer runs: layers legitimately rewrite
+    # tracked evidence bundles (e.g. layer 5's live-canary-certified.json), which
+    # would otherwise look like uncommitted changes.  The invariant that matters
+    # is that the code actually exercised was the committed HEAD when the gate
+    # began — evidence files written during the run are outputs, not running code.
+    worktree_dirty = _worktree_dirty()
     layers = [
         layer1_reproducibility(),
         layer2_replay(),
@@ -573,7 +579,6 @@ def run_gate(*, commit: str | None) -> GateReport:
         layer6_full_e2e(),
     ]
     applicable = _applicable(layers)
-    worktree_dirty = _worktree_dirty()
     passed = (
         not worktree_dirty
         and bool(applicable)

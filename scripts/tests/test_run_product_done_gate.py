@@ -104,3 +104,35 @@ def test_run_gate_clean_tree_can_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     assert report.worktree_dirty is False
     assert report.passed is True
     assert report.commit_sha == "cafe1234"
+
+
+def test_run_gate_snapshots_worktree_before_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dirty check must capture the tree BEFORE layers rewrite tracked
+    evidence bundles (e.g. layer 5's live-canary-certified.json), so evidence
+    writes during the run never flip ``worktree_dirty`` to true."""
+    dirty_checked: list[bool] = []
+
+    def fake_worktree_dirty() -> bool:
+        dirty_checked.append(True)
+        return False
+
+    monkeypatch.setattr(gate, "_worktree_dirty", fake_worktree_dirty)
+    for name in (
+        "layer1_reproducibility",
+        "layer2_replay",
+        "layer3_clean_chrome_fixtures",
+        "layer4_model_smoke",
+        "layer5_real_canary",
+        "layer6_full_e2e",
+    ):
+
+        def layer(name=name) -> gate.LayerResult:
+            assert dirty_checked, f"{name} ran before the worktree snapshot"
+            return gate.LayerResult(name=name, passed=True)
+
+        monkeypatch.setattr(gate, name, layer)
+
+    report = gate.run_gate(commit="deadbeef")
+
+    assert report.worktree_dirty is False
+    assert report.passed is True
