@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -30,6 +32,7 @@ from tripchord.providers.browser_bridge import (
     BrowserTaskState,
     BrowserTaskSubmission,
     BrowserVertical,
+    JsonFileBrowserBridgeStateStore,
     create_browser_bridge_app,
 )
 
@@ -482,3 +485,148 @@ async def test_preserved_result_tab_retry_is_suppressed_when_scope_cancelled_in_
     # Only attempt 0 reached the bridge — the reuse retry was suppressed.
     assert len(bridge.submitted_ids) == 1
     assert len(receipt.output["attempt_snapshots"]) == 1
+
+
+class _FileTrackingBridge(_TrackingBridge):
+    """_TrackingBridge bound to an explicit file store for zero-residue proofs."""
+
+    def __init__(self, store: JsonFileBrowserBridgeStateStore) -> None:
+        BrowserTaskBridge.__init__(self, state_store=store, now=lambda: NOW)
+        self.submitted_ids: list[str] = []
+        self.all_submitted = asyncio.Event()
+
+
+async def _assert_cancellation_converged(bridge: BrowserTaskBridge) -> None:
+    """Invariant every cancellation counter-example must converge to: all
+    submitted tasks terminal CANCELLED, exactly six were ever claimed, and the
+    queue is unclaimable afterwards (zero residue)."""
+    snapshots = await asyncio.gather(
+        *(bridge.get(task_id) for task_id in bridge.submitted_ids)
+    )
+    assert len(snapshots) == 11
+    assert all(snapshot.state == BrowserTaskState.CANCELLED for snapshot in snapshots)
+    assert sum(snapshot.claimed_at is not None for snapshot in snapshots) == 6
+    assert await bridge.claim("late-companion", limit=6) == ()
+
+
+async def _wait_submissions(bridge: _TrackingBridge, expected: int, *, timeout: float = 5.0) -> None:
+    deadline = asyncio.get_event_loop().time() + timeout
+    while len(bridge.submitted_ids) < expected:
+        remaining = deadline - asyncio.get_event_loop().time()
+        assert remaining > 0, (
+            f"timed out waiting for {expected} bridge submissions; "
+            f"got {len(bridge.submitted_ids)}"
+        )
+        await asyncio.wait_for(asyncio.sleep(min(0.05, remaining)), timeout=remaining)
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_runs_converge_deterministically() -> None:
+    """Counter-example (repeated runs): the live-run cancellation must converge
+    to the exact same terminal state every time it is executed — all eleven
+    tasks CANCELLED, six ever claimed, zero claimable residue — with a fresh
+    bridge each repetition.  A flaky/convergence-only-under-load bug would show
+    up as a different residue across repetitions."""
+    for _ in range(3):
+        bridge = _TrackingBridge()
+        system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+        run_task = asyncio.create_task(
+            system.run(
+                _intent(),
+                _query(),
+                mode=LiveCoverageMode.STRICT,
+                timeout_seconds=15,
+            )
+        )
+        await asyncio.wait_for(bridge.all_submitted.wait(), timeout=2)
+        leases = await bridge.claim("paired-companion", limit=6)
+        assert len(leases) == 6
+
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+        await _assert_cancellation_converged(bridge)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_high_load_cancellation_leaves_zero_residue() -> None:
+    """Counter-example (concurrent high load): three live runs share one bridge
+    and are all cancelled while their sources are still in flight.  Every task
+    across every run must deterministically converge to CANCELLED and the shared
+    queue must be unclaimable afterwards — cancellation under load must not leak
+    or strand leases for a later companion."""
+    bridge = _TrackingBridge()
+    systems = [
+        LivePackageAgentSystem(bridge, now=lambda: NOW) for _ in range(3)
+    ]
+    run_tasks = [
+        asyncio.create_task(
+            system.run(
+                _intent(),
+                _query(),
+                mode=LiveCoverageMode.STRICT,
+                timeout_seconds=15,
+            )
+        )
+        for system in systems
+    ]
+    await _wait_submissions(bridge, expected=33)
+
+    leases = await bridge.claim("paired-companion", limit=6)
+    assert len(leases) == 6
+    claimed_ids = {lease.task_id for lease in leases}
+
+    for run_task in run_tasks:
+        run_task.cancel()
+    for run_task in run_tasks:
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+    snapshots = await asyncio.gather(
+        *(bridge.get(task_id) for task_id in bridge.submitted_ids)
+    )
+    assert len(snapshots) == 33
+    assert all(snapshot.state == BrowserTaskState.CANCELLED for snapshot in snapshots)
+    assert {snapshot.id for snapshot in snapshots if snapshot.claimed_at is not None} == claimed_ids
+    assert await bridge.claim("late-companion", limit=6) == ()
+
+
+@pytest.mark.asyncio
+async def test_zero_residue_across_restart_after_cancelled_run(tmp_path: Path) -> None:
+    """Counter-example (zero residue before/after): a cancelled live run must
+    leave nothing claimable behind, and a fresh bridge restored from the same
+    persisted store must observe an empty queue — residual leases are never
+    replayed across a restart."""
+    state_path = (tmp_path / "bridge-cancel-residue.json").resolve()
+    store = JsonFileBrowserBridgeStateStore(state_path)
+    bridge = _FileTrackingBridge(store)
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+    run_task = asyncio.create_task(
+        system.run(
+            _intent(),
+            _query(),
+            mode=LiveCoverageMode.STRICT,
+            timeout_seconds=15,
+        )
+    )
+    await asyncio.wait_for(bridge.all_submitted.wait(), timeout=2)
+    leases = await bridge.claim("paired-companion", limit=6)
+    assert len(leases) == 6
+
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    await _assert_cancellation_converged(bridge)
+
+    # The persisted store must hold only terminal records — no queued/claimed
+    # residue survives the cancelled run.
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert all(
+        task["state"] in ("cancelled", "failed", "succeeded")
+        for task in persisted["tasks"]
+    )
+    # A fresh bridge over the same store sees an empty claimable queue.
+    recovered = _FileTrackingBridge(store)
+    assert await recovered.claim("companion-after-restart", limit=6) == ()
