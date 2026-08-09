@@ -41,6 +41,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 from tripchord.runtime_provenance import local_expected_provenance, provenance_mismatches
 
@@ -562,27 +563,180 @@ def _bridge_env(bridge_token: str) -> dict[str, str]:
     return env
 
 
-def _secret_scan_staging(staging_dir: Path, bridge_token: str) -> None:
-    """Fail closed if the bridge token appears anywhere in staging evidence.
+# Evidence files are the only surface the gate itself reads back after a run.
+# A planted symlink/hardlink, or a file owned by another user, could redirect
+# that read (or the copy into the tracked tree) to attacker-chosen bytes, so any
+# such file hard-fails the gate.
+def _verify_evidence_file_safety(path: Path, label: str) -> None:
+    """Reject an evidence file that is a symlink, a hardlink, or owned by a
+    non-current user.  Fail-closed (exit-2 semantics) before the gate reads it."""
+    try:
+        if path.is_symlink():
+            raise GateStateChangedError(
+                f"{label} {path.name} is a symlink; refusing to read evidence"
+            )
+        st = path.stat()
+        if st.st_nlink > 1:
+            raise GateStateChangedError(
+                f"{label} {path.name} is a hardlink (nlink={st.st_nlink}); "
+                "refusing to read evidence"
+            )
+        if st.st_uid != os.getuid():
+            raise GateStateChangedError(
+                f"{label} {path.name} is owned by uid {st.st_uid}, not the "
+                f"current user ({os.getuid()}); refusing to read evidence"
+            )
+    except GateStateChangedError:
+        raise
+    except OSError as exc:
+        raise GateStateChangedError(
+            f"{label} {path.name} unreadable: {exc}"
+        ) from exc
 
-    The token must never reach logs or evidence.  Every staging file (reports,
-    canary JSON, E2E JSON, screenshots) is scanned for the token bytes; a leak
-    aborts the gate with exit-2 semantics before any verdict is certified.
+
+def _harden_staging_permissions(staging_dir: Path) -> None:
+    """Restrict the staging tree: directory 0700, every file 0600.
+
+    Raw evidence can carry account/session-adjacent material; even though it
+    lives outside the tracked tree, it must not be world- or group-readable on
+    disk.  Runs after the layers finish writing, so files created by child
+    processes (with the host umask) are re-secured to owner-only."""
+    try:
+        staging_dir.chmod(0o700)
+    except OSError as exc:
+        raise GateStateChangedError(
+            f"cannot harden staging dir {staging_dir}: {exc}"
+        ) from exc
+    for path in sorted(staging_dir.rglob("*")):
+        try:
+            if path.is_dir():
+                path.chmod(0o700)
+            elif path.is_file():
+                path.chmod(0o600)
+        except OSError as exc:
+            raise GateStateChangedError(
+                f"cannot harden staging path {path}: {exc}"
+            ) from exc
+
+
+def _evidence_secrets() -> tuple[str, ...]:
+    """Active secret values that must never appear in evidence: the bridge token
+    plus any model API key configured on the host.  Deduplicated, order kept."""
+    secrets = [
+        value
+        for value in (
+            _bridge_token(),
+            os.environ.get("MODEL_API_KEY", ""),
+            os.environ.get("TRIPCHORD_MODEL_API_KEY", ""),
+        )
+        if value
+    ]
+    return tuple(dict.fromkeys(secrets))
+
+
+# Authorization / Cookie header-or-field values that are not already redacted.
+# ``[REDACTED]`` is 11 chars and contains brackets, so it never matches the
+# {12,} alnum body requirement.
+_AUTH_COOKIE_PATTERN = re.compile(
+    r"(?i)(?:authorization|cookie)\s*[:=]\s*[\"']?"
+    r"(?:bearer|basic)\s+[A-Za-z0-9+/=_\-]{12,}|"
+    r"(?:authorization|cookie)\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{16,}",
+    re.MULTILINE,
+)
+
+# Account / member / passenger identifiers with a numeric value (>= 6 digits).
+# Tolerates the JSON key-quote between the name and the colon.
+_ACCOUNT_ID_PATTERN = re.compile(
+    r"(?i)(?:account|user|member|passenger|contact|order)"
+    r"[_-]?(?:id|no|number|uid|phone)\s*[\"']?\s*[:=]\s*[\"']?\d{6,}",
+    re.MULTILINE,
+)
+
+# Chinese mobile number as a bare account identifier.
+_PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+
+
+def _is_tracking_url_leak(url: str) -> bool:
+    """True when a full URL carries a non-redacted query value that reads as a
+    session/account token — the tracking-URL leak the byte scan alone cannot
+    see.  Redacted values (``[REDACTED]``) and benign short values pass."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if not parsed.query:
+        return False
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        value = value.strip()
+        if not value or value == "[REDACTED]":
+            continue
+        if key.lower() in {
+            "sid",
+            "token",
+            "auth",
+            "sign",
+            "sig",
+            "st",
+            "at",
+            "uid",
+            "userinfo",
+            "user_info",
+            "pay",
+        }:
+            return True
+        if len(value) >= 16:
+            return True
+        if re.search(r"\d{4,}", value):
+            return True
+    return False
+
+
+_TRACKING_URL_PATTERN = re.compile(r"https?://[^\s\"'<>)\[\]{}]+")
+
+
+def _secret_scan_staging(staging_dir: Path, secrets: tuple[str, ...]) -> None:
+    """Fail closed if a secret value or sensitive evidence pattern appears in
+    staging evidence.
+
+    Multi-class scan, not just a single token's bytes: exact secret values
+    (bridge token, model API keys), Authorization/Cookie values, account
+    identifiers (numeric ids, phone numbers) and full tracking URLs with
+    non-redacted query values.  Every file is also safety-checked (no
+    symlink/hardlink/non-current-user).  A leak aborts the gate with exit-2
+    semantics before any verdict is certified.
     """
-    needle = bridge_token.encode("utf-8")
-    if not needle:
-        return
-    for path in sorted(staging_dir.iterdir()):
+    active = tuple(secret.encode("utf-8") for secret in secrets if secret)
+    for path in sorted(staging_dir.rglob("*")):
         if not path.is_file():
             continue
+        _verify_evidence_file_safety(path, "evidence")
         try:
             data = path.read_bytes()
         except OSError:
             continue
-        if needle in data:
-            raise GateStateChangedError(
-                f"secret leak: bridge token found in evidence file {path.name}"
-            )
+        for needle in active:
+            if needle in data:
+                raise GateStateChangedError(
+                    f"secret leak: secret value found in evidence file {path.name}"
+                )
+        text = data.decode("utf-8", errors="ignore")
+        for pattern, kind in (
+            (_AUTH_COOKIE_PATTERN, "Authorization/Cookie"),
+            (_ACCOUNT_ID_PATTERN, "account identifier"),
+            (_PHONE_PATTERN, "phone number"),
+        ):
+            match = pattern.search(text)
+            if match:
+                raise GateStateChangedError(
+                    f"secret leak: {kind} in evidence file {path.name} "
+                    f"(matched {match.group(0)[:80]!r})"
+                )
+        for match in _TRACKING_URL_PATTERN.finditer(text):
+            if _is_tracking_url_leak(match.group(0)):
+                raise GateStateChangedError(
+                    f"secret leak: tracking URL in evidence file {path.name} "
+                    f"(matched {match.group(0)[:80]!r})"
+                )
 
 
 def layer5_real_canary(staging_dir: Path) -> LayerResult:
@@ -1006,9 +1160,10 @@ def run_gate(
         layer5_real_canary(staging_dir),
         layer6_full_e2e(staging_dir, start),
     ]
-    # B1 secret scan: the bridge token must never reach logs or evidence.  Fail
-    # closed (exit-2 semantics) before any verdict is certified if it does.
-    _secret_scan_staging(staging_dir, _bridge_token())
+    # B1 secret scan: bridge token + model API keys must never reach logs or
+    # evidence.  Fail closed (exit-2 semantics) before any verdict is certified
+    # if a secret value or a sensitive evidence pattern does.
+    _secret_scan_staging(staging_dir, _evidence_secrets())
     applicable = _applicable(layers)
     passed = (
         not start.worktree_dirty
@@ -1089,6 +1244,7 @@ def _copy_staged_evidence(staging_dir: Path) -> list[str]:
         staged = staging_dir / staged_name
         if not staged.is_file():
             continue
+        _verify_evidence_file_safety(staged, "evidence")
         target = ROOT / tracked_rel
         # Skip targets the repository ignores: ``git add`` fails closed on
         # ignored paths, so copying one into the tracked tree would abort the
@@ -1127,6 +1283,7 @@ def _manifest_files(staging_dir: Path) -> list[dict[str, Any]]:
         staged = staging_dir / staged_name
         if not staged.is_file():
             continue
+        _verify_evidence_file_safety(staged, "evidence")
         ignored = (
             _git("check-ignore", "-q", "--", tracked_rel, check=False).returncode == 0
         )
@@ -1650,6 +1807,8 @@ def main(argv: list[str] | None = None) -> int:
             _reject_target_conflict(args.output, "output path", kind="file")
         # Only now is it safe to create the write targets.
         staging_dir.mkdir(parents=True, exist_ok=True)
+        # Owner-only from creation: raw evidence never world/group-readable.
+        staging_dir.chmod(0o700)
         if args.output is not None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
         report = run_gate(staging_dir, commit=args.commit)
@@ -1662,6 +1821,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     _dump(report, output_path)
+    try:
+        # Re-secure the staging tree after layers wrote it: dir 0700, every raw
+        # evidence + report file 0600.  A hardening failure fails the gate.
+        _harden_staging_permissions(staging_dir)
+    except GateStateChangedError as exc:
+        print(f"staging hardening failed: {exc}", file=sys.stderr)
+        return 2
 
     if args.commit_evidence and not report.passed:
         # A failed gate never commits evidence (A1): the staged evidence stays

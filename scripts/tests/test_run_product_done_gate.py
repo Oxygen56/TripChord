@@ -1689,3 +1689,173 @@ def test_verify_evidence_contract_fails_closed_on_incomplete_manifest_fields(
 
     with pytest.raises(gate.GateStateChangedError, match="layer_verdicts"):
         gate._verify_evidence_contract(e_commit, staging_dir, manifest)
+
+
+# ---------------------------------------------------------------------------
+# Evidence disk safety (A3: 0700/0600, symlink/hardlink/owner, multi-class scan)
+# ---------------------------------------------------------------------------
+
+
+def _staging_evidence(staging_dir: Path) -> None:
+    """Minimal staging set for a passing run (no bridge token configured)."""
+    staging_dir.mkdir(exist_ok=True)
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        '{"run_status": "completed"}\n', encoding="utf-8"
+    )
+
+
+def test_harden_staging_permissions_sets_0700_0600(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A3 counter-example: after the gate runs, the staging dir must be 0700 and
+    every raw evidence file 0600 — never world/group readable."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _populate_required_evidence(staging_dir)
+    rc = gate.main(["--staging-dir", str(staging_dir), "--quiet"])
+    assert rc == 0
+    assert (staging_dir.stat().st_mode & 0o777) == 0o700
+    for name in ("product-acceptance.json", "live-done-gate-v4.json"):
+        assert (staging_dir / name).stat().st_mode & 0o777 == 0o600
+
+
+def test_secret_scan_rejects_symlink_in_staging(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A3 counter-example: a symlink planted in staging must fail the gate —
+    it could redirect the evidence read to attacker-chosen bytes."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    target = staging_dir.parent / "outside.txt"
+    target.write_text("secret", encoding="utf-8")
+    (staging_dir / "live-canary-certified.json").symlink_to(target)
+
+    with pytest.raises(gate.GateStateChangedError, match="symlink"):
+        gate.run_gate(staging_dir)
+
+
+def test_secret_scan_rejects_hardlink_in_staging(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A3 counter-example: a hardlink planted in staging must fail the gate."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    src = staging_dir / "live-canary-certified.json"
+    src.write_text('{"scopes": []}\n', encoding="utf-8")
+    os.link(src, staging_dir / "browser-e2e.json")
+
+    with pytest.raises(gate.GateStateChangedError, match="hardlink"):
+        gate.run_gate(staging_dir)
+
+
+def test_secret_scan_rejects_non_current_user_file(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A3 counter-example: a staging file owned by a different uid must fail the
+    gate even when nothing else is wrong with it."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+
+    with pytest.raises(gate.GateStateChangedError, match="owned by uid"):
+        gate.run_gate(staging_dir)
+
+
+def test_secret_scan_flags_tracking_url_query(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A3 counter-example: a full tracking URL with a live query value in raw
+    evidence must fail the gate — a byte scan of the token alone cannot see it."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps({"result": {"source_urls": [
+            "https://flights.ctrip.com/online/list?sid=AbCdEfGh123456"
+        ]}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.GateStateChangedError, match="tracking URL"):
+        gate.run_gate(staging_dir)
+
+
+def test_secret_scan_flags_authorization_header(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A3 counter-example: an Authorization header value in evidence fails the
+    gate even when the bridge token itself is absent."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        '{"request": {"headers": "Authorization: Bearer '
+        'sk-abcdefghijklmnopqrstuvwxyz123456"}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.GateStateChangedError, match="Authorization/Cookie"):
+        gate.run_gate(staging_dir)
+
+
+def test_secret_scan_flags_account_identifier(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A3 counter-example: a numeric account identifier in evidence fails the
+    gate."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps({"trace": {"account_id": 12345678}}), encoding="utf-8"
+    )
+    with pytest.raises(gate.GateStateChangedError, match="account identifier"):
+        gate.run_gate(staging_dir)
+
+
+def test_secret_scan_flags_model_api_key_from_env(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A3 counter-example: a model API key configured on the host that leaks
+    into evidence fails the gate even when the bridge token is unset."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    key = "sk-prod-0123456789abcdefghijklmnopqrstuvwxyz"
+    monkeypatch.setenv("MODEL_API_KEY", key)
+    (staging_dir / "product-acceptance.json").write_text(
+        json.dumps({"leak": key}), encoding="utf-8"
+    )
+    with pytest.raises(gate.GateStateChangedError, match="secret value"):
+        gate.run_gate(staging_dir)
+
+
+def test_secret_scan_allows_redacted_evidence(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A3 counter-example: desensitized evidence — [REDACTED] values, benign
+    query params, no account identifiers — must pass the scan untouched."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps(
+            {
+                "run_status": "completed",
+                "result": {
+                    "source_urls": [
+                        "https://example.com/search?q=hotel&page=1",
+                        "https://example.com/pay?sid=[REDACTED]",
+                    ]
+                },
+                "runtime_provenance": {"pid": 1234, "commit_sha": "a" * 40},
+            }
+        ),
+        encoding="utf-8",
+    )
+    gate.run_gate(staging_dir)  # no raise
