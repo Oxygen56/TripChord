@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sqlite3
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -70,7 +73,40 @@ def _passing_layers(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             gate,
             name,
-            lambda *args, name=name: gate.LayerResult(name=name, passed=True),
+            lambda *args, name=name, **kwargs: gate.LayerResult(
+                name=name, passed=True
+            ),
+        )
+
+
+def _populating_passing_layers(
+    monkeypatch: pytest.MonkeyPatch, staging_dir: Path
+) -> None:
+    """Mock every layer to pass AND write the raw required evidence into staging,
+    modelling the real flow (C-114 R3): main() creates an initially-empty staging
+    dir, then the layers populate it — the tests never hand main() a pre-filled
+    dir, because the gate refuses reused non-empty staging."""
+    monkeypatch.setattr(
+        gate,
+        "layer1_reproducibility",
+        lambda *args, sd=staging_dir: (
+            _populate_required_evidence(sd),
+            gate.LayerResult(name="layer1_reproducibility", passed=True),
+        )[1],
+    )
+    for name in (
+        "layer2_replay",
+        "layer3_clean_chrome_fixtures",
+        "layer4_model_smoke",
+        "layer5_real_canary",
+        "layer6_full_e2e",
+    ):
+        monkeypatch.setattr(
+            gate,
+            name,
+            lambda *args, name=name, **kwargs: gate.LayerResult(
+                name=name, passed=True
+            ),
         )
 
 
@@ -247,7 +283,9 @@ def test_run_gate_aborts_when_layer_dirties_tracked_tree(
         monkeypatch.setattr(
             gate,
             name,
-            lambda *args, name=name: gate.LayerResult(name=name, passed=True),
+            lambda *args, name=name, **kwargs: gate.LayerResult(
+                name=name, passed=True
+            ),
         )
 
     def dirtying_layer(staging: Path) -> gate.LayerResult:
@@ -276,7 +314,9 @@ def test_run_gate_aborts_when_head_moves_mid_run(
         monkeypatch.setattr(
             gate,
             name,
-            lambda *args, name=name: gate.LayerResult(name=name, passed=True),
+            lambda *args, name=name, **kwargs: gate.LayerResult(
+                name=name, passed=True
+            ),
         )
 
     def moving_layer() -> gate.LayerResult:
@@ -307,10 +347,83 @@ def _expected_snapshot(root: Path) -> gate.GitSnapshot:
     )
 
 
+def _matching_done_gate() -> dict[str, object]:
+    """A passing layer-6 ``done_gate`` report in the real runner schema:
+    ``passed`` plus the full 15-item check set, each item passed (the actual
+    ``LiveV4DoneGateReport`` shape — there is no top-level ``passed``)."""
+    check_names = (
+        "prefrozen_stay_plan_candidate_set",
+        "v4_source_graph",
+        "stage_aware_exploration_publication_contract",
+        "stay_inventory_four_state_contract",
+        "planner_verifier_repair_master_stay_plan_chain",
+        "recommendable_date_pair_stay_plan_options",
+        "icom_exploration_and_publication_evidence",
+        "all_recommended_publication_closures",
+        "real_v4_browser_source_evidence",
+        "flight_search_outcome_contract",
+        "observed_cross_platform_overlap",
+        "strict_selected_plan_platform_coverage",
+        "planner_verifier_repair_orchestrator",
+        "exact_budget_and_selected_evidence",
+        "event_injection_repair_reverify_master",
+    )
+    return {
+        "passed": True,
+        "checks": [
+            {"name": name, "passed": True, "summary": "ok", "evidence_refs": []}
+            for name in check_names
+        ],
+    }
+
+
+def _matching_canary() -> dict[str, object]:
+    """A passing certified-OTA canary in the real schema: top-level ``passed``
+    plus the complete six certified scopes, each fresh/authorized/read_only/
+    passed."""
+    scopes = (
+        ("ctrip:flight", "companion_heartbeat"),
+        ("ctrip:lodging", "companion_heartbeat"),
+        ("qunar:flight", "companion_heartbeat"),
+        ("qunar:lodging", "companion_heartbeat"),
+        ("tongcheng:flight", "companion_heartbeat"),
+        ("icom:transfer", "icom_public_api"),
+    )
+    return {
+        "passed": True,
+        "bridge_token_present": True,
+        "scopes": [
+            {
+                "scope": scope,
+                "kind": kind,
+                "passed": True,
+                "fresh": True,
+                "authorized": True,
+                "read_only": True,
+            }
+            for scope, kind in scopes
+        ],
+        "companion_status": {
+            "status": "connected",
+            "stale_after_seconds": 45,
+            "companions": [
+                {
+                    "companion_id": "comp-1",
+                    "providers": ["ctrip", "qunar", "tongcheng"],
+                    "authorized_scope_keys": [scope for scope, _ in scopes],
+                    "is_fresh": True,
+                    "age_seconds": 3,
+                    "build_identity": {"build_sha256": "a" * 64},
+                }
+            ],
+        },
+    }
+
+
 def _matching_evidence(root: Path) -> dict[str, object]:
     return {
         "run_status": "completed",
-        "passed": True,
+        "done_gate": _matching_done_gate(),
         "repo_revision": {
             "toplevel": str(root),
             "branch": "main",
@@ -405,7 +518,7 @@ def _matching_runner_evidence(root: Path) -> dict[str, object]:
     # commit_sha as the meaningful compared fields.
     return {
         "run_status": "completed",
-        "passed": True,
+        "done_gate": _matching_done_gate(),
         "repo_revision": {
             "toplevel": str(root),
             "branch": "main",
@@ -487,6 +600,184 @@ def test_runner_runtime_provenance_mismatches_missing_bundle(
     _patch_root(monkeypatch, clean_repo)
     mismatches = gate._runtime_provenance_mismatches({}, clean_repo)
     assert any("runtime_before_run" in item for item in mismatches)
+
+
+# ---------------------------------------------------------------------------
+# layer 5/6 real-schema contract (C-114 review R1/R2)
+# ---------------------------------------------------------------------------
+
+
+def test_done_gate_mismatches_rejects_forged_top_level_passed() -> None:
+    """R1 counter-example: a bundle carrying only a forged top-level ``passed``
+    (the schema the real runner never emits) must fail closed — the real
+    contract lives under ``done_gate``."""
+    mismatches = gate._done_gate_mismatches({"run_status": "completed", "passed": True})
+    assert any("no done_gate report" in item for item in mismatches)
+
+
+def test_done_gate_mismatches_rejects_missing_report() -> None:
+    mismatches = gate._done_gate_mismatches({"run_status": "completed"})
+    assert any("no done_gate report" in item for item in mismatches)
+
+
+def test_done_gate_mismatches_rejects_failed_check() -> None:
+    done_gate = _matching_done_gate()
+    done_gate["checks"][0]["passed"] = False  # type: ignore[index]
+    mismatches = gate._done_gate_mismatches({"done_gate": done_gate})
+    assert any("not all passed" in item for item in mismatches)
+
+
+def test_done_gate_mismatches_rejects_missing_required_check() -> None:
+    done_gate = _matching_done_gate()
+    done_gate["checks"] = done_gate["checks"][:-1]  # type: ignore[assignment]
+    mismatches = gate._done_gate_mismatches({"done_gate": done_gate})
+    assert any("missing required items" in item for item in mismatches)
+
+
+def test_done_gate_mismatches_rejects_non_true_verdict() -> None:
+    mismatches = gate._done_gate_mismatches(
+        {"done_gate": {"passed": "True", "checks": _matching_done_gate()["checks"]}}
+    )
+    assert any("must be true" in item for item in mismatches)
+
+
+def test_done_gate_mismatches_rejects_malformed_check() -> None:
+    done_gate = _matching_done_gate()
+    done_gate["checks"] = [{"name": 42, "passed": True}]  # type: ignore[list-item]
+    mismatches = gate._done_gate_mismatches({"done_gate": done_gate})
+    assert any("malformed" in item for item in mismatches)
+    assert any("missing required items" in item for item in mismatches)
+
+
+def test_done_gate_mismatches_accepts_complete_passing_report() -> None:
+    assert gate._done_gate_mismatches({"done_gate": _matching_done_gate()}) == []
+
+
+def test_layer5_fails_on_empty_scopes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R2 counter-example: a certified canary with no scopes can never pass —
+    the layer must not trust the process exit code."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(
+        gate,
+        "_run",
+        lambda cmd, **kwargs: (0, ""),
+    )
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps({"passed": True, "scopes": [], "companion_status": {}}),
+        encoding="utf-8",
+    )
+    assert gate.layer5_real_canary(staging_dir).passed is False
+
+
+def test_layer5_fails_on_missing_certified_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R2 counter-example: a canary omitting one certified scope fails even
+    when every listed scope passes."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (0, ""))
+    canary = _matching_canary()
+    canary["scopes"] = canary["scopes"][:-1]  # type: ignore[assignment]
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(canary), encoding="utf-8"
+    )
+    assert gate.layer5_real_canary(staging_dir).passed is False
+
+
+def test_layer5_fails_on_stale_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R2 counter-example: a certified scope that is stale (not fresh) fails."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (0, ""))
+    canary = _matching_canary()
+    canary["scopes"][0]["fresh"] = False  # type: ignore[index]
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(canary), encoding="utf-8"
+    )
+    assert gate.layer5_real_canary(staging_dir).passed is False
+
+
+def test_layer5_fails_when_top_level_passed_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R2 counter-example: the canary JSON reporting passed=false must fail the
+    layer even if the subprocess exits 0."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (0, ""))
+    canary = _matching_canary()
+    canary["passed"] = False
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(canary), encoding="utf-8"
+    )
+    assert gate.layer5_real_canary(staging_dir).passed is False
+
+
+def test_layer5_passes_only_complete_certified_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R2 positive: the full certified scope set, each fresh/authorized/
+    read-only/passed, passes the layer."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (0, ""))
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(_matching_canary()), encoding="utf-8"
+    )
+    assert gate.layer5_real_canary(staging_dir).passed is True
+
+
+def test_layer3_browser_e2e_exit2_is_not_a_pass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-114 R3 counter-example: a clean-Chrome browser E2E that skips (exit 2)
+    must NOT pass layer 3 — only a real rendered E2E in clean headless Chrome
+    (exit 0) satisfies the fixture.  Skipping is honest reporting, not a pass."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    def fake_run(cmd: list[str], **kwargs: object) -> tuple[int, str]:
+        if any("scripts/browser_e2e.py" in part for part in cmd):
+            return 2, "SKIP: no Google Chrome / Chromium binary found"
+        return 0, ""
+
+    monkeypatch.setattr(gate, "_run", fake_run)
+    result = gate.layer3_clean_chrome_fixtures(staging_dir)
+    assert result.passed is False
+    assert not any(
+        check["passed"]
+        for check in result.sub_checks
+        if check["name"] == "clean_chrome_browser_e2e"
+    )
+
+
+def test_layer3_browser_e2e_real_run_passes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-114 R3 positive: the clean-Chrome browser E2E that actually renders
+    (exit 0) passes layer 3."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    def fake_run(cmd: list[str], **kwargs: object) -> tuple[int, str]:
+        if any("scripts/browser_e2e.py" in part for part in cmd):
+            return 0, ""
+        return 0, ""
+
+    monkeypatch.setattr(gate, "_run", fake_run)
+    result = gate.layer3_clean_chrome_fixtures(staging_dir)
+    assert result.passed is True
 
 
 # ---------------------------------------------------------------------------
@@ -780,7 +1071,7 @@ def test_main_exits_2_when_runner_evidence_missing_fields(
     evidence_path = staging_dir / "live-done-gate-v4.json"
     evidence: dict[str, object] = {
         "run_status": None,
-        "passed": True,
+        "done_gate": _matching_done_gate(),
         "repo_revision": {
             "toplevel": None,
             "branch": "main",
@@ -950,6 +1241,63 @@ def test_main_exits_2_when_staging_is_file_conflict(
     assert _porcelain(clean_repo) == before
 
 
+def test_main_exits_2_when_staging_is_non_empty_dir(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, tmp_path: Path
+) -> None:
+    """C-114 R3 counter-example: a ``--staging-dir`` that already exists and is
+    non-empty must be rejected with exit 2 — the gate never sweeps stale files
+    from an earlier run into this run's evidence trail."""
+    _patch_root(monkeypatch, clean_repo)
+    before = _porcelain(clean_repo)
+    stale = tmp_path / "staging-reused"
+    stale.mkdir()
+    (stale / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    rc = gate.main(["--staging-dir", str(stale), "--quiet"])
+    assert rc == 2
+    assert _porcelain(clean_repo) == before
+    # The stale evidence was not touched.
+    assert (stale / "product-acceptance.json").read_text() == '{"passed": true}\n'
+
+
+def test_main_accepts_existing_empty_staging_dir(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, tmp_path: Path
+) -> None:
+    """C-114 R3: an existing-but-empty ``--staging-dir`` is acceptable (the gate
+    still populates it itself); only non-empty reuse is refused."""
+    _patch_root(monkeypatch, clean_repo)
+    empty = tmp_path / "staging-empty"
+    empty.mkdir()
+    _populating_passing_layers(monkeypatch, empty)
+    rc = gate.main(["--staging-dir", str(empty), "--quiet"])
+    assert rc == 0
+    assert (empty / "product-v1-done-gate.json").is_file()
+
+
+def test_new_staging_dir_embeds_unique_run_id() -> None:
+    """C-114 R3: the default staging path embeds a per-run id, and two runs never
+    collide on the same directory."""
+    first = gate._new_staging_dir()
+    second = gate._new_staging_dir()
+    assert first != second
+    assert first.parent == second.parent
+    assert gate._RUN_ID_RE.search(first.name) is not None
+    assert gate._RUN_ID_RE.search(second.name) is not None
+
+
+def test_run_gate_report_carries_run_id(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    """C-114 R3: the report binds the run_id supplied by main so the evidence
+    trail identifies exactly one execution."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    staging = clean_repo.parent / "staging"
+    report = gate.run_gate(staging, run_id="test-run-123")
+    assert report.run_id == "test-run-123"
+
+
 def test_main_exits_2_when_output_is_directory_conflict(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, tmp_path: Path
 ) -> None:
@@ -1049,8 +1397,7 @@ def test_main_commit_evidence_failure_marks_report_failed_on_disk(
     on-disk report whose JSON carries passed=false — asserting fields, not
     just the return code."""
     _patch_root(monkeypatch, clean_repo)
-    _passing_layers(monkeypatch)
-    _populate_required_evidence(staging_dir)
+    _populating_passing_layers(monkeypatch, staging_dir)
     # Fail the phase-2 pointer commit-tree: E exists as an object but the
     # branch must never advance to it, and the report on disk must say passed.
     _inject_git_failure(monkeypatch, "commit-tree", when=2)
@@ -1202,7 +1549,7 @@ def test_main_commit_evidence_skips_gitignored_evidence_end_to_end(
     live-* files must still commit the committable evidence and exit 0 — the
     gate never aborts on ignored evidence it cannot commit."""
     _patch_root(monkeypatch, clean_repo)
-    _passing_layers(monkeypatch)
+    _populating_passing_layers(monkeypatch, staging_dir)
     (clean_repo / ".gitignore").write_text(
         "/benchmarks/results/live-*\n", encoding="utf-8"
     )
@@ -1211,7 +1558,6 @@ def test_main_commit_evidence_skips_gitignored_evidence_end_to_end(
         ["git", "-C", str(clean_repo), "commit", "-q", "-m", "ignore live evidence"],
         check=True,
     )
-    _populate_required_evidence(staging_dir)
 
     rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
     assert rc == 0
@@ -1231,34 +1577,14 @@ def test_main_failed_gate_never_commits_evidence(
     tracked results tree byte-for-byte unchanged — no _commit_evidence, no new
     commit, no staged or tracked writes."""
     _patch_root(monkeypatch, clean_repo)
-    for name in (
-        "layer1_reproducibility",
-        "layer2_replay",
-        "layer3_clean_chrome_fixtures",
-        "layer4_model_smoke",
-        "layer5_real_canary",
-    ):
-        monkeypatch.setattr(
-            gate,
-            name,
-            lambda *args, name=name: gate.LayerResult(name=name, passed=True),
-        )
+    _populating_passing_layers(monkeypatch, staging_dir)
     monkeypatch.setattr(
         gate,
         "layer6_full_e2e",
-        lambda *args: gate.LayerResult(
+        lambda *args, **kwargs: gate.LayerResult(
             name="6_full_e2e", passed=False, detail="real e2e failure"
         ),
     )
-    staging_dir.mkdir()
-    for name in (
-        "product-acceptance.json",
-        "browser-e2e.json",
-        "browser-e2e-screenshot.png",
-        "live-canary-certified.json",
-        "live-done-gate-v4.json",
-    ):
-        (staging_dir / name).write_bytes(b"{}\n" if name.endswith(".json") else b"PNG")
 
     head_before = _head(clean_repo)
     log_before = subprocess.run(
@@ -1491,7 +1817,7 @@ def test_layer5_bridge_token_env_only_not_argv(
 
     monkeypatch.setattr(gate, "_run", fake_run)
     (staging_dir / "live-canary-certified.json").write_text(
-        json.dumps({"scopes": [], "companion_status": {}}), encoding="utf-8"
+        json.dumps(_matching_canary()), encoding="utf-8"
     )
     result = gate.layer5_real_canary(staging_dir)
     assert result.passed is True
@@ -1526,9 +1852,14 @@ def test_layer6_bridge_token_env_only_not_argv(
     monkeypatch.setattr(gate, "_runner_revision_mismatches", lambda *a, **k: [])
     monkeypatch.setattr(gate, "_runtime_provenance_mismatches", lambda *a, **k: [])
     monkeypatch.setattr(gate, "_extract_build_fingerprint", lambda *a, **k: None)
+    # This test exercises token-via-env propagation, not the R7 lease preflight;
+    # isolate the preflight to a clean live state.
+    monkeypatch.setattr(gate, "_live_state_lease_preflight", lambda *a, **k: [])
     start = _expected_snapshot(clean_repo)
     (staging_dir / "live-done-gate-v4.json").write_text(
-        json.dumps({"run_status": "completed", "done_gate": {"passed": "True"}}),
+        json.dumps(
+            {"run_status": "completed", "done_gate": _matching_done_gate()}
+        ),
         encoding="utf-8",
     )
     result = gate.layer6_full_e2e(staging_dir, start)
@@ -1542,6 +1873,218 @@ def test_layer6_bridge_token_env_only_not_argv(
         assert "--bridge-token" not in cmd
         assert token not in cmd
         assert kwargs["env"]["TRIPCHORD_BROWSER_BRIDGE_TOKEN"] == token  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# C-114 R7: read-only live-state lease preflight (residual queued/claimed
+# leases must not pollute a new live run)
+# ---------------------------------------------------------------------------
+
+
+def _make_jobs_db(
+    db_path: Path, rows: list[tuple[str, str, str | None]]
+) -> None:
+    """Create a minimal durable live-state ``jobs`` table matching the API's
+    JobRow schema columns the preflight reads, seeded with
+    (id, status, lease_expires_at) rows."""
+    connection = sqlite3.connect(str(db_path))
+    connection.execute(
+        "CREATE TABLE jobs ("
+        " id TEXT PRIMARY KEY,"
+        " workspace_id TEXT,"
+        " status TEXT,"
+        " stage TEXT,"
+        " progress INTEGER,"
+        " attempts INTEGER,"
+        " max_attempts INTEGER,"
+        " lease_expires_at TEXT,"
+        " idempotency_key TEXT,"
+        " trace_id TEXT,"
+        " request TEXT,"
+        " result TEXT,"
+        " error TEXT,"
+        " created_at TEXT,"
+        " updated_at TEXT"
+        ")"
+    )
+    for job_id, status, lease in rows:
+        connection.execute(
+            "INSERT INTO jobs (id, status, lease_expires_at) VALUES (?, ?, ?)",
+            (job_id, status, lease),
+        )
+    connection.commit()
+    connection.close()
+
+
+def _db_sha256(db_path: Path) -> str:
+    return hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+
+def _future_lease() -> str:
+    return (datetime.now(UTC) + timedelta(minutes=15)).isoformat()
+
+
+def _expired_lease() -> str:
+    return (datetime.now(UTC) - timedelta(minutes=15)).isoformat()
+
+
+def test_live_state_lease_preflight_detects_residual_queued_lease(
+    tmp_path: Path,
+) -> None:
+    """R7 counter-example: a queued job with an unexpired lease is residual and
+    must block a fresh run."""
+    db_path = tmp_path / "live.db"
+    _make_jobs_db(
+        db_path,
+        [
+            ("job-1", "queued", _future_lease()),
+        ],
+    )
+    residual = gate._live_state_lease_preflight(db_path)
+    assert residual
+    assert "job-1" in residual[0]
+    assert "queued" in residual[0]
+
+
+def test_live_state_lease_preflight_detects_residual_claimed_lease(
+    tmp_path: Path,
+) -> None:
+    """R7 counter-example: a claimed (running) job with an unexpired lease is
+    residual."""
+    db_path = tmp_path / "live.db"
+    _make_jobs_db(
+        db_path,
+        [
+            ("job-2", "running", _future_lease()),
+        ],
+    )
+    residual = gate._live_state_lease_preflight(db_path)
+    assert residual
+    assert "job-2" in residual[0]
+    assert "running" in residual[0]
+
+
+def test_live_state_lease_preflight_detects_queued_without_lease(
+    tmp_path: Path,
+) -> None:
+    """R7 counter-example: a queued job with no lease at all is still pending
+    work a fresh run would race with."""
+    db_path = tmp_path / "live.db"
+    _make_jobs_db(db_path, [("job-3", "queued", None)])
+    residual = gate._live_state_lease_preflight(db_path)
+    assert residual
+    assert "job-3" in residual[0]
+
+
+def test_live_state_lease_preflight_passes_on_clean_db(tmp_path: Path) -> None:
+    """R7 positive: an empty jobs table is isolated."""
+    db_path = tmp_path / "live.db"
+    _make_jobs_db(db_path, [])
+    assert gate._live_state_lease_preflight(db_path) == []
+
+
+def test_live_state_lease_preflight_ignores_expired_leases(
+    tmp_path: Path,
+) -> None:
+    """R7 positive: an expired lease has lapsed and cannot contaminate a new
+    run — only unexpired queued/claimed leases are residual."""
+    db_path = tmp_path / "live.db"
+    _make_jobs_db(
+        db_path,
+        [
+            ("job-old", "running", _expired_lease()),
+            ("job-done", "succeeded", _future_lease()),
+            ("job-failed", "failed", _future_lease()),
+        ],
+    )
+    assert gate._live_state_lease_preflight(db_path) == []
+
+
+def test_live_state_lease_preflight_fails_closed_on_missing_db(
+    tmp_path: Path,
+) -> None:
+    """R7 counter-example: a missing live-state DB cannot prove lease isolation
+    and must fail closed."""
+    db_path = tmp_path / "does-not-exist.db"
+    residual = gate._live_state_lease_preflight(db_path)
+    assert residual
+    assert "missing" in residual[0]
+
+
+def test_live_state_lease_preflight_is_strictly_read_only(tmp_path: Path) -> None:
+    """R7 safety: the preflight opens the DB ``mode=ro`` — it must neither clear
+    nor extend a lease, nor create a journal/WAL.  Bytes before == bytes after,
+    and no sidecar journal file may appear."""
+    db_path = tmp_path / "live.db"
+    _make_jobs_db(db_path, [("job-4", "running", _future_lease())])
+    before = _db_sha256(db_path)
+    residual = gate._live_state_lease_preflight(db_path)
+    assert residual
+    after = _db_sha256(db_path)
+    assert before == after
+    assert not (tmp_path / "live.db-journal").exists()
+    assert not (tmp_path / "live.db-wal").exists()
+
+
+def test_resolve_live_state_db_honors_explicit_and_local_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R7 wiring: an explicit ``--live-state-db`` wins; otherwise a local sqlite
+    DATABASE_URL path is honoured; otherwise the repo-root default applies."""
+    explicit = tmp_path / "explicit.db"
+    assert gate._resolve_live_state_db(explicit) == explicit
+    monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///./custom.db")
+    assert gate._resolve_live_state_db().name == "custom.db"
+    monkeypatch.delenv("DATABASE_URL")
+    monkeypatch.setenv("TRIPCHORD_DATABASE_URL", "sqlite+aiosqlite:///./custom2.db")
+    assert gate._resolve_live_state_db().name == "custom2.db"
+    monkeypatch.delenv("TRIPCHORD_DATABASE_URL")
+    assert gate._resolve_live_state_db() == gate.ROOT / "tripchord.db"
+
+
+def test_layer6_fails_when_residual_lease_present(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_repo: Path,
+    tmp_path: Path,
+    staging_dir: Path,
+) -> None:
+    """R7 integration: layer 6 refuses to run a fresh E2E when the live-state DB
+    holds a residual queued/claimed lease, even when every auth gate is met."""
+    staging_dir.mkdir()
+    db_path = tmp_path / "live.db"
+    _make_jobs_db(db_path, [("job-5", "queued", _future_lease())])
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setenv("TRIPCHORD_ACK_MODEL_COST", "1")
+    start = _expected_snapshot(clean_repo)
+    result = gate.layer6_full_e2e(staging_dir, start, live_state_db=db_path)
+    assert result.passed is False
+    assert "lease preflight" in result.detail
+
+
+def test_layer6_lease_preflight_passes_on_clean_live_state(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_repo: Path,
+    tmp_path: Path,
+    staging_dir: Path,
+) -> None:
+    """R7 integration: a clean live-state DB passes the preflight and the layer
+    proceeds to the E2E runner (which then drives the verdict)."""
+    staging_dir.mkdir()
+    db_path = tmp_path / "live.db"
+    _make_jobs_db(db_path, [])
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setenv("TRIPCHORD_ACK_MODEL_COST", "1")
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (0, ""))
+    monkeypatch.setattr(gate, "_runner_revision_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr(gate, "_runtime_provenance_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr(gate, "_extract_build_fingerprint", lambda *a, **k: None)
+    start = _expected_snapshot(clean_repo)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps({"run_status": "completed", "done_gate": _matching_done_gate()}),
+        encoding="utf-8",
+    )
+    result = gate.layer6_full_e2e(staging_dir, start, live_state_db=db_path)
+    assert result.passed is True
 
 
 def test_secret_scan_fails_closed_on_token_in_evidence(
@@ -1752,6 +2295,163 @@ def test_compact_canary_drops_raw_detail_fields(staging_dir: Path) -> None:
     assert compact["raw_evidence"]["committed"] is False
 
 
+def test_compact_canary_carries_coverage_and_bindings(staging_dir: Path) -> None:
+    """C-114 R5: the layer-5 compact must carry the certified-scope coverage
+    thresholds and the per-scope provider/query/candidate/quote bindings — not
+    just a pass/fail boolean — so a reviewer can independently verify the canary
+    actually exercised every declared scope."""
+    staging_dir.mkdir()
+    canary = dict(_matching_canary())
+    canary["scopes"] = [
+        {
+            "scope": "ctrip:flight",
+            "kind": "companion_heartbeat",
+            "passed": True,
+            "fresh": True,
+            "authorized": True,
+            "read_only": True,
+            "evidence": {
+                "companion_id": "companion-001",
+                "providers": ["ctrip"],
+                "authorized_scope_keys": ["ctrip:flight"],
+                "runtime_instance_id": "inst-abc",
+                "adapter_version": "v2",
+            },
+        },
+        {
+            "scope": "icom:transfer",
+            "kind": "icom_public_api",
+            "passed": True,
+            "fresh": True,
+            "authorized": True,
+            "read_only": True,
+            "evidence": {
+                "searched_at": "2026-08-10T00:00:00Z",
+                "source_urls": [
+                    "https://transfer.example/search?from=MLE",
+                    "https://transfer.example/search?from=MLE&to=AIR",
+                ],
+                "options": 7,
+                "sample": {
+                    "service_name": "speedboat",
+                    "fare_amount": "42.00",
+                    "currency": "USD",
+                },
+            },
+        },
+    ]
+    canary["passed"] = False  # only 2 of the 6 certified scopes are present
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(canary), encoding="utf-8"
+    )
+    compact = gate._compact_canary(staging_dir)
+    assert compact is not None
+    coverage = compact["coverage"]
+    assert coverage["expected_scope_count"] == 6
+    assert set(coverage["expected_scopes"]) == set(gate._CERTIFIED_OTA_SCOPES)
+    assert coverage["passed_scope_count"] == 2
+    assert "qunar:lodging" in coverage["missing"]
+
+    by_scope = {entry["scope"]: entry for entry in compact["scopes"]}
+    ctrip = by_scope["ctrip:flight"]
+    assert ctrip["provider"] == "ctrip"
+    assert ctrip["evidence"]["companion_id"] == "companion-001"
+    assert ctrip["evidence"]["providers"] == ["ctrip"]
+    icom = by_scope["icom:transfer"]
+    assert icom["provider"] == "icom"
+    assert icom["evidence"]["options"] == 7
+    assert icom["evidence"]["sample"]["fare_amount"] == "42.00"
+    # Raw URLs are never committed into the compact.
+    assert "source_urls" not in icom["evidence"]
+    assert "search?from=" not in json.dumps(compact)
+
+
+def test_compact_live_e2e_carries_15_checks(staging_dir: Path) -> None:
+    """C-114 R5: the layer-6 compact must carry the full 15-item done-gate check
+    set (including the planner-verifier-repair chain, exact budget + selected
+    evidence, and the event-injection repair/re-verify master) so a reviewer can
+    re-verify each verdict without the raw runner payload."""
+    staging_dir.mkdir()
+    done_gate = _matching_done_gate()
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-live-v4-done-gate-report",
+                "run_status": "completed",
+                "repo_revision": "abc123",
+                "captured_at": "2026-08-10T00:00:00Z",
+                "done_gate": done_gate,
+            }
+        ),
+        encoding="utf-8",
+    )
+    compact = gate._compact_live_e2e(staging_dir)
+    assert compact is not None
+    assert compact["done_gate"]["check_count"] == 15
+    assert compact["done_gate"]["passed_check_count"] == 15
+    names = [check["name"] for check in compact["done_gate"]["checks"]]
+    for required in (
+        "planner_verifier_repair_master_stay_plan_chain",
+        "planner_verifier_repair_orchestrator",
+        "exact_budget_and_selected_evidence",
+        "event_injection_repair_reverify_master",
+    ):
+        assert required in names
+    assert compact["done_gate"]["checks"][0]["summary"] == "ok"
+
+
+def test_verify_evidence_contract_rejects_blank_compact_content(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-114 R5 counter-example: a committed compact blob that parses but lacks
+    the contract-required content (layer-5 coverage / layer-6 check set) must
+    fail the post-commit re-verify — a blank or hash-only artifact is not enough."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    blank_payload = '{"schema_version": "tripchord-done-gate-layer6-compact-v2"}\n'
+    staged_compact = staging_dir / gate._COMPACT_E2E_STAGED_NAME
+    staged_compact.write_text(blank_payload, encoding="utf-8")
+    manifest = {
+        "schema_version": "tripchord-product-v1-done-gate-manifest",
+        "tested_commit_sha": _head(clean_repo),
+        "run_id": "test-run",
+        "evidence_commit": _head(clean_repo),
+        "generated_at": "2026-08-10T00:00:00+00:00",
+        "toplevel": str(clean_repo),
+        "branch": "main",
+        "files": [
+            {
+                "name": gate._COMPACT_E2E_STAGED_NAME,
+                "tracked_path": gate._EVIDENCE_TRACKED_PATHS[-1][1],
+                "sha256": gate._sha256_file(staged_compact),
+                "size_bytes": len(blank_payload),
+                "committed": True,
+            }
+        ],
+        "layer_verdicts": {"5_real_canary": {}, "6_full_e2e": {}},
+    }
+    # E (== HEAD) carries the manifest plus a compact artifact with no done-gate
+    # check set.
+    results = clean_repo / "benchmarks" / "results"
+    results.mkdir(parents=True, exist_ok=True)
+    rel = gate._EVIDENCE_TRACKED_PATHS[-1][1]
+    blank = results / Path(rel).name
+    blank.write_text(blank_payload, encoding="utf-8")
+    (results / Path(gate._MANIFEST_REL).name).write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    gate._git("add", "--", rel, gate._MANIFEST_REL, check=True)
+    gate._git(
+        "commit",
+        "-q",
+        "-m",
+        "blank compact",
+        check=True,
+    )
+    with pytest.raises(gate.GateStateChangedError, match="done-gate check set"):
+        gate._verify_evidence_contract(_head(clean_repo), staging_dir, manifest)
+
+
 def test_main_commits_desensitized_layer5_6_compact_artifacts(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
@@ -1759,7 +2459,7 @@ def test_main_commits_desensitized_layer5_6_compact_artifacts(
     independently reviewable desensitized layer-5/6 compact artifacts — never
     only a committed=false raw hash — and E must contain them."""
     _patch_root(monkeypatch, clean_repo)
-    _passing_layers(monkeypatch)
+    _populating_passing_layers(monkeypatch, staging_dir)
     # Reproduce the real repository's rule: raw live-* evidence is gitignored,
     # so only the compact artifacts can (and must) be committed.
     (clean_repo / ".gitignore").write_text(
@@ -1770,7 +2470,6 @@ def test_main_commits_desensitized_layer5_6_compact_artifacts(
         ["git", "-C", str(clean_repo), "commit", "-q", "-m", "ignore live evidence"],
         check=True,
     )
-    _populate_required_evidence(staging_dir)
 
     rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
     assert rc == 0
@@ -1898,8 +2597,7 @@ def test_harden_staging_permissions_sets_0700_0600(
     """A3 counter-example: after the gate runs, the staging dir must be 0700 and
     every raw evidence file 0600 — never world/group readable."""
     _patch_root(monkeypatch, clean_repo)
-    _passing_layers(monkeypatch)
-    _populate_required_evidence(staging_dir)
+    _populating_passing_layers(monkeypatch, staging_dir)
     rc = gate.main(["--staging-dir", str(staging_dir), "--quiet"])
     assert rc == 0
     assert (staging_dir.stat().st_mode & 0o777) == 0o700
@@ -1951,6 +2649,99 @@ def test_secret_scan_rejects_non_current_user_file(
 
     with pytest.raises(gate.GateStateChangedError, match="owned by uid"):
         gate.run_gate(staging_dir)
+
+
+def test_secret_scan_fails_closed_on_unreadable_file(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-114 R4 counter-example: a mode-000 evidence file that cannot be read
+    must fail the scan (never silently pass) — an unreadable file could hide a
+    secret.  The error names only the category and file, not content."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    unreadable = staging_dir / "product-acceptance.json"
+    unreadable.chmod(0o000)
+    try:
+        with pytest.raises(
+            gate.GateStateChangedError, match="cannot read evidence file"
+        ):
+            gate._secret_scan_staging(
+                staging_dir, ("nope",)
+            )
+    finally:
+        unreadable.chmod(0o600)
+
+
+def test_secret_scan_covers_all_model_api_key_envs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-114 R4 counter-example: the scan must cover EVERY model provider key the
+    host exports — OPENAI_API_KEY / ANTHROPIC_API_KEY included — not just the
+    primary MODEL_API_KEY."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-abc123")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-xyz789")
+    secrets = gate._evidence_secrets()
+    assert "sk-openai-abc123" in secrets
+    assert "sk-ant-xyz789" in secrets
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    (staging_dir / "evidence.json").write_text(
+        '{"key": "sk-ant-xyz789"}\n', encoding="utf-8"
+    )
+    with pytest.raises(gate.GateStateChangedError, match="secret value found"):
+        gate._secret_scan_staging(staging_dir, secrets)
+
+
+def test_harden_staging_rejects_symlink_subdir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-114 R6 counter-example: a symlink planted as a staging subdirectory must
+    be rejected by lstat BEFORE its chmod — chmod would otherwise follow the link
+    onto the attacker-chosen target."""
+    _patch_root(monkeypatch, tmp_path / "repo")
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    (staging_dir / "real").mkdir()
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    (staging_dir / "evil").symlink_to(outside)
+
+    with pytest.raises(gate.GateStateChangedError, match="symlink"):
+        gate._harden_staging_permissions(staging_dir)
+
+
+def test_harden_staging_rejects_symlink_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-114 R6 counter-example: a staging ROOT that is a symlink must be
+    rejected before chmod — chmod(0o700) on a symlink would hit its target."""
+    _patch_root(monkeypatch, tmp_path / "repo")
+    real_dir = tmp_path / "real-staging"
+    real_dir.mkdir()
+    staging_dir = tmp_path / "staging-link"
+    staging_dir.symlink_to(real_dir)
+
+    with pytest.raises(gate.GateStateChangedError, match="symlink"):
+        gate._harden_staging_permissions(staging_dir)
+
+
+def test_dump_output_atomic_0600_outside_staging(tmp_path: Path) -> None:
+    """C-114 R6 counter-example: ``--output`` outside the staging tree must still
+    be 0600 after the atomic rename — the host umask must not widen the report."""
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha="a" * 40,
+        run_id="test-run",
+        passed=False,
+        summary="x",
+    )
+    out = tmp_path / "elsewhere" / "report.json"
+    gate._dump(report, out)
+    assert out.exists()
+    assert out.stat().st_mode & 0o777 == 0o600
 
 
 def test_secret_scan_flags_tracking_url_query(
@@ -2098,14 +2889,13 @@ def test_commit_evidence_catches_last_step_report_leak(
     before the atomic ref update) can see the leak — the ordering fix that keeps
     a passed=true report with a leaked secret from ever being committed."""
     _patch_root(monkeypatch, clean_repo)
-    _passing_layers(monkeypatch)
-    _populate_required_evidence(staging_dir)
+    _populating_passing_layers(monkeypatch, staging_dir)
     token = "F" * 64
     monkeypatch.setattr(gate, "_bridge_token", lambda: token)
     monkeypatch.setattr(
         gate,
         "layer6_full_e2e",
-        lambda *args: gate.LayerResult(
+        lambda *args, **kwargs: gate.LayerResult(
             name="6_full_e2e", passed=True, detail=token
         ),
     )

@@ -34,9 +34,12 @@ import json
 import os
 import re
 import shutil
+import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -114,6 +117,7 @@ class GateReport:
     schema_version: str
     generated_at: str
     tested_commit_sha: str | None
+    run_id: str = ""
     evidence_commit: str | None = None
     toplevel: str | None = None
     branch: str | None = None
@@ -450,13 +454,18 @@ def layer3_clean_chrome_fixtures(staging_dir: Path) -> LayerResult:
     if code4 == 0:
         e2e_detail = "workflow-steps + replay plan rendered in clean headless Chrome"
     elif code4 == 2:
-        e2e_detail = "clean Chrome or built SPA not available; skipped"
+        e2e_detail = (
+            "clean Chrome or built SPA not available; browser E2E was skipped "
+            "and therefore does NOT pass this layer (C-114 R3)"
+        )
     else:
         e2e_detail = out4[-300:]
     checks.append(
         {
             "name": "clean_chrome_browser_e2e",
-            "passed": code4 in {0, 2},
+            # R3: a skip (exit 2) is not a pass — only a real rendered E2E in a
+            # clean headless Chrome proves the fixture, so code4 must be 0.
+            "passed": code4 == 0,
             "detail": e2e_detail,
         }
     )
@@ -601,13 +610,47 @@ def _verify_evidence_file_safety(path: Path, label: str) -> None:
         ) from exc
 
 
+def _lstat_safe_check(path: Path, label: str) -> None:
+    """lstat-based safety check, applied BEFORE any chmod (C-114 R6).
+
+    ``path.chmod`` follows symlinks, so a planted symlink (or a file owned by
+    another user) could redirect the hardening chmod — and a hardlinked file is
+    a second identity that survives the tree's own protection.  Every staging
+    path, including the staging root itself, is lstat-checked first: a symlink,
+    a non-current-user owner, or (for regular files) an nlink>1 hardlink fails
+    the gate closed."""
+    try:
+        st = path.lstat()
+    except OSError as exc:
+        raise GateStateChangedError(
+            f"{label} {path.name} unreadable: {exc}"
+        ) from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise GateStateChangedError(
+            f"{label} {path.name} is a symlink; refusing to harden an evidence path"
+        )
+    if st.st_uid != os.getuid():
+        raise GateStateChangedError(
+            f"{label} {path.name} is owned by uid {st.st_uid}, not the current "
+            f"user ({os.getuid()}); refusing to harden an evidence path"
+        )
+    if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+        raise GateStateChangedError(
+            f"{label} {path.name} is a hardlink (nlink={st.st_nlink}); refusing "
+            "to harden an evidence path"
+        )
+
+
 def _harden_staging_permissions(staging_dir: Path) -> None:
     """Restrict the staging tree: directory 0700, every file 0600.
 
     Raw evidence can carry account/session-adjacent material; even though it
     lives outside the tracked tree, it must not be world- or group-readable on
     disk.  Runs after the layers finish writing, so files created by child
-    processes (with the host umask) are re-secured to owner-only."""
+    processes (with the host umask) are re-secured to owner-only.  Every path —
+    the staging root and every subdir/file — is lstat safety-checked before its
+    chmod (C-114 R6)."""
+    _lstat_safe_check(staging_dir, "staging dir")
     try:
         staging_dir.chmod(0o700)
     except OSError as exc:
@@ -615,6 +658,7 @@ def _harden_staging_permissions(staging_dir: Path) -> None:
             f"cannot harden staging dir {staging_dir}: {exc}"
         ) from exc
     for path in sorted(staging_dir.rglob("*")):
+        _lstat_safe_check(path, "staging path")
         try:
             if path.is_dir():
                 path.chmod(0o700)
@@ -626,18 +670,51 @@ def _harden_staging_permissions(staging_dir: Path) -> None:
             ) from exc
 
 
+_SECRET_ENV_NAME_RE = re.compile(
+    r"(?i)(api[_-]?key|token|secret|passwd|password)"
+)
+
+# Known secret-bearing environment variables beyond the model candidates: the
+# bridge token plus travel/supplier credentials the evidence can touch (Amap,
+# Booking, Amadeus) and additional model providers.
+_SECRET_ENV_CANDIDATES = (
+    "TRIPCHORD_BROWSER_BRIDGE_TOKEN",
+    *_MODEL_API_KEY_ENV_CANDIDATES,
+    "AMAP_API_KEY",
+    "BOOKING_API_TOKEN",
+    "AMADEUS_CLIENT_SECRET",
+    "DEEPSEEK_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+)
+
+
 def _evidence_secrets() -> tuple[str, ...]:
     """Active secret values that must never appear in evidence: the bridge token
-    plus any model API key configured on the host.  Deduplicated, order kept."""
-    secrets = [
-        value
-        for value in (
-            _bridge_token(),
-            os.environ.get("MODEL_API_KEY", ""),
-            os.environ.get("TRIPCHORD_MODEL_API_KEY", ""),
+    plus every API key / token / secret configured on the host.  Deduplicated,
+    order kept.
+
+    Covers the model providers (OpenAI, Anthropic, DeepSeek, Gemini, Azure…),
+    the travel/supplier credentials (Amap, Booking, Amadeus) and any other
+    ``*_API_KEY`` / ``*_TOKEN`` / ``*_SECRET`` environment variable the host has
+    exported — so a newly added provider key cannot silently bypass the scan
+    (C-114 R4).
+    """
+    secrets: list[str] = []
+    for name in _SECRET_ENV_CANDIDATES:
+        value = (
+            _bridge_token()
+            if name == "TRIPCHORD_BROWSER_BRIDGE_TOKEN"
+            else os.environ.get(name, "")
         )
-        if value
-    ]
+        if value:
+            secrets.append(value)
+    for name, value in os.environ.items():
+        if name in _SECRET_ENV_CANDIDATES:
+            continue
+        if value and _SECRET_ENV_NAME_RE.search(name):
+            secrets.append(value)
     return tuple(dict.fromkeys(secrets))
 
 
@@ -743,8 +820,13 @@ def _secret_scan_paths(
         _verify_evidence_file_safety(path, label)
         try:
             data = path.read_bytes()
-        except OSError:
-            continue
+        except OSError as exc:
+            # Fail closed (C-114 R4): an unreadable evidence file could hide a
+            # secret.  Report only the category and file name — never content.
+            raise GateStateChangedError(
+                f"secret scan: cannot read {label} file {path.name} "
+                f"({exc.__class__.__name__}); refusing to certify evidence"
+            ) from exc
         for needle in active:
             if needle in data:
                 raise GateStateChangedError(
@@ -861,20 +943,55 @@ def layer5_real_canary(staging_dir: Path) -> LayerResult:
         env=_bridge_env(bridge_token),
         timeout=900,
     )
-    passed = code == 0
+    passed = False
+    canary_failures: list[str] = []
     try:
         report = json.loads(evidence_path.read_text(encoding="utf-8"))
-        for entry in report.get("scopes", []):
-            sub_checks.append(
-                {
-                    "name": entry.get("scope", "scope"),
-                    "passed": entry.get("passed", False),
-                    "drives_pass": True,
-                    "detail": entry.get("detail", ""),
-                }
-            )
-        status = report.get("companion_status") or {}
-        if not status.get("error") and "companions" in status:
+    except (OSError, ValueError):
+        report = None
+        canary_failures.append("canary evidence JSON missing or unreadable")
+    if report is not None:
+        # Layer verdict is driven by the certified canary JSON, never by the
+        # process exit code alone: a canary that exits 0 while reporting a
+        # failed/stale/unauthorized/incomplete scope set must fail the layer
+        # (C-114 review R2).
+        scopes = report.get("scopes")
+        if not isinstance(scopes, list) or not scopes:
+            canary_failures.append("canary carries no scopes")
+        else:
+            present: set[str] = set()
+            for entry in scopes:
+                if not isinstance(entry, dict):
+                    continue
+                scope = entry.get("scope")
+                if not isinstance(scope, str) or not scope:
+                    continue
+                present.add(scope)
+                ok = (
+                    entry.get("passed") is True
+                    and entry.get("fresh") is True
+                    and entry.get("authorized") is True
+                    and entry.get("read_only") is True
+                )
+                sub_checks.append(
+                    {
+                        "name": scope,
+                        "passed": ok,
+                        "drives_pass": True,
+                        "detail": entry.get("detail", ""),
+                    }
+                )
+                if not ok:
+                    canary_failures.append(
+                        f"{scope}: not fresh/authorized/read-only/passed"
+                    )
+            missing = sorted(_CERTIFIED_OTA_SCOPES - present)
+            if missing:
+                canary_failures.append("missing certified scopes: " + ", ".join(missing))
+        if report.get("passed") is not True:
+            canary_failures.append("canary passed != true")
+        status = report.get("companion_status")
+        if isinstance(status, dict) and not status.get("error") and "companions" in status:
             sub_checks.append(
                 {
                     "name": "companion_status",
@@ -883,15 +1000,17 @@ def layer5_real_canary(staging_dir: Path) -> LayerResult:
                     "detail": "local Browser Bridge companion status endpoint reachable",
                 }
             )
-    except (OSError, ValueError):
+    if canary_failures:
         sub_checks.append(
             {
                 "name": "certified_ota_canary",
-                "passed": passed,
+                "passed": False,
                 "drives_pass": True,
-                "detail": out[-300:],
+                "detail": "; ".join(canary_failures[:5]),
             }
         )
+    else:
+        passed = True
     return LayerResult(
         name="5_real_canary",
         passed=passed,
@@ -932,6 +1051,178 @@ def _extract_build_fingerprint(status_payload: Any) -> str | None:
     return None
 
 
+# The declared-certified OTA scopes layer 5 requires (companion heartbeat for
+# the browser providers, a real public API read for icom:transfer).  A canary
+# that omits, skips or stales any of these must fail the layer (C-114 review
+# R2): a certified canary is complete or it is not a canary.
+_CERTIFIED_OTA_SCOPES = frozenset(
+    {
+        "ctrip:flight",
+        "ctrip:lodging",
+        "qunar:flight",
+        "qunar:lodging",
+        "tongcheng:flight",
+        "icom:transfer",
+    }
+)
+
+
+def _resolve_live_state_db(explicit: Path | None = None) -> Path:
+    """The durable live-state SQLite file a live run must not pollute (C-114 R7).
+
+    Defaults to ``<repo-root>/tripchord.db`` — the same file the API's
+    ``DATABASE_URL`` default resolves to when launched from the repository root.
+    An explicit ``--live-state-db`` wins; a non-local ``DATABASE_URL`` /
+    ``TRIPCHORD_DATABASE_URL`` is ignored in favour of the default rather than
+    guessing at a remote host.
+    """
+    if explicit is not None:
+        return explicit
+    for key in ("DATABASE_URL", "TRIPCHORD_DATABASE_URL"):
+        url = os.environ.get(key)
+        if not url:
+            continue
+        # sqlite+aiosqlite:///./tripchord.db -> ./tripchord.db
+        match = re.search(r"sqlite(?:\+\w+)?:///(.*)$", url)
+        if match and match.group(1):
+            return ROOT / match.group(1)
+    return ROOT / "tripchord.db"
+
+
+def _live_state_lease_preflight(db_path: Path) -> list[str]:
+    """Read-only live-state preflight: residual queued/claimed leases.
+
+    Opens the SQLite file strictly read-only (``mode=ro``) so it can neither
+    clear nor extend a lease, and therefore cannot mask the very residual-lease
+    problem it exists to detect (C-114 R7).  A job whose status is ``queued`` or
+    ``running`` and whose lease has not yet expired is residual: a fresh live run
+    would contend with it.  Returns an empty list when the live state is
+    isolated; each non-empty entry names one residual lease (job id + status +
+    lease detail) so the runner can surface *which* live-state residue blocks the
+    run.
+    """
+    if not db_path.is_file():
+        return [f"live-state DB {db_path} missing; cannot prove lease isolation"]
+    try:
+        connection = sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True, timeout=5
+        )
+    except (OSError, sqlite3.Error) as exc:
+        return [
+            f"live-state DB {db_path} unreadable ({exc.__class__.__name__}); "
+            "cannot prove lease isolation"
+        ]
+    residual: list[str] = []
+    try:
+        rows = connection.execute(
+            "SELECT id, status, lease_expires_at FROM jobs "
+            "WHERE status IN ('queued', 'running')"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        return [
+            f"live-state DB {db_path} jobs query failed ({exc.__class__.__name__}); "
+            "cannot prove lease isolation"
+        ]
+    finally:
+        connection.close()
+    now = datetime.now(UTC)
+    for job_id, status, lease_raw in rows:
+        if lease_raw is None:
+            # queued/running with no lease bound is still residual: the job is
+            # pending/active work a fresh run would race with.
+            residual.append(
+                f"job {job_id} status={status} holds an active pending lease"
+            )
+            continue
+        try:
+            expires = datetime.fromisoformat(str(lease_raw))
+        except ValueError:
+            residual.append(
+                f"job {job_id} status={status} has unparseable lease {lease_raw!r}"
+            )
+            continue
+        if expires.replace(tzinfo=UTC) > now:
+            residual.append(
+                f"job {job_id} status={status} holds lease until {expires.isoformat()}"
+            )
+    return residual
+
+
+# The real ``run_live_done_gate_v4`` completion artifact carries its verdict in
+# ``done_gate.passed`` with the full itemised check set in ``done_gate.checks``
+# (LiveV4DoneGateReport).  The outer layer 6 must not trust a process exit code
+# or a forged top-level ``passed``: it requires the real 15-item check set, each
+# item present and passed (C-114 review R1).
+_V4_DONE_GATE_CHECK_NAMES = frozenset(
+    {
+        "prefrozen_stay_plan_candidate_set",
+        "v4_source_graph",
+        "stage_aware_exploration_publication_contract",
+        "stay_inventory_four_state_contract",
+        "planner_verifier_repair_master_stay_plan_chain",
+        "recommendable_date_pair_stay_plan_options",
+        "icom_exploration_and_publication_evidence",
+        "all_recommended_publication_closures",
+        "real_v4_browser_source_evidence",
+        "flight_search_outcome_contract",
+        "observed_cross_platform_overlap",
+        "strict_selected_plan_platform_coverage",
+        "planner_verifier_repair_orchestrator",
+        "exact_budget_and_selected_evidence",
+        "event_injection_repair_reverify_master",
+    }
+)
+
+
+def _done_gate_mismatches(runner_evidence: dict[str, Any]) -> list[str]:
+    """Validate the real layer-6 runner ``done_gate`` report contract.
+
+    The runner's completed bundle embeds ``done_gate`` (the
+    ``LiveV4DoneGateReport``): ``passed`` plus the full itemised ``checks``
+    tuple.  Fail closed on a missing/mis-nested report, a non-true verdict, a
+    missing/empty check list, any check that did not pass, or any of the 15
+    required check names absent — a partial or forged summary can never pass.
+    """
+    mismatches: list[str] = []
+    done_gate = runner_evidence.get("done_gate")
+    if not isinstance(done_gate, dict):
+        return [f"runner evidence carries no done_gate report ({done_gate!r})"]
+    if done_gate.get("passed") is not True:
+        mismatches.append(
+            f"runner done_gate.passed = {done_gate.get('passed')!r} (must be true)"
+        )
+    checks = done_gate.get("checks")
+    if not isinstance(checks, (list, tuple)) or not checks:
+        mismatches.append("runner done_gate.checks missing or empty")
+        return mismatches
+    present: set[str] = set()
+    failed: list[str] = []
+    malformed = 0
+    for item in checks:
+        if not isinstance(item, dict):
+            malformed += 1
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            malformed += 1
+            continue
+        present.add(name)
+        if item.get("passed") is not True:
+            failed.append(name)
+    if malformed:
+        mismatches.append(f"runner done_gate.checks has {malformed} malformed item(s)")
+    missing = sorted(_V4_DONE_GATE_CHECK_NAMES - present)
+    if missing:
+        mismatches.append(
+            "runner done_gate.checks missing required items: " + ", ".join(missing)
+        )
+    if failed:
+        mismatches.append(
+            "runner done_gate.checks not all passed: " + ", ".join(failed)
+        )
+    return mismatches
+
+
 def _runner_revision_mismatches(
     runner_evidence: dict[str, Any], expected: GitSnapshot, root: Path
 ) -> list[str]:
@@ -968,10 +1259,10 @@ def _runner_revision_mismatches(
     run_status = runner_evidence.get("run_status")
     if run_status != "completed":
         mismatches.append(f"runner run_status = {run_status!r} (must be 'completed')")
-    if runner_evidence.get("passed") is not True:
-        mismatches.append(
-            f"runner passed = {runner_evidence.get('passed')!r} (must be true)"
-        )
+    # The real completion artifact carries its verdict in done_gate.passed +
+    # done_gate.checks (LiveV4DoneGateReport), never a top-level ``passed``.
+    # Fail closed on any missing/mis-nested/failed check (C-114 review R1).
+    mismatches.extend(_done_gate_mismatches(runner_evidence))
     return mismatches
 
 
@@ -997,7 +1288,9 @@ def _runtime_provenance_mismatches(
     return provenance_mismatches(reported, expected)
 
 
-def layer6_full_e2e(staging_dir: Path, start: GitSnapshot) -> LayerResult:
+def layer6_full_e2e(
+    staging_dir: Path, start: GitSnapshot, *, live_state_db: Path | None = None
+) -> LayerResult:
     """Full-platform real E2E only when every external condition is met.
 
     Runs ``benchmarks/run_live_done_gate_v4.py`` as the real executor: live job
@@ -1011,6 +1304,12 @@ def layer6_full_e2e(staging_dir: Path, start: GitSnapshot) -> LayerResult:
     parsed and cross-verified against the gate's own git snapshot — HEAD SHA,
     toplevel, worktree cleanliness — and against the layer-5 canary's Companion
     build fingerprint.  Any mismatch hard-fails the layer.
+
+    Before the executor is allowed to submit a fresh live run, a read-only
+    live-state preflight (R7) must prove the durable job store holds no residual
+    queued/claimed lease: a leftover lease would contaminate the new run.  The
+    preflight only reads the DB — it can neither clear nor extend a lease, so it
+    cannot mask the very residue it exists to detect.
     """
     bridge_token = _bridge_token()
     model_acked = os.environ.get("TRIPCHORD_ACK_MODEL_COST") == "1"
@@ -1032,6 +1331,18 @@ def layer6_full_e2e(staging_dir: Path, start: GitSnapshot) -> LayerResult:
                 "pending user authorization: full real E2E runs the configured "
                 "model for Agent stages; set TRIPCHORD_ACK_MODEL_COST=1 to "
                 "authorise the bounded live model cost, then re-run"
+            ),
+        )
+    lease_problems = _live_state_lease_preflight(
+        _resolve_live_state_db(live_state_db)
+    )
+    if lease_problems:
+        return LayerResult(
+            name="6_full_e2e",
+            passed=False,
+            detail=(
+                "live-state lease preflight failed (residual queued/claimed "
+                "lease would contaminate this run): " + "; ".join(lease_problems)
             ),
         )
     output_path = staging_dir / "live-done-gate-v4.json"
@@ -1108,14 +1419,28 @@ def _applicable(layers: list[LayerResult]) -> list[LayerResult]:
     return [layer for layer in layers if not layer.skipped]
 
 
-def _new_staging_dir() -> Path:
+_RUN_ID_RE = re.compile(r"[0-9a-f]{12}")
+
+
+def _new_run_id() -> str:
+    """A short unique run identifier, bound into the staging path, the report
+    and the committed manifest so each run's evidence is attributable to exactly
+    one execution (C-114 R3)."""
+    return uuid.uuid4().hex[:12]
+
+
+def _new_staging_dir(run_id: str | None = None) -> Path:
     """A fresh git-ignored staging path for this run's evidence.
 
-    Returns only the path — ``main`` validates it before creating it, so a
-    rejected target never leaves a side-effect untracked directory behind.
+    The path embeds a timestamp plus a unique ``run_id`` (R3): two runs never
+    collide on the same staging directory, so evidence written by run A cannot
+    be silently reused by run B.  Returns only the path — ``main`` validates it
+    before creating it, so a rejected target never leaves a side-effect
+    untracked directory behind.
     """
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return RUNTIME_EVIDENCE_DIR / f"gate-{stamp}"
+    rid = run_id or _new_run_id()
+    return RUNTIME_EVIDENCE_DIR / f"gate-{stamp}-{rid}"
 
 
 def _require_outside_or_ignored(path: Path, label: str) -> None:
@@ -1173,6 +1498,11 @@ def _reject_target_conflict(path: Path, label: str, kind: str) -> None:
     report output path.  ``mkdir`` over an existing file, or ``os.replace``
     onto an existing directory, would otherwise surface a raw OSError outside
     the gate's error contract instead of a contractized exit 2.
+
+    A pre-existing staging directory must be *empty* (C-114 R3): evidence is
+    staged only into a directory this run created and populated itself.  An
+    existing non-empty directory is rejected so stale files from an earlier run
+    can never be swept into this run's committed trail.
     """
     try:
         exists = path.exists()
@@ -1186,6 +1516,22 @@ def _reject_target_conflict(path: Path, label: str, kind: str) -> None:
             f"{label} {path} exists and is not a directory; refusing to create "
             "a directory over a file"
         )
+    if kind == "dir" and is_dir:
+        # Exclusivity (R3): only a directory this run created and initially
+        # emptied is acceptable — an existing non-empty staging dir would mix
+        # stale evidence into the new run.
+        try:
+            has_entries = any(path.iterdir())
+        except OSError as exc:
+            raise GateStateChangedError(
+                f"{label} {path} exists but cannot be enumerated; refusing to "
+                f"reuse an unreadable staging dir: {exc}"
+            ) from exc
+        if has_entries:
+            raise GateStateChangedError(
+                f"{label} {path} already exists and is not empty; refusing to "
+                "write this run's evidence into a reused staging directory"
+            )
     if kind == "file" and is_dir:
         raise GateStateChangedError(
             f"{label} {path} exists and is a directory; refusing to write a "
@@ -1197,8 +1543,15 @@ def run_gate(
     staging_dir: Path,
     *,
     commit: str | None = None,
+    run_id: str | None = None,
+    live_state_db: Path | None = None,
 ) -> GateReport:
     """Run all six layers and return the report.
+
+    ``run_id`` uniquely identifies this execution (C-114 R3): it is bound into
+    the report so every consumed artifact is attributable to exactly one run.
+    A caller that pre-seeded the staging path with a run_id should pass the same
+    id here; otherwise a fresh one is generated.
 
     The repository is snapshotted *before* any layer runs (start) and again
     *after* the report is complete (end).  Layers write evidence only into
@@ -1219,7 +1572,7 @@ def run_gate(
         layer3_clean_chrome_fixtures(staging_dir),
         layer4_model_smoke(),
         layer5_real_canary(staging_dir),
-        layer6_full_e2e(staging_dir, start),
+        layer6_full_e2e(staging_dir, start, live_state_db=live_state_db),
     ]
     # B1 secret scan: bridge token + model API keys must never reach logs or
     # evidence.  Fail closed (exit-2 semantics) before any verdict is certified
@@ -1257,6 +1610,7 @@ def run_gate(
         schema_version=EVIDENCE_SCHEMA,
         generated_at=_now(),
         tested_commit_sha=tested_commit_sha,
+        run_id=run_id or _new_run_id(),
         toplevel=start.toplevel,
         branch=start.branch,
         worktree_dirty=start.worktree_dirty,
@@ -1277,6 +1631,10 @@ def _dump(report: GateReport, output_path: Path = OUTPUT_PATH) -> Path:
         separators=(",", ":"),
     )
     tmp.write_text(payload, encoding="utf-8")
+    # The report is owner-only even when ``--output`` points OUTSIDE the staging
+    # tree (C-114 R6): the tmp is sealed to 0600 before the atomic rename so the
+    # final file is 0600 regardless of the host umask or the target location.
+    tmp.chmod(0o600)
     os.replace(tmp, output_path)
     return output_path
 
@@ -1437,13 +1795,58 @@ def _live_e2e_manifest(staging_dir: Path) -> dict[str, Any] | None:
     }
 
 
+def _desensitize_scope_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Extract only independently-reviewable structural fields from one canary
+    scope's raw evidence — candidate identity, provider/scope bindings, quote
+    sample and query-result counts — never raw URLs, account/session values or
+    tokens (the compact must itself pass the final secret scan, C-114 R5)."""
+    safe: dict[str, Any] = {}
+    for key in (
+        "companion_id",
+        "adapter_version",
+        "contract_version",
+        "runtime_instance_id",
+        "options",
+        "searched_at",
+    ):
+        value = evidence.get(key)
+        if value is not None:
+            safe[key] = value
+    providers = evidence.get("providers")
+    if isinstance(providers, list):
+        safe["providers"] = sorted({p for p in providers if isinstance(p, str)})
+    authorized = evidence.get("authorized_scope_keys")
+    if isinstance(authorized, list):
+        safe["authorized_scope_keys"] = sorted(
+            {a for a in authorized if isinstance(a, str)}
+        )
+    sample = evidence.get("sample")
+    if isinstance(sample, dict):
+        safe["sample"] = {
+            "service_name": sample.get("service_name"),
+            "departure_at": sample.get("departure_at"),
+            "fare_amount": (
+                str(sample["fare_amount"]) if sample.get("fare_amount") is not None else None
+            ),
+            "currency": sample.get("currency"),
+        }
+    source_urls = evidence.get("source_urls")
+    if isinstance(source_urls, list):
+        # The read-only query bindings are proven by count + the quote sample,
+        # not by replaying raw URLs into a committed artifact.
+        safe["source_url_count"] = len(source_urls)
+    return safe
+
+
 def _compact_canary(staging_dir: Path) -> dict[str, Any] | None:
     """Desensitized, independently reviewable layer-5 compact artifact.
 
     Carries the full per-scope verdict (scope/kind/passed/fresh/authorized/
-    read_only) and companion identity/heartbeat fields, plus the SHA256 of the
-    raw ``live-canary-certified.json`` it was derived from.  It commits none of
-    the raw token/Cookie/account/full-URL bytes the raw file may hold.
+    read_only), the provider/scope and candidate bindings, the live query-result
+    and quote sample (icom), the certified-scope coverage thresholds, companion
+    identity/heartbeat fields, and the SHA256 of the raw
+    ``live-canary-certified.json`` it was derived from (C-114 R5).  It commits
+    none of the raw token/Cookie/account/full-URL bytes the raw file may hold.
     """
     path = staging_dir / "live-canary-certified.json"
     if not path.is_file():
@@ -1454,21 +1857,41 @@ def _compact_canary(staging_dir: Path) -> dict[str, Any] | None:
         return None
     companion_status = payload.get("companion_status") or {}
     companions = companion_status.get("companions") or []
+    scopes = payload.get("scopes") or []
+    seen = {entry.get("scope") for entry in scopes if isinstance(entry, dict)}
+    expected = sorted(_CERTIFIED_OTA_SCOPES)
+    coverage = {
+        "expected_scope_count": len(expected),
+        "expected_scopes": expected,
+        "observed_scope_count": len(seen),
+        "passed_scope_count": sum(
+            1 for entry in scopes if isinstance(entry, dict) and entry.get("passed") is True
+        ),
+        "missing": sorted(set(expected) - seen),
+    }
     return {
-        "schema_version": "tripchord-done-gate-layer5-compact-v1",
+        "schema_version": "tripchord-done-gate-layer5-compact-v2",
         "generated_at": payload.get("generated_at"),
         "passed": payload.get("passed"),
         "bridge_token_present": payload.get("bridge_token_present"),
+        "coverage": coverage,
         "scopes": [
             {
                 "scope": entry.get("scope"),
+                "provider": (
+                    str(entry.get("scope")).split(":", 1)[0]
+                    if isinstance(entry.get("scope"), str)
+                    else None
+                ),
                 "kind": entry.get("kind"),
                 "passed": entry.get("passed"),
                 "fresh": entry.get("fresh"),
                 "authorized": entry.get("authorized"),
                 "read_only": entry.get("read_only"),
+                "evidence": _desensitize_scope_evidence(entry.get("evidence") or {}),
             }
-            for entry in payload.get("scopes", [])
+            for entry in scopes
+            if isinstance(entry, dict)
         ],
         "companion_status": {
             "status": companion_status.get("status"),
@@ -1498,9 +1921,12 @@ def _compact_canary(staging_dir: Path) -> dict[str, Any] | None:
 def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
     """Desensitized, independently reviewable layer-6 compact artifact.
 
-    Carries the run status, repo revision, timeout/runner/event-injection
-    contracts, runtime identity and Companion preflight — never the raw
-    request/quote/URL/account content of the E2E run.
+    Carries the run status, the FULL 15-item done-gate check verdicts (which
+    cover the planner-verifier-repair chain, the exact budget + selected
+    evidence, and the event-injection repair/re-verify master), repo revision,
+    timeout/runner/event-injection contracts, runtime identity and Companion
+    preflight — never the raw request/quote/URL/account content of the E2E run
+    (C-114 R5).
     """
     path = staging_dir / "live-done-gate-v4.json"
     if not path.is_file():
@@ -1513,11 +1939,32 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
     rp = rb.get("runtime_provenance") or {}
     cp = payload.get("companion_preflight") or {}
     companions = cp.get("companions") or []
+    dg = payload.get("done_gate") or {}
+    checks = dg.get("checks") or []
+    done_gate = {
+        "passed": dg.get("passed"),
+        "check_count": len(checks),
+        "passed_check_count": sum(
+            1
+            for check in checks
+            if isinstance(check, dict) and check.get("passed") is True
+        ),
+        "checks": [
+            {
+                "name": check.get("name"),
+                "passed": check.get("passed"),
+                "summary": check.get("summary"),
+                "evidence_refs": check.get("evidence_refs"),
+            }
+            for check in checks
+            if isinstance(check, dict) and check.get("name")
+        ],
+    }
     return {
-        "schema_version": "tripchord-done-gate-layer6-compact-v1",
+        "schema_version": "tripchord-done-gate-layer6-compact-v2",
         "captured_at": payload.get("captured_at"),
         "run_status": payload.get("run_status"),
-        "done_gate_passed": (payload.get("done_gate") or {}).get("passed"),
+        "done_gate": done_gate,
         "repo_revision": payload.get("repo_revision"),
         "start_revision": payload.get("start_revision"),
         "failure": payload.get("failure"),
@@ -1611,6 +2058,7 @@ def _evidence_manifest(
     return {
         "schema_version": _MANIFEST_SCHEMA,
         "tested_commit_sha": report.tested_commit_sha,
+        "run_id": report.run_id,
         "evidence_commit": evidence_commit,
         "generated_at": report.generated_at,
         "toplevel": report.toplevel,
@@ -1762,6 +2210,41 @@ def _verify_evidence_contract(
                 f"evidence commit E manifest does not record compact artifact "
                 f"{tracked_rel} as committed"
             )
+        # C-114 R5: re-verify the committed compact CONTENT from E, not just its
+        # hash — it must parse and carry the independently reviewable fields the
+        # contract promises (layer-5 coverage + per-scope bindings, layer-6 full
+        # done-gate check set).
+        blob = _git("show", f"{evidence_commit}:{tracked_rel}", check=True, binary=True)
+        try:
+            compact = json.loads(blob.stdout.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise GateStateChangedError(
+                f"evidence commit E compact artifact {tracked_rel} is not valid JSON"
+            ) from exc
+        if not isinstance(compact, dict) or not isinstance(
+            compact.get("schema_version"), str
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E compact artifact {tracked_rel} has no "
+                "schema_version"
+            )
+        if staged_name == _COMPACT_CANARY_STAGED_NAME:
+            coverage = compact.get("coverage")
+            if not isinstance(coverage, dict) or not isinstance(
+                coverage.get("expected_scopes"), list
+            ):
+                raise GateStateChangedError(
+                    f"evidence commit E layer-5 compact {tracked_rel} lacks "
+                    "coverage thresholds"
+                )
+        elif staged_name == _COMPACT_E2E_STAGED_NAME:
+            done_gate = compact.get("done_gate")
+            checks = done_gate.get("checks") if isinstance(done_gate, dict) else None
+            if not isinstance(checks, list):
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} lacks the "
+                    "done-gate check set"
+                )
 
 
 def _git_parent(commit: str) -> str:
@@ -2103,6 +2586,16 @@ def main(argv: list[str] | None = None) -> int:
         help="require the tested HEAD to equal this commit SHA, else exit 2",
     )
     parser.add_argument(
+        "--live-state-db",
+        type=Path,
+        default=None,
+        help=(
+            "durable live-state SQLite file for the R7 read-only lease "
+            "preflight (default: <repo-root>/tripchord.db, or the local path "
+            "named by DATABASE_URL/TRIPCHORD_DATABASE_URL)"
+        ),
+    )
+    parser.add_argument(
         "--commit-evidence",
         action="store_true",
         help=(
@@ -2113,7 +2606,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    staging_dir = args.staging_dir or _new_staging_dir()
+    # One run_id per execution (C-114 R3): bound into the staging path (default
+    # dir) and threaded into the report so the evidence trail identifies exactly
+    # which run produced it.
+    run_id = _new_run_id()
+    staging_dir = args.staging_dir or _new_staging_dir(run_id)
     output_path = (
         staging_dir / "product-v1-done-gate.json"
         if args.output is None
@@ -2136,7 +2633,12 @@ def main(argv: list[str] | None = None) -> int:
         staging_dir.chmod(0o700)
         if args.output is not None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
-        report = run_gate(staging_dir, commit=args.commit)
+        report = run_gate(
+            staging_dir,
+            commit=args.commit,
+            run_id=run_id,
+            live_state_db=args.live_state_db,
+        )
     except (GateStateChangedError, OSError) as exc:
         if args.quiet:
             print(json.dumps({"passed": False, "summary": str(exc)}, sort_keys=True))
