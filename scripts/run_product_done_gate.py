@@ -1525,15 +1525,6 @@ def _assert_parent_is(commit: str, expected_parent: str, label: str) -> None:
         )
 
 
-def _assert_head_is(expected: str, label: str) -> None:
-    """Fail closed unless the current HEAD is exactly ``expected``."""
-    head = _git_snapshot().commit_sha
-    if head != expected:
-        raise GateStateChangedError(
-            f"{label}: HEAD moved to {head!r}, expected {expected!r}"
-        )
-
-
 def _restore_tracked_file(rel: str) -> None:
     """Restore one repo-relative file to its current HEAD state (or remove it
     when HEAD does not track it), so a failed commit-phase leaves no dirty
@@ -1571,13 +1562,23 @@ def _commit_evidence(
     *,
     start: GitSnapshot,
 ) -> str:
-    """Two-phase evidence commit.
+    """Two-phase evidence commit, atomically.
 
     Phase 1: ``E`` — a commit whose tree contains only evidence paths (the
     report at this point carries ``tested_commit_sha=S`` and ``evidence_commit``
     unset).  Phase 2: a thin pointer commit that fills ``evidence_commit=E``
     into the report so the authoritative record names both S and E, while never
     claiming E was tested at S.
+
+    Atomicity: neither phase moves the branch.  Both E and the pointer commit P
+    are materialized with ``git commit-tree`` off the current index tree, and
+    the branch only advances through a single compare-and-swap
+    ``git update-ref HEAD <P> <S>`` at the very end.  A failure in either phase,
+    the add, the write-tree, the commit-tree, or the update-ref therefore never
+    leaves the final HEAD on an intermediate E, never leaves a dirty
+    index/worktree, and never leaves a ``passed=true`` report without a
+    committed evidence trail: on any failure the working-tree writes are rolled
+    back to their HEAD state, the index is reset to HEAD, and the gate exits 2.
 
     Requires a clean start tree: the gate already verified end==start, and this
     phase must not sweep unrelated working-tree changes into E.
@@ -1587,11 +1588,9 @@ def _commit_evidence(
     evidence would land in a different repository between the run and this
     phase, the audit trail cannot claim it certifies ``tested_commit_sha``.
 
-    Parentage is hard-verified *after* each commit (``E^ == S``, pointer``^ ==
-    E``), closing the window between the entry snapshot and the actual commit.
-    On any failure the working-tree writes are rolled back to their HEAD state
-    and the index is unstaged, so a failed ``--commit-evidence`` never leaves
-    a report claiming ``passed=true`` with no committed evidence trail.
+    Parentage is hard-verified *after* each materialized commit (``E^ == S``,
+    ``pointer^ == E``), closing the window between the entry snapshot and the
+    actual commit.
     """
     if start.worktree_dirty:
         raise GateStateChangedError(
@@ -1641,53 +1640,57 @@ def _commit_evidence(
         copied.append(_MANIFEST_REL)
         if not copied:
             raise GateStateChangedError("no staged evidence to commit")
-        # Phase 1: stage only evidence paths and create E.  Both git calls
-        # hard-check the exit code: a failed add/commit must abort the phase,
-        # never be silently consumed and reported as a success.
+        # Phase 1: stage only evidence paths and materialize E via commit-tree.
+        # HEAD is NOT moved yet — a phase-1 failure can never leave an
+        # intermediate commit on the branch.  Every git call hard-checks its
+        # exit code: a failed add/write-tree/commit-tree aborts the phase.
         _git("add", "--", *copied, check=True)
         staged_paths = list(copied)
-        _git(
-            "commit",
+        e_tree = _git("write-tree", check=True).stdout.strip()
+        if not e_tree:
+            raise GateStateChangedError("evidence tree unreadable after write-tree")
+        evidence_commit = _git(
+            "commit-tree",
+            e_tree,
+            "-p",
+            report.tested_commit_sha,
             "-m",
             f"Done-Gate evidence for tested commit {report.tested_commit_sha} "
             f"({report.generated_at})",
             check=True,
-        )
-        evidence_commit = _git_snapshot().commit_sha
+        ).stdout.strip()
         if not evidence_commit:
             raise GateStateChangedError("evidence commit created but SHA unreadable")
-        # Atomic binding: E must be HEAD and its first parent must be the
-        # tested revision S (post-commit hard verify).
-        _assert_head_is(evidence_commit, "phase 1")
+        # Atomic binding: E's first parent must be the tested revision S
+        # (post-commit hard verify), and E must carry the contract files.
         _assert_parent_is(evidence_commit, report.tested_commit_sha, "evidence commit E")
-        # Hard-verify E actually contains the contract-required manifest and
-        # every committable evidence file (hash-matched against the staging
-        # originals).  Any missing/corrupted committed evidence fails the phase
-        # closed, never a silent success.
         _verify_evidence_contract(evidence_commit, staging_dir, manifest)
-        # Phase 2 entry re-verify: HEAD must still be E before the pointer commit.
-        _assert_head_is(evidence_commit, "phase 2 entry")
         # Phase 2: record evidence_commit=E in the report, re-stamp the manifest
-        # with the evidence-commit SHA, and point the audit trail.
+        # with the evidence-commit SHA, and materialize the pointer commit P.
+        # Still no branch move: P is created but HEAD is untouched.
         report.evidence_commit = evidence_commit
         _dump(report, tracked_report_path)
         _write_manifest(_evidence_manifest(staging_dir, report, evidence_commit=evidence_commit))
         _git("add", "--", str(tracked_report_path.relative_to(ROOT)), _MANIFEST_REL, check=True)
         staged_paths.extend([str(tracked_report_path.relative_to(ROOT)), _MANIFEST_REL])
-        _git(
-            "commit",
+        p_tree = _git("write-tree", check=True).stdout.strip()
+        if not p_tree:
+            raise GateStateChangedError("pointer tree unreadable after write-tree")
+        pointer_commit = _git(
+            "commit-tree",
+            p_tree,
+            "-p",
+            evidence_commit,
             "-m",
             f"Record Done-Gate evidence_commit={evidence_commit} for tested commit "
             f"{report.tested_commit_sha}",
             check=True,
-        )
-        pointer_commit = _git_snapshot().commit_sha
+        ).stdout.strip()
         if not pointer_commit:
             raise GateStateChangedError("pointer commit created but SHA unreadable")
-        # Phase 2 parent must be E, and the final tree must be clean.
-        _assert_parent_is(pointer_commit, evidence_commit, "phase 2 pointer commit")
-        # Phase-2 post-commit contract: the pointer tree must carry the manifest
+        # Phase 2 parent must be E, and the pointer tree must carry the manifest
         # with evidence_commit=E (field-completeness of the committed trail).
+        _assert_parent_is(pointer_commit, evidence_commit, "phase 2 pointer commit")
         committed_manifest_blob = _git(
             "show", f"{pointer_commit}:{_MANIFEST_REL}", check=True
         ).stdout
@@ -1701,9 +1704,15 @@ def _commit_evidence(
             raise GateStateChangedError(
                 "phase 2 manifest tested_commit_sha does not match the tested revision"
             )
+        # Atomic commit point: compare-and-swap HEAD from the tested revision S
+        # to P.  If a concurrent writer moved HEAD in the meantime, update-ref
+        # fails (non-zero exit, check=True) and the whole phase aborts — the
+        # branch never lands on an intermediate E and never loses the
+        # concurrent writer's commit.  This is the ONLY moment HEAD moves.
+        _git("update-ref", "HEAD", pointer_commit, report.tested_commit_sha, check=True)
         final = _git_snapshot()
         if final.commit_sha != pointer_commit:
-            raise GateStateChangedError("HEAD moved after the pointer commit")
+            raise GateStateChangedError("HEAD moved after the atomic ref update")
         if final.worktree_dirty:
             raise GateStateChangedError(
                 "evidence commit left the worktree dirty; refusing to certify"
@@ -1711,14 +1720,22 @@ def _commit_evidence(
         return evidence_commit
     except (GateStateChangedError, OSError) as exc:
         # Fail closed on disk too: never leave a report claiming passed=true
-        # with no evidence trail.  Restore every file this phase wrote and
-        # unstage whatever was staged, then propagate the failure.
+        # with no evidence trail.  HEAD was never moved before the atomic
+        # update-ref, so restore every file this phase wrote and reset the index
+        # to HEAD, then propagate the failure.
+        # The report object must also forget the in-flight evidence_commit: the
+        # trail was never installed, so any delivered report says None.
+        report.evidence_commit = None
         for target in written:
             try:
                 rel = str(target.relative_to(ROOT))
             except ValueError:
                 continue
             _restore_tracked_file(rel)
+        # Mixed reset: index back to HEAD (no working-tree writes; the files
+        # above were already restored).  Belt-and-suspenders alongside
+        # _unstage_paths so a failed phase never leaves a dirty index.
+        _git("reset", "-q", check=False)
         _unstage_paths(staged_paths)
         if isinstance(exc, OSError):
             raise GateStateChangedError(f"evidence commit I/O failure: {exc}") from exc

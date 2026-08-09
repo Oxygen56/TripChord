@@ -617,25 +617,58 @@ def test_git_check_raises_on_nonzero_exit(tmp_path: Path) -> None:
         gate._git("rev-parse", "HEAD", cwd=tmp_path, check=True)
 
 
+def _inject_git_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    subcmd: str,
+    when: int | None = None,
+    stderr: str = "injected failure",
+) -> None:
+    """Make ``gate._git`` fail on the ``when``-th (1-based) invocation of
+    ``subcmd`` (``when=None`` → the first invocation).  Failures surface exactly
+    as a real non-zero git exit would: ``check=True`` callers raise
+    ``GateStateChangedError``, ``check=False`` callers get a non-zero proc."""
+
+    real_git = gate._git
+    seen = 0
+
+    def fake_git(*args: str, **kwargs: object) -> subprocess.CompletedProcess:
+        nonlocal seen
+        if args and args[0] == subcmd:
+            seen += 1
+            if when is None or seen == when:
+                proc = subprocess.CompletedProcess(
+                    args, returncode=1, stdout=b"", stderr=stderr.encode()
+                )
+                if kwargs.get("check"):
+                    raise gate.GateStateChangedError(
+                        f"git {' '.join(args)} failed with exit 1: {stderr}"
+                    )
+                return proc
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(gate, "_git", fake_git)
+
+
 def test_main_exits_2_when_evidence_commit_fails(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """Real git lifecycle counter-example: a failed ``git commit`` (a real
-    pre-commit hook that exits non-zero) during the evidence-commit phase must
-    abort the gate with exit 2 — a commit failure must never be swallowed and
-    reported as a pass."""
+    """Real git lifecycle counter-example: a failed phase-1 ``commit-tree``
+    during the evidence-commit phase must abort the gate with exit 2 — a commit
+    failure must never be swallowed and reported as a pass, and the branch must
+    stay on the tested revision."""
     _patch_root(monkeypatch, clean_repo)
     _passing_layers(monkeypatch)
     _populate_required_evidence(staging_dir)
-    hook = clean_repo / ".git" / "hooks" / "pre-commit"
-    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-    hook.chmod(0o755)
+    _inject_git_failure(monkeypatch, "commit-tree", when=1)
 
+    head_before = _head(clean_repo)
     rc = gate.main(
         ["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"]
     )
 
     assert rc == 2
+    assert _head(clean_repo) == head_before
+    assert _porcelain(clean_repo) == ""
 
 
 def test_main_exits_2_when_head_moves_before_evidence_commit(
@@ -1014,9 +1047,9 @@ def test_main_commit_evidence_failure_marks_report_failed_on_disk(
     _patch_root(monkeypatch, clean_repo)
     _passing_layers(monkeypatch)
     _populate_required_evidence(staging_dir)
-    hook = clean_repo / ".git" / "hooks" / "pre-commit"
-    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-    hook.chmod(0o755)
+    # Fail the phase-2 pointer commit-tree: E exists as an object but the
+    # branch must never advance to it, and the report on disk must say passed.
+    _inject_git_failure(monkeypatch, "commit-tree", when=2)
 
     rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
     assert rc == 2
@@ -1859,3 +1892,143 @@ def test_secret_scan_allows_redacted_evidence(
         encoding="utf-8",
     )
     gate.run_gate(staging_dir)  # no raise
+
+
+# ---------------------------------------------------------------------------
+# Two-phase evidence-commit atomicity (A4: atomic ref update, no intermediate E)
+# ---------------------------------------------------------------------------
+
+
+def _passing_report_and_start(clean_repo: Path) -> tuple[gate.GateReport, gate.GitSnapshot]:
+    tested_sha = _head(clean_repo)
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha=tested_sha,
+        toplevel=str(clean_repo),
+        branch="main",
+        worktree_dirty=False,
+        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        passed=True,
+        summary="all applicable Done-Gate layers passed",
+        boundary="",
+    )
+    return report, _expected_snapshot(clean_repo)
+
+
+def _assert_phase_failure_is_atomic(
+    clean_repo: Path, staging_dir: Path, tested_sha: str
+) -> None:
+    """After any phase-1/phase-2/add/update-ref failure the branch must still be
+    at the tested revision, the object graph may not expose an intermediate E on
+    the branch, and the index + worktree must be byte-for-byte clean."""
+    assert _head(clean_repo) == tested_sha, "branch moved on a failed commit phase"
+    assert _porcelain(clean_repo) == "", "failed commit phase left a dirty tree"
+    # No intermediate commit may be reachable from the branch tip.
+    log = subprocess.run(
+        ["git", "-C", str(clean_repo), "log", "--oneline", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "Done-Gate evidence" not in log
+    assert "evidence_commit=" not in log
+
+
+def test_commit_evidence_phase1_add_failure_is_atomic(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A4 counter-example: a failed phase-1 ``git add`` leaves the branch on the
+    tested revision, no intermediate commit, and a clean index/worktree."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+    _inject_git_failure(monkeypatch, "add", when=1)
+
+    with pytest.raises(gate.GateStateChangedError):
+        gate._commit_evidence(staging_dir, report, start=start)
+    _assert_phase_failure_is_atomic(clean_repo, staging_dir, start.commit_sha)
+
+
+def test_commit_evidence_phase1_commit_failure_is_atomic(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A4 counter-example: a failed phase-1 ``commit-tree`` leaves the branch on
+    the tested revision — E is never installed as HEAD."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+    _inject_git_failure(monkeypatch, "commit-tree", when=1)
+
+    with pytest.raises(gate.GateStateChangedError):
+        gate._commit_evidence(staging_dir, report, start=start)
+    _assert_phase_failure_is_atomic(clean_repo, staging_dir, start.commit_sha)
+
+
+def test_commit_evidence_phase2_commit_failure_is_atomic(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A4 counter-example: a failed phase-2 ``commit-tree`` (after E was
+    materialized) leaves the branch on the tested revision — E is never
+    installed, so no intermediate commit pollutes the branch history."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+    _inject_git_failure(monkeypatch, "commit-tree", when=2)
+
+    with pytest.raises(gate.GateStateChangedError):
+        gate._commit_evidence(staging_dir, report, start=start)
+    _assert_phase_failure_is_atomic(clean_repo, staging_dir, start.commit_sha)
+
+
+def test_commit_evidence_update_ref_failure_is_atomic(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A4 counter-example: a failed compare-and-swap ``update-ref`` (the atomic
+    commit point) leaves the branch on the tested revision even though E and P
+    were fully materialized — the branch only advances atomically or not at
+    all."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+    _inject_git_failure(monkeypatch, "update-ref")
+
+    with pytest.raises(gate.GateStateChangedError):
+        gate._commit_evidence(staging_dir, report, start=start)
+    _assert_phase_failure_is_atomic(clean_repo, staging_dir, start.commit_sha)
+
+
+def test_commit_evidence_success_moves_head_once_atomically(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A4 positive control: on success HEAD lands exactly on the pointer commit
+    P whose parent is E, E's parent is the tested revision, and the tree is
+    clean — the atomic trail S -> E -> P is exactly what update-ref installed."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+
+    head = _head(clean_repo)
+    assert head != start.commit_sha
+    # P's parent is E, E's parent is S.
+    parent_p = subprocess.run(
+        ["git", "-C", str(clean_repo), "rev-parse", f"{head}^"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert parent_p == evidence_commit
+    parent_e = subprocess.run(
+        ["git", "-C", str(clean_repo), "rev-parse", f"{evidence_commit}^"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert parent_e == start.commit_sha
+    assert _porcelain(clean_repo) == ""
+    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["evidence_commit"] == evidence_commit
+    assert payload["passed"] is True
