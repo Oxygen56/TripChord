@@ -1,6 +1,8 @@
 # v1.0 Done-Gate 第十五轮（C-113）阶段评审：先修层2/3根因与证据合同/落盘/原子性
 
-> 结论：**修复已提交并验证，受控重启完成，层 5/6 仍待用户配对（推进中）** —— 本轮按监督续跑指令先修根因、不等待配对；四项缺陷（层 2/3 宿主 bridge-state 泄漏、证据合同缺层 5/6 原始输入、证据落盘权限/链接/秘密扫描、两阶段 commit 非原子）全部修复并有真实临时仓库反例测试；API 已 `launchctl kickstart -k` 受控重启并绑定新 HEAD。`passed=true` 仍受制于用户侧唯一动作：浏览器配对 Companion。
+> 结论：**修复已提交并验证，受控重启完成（C-114 更正：该重启绑定的是 `e862a98`，并非最终 HEAD），层 5/6 仍待用户配对（推进中）** —— 本轮按监督续跑指令先修根因、不等待配对；四项缺陷（层 2/3 宿主 bridge-state 泄漏、证据合同缺层 5/6 原始输入、证据落盘权限/链接/秘密扫描、两阶段 commit 非原子）全部修复并有真实临时仓库反例测试；API 已 `launchctl kickstart -k` 受控重启。
+>
+> **C-114 更正（2026-08-10）**：原结论中「API 已绑定新 HEAD」与「`passed=true` 仅受制于用户侧唯一动作（浏览器配对）」均不成立——独立代码审查在重启后又提出 8 项硬性要求（R1–R8：层 6 真实 schema 合同、层 5 真 JSON 判定、staging 独占/run_id/层3 exit-2、秘密扫描 fail-closed 与多类模型 key、compact 证据独立复核内容、symlink/hardlink/0600 落盘安全、只读 live-state lease preflight、文档结论更正与最终 HEAD 重启）。C-113 的 `e862a98` 重启早于这些修复，不能声称「绑定最终 HEAD」；最终代码与文档全部提交后需在真实最终 HEAD 再次受控重启并生成机器证据。
 
 ## 1. 层 2/3 根因：宿主 bridge-state 泄漏进测试 — 通过
 
@@ -25,11 +27,11 @@
 - **修复**：两阶段 commit 不再 `git commit` 移动分支两次——E 与指针提交 P 均用 `git commit-tree` 从当前 index tree 物化（HEAD 不动），分支只在最后通过**一次** `git update-ref HEAD <P> <S>` 比较-交换前进。任一阶段/add/write-tree/commit-tree/update-ref 失败：最终 HEAD 停在 S、无中间 E、index/worktree 干净、报告 `evidence_commit` 清空、`passed=true` 不落盘。
 - **反例**（真实临时仓库）：phase-1 add 失败、phase-1 commit-tree 失败、phase-2 commit-tree 失败、update-ref CAS 失败——分支均在 S、无可达中间提交、porcelain 为空；成功对照组断言 S→E→P 父链、`evidence_commit` 记录、树干净。
 
-## 5. 受控重启绑定新 HEAD — 完成（工程侧）
+## 5. 受控重启 — 工程侧完成，但绑定的是 C-113 中间 HEAD（C-114 更正）
 
 - API 由 launchd（`com.tripchord.live-api`）管理，plist 为加固版安全启动器（从 0600 文件读 token/key，无内嵌秘密）。
-- `launchctl kickstart -k gui/<uid>/com.tripchord.live-api` 受控重启；`/api/v1/agents/runtime` provenance 三哈希（`commit_sha=e862a98…`、`dependency_lock_sha256`、`live_system_source_sha256`）与本地树完全匹配；bridge token 保留、model key 加载、companion supervisor 运行。
-- 重启后工作树干净（恢复了被测试污染的 `benchmarks/results/browser-e2e.json` 时间戳）。
+- `launchctl kickstart -k gui/<uid>/com.tripchord.live-api` 受控重启；当时 `/api/v1/agents/runtime` provenance 三哈希（`commit_sha=e862a98…`、`dependency_lock_sha256`、`live_system_source_sha256`）与 C-113 本地树匹配。
+- **C-114 更正**：`e862a98` 是 C-113 的原子提交修复，其后独立审查又提出 R1–R8 八项硬性要求（见顶部结论），因此该重启**不构成**「绑定最终 HEAD」。最终代码与文档（含 R1–R8 全部修复）提交后，须在真实最终 HEAD 再次 `launchctl kickstart -k` 受控重启并核验 provenance 三哈希，才可声称 API 已绑定最终 HEAD。
 
 ## 当前仍不能声称
 
