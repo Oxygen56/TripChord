@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import httpx
@@ -17,7 +18,7 @@ def _provenance(**overrides: Any) -> dict[str, Any]:
         "dependency_lock_sha256": expected["dependency_lock_sha256"],
         "live_system_source_sha256": expected["live_system_source_sha256"],
         "started_at": "2026-08-10T00:00:00+00:00",
-        "pid": 4242,
+        "pid": os.getpid(),
         "python_version": "3.12",
         "python_executable": "/usr/bin/python3",
         **overrides,

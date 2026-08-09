@@ -394,7 +394,7 @@ def _matching_runner_evidence(root: Path) -> dict[str, object]:
                 "dependency_lock_sha256": None,
                 "live_system_source_sha256": None,
                 "started_at": "2026-08-10T00:00:00+00:00",
-                "pid": 4242,
+                "pid": os.getpid(),
                 "python_version": "3.12",
                 "python_executable": "/usr/bin/python3",
             }
@@ -742,7 +742,7 @@ def test_main_exits_2_when_runner_evidence_missing_fields(
                 "dependency_lock_sha256": None,
                 "live_system_source_sha256": None,
                 "started_at": "2026-08-10T00:00:00+00:00",
-                "pid": 4242,
+                "pid": os.getpid(),
                 "python_version": "3.12",
                 "python_executable": "/usr/bin/python3",
             }
@@ -837,3 +837,244 @@ def test_runner_revision_mismatches_missing_run_status(
         evidence, _expected_snapshot(clean_repo), clean_repo
     )
     assert any("run_status" in item for item in mismatches)
+
+
+# ---------------------------------------------------------------------------
+# round 15 follow-up (supervisor 04:00 final review): staging-dir pre-write
+# validation ordering, commit-phase parent binding, fail-closed on-disk report,
+# and runtime provenance Python/start-time/process hard checks.  These are real
+# temp-repo lifecycle counter-examples: only layer execution is stubbed, the
+# git/validation/commit machinery is real.
+# ---------------------------------------------------------------------------
+
+
+def _porcelain(root: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
+def test_main_exits_2_when_staging_is_tracked_path(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    """A tracked repository path must be rejected as ``--staging-dir`` with
+    exit 2, leaving the porcelain byte-for-byte unchanged."""
+    _patch_root(monkeypatch, clean_repo)
+    before = _porcelain(clean_repo)
+    rc = gate.main(["--staging-dir", str(clean_repo / "tracked.txt"), "--quiet"])
+    assert rc == 2
+    assert _porcelain(clean_repo) == before
+
+
+def test_main_exits_2_when_staging_is_unignored_in_repo_path(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    """An un-ignored in-repo ``--staging-dir`` must be rejected *before* any
+    mkdir: the untracked directory must not exist afterwards (no side-effect
+    creation before validation)."""
+    _patch_root(monkeypatch, clean_repo)
+    before = _porcelain(clean_repo)
+    unignored = clean_repo / "unignored-dir" / "evidence"
+    rc = gate.main(["--staging-dir", str(unignored), "--quiet"])
+    assert rc == 2
+    assert _porcelain(clean_repo) == before
+    assert not unignored.exists()  # the directory was never created
+
+
+def test_main_exits_2_when_staging_is_file_conflict(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, tmp_path: Path
+) -> None:
+    """A ``--staging-dir`` that already exists as a file is a file conflict:
+    the gate must exit 2 instead of surfacing a raw FileExistsError."""
+    _patch_root(monkeypatch, clean_repo)
+    before = _porcelain(clean_repo)
+    conflict = tmp_path / "staging-file"
+    conflict.write_text("not a directory\n", encoding="utf-8")
+    rc = gate.main(["--staging-dir", str(conflict), "--quiet"])
+    assert rc == 2
+    assert _porcelain(clean_repo) == before
+
+
+def test_main_exits_2_when_output_is_directory_conflict(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, tmp_path: Path
+) -> None:
+    """A ``--output`` that already exists as a directory is rejected with exit
+    2 instead of a raw IsADirectoryError from os.replace."""
+    _patch_root(monkeypatch, clean_repo)
+    before = _porcelain(clean_repo)
+    conflict = tmp_path / "output-as-dir"
+    conflict.mkdir()
+    rc = gate.main(
+        ["--staging-dir", str(staging_dir), "--output", str(conflict), "--quiet"]
+    )
+    assert rc == 2
+    assert _porcelain(clean_repo) == before
+
+
+def test_commit_evidence_fails_when_head_moves_after_entry_snapshot(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """Counter-example: HEAD moves *after* the entry snapshot but before the
+    commit — the re-verify must abort before writing anything, leaving the
+    tree untouched."""
+    _patch_root(monkeypatch, clean_repo)
+    staging_dir.mkdir()
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha=_head(clean_repo),
+        toplevel=str(clean_repo),
+        branch="main",
+        worktree_dirty=False,
+        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        passed=True,
+        summary="all applicable Done-Gate layers passed",
+        boundary="",
+    )
+    start = _expected_snapshot(clean_repo)
+    # Concurrent writer moves HEAD after the entry snapshot.
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "commit", "--allow-empty", "-q", "-m", "moved"],
+        check=True,
+    )
+    with pytest.raises(gate.GateStateChangedError, match="HEAD moved"):
+        gate._commit_evidence(staging_dir, report, start=start)
+    # No tracked report was written and the porcelain is unchanged.
+    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
+    assert not report_path.exists()
+    assert _porcelain(clean_repo) == ""
+
+
+def test_commit_evidence_fails_on_real_git_add_error(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """Counter-example: a real ``git add`` failure (an existing index.lock)
+    must abort the phase, and the working tree must be rolled back so no
+    passed=true report without an evidence commit is left on disk."""
+    _patch_root(monkeypatch, clean_repo)
+    staging_dir.mkdir()
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha=_head(clean_repo),
+        toplevel=str(clean_repo),
+        branch="main",
+        worktree_dirty=False,
+        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        passed=True,
+        summary="all applicable Done-Gate layers passed",
+        boundary="",
+    )
+    start = _expected_snapshot(clean_repo)
+    (clean_repo / ".git" / "index.lock").write_text("locked\n", encoding="utf-8")
+
+    with pytest.raises(gate.GateStateChangedError, match="failed"):
+        gate._commit_evidence(staging_dir, report, start=start)
+
+    # Fail-closed on disk: no tracked report/evidence was left behind.
+    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
+    assert not report_path.exists()
+    assert _porcelain(clean_repo) == ""
+
+
+def test_main_commit_evidence_failure_marks_report_failed_on_disk(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A failed --commit-evidence phase must hard-fail the process AND write an
+    on-disk report whose JSON carries passed=false — asserting fields, not
+    just the return code."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    staging_dir.mkdir()
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    hook = clean_repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
+    assert rc == 2
+
+    report_path = staging_dir / "product-v1-done-gate.json"
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["passed"] is False
+    assert payload["evidence_commit"] is None
+    assert "evidence commit failed" in payload["summary"]
+    # The repository was rolled back to a clean tree after the failure.
+    assert _porcelain(clean_repo) == ""
+
+
+def test_runner_runtime_provenance_mismatches_bad_python_version(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    _patch_root(monkeypatch, clean_repo)
+    evidence = _matching_runner_evidence(clean_repo)
+    evidence["runtime_before_run"]["runtime_provenance"][  # type: ignore[index]
+        "python_version"
+    ] = "not-a-version"
+    mismatches = gate._runtime_provenance_mismatches(evidence, clean_repo)
+    assert any("python_version" in item for item in mismatches)
+
+
+def test_runner_runtime_provenance_mismatches_missing_python_version(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    _patch_root(monkeypatch, clean_repo)
+    evidence = _matching_runner_evidence(clean_repo)
+    evidence["runtime_before_run"]["runtime_provenance"].pop(  # type: ignore[index]
+        "python_version"
+    )
+    mismatches = gate._runtime_provenance_mismatches(evidence, clean_repo)
+    assert any("python_version" in item for item in mismatches)
+
+
+def test_runner_runtime_provenance_mismatches_relative_python_executable(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    _patch_root(monkeypatch, clean_repo)
+    evidence = _matching_runner_evidence(clean_repo)
+    evidence["runtime_before_run"]["runtime_provenance"][  # type: ignore[index]
+        "python_executable"
+    ] = ".venv/bin/python"
+    mismatches = gate._runtime_provenance_mismatches(evidence, clean_repo)
+    assert any("python_executable" in item for item in mismatches)
+
+
+def test_runner_runtime_provenance_mismatches_bad_started_at(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    _patch_root(monkeypatch, clean_repo)
+    evidence = _matching_runner_evidence(clean_repo)
+    evidence["runtime_before_run"]["runtime_provenance"]["started_at"] = "yesterday-ish"  # type: ignore[index]
+    mismatches = gate._runtime_provenance_mismatches(evidence, clean_repo)
+    assert any("started_at" in item for item in mismatches)
+
+
+def test_runner_runtime_provenance_mismatches_missing_started_at(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    _patch_root(monkeypatch, clean_repo)
+    evidence = _matching_runner_evidence(clean_repo)
+    evidence["runtime_before_run"]["runtime_provenance"].pop("started_at")  # type: ignore[index]
+    mismatches = gate._runtime_provenance_mismatches(evidence, clean_repo)
+    assert any("started_at" in item for item in mismatches)
+
+
+def test_runner_runtime_provenance_mismatches_dead_pid(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    _patch_root(monkeypatch, clean_repo)
+    evidence = _matching_runner_evidence(clean_repo)
+    evidence["runtime_before_run"]["runtime_provenance"]["pid"] = 2147483647  # type: ignore[index]
+    mismatches = gate._runtime_provenance_mismatches(evidence, clean_repo)
+    assert any("pid" in item for item in mismatches)

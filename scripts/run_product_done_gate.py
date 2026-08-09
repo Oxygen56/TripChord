@@ -849,11 +849,13 @@ def _applicable(layers: list[LayerResult]) -> list[LayerResult]:
 
 
 def _new_staging_dir() -> Path:
-    """A fresh git-ignored staging directory for this run's evidence."""
+    """A fresh git-ignored staging path for this run's evidence.
+
+    Returns only the path — ``main`` validates it before creating it, so a
+    rejected target never leaves a side-effect untracked directory behind.
+    """
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    path = RUNTIME_EVIDENCE_DIR / f"gate-{stamp}"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return RUNTIME_EVIDENCE_DIR / f"gate-{stamp}"
 
 
 def _require_outside_or_ignored(path: Path, label: str) -> None:
@@ -899,6 +901,35 @@ def _require_outside_or_ignored(path: Path, label: str) -> None:
         raise GateStateChangedError(
             f"{label} {path} is inside the repository but not git-ignored; "
             "evidence must be written outside the repo or into a git-ignored directory"
+        )
+
+
+def _reject_target_conflict(path: Path, label: str, kind: str) -> None:
+    """Reject a write target whose existing on-disk form conflicts with the
+    directory/file the gate must create — before any write (fail-closed, and
+    the repository porcelain stays byte-for-byte unchanged).
+
+    ``kind`` is ``"dir"`` for the staging directory and ``"file"`` for the
+    report output path.  ``mkdir`` over an existing file, or ``os.replace``
+    onto an existing directory, would otherwise surface a raw OSError outside
+    the gate's error contract instead of a contractized exit 2.
+    """
+    try:
+        exists = path.exists()
+        is_dir = path.is_dir()
+    except OSError:
+        exists, is_dir = False, False
+    if not exists:
+        return
+    if kind == "dir" and not is_dir:
+        raise GateStateChangedError(
+            f"{label} {path} exists and is not a directory; refusing to create "
+            "a directory over a file"
+        )
+    if kind == "file" and is_dir:
+        raise GateStateChangedError(
+            f"{label} {path} exists and is a directory; refusing to write a "
+            "report over a directory"
         )
 
 
@@ -1017,6 +1048,68 @@ def _copy_staged_evidence(staging_dir: Path) -> list[str]:
     return copied
 
 
+def _git_parent(commit: str) -> str:
+    """The first parent of ``commit``, fail-closed on an unreadable graph."""
+    parent = _git("rev-parse", "--verify", f"{commit}^", check=True).stdout.strip()
+    if not parent:
+        raise GateStateChangedError(f"commit {commit} has no readable parent")
+    return parent
+
+
+def _assert_parent_is(commit: str, expected_parent: str, label: str) -> None:
+    """Fail closed unless ``commit``'s first parent is exactly ``expected``.
+
+    This is the post-commit hard binding: even if HEAD moved in the small
+    window between the entry snapshot and the commit, E's parent (or the
+    pointer commit's parent) must still name the tested revision, so the
+    audit trail can never claim a parentage the gate did not observe.
+    """
+    actual = _git_parent(commit)
+    if actual != expected_parent:
+        raise GateStateChangedError(
+            f"{label} {commit} has parent {actual!r}, expected {expected_parent!r}; "
+            "the evidence trail would bind to the wrong revision"
+        )
+
+
+def _assert_head_is(expected: str, label: str) -> None:
+    """Fail closed unless the current HEAD is exactly ``expected``."""
+    head = _git_snapshot().commit_sha
+    if head != expected:
+        raise GateStateChangedError(
+            f"{label}: HEAD moved to {head!r}, expected {expected!r}"
+        )
+
+
+def _restore_tracked_file(rel: str) -> None:
+    """Restore one repo-relative file to its current HEAD state (or remove it
+    when HEAD does not track it), so a failed commit-phase leaves no dirty
+    uncommitted report/evidence behind on disk."""
+    target = ROOT / rel
+    probe = _git("show", f"HEAD:{rel}", check=False)
+    if probe.returncode == 0:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(probe.stdout.encode("utf-8"))
+    else:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _unstage_paths(paths: list[str]) -> None:
+    """Drop any index entries this phase staged for ``paths`` (index-only, no
+    working-tree change) so a failed commit leaves the repository clean."""
+    if not paths:
+        return
+    try:
+        _git("restore", "--staged", "--", *paths, check=False)
+    except GateStateChangedError:
+        # git restore unavailable/refused is not fatal for the fail-closed
+        # contract; the working-tree rollback still restores the files.
+        pass
+
+
 def _commit_evidence(
     staging_dir: Path,
     report: GateReport,
@@ -1038,6 +1131,12 @@ def _commit_evidence(
     tested revision the report records (TOCTOU guard): if HEAD moved or the
     evidence would land in a different repository between the run and this
     phase, the audit trail cannot claim it certifies ``tested_commit_sha``.
+
+    Parentage is hard-verified *after* each commit (``E^ == S``, pointer``^ ==
+    E``), closing the window between the entry snapshot and the actual commit.
+    On any failure the working-tree writes are rolled back to their HEAD state
+    and the index is unstaged, so a failed ``--commit-evidence`` never leaves
+    a report claiming ``passed=true`` with no committed evidence trail.
     """
     if start.worktree_dirty:
         raise GateStateChangedError(
@@ -1055,38 +1154,90 @@ def _commit_evidence(
             f"!= tested commit {report.tested_commit_sha!r}"
         )
     tracked_report_path = ROOT / "benchmarks" / "results" / "product-v1-done-gate.json"
-    # The report goes into E with tested_commit_sha=S and evidence_commit unset.
-    _dump(report, tracked_report_path)
-    copied = _copy_staged_evidence(staging_dir)
-    copied.append(str(tracked_report_path.relative_to(ROOT)))
-    if not copied:
-        raise GateStateChangedError("no staged evidence to commit")
-    # Phase 1: stage only evidence paths and create E.  Both git calls hard-
-    # check the exit code: a failed add/commit must abort the phase, never be
-    # silently consumed and reported as a success.
-    _git("add", "--", *copied, check=True)
-    _git(
-        "commit",
-        "-m",
-        f"Done-Gate evidence for tested commit {report.tested_commit_sha} "
-        f"({report.generated_at})",
-        check=True,
-    )
-    evidence_commit = _git_snapshot().commit_sha
-    if not evidence_commit:
-        raise GateStateChangedError("evidence commit created but SHA unreadable")
-    # Phase 2: record evidence_commit=E in the report and point the audit trail.
-    report.evidence_commit = evidence_commit
-    _dump(report, tracked_report_path)
-    _git("add", "--", str(tracked_report_path.relative_to(ROOT)), check=True)
-    _git(
-        "commit",
-        "-m",
-        f"Record Done-Gate evidence_commit={evidence_commit} for tested commit "
-        f"{report.tested_commit_sha}",
-        check=True,
-    )
-    return evidence_commit
+
+    # Re-verify HEAD right before the first write: a concurrent writer could
+    # have moved HEAD after the entry snapshot.  This narrows the TOCTOU
+    # window; the post-commit parent checks close it definitively.
+    current = _git_snapshot()
+    if current.commit_sha != report.tested_commit_sha:
+        raise GateStateChangedError(
+            f"refusing to commit evidence: HEAD moved to {current.commit_sha!r} "
+            f"since the entry snapshot (tested commit {report.tested_commit_sha!r})"
+        )
+
+    # Every file this phase may write, captured before any dump/copy so a
+    # failure can restore the working tree to its HEAD state (fail-closed on
+    # disk: no passed=true report without a committed evidence trail).
+    written: list[Path] = [tracked_report_path]
+    staged_paths: list[str] = []
+    try:
+        # The report goes into E with tested_commit_sha=S and evidence_commit unset.
+        _dump(report, tracked_report_path)
+        copied = _copy_staged_evidence(staging_dir)
+        written.extend(ROOT / rel for rel in copied)
+        copied.append(str(tracked_report_path.relative_to(ROOT)))
+        if not copied:
+            raise GateStateChangedError("no staged evidence to commit")
+        # Phase 1: stage only evidence paths and create E.  Both git calls
+        # hard-check the exit code: a failed add/commit must abort the phase,
+        # never be silently consumed and reported as a success.
+        _git("add", "--", *copied, check=True)
+        staged_paths = list(copied)
+        _git(
+            "commit",
+            "-m",
+            f"Done-Gate evidence for tested commit {report.tested_commit_sha} "
+            f"({report.generated_at})",
+            check=True,
+        )
+        evidence_commit = _git_snapshot().commit_sha
+        if not evidence_commit:
+            raise GateStateChangedError("evidence commit created but SHA unreadable")
+        # Atomic binding: E must be HEAD and its first parent must be the
+        # tested revision S (post-commit hard verify).
+        _assert_head_is(evidence_commit, "phase 1")
+        _assert_parent_is(evidence_commit, report.tested_commit_sha, "evidence commit E")
+        # Phase 2 entry re-verify: HEAD must still be E before the pointer commit.
+        _assert_head_is(evidence_commit, "phase 2 entry")
+        # Phase 2: record evidence_commit=E in the report and point the audit trail.
+        report.evidence_commit = evidence_commit
+        _dump(report, tracked_report_path)
+        _git("add", "--", str(tracked_report_path.relative_to(ROOT)), check=True)
+        staged_paths.append(str(tracked_report_path.relative_to(ROOT)))
+        _git(
+            "commit",
+            "-m",
+            f"Record Done-Gate evidence_commit={evidence_commit} for tested commit "
+            f"{report.tested_commit_sha}",
+            check=True,
+        )
+        pointer_commit = _git_snapshot().commit_sha
+        if not pointer_commit:
+            raise GateStateChangedError("pointer commit created but SHA unreadable")
+        # Phase 2 parent must be E, and the final tree must be clean.
+        _assert_parent_is(pointer_commit, evidence_commit, "phase 2 pointer commit")
+        final = _git_snapshot()
+        if final.commit_sha != pointer_commit:
+            raise GateStateChangedError("HEAD moved after the pointer commit")
+        if final.worktree_dirty:
+            raise GateStateChangedError(
+                "evidence commit left the worktree dirty; refusing to certify"
+            )
+        return evidence_commit
+    except (GateStateChangedError, OSError) as exc:
+        # Fail closed on disk too: never leave a report claiming passed=true
+        # with no evidence trail.  Restore every file this phase wrote and
+        # unstage whatever was staged, then propagate the failure.
+        for target in written:
+            try:
+                rel = str(target.relative_to(ROOT))
+            except ValueError:
+                continue
+            _restore_tracked_file(rel)
+        _unstage_paths(staged_paths)
+        if isinstance(exc, OSError):
+            raise GateStateChangedError(f"evidence commit I/O failure: {exc}") from exc
+        raise
 
 
 def _print_report(report: GateReport, output_path: Path, quiet: bool) -> None:
@@ -1153,7 +1304,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     staging_dir = args.staging_dir or _new_staging_dir()
-    staging_dir.mkdir(parents=True, exist_ok=True)
     output_path = (
         staging_dir / "product-v1-done-gate.json"
         if args.output is None
@@ -1161,13 +1311,21 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        # The gate may only write evidence outside the repo or into git-ignored
-        # paths; a tracked or un-ignored in-repo target is a fail-closed reject.
+        # Validate every write target *before* creating anything: a tracked,
+        # un-ignored, repo-root or on-disk-conflicting target must be rejected
+        # with exit-2 semantics and must leave the repository porcelain
+        # byte-for-byte unchanged (no side-effect mkdir before validation).
         _require_outside_or_ignored(staging_dir, "staging dir")
+        _reject_target_conflict(staging_dir, "staging dir", kind="dir")
         if args.output is not None:
             _require_outside_or_ignored(args.output, "output path")
+            _reject_target_conflict(args.output, "output path", kind="file")
+        # Only now is it safe to create the write targets.
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
         report = run_gate(staging_dir, commit=args.commit)
-    except GateStateChangedError as exc:
+    except (GateStateChangedError, OSError) as exc:
         if args.quiet:
             print(json.dumps({"passed": False, "summary": str(exc)}, sort_keys=True))
         else:
@@ -1187,6 +1345,15 @@ def main(argv: list[str] | None = None) -> int:
             # not exist, so the phase failure hard-fails the whole gate (exit 2)
             # even when the layers themselves all passed.
             print(f"evidence commit failed: {exc}", file=sys.stderr)
+            # Fail closed on disk too: never deliver a report that claims
+            # passed=true while the evidence trail is missing.  The process
+            # already exits 2; the on-disk JSON must carry the same verdict.
+            report.passed = False
+            report.summary = (
+                f"{report.summary} (evidence commit failed; gate result voided)"
+                if report.summary
+                else "evidence commit failed; gate result voided"
+            )
             _dump(report, output_path)
             _print_report(report, output_path, args.quiet)
             return 2

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -31,14 +32,20 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 _GIT_ENV_KEEP = frozenset({"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"})
 
 # Fields that must match between a running API and the current tree.  ``pid``
-# is validated separately (must be a positive integer) because it is inherently
-# process-specific.
+# is validated separately (must be a positive integer naming a live process)
+# because it is inherently process-specific.
 _PROVENANCE_COMPARE_FIELDS = (
     "repo_toplevel",
     "commit_sha",
     "dependency_lock_sha256",
     "live_system_source_sha256",
 )
+
+# Python identity and startup-time are hard-validated per the C-101 runtime
+# contract: they are collected by the worker but are not part of the local-tree
+# comparison (the tree cannot know which interpreter a remote worker used), so
+# they are checked for presence and shape instead of equality.
+_PYTHON_VERSION_RE = re.compile(r"^\d+\.\d+(?:\.\d+)?")
 
 
 def _git_safe_env() -> dict[str, str]:
@@ -164,9 +171,53 @@ def provenance_mismatches(
             mismatches.append(
                 f"runtime provenance {key}={reported_value!r} != expected {expected_value!r}"
             )
+    # Process identity: the reported PID must be a positive integer that names
+    # a live process at check time — a dead worker cannot certify a running
+    # code identity even if its captured fields happen to match.
     pid = reported.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         mismatches.append(f"runtime provenance pid={pid!r} is not a positive integer")
+    else:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            mismatches.append(
+                f"runtime provenance pid={pid!r} does not name a live process"
+            )
+        except (PermissionError, OSError):
+            # PermissionError still means the process exists; other transient
+            # OSErrors are treated as present rather than failing the check.
+            pass
+    # Python identity: the worker must record a plausible interpreter version
+    # and an absolute executable path.
+    python_version = reported.get("python_version")
+    if not isinstance(python_version, str) or not _PYTHON_VERSION_RE.match(python_version):
+        mismatches.append(
+            f"runtime provenance python_version={python_version!r} is missing or malformed"
+        )
+    python_executable = reported.get("python_executable")
+    if (
+        not isinstance(python_executable, str)
+        or not python_executable
+        or not os.path.isabs(python_executable)
+    ):
+        mismatches.append(
+            f"runtime provenance python_executable={python_executable!r} is missing "
+            "or not an absolute path"
+        )
+    # Startup time format: ``started_at`` must be a parseable ISO-8601/RFC3339
+    # timestamp so the worker's start instant is auditable.
+    started_at = reported.get("started_at")
+    if not isinstance(started_at, str) or not started_at:
+        mismatches.append(f"runtime provenance started_at={started_at!r} is missing")
+    else:
+        try:
+            datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        except ValueError:
+            mismatches.append(
+                f"runtime provenance started_at={started_at!r} is not a valid "
+                "ISO-8601 timestamp"
+            )
     return mismatches
 
 
