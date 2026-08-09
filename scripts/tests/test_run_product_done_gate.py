@@ -370,6 +370,101 @@ def test_extract_build_fingerprint() -> None:
 
 
 # ---------------------------------------------------------------------------
+# layer 6 API runtime provenance cross-check (round 14 counter-examples)
+# ---------------------------------------------------------------------------
+
+
+def _matching_runner_evidence(root: Path) -> dict[str, object]:
+    # Temp repos have no uv.lock / live_system.py, so the expected fingerprints
+    # are None; the matching runtime also reports None, leaving toplevel and
+    # commit_sha as the meaningful compared fields.
+    return {
+        "run_status": "completed",
+        "passed": True,
+        "repo_revision": {
+            "toplevel": str(root),
+            "branch": "main",
+            "commit_sha": _head(root),
+            "worktree_dirty": False,
+        },
+        "runtime_before_run": {
+            "runtime_provenance": {
+                "repo_toplevel": str(root),
+                "commit_sha": _head(root),
+                "dependency_lock_sha256": None,
+                "live_system_source_sha256": None,
+                "started_at": "2026-08-10T00:00:00+00:00",
+                "pid": 4242,
+                "python_version": "3.12",
+                "python_executable": "/usr/bin/python3",
+            }
+        },
+    }
+
+
+def test_runner_runtime_provenance_accepts_matching(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    _patch_root(monkeypatch, clean_repo)
+    mismatches = gate._runtime_provenance_mismatches(
+        _matching_runner_evidence(clean_repo), clean_repo
+    )
+    assert mismatches == []
+
+
+def test_runner_runtime_provenance_mismatches_stale_commit(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    _patch_root(monkeypatch, clean_repo)
+    evidence = _matching_runner_evidence(clean_repo)
+    evidence["runtime_before_run"]["runtime_provenance"]["commit_sha"] = "0" * 40  # type: ignore[index]
+    mismatches = gate._runtime_provenance_mismatches(evidence, clean_repo)
+    assert any("commit_sha" in item for item in mismatches)
+
+
+def test_runner_runtime_provenance_mismatches_wrong_live_system_fingerprint(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    _patch_root(monkeypatch, clean_repo)
+    evidence = _matching_runner_evidence(clean_repo)
+    evidence["runtime_before_run"]["runtime_provenance"][  # type: ignore[index]
+        "live_system_source_sha256"
+    ] = "f" * 64
+    mismatches = gate._runtime_provenance_mismatches(evidence, clean_repo)
+    assert any("live_system_source_sha256" in item for item in mismatches)
+
+
+def test_runner_runtime_provenance_mismatches_wrong_lock_fingerprint(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    _patch_root(monkeypatch, clean_repo)
+    evidence = _matching_runner_evidence(clean_repo)
+    evidence["runtime_before_run"]["runtime_provenance"][  # type: ignore[index]
+        "dependency_lock_sha256"
+    ] = "e" * 64
+    mismatches = gate._runtime_provenance_mismatches(evidence, clean_repo)
+    assert any("dependency_lock_sha256" in item for item in mismatches)
+
+
+def test_runner_runtime_provenance_mismatches_foreign_toplevel(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    _patch_root(monkeypatch, clean_repo)
+    evidence = _matching_runner_evidence(clean_repo)
+    evidence["runtime_before_run"]["runtime_provenance"]["repo_toplevel"] = "/elsewhere"  # type: ignore[index]
+    mismatches = gate._runtime_provenance_mismatches(evidence, clean_repo)
+    assert any("repo_toplevel" in item for item in mismatches)
+
+
+def test_runner_runtime_provenance_mismatches_missing_bundle(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    _patch_root(monkeypatch, clean_repo)
+    mismatches = gate._runtime_provenance_mismatches({}, clean_repo)
+    assert any("runtime_before_run" in item for item in mismatches)
+
+
+# ---------------------------------------------------------------------------
 # two-phase evidence commit (defect fix ②)
 # ---------------------------------------------------------------------------
 

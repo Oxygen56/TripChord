@@ -41,6 +41,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from tripchord.runtime_provenance import local_expected_provenance, provenance_mismatches
+
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "benchmarks" / "results"
 OUTPUT_PATH = RESULTS_DIR / "product-v1-done-gate.json"
@@ -691,6 +693,28 @@ def _runner_revision_mismatches(
     return mismatches
 
 
+def _runtime_provenance_mismatches(
+    runner_evidence: dict[str, Any],
+    root: Path,
+) -> list[str]:
+    """Cross-check the runner's captured API runtime provenance.
+
+    The layer-6 executor records the running API's self-reported *startup*
+    provenance (``runtime_before_run.runtime_provenance``) before any live
+    search.  The gate re-derives the provenance the current tree claims and
+    hard-fails the layer on any mismatch: a worker started before a HEAD move,
+    or whose on-disk source changed without a restart, cannot certify the
+    commit this gate is testing.  This is deliberately stronger than trusting
+    the subprocess exit code or a working-tree ``git status``.
+    """
+    runtime_before = runner_evidence.get("runtime_before_run")
+    if not isinstance(runtime_before, dict):
+        return ["runner evidence carries no runtime_before_run"]
+    reported = runtime_before.get("runtime_provenance")
+    expected = local_expected_provenance(repo_root=root)
+    return provenance_mismatches(reported, expected)
+
+
 def layer6_full_e2e(staging_dir: Path, start: GitSnapshot) -> LayerResult:
     """Full-platform real E2E only when every external condition is met.
 
@@ -775,6 +799,10 @@ def layer6_full_e2e(staging_dir: Path, start: GitSnapshot) -> LayerResult:
                 f"Companion build fingerprint {runner_fingerprint} != "
                 f"layer-5 canary fingerprint {canary_fingerprint}"
             )
+        # Cross-check the API runtime identity recorded by the runner against
+        # the provenance the current tree claims (commit SHA + lock/source
+        # fingerprints).  A stale worker cannot certify the tested HEAD.
+        mismatches.extend(_runtime_provenance_mismatches(runner_evidence, ROOT))
     passed = code == 0 and not mismatches
     if passed:
         detail = f"full-platform real E2E passed; evidence {output_path}"

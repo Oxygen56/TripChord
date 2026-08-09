@@ -101,6 +101,7 @@ from tripchord.api import (
     AgentMemoryListResponse,
     AgentPlanningRequest,
     AgentPlanningResponse,
+    AgentRuntimeProvenance,
     AgentRuntimeStatusResponse,
     ConfirmPreferenceMemoryRequest,
     ConfirmPreferenceMemoryResponse,
@@ -208,6 +209,7 @@ from tripchord.providers.factory import build_amap_provider, build_provider_regi
 from tripchord.providers.icom_transfer import IComTransferProvider
 from tripchord.providers.user_snapshot import UserQuoteInput
 from tripchord.rate_limit import RateLimiter
+from tripchord.runtime_provenance import PROVENANCE
 from tripchord.security.secrets import redact_secrets
 
 _BROWSER_BRIDGE_MOUNT = "/browser-bridge"
@@ -1252,6 +1254,7 @@ async def agent_runtime_status_endpoint(
         fast_model=fast.model if fast is not None else None,
         model_trace_count=len(model_trace_sink.records),
         effective_flexible_timeout_seconds=_flexible_total_timeout_seconds(None),
+        runtime_provenance=AgentRuntimeProvenance(**PROVENANCE.to_dict()),
         memory_backend=(
             "single-process checksummed atomic JSON snapshot"
             if isinstance(memory_store, PersistentMemoryStore)

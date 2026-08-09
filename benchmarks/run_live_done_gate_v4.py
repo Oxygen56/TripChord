@@ -50,6 +50,7 @@ from tripchord.planning.package import (
 from tripchord.planning.stay_plans import (
     system_stay_plan_candidate_set,
 )
+from tripchord.runtime_provenance import validate_runtime_provenance
 
 try:
     from benchmarks.run_live_done_gate import (
@@ -122,6 +123,7 @@ _RUNTIME_EVIDENCE_FIELDS = (
     "model_trace_count",
     "effective_flexible_timeout_seconds",
     "rag_enabled",
+    "runtime_provenance",
 )
 
 
@@ -538,6 +540,24 @@ def _validate_runtime_timeout_contract(runtime: dict[str, Any]) -> None:
             "live-v4 runtime preflight failed before live search: "
             "runtime.effective_flexible_timeout_seconds must equal 3600; "
             f"observed {observed!r}"
+        )
+
+
+def _validate_runtime_provenance(runtime: dict[str, Any]) -> None:
+    """Fail before live search when the running API is not executing HEAD.
+
+    The running API reports its *startup* provenance (repo toplevel, commit
+    SHA, dependency-lock fingerprint, live_system source fingerprint).  It is
+    compared against the provenance the current checked-out tree claims, so a
+    worker started before a HEAD move, or whose on-disk source changed without
+    a restart, hard-fails here (exit 2) — the E2E cannot certify code it did
+    not actually run.
+    """
+    mismatches = validate_runtime_provenance(runtime, repo_root=_REPO_ROOT)
+    if mismatches:
+        raise RuntimeError(
+            "live-v4 runtime provenance preflight failed before live search: "
+            + "; ".join(mismatches)
         )
 
 
@@ -1522,6 +1542,8 @@ async def _run(args: argparse.Namespace) -> int:
                 runtime_before,
                 require_model_enhancement=require_model_enhancement,
             )
+            stage = "validate_runtime_provenance"
+            _validate_runtime_provenance(runtime_before)
             stage = "companion_preflight"
             companion = await _preflight_companion(
                 client,

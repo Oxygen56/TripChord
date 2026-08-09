@@ -173,6 +173,19 @@ class AgentPlanningResponse(ApiModel):
     run: TravelAgentRun
 
 
+class AgentRuntimeProvenance(ApiModel):
+    """Startup identity of the running API process (captured once at import)."""
+
+    repo_toplevel: str | None = None
+    commit_sha: str | None = None
+    started_at: str | None = None
+    pid: int | None = None
+    python_version: str | None = None
+    python_executable: str | None = None
+    dependency_lock_sha256: str | None = None
+    live_system_source_sha256: str | None = None
+
+
 class AgentRuntimeStatusResponse(ApiModel):
     codex_runtime_dependency: bool = False
     chatgpt_runtime_dependency: bool = False
@@ -197,6 +210,7 @@ class AgentRuntimeStatusResponse(ApiModel):
     browser_companion_supervisor_attempt_count: int = Field(default=0, ge=0)
     browser_companion_last_reconcile: BrowserCompanionBuildReconcileResponse | None = None
     rag_enabled: bool = True
+    runtime_provenance: AgentRuntimeProvenance | None = None
     rag_boundary: str = (
         "只检索用户偏好、历史决策、平台能力与非实时证据；实时价格、余票和库存禁止进入 RAG。"
     )

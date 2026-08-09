@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import stat
+import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +31,7 @@ from tripchord.planning.package import (
     QuoteAvailability,
 )
 from tripchord.planning.stay_plans import system_stay_plan_candidate_set
+from tripchord.runtime_provenance import local_expected_provenance
 
 from benchmarks import run_live_done_gate_v4
 
@@ -53,6 +56,7 @@ def _runtime_payload(*, model_trace_count: int = 7) -> dict[str, Any]:
         "model_trace_count": model_trace_count,
         "effective_flexible_timeout_seconds": 3600,
         "rag_enabled": True,
+        "runtime_provenance": _runtime_provenance_payload(),
     }
 
 
@@ -2091,3 +2095,98 @@ def test_repo_revision_detects_mid_run_change(
     _subprocess.run(["git", "-C", str(tmp_path), "checkout", "--", "tracked.txt"], check=True)
     unchanged = run_live_done_gate_v4._repo_revision(start)
     assert unchanged.get("revision_changed_during_run") is None
+
+
+# ---------------------------------------------------------------------------
+# runtime provenance preflight (round 14 counter-examples: all exit 2)
+# ---------------------------------------------------------------------------
+
+
+def _runtime_provenance_payload(
+    *,
+    commit_sha: str | None = None,
+    repo_toplevel: str | None = None,
+    dependency_lock_sha256: str | None = None,
+    live_system_source_sha256: str | None = None,
+    pid: int | None = None,
+) -> dict[str, Any]:
+    expected = local_expected_provenance()
+    return {
+        "repo_toplevel": expected["repo_toplevel"] if repo_toplevel is None else repo_toplevel,
+        "commit_sha": expected["commit_sha"] if commit_sha is None else commit_sha,
+        "dependency_lock_sha256": (
+            expected["dependency_lock_sha256"]
+            if dependency_lock_sha256 is None
+            else dependency_lock_sha256
+        ),
+        "live_system_source_sha256": (
+            expected["live_system_source_sha256"]
+            if live_system_source_sha256 is None
+            else live_system_source_sha256
+        ),
+        "started_at": "2026-08-10T00:00:00+00:00",
+        "pid": os.getpid() if pid is None else pid,
+        "python_version": "3.12",
+        "python_executable": sys.executable,
+    }
+
+
+def _runtime_with_provenance(**overrides: Any) -> dict[str, Any]:
+    payload = _runtime_payload()
+    payload["runtime_provenance"] = _runtime_provenance_payload(**overrides)
+    return payload
+
+
+def test_v4_runtime_provenance_accepts_matching() -> None:
+    runtime = _runtime_with_provenance()
+    run_live_done_gate_v4._validate_runtime_provenance(runtime)
+
+
+def test_v4_runtime_provenance_rejects_stale_commit() -> None:
+    runtime = _runtime_with_provenance(commit_sha="0" * 40)
+    with pytest.raises(RuntimeError, match="commit_sha"):
+        run_live_done_gate_v4._validate_runtime_provenance(runtime)
+
+
+def test_v4_runtime_provenance_rejects_old_api_process() -> None:
+    # Counter-example: a worker started before the current HEAD reports its
+    # startup commit, which differs from the current tree — hard-fail (exit 2),
+    # never a pass based on a clean working tree alone.
+    runtime = _runtime_with_provenance(commit_sha="1" * 40)
+    with pytest.raises(RuntimeError, match="commit_sha"):
+        run_live_done_gate_v4._validate_runtime_provenance(runtime)
+
+
+def test_v4_runtime_provenance_rejects_head_changed_without_restart() -> None:
+    # Counter-example: HEAD moved after the worker started and the worker was
+    # not restarted — the running memory code is stale, exit 2.
+    runtime = _runtime_with_provenance(commit_sha="2" * 40)
+    with pytest.raises(RuntimeError, match="commit_sha"):
+        run_live_done_gate_v4._validate_runtime_provenance(runtime)
+
+
+def test_v4_runtime_provenance_rejects_wrong_live_system_fingerprint() -> None:
+    # Counter-example: the running live_system source differs from the current
+    # tree (changed on disk without a restart) — exit 2.
+    runtime = _runtime_with_provenance(live_system_source_sha256="3" * 64)
+    with pytest.raises(RuntimeError, match="live_system_source_sha256"):
+        run_live_done_gate_v4._validate_runtime_provenance(runtime)
+
+
+def test_v4_runtime_provenance_rejects_wrong_lock_fingerprint() -> None:
+    runtime = _runtime_with_provenance(dependency_lock_sha256="4" * 64)
+    with pytest.raises(RuntimeError, match="dependency_lock_sha256"):
+        run_live_done_gate_v4._validate_runtime_provenance(runtime)
+
+
+def test_v4_runtime_provenance_rejects_foreign_toplevel() -> None:
+    runtime = _runtime_with_provenance(repo_toplevel="/elsewhere")
+    with pytest.raises(RuntimeError, match="repo_toplevel"):
+        run_live_done_gate_v4._validate_runtime_provenance(runtime)
+
+
+def test_v4_runtime_provenance_rejects_missing_provenance() -> None:
+    runtime = dict(_runtime_payload())
+    del runtime["runtime_provenance"]
+    with pytest.raises(RuntimeError, match="no runtime_provenance"):
+        run_live_done_gate_v4._validate_runtime_provenance(runtime)
