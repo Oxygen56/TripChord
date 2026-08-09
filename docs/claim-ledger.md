@@ -86,6 +86,9 @@
 | 来源任务图 | `apps/api/tests/test_live_agent_system.py`、`docs/done-gate.md` | 当前 frozen-stay 每日期对 17 个逻辑 Source：13 浏览器 + 4 iCom；浏览器最多 6 个任务并发 | 不是 17 个浏览器标签同时打开；历史 v3 的 11+4 不能当当前任务图 |
 | 当前 live 长任务传输 | `benchmarks/run_live_done_gate_v4.py`、`benchmarks/scenarios/live-hgh-mle-aug-2026-v4.json`、`benchmarks/results/live-done-gate-v4-round17-async-v13.json`、runner/API tests | Round 17 已在真实三日期运行中完成异步 202 job、3600 秒预算、三个绑定 checkpoint 和 47/47 job-scoped 模型回执；旧长 HTTP 超时未再出现 | 只证明该次控制面完成；不证明持久队列、生产 SLA 或业务 Done-Gate，后者仍为 `done_gate_failed` |
 | Round 15/16 失败 lineage | `benchmarks/results/live-done-gate-v4-round15-async-v13.json`、`benchmarks/results/live-done-gate-v4-round16-async-v13.json` | Round 15 为 33/33 模型成功但旧 waiter/lease 唤醒问题；Round 16 为 32/32 成功、首 checkpoint 封存，第二 pair 暴露最终方案 lineage 校验问题；两处代码根因均已修复 | 两轮均为 `failed_before_done_gate`，仅作根因演进证据；不能替代 Round 17 或当前业务 gate |
+| C-114 R1–R8 修复与 gate 单测 | `scripts/run_product_done_gate.py`、`scripts/tests/test_run_product_done_gate.py`（121 项） | 层 6 按真实 `done_gate.checks` 15 项合同校验；层 5 只信 certified canary JSON；staging 独占+run_id+层3 exit-2；秘密扫描 fail-closed+全模型 key；compact 证据独立复核内容+提交后读回复核；lstat 拒 symlink/hardlink/非当前用户+`--output` 原子 0600；只读 live-state lease preflight | 单测通过不等于真实 OTA 门通过；层 5/6 的真实运行仍需用户配对与授权 |
+| C-114 最终 HEAD 受控重启 | `/api/v1/agents/runtime` provenance（`commit_sha=74cd75c`、`dependency_lock_sha256`、`live_system_source_sha256` 三哈希匹配，pid 存活） | API 已绑定**真实最终 HEAD** `74cd75c`（C-113 的 `e862a98` 是中间态，不构成绑定） | 只证明运行代码=最终 HEAD；不证明六层门通过 |
+| C-114 六层门重跑（run_id=`e5ba5325692d`） | `.runtime/done-gate-evidence/gate-20260809T233822Z-e5ba5325692d/product-v1-done-gate.json` | 层 1/2/3 PASS、层 4 skip（模型成本未授权）、层 5 FAIL（5 浏览器 scope 无 Companion、`icom:transfer` 7 选项 PASS）、层 6 FAIL（pending user authorization）；`passed=false` 退出码 2、无证据提交、工作树干净 | 不得把层 1–3 通过或 `icom:transfer` 单 scope 说成层 5/6 或 Done-Gate 通过；15 项 done_gate checks 未运行 |
 
 ## 后训练与全栈工程
 
