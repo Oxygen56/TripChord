@@ -123,6 +123,35 @@ def load_or_create_bridge_token(
     return token, True
 
 
+def _load_model_api_key(runtime_directory: Path, environment: dict[str, str]) -> None:
+    """Inject the model API key from the 0600 key file when env does not carry it.
+
+    The launchd job holds no secret in its plist (B2 hardening); the key file is
+    a current-user-owned regular file with exact mode 0600.  The key is only ever
+    placed into the uvicorn subprocess environment — never printed or logged.
+    """
+    if environment.get("MODEL_API_KEY") or environment.get("TRIPCHORD_MODEL_API_KEY"):
+        return
+    key_file = runtime_directory / "model-api-key"
+    try:
+        before = key_file.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        return
+    if before.st_uid != os.getuid():
+        return
+    if stat.S_IMODE(before.st_mode) != 0o600:
+        return
+    try:
+        key = key_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if key:
+        environment["MODEL_API_KEY"] = key
+        environment["TRIPCHORD_MODEL_API_KEY"] = key
+
+
 def run_live_api(*, port: int, repository: Path | None = None) -> int:
     if not 1 <= port <= 65_535:
         raise SystemExit("--port must be between 1 and 65535")
@@ -138,6 +167,7 @@ def run_live_api(*, port: int, repository: Path | None = None) -> int:
     environment["TRIPCHORD_BROWSER_BRIDGE_ENABLED"] = "true"
     environment["TRIPCHORD_BROWSER_BRIDGE_TOKEN"] = token
     environment["TRIPCHORD_BROWSER_COMPANION_AUTO_RELOAD_ENABLED"] = "true"
+    _load_model_api_key(runtime_directory, environment)
 
     print("TripChord 实时只读服务即将启动。", flush=True)
     print(f"Chrome 加载目录：{companion}", flush=True)

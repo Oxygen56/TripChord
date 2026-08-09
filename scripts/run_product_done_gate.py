@@ -29,6 +29,7 @@ Layer reference (contract section 六 v1.0):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -552,6 +553,38 @@ def _bridge_token() -> str:
     return candidate if candidate else ""
 
 
+def _bridge_env(bridge_token: str) -> dict[str, str]:
+    """Child env for canary/E2E runners: parent env plus the bridge token ONLY
+    via the TRIPCHORD_BROWSER_BRIDGE_TOKEN variable — never argv, so the token
+    stays out of the process list and command logs."""
+    env = dict(os.environ)
+    env["TRIPCHORD_BROWSER_BRIDGE_TOKEN"] = bridge_token
+    return env
+
+
+def _secret_scan_staging(staging_dir: Path, bridge_token: str) -> None:
+    """Fail closed if the bridge token appears anywhere in staging evidence.
+
+    The token must never reach logs or evidence.  Every staging file (reports,
+    canary JSON, E2E JSON, screenshots) is scanned for the token bytes; a leak
+    aborts the gate with exit-2 semantics before any verdict is certified.
+    """
+    needle = bridge_token.encode("utf-8")
+    if not needle:
+        return
+    for path in sorted(staging_dir.iterdir()):
+        if not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if needle in data:
+            raise GateStateChangedError(
+                f"secret leak: bridge token found in evidence file {path.name}"
+            )
+
+
 def layer5_real_canary(staging_dir: Path) -> LayerResult:
     """Every declared-certified real provider x vertical needs a live canary.
 
@@ -598,17 +631,19 @@ def layer5_real_canary(staging_dir: Path) -> LayerResult:
         )
 
     evidence_path = staging_dir / "live-canary-certified.json"
+    # The bridge token travels to the canary via the inherited environment, NEVER
+    # via argv: argv is visible in the process list and can leak into logs.  The
+    # child script reads TRIPCHORD_BROWSER_BRIDGE_TOKEN as its default token.
     code, out = _run(
         [
             "uv",
             "run",
             "python",
             "benchmarks/live_canary_certified.py",
-            "--bridge-token",
-            bridge_token,
             "--output",
             str(evidence_path),
         ],
+        env=_bridge_env(bridge_token),
         timeout=900,
     )
     passed = code == 0
@@ -785,6 +820,7 @@ def layer6_full_e2e(staging_dir: Path, start: GitSnapshot) -> LayerResult:
             ),
         )
     output_path = staging_dir / "live-done-gate-v4.json"
+    # Same B1 contract as layer 5: token via inherited env only, never argv.
     code, out = _run(
         [
             "uv",
@@ -793,12 +829,11 @@ def layer6_full_e2e(staging_dir: Path, start: GitSnapshot) -> LayerResult:
             "benchmarks/run_live_done_gate_v4.py",
             "--api-base",
             "http://127.0.0.1:8000",
-            "--bridge-token",
-            bridge_token,
             "--require-model-enhancement",
             "--output",
             str(output_path),
         ],
+        env=_bridge_env(bridge_token),
         timeout=4500,
     )
     mismatches: list[str] = []
@@ -971,6 +1006,9 @@ def run_gate(
         layer5_real_canary(staging_dir),
         layer6_full_e2e(staging_dir, start),
     ]
+    # B1 secret scan: the bridge token must never reach logs or evidence.  Fail
+    # closed (exit-2 semantics) before any verdict is certified if it does.
+    _secret_scan_staging(staging_dir, _bridge_token())
     applicable = _applicable(layers)
     passed = (
         not start.worktree_dirty
@@ -1054,15 +1092,188 @@ def _copy_staged_evidence(staging_dir: Path) -> list[str]:
         target = ROOT / tracked_rel
         # Skip targets the repository ignores: ``git add`` fails closed on
         # ignored paths, so copying one into the tracked tree would abort the
-        # commit phase and leave untrackable disk junk.  Such evidence stays in
-        # the (already ignored) staging dir — the committed E carries only the
-        # committable evidence.
+        # commit phase and leave untrackable disk junk.  Such evidence is still
+        # recorded by hash in the committed evidence manifest, so it is never
+        # silently dropped from the audit trail.
         if _git("check-ignore", "-q", "--", tracked_rel, check=False).returncode == 0:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(staged, target)
         copied.append(tracked_rel)
     return copied
+
+
+# The committed-evidence contract manifest.  The manifest is the *only* record
+# of the git-ignored sensitive live-* evidence that E may not carry: it lists
+# the SHA256 + size of every staging original (committed or not) plus redacted
+# layer-5/6 verdict fields, so the audit trail proves what raw evidence existed
+# and how it was ruled on, without committing token/Cookie/account/full-URL
+# bytes.  ``committed`` records whether the raw file itself landed in E.
+_MANIFEST_REL = "benchmarks/results/done-gate-evidence-manifest.json"
+_MANIFEST_SCHEMA = "tripchord-done-gate-evidence-manifest-v1"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 16), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _manifest_files(staging_dir: Path) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    for staged_name, tracked_rel in _EVIDENCE_TRACKED_PATHS:
+        staged = staging_dir / staged_name
+        if not staged.is_file():
+            continue
+        ignored = (
+            _git("check-ignore", "-q", "--", tracked_rel, check=False).returncode == 0
+        )
+        files.append(
+            {
+                "name": staged_name,
+                "tracked_path": tracked_rel,
+                "sha256": _sha256_file(staged),
+                "size_bytes": staged.stat().st_size,
+                "committed": not ignored,
+            }
+        )
+    return files
+
+
+def _canary_manifest(staging_dir: Path) -> dict[str, Any] | None:
+    """Redacted layer-5 canary verdict: scope keys + companion identity only."""
+    path = staging_dir / "live-canary-certified.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    companions = ((payload.get("companion_status") or {}).get("companions")) or []
+    comp = companions[0] if companions else {}
+    build = comp.get("build_identity") or {}
+    return {
+        "passed": payload.get("passed"),
+        "bridge_token_present": payload.get("bridge_token_present"),
+        "scopes": [
+            {"scope": entry.get("scope"), "passed": entry.get("passed")}
+            for entry in payload.get("scopes", [])
+        ],
+        "companion": {
+            "companion_id": comp.get("companion_id"),
+            "providers": comp.get("providers"),
+            "authorized_scope_keys": comp.get("authorized_scope_keys"),
+            "is_fresh": comp.get("is_fresh"),
+            "age_seconds": comp.get("age_seconds"),
+            "build_sha256": build.get("build_sha256"),
+        },
+    }
+
+
+def _live_e2e_manifest(staging_dir: Path) -> dict[str, Any] | None:
+    """Redacted layer-6 verdict: run status, repo revision, runtime identity and
+    Companion preflight — never the raw request/quote/URL/account content."""
+    path = staging_dir / "live-done-gate-v4.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    rb = payload.get("runtime_before_run") or {}
+    rp = rb.get("runtime_provenance") or {}
+    cp = payload.get("companion_preflight") or {}
+    companions = cp.get("companions") or []
+    comp = companions[0] if companions else {}
+    return {
+        "run_status": payload.get("run_status"),
+        "done_gate_passed": (payload.get("done_gate") or {}).get("passed"),
+        "repo_revision": payload.get("repo_revision"),
+        "runtime_before_run": {
+            "model_provider": rb.get("model_provider"),
+            "primary_model": rb.get("primary_model"),
+            "model_enabled": rb.get("model_enabled"),
+            "model_required": rb.get("model_required"),
+            "runtime_provenance": {
+                "repo_toplevel": rp.get("repo_toplevel"),
+                "commit_sha": rp.get("commit_sha"),
+                "python_version": rp.get("python_version"),
+                "pid": rp.get("pid"),
+            },
+        },
+        "companion_preflight": {
+            "status": cp.get("status"),
+            "companion_id": comp.get("companion_id"),
+            "authorized_scope_keys": comp.get("authorized_scope_keys"),
+        },
+    }
+
+
+def _evidence_manifest(
+    staging_dir: Path,
+    report: GateReport,
+    *,
+    evidence_commit: str | None = None,
+) -> dict[str, Any]:
+    """Build the committed-evidence contract manifest for a passing gate."""
+    return {
+        "schema_version": _MANIFEST_SCHEMA,
+        "tested_commit_sha": report.tested_commit_sha,
+        "evidence_commit": evidence_commit,
+        "generated_at": report.generated_at,
+        "toplevel": report.toplevel,
+        "branch": report.branch,
+        "files": _manifest_files(staging_dir),
+        "layer_verdicts": {
+            "5_real_canary": _canary_manifest(staging_dir),
+            "6_full_e2e": _live_e2e_manifest(staging_dir),
+        },
+    }
+
+
+def _write_manifest(manifest: dict[str, Any]) -> Path:
+    target = ROOT / _MANIFEST_REL
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    target.write_text(payload, encoding="utf-8")
+    return target
+
+
+def _verify_evidence_contract(
+    evidence_commit: str,
+    staging_dir: Path,
+    manifest: dict[str, Any],
+) -> None:
+    """Hard-verify E actually contains the contract-required manifest and every
+    file the manifest marks committed (with a matching SHA256).  Any missing or
+    corrupted committed evidence fails the phase closed (exit 2)."""
+    tree = _git(
+        "ls-tree", "-r", "--name-only", evidence_commit, check=True
+    ).stdout.strip().splitlines()
+    if _MANIFEST_REL not in tree:
+        raise GateStateChangedError(
+            f"evidence commit E {evidence_commit} missing required manifest"
+        )
+    for entry in manifest["files"]:
+        if not entry["committed"]:
+            continue
+        rel = entry["tracked_path"]
+        if rel not in tree:
+            raise GateStateChangedError(
+                f"evidence commit E {evidence_commit} missing committed file {rel}"
+            )
+        blob = _git("show", f"{evidence_commit}:{rel}", check=True, binary=True)
+        if hashlib.sha256(blob.stdout).hexdigest() != entry["sha256"]:
+            raise GateStateChangedError(
+                f"evidence commit E file {rel} sha256 mismatch with staged original"
+            )
 
 
 def _git_parent(commit: str) -> str:
@@ -1194,7 +1405,15 @@ def _commit_evidence(
         _dump(report, tracked_report_path)
         copied = _copy_staged_evidence(staging_dir)
         written.extend(ROOT / rel for rel in copied)
-        copied.append(str(tracked_report_path.relative_to(ROOT)))
+        # Evidence-contract manifest: records every staging original by SHA256
+        # (including the git-ignored live-* files E may not carry) plus the
+        # redacted layer-5/6 verdict fields.  The ignored raw evidence is thus
+        # never silently dropped from the audit trail even though E cannot
+        # commit its bytes.
+        manifest = _evidence_manifest(staging_dir, report)
+        manifest_target = _write_manifest(manifest)
+        written.append(manifest_target)
+        copied.append(_MANIFEST_REL)
         if not copied:
             raise GateStateChangedError("no staged evidence to commit")
         # Phase 1: stage only evidence paths and create E.  Both git calls
@@ -1216,13 +1435,20 @@ def _commit_evidence(
         # tested revision S (post-commit hard verify).
         _assert_head_is(evidence_commit, "phase 1")
         _assert_parent_is(evidence_commit, report.tested_commit_sha, "evidence commit E")
+        # Hard-verify E actually contains the contract-required manifest and
+        # every committable evidence file (hash-matched against the staging
+        # originals).  Any missing/corrupted committed evidence fails the phase
+        # closed, never a silent success.
+        _verify_evidence_contract(evidence_commit, staging_dir, manifest)
         # Phase 2 entry re-verify: HEAD must still be E before the pointer commit.
         _assert_head_is(evidence_commit, "phase 2 entry")
-        # Phase 2: record evidence_commit=E in the report and point the audit trail.
+        # Phase 2: record evidence_commit=E in the report, re-stamp the manifest
+        # with the evidence-commit SHA, and point the audit trail.
         report.evidence_commit = evidence_commit
         _dump(report, tracked_report_path)
-        _git("add", "--", str(tracked_report_path.relative_to(ROOT)), check=True)
-        staged_paths.append(str(tracked_report_path.relative_to(ROOT)))
+        _write_manifest(_evidence_manifest(staging_dir, report, evidence_commit=evidence_commit))
+        _git("add", "--", str(tracked_report_path.relative_to(ROOT)), _MANIFEST_REL, check=True)
+        staged_paths.extend([str(tracked_report_path.relative_to(ROOT)), _MANIFEST_REL])
         _git(
             "commit",
             "-m",
@@ -1353,6 +1579,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     _dump(report, output_path)
+
+    if args.commit_evidence and not report.passed:
+        # A failed gate never commits evidence (A1): the staged evidence stays
+        # in the ignored/out-of-repo staging dir; HEAD, index and tracked files
+        # are left byte-for-byte unchanged — no _commit_evidence, no report
+        # write to the tracked results tree.  The staging report already
+        # carries the failed verdict, so exit 2 directly.
+        _print_report(report, output_path, args.quiet)
+        return 2
 
     if args.commit_evidence:
         try:

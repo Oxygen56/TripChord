@@ -1178,6 +1178,349 @@ def test_main_commit_evidence_skips_gitignored_evidence_end_to_end(
     assert _porcelain(clean_repo) == ""
 
 
+def test_main_failed_gate_never_commits_evidence(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A1 counter-example: a gate that fails MUST NEVER commit evidence.  With
+    --commit-evidence, a failed run keeps the evidence in the ignored/out-of-repo
+    staging dir and exits 2, leaving HEAD, commit parentage, porcelain and the
+    tracked results tree byte-for-byte unchanged — no _commit_evidence, no new
+    commit, no staged or tracked writes."""
+    _patch_root(monkeypatch, clean_repo)
+    for name in (
+        "layer1_reproducibility",
+        "layer2_replay",
+        "layer3_clean_chrome_fixtures",
+        "layer4_model_smoke",
+        "layer5_real_canary",
+    ):
+        monkeypatch.setattr(
+            gate,
+            name,
+            lambda *args, name=name: gate.LayerResult(name=name, passed=True),
+        )
+    monkeypatch.setattr(
+        gate,
+        "layer6_full_e2e",
+        lambda *args: gate.LayerResult(
+            name="6_full_e2e", passed=False, detail="real e2e failure"
+        ),
+    )
+    staging_dir.mkdir()
+    for name in (
+        "product-acceptance.json",
+        "browser-e2e.json",
+        "browser-e2e-screenshot.png",
+        "live-canary-certified.json",
+        "live-done-gate-v4.json",
+    ):
+        (staging_dir / name).write_bytes(b"{}\n" if name.endswith(".json") else b"PNG")
+
+    head_before = _head(clean_repo)
+    log_before = subprocess.run(
+        ["git", "-C", str(clean_repo), "log", "--format=%H %P", "-1"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    porcelain_before = _porcelain(clean_repo)
+    tracked_results = clean_repo / "benchmarks" / "results"
+    tracked_before = {
+        p.relative_to(clean_repo).as_posix(): p.read_bytes()
+        for p in sorted(tracked_results.rglob("*"))
+        if p.is_file()
+    }
+
+    rc = gate.main(
+        ["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"]
+    )
+
+    assert rc == 2
+    assert _head(clean_repo) == head_before
+    log_after = subprocess.run(
+        ["git", "-C", str(clean_repo), "log", "--format=%H %P", "-1"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert log_after == log_before
+    assert _porcelain(clean_repo) == porcelain_before
+    tracked_after = {
+        p.relative_to(clean_repo).as_posix(): p.read_bytes()
+        for p in sorted(tracked_results.rglob("*"))
+        if p.is_file()
+    }
+    assert tracked_after == tracked_before
+    # The failed verdict lives only in the ignored/out-of-repo staging report.
+    payload = json.loads(
+        (staging_dir / "product-v1-done-gate.json").read_text(encoding="utf-8")
+    )
+    assert payload["passed"] is False
+    assert payload["evidence_commit"] is None
+
+
+def test_commit_evidence_manifest_records_ignored_and_committed(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A2 counter-example: the committed evidence manifest must record EVERY
+    staging original by SHA256 — including git-ignored live-* files that E
+    cannot carry — plus redacted layer-5/6 verdict fields.  E must contain the
+    manifest and every committable file; the raw ignored evidence stays in the
+    staging dir only."""
+    _patch_root(monkeypatch, clean_repo)
+    (clean_repo / ".gitignore").write_text(
+        "/benchmarks/results/live-*\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(clean_repo), "add", ".gitignore"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "commit", "-q", "-m", "ignore live evidence"],
+        check=True,
+    )
+    staging_dir.mkdir()
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(
+            {
+                "passed": True,
+                "bridge_token_present": True,
+                "scopes": [{"scope": "x", "passed": True}],
+                "companion_status": {
+                    "companions": [
+                        {
+                            "companion_id": "comp-1",
+                            "providers": ["p"],
+                            "authorized_scope_keys": ["x"],
+                            "is_fresh": True,
+                            "age_seconds": 3,
+                            "build_identity": {"build_sha256": "abc123"},
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    tested_sha = _head(clean_repo)
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha=tested_sha,
+        toplevel=str(clean_repo),
+        branch="main",
+        worktree_dirty=False,
+        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        passed=True,
+        summary="all applicable Done-Gate layers passed",
+        boundary="",
+    )
+    start = _expected_snapshot(clean_repo)
+
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+
+    # E contains the manifest + committable evidence, never the ignored live-*.
+    tree = subprocess.run(
+        ["git", "-C", str(clean_repo), "ls-tree", "-r", "--name-only", evidence_commit],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert gate._MANIFEST_REL in tree
+    assert "benchmarks/results/product-acceptance.json" in tree
+    assert not any("live-" in p for p in tree)
+    # The manifest records both committed and ignored originals by hash.
+    manifest = json.loads(
+        (clean_repo / gate._MANIFEST_REL).read_text(encoding="utf-8")
+    )
+    by_name = {entry["name"]: entry for entry in manifest["files"]}
+    assert by_name["product-acceptance.json"]["committed"] is True
+    assert by_name["live-canary-certified.json"]["committed"] is False
+    assert by_name["live-canary-certified.json"]["sha256"] == gate._sha256_file(
+        staging_dir / "live-canary-certified.json"
+    )
+    assert manifest["schema_version"] == gate._MANIFEST_SCHEMA
+    assert manifest["tested_commit_sha"] == tested_sha
+    assert manifest["evidence_commit"] == evidence_commit
+    # Redacted layer-5 verdict: identity + scope verdict, never raw bytes.
+    verdict = manifest["layer_verdicts"]["5_real_canary"]
+    assert verdict["companion"]["companion_id"] == "comp-1"
+    assert verdict["passed"] is True
+    assert _porcelain(clean_repo) == ""
+
+
+def test_verify_evidence_contract_fails_closed_on_missing_manifest(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A2 counter-example: the post-commit contract verify must hard-fail (exit 2
+    semantics) when E lacks the contract-required manifest."""
+    _patch_root(monkeypatch, clean_repo)
+    staging_dir.mkdir()
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    tested_sha = _head(clean_repo)
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha=tested_sha,
+        toplevel=str(clean_repo),
+        branch="main",
+        worktree_dirty=False,
+        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        passed=True,
+        summary="all applicable Done-Gate layers passed",
+        boundary="",
+    )
+    manifest = gate._evidence_manifest(staging_dir, report)
+    # Commit E WITHOUT the manifest (as if the manifest write was skipped).
+    target = clean_repo / "benchmarks" / "results" / "product-acceptance.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text('{"passed": true}\n', encoding="utf-8")
+    subprocess.run(["git", "-C", str(clean_repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "commit", "-q", "-m", "bare evidence"],
+        check=True,
+    )
+    e_commit = _head(clean_repo)
+
+    with pytest.raises(gate.GateStateChangedError, match="missing required manifest"):
+        gate._verify_evidence_contract(e_commit, staging_dir, manifest)
+
+
+def test_verify_evidence_contract_fails_closed_on_missing_committed_file(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A2 counter-example: the contract verify must hard-fail when E carries the
+    manifest but is missing a file the manifest marks committed."""
+    _patch_root(monkeypatch, clean_repo)
+    staging_dir.mkdir()
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    tested_sha = _head(clean_repo)
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha=tested_sha,
+        toplevel=str(clean_repo),
+        branch="main",
+        worktree_dirty=False,
+        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        passed=True,
+        summary="all applicable Done-Gate layers passed",
+        boundary="",
+    )
+    manifest = gate._evidence_manifest(staging_dir, report)
+    # Commit E with the manifest but WITHOUT the committed evidence file it names.
+    results = clean_repo / "benchmarks" / "results"
+    results.mkdir(parents=True, exist_ok=True)
+    (results / gate._MANIFEST_REL.rsplit("/", 1)[-1]).write_text(
+        json.dumps(manifest, sort_keys=True), encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(clean_repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "commit", "-q", "-m", "manifest but no evidence"],
+        check=True,
+    )
+    e_commit = _head(clean_repo)
+
+    with pytest.raises(gate.GateStateChangedError, match="missing committed file"):
+        gate._verify_evidence_contract(e_commit, staging_dir, manifest)
+
+
+def test_layer5_bridge_token_env_only_not_argv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """B1 counter-example: the canary subprocess must receive the bridge token
+    via the inherited environment (TRIPCHORD_BROWSER_BRIDGE_TOKEN) and NEVER via
+    argv — argv is visible in the process list and logs."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    token = "B" * 64
+    monkeypatch.setattr(gate, "_bridge_token", lambda: token)
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> tuple[int, str]:
+        calls.append((cmd, kwargs))
+        return 0, ""
+
+    monkeypatch.setattr(gate, "_run", fake_run)
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps({"scopes": [], "companion_status": {}}), encoding="utf-8"
+    )
+    result = gate.layer5_real_canary(staging_dir)
+    assert result.passed is True
+    assert any(
+        any("live_canary_certified.py" in part for part in cmd) for cmd, _ in calls
+    )
+    for cmd, kwargs in calls:
+        if not any("live_canary_certified.py" in part for part in cmd):
+            continue
+        assert "--bridge-token" not in cmd
+        assert token not in cmd
+        assert kwargs["env"]["TRIPCHORD_BROWSER_BRIDGE_TOKEN"] == token  # type: ignore[index]
+
+
+def test_layer6_bridge_token_env_only_not_argv(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, tmp_path: Path
+) -> None:
+    """B1 counter-example: the E2E runner subprocess must also get the token via
+    env only — never argv."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    token = "C" * 64
+    monkeypatch.setattr(gate, "_bridge_token", lambda: token)
+    monkeypatch.setenv("TRIPCHORD_ACK_MODEL_COST", "1")
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> tuple[int, str]:
+        calls.append((cmd, kwargs))
+        return 0, ""
+
+    monkeypatch.setattr(gate, "_run", fake_run)
+    monkeypatch.setattr(gate, "_runner_revision_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr(gate, "_runtime_provenance_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr(gate, "_extract_build_fingerprint", lambda *a, **k: None)
+    start = _expected_snapshot(clean_repo)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps({"run_status": "completed", "done_gate": {"passed": "True"}}),
+        encoding="utf-8",
+    )
+    result = gate.layer6_full_e2e(staging_dir, start)
+    assert result.passed is True
+    assert any(
+        any("run_live_done_gate_v4.py" in part for part in cmd) for cmd, _ in calls
+    )
+    for cmd, kwargs in calls:
+        if not any("run_live_done_gate_v4.py" in part for part in cmd):
+            continue
+        assert "--bridge-token" not in cmd
+        assert token not in cmd
+        assert kwargs["env"]["TRIPCHORD_BROWSER_BRIDGE_TOKEN"] == token  # type: ignore[index]
+
+
+def test_secret_scan_fails_closed_on_token_in_evidence(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """B1 counter-example: a leak of the bridge token into any staging evidence
+    file aborts the gate with exit-2 semantics — the token must never reach
+    logs or evidence."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    staging_dir.mkdir()
+    token = "D" * 64
+    monkeypatch.setattr(gate, "_bridge_token", lambda: token)
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps({"leak": token}), encoding="utf-8"
+    )
+    with pytest.raises(gate.GateStateChangedError, match="secret leak"):
+        gate.run_gate(staging_dir)
+
+
 def test_runner_runtime_provenance_mismatches_bad_python_version(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path
 ) -> None:
