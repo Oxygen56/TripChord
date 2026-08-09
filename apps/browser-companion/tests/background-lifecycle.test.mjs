@@ -5756,6 +5756,151 @@ for (const [mutated, reason] of [
 }
 
 {
+  // A qunar lodging search list that keeps showing the realtime-search shell
+  // must seal the bounded-pending receipt as soon as the minimum observation
+  // window has elapsed (QUNAR_PENDING_MIN_OBSERVED_MS), instead of squandering
+  // the lease re-reading the same non-terminal DOM until near the extraction
+  // deadline.  Sealing early is what leaves budget for the audited detail-page
+  // fallback (orchestrateQunarLodgingDetails).
+  tabs.set(126, {
+    id: 126,
+    windowId: 1,
+    status: "complete",
+    url: "https://hotel.qunar.com/city/i-ka_maafushi/",
+  });
+  await chrome.tabs.update(900, { active: true });
+  let extractionCalls = 0;
+  const capturedObservedDurations = [];
+  sendMessageImpl = async (_tabId, message) => {
+    assert.equal(message.type, "tripchord:extract");
+    extractionCalls += 1;
+    const baseDetails = {
+      parser_version: hooks.LODGING_INVENTORY_RECEIPT_PARSER_VERSION,
+      dom_diagnostics: {
+        scope: "visible_candidate_cards_only",
+        max_candidates: 6,
+        candidates: [],
+        result_state_evidence: [
+          { tag: "div", class: "hotels-num", text_summary: "共 家酒店满足条件" },
+          { tag: "a", class: "clear js_clear", text_summary: "清空筛选条件" },
+          { tag: "p", class: "msg", text_summary: "请稍等,您查询的结果正在实时搜索中..." },
+          { tag: "span", class: "nopr", text_summary: "暂无报价" },
+        ],
+      },
+    };
+    const observed = message.driver && message.driver.bounded_pending_observed_ms;
+    if (Number.isInteger(observed) && observed >= hooks.QUNAR_PENDING_MIN_OBSERVED_MS) {
+      capturedObservedDurations.push(observed);
+      const receipt = {
+        schema_version: hooks.LODGING_INVENTORY_RECEIPT_SCHEMA_VERSION,
+        parser_version: hooks.LODGING_INVENTORY_RECEIPT_PARSER_VERSION,
+        provider: "qunar",
+        state: "bounded_provider_pending",
+        confirmed_query: {
+          destination: qunarLodgingQuery.destination,
+          start_date: qunarLodgingQuery.start_date,
+          end_date: qunarLodgingQuery.end_date,
+          adults: qunarLodgingQuery.adults,
+          rooms: qunarLodgingQuery.rooms,
+          options: { ...qunarLodgingQuery.options },
+        },
+        confirmation_scope: "confirmed_visible_search",
+        scan_limit: 12,
+        scanned_count: 0,
+        candidate_summaries: [],
+        explicit_empty_evidence: null,
+        provider_pending_evidence: {
+          contract_version: hooks.QUNAR_PENDING_CONTRACT_VERSION,
+          result_count_text: hooks.QUNAR_PENDING_RESULT_COUNT_TEXT,
+          pending_message: hooks.QUNAR_PENDING_MESSAGE,
+          observed_duration_ms: observed,
+        },
+        page_url: "https://hotel.qunar.com/city/i-ka_maafushi/",
+        captured_at: new Date().toISOString(),
+      };
+      const receiptSha256 = await hooks.inventoryReceiptSha256(
+        hooks.canonicalInventoryJson(receipt),
+      );
+      return {
+        ok: true,
+        result: {
+          state: "failed",
+          quotes: [],
+          failure: {
+            code: "extraction_error",
+            message: "精确住宿查询有界等待后仍处于平台实时搜索中",
+            retryable: false,
+            page_url: receipt.page_url,
+            captured_at: receipt.captured_at,
+            details: {
+              ...baseDetails,
+              inventory_result_state: "bounded_provider_pending",
+              confirmed_exhaustive: false,
+              scanned_count: 0,
+              candidate_summaries: [],
+              capture_code: "audited_qunar_bounded_realtime_search_pending",
+              inventory_receipt: receipt,
+              inventory_receipt_sha256: receiptSha256,
+            },
+          },
+        },
+      };
+    }
+    return {
+      ok: true,
+      result: {
+        state: "failed",
+        quotes: [],
+        failure: {
+          code: "dom_drift",
+          message: "页面已加载，但没有找到可验证的报价卡片",
+          retryable: false,
+          page_url: "https://hotel.qunar.com/city/i-ka_maafushi/",
+          captured_at: new Date().toISOString(),
+          details: baseDetails,
+        },
+      },
+    };
+  };
+  const extraction = await hooks.extractWithRetry(
+    126,
+    {
+      task_id: "qunar-lodging-early-pending-seal",
+      provider: "qunar",
+      kind: "lodging",
+      query: qunarLodgingQuery,
+    },
+    {
+      triggered: true,
+      confirmation_scope: "confirmed_visible_search",
+      confirmed_query: { ...qunarLodgingQuery },
+    },
+    Date.now() + 60000,
+    new Set([126]),
+  );
+  assert.equal(extraction.state, "failed");
+  assert.equal(extraction.failure.code, "extraction_error");
+  assert.equal(
+    extraction.failure.details.inventory_result_state,
+    "bounded_provider_pending",
+  );
+  assert.equal(capturedObservedDurations.length, 1);
+  assert.ok(
+    capturedObservedDurations[0] >= hooks.QUNAR_PENDING_MIN_OBSERVED_MS,
+    "pending receipt must be sealed only after the minimum observation window",
+  );
+  assert.ok(
+    capturedObservedDurations[0] < 40000,
+    "pending receipt must be sealed at the minimum window, not near the deadline",
+  );
+  assert.equal(
+    extraction.failure.details.inventory_receipt.provider_pending_evidence
+      .observed_duration_ms,
+    capturedObservedDurations[0],
+  );
+}
+
+{
   tabs.set(125, {
     id: 125,
     windowId: 1,

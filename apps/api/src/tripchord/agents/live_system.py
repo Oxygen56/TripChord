@@ -1466,6 +1466,24 @@ def _source_task_scope(task: AgentTask) -> ProviderScopeKey | None:
     return None
 
 
+def _browser_submission_scope(
+    submission: BrowserTaskSubmission,
+) -> ProviderScopeKey | None:
+    """Derive the frozen scope from a browser submission, or None when unmappable.
+
+    Mirrors ``_source_task_scope`` for submissions inside the search tool, so
+    the retry path can re-check the scope cancellation tombstone at the same
+    generation as the source executor.
+    """
+    kind = submission.kind if isinstance(submission.kind, str) else None
+    if kind in {"flight", "lodging"}:
+        return ProviderScopeKey(
+            provider=submission.provider,
+            vertical=ProviderVertical(kind),
+        )
+    return None
+
+
 def _record_scope_cancellation(
     state: _RunState,
     scope: ProviderScopeKey,
@@ -5069,6 +5087,50 @@ class LivePackageAgentSystem:
 
         return execute
 
+    def _scope_cancellation_suppressed_result(
+        self,
+        task: AgentTask,
+        scope: ProviderScopeKey,
+        generation: int,
+    ) -> AgentTaskResult:
+        """Build the deterministic tombstone-suppressed result for one source.
+
+        Every entry point that could reintroduce a cancelled scope must return
+        this shape instead of performing a browser/model/network access: the
+        attempt is late, ``external_tool_called`` is false, and the output can
+        never enter the Planner.  Used both at task start and re-checked after
+        a scheduled start delay / between retries so a scope cancelled while a
+        previous attempt was in flight stays closed.
+        """
+        output: dict[str, JsonValue] = {
+            "scope_cancelled": True,
+            "scope": scope.key,
+            "attempt_generation": generation,
+            "external_tool_called": False,
+        }
+        summary = f"{task.id} suppressed by scope cancellation tombstone"
+        topic = (
+            "public_transfer_result"
+            if "icom_query" in task.input
+            else "browser_result"
+        )
+        return AgentTaskResult(
+            task_id=task.id,
+            agent_role=task.role,
+            success=True,
+            summary=summary,
+            output=output,
+            evidence=(
+                self._evidence(
+                    task,
+                    topic=topic,
+                    subject=task.id,
+                    payload=output,
+                    source="tripchord:scope-cancellation-tombstone",
+                ),
+            ),
+        )
+
     def _source_executor(
         self,
         state: _RunState,
@@ -5150,42 +5212,21 @@ class LivePackageAgentSystem:
                         ),
                     )
             scope = _source_task_scope(task)
-            if scope is not None:
-                raw_generation = task.input.get("__tripchord_attempt_generation", 0)
-                attempt_generation = raw_generation if isinstance(raw_generation, int) else 0
-                if state.cancellation_tombstones.rejects(scope, attempt_generation):
-                    # A scope was cancelled earlier in this run (or carried over
-                    # from a previous generation).  This attempt is late: it must
-                    # not produce a browser/model/network access and its result
-                    # must never enter the Planner.
-                    tombstone_output: dict[str, JsonValue] = {
-                        "scope_cancelled": True,
-                        "scope": scope.key,
-                        "attempt_generation": attempt_generation,
-                        "external_tool_called": False,
-                    }
-                    summary = f"{task.id} suppressed by scope cancellation tombstone"
-                    topic = (
-                        "public_transfer_result"
-                        if "icom_query" in task.input
-                        else "browser_result"
-                    )
-                    return AgentTaskResult(
-                        task_id=task.id,
-                        agent_role=task.role,
-                        success=True,
-                        summary=summary,
-                        output=tombstone_output,
-                        evidence=(
-                            self._evidence(
-                                task,
-                                topic=topic,
-                                subject=task.id,
-                                payload=tombstone_output,
-                                source="tripchord:scope-cancellation-tombstone",
-                            ),
-                        ),
-                    )
+            raw_generation = task.input.get("__tripchord_attempt_generation", 0)
+            attempt_generation = raw_generation if isinstance(raw_generation, int) else 0
+            if (
+                scope is not None
+                and state.cancellation_tombstones.rejects(scope, attempt_generation)
+            ):
+                # A scope was cancelled earlier in this run (or carried over
+                # from a previous generation).  This attempt is late: it must
+                # not produce a browser/model/network access and its result
+                # must never enter the Planner.
+                return self._scope_cancellation_suppressed_result(
+                    task,
+                    scope,
+                    attempt_generation,
+                )
             try:
                 raw_delay = task.input.get("start_delay_ms", 0)
                 if not isinstance(raw_delay, int) or isinstance(raw_delay, bool):
@@ -5207,6 +5248,22 @@ class LivePackageAgentSystem:
                 }
                 if applied_delay_ms > 0:
                     await self._sleep(applied_delay_ms / 1000)
+                # Re-check the cancellation tombstone after the start delay:
+                # a source that was live when submitted may have had its scope
+                # cancelled while it slept.  Without this re-check a delayed
+                # task would still invoke the browser/model after the user
+                # closed the scope, leaking access (and its preserved/retry
+                # task could revive later).  Deterministic tombstone suppression
+                # — never touch the browser/model/network after cancellation.
+                if (
+                    scope is not None
+                    and state.cancellation_tombstones.rejects(scope, attempt_generation)
+                ):
+                    return self._scope_cancellation_suppressed_result(
+                        task,
+                        scope,
+                        attempt_generation,
+                    )
                 if "icom_query" in task.input:
                     call = ToolCall(
                         id=f"call:{task.id}",
@@ -5234,7 +5291,14 @@ class LivePackageAgentSystem:
                         tool_name=_BROWSER_SEARCH_TOOL,
                         task_id=task.id,
                         agent_role=task.role,
-                        arguments={"submission": task.input["submission"]},
+                        arguments={
+                            "submission": task.input["submission"],
+                            # Thread the attempt generation through the tool
+                            # call so the search tool's retry submission can
+                            # re-check the scope cancellation tombstone at the
+                            # same generation (see _browser_search_tool retry).
+                            "__tripchord_attempt_generation": attempt_generation,
+                        },
                     )
                     receipt = await tools.invoke(call)
                     snapshot_raw = receipt.output.get("snapshot")
@@ -6993,6 +7057,11 @@ class LivePackageAgentSystem:
         async def search(call: ToolCall) -> dict[str, JsonValue]:
             submission_raw = call.arguments.get("submission")
             submission = BrowserTaskSubmission.model_validate(submission_raw)
+            raw_generation = call.arguments.get("__tripchord_attempt_generation", 0)
+            attempt_generation = (
+                raw_generation if isinstance(raw_generation, int) else 0
+            )
+            retry_scope = _browser_submission_scope(submission)
             submitted_ids: list[str] = []
             attempts: list[BrowserTaskSnapshot] = []
             try:
@@ -7024,6 +7093,28 @@ class LivePackageAgentSystem:
                             "attempt_snapshots": _json_value(
                                 [value.model_dump(mode="json") for value in attempts]
                             ),
+                        }
+                    # Scope cancellation tombstone re-check before the retry:
+                    # if the user closed this scope (or the source timed out)
+                    # while attempt 0 was in flight, the retry — including the
+                    # preserved-result-tab reuse — would revive browser/model
+                    # access after cancellation, which is forbidden. Suppress
+                    # the retry and return attempt 0's terminal so the caller
+                    # sees the suppressed flag and never treats it as a live
+                    # result.
+                    if (
+                        retry_scope is not None
+                        and state.cancellation_tombstones.rejects(
+                            retry_scope,
+                            attempt_generation,
+                        )
+                    ):
+                        return {
+                            "snapshot": _json_value(terminal.model_dump(mode="json")),
+                            "attempt_snapshots": _json_value(
+                                [value.model_dump(mode="json") for value in attempts]
+                            ),
+                            "retry_suppressed_by_scope_cancellation": True,
                         }
                     # When the companion preserved the established result tab
                     # because the 90s extraction phase could not fit the

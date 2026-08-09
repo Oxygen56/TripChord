@@ -6,8 +6,16 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from tripchord.agents.live_system import LiveCoverageMode, LivePackageAgentSystem
+from tripchord.agents.live_system import (
+    LiveCoverageMode,
+    LivePackageAgentSystem,
+    _record_scope_cancellation,
+    _RunState,
+)
+from tripchord.agents.models import AgentRole, AgentTask
+from tripchord.agents.tools import ToolCall
 from tripchord.planning.package import PackageDecisionState, PackageIntent
+from tripchord.platform.capability import ProviderScopeKey, ProviderVertical
 from tripchord.providers.browser_bridge import (
     BRIDGE_TOKEN_HEADER,
     LIVE_V5_BROWSER_PROVIDERS,
@@ -308,3 +316,169 @@ async def test_source_timeouts_cancel_bridge_tasks_before_degraded_decision() ->
         for coverage in run.coverage
     )
     assert await bridge.claim("late-companion", limit=6) == ()
+
+
+class _ControlledSleep:
+    """Deterministic sleep that pauses until the test records the tombstone."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, seconds: float) -> None:
+        del seconds
+        self.started.set()
+        await self.release.wait()
+
+
+def _qunar_lodging_task(*, task_id: str, start_delay_ms: int | None = None) -> AgentTask:
+    submission = _submission(BrowserProvider.QUNAR)
+    input_: dict = {
+        "submission": submission.model_dump(mode="json"),
+        "__tripchord_attempt_generation": 0,
+    }
+    if start_delay_ms is not None:
+        input_["start_delay_ms"] = start_delay_ms
+    return AgentTask(
+        id=task_id,
+        role=AgentRole.LODGING,
+        goal="only-read qunar lodging quotes",
+        allowed_tools=("browser_bridge_search",),
+        input=input_,
+        max_attempts=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_scope_cancelled_during_start_delay_never_invokes_browser() -> None:
+    """Counter-example: a scope cancelled while a source sleeps in its start
+    delay must NOT invoke the browser after the delay.
+
+    A delayed source passes the task-start tombstone check (the scope was live
+    when it was submitted), then sleeps.  If the user closes the scope during
+    that sleep, the post-delay re-check must suppress the tool invoke:
+    zero browser/model/network access after cancellation.
+    """
+    bridge = _TrackingBridge()
+    sleep = _ControlledSleep()
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW, sleep=sleep)
+    state = _RunState(source_task_ids=("delayed-qunar-lodging",))
+    tools = system._tool_registry(state, source_task_count=1)
+    task = _qunar_lodging_task(
+        task_id="delayed-qunar-lodging",
+        start_delay_ms=120_000,
+    )
+    executor = system._source_executor(state)
+    run_task = asyncio.create_task(executor(task, None, tools))
+    await asyncio.wait_for(sleep.started.wait(), timeout=2)
+
+    # The user closes the lodging scope while the source is still delayed.
+    _record_scope_cancellation(
+        state,
+        ProviderScopeKey(provider="qunar", vertical=ProviderVertical.LODGING),
+        generation=0,
+        reason="user closed the lodging scope during the start delay",
+    )
+    sleep.release.set()
+
+    result = await run_task
+    assert result.success is True
+    assert result.output["scope_cancelled"] is True
+    assert result.output["external_tool_called"] is False
+    # Zero browser access after the cancellation.
+    assert bridge.submitted_ids == []
+
+
+class _PreservedFailureThenCancelBridge(_TrackingBridge):
+    """Attempt 0 fails retryably with a preserved result tab; the scope is
+    cancelled while attempt 0 is in flight (recorded before wait_many returns).
+    """
+
+    def __init__(self, state: _RunState) -> None:
+        super().__init__()
+        self._state = state
+        self._cancellation_recorded = False
+
+    async def wait_many(
+        self,
+        task_ids: Iterable[str],
+        *,
+        timeout_seconds: float,
+    ) -> tuple[BrowserTaskSnapshot, ...]:
+        del timeout_seconds
+        if not self._cancellation_recorded:
+            self._cancellation_recorded = True
+            # Simulate the user closing the scope / source timeout landing
+            # while attempt 0 is still in flight: the retry decision must
+            # observe the tombstone.
+            _record_scope_cancellation(
+                self._state,
+                ProviderScopeKey(provider="qunar", vertical=ProviderVertical.LODGING),
+                generation=0,
+                reason="source timeout cancelled the lodging scope while attempt 0 was in flight",
+            )
+        task_id = next(iter(task_ids))
+        return (
+            BrowserTaskSnapshot(
+                id=task_id,
+                provider=BrowserProvider.QUNAR,
+                kind=BrowserVertical.LODGING,
+                query=_submission(BrowserProvider.QUNAR).query,
+                state=BrowserTaskState.FAILED,
+                created_at=NOW,
+                updated_at=NOW,
+                attempt_count=1,
+                failure=BrowserFailure(
+                    code=BrowserFailureCode.TIMEOUT,
+                    message=(
+                        "browser companion preserved the result tab but could "
+                        "not finish extraction before the lease expired"
+                    ),
+                    retryable=True,
+                    captured_at=NOW,
+                    details={
+                        "preserved_exact_result_tab": {
+                            "provider": "qunar",
+                            "kind": "lodging",
+                            "tab_id": 25,
+                            "url": "https://hotel.qunar.com/intl/search.jsp",
+                        },
+                    },
+                ),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_preserved_result_tab_retry_is_suppressed_when_scope_cancelled_in_flight() -> None:
+    """Counter-example: a preserved-result-tab retry must NOT revive the browser
+    after the scope is cancelled while attempt 0 is in flight.
+
+    The search tool's retry (attempt 1, reusing the preserved exact result tab)
+    is a real access that must be forbidden after cancellation: it must observe
+    the tombstone and suppress the retry submission, so exactly one submission
+    reaches the bridge and the caller sees the suppression flag.
+    """
+    state = _RunState(source_task_ids=("qunar-lodging-retry",))
+    bridge = _PreservedFailureThenCancelBridge(state)
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+    tools = system._tool_registry(state, source_task_count=1)
+    submission = _submission(BrowserProvider.QUNAR)
+    call = ToolCall(
+        id="call:qunar-lodging-retry",
+        tool_name="browser_bridge_search",
+        task_id="qunar-lodging-retry",
+        agent_role=AgentRole.LODGING,
+        arguments={
+            "submission": submission.model_dump(mode="json"),
+            "__tripchord_attempt_generation": 0,
+        },
+    )
+
+    receipt = await tools.invoke(call)
+
+    assert receipt.success is True
+    assert receipt.output["retry_suppressed_by_scope_cancellation"] is True
+    # Only attempt 0 reached the bridge — the reuse retry was suppressed.
+    assert len(bridge.submitted_ids) == 1
+    assert len(receipt.output["attempt_snapshots"]) == 1

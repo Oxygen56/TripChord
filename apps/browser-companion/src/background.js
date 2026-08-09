@@ -6908,6 +6908,24 @@ async function extractWithRetry(
       return withRetainedFlightSearchReceipt(extraction);
     }
     if (
+      lease.provider === "qunar" &&
+      lease.kind === "lodging" &&
+      !qunarPendingSealAttempted &&
+      qunarLodgingPendingDomSignature(extraction) &&
+      Date.now() - extractionStartedAt >= QUNAR_PENDING_MIN_OBSERVED_MS
+    ) {
+      // The search list has shown the realtime-search shell for the full
+      // minimum observation window.  Seal the bounded-pending receipt now and
+      // hand the remaining lease to the audited detail-page fallback instead of
+      // re-reading the same non-terminal shell until the extraction deadline.
+      qunarPendingSealAttempted = true;
+      workflowDriver = {
+        ...workflowDriver,
+        bounded_pending_observed_ms: Date.now() - extractionStartedAt,
+      };
+      continue;
+    }
+    if (
       Date.now() +
         LODGING_DOM_DRIFT_POLL_INTERVAL_MS +
         LODGING_EXTRACTION_RETRY_MIN_BUDGET_MS >=
@@ -7140,6 +7158,35 @@ function shouldTryFliggyLodgingDetailOrchestration(
         extraction.quotes.length === 0
       )
     )
+  );
+}
+
+// A qunar lodging extraction that is still waiting on the platform's visible
+// realtime-search shell returns a `dom_drift` failure whose DOM diagnostics
+// carry the pending signature (empty hotel count placeholder + the
+// "正在实时搜索中" message).  Detecting that signature in the drift loop lets
+// the extraction seal the bounded-pending receipt as soon as it has satisfied
+// the minimum observation window, instead of squandering the whole lease
+// re-reading the same non-terminal shell.  Sealing early is what leaves budget
+// for the audited detail-page fallback (orchestrateQunarLodgingDetails).
+function qunarLodgingPendingDomSignature(extraction) {
+  const failureDetails =
+    extraction && extraction.failure && extraction.failure.details;
+  const diagnostics =
+    failureDetails && failureDetails.dom_diagnostics;
+  const resultStateEvidence =
+    diagnostics &&
+    Array.isArray(diagnostics.result_state_evidence)
+      ? diagnostics.result_state_evidence
+      : [];
+  const texts = resultStateEvidence
+    .map((entry) => String(
+      entry && entry.text_summary || entry && entry.text || "",
+    ))
+    .filter(Boolean);
+  return (
+    texts.some((text) => /共\s*家酒店满足条件/.test(text)) &&
+    texts.some((text) => /请稍等[，,]\s*您查询的结果正在实时搜索中/.test(text))
   );
 }
 
@@ -11585,6 +11632,10 @@ if (globalThis.__TRIPCHORD_BACKGROUND_TEST_HOOKS__) {
     QUNAR_OBSERVATION_LINEAGE_VERSION,
     QUNAR_DETAIL_FALLBACK_SUMMARY_VERSION,
     QUNAR_DETAIL_SEED_SELECTION_POLICY,
+    QUNAR_PENDING_MIN_OBSERVED_MS,
+    QUNAR_PENDING_CONTRACT_VERSION,
+    QUNAR_PENDING_RESULT_COUNT_TEXT,
+    QUNAR_PENDING_MESSAGE,
     MAX_CONCURRENT_INITIAL_LANDINGS,
     MAX_LODGING_DETAIL_PAGES_PER_LEASE,
     MAX_QUNAR_LODGING_DETAIL_PAGES_PER_LEASE,
@@ -11673,6 +11724,7 @@ if (globalThis.__TRIPCHORD_BACKGROUND_TEST_HOOKS__) {
     providerVerticalUrlAllowed,
     fliggyLodgingResultUrlDecision,
     qunarLodgingResultUrlDecision,
+    qunarLodgingPendingDomSignature,
     qunarAuditedLodgingDetailTargets,
     qunarLodgingDetailSeedOffset,
     qunarLodgingDetailUrlDecision,

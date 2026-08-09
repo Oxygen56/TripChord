@@ -21,6 +21,9 @@ coverage/
 /training/runs/
 /tripchord.db
 /.runtime/
+# Runtime-only state under apps/api must never be committed (MUL-4252).
+/apps/api/tripchord.db
+/apps/api/.runtime/
 /apps/browser-companion/.tripchord-release-seal.json
 
 # Local/private live evidence. These files may contain real trip parameters,
