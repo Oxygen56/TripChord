@@ -1246,6 +1246,41 @@ def _write_manifest(manifest: dict[str, Any]) -> Path:
     return target
 
 
+# Fixed required raw-evidence inputs the gate must certify before any committed
+# trail can be produced.  This list is part of the evidence contract: layer-5/6
+# raw evidence must exist — and must never be silently omitted via gitignore —
+# before ``passed=true`` can be claimed and an evidence commit produced.
+_REQUIRED_EVIDENCE_INPUTS: tuple[str, ...] = (
+    "product-acceptance.json",
+    "browser-e2e.json",
+    "browser-e2e-screenshot.png",
+    "live-canary-certified.json",
+    "live-done-gate-v4.json",
+)
+
+
+def _verify_required_evidence_inputs(staging_dir: Path) -> None:
+    """Fail closed (exit-2 semantics) when a fixed required evidence input is
+    missing from the staging dir.
+
+    The raw layer-5/6 evidence (``live-canary-certified.json``,
+    ``live-done-gate-v4.json``) plus the other contract-required inputs must all
+    exist before certification.  A missing required input means the gate cannot
+    prove the verdict it is about to commit, so certification is refused instead
+    of silently producing a manifest that omits the file.
+    """
+    missing = [
+        name
+        for name in _REQUIRED_EVIDENCE_INPUTS
+        if not (staging_dir / name).is_file()
+    ]
+    if missing:
+        raise GateStateChangedError(
+            "evidence contract: required raw evidence input(s) missing from "
+            f"staging dir {staging_dir}: {', '.join(missing)}"
+        )
+
+
 def _verify_evidence_contract(
     evidence_commit: str,
     staging_dir: Path,
@@ -1261,6 +1296,39 @@ def _verify_evidence_contract(
         raise GateStateChangedError(
             f"evidence commit E {evidence_commit} missing required manifest"
         )
+    # Field-completeness of the manifest itself: the committed manifest must
+    # carry the contract's required keys, or the audit trail cannot be
+    # independently re-verified from the commit alone.
+    for key in (
+        "schema_version",
+        "tested_commit_sha",
+        "files",
+        "layer_verdicts",
+    ):
+        if key not in manifest:
+            raise GateStateChangedError(
+                f"evidence commit E manifest missing required field {key!r}"
+            )
+    if not isinstance(manifest["files"], list):
+        raise GateStateChangedError(
+            "evidence commit E manifest files field must be a list"
+        )
+    for entry in manifest["files"]:
+        for key in ("name", "tracked_path", "sha256", "size_bytes", "committed"):
+            if key not in entry:
+                raise GateStateChangedError(
+                    f"evidence commit E manifest file entry missing field {key!r}"
+                )
+    verdicts = manifest["layer_verdicts"]
+    if not isinstance(verdicts, dict):
+        raise GateStateChangedError(
+            "evidence commit E manifest layer_verdicts field must be an object"
+        )
+    for key in ("5_real_canary", "6_full_e2e"):
+        if key not in verdicts:
+            raise GateStateChangedError(
+                f"evidence commit E manifest layer_verdicts missing {key!r}"
+            )
     for entry in manifest["files"]:
         if not entry["committed"]:
             continue
@@ -1461,6 +1529,21 @@ def _commit_evidence(
             raise GateStateChangedError("pointer commit created but SHA unreadable")
         # Phase 2 parent must be E, and the final tree must be clean.
         _assert_parent_is(pointer_commit, evidence_commit, "phase 2 pointer commit")
+        # Phase-2 post-commit contract: the pointer tree must carry the manifest
+        # with evidence_commit=E (field-completeness of the committed trail).
+        committed_manifest_blob = _git(
+            "show", f"{pointer_commit}:{_MANIFEST_REL}", check=True
+        ).stdout
+        committed_manifest = json.loads(committed_manifest_blob)
+        if committed_manifest.get("evidence_commit") != evidence_commit:
+            raise GateStateChangedError(
+                "phase 2 manifest does not record evidence_commit "
+                f"{evidence_commit} in the pointer commit"
+            )
+        if committed_manifest.get("tested_commit_sha") != report.tested_commit_sha:
+            raise GateStateChangedError(
+                "phase 2 manifest tested_commit_sha does not match the tested revision"
+            )
         final = _git_snapshot()
         if final.commit_sha != pointer_commit:
             raise GateStateChangedError("HEAD moved after the pointer commit")
@@ -1591,6 +1674,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.commit_evidence:
         try:
+            # Evidence-contract gate: the fixed required raw inputs (including
+            # layer-5/6 raw evidence) must all exist before any committed trail
+            # is produced.  A missing required input hard-fails exit 2 rather
+            # than silently omitting the file from the manifest.
+            _verify_required_evidence_inputs(staging_dir)
             start = _git_snapshot()
             _commit_evidence(staging_dir, report, start=start)
         except GateStateChangedError as exc:

@@ -74,6 +74,31 @@ def _passing_layers(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
+def _populate_required_evidence(staging_dir: Path) -> None:
+    """Write the fixed required raw-evidence inputs into staging so main()'s
+    evidence-contract gate passes and the commit phase is actually exercised."""
+    staging_dir.mkdir(exist_ok=True)
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    (staging_dir / "browser-e2e.json").write_text('{"passed": true}\n', encoding="utf-8")
+    (staging_dir / "browser-e2e-screenshot.png").write_bytes(b"PNG")
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(
+            {
+                "passed": True,
+                "bridge_token_present": True,
+                "scopes": [{"scope": "x", "passed": True}],
+                "companion_status": {"companions": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        '{"run_status": "completed"}\n', encoding="utf-8"
+    )
+
+
 # ---------------------------------------------------------------------------
 # _git_safe_env / _git_snapshot / _verify_tree_unchanged
 # ---------------------------------------------------------------------------
@@ -601,10 +626,7 @@ def test_main_exits_2_when_evidence_commit_fails(
     reported as a pass."""
     _patch_root(monkeypatch, clean_repo)
     _passing_layers(monkeypatch)
-    staging_dir.mkdir()
-    (staging_dir / "product-acceptance.json").write_text(
-        '{"passed": true}\n', encoding="utf-8"
-    )
+    _populate_required_evidence(staging_dir)
     hook = clean_repo / ".git" / "hooks" / "pre-commit"
     hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     hook.chmod(0o755)
@@ -624,10 +646,7 @@ def test_main_exits_2_when_head_moves_before_evidence_commit(
     must disagree with the tested commit and the gate must exit 2 (TOCTOU)."""
     _patch_root(monkeypatch, clean_repo)
     _passing_layers(monkeypatch)
-    staging_dir.mkdir()
-    (staging_dir / "product-acceptance.json").write_text(
-        '{"passed": true}\n', encoding="utf-8"
-    )
+    _populate_required_evidence(staging_dir)
 
     real_dump = gate._dump
     moved = False
@@ -994,10 +1013,7 @@ def test_main_commit_evidence_failure_marks_report_failed_on_disk(
     just the return code."""
     _patch_root(monkeypatch, clean_repo)
     _passing_layers(monkeypatch)
-    staging_dir.mkdir()
-    (staging_dir / "product-acceptance.json").write_text(
-        '{"passed": true}\n', encoding="utf-8"
-    )
+    _populate_required_evidence(staging_dir)
     hook = clean_repo / ".git" / "hooks" / "pre-commit"
     hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     hook.chmod(0o755)
@@ -1157,17 +1173,7 @@ def test_main_commit_evidence_skips_gitignored_evidence_end_to_end(
         ["git", "-C", str(clean_repo), "commit", "-q", "-m", "ignore live evidence"],
         check=True,
     )
-    staging_dir.mkdir()
-    (staging_dir / "product-acceptance.json").write_text(
-        '{"passed": true}\n', encoding="utf-8"
-    )
-    (staging_dir / "browser-e2e-screenshot.png").write_bytes(b"PNG")
-    (staging_dir / "live-canary-certified.json").write_text(
-        '{"scopes": []}\n', encoding="utf-8"
-    )
-    (staging_dir / "live-done-gate-v4.json").write_text(
-        '{"run_status": "completed"}\n', encoding="utf-8"
-    )
+    _populate_required_evidence(staging_dir)
 
     rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
     assert rc == 0
@@ -1585,3 +1591,101 @@ def test_runner_runtime_provenance_mismatches_dead_pid(
     evidence["runtime_before_run"]["runtime_provenance"]["pid"] = 2147483647  # type: ignore[index]
     mismatches = gate._runtime_provenance_mismatches(evidence, clean_repo)
     assert any("pid" in item for item in mismatches)
+
+
+# ---------------------------------------------------------------------------
+# Evidence-contract required inputs (A2: layer-5/6 raw evidence gate)
+# ---------------------------------------------------------------------------
+
+
+def test_main_exits_2_when_required_evidence_missing(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """Evidence-contract counter-example: a clean passing run whose staging dir
+    lacks a fixed required raw evidence input (layer-6 raw evidence) must exit
+    2 at the contract gate and must NOT produce any commit — the missing file
+    is never silently omitted from the committed trail."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _populate_required_evidence(staging_dir)
+    # Delete the layer-6 raw evidence — the contract-required input.
+    (staging_dir / "live-done-gate-v4.json").unlink()
+
+    head_before = _head(clean_repo)
+    rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
+
+    assert rc == 2
+    assert _head(clean_repo) == head_before
+    assert _porcelain(clean_repo) == ""
+
+
+def test_main_exits_2_when_layer5_raw_evidence_missing(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """Evidence-contract counter-example: missing layer-5 raw evidence
+    (live-canary-certified.json) also hard-fails the contract gate exit 2."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _populate_required_evidence(staging_dir)
+    (staging_dir / "live-canary-certified.json").unlink()
+
+    head_before = _head(clean_repo)
+    rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
+
+    assert rc == 2
+    assert _head(clean_repo) == head_before
+
+
+def test_verify_required_evidence_inputs_accepts_full_set(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """The required-input verifier accepts a complete staging set and fails
+    closed on any missing member."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    gate._verify_required_evidence_inputs(staging_dir)  # no raise
+
+    (staging_dir / "browser-e2e.json").unlink()
+    with pytest.raises(gate.GateStateChangedError, match="browser-e2e.json"):
+        gate._verify_required_evidence_inputs(staging_dir)
+
+
+def test_verify_evidence_contract_fails_closed_on_incomplete_manifest_fields(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A2 counter-example: the post-commit contract verify must hard-fail when
+    E's manifest omits a required contract field (field-completeness of the
+    committed trail), even when every committed file hash matches."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    tested_sha = _head(clean_repo)
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha=tested_sha,
+        toplevel=str(clean_repo),
+        branch="main",
+        worktree_dirty=False,
+        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        passed=True,
+        summary="all applicable Done-Gate layers passed",
+        boundary="",
+    )
+    manifest = gate._evidence_manifest(staging_dir, report)
+    manifest.pop("layer_verdicts")
+    results = clean_repo / "benchmarks" / "results"
+    results.mkdir(parents=True, exist_ok=True)
+    (results / gate._MANIFEST_REL.rsplit("/", 1)[-1]).write_text(
+        json.dumps(manifest, sort_keys=True), encoding="utf-8"
+    )
+    for name in ("product-acceptance.json", "browser-e2e.json", "browser-e2e-screenshot.png"):
+        (results / name).write_bytes((staging_dir / name).read_bytes())
+    subprocess.run(["git", "-C", str(clean_repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "commit", "-q", "-m", "manifest missing fields"],
+        check=True,
+    )
+    e_commit = _head(clean_repo)
+
+    with pytest.raises(gate.GateStateChangedError, match="layer_verdicts"):
+        gate._verify_evidence_contract(e_commit, staging_dir, manifest)
