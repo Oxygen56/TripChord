@@ -662,11 +662,21 @@ _ACCOUNT_ID_PATTERN = re.compile(
 # Chinese mobile number as a bare account identifier.
 _PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 
+# ISO-8601 date/datetime (``2026-08-13``, ``2026-08-13T10:00:00Z``, …).  A
+# public read-only API may legitimately carry such a value in a query (e.g. a
+# schedules ``?date=``), so it must not be mistaken for an opaque numeric
+# session/account token by the ``\d{4,}`` rule below.
+_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}(?:[Tt ][0-2]\d:[0-5]\d(?::[0-5]\d(?:\.\d+)?)?"
+    r"(?:[Zz]|[+-][0-2]\d:?[0-5]\d)?)?$"
+)
+
 
 def _is_tracking_url_leak(url: str) -> bool:
     """True when a full URL carries a non-redacted query value that reads as a
     session/account token — the tracking-URL leak the byte scan alone cannot
-    see.  Redacted values (``[REDACTED]``) and benign short values pass."""
+    see.  Redacted values (``[REDACTED]``), benign short values and plain
+    ISO-8601 date values pass."""
     try:
         parsed = urlsplit(url)
     except ValueError:
@@ -691,8 +701,17 @@ def _is_tracking_url_leak(url: str) -> bool:
             "pay",
         }:
             return True
+        # A plain ISO-8601 date/datetime is a schedule/filter value, never an
+        # opaque session/account token — skip it before the length and
+        # ``\d{4,}`` numeric-token rules (a datetime is naturally >16 chars and
+        # carries a 4-digit year, both of which would otherwise false-positive
+        # on public read-only API queries like ``?from=2026-08-13T07:30:00Z``).
+        if _ISO_DATETIME_RE.match(value):
+            continue
         if len(value) >= 16:
             return True
+        # A pure numeric run (e.g. ``1234567890``) is a session/account token;
+        # a calendar date is not.  ``\d{4,}`` alone cannot tell them apart.
         if re.search(r"\d{4,}", value):
             return True
     return False

@@ -567,6 +567,10 @@ def main() -> int:
                 passed = all(item["passed"] for item in checks)
                 screenshot_data = evidence["screenshot_data"]
                 screenshot_bytes = __import__("base64").b64decode(screenshot_data.encode("ascii"))
+                # A relative --output-screenshot is relative to the process CWD
+                # (the gate runs with cwd=ROOT); resolve before relative_to so a
+                # relative staging path cannot raise a spurious ValueError.
+                screenshot_path_out = screenshot_path_out.resolve()
                 screenshot_path_out.parent.mkdir(parents=True, exist_ok=True)
                 screenshot_path_out.write_bytes(screenshot_bytes)
                 screenshot_path = str(screenshot_path_out.relative_to(ROOT))

@@ -1971,6 +1971,29 @@ def test_secret_scan_flags_tracking_url_query(
         gate.run_gate(staging_dir)
 
 
+def test_secret_scan_allows_public_api_date_query(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A3 negative: a public read-only API URL carrying a plain ISO-8601 date
+    (e.g. a schedules ``?date=2026-08-13``) is NOT a tracking URL — the scan
+    must not mistake the 4-digit year for an opaque numeric token."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps({"result": {"source_urls": [
+            "https://sfs-api.icomtours.com/api/v1/public/trips/"
+            "schedules?date=2026-08-13",
+            "https://sfs-api.icomtours.com/api/v1/public/trips/"
+            "schedules?from=2026-08-13T07%3A30%3A00%2B05%3A00&to=2026-08-13",
+        ]}}),
+        encoding="utf-8",
+    )
+    # Must not raise: no session/account token, no Authorization/Cookie, no
+    # bare phone number and no 16+ char opaque value.
+    gate.run_gate(staging_dir)
+
+
 def test_secret_scan_flags_authorization_header(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
