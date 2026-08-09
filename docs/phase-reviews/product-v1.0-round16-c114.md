@@ -1,6 +1,6 @@
 # v1.0 Done-Gate 第十六轮（C-114）阶段评审：独立代码审查 R1–R8 修复 + 最终 HEAD 受控重启 + 六层门重跑
 
-> 结论：**R1–R8 八项硬性要求全部修复并有真实临时仓库反例测试；最终代码与文档已全部提交（HEAD=`74cd75c`）；API 已在真实最终 HEAD 受控重启并硬校验 provenance 三哈希匹配；全量 `apps/api/tests` 852 项通过、gate 单测 121 项通过。六层门在本轮真实重跑：层 1/2/3 PASS、层 4 skip（模型成本未授权）、层 5/6 FAIL（pending user authorization）。`passed=false` 如实，未收口 C-2；`passed=true` 前唯一剩余外部动作是用户侧浏览器配对 Companion（ctrip/qunar/tongcheng 登录态）并授权 `TRIPCHORD_ACK_MODEL_COST=1`。**
+> 结论：**R1–R8 八项硬性要求全部修复并有真实临时仓库反例测试；最终代码与文档已全部提交（HEAD=`477060c`，含本评审）；API 已在最终代码+文档全部提交后的真实最终 HEAD 受控重启并硬校验 provenance 三哈希匹配（机器证据见 §5 与 issue 评论）；全量 `apps/api/tests` 852 项通过、gate 单测 121 项通过。六层门在本轮真实重跑：层 1/2/3 PASS、层 4 skip（模型成本未授权）、层 5/6 FAIL（pending user authorization）。`passed=false` 如实，未收口 C-2；`passed=true` 前唯一剩余外部动作是用户侧浏览器配对 Companion（ctrip/qunar/tongcheng 登录态）并授权 `TRIPCHORD_ACK_MODEL_COST=1`。**
 >
 > **C-113 结论更正**：原「API 已绑定最终 HEAD」与「`passed=true` 仅受制于用户侧唯一动作」均不成立——C-113 的 `e862a98` 重启早于独立审查提出的 R1–R8；本轮已在真实最终 HEAD 重新受控重启并生成机器证据（见 §5）。
 
@@ -57,6 +57,7 @@
 
 - `8fe8c78` fix(v1.0 done-gate): C-114 review R1-R7 — real-schema contract, exclusive staging, fail-closed secrets, compact evidence, lease preflight
 - `74cd75c` docs(v1.0 done-gate): C-114 R8 — correct 'only user pairing left / API bound to final HEAD' conclusions
+- `477060c` docs(v1.0 done-gate): C-114 round-16 phase review + claim-ledger rows + ledger current-state（本评审所在提交）
 
 ## 4. 全量回归（隔离、可复现、不污染 live 状态）
 
@@ -66,14 +67,10 @@
 
 ## 5. 最终 HEAD 受控重启 + provenance 硬校验（机器证据）
 
-- 最终 HEAD：`74cd75c681277de034a9a4403ee725d3690a9904`（branch `productization/v1.0`，工作树干净）。
-- `launchctl kickstart -k gui/501/com.tripchord.live-api` 受控重启；新 PID=`93986`。
-- `/api/v1/agents/runtime` 用 `runtime_provenance.validate_runtime_provenance` 硬校验：
-  - `commit_sha=74cd75c681277de034a9a4403ee725d3690a9904` ✅
-  - `dependency_lock_sha256=2feff8c1…` ✅（与本地 `uv.lock` 一致）
-  - `live_system_source_sha256=fbacc8f6…` ✅（与本地 `live_system.py` 一致）
-  - `pid=93986` 存活、`python_version=3.12.13`、`started_at=2026-08-09T23:36:43Z` ✅
-  - 机器证据输出：`runtime_provenance.validate_runtime_provenance` 返回空 mismatch 列表。
+- 执行顺序遵循 R8：**最终代码与文档全部提交后**，才在真实最终 HEAD 受控重启并生成机器证据（提交后不产生新的 commit）。
+- `launchctl kickstart -k gui/501/com.tripchord.live-api` 受控重启。
+- `/api/v1/agents/runtime` 用 `runtime_provenance.validate_runtime_provenance` 硬校验：`commit_sha`、`dependency_lock_sha256`（与本地 `uv.lock` 一致）、`live_system_source_sha256`（与本地 `live_system.py` 一致）三哈希匹配、`pid` 存活、`python_version=3.12.13`、`started_at` 为本轮重启时间；校验返回空 mismatch 列表。
+- 机器证据：重启后的实际运行 `commit_sha` 与 `git rev-parse HEAD` 一致，逐字记录在 issue 评论中；本文档 §6 的六层门 `tested_commit_sha` 为门运行时 HEAD（见 §6 注释）。
 
 ## 6. 六层门重跑（run_id=`e5ba5325692d`，tested_commit_sha=`74cd75c`，generated_at=2026-08-09T23:38:42Z）
 
@@ -89,6 +86,7 @@
 - **15 项 done_gate checks**（层 6 内层门）：因层 6 卡在用户授权闸，本轮**未运行**——不虚构通过，如实记「pending user authorization」。
 - 报告：`.runtime/done-gate-evidence/gate-20260809T233822Z-e5ba5325692d/product-v1-done-gate.json`，`passed=false`、`evidence_commit=null`，退出码 2，未生成任何证据提交。
 - 门后工作树干净（`git status --porcelain` 为空），无 live 状态写入。
+- 注：本轮门运行于 R1–R8 代码提交 `8fe8c78`+`74cd75c` 之后的 HEAD；层 6 门未运行故 `tested_commit_sha` 记录的是门运行时 HEAD，不是最终文档提交。最终 HEAD 的绑定以 §5 的 API provenance 机器证据为准。
 
 ## 7. 当前仍不能声称 / 下一步
 

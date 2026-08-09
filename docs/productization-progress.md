@@ -7,7 +7,7 @@
 ## 当前状态
 
 - **当前版本**：v1.0 Done-Gate 第十六轮（C-114，独立代码审查续跑）——按审查 R1–R8 修复：层 6 真实 schema 合同（15 项 `done_gate.checks`）、层 5 真 JSON 判定（fresh/authorized/read_only/passed + 完整 scope 集）、staging 独占新建与 run_id 绑定、层 3 浏览器 E2E exit 2 不算通过、秘密扫描 fail-closed 与多类模型 key、compact 证据独立复核内容、symlink/hardlink/0600 落盘安全、只读 live-state lease preflight（R7）+ 文档结论更正（R8）。**C-114 更正**：C-113 声称「API 已绑定新 HEAD」不成立——当时绑定的是 `e862a98` 中间 HEAD，审查又提出 R1–R8；最终代码与文档全部提交后，已在真实最终 HEAD `74cd75c` 受控重启并核验 provenance 三哈希匹配（见 `docs/phase-reviews/product-v1.0-round16-c114.md`）。
-- **当前分支**：`productization/v1.0`（未 push，HEAD=`74cd75c`，工作树干净；API 已在最终 HEAD 受控重启并硬校验 provenance，见第十六轮评审）
+- **当前分支**：`productization/v1.0`（未 push，工作树干净；API 已在最终代码+文档全部提交后的最终 HEAD 受控重启并硬校验 provenance，运行 commit_sha 与 `git rev-parse HEAD` 一致，机器证据见第十六轮评审 §5 与 issue 评论）
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
 - **最后完成的最小任务**：C-114 第十六轮——R1–R8 全部修复并有真实临时仓库反例测试（gate 测试 121 项通过）；文档「唯一只差用户配对 / API 已绑定最终 HEAD」结论已更正；层 5/6 仍待用户配对 Companion（当前 0 companions），passed=true 前不声称通过
