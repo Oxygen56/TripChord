@@ -491,7 +491,21 @@ def main() -> int:
     parser.add_argument("--api-port", type=int, default=0)
     parser.add_argument("--web-port", type=int, default=0)
     parser.add_argument("--keep-artifacts", action="store_true")
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=OUTPUT_PATH,
+        help="atomic evidence JSON output path (default: benchmarks/results/browser-e2e.json)",
+    )
+    parser.add_argument(
+        "--output-screenshot",
+        type=Path,
+        default=SCREENSHOT_PATH,
+        help="screenshot PNG output path (default: benchmarks/results/browser-e2e-screenshot.png)",
+    )
     args = parser.parse_args()
+    output_path = args.output_json
+    screenshot_path_out = args.output_screenshot
 
     chrome = _find_chrome()
     if chrome is None:
@@ -553,8 +567,9 @@ def main() -> int:
                 passed = all(item["passed"] for item in checks)
                 screenshot_data = evidence["screenshot_data"]
                 screenshot_bytes = __import__("base64").b64decode(screenshot_data.encode("ascii"))
-                SCREENSHOT_PATH.write_bytes(screenshot_bytes)
-                screenshot_path = str(SCREENSHOT_PATH.relative_to(ROOT))
+                screenshot_path_out.parent.mkdir(parents=True, exist_ok=True)
+                screenshot_path_out.write_bytes(screenshot_bytes)
+                screenshot_path = str(screenshot_path_out.relative_to(ROOT))
                 result = {
                     "schema_version": EVIDENCE_SCHEMA,
                     "generated_at": _now(),
@@ -584,8 +599,8 @@ def main() -> int:
                     "screenshot": None,
                 }
             finally:
-                RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-                OUTPUT_PATH.write_text(
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(
                     json.dumps(result, ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8",
                 )

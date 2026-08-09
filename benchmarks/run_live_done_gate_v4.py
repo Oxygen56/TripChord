@@ -175,38 +175,128 @@ def _canonical_sha256(payload: object) -> str:
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# Environment variables that redirect ``git -C <root>`` to a different
+# repository.  Stripped before any git call so the evidence names the repo that
+# actually ran, never one injected through the caller's environment
+# (GIT_DIR / GIT_WORK_TREE override risk).
+_GIT_ENV_OVERRIDES = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_COMMON_DIR",
+        "GIT_CEILING_DIRECTORIES",
+    }
+)
 
-def _repo_revision() -> dict[str, Any]:
-    """Name the repo revision this evidence was produced against.
 
-    Keeps layer-6 evidence cross-checkable against the product Done-Gate
-    report: ``commit_sha`` must equal the revision that actually ran, and a
-    dirty worktree (``worktree_dirty=true``) voids the revision mapping because
-    the running code differs from ``HEAD``.
+def _git_safe_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_") or key in {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
+    }
+
+
+def _repo_revision_snapshot() -> dict[str, Any]:
+    """One safe, un-redirected snapshot of the authoritative repository.
+
+    ``porcelain`` is kept for start/end comparison and stripped before bundling.
     """
-    revision: dict[str, Any] = {"commit_sha": None, "worktree_dirty": True}
+    revision: dict[str, Any] = {
+        "toplevel": None,
+        "branch": None,
+        "commit_sha": None,
+        "worktree_dirty": True,
+        "porcelain": "",
+    }
     try:
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+        toplevel = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
             cwd=_REPO_ROOT,
+            env=_git_safe_env(),
             capture_output=True,
             text=True,
             check=True,
             timeout=10,
         )
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=_REPO_ROOT,
+            env=_git_safe_env(),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        branch = subprocess.run(
+            ["git", "symbolic-ref", "--short", "-q", "HEAD"],
+            cwd=_REPO_ROOT,
+            env=_git_safe_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
         status = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=_REPO_ROOT,
+            env=_git_safe_env(),
             capture_output=True,
             text=True,
             check=True,
             timeout=10,
         )
     except (subprocess.SubprocessError, FileNotFoundError):
+        # Git unavailable means the revision cannot be proven; fail closed.
         return revision
+    revision["toplevel"] = toplevel.stdout.strip() or None
+    revision["branch"] = branch.stdout.strip() or None
     revision["commit_sha"] = head.stdout.strip() or None
     revision["worktree_dirty"] = bool(status.stdout.strip())
+    revision["porcelain"] = status.stdout
     return revision
+
+
+def _repo_revision(start: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Name the repo revision this evidence was produced against.
+
+    Keeps layer-6 evidence cross-checkable against the product Done-Gate
+    report: ``commit_sha`` must equal the revision that actually ran, and a
+    dirty worktree (``worktree_dirty=true``) voids the revision mapping because
+    the running code differs from ``HEAD``.
+
+    When ``start`` is the snapshot captured at the beginning of the run, the
+    end snapshot is compared to it; any HEAD move or worktree change sets
+    ``revision_changed_during_run=true`` (with the start revision embedded) so
+    the evidence fails closed instead of naming a revision that changed while
+    the run was in flight (TOCTOU).
+    """
+    end = _repo_revision_snapshot()
+    if start is None:
+        # Full snapshot (incl. porcelain) used as the run's start marker.
+        return end
+    changed = (
+        end.get("commit_sha") != start.get("commit_sha")
+        or end.get("toplevel") != start.get("toplevel")
+        or end.get("porcelain") != start.get("porcelain")
+    )
+    public: dict[str, Any] = {
+        "toplevel": end.get("toplevel"),
+        "branch": end.get("branch"),
+        "commit_sha": end.get("commit_sha"),
+        "worktree_dirty": end.get("worktree_dirty"),
+    }
+    if changed:
+        public["revision_changed_during_run"] = True
+        public["start_revision"] = {
+            key: start.get(key)
+            for key in ("toplevel", "branch", "commit_sha", "worktree_dirty")
+        }
+    return public
 
 
 def _safe_response_json(response: httpx.Response, label: str) -> dict[str, Any]:
@@ -295,12 +385,13 @@ def _failure_evidence_bundle(
     error: Exception,
     captured_at: datetime,
     context: dict[str, Any],
+    repo_revision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     bundle: dict[str, Any] = {
         "schema_version": _EVIDENCE_SCHEMA_VERSION,
         "run_status": "failed_before_done_gate",
         "captured_at": captured_at.isoformat(),
-        "repo_revision": _repo_revision(),
+        "repo_revision": repo_revision if repo_revision is not None else _repo_revision(),
         "failure": {
             "stage": stage,
             "type": type(error).__name__,
@@ -324,6 +415,7 @@ def _completed_evidence_bundle(
     report: LiveV4DoneGateReport,
     captured_at: datetime,
     context: dict[str, Any],
+    repo_revision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Materialize a completed run without dropping pre-run evidence context."""
 
@@ -332,7 +424,7 @@ def _completed_evidence_bundle(
         "run_status": "completed" if report.passed else "done_gate_failed",
         "captured_at": captured_at.isoformat(),
         "scenario_sha256": _canonical_sha256(request),
-        "repo_revision": _repo_revision(),
+        "repo_revision": repo_revision if repo_revision is not None else _repo_revision(),
         "request": request,
         **context,
         "done_gate": report.model_dump(mode="json"),
@@ -1366,6 +1458,14 @@ async def _run(args: argparse.Namespace) -> int:
     stage = "load_request"
     context: dict[str, Any] = {}
     base = args.api_base.rstrip("/")
+    # Capture the repo revision BEFORE any work: every evidence bundle is later
+    # checked against this marker, so a HEAD move or tracked-tree change during
+    # the run fails the evidence closed instead of naming a stale revision.
+    start_revision = _repo_revision()
+    context["start_revision"] = {
+        key: start_revision.get(key)
+        for key in ("toplevel", "branch", "commit_sha", "worktree_dirty")
+    }
     try:
         request = _load_request(args.request)
         stage = "validate_frozen_request"
@@ -1584,6 +1684,7 @@ async def _run(args: argparse.Namespace) -> int:
             error=exc,
             captured_at=captured_at,
             context=context,
+            repo_revision=_repo_revision(start_revision),
         )
         bundle = TypeAdapter(dict[str, Any]).validate_python(
             _redact_explicit_secrets(bundle, _runner_secrets(args))
@@ -1646,6 +1747,7 @@ async def _run(args: argparse.Namespace) -> int:
             error=exc,
             captured_at=captured_at,
             context=context,
+            repo_revision=_repo_revision(start_revision),
         )
         bundle = TypeAdapter(dict[str, Any]).validate_python(
             _redact_explicit_secrets(bundle, _runner_secrets(args))
@@ -1673,11 +1775,24 @@ async def _run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # The run is about to be certified: the repository it exercised must still
+    # be the revision it started on.  A HEAD move or tracked-tree change during
+    # the run means the evidence cannot name what actually ran — fail closed.
+    repo_revision = _repo_revision(start_revision)
+    if repo_revision.get("revision_changed_during_run"):
+        raise RuntimeError(
+            "repository revision changed during the run (TOCTOU): "
+            f"start {repo_revision.get('start_revision')} != "
+            f"end {repo_revision.get('commit_sha')} worktree_dirty="
+            f"{repo_revision.get('worktree_dirty')}; evidence cannot name a "
+            "tested revision"
+        )
     bundle = _completed_evidence_bundle(
         request=request,
         report=report,
         captured_at=captured_at,
         context=context,
+        repo_revision=repo_revision,
     )
     bundle = TypeAdapter(dict[str, Any]).validate_python(
         _redact_explicit_secrets(bundle, _runner_secrets(args))

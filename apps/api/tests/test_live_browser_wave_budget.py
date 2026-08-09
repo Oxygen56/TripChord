@@ -144,10 +144,11 @@ async def test_eleven_browser_sources_do_not_time_out_while_waiting_for_later_wa
     )
 
     assert len(bridge.wait_budgets) == 11
-    # Flight source tasks keep the request-level 15s lease (2 waves -> 32s),
-    # while lodging source tasks are granted the longer minimum lease
-    # (2 waves -> 482s) so Qunar extraction can seal a terminal receipt.
-    assert set(bridge.wait_budgets.values()) == {32.0, 482.0}
+    # All browser source tasks keep the frozen request-level lease (15s); 11
+    # tasks across 6 slots = 2 waves -> 32s API-side wait.  The C-98 lodging
+    # lease bump (482s) is removed: the retry-with-tab-reuse closure handles the
+    # lodging budget split inside the frozen per-task lease.
+    assert set(bridge.wait_budgets.values()) == {32.0}
     assert all(
         all("TimeoutError" not in reason for reason in coverage.failure_reasons)
         for coverage in run.coverage

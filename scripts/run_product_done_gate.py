@@ -31,6 +31,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -43,6 +45,24 @@ ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "benchmarks" / "results"
 OUTPUT_PATH = RESULTS_DIR / "product-v1-done-gate.json"
 EVIDENCE_SCHEMA = "tripchord-product-v1-done-gate"
+RUNTIME_EVIDENCE_DIR = ROOT / ".runtime" / "done-gate-evidence"
+
+# Environment variables that redirect a ``git -C <root>`` invocation to a
+# different repository.  The Done-Gate evidence must name the repository it
+# actually exercised, so these overrides are stripped from the subprocess env
+# before any git call (defect fix: GIT_DIR / GIT_WORK_TREE override risk).
+_GIT_ENV_OVERRIDES = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_COMMON_DIR",
+        "GIT_CEILING_DIRECTORIES",
+    }
+)
 
 _MODEL_ENV_VARS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "TRIPCHORD_MODEL_API_KEY")
 # Priority order for resolving which environment variable actually holds the
@@ -54,6 +74,26 @@ _MODEL_API_KEY_ENV_CANDIDATES = (
     "OPENAI_API_KEY",
     "TRIPCHORD_MODEL_API_KEY",
 )
+
+
+@dataclass(frozen=True)
+class GitSnapshot:
+    """One consistent snapshot of the authoritative repository.
+
+    Captured through a git invocation that cannot be redirected by
+    GIT_DIR/GIT_WORK_TREE and read with a single ``git status --porcelain`` so
+    the HEAD revision and the worktree state refer to the same instant's tree.
+    """
+
+    toplevel: str | None
+    branch: str | None
+    commit_sha: str | None
+    worktree_dirty: bool
+    porcelain: str
+
+
+class GateStateChangedError(RuntimeError):
+    """The gate itself changed the tracked tree or HEAD moved during the run."""
 
 
 @dataclass
@@ -69,57 +109,103 @@ class LayerResult:
 class GateReport:
     schema_version: str
     generated_at: str
-    commit_sha: str | None
-    worktree_dirty: bool
-    layers: list[LayerResult]
-    passed: bool
-    summary: str
-    boundary: str
+    tested_commit_sha: str | None
+    evidence_commit: str | None = None
+    toplevel: str | None = None
+    branch: str | None = None
+    worktree_dirty: bool = False
+    layers: list[LayerResult] = field(default_factory=list)
+    passed: bool = False
+    summary: str = ""
+    boundary: str = ""
+
+    @property
+    def commit_sha(self) -> str | None:
+        """Backward-compatible alias: the report's tested revision."""
+        return self.tested_commit_sha
+
+
+def _git_safe_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_") or key in {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
+    }
+
+
+def _git(
+    *args: str,
+    cwd: Path | None = None,
+    timeout: int = 10,
+) -> subprocess.CompletedProcess[str]:
+    # ``ROOT`` is resolved at call time (not bound as a default) so tests and
+    # embedders can point the gate at a different repository via monkeypatch.
+    cwd = cwd or ROOT
+    try:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            env=_git_safe_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError) as exc:
+        raise GateStateChangedError(f"git is unavailable or timed out: {exc}") from exc
+
+
+def _git_snapshot(cwd: Path | None = None) -> GitSnapshot:
+    """Read toplevel + HEAD + full porcelain in one safe, un-redirected pass."""
+    cwd = cwd or ROOT
+    toplevel = _git("rev-parse", "--show-toplevel", cwd=cwd)
+    head = _git("rev-parse", "HEAD", cwd=cwd)
+    branch = _git("symbolic-ref", "--short", "-q", "HEAD", cwd=cwd)
+    status = _git("status", "--porcelain", cwd=cwd)
+    return GitSnapshot(
+        toplevel=toplevel.stdout.strip() or None,
+        branch=branch.stdout.strip() or None,
+        commit_sha=head.stdout.strip() or None,
+        worktree_dirty=bool(status.stdout.strip()),
+        porcelain=status.stdout,
+    )
+
+
+def _snapshot_dict(snapshot: GitSnapshot | None) -> dict[str, Any]:
+    if snapshot is None:
+        return {}
+    return {
+        "toplevel": snapshot.toplevel,
+        "branch": snapshot.branch,
+        "commit_sha": snapshot.commit_sha,
+        "worktree_dirty": snapshot.worktree_dirty,
+    }
+
+
+def _verify_tree_unchanged(start: GitSnapshot, end: GitSnapshot) -> None:
+    """Fail closed when the gate run changed the tracked tree or HEAD moved.
+
+    This is the self-pollution guard: layers must write evidence only to
+    git-ignored staging directories, so the porcelain output after the run must
+    byte-for-byte match the snapshot taken before the run.  A mismatch means the
+    gate dirtied the repository (or an external actor moved HEAD), and the
+    evidence cannot claim a tested commit.
+    """
+    mismatches: list[str] = []
+    if start.toplevel is not None and end.toplevel != start.toplevel:
+        mismatches.append(f"toplevel {start.toplevel!r} -> {end.toplevel!r}")
+    if end.commit_sha != start.commit_sha:
+        mismatches.append(f"HEAD {start.commit_sha!r} -> {end.commit_sha!r}")
+    if end.porcelain != start.porcelain:
+        mismatches.append("worktree porcelain changed during the run")
+    if mismatches:
+        raise GateStateChangedError(
+            "Done-Gate self-pollution or HEAD movement detected: "
+            + "; ".join(mismatches)
+        )
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def _commit_sha() -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        )
-        return result.stdout.strip() or None
-    except (subprocess.SubprocessError, FileNotFoundError):
-        return None
-
-
-def _worktree_dirty() -> bool:
-    """Whether the repo has uncommitted changes.
-
-    Done-Gate evidence must map 1:1 to a committed revision.  A dirty worktree
-    means the code that actually ran differs from ``HEAD``, so a ``commit_sha``
-    recorded via ``git rev-parse HEAD`` alone (the stale-HEAD bug this replaces)
-    would silently point at code that was never exercised.  When the tree is
-    dirty the gate forces ``passed=false`` and records ``worktree_dirty=true``
-    instead of claiming a pass against an unverifiable revision.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        )
-        return bool(result.stdout.strip())
-    except (subprocess.SubprocessError, FileNotFoundError):
-        # Git unavailable means the tree's cleanliness cannot be proven; treat
-        # the revision as unverifiable rather than guess at a pass.
-        return True
 
 
 def _run(
@@ -201,7 +287,7 @@ def layer1_reproducibility() -> LayerResult:
     )
 
 
-def layer2_replay() -> LayerResult:
+def layer2_replay(staging_dir: Path) -> LayerResult:
     """Replay-mode core benchmarks (no real OTA access)."""
     checks: list[dict[str, Any]] = []
     commands = (
@@ -209,22 +295,55 @@ def layer2_replay() -> LayerResult:
         ("benchmarks.evaluate_planning", "benchmark_planning"),
         ("benchmarks.evaluate_repair", "benchmark_repair"),
         ("benchmarks.evaluate_events", "benchmark_events"),
-        ("benchmarks.evaluate_acceptance", "acceptance_surfaces"),
     )
     for module, label in commands:
         code, out = _run(["uv", "run", "python", "-m", module], timeout=600)
         passed = code == 0
         checks.append({"name": label, "passed": passed, "detail": out[-300:] if not passed else ""})
+    # The five anti-surface acceptance suite must write its evidence into the
+    # git-ignored staging dir, never into the tracked results tree (defect fix:
+    # the gate no longer pollutes the repo it is certifying).
+    acceptance_out = staging_dir / "product-acceptance.json"
+    code_accept, out_accept = _run(
+        [
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "benchmarks.evaluate_acceptance",
+            "--output",
+            str(acceptance_out),
+        ],
+        timeout=600,
+    )
+    passed_accept = code_accept == 0
+    if passed_accept and acceptance_out.is_file():
+        try:
+            payload = json.loads(acceptance_out.read_text(encoding="utf-8"))
+            accept_detail = (
+                f"all {len(payload.get('surfaces', []))} anti-surface surfaces passed"
+            )
+        except (OSError, ValueError):
+            accept_detail = "acceptance suite passed (evidence unreadable)"
+    else:
+        accept_detail = out_accept[-300:] if code_accept else ""
+    checks.append(
+        {
+            "name": "acceptance_surfaces",
+            "passed": passed_accept,
+            "detail": accept_detail,
+        }
+    )
     passed = all(item["passed"] for item in checks)
     return LayerResult(
         name="2_replay",
         passed=passed,
-        detail="verifier/planning/repair/events benchmarks",
+        detail="verifier/planning/repair/events benchmarks + five anti-surface acceptance",
         sub_checks=checks,
     )
 
 
-def layer3_clean_chrome_fixtures() -> LayerResult:
+def layer3_clean_chrome_fixtures(staging_dir: Path) -> LayerResult:
     """Clean-Chrome malicious fixture gates (browser bridge + handoff URL policy
     + booking protection + reprice wiring fixtures)."""
     checks: list[dict[str, Any]] = []
@@ -272,8 +391,22 @@ def layer3_clean_chrome_fixtures() -> LayerResult:
                 "detail": out3[-300:] if code3 else "",
             }
         )
+    # The clean-Chrome E2E writes its JSON + screenshot into the staging dir
+    # (defect fix: tracked browser-e2e.json / browser-e2e-screenshot.png in the
+    # results tree must never be rewritten by the gate).
+    e2e_json = staging_dir / "browser-e2e.json"
+    e2e_screenshot = staging_dir / "browser-e2e-screenshot.png"
     code4, out4 = _run(
-        ["uv", "run", "python", "scripts/browser_e2e.py"],
+        [
+            "uv",
+            "run",
+            "python",
+            "scripts/browser_e2e.py",
+            "--output-json",
+            str(e2e_json),
+            "--output-screenshot",
+            str(e2e_screenshot),
+        ],
         timeout=600,
     )
     if code4 == 0:
@@ -390,7 +523,7 @@ def _bridge_token() -> str:
     return candidate if candidate else ""
 
 
-def layer5_real_canary() -> LayerResult:
+def layer5_real_canary(staging_dir: Path) -> LayerResult:
     """Every declared-certified real provider x vertical needs a live canary.
 
     The layer verdict is driven by a per-scope certified OTA canary
@@ -435,7 +568,7 @@ def layer5_real_canary() -> LayerResult:
             sub_checks=sub_checks,
         )
 
-    evidence_path = ROOT / "benchmarks" / "results" / "live-canary-certified.json"
+    evidence_path = staging_dir / "live-canary-certified.json"
     code, out = _run(
         [
             "uv",
@@ -444,6 +577,8 @@ def layer5_real_canary() -> LayerResult:
             "benchmarks/live_canary_certified.py",
             "--bridge-token",
             bridge_token,
+            "--output",
+            str(evidence_path),
         ],
         timeout=900,
     )
@@ -487,14 +622,76 @@ def layer5_real_canary() -> LayerResult:
             else (
                 "pending user authorization: not all certified OTA scopes have a "
                 "fresh authorised read-only canary; evidence in "
-                "benchmarks/results/live-canary-certified.json"
+                + str(evidence_path)
             )
         ),
         sub_checks=sub_checks,
     )
 
 
-def layer6_full_e2e() -> LayerResult:
+def _extract_build_fingerprint(status_payload: Any) -> str | None:
+    """Extract the installed Companion ``build_identity.build_sha256``.
+
+    Accepts either the companion status payload (layer 5 canary) or the
+    companion preflight payload (layer 6 runner), both of which carry a
+    ``companions`` array whose entries expose ``build_identity.build_sha256``.
+    Returns None when the payload is missing/empty so callers can fail closed.
+    """
+    if not isinstance(status_payload, dict):
+        return None
+    companions = status_payload.get("companions")
+    if not isinstance(companions, list):
+        return None
+    for companion in companions:
+        if not isinstance(companion, dict):
+            continue
+        identity = companion.get("build_identity")
+        if isinstance(identity, dict) and isinstance(identity.get("build_sha256"), str):
+            sha = identity["build_sha256"]
+            if re.fullmatch(r"[0-9a-f]{64}", sha):
+                return sha
+    return None
+
+
+def _runner_revision_mismatches(
+    runner_evidence: dict[str, Any], expected: GitSnapshot, root: Path
+) -> list[str]:
+    """Cross-check the runner's recorded revision against the gate snapshot.
+
+    The runner's ``repo_revision`` names the repository and commit it claims to
+    have exercised.  The gate must not trust the subprocess exit code alone:
+    a dirty tree, a mismatched SHA, a foreign toplevel or a not-completed run
+    all hard-fail layer 6 even when the subprocess happens to exit 0.
+    """
+    mismatches: list[str] = []
+    repo = runner_evidence.get("repo_revision") or {}
+    if not isinstance(repo, dict):
+        mismatches.append("runner evidence carries no repo_revision")
+        return mismatches
+    if repo.get("commit_sha") != expected.commit_sha:
+        mismatches.append(
+            f"runner repo_revision.commit_sha {repo.get('commit_sha')!r} != "
+            f"gate tested HEAD {expected.commit_sha!r}"
+        )
+    if repo.get("worktree_dirty") is not False:
+        mismatches.append(
+            f"runner repo_revision.worktree_dirty = {repo.get('worktree_dirty')!r} (must be False)"
+        )
+    if root is not None and repo.get("toplevel") not in (None, str(root), os.fspath(root)):
+        mismatches.append(
+            f"runner repo_revision.toplevel {repo.get('toplevel')!r} != {os.fspath(root)!r}"
+        )
+    run_status = runner_evidence.get("run_status")
+    if run_status not in (None, "completed"):
+        mismatches.append(f"runner run_status = {run_status!r} (must be 'completed')")
+    if runner_evidence.get("passed") is not True:
+        mismatches.append(
+            f"runner passed = {runner_evidence.get('passed')!r} (must be true)"
+        )
+    return mismatches
+
+
+def layer6_full_e2e(staging_dir: Path, start: GitSnapshot) -> LayerResult:
     """Full-platform real E2E only when every external condition is met.
 
     Runs ``benchmarks/run_live_done_gate_v4.py`` as the real executor: live job
@@ -503,6 +700,11 @@ def layer6_full_e2e() -> LayerResult:
     ``TRIPCHORD_ACK_MODEL_COST=1``) and requires the paired Companion; until
     those gates are met this layer honestly fails as pending user
     authorization — never forged.
+
+    Layer 6 does not trust the subprocess exit code.  Its evidence bundle is
+    parsed and cross-verified against the gate's own git snapshot — HEAD SHA,
+    toplevel, worktree cleanliness — and against the layer-5 canary's Companion
+    build fingerprint.  Any mismatch hard-fails the layer.
     """
     bridge_token = _bridge_token()
     model_acked = os.environ.get("TRIPCHORD_ACK_MODEL_COST") == "1"
@@ -526,7 +728,7 @@ def layer6_full_e2e() -> LayerResult:
                 "authorise the bounded live model cost, then re-run"
             ),
         )
-    output_path = ROOT / "benchmarks" / "results" / "live-done-gate-v4.json"
+    output_path = staging_dir / "live-done-gate-v4.json"
     code, out = _run(
         [
             "uv",
@@ -543,19 +745,52 @@ def layer6_full_e2e() -> LayerResult:
         ],
         timeout=4500,
     )
-    passed = code == 0
+    mismatches: list[str] = []
+    runner_evidence: dict[str, Any] = {}
+    try:
+        runner_evidence = json.loads(output_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        mismatches.append("runner evidence JSON missing or unreadable")
+    if not mismatches:
+        mismatches.extend(_runner_revision_mismatches(runner_evidence, start, ROOT))
+        # Cross-check the Companion build fingerprint against layer 5's canary:
+        # both must name the same installed build, or the E2E can claim nothing
+        # about the build the canary certified.
+        canary_path = staging_dir / "live-canary-certified.json"
+        canary_fingerprint = None
+        try:
+            canary = json.loads(canary_path.read_text(encoding="utf-8"))
+            canary_fingerprint = _extract_build_fingerprint(canary.get("companion_status"))
+        except (OSError, ValueError):
+            pass
+        runner_fingerprint = _extract_build_fingerprint(
+            runner_evidence.get("companion_preflight")
+        )
+        if canary_fingerprint is not None and runner_fingerprint is None:
+            mismatches.append(
+                "runner evidence carries no Companion build fingerprint (companion_preflight)"
+            )
+        elif canary_fingerprint is not None and runner_fingerprint != canary_fingerprint:
+            mismatches.append(
+                f"Companion build fingerprint {runner_fingerprint} != "
+                f"layer-5 canary fingerprint {canary_fingerprint}"
+            )
+    passed = code == 0 and not mismatches
+    if passed:
+        detail = f"full-platform real E2E passed; evidence {output_path}"
+    else:
+        parts: list[str] = []
+        if mismatches:
+            parts.append("evidence cross-check failed: " + "; ".join(mismatches))
+        elif code != 0:
+            parts.append(f"run_live_done_gate_v4.py exited {code}")
+        if out and not mismatches:
+            parts.append(out[-300:])
+        detail = "pending user authorization or executor failure: " + " | ".join(parts)
     return LayerResult(
         name="6_full_e2e",
         passed=passed,
-        detail=(
-            f"full-platform real E2E passed; evidence {output_path}"
-            if passed
-            else (
-                "pending user authorization or executor failure: "
-                f"run_live_done_gate_v4.py exited {code}; "
-                f"{out[-300:]}"
-            )
-        ),
+        detail=detail,
     )
 
 
@@ -563,32 +798,53 @@ def _applicable(layers: list[LayerResult]) -> list[LayerResult]:
     return [layer for layer in layers if not layer.skipped]
 
 
-def run_gate(*, commit: str | None) -> GateReport:
-    # Snapshot the tree state BEFORE any layer runs: layers legitimately rewrite
-    # tracked evidence bundles (e.g. layer 5's live-canary-certified.json), which
-    # would otherwise look like uncommitted changes.  The invariant that matters
-    # is that the code actually exercised was the committed HEAD when the gate
-    # began — evidence files written during the run are outputs, not running code.
-    worktree_dirty = _worktree_dirty()
+def _new_staging_dir() -> Path:
+    """A fresh git-ignored staging directory for this run's evidence."""
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    path = RUNTIME_EVIDENCE_DIR / f"gate-{stamp}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def run_gate(
+    staging_dir: Path,
+    *,
+    commit: str | None = None,
+) -> GateReport:
+    """Run all six layers and return the report.
+
+    The repository is snapshotted *before* any layer runs (start) and again
+    *after* the report is complete (end).  Layers write evidence only into
+    ``staging_dir`` (git-ignored); if the tracked tree or HEAD moved between the
+    two snapshots, ``GateStateChangedError`` is raised and the gate exits 2 —
+    the evidence would name a revision that was never exercised.
+    """
+    start = _git_snapshot()
+    if commit is not None and commit != start.commit_sha:
+        raise GateStateChangedError(
+            f"requested commit {commit} != current HEAD {start.commit_sha}; "
+            "cannot certify a revision that is not checked out"
+        )
+    tested_commit_sha = start.commit_sha
     layers = [
         layer1_reproducibility(),
-        layer2_replay(),
-        layer3_clean_chrome_fixtures(),
+        layer2_replay(staging_dir),
+        layer3_clean_chrome_fixtures(staging_dir),
         layer4_model_smoke(),
-        layer5_real_canary(),
-        layer6_full_e2e(),
+        layer5_real_canary(staging_dir),
+        layer6_full_e2e(staging_dir, start),
     ]
     applicable = _applicable(layers)
     passed = (
-        not worktree_dirty
+        not start.worktree_dirty
         and bool(applicable)
         and all(layer.passed for layer in applicable)
     )
-    if worktree_dirty:
+    if start.worktree_dirty:
         summary = (
             "worktree has uncommitted changes; running code differs from HEAD, "
-            "so commit_sha cannot name the code that was exercised — commit the "
-            "tree and re-run before this evidence can be accepted"
+            "so tested_commit_sha cannot name the code that was exercised — "
+            "commit the tree and re-run before this evidence can be accepted"
         )
     else:
         summary = (
@@ -601,12 +857,18 @@ def run_gate(*, commit: str | None) -> GateReport:
         "E2E 需用户授权官方域名并保持登录态后才能声明通过。"
         "HTTP 任务成功、测试成功、模型调用成功或全部 Source 终态均不单独构成通过。"
         "证据必须落在干净已提交工作树上；worktree_dirty=true 时 passed 恒为 false。"
+        "tested_commit_sha 标注被测试的代码提交；evidence_commit 标注承载证据的提交，"
+        "二者不同一，绝不宣称 evidence_commit 所指提交被 tested_commit_sha 测过。"
     )
+    end = _git_snapshot()
+    _verify_tree_unchanged(start, end)
     return GateReport(
         schema_version=EVIDENCE_SCHEMA,
         generated_at=_now(),
-        commit_sha=commit,
-        worktree_dirty=worktree_dirty,
+        tested_commit_sha=tested_commit_sha,
+        toplevel=start.toplevel,
+        branch=start.branch,
+        worktree_dirty=start.worktree_dirty,
         layers=layers,
         passed=passed,
         summary=summary,
@@ -628,31 +890,109 @@ def _dump(report: GateReport, output_path: Path = OUTPUT_PATH) -> Path:
     return output_path
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--quiet", action="store_true", help="only print the verdict")
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=OUTPUT_PATH,
-        help="atomic output JSON path",
+_EVIDENCE_TRACKED_PATHS: tuple[tuple[str, str], ...] = (
+    ("product-acceptance.json", "benchmarks/results/product-acceptance.json"),
+    ("browser-e2e.json", "benchmarks/results/browser-e2e.json"),
+    (
+        "browser-e2e-screenshot.png",
+        "benchmarks/results/browser-e2e-screenshot.png",
+    ),
+    ("live-canary-certified.json", "benchmarks/results/live-canary-certified.json"),
+    ("live-done-gate-v4.json", "benchmarks/results/live-done-gate-v4.json"),
+)
+
+
+def _copy_staged_evidence(staging_dir: Path) -> list[str]:
+    """Copy staged evidence into the tracked results tree.
+
+    Returns repo-relative paths of the files copied (the report is handled by
+    the caller, not here).  Called only from the explicit ``--commit-evidence``
+    phase, after the run verified the tree is clean — never during the run.
+    """
+    copied: list[str] = []
+    for staged_name, tracked_rel in _EVIDENCE_TRACKED_PATHS:
+        staged = staging_dir / staged_name
+        if not staged.is_file():
+            continue
+        target = ROOT / tracked_rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(staged, target)
+        copied.append(tracked_rel)
+    return copied
+
+
+def _commit_evidence(
+    staging_dir: Path,
+    report: GateReport,
+    *,
+    start: GitSnapshot,
+) -> str:
+    """Two-phase evidence commit.
+
+    Phase 1: ``E`` — a commit whose tree contains only evidence paths (the
+    report at this point carries ``tested_commit_sha=S`` and ``evidence_commit``
+    unset).  Phase 2: a thin pointer commit that fills ``evidence_commit=E``
+    into the report so the authoritative record names both S and E, while never
+    claiming E was tested at S.
+
+    Requires a clean start tree: the gate already verified end==start, and this
+    phase must not sweep unrelated working-tree changes into E.
+    """
+    if start.worktree_dirty:
+        raise GateStateChangedError(
+            "refusing to commit evidence from a dirty worktree: E must contain "
+            "only evidence paths, not unrelated uncommitted changes"
+        )
+    tracked_report_path = ROOT / "benchmarks" / "results" / "product-v1-done-gate.json"
+    # The report goes into E with tested_commit_sha=S and evidence_commit unset.
+    _dump(report, tracked_report_path)
+    copied = _copy_staged_evidence(staging_dir)
+    copied.append(str(tracked_report_path.relative_to(ROOT)))
+    if not copied:
+        raise GateStateChangedError("no staged evidence to commit")
+    # Phase 1: stage only evidence paths and create E.
+    _git("add", "--", *copied)
+    _git(
+        "commit",
+        "-m",
+        f"Done-Gate evidence for tested commit {report.tested_commit_sha} "
+        f"({report.generated_at})",
     )
-    args = parser.parse_args()
+    evidence_commit = _git_snapshot().commit_sha
+    if not evidence_commit:
+        raise GateStateChangedError("evidence commit created but SHA unreadable")
+    # Phase 2: record evidence_commit=E in the report and point the audit trail.
+    report.evidence_commit = evidence_commit
+    _dump(report, tracked_report_path)
+    _git("add", "--", str(tracked_report_path.relative_to(ROOT)))
+    _git(
+        "commit",
+        "-m",
+        f"Record Done-Gate evidence_commit={evidence_commit} for tested commit "
+        f"{report.tested_commit_sha}",
+    )
+    return evidence_commit
 
-    report = run_gate(commit=_commit_sha())
-    output_path = _dump(report, args.output)
 
-    if args.quiet:
+def _print_report(report: GateReport, output_path: Path, quiet: bool) -> None:
+    if quiet:
         print(
             json.dumps(
-                {"passed": report.passed, "summary": report.summary},
+                {
+                    "passed": report.passed,
+                    "summary": report.summary,
+                    "tested_commit_sha": report.tested_commit_sha,
+                    "evidence_commit": report.evidence_commit,
+                },
                 sort_keys=True,
             )
         )
-        return 0 if report.passed else 2
-
+        return
     print(f"TripChord product v1.0 Done-Gate  {report.generated_at}")
-    print(f"commit: {report.commit_sha or 'unknown'}")
+    print(f"tested_commit: {report.tested_commit_sha or 'unknown'}")
+    print(f"evidence_commit: {report.evidence_commit or '(not committed)'}")
+    print(f"toplevel: {report.toplevel or 'unknown'}")
+    print(f"branch: {report.branch or 'unknown'}")
     print(f"worktree_dirty: {report.worktree_dirty}")
     for layer in report.layers:
         marker = "PASS" if layer.passed else ("SKIP" if layer.skipped else "FAIL")
@@ -660,6 +1000,75 @@ def main() -> int:
     print(f"\nverdict: {report.summary}")
     print(f"boundary: {report.boundary}")
     print(f"evidence: {output_path}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--quiet", action="store_true", help="only print the verdict")
+    parser.add_argument(
+        "--staging-dir",
+        type=Path,
+        default=None,
+        help=(
+            "git-ignored directory for run evidence (default: a fresh "
+            ".runtime/done-gate-evidence/gate-<ts> dir)"
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="atomic report JSON path (default: <staging-dir>/product-v1-done-gate.json)",
+    )
+    parser.add_argument(
+        "--commit",
+        type=str,
+        default=None,
+        help="require the tested HEAD to equal this commit SHA, else exit 2",
+    )
+    parser.add_argument(
+        "--commit-evidence",
+        action="store_true",
+        help=(
+            "after a clean verified run, copy staged evidence into the tracked "
+            "results tree and create the evidence commit E (two-phase model: "
+            "tested_commit_sha=S, evidence_commit=E)"
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    staging_dir = args.staging_dir or _new_staging_dir()
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    output_path = (
+        staging_dir / "product-v1-done-gate.json"
+        if args.output is None
+        else args.output
+    )
+
+    try:
+        report = run_gate(staging_dir, commit=args.commit)
+    except GateStateChangedError as exc:
+        if args.quiet:
+            print(json.dumps({"passed": False, "summary": str(exc)}, sort_keys=True))
+        else:
+            print(f"TripChord product v1.0 Done-Gate  {_now()}")
+            print(f"gate aborted: {exc}", file=sys.stderr)
+        return 2
+
+    _dump(report, output_path)
+
+    if args.commit_evidence:
+        try:
+            start = _git_snapshot()
+            _commit_evidence(staging_dir, report, start=start)
+        except GateStateChangedError as exc:
+            # Report already dumped; surface the commit-phase failure but keep
+            # the run verdict intact.
+            print(f"evidence commit skipped: {exc}", file=sys.stderr)
+        # Re-dump so the delivered report carries evidence_commit=E.
+        _dump(report, output_path)
+
+    _print_report(report, output_path, args.quiet)
     return 0 if report.passed else 2
 
 

@@ -209,15 +209,13 @@ _LODGING_PROVIDERS = frozenset({BrowserProvider.CTRIP, BrowserProvider.QUNAR})
 _MINIMUM_EXACT_LODGING_COMPARISON_PROVIDERS = 2
 _LODGING_SEGMENTS = ("full", "first", "middle", "last")
 _V4_LODGING_SEGMENTS = (*_LODGING_SEGMENTS, "hulhumale-full")
-# Qunar lodging searches need more than the default 120s source lease: landing
-# alone can take up to ~40s and the browser companion's extraction phase is
-# capped at 90s (LODGING_EXTRACTION_STAGE_CAP_MS). A lease that expires before
-# the companion seals a bounded terminal receipt (exact quote / confirmed
-# empty / bounded pending) drops the task with no four-state inventory outcome,
-# which breaks the stay-inventory contract downstream. Lodging source tasks are
-# therefore granted a longer lease than the request-level default, capped at
-# the 300s submission validation limit.
-_LODGING_MINIMUM_SOURCE_TIMEOUT_SECONDS = 240
+# Lodging source tasks keep the frozen 120s single-task lease (no bump). The
+# original bump existed because a Qunar landing (~40s) + 90s extraction cap can
+# exceed a single 120s lease; the supported closure is the retry-with-tab-reuse
+# contract instead: attempt 0 fails fast with ``stage_timeout`` and preserves
+# the exact result tab, attempt 1 reuses that tab, skips landing/trigger and
+# spends the full fresh 120s budget on extraction, sealing a four-state receipt
+# (exact quote / confirmed empty / bounded pending / bounded no-exact-quote).
 
 
 def _candidate_id_sequence_sha256(candidate_ids: tuple[str, ...]) -> str:
@@ -7940,14 +7938,9 @@ class LivePackageAgentSystem:
                     "options": options,
                 }
             )
-        if vertical == BrowserVertical.LODGING:
-            # See _LODGING_MINIMUM_SOURCE_TIMEOUT_SECONDS: lodging leases must
-            # outlive landing + the companion's extraction phase so every task
-            # reaches a terminal receipt instead of expiring mid-search.
-            timeout_seconds = min(
-                300,
-                max(timeout_seconds, _LODGING_MINIMUM_SOURCE_TIMEOUT_SECONDS),
-            )
+        # Lodging tasks keep the frozen per-task lease (timeout_seconds from the
+        # request contract, 120s). No lease bump: the retry-with-tab-reuse
+        # closure handles the landing + extraction budget split.
         submission = BrowserTaskSubmission(
             provider=provider,
             kind=vertical,

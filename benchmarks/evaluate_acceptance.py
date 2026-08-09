@@ -92,22 +92,36 @@ def evaluate() -> dict[str, object]:
     }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=OUTPUT_PATH,
+        help=(
+            "atomic evidence output JSON path "
+            "(default: benchmarks/results/product-acceptance.json)"
+        ),
+    )
+    args = parser.parse_args(argv)
+    output_path = args.output
     report = evaluate()
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = OUTPUT_PATH.with_suffix(".json.tmp")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = output_path.with_suffix(".json.tmp")
     tmp.write_text(
         json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
     )
-    os.replace(tmp, OUTPUT_PATH)
+    os.replace(tmp, output_path)
     passed = bool(report["passed"])
     print(f"five anti-surface acceptance  {report['generated_at']}")
     for check in report["surfaces"]:
         marker = "PASS" if check["passed"] else "FAIL"
         print(f"  [{marker}] {check['name']}  {check['module']}")
     print(f"\nverdict: {report['summary']}")
-    print(f"evidence: {OUTPUT_PATH}")
+    print(f"evidence: {output_path}")
     return 0 if passed else 2
 
 

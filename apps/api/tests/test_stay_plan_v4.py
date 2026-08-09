@@ -2583,8 +2583,10 @@ def test_counterexample_timeout_without_receipt_drops_four_state_row() -> None:
     A Qunar lodging task whose lease expired mid-search produced no terminal
     receipt; _stay_plan_inventory_outcomes therefore emits NO four-state row
     for that provider/segment, which fails the stay_inventory_four_state_contract
-    (missing outcome).  Fix A grants lodging source tasks a longer lease so the
-    companion can seal a bounded receipt (quote/empty/pending) before expiry.
+    (missing outcome).  The frozen 120s lease is kept; the closure is that a
+    fast-failed extraction preserves the exact result tab and the retry reuses
+    it for a full-budget extraction that seals a bounded receipt
+    (quote/empty/pending) — never a silent lease bump.
     """
     snapshot = _timeout_without_receipt_snapshot()
     outcomes = _inventory_outcomes_for_snapshot(snapshot)
@@ -2595,17 +2597,14 @@ def test_counterexample_timeout_without_receipt_drops_four_state_row() -> None:
     assert "inventory_receipt" not in snapshot.failure.details
 
 
-def test_lodging_source_tasks_get_longer_lease_than_request_timeout() -> None:
-    """Regression guard for Fix A.
+def test_lodging_source_tasks_keep_frozen_request_lease() -> None:
+    """Regression guard for the frozen 120s single-task lease.
 
-    Lodging source submissions must carry at least the lodging minimum lease
-    even when the request-level timeout is far shorter, so Qunar extraction
-    outlives landing (~40s) + the 90s extraction cap and seals a terminal
-    receipt.  Flight source submissions keep the exact request lease so the
-    bump never inflates flight wave budgets.
+    Lodging source submissions must keep the exact request-level timeout
+    (120s) — the C-98 bump that raised lodging leases to 240/300s violated the
+    frozen contract and must not regress.  Flight source submissions also keep
+    the exact request lease.
     """
-    from tripchord.agents.live_system import _LODGING_MINIMUM_SOURCE_TIMEOUT_SECONDS
-
     system = LivePackageAgentSystem(BrowserTaskBridge())
     profile = system_stay_area_search_profile("马累")
     assert profile is not None
@@ -2635,10 +2634,10 @@ def test_lodging_source_tasks_get_longer_lease_than_request_timeout() -> None:
                 segment=segment,
             )
             submission = BrowserTaskSubmission.model_validate(task.input["submission"])
-            assert (
-                submission.timeout_seconds
-                >= _LODGING_MINIMUM_SOURCE_TIMEOUT_SECONDS
-            ), f"{provider.value}/{segment} kept the short request lease"
+            assert submission.timeout_seconds == 120, (
+                f"{provider.value}/{segment} got lease "
+                f"{submission.timeout_seconds}, expected the frozen 120s"
+            )
 
     flight_task = system._source_task(
         BrowserProvider.CTRIP,
@@ -2650,3 +2649,76 @@ def test_lodging_source_tasks_get_longer_lease_than_request_timeout() -> None:
         flight_task.input["submission"]
     )
     assert flight_submission.timeout_seconds == 120
+
+
+def test_counterexample_preserved_tab_triggers_retry_reuse() -> None:
+    """Counter-example for the 120s closure.
+
+    A Qunar lodging task that fast-failed (retryable timeout) and preserved its
+    exact result tab must mark the retry for tab reuse; the companion then skips
+    landing/trigger and spends the full fresh budget on extraction.  Without the
+    preserved tab no reuse is triggered and the four-state row stays missing.
+    """
+    from tripchord.agents.live_system import (
+        _should_reuse_lodging_result_tab,
+        _with_reuse_lodging_result_tab,
+    )
+
+    system = LivePackageAgentSystem(BrowserTaskBridge())
+    profile = system_stay_area_search_profile("马累")
+    assert profile is not None
+    query = BrowserSearchQuery(
+        origin="杭州",
+        destination="马累",
+        origin_code="HGH",
+        destination_code="MLE",
+        start_date=date(2026, 8, 12),
+        end_date=date(2026, 8, 18),
+        adults=2,
+        rooms=1,
+        options={
+            "gateway_destination": "马累",
+            "stay_area_search_profile": profile.model_dump(mode="json"),
+            "stay_plan_candidate_set": system_stay_plan_candidate_set().model_dump(mode="json"),
+        },
+    )
+    task = system._source_task(
+        BrowserProvider.QUNAR,
+        BrowserVertical.LODGING,
+        query,
+        120,
+        segment="full",
+    )
+    submission = BrowserTaskSubmission.model_validate(task.input["submission"])
+    assert submission.timeout_seconds == 120
+
+    preserved = _timeout_without_receipt_snapshot(provider=BrowserProvider.QUNAR)
+    preserved = preserved.model_copy(
+        update={
+            "failure": BrowserFailure(
+                code=BrowserFailureCode.TIMEOUT,
+                message="stage_timeout: remaining lease below extraction minimum budget",
+                page_url="https://touch.qunar.com/hotel/list",
+                captured_at=NOW,
+                retryable=True,
+                details={
+                    "inventory_result_state": "bounded_provider_pending",
+                    "preserved_exact_result_tab": {
+                        "provider": "qunar",
+                        "kind": "lodging",
+                        "tab_id": 42,
+                        "url": "https://touch.qunar.com/hotel/list",
+                    },
+                },
+            )
+        }
+    )
+    assert _should_reuse_lodging_result_tab(preserved, submission) is True
+
+    reused = _with_reuse_lodging_result_tab(submission)
+    assert reused.query.options.get("__tripchord_reuse_exact_result_tab") is True
+    assert reused.timeout_seconds == 120
+
+    # Without the preserved tab the same failure is not eligible for reuse.
+    bare = _timeout_without_receipt_snapshot(provider=BrowserProvider.QUNAR)
+    assert _should_reuse_lodging_result_tab(bare, submission) is False

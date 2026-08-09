@@ -1984,8 +1984,110 @@ def test_repo_revision_identifies_committed_revision(
     clean = run_live_done_gate_v4._repo_revision()
     assert clean["worktree_dirty"] is False
     assert isinstance(clean["commit_sha"], str) and len(clean["commit_sha"]) >= 7
+    assert clean["toplevel"] == str(tmp_path)
+    assert clean["branch"] is not None
 
     tracked.write_text("modified\n", encoding="utf-8")
     dirty = run_live_done_gate_v4._repo_revision()
     assert dirty["worktree_dirty"] is True
     assert dirty["commit_sha"] == clean["commit_sha"]
+
+
+def test_repo_revision_ignores_git_dir_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Counter-example (defect fix ④): a caller-injected GIT_DIR must not make
+    the runner name a different repository as the evidence root."""
+    import subprocess as _subprocess
+
+    _subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    _subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "gate-test@example.com"],
+        check=True,
+    )
+    _subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Gate Test"],
+        check=True,
+    )
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("baseline\n", encoding="utf-8")
+    _subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    _subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-q", "-m", "baseline"],
+        check=True,
+    )
+    # A decoy repo whose HEAD the environment would otherwise redirect git to.
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    _subprocess.run(["git", "init", "-q", str(decoy)], check=True)
+    _subprocess.run(
+        ["git", "-C", str(decoy), "config", "user.email", "gate-test@example.com"],
+        check=True,
+    )
+    _subprocess.run(
+        ["git", "-C", str(decoy), "config", "user.name", "Gate Test"],
+        check=True,
+    )
+    decoy_tracked = decoy / "decoy.txt"
+    decoy_tracked.write_text("decoy\n", encoding="utf-8")
+    _subprocess.run(["git", "-C", str(decoy), "add", "decoy.txt"], check=True)
+    _subprocess.run(
+        ["git", "-C", str(decoy), "commit", "-q", "-m", "decoy"],
+        check=True,
+    )
+
+    monkeypatch.setattr(run_live_done_gate_v4, "_REPO_ROOT", tmp_path)
+    env = run_live_done_gate_v4._git_safe_env()
+    assert "GIT_DIR" not in env
+    assert "GIT_WORK_TREE" not in env
+
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
+    revision = run_live_done_gate_v4._repo_revision()
+    assert revision["toplevel"] == str(tmp_path)
+    assert revision["commit_sha"] != _subprocess.run(
+        ["git", "-C", str(decoy), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def test_repo_revision_detects_mid_run_change(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Counter-example (defect fix ④): when the tree changes between the start
+    snapshot and bundle time, the revision fails closed with a change flag."""
+    import subprocess as _subprocess
+
+    _subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    _subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "gate-test@example.com"],
+        check=True,
+    )
+    _subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Gate Test"],
+        check=True,
+    )
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("baseline\n", encoding="utf-8")
+    _subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    _subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-q", "-m", "baseline"],
+        check=True,
+    )
+    monkeypatch.setattr(run_live_done_gate_v4, "_REPO_ROOT", tmp_path)
+
+    start = run_live_done_gate_v4._repo_revision()
+    tracked.write_text("changed mid-run\n", encoding="utf-8")
+    changed = run_live_done_gate_v4._repo_revision(start)
+    assert changed["revision_changed_during_run"] is True
+    assert changed["start_revision"]["commit_sha"] == start["commit_sha"]
+
+    # A clean end against the same start carries no change flag.
+    tracked.write_text("baseline\n", encoding="utf-8")
+    _subprocess.run(["git", "-C", str(tmp_path), "checkout", "--", "tracked.txt"], check=True)
+    unchanged = run_live_done_gate_v4._repo_revision(start)
+    assert unchanged.get("revision_changed_during_run") is None
