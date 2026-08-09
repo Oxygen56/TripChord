@@ -646,3 +646,165 @@ async def test_model_trace_scope_reports_zero_and_failed_attempts_without_conten
     assert "secret-prompt-must-not-be-persisted" not in serialized
     assert "secret-user-text" not in serialized
     assert secret_response not in serialized
+
+
+@pytest.mark.asyncio
+async def test_structured_output_locally_repairs_markdown_fenced_json_without_model_retry() -> None:
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": '```json\n{"status":"ok"}\n```',
+                        },
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = build_model_client(
+            ModelClientConfig(
+                provider=ModelProviderName.OPENAI_COMPATIBLE,
+                model="deepseek-v4-flash",
+                base_url="https://api.deepseek.com",
+                retry=ModelRetryPolicy(
+                    max_attempts=2,
+                    base_delay_seconds=0,
+                    max_delay_seconds=0,
+                ),
+            ),
+            http_client=http_client,
+        )
+        response = await client.complete(
+            ModelRequest(
+                role=AgentRole.EXPLANATION,
+                system="Return compact JSON.",
+                messages=(ModelMessage(role="user", content="go"),),
+                response_schema={
+                    "type": "object",
+                    "required": ["status"],
+                    "properties": {"status": {"type": "string", "const": "ok"}},
+                },
+            )
+        )
+
+    # The fence is repaired locally; the model is never asked to retry.
+    assert len(bodies) == 1
+    assert "repair attempt" not in json.dumps(bodies[0])
+    assert response.structured_output == {"status": "ok"}
+    assert response.metadata["attempt_count"] == 1
+    assert response.metadata["structured_repair_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_structured_output_locally_repairs_prose_wrapped_json_without_model_retry() -> None:
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": 'Here is the result:\n{"status":"ok"}\nThat is all.',
+                        },
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = build_model_client(
+            ModelClientConfig(
+                provider=ModelProviderName.OPENAI_COMPATIBLE,
+                model="deepseek-v4-flash",
+                base_url="https://api.deepseek.com",
+                retry=ModelRetryPolicy(
+                    max_attempts=2,
+                    base_delay_seconds=0,
+                    max_delay_seconds=0,
+                ),
+            ),
+            http_client=http_client,
+        )
+        response = await client.complete(
+            ModelRequest(
+                role=AgentRole.EXPLANATION,
+                system="Return compact JSON.",
+                messages=(ModelMessage(role="user", content="go"),),
+                response_schema={
+                    "type": "object",
+                    "required": ["status"],
+                    "properties": {"status": {"type": "string", "const": "ok"}},
+                },
+            )
+        )
+
+    assert len(bodies) == 1
+    assert response.structured_output == {"status": "ok"}
+    assert response.metadata["attempt_count"] == 1
+    assert response.metadata["structured_repair_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_structured_output_archives_raw_text_when_local_repair_exhausted() -> None:
+    malformed = 'prefix {"status": "truncated"'
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": malformed},
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = build_model_client(
+            ModelClientConfig(
+                provider=ModelProviderName.OPENAI_COMPATIBLE,
+                model="deepseek-v4-flash",
+                base_url="https://api.deepseek.com",
+                retry=ModelRetryPolicy(
+                    max_attempts=2,
+                    base_delay_seconds=0,
+                    max_delay_seconds=0,
+                ),
+            ),
+            http_client=http_client,
+        )
+        with pytest.raises(StructuredOutputError) as captured:
+            await client.complete(
+                ModelRequest(
+                    role=AgentRole.EXPLANATION,
+                    system="Return compact JSON.",
+                    messages=(ModelMessage(role="user", content="go"),),
+                    response_schema={
+                        "type": "object",
+                        "required": ["status"],
+                        "properties": {"status": {"type": "string"}},
+                    },
+                )
+            )
+
+    # The model got one repair request, then failed closed with the raw text
+    # archived on the exception so the evidence chain can seal the failure.
+    assert len(bodies) == 2
+    assert captured.value.raw_output == malformed
+    assert captured.value.attempt_count == 2

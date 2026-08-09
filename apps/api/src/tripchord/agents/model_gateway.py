@@ -333,7 +333,18 @@ class ModelHTTPError(ModelGatewayError):
 
 
 class StructuredOutputError(ModelGatewayError):
-    pass
+    """A completion failed local JSON parse or schema validation.
+
+    ``raw_output`` archives the exact untrusted model text that failed, so a
+    caller (or the sealed exploration evidence) can audit the failure without
+    replaying it into the next model request.  It is intentionally not part of
+    the message: the message stays stable for programmatic callers while the
+    archived text is available to the evidence chain.
+    """
+
+    def __init__(self, message: str, *, raw_output: str | None = None) -> None:
+        super().__init__(message)
+        self.raw_output = raw_output
 
 
 class ModelResponseFormatMode(StrEnum):
@@ -507,11 +518,56 @@ def _structured_output(text: str, schema: Mapping[str, Any] | None) -> JsonValue
     if schema is None:
         return None
     try:
-        value: Any = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise StructuredOutputError("model did not return valid JSON") from exc
+        value: Any = _parse_structured_json(text)
+    except StructuredOutputError:
+        raise
     _validate_json_schema(value, schema)
     return TypeAdapter(JsonValue).validate_python(value)
+
+
+def _parse_structured_json(text: str) -> JsonValue:
+    """Parse model output as JSON with bounded deterministic local repairs.
+
+    The model is told to return one compact JSON object, but real completions
+    can arrive wrapped in Markdown fences, carry a prose prefix/suffix, or
+    contain a trailing comma.  A bounded set of local syntactic repairs runs
+    BEFORE the single model-side correction request, so a recoverable
+    malformation is repaired without spending the model's correction budget,
+    and a hard failure archives the raw text on the raised error for sealed
+    audit evidence.  No repair adds facts, tools, permissions, or authority;
+    each candidate is derived only from the supplied text.
+    """
+
+    candidates: list[str] = [text]
+    stripped = text.strip()
+    if stripped != text:
+        candidates.append(stripped)
+    # Markdown code fences: ```json {…} ``` / ``` {…} ``` — take the first
+    # fenced body and stop at the closing fence.
+    for fence in ("```json", "```JSON", "```"):
+        if fence in text:
+            _, _, after = text.partition(fence)
+            if "```" in after:
+                body = after.split("```", 1)[0].strip()
+                if body:
+                    candidates.append(body)
+    # Object/array extraction: the first opener to the last matching closer,
+    # which drops a prose prefix and any trailing text after the JSON value.
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = text.find(opener)
+        end = text.rfind(closer)
+        if start >= 0 and end > start:
+            candidates.append(text[start : end + 1])
+    last_error: json.JSONDecodeError | None = None
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+    raise StructuredOutputError(
+        "model did not return valid JSON",
+        raw_output=text,
+    ) from last_error
 
 
 def _trace_success(

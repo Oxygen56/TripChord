@@ -140,7 +140,13 @@ const FLIGHT_LOADING_DOM_DRIFT_MAX_POLLS = 3;
 const FLIGHT_STAGED_DOM_DRIFT_MAX_POLLS = 4;
 // Ctrip's return-flight list is hydrated after the exact outbound transition;
 // live pages have taken more than two seconds even after the tab reports ready.
-const CTRIP_OUTBOUND_STAGE_WARMUP_MAX_POLLS = 12;
+// Round-10 live evidence: the outbound list can still be empty at 6s of warmup
+// (12 x 500ms polls) and only later hydrates its price cards.  Widen the warmup
+// window to ~30s so a slow-hydrating outbound list has a real chance to render
+// before the extraction falls back to the bounded no-exact-quote receipt.  The
+// polling loop is still deadline-bounded (FLIGHT_DOM_DRIFT_POLL_INTERVAL_MS),
+// so the extraction never overruns the frozen lease contract.
+const CTRIP_OUTBOUND_STAGE_WARMUP_MAX_POLLS = 60;
 // Tongcheng reports the document as complete before its international-flight
 // result XHR has hydrated any price cards.  Keep this bounded and only retry
 // the recognizable result shell; an empty or unrelated page remains terminal.
@@ -172,6 +178,17 @@ const QUNAR_PENDING_MESSAGE =
   "请稍等,您查询的结果正在实时搜索中...";
 const QUNAR_PENDING_MIN_OBSERVED_MS = 25000;
 const QUNAR_PENDING_MAX_OBSERVED_MS = 120000;
+// A lodging extraction must retain enough budget to reach a terminal receipt:
+// >= QUNAR_PENDING_MIN_OBSERVED_MS of pending observation, one bounded
+// re-read pass (LODGING_EXTRACTION_RETRY_MIN_BUDGET_MS), and a small margin.
+// If less remains, the lease fails fast with a retryable timeout and the
+// established result tab is preserved for reuse instead of being squandered
+// into a native lease timeout with no receipt.
+const LODGING_EXTRACTION_MIN_BUDGET_MS =
+  QUNAR_PENDING_MIN_OBSERVED_MS + LODGING_EXTRACTION_RETRY_MIN_BUDGET_MS + 5000;
+// A preserved result tab is claimed by the API retry within a few poll cycles.
+// Close it if it is never claimed so a Qunar isolation window cannot leak.
+const PRESERVED_EXACT_RESULT_TAB_MAX_AGE_MS = 120000;
 const FLIGHT_DOM_DRIFT_POLL_INTERVAL_MS = 500;
 const VISIBLE_CONTENT_MESSAGE_TYPES = new Set([
   "tripchord:prepare-search",
@@ -277,6 +294,10 @@ let activeInitialLandings = 0;
 const initialLandingQueue = [];
 const leasedExistingTabIds = new Set();
 const activeLeaseIds = new Set();
+// Result tabs preserved across a retryable lease timeout so the API retry can
+// reuse the established search-result page with a fresh full-budget extraction.
+// tabId -> { window_id, provider, kind, preserved_at_ms, isolation_window }
+const preservedExactResultTabs = new Map();
 
 function navigationPathShape(pathname) {
   const segments = String(pathname || "")
@@ -1514,6 +1535,103 @@ function auditedLodgingResultUrl(provider, query = {}) {
   return null;
 }
 
+function preservedLodgingResultQueryKey(query = {}) {
+  const placeKey = String(
+    query && query.options && query.options.expected_lodging_place_key || "",
+  ).trim().toLowerCase();
+  return [
+    placeKey,
+    String(query && query.start_date || ""),
+    String(query && query.end_date || ""),
+    Number(query && query.adults),
+    Number(query && query.rooms),
+  ].join("|");
+}
+
+async function preserveExactLodgingResultTab(
+  lease,
+  tabId,
+  ownedTabIds,
+  ownedWindowIds,
+) {
+  if (
+    !lease ||
+    lease.kind !== "lodging" ||
+    lease.query.search_url ||
+    !["fliggy", "qunar"].includes(lease.provider) ||
+    !Number.isInteger(tabId) ||
+    !chrome.tabs ||
+    typeof chrome.tabs.get !== "function"
+  ) {
+    return null;
+  }
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return null;
+  }
+  const tabUrl = String(tab && (tab.url || tab.pendingUrl) || "");
+  const decision = auditedLodgingResultUrlDecision(
+    lease.provider,
+    tabUrl,
+    lease.query,
+  );
+  if (!decision || !decision.allowed) {
+    // The tab is not on a reusable exact result page, so closing it (the
+    // lease default) is the honest outcome — there is nothing to reuse.
+    return null;
+  }
+  const windowId = Number.isInteger(tab.windowId) ? tab.windowId : null;
+  ownedTabIds.delete(tabId);
+  if (windowId !== null) {
+    ownedWindowIds.delete(windowId);
+  }
+  const isolationWindow = lease.provider === "qunar";
+  preservedExactResultTabs.set(tabId, {
+    window_id: windowId,
+    provider: lease.provider,
+    kind: lease.kind,
+    preserved_at_ms: Date.now(),
+    query_key: preservedLodgingResultQueryKey(lease.query),
+    isolation_window: isolationWindow,
+  });
+  // Reserve the tab in the reuse pool so no other lease can claim it and so
+  // the API retry's exact-result reuse path finds it.
+  leasedExistingTabIds.add(tabId);
+  return {
+    tab_id: tabId,
+    window_id: windowId,
+    isolation_window: isolationWindow,
+    url: decision.href,
+  };
+}
+
+async function sweepExpiredPreservedResultTabs() {
+  const now = Date.now();
+  for (const [tabId, record] of preservedExactResultTabs) {
+    if (
+      !record ||
+      now - record.preserved_at_ms < PRESERVED_EXACT_RESULT_TAB_MAX_AGE_MS
+    ) {
+      continue;
+    }
+    preservedExactResultTabs.delete(tabId);
+    leasedExistingTabIds.delete(tabId);
+    if (chrome.tabs && typeof chrome.tabs.remove === "function") {
+      chrome.tabs.remove(tabId).catch(() => {});
+    }
+    if (
+      record.isolation_window &&
+      record.window_id !== null &&
+      chrome.windows &&
+      typeof chrome.windows.remove === "function"
+    ) {
+      chrome.windows.remove(record.window_id).catch(() => {});
+    }
+  }
+}
+
 async function claimReusableExactLodgingResultTab(lease) {
   if (
     !lease ||
@@ -1528,6 +1646,48 @@ async function claimReusableExactLodgingResultTab(lease) {
     typeof chrome.tabs.query !== "function"
   ) {
     return null;
+  }
+  const queryKey = preservedLodgingResultQueryKey(lease.query);
+  for (const [tabId, record] of preservedExactResultTabs) {
+    if (
+      !record ||
+      record.provider !== lease.provider ||
+      record.kind !== "lodging" ||
+      record.query_key !== queryKey
+    ) {
+      continue;
+    }
+    let currentUrl = null;
+    try {
+      const current = await chrome.tabs.get(tabId);
+      currentUrl = String(current && (current.url || current.pendingUrl) || "");
+    } catch {
+      currentUrl = null;
+    }
+    if (!currentUrl) {
+      preservedExactResultTabs.delete(tabId);
+      leasedExistingTabIds.delete(tabId);
+      continue;
+    }
+    const decision = auditedLodgingResultUrlDecision(
+      lease.provider,
+      currentUrl,
+      lease.query,
+    );
+    if (!decision || !decision.allowed) {
+      preservedExactResultTabs.delete(tabId);
+      leasedExistingTabIds.delete(tabId);
+      continue;
+    }
+    preservedExactResultTabs.delete(tabId);
+    leasedExistingTabIds.add(tabId);
+    return {
+      tab_id: tabId,
+      url: decision.href,
+      preserved_exact_result: true,
+      isolation_window: Boolean(record.isolation_window),
+      window_id: Number.isInteger(record.window_id) ? record.window_id : null,
+    };
   }
   const expectedUrl = auditedLodgingResultUrl(
     lease.provider,
@@ -6116,6 +6276,25 @@ async function extractWithRetry(
       ),
   );
   const extractionStartedAt = Date.now();
+  if (
+    lease.kind === "lodging" &&
+    extractionDeadline - extractionStartedAt < LODGING_EXTRACTION_MIN_BUDGET_MS
+  ) {
+    // A realtime search cannot settle into a terminal quote/empty/pending
+    // receipt with less than the minimum observation budget. Failing fast here
+    // (instead of attempting a doomed extraction) lets the caller preserve the
+    // result tab for a full-budget retry rather than burn the lease into a
+    // native timeout with no receipt.
+    throw lifecycleError(
+      "stage_timeout",
+      `lodging extraction has insufficient remaining lease budget for a terminal receipt`,
+      {
+        stage: "list_extraction",
+        required_budget_ms: LODGING_EXTRACTION_MIN_BUDGET_MS,
+        available_budget_ms: Math.max(0, extractionDeadline - extractionStartedAt),
+      },
+    );
+  }
   let qunarPendingSealAttempted = false;
   let workflowDriver = driver;
   if (lease.kind === "flight") {
@@ -10296,6 +10475,10 @@ async function executeLease(lease) {
   let tabId = null;
   let reusedTabId = null;
   let reusedExactLodgingResult = false;
+  let reusedPreservedIsolationWindow = false;
+  let reusedPreservedWindowId = null;
+  let preservedResultTabId = null;
+  let preservedResultEvidence = null;
   let pageUrl = null;
   const ownedTabIds = new Set();
   const ownedWindowIds = new Set();
@@ -10477,6 +10660,14 @@ async function executeLease(lease) {
             tabId = reusable.tab_id;
             reusedTabId = reusable.tab_id;
             reusedExactLodgingResult = true;
+            if (
+              reusable.preserved_exact_result === true &&
+              Number.isInteger(reusable.window_id)
+            ) {
+              reusedPreservedWindowId = reusable.window_id;
+              reusedPreservedIsolationWindow =
+                reusable.isolation_window === true;
+            }
             const readiness = await waitForTabInteractive(
               tabId,
               remainingTimeout(
@@ -11012,6 +11203,44 @@ async function executeLease(lease) {
           : error && error.tripchordCode === "navigation_error"
             ? "navigation_error"
             : "extraction_error";
+    let failureDetails = lifecycleFailureDetails(error) || {};
+    if (
+      code === "timeout" &&
+      tabId !== null &&
+      lease.kind === "lodging" &&
+      ["qunar", "fliggy"].includes(lease.provider)
+    ) {
+      // Fail fast with a clean retryable timeout while preserving the
+      // established result tab, so the API retry can reuse it with a fresh
+      // full-budget extraction instead of hitting a native lease timeout with
+      // no receipt.
+      const preserved = await preserveExactLodgingResultTab(
+        lease,
+        tabId,
+        ownedTabIds,
+        ownedWindowIds,
+      );
+      if (preserved) {
+        preservedResultTabId = preserved.tab_id;
+        preservedResultEvidence = preserved;
+        failureDetails = {
+          ...failureDetails,
+          preserved_exact_result_tab: {
+            provider: lease.provider,
+            kind: lease.kind,
+            tab_id: preserved.tab_id,
+            url: preserved.url,
+          },
+        };
+        if (lease.provider === "qunar") {
+          browserIsolationEvidence = qunarLodgingIsolationEvidence({
+            lifecycle_state: "retained_for_reuse",
+            observed_focused: false,
+            observed_active_tab_count: 1,
+          });
+        }
+      }
+    }
     try {
       return await finish(
         failure(
@@ -11020,7 +11249,7 @@ async function executeLease(lease) {
           message,
           pageUrl,
           code === "timeout",
-          lifecycleFailureDetails(error),
+          failureDetails,
         ),
       );
     } catch {
@@ -11032,6 +11261,24 @@ async function executeLease(lease) {
     if (reusedTabId !== null) {
       leasedExistingTabIds.delete(reusedTabId);
     }
+    if (reusedPreservedWindowId !== null) {
+      const windowIdToClose = reusedPreservedWindowId;
+      reusedPreservedWindowId = null;
+      if (reusedPreservedIsolationWindow) {
+        try {
+          if (chrome.windows && typeof chrome.windows.remove === "function") {
+            await chrome.windows.remove(windowIdToClose);
+          }
+        } catch {
+          // The reused-tab window may already be closed by the user or by the
+          // lease's own isolation cleanup; a leak-free completion is best-effort.
+        }
+      }
+    }
+    if (preservedResultTabId !== null) {
+      preservedResultTabId = null;
+    }
+    sweepExpiredPreservedResultTabs();
   }
 }
 
@@ -11096,6 +11343,7 @@ async function pollOnce() {
   }
   polling = true;
   try {
+    sweepExpiredPreservedResultTabs();
     const config = await sessionConfig();
     if (!config.connected) {
       return;
@@ -11438,6 +11686,10 @@ if (globalThis.__TRIPCHORD_BACKGROUND_TEST_HOOKS__) {
     auditedLodgingResultUrl,
     claimReusableExactLodgingResultTab,
     claimReusableExactFlightResultTab,
+    preserveExactLodgingResultTab,
+    preservedLodgingResultQueryKey,
+    sweepExpiredPreservedResultTabs,
+    preservedExactResultTabs,
     auditedProviderLoginRedirect,
     qunarGeometryStabilityKeys,
     restartTrustedFlightSearch,

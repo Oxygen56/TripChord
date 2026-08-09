@@ -3139,6 +3139,91 @@ const portClosed = () =>
 }
 
 {
+  // A Qunar lodging result tab that runs out of lease budget is preserved
+  // (not closed) so a retryable-timeout retry can reuse it with a fresh
+  // full-budget extraction.  This is the cancel/retry half of the 90s-phase /
+  // 120s-lease redesign: without it, the retry restarts from a fresh landing
+  // and can hit a native lease timeout with no receipt.
+  const qunarResultUrl =
+    "https://hotel.qunar.com/intl/search.jsp?toCity=%E8%83%A1%E9%B2%81%E9%A9%AC%E7%B4%AF&fromDate=2026-08-20&toDate=2026-08-27&cityurl=i-hulhumale&from=globalhotelpages";
+  tabs.set(25, {
+    id: 25,
+    windowId: 7,
+    status: "complete",
+    url: qunarResultUrl,
+  });
+  const ownedTabs = new Set([25]);
+  const ownedWindows = new Set([7]);
+  const lease = {
+    task_id: "preserve-qunar-hulhumale",
+    provider: "qunar",
+    kind: "lodging",
+    query: {
+      destination: "Hulhumalé",
+      start_date: "2026-08-20",
+      end_date: "2026-08-27",
+      adults: 2,
+      rooms: 1,
+      search_url: null,
+      options: {
+        expected_lodging_place_key: "hulhumale",
+      },
+    },
+  };
+  const preserved = await hooks.preserveExactLodgingResultTab(
+    lease,
+    25,
+    ownedTabs,
+    ownedWindows,
+  );
+  assert.equal(preserved.tab_id, 25);
+  assert.equal(preserved.isolation_window, true);
+  assert.equal(ownedTabs.has(25), false);
+  assert.equal(ownedWindows.has(7), false);
+  assert.equal(hooks.preservedExactResultTabs.has(25), true);
+
+  // A retry submitted with the exact-result reuse flag claims the preserved
+  // tab instead of scanning for a generic one.
+  const reusable = await hooks.claimReusableExactLodgingResultTab({
+    ...lease,
+    query: {
+      ...lease.query,
+      options: {
+        expected_lodging_place_key: "hulhumale",
+        __tripchord_reuse_exact_result_tab: true,
+      },
+    },
+  });
+  assert.equal(reusable.tab_id, 25);
+  assert.equal(reusable.preserved_exact_result, true);
+  assert.equal(reusable.isolation_window, true);
+  assert.equal(hooks.preservedExactResultTabs.has(25), false);
+
+  // Sweep with an artificially expired record closes the tab and window.
+  tabs.set(26, {
+    id: 26,
+    windowId: 8,
+    status: "complete",
+    url: qunarResultUrl,
+  });
+  hooks.preservedExactResultTabs.set(26, {
+    window_id: 8,
+    provider: "qunar",
+    kind: "lodging",
+    preserved_at_ms: Date.now() - 200000,
+    query_key: hooks.preservedLodgingResultQueryKey(lease.query),
+    isolation_window: true,
+  });
+  await hooks.sweepExpiredPreservedResultTabs();
+  assert.equal(hooks.preservedExactResultTabs.has(26), false);
+  assert.equal(removedTabs.includes(26), true);
+  assert.equal(removedWindows.includes(8), true);
+
+  tabs.delete(25);
+  tabs.delete(26);
+}
+
+{
   tabs.set(30, {
     id: 30,
     status: "complete",
@@ -5663,7 +5748,7 @@ for (const [mutated, reason] of [
       confirmation_scope: "confirmed_visible_search",
       confirmed_query: { ...ctripDetailQuery },
     },
-    Date.now() + 6000,
+    Date.now() + 60000,
     new Set([124]),
   );
   assert.equal(extraction.failure.code, "dom_drift");

@@ -236,6 +236,44 @@ def _browser_wait_timeout_seconds(
     return float(waves * (execution_timeout_seconds + _BROWSER_WAVE_HANDOFF_SECONDS))
 
 
+def _should_reuse_lodging_result_tab(
+    terminal: BrowserTaskSnapshot,
+    submission: BrowserTaskSubmission,
+) -> bool:
+    """Whether a retryable browser-timeout failure preserved an exact result tab
+    that the retry should reuse with a fresh full-budget extraction.
+
+    The companion preserves a Qunar/Fliggy lodging result tab only when it
+    failed fast because the remaining lease could not produce a terminal
+    receipt (90s extraction phase vs the 120s lease contract). Reusing that
+    tab on the retry skips landing/trigger and gives extraction the full budget
+    instead of re-running the doomed pipeline into a native lease timeout.
+    """
+    if (
+        terminal.state != BrowserTaskState.FAILED
+        or terminal.failure is None
+        or not terminal.failure.retryable
+        or submission.kind != BrowserVertical.LODGING
+        or submission.provider not in {BrowserProvider.QUNAR, BrowserProvider.FLIGGY}
+        or submission.query.search_url is not None
+    ):
+        return False
+    details = terminal.failure.details or {}
+    preserved = details.get("preserved_exact_result_tab")
+    return isinstance(preserved, dict) and bool(preserved)
+
+
+def _with_reuse_lodging_result_tab(
+    submission: BrowserTaskSubmission,
+) -> BrowserTaskSubmission:
+    """Return a clone of ``submission`` that asks the companion to reuse a
+    preserved exact-result tab on the retry."""
+    options = dict(submission.query.options or {})
+    options["__tripchord_reuse_exact_result_tab"] = True
+    query = submission.query.model_copy(update={"options": options})
+    return submission.model_copy(update={"query": query})
+
+
 def _remaining_absolute_delay_ms(
     configured_delay_ms: int,
     *,
@@ -6963,13 +7001,14 @@ class LivePackageAgentSystem:
                 # international-flight landing page). Re-submit exactly once;
                 # non-retryable DOM, login, captcha and inventory outcomes are
                 # never hidden or retried.
+                retry_submission = submission
                 for attempt_index in range(2):
-                    (submitted,) = await self._bridge.submit_many((submission,))
+                    (submitted,) = await self._bridge.submit_many((retry_submission,))
                     submitted_ids.append(submitted.id)
                     (terminal,) = await self._bridge.wait_many(
                         (submitted.id,),
                         timeout_seconds=_browser_wait_timeout_seconds(
-                            submission.timeout_seconds,
+                            retry_submission.timeout_seconds,
                             source_task_count=source_task_count,
                         ),
                     )
@@ -6986,6 +7025,15 @@ class LivePackageAgentSystem:
                                 [value.model_dump(mode="json") for value in attempts]
                             ),
                         }
+                    # When the companion preserved the established result tab
+                    # because the 90s extraction phase could not fit the
+                    # remaining lease, reuse that tab on the retry so the
+                    # extraction starts with a fresh full budget instead of a
+                    # second fresh landing that is equally lease-constrained.
+                    if _should_reuse_lodging_result_tab(terminal, submission):
+                        retry_submission = _with_reuse_lodging_result_tab(
+                            submission,
+                        )
                 raise RuntimeError("browser search retry loop did not return")
             except BaseException as exc:
                 await self._cancel_submitted_tasks(

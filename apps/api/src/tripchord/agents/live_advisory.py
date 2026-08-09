@@ -20,6 +20,7 @@ from tripchord.agents.model_gateway import (
     ModelRouter,
     ModelTool,
     ModelToolResult,
+    StructuredOutputError,
     compact_json,
 )
 from tripchord.agents.models import AgentRole, AgentTask, AgentTaskResult
@@ -1167,7 +1168,15 @@ class StructuredLiveModelAgent:
                     raise ModelGatewayError("required_tool_not_called")
                 raw: Any = None
                 try:
-                    raw = json.loads(response.text)
+                    # Prefer the client-side validated structured output.  The raw
+                    # ``response.text`` is the un-repaired model text; reparsing it
+                    # would undo the bounded local repair in _structured_output and
+                    # burn a proposal repair round-trip on a recoverable malformation.
+                    raw = (
+                        response.structured_output
+                        if response.structured_output is not None
+                        else json.loads(response.text)
+                    )
                     proposal = self._output_model.model_validate(raw)
                     reference_failure = self._proposal_reference_failure(
                         proposal,
@@ -1420,9 +1429,19 @@ class StructuredLiveModelAgent:
             RuntimeError,
             PermissionError,
         ) as exc:
+            failure = f"{type(exc).__name__}:{exc}"
+            if isinstance(exc, StructuredOutputError) and exc.raw_output:
+                snippet = exc.raw_output.strip()
+                if snippet:
+                    # Archive a bounded audit snippet of the exact malformed model
+                    # output so the sealed exploration evidence records why a
+                    # required model stage could not produce a proposal.  The
+                    # snippet is untrusted model text, bounded, and never replayed
+                    # into a later model request.
+                    failure = f"{failure}; raw_output={snippet[:500]!r}"
             return self._unavailable(
                 task,
-                f"{type(exc).__name__}:{exc}",
+                failure,
                 provider=provider,
                 model=model,
                 token_usage=total_tokens,
