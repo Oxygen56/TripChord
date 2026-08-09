@@ -40,7 +40,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlsplit
 
 from tripchord.runtime_provenance import local_expected_provenance, provenance_mismatches
@@ -143,17 +143,24 @@ def _git(
     timeout: int = 10,
     check: bool = False,
     binary: bool = False,
+    env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     # ``ROOT`` is resolved at call time (not bound as a default) so tests and
     # embedders can point the gate at a different repository via monkeypatch.
     # ``binary=True`` returns raw bytes on stdout/stderr (e.g. ``git show`` of
     # a PNG blob); the default text mode must never be used on binary content
     # because UTF-8 decoding crashes the caller.
+    # ``env_extra`` injects variables (e.g. a controlled temp GIT_INDEX_FILE)
+    # *after* ``_git_safe_env()`` drops caller-supplied GIT_* redirects: the
+    # gate alone decides where the evidence index lives, never the environment.
     cwd = cwd or ROOT
+    env = _git_safe_env()
+    if env_extra:
+        env = {**env, **env_extra}
     try:
         result = subprocess.run(
             ["git", "-C", str(cwd), *args],
-            env=_git_safe_env(),
+            env=env,
             capture_output=True,
             text=not binary,
             timeout=timeout,
@@ -694,22 +701,27 @@ def _is_tracking_url_leak(url: str) -> bool:
 _TRACKING_URL_PATTERN = re.compile(r"https?://[^\s\"'<>)\[\]{}]+")
 
 
-def _secret_scan_staging(staging_dir: Path, secrets: tuple[str, ...]) -> None:
+def _secret_scan_paths(
+    paths: Iterable[Path],
+    secrets: tuple[str, ...],
+    label: str,
+) -> None:
     """Fail closed if a secret value or sensitive evidence pattern appears in
-    staging evidence.
+    any of ``paths``.
 
     Multi-class scan, not just a single token's bytes: exact secret values
     (bridge token, model API keys), Authorization/Cookie values, account
     identifiers (numeric ids, phone numbers) and full tracking URLs with
     non-redacted query values.  Every file is also safety-checked (no
     symlink/hardlink/non-current-user).  A leak aborts the gate with exit-2
-    semantics before any verdict is certified.
+    semantics before any verdict is certified.  Scan errors report only the
+    category and the file name — never the matched bytes (C-114).
     """
     active = tuple(secret.encode("utf-8") for secret in secrets if secret)
-    for path in sorted(staging_dir.rglob("*")):
+    for path in sorted(paths, key=lambda p: str(p)):
         if not path.is_file():
             continue
-        _verify_evidence_file_safety(path, "evidence")
+        _verify_evidence_file_safety(path, label)
         try:
             data = path.read_bytes()
         except OSError:
@@ -717,7 +729,7 @@ def _secret_scan_staging(staging_dir: Path, secrets: tuple[str, ...]) -> None:
         for needle in active:
             if needle in data:
                 raise GateStateChangedError(
-                    f"secret leak: secret value found in evidence file {path.name}"
+                    f"secret leak: secret value found in {label} file {path.name}"
                 )
         text = data.decode("utf-8", errors="ignore")
         for pattern, kind in (
@@ -725,18 +737,48 @@ def _secret_scan_staging(staging_dir: Path, secrets: tuple[str, ...]) -> None:
             (_ACCOUNT_ID_PATTERN, "account identifier"),
             (_PHONE_PATTERN, "phone number"),
         ):
-            match = pattern.search(text)
-            if match:
+            if pattern.search(text):
                 raise GateStateChangedError(
-                    f"secret leak: {kind} in evidence file {path.name} "
-                    f"(matched {match.group(0)[:80]!r})"
+                    f"secret leak: {kind} in {label} file {path.name}"
                 )
         for match in _TRACKING_URL_PATTERN.finditer(text):
             if _is_tracking_url_leak(match.group(0)):
                 raise GateStateChangedError(
-                    f"secret leak: tracking URL in evidence file {path.name} "
-                    f"(matched {match.group(0)[:80]!r})"
+                    f"secret leak: tracking URL in {label} file {path.name}"
                 )
+
+
+def _secret_scan_staging(staging_dir: Path, secrets: tuple[str, ...]) -> None:
+    """Fail closed if a secret value or sensitive evidence pattern appears in
+    staging evidence (every file under ``staging_dir``)."""
+    _secret_scan_paths(
+        (p for p in staging_dir.rglob("*") if p.is_file()),
+        secrets,
+        "evidence",
+    )
+
+
+def _final_evidence_secret_scan(
+    staging_dir: Path,
+    tracked_paths: Iterable[Path],
+) -> None:
+    """Final comprehensive secret scan, run AFTER every report / manifest /
+    compact evidence file is written and immediately BEFORE the atomic commit
+    CAS (C-114 ordering fix).
+
+    Covers the staging dir (raw evidence, desensitized compact artifacts, the
+    staging report) plus every file this phase wrote into the tracked results
+    tree (the authoritative report, the evidence manifest, the copied committed
+    evidence).  A leak that only appears in the last-written report or manifest
+    is therefore caught before the branch moves, not after.
+    """
+    secrets = _evidence_secrets()
+    _secret_scan_staging(staging_dir, secrets)
+    _secret_scan_paths(
+        (p for p in tracked_paths if p.is_file()),
+        secrets,
+        "committed evidence",
+    )
 
 
 def layer5_real_canary(staging_dir: Path) -> LayerResult:
@@ -1220,6 +1262,12 @@ def _dump(report: GateReport, output_path: Path = OUTPUT_PATH) -> Path:
     return output_path
 
 
+# Compact artifact names: deliberately NOT matching the git-ignored
+# ``/benchmarks/results/live-*`` patterns so they are committed as the
+# independently reviewable layer-5/6 evidence (C-114).
+_COMPACT_CANARY_STAGED_NAME = "done-gate-layer5-compact.json"
+_COMPACT_E2E_STAGED_NAME = "done-gate-layer6-compact.json"
+
 _EVIDENCE_TRACKED_PATHS: tuple[tuple[str, str], ...] = (
     ("product-acceptance.json", "benchmarks/results/product-acceptance.json"),
     ("browser-e2e.json", "benchmarks/results/browser-e2e.json"),
@@ -1229,6 +1277,8 @@ _EVIDENCE_TRACKED_PATHS: tuple[tuple[str, str], ...] = (
     ),
     ("live-canary-certified.json", "benchmarks/results/live-canary-certified.json"),
     ("live-done-gate-v4.json", "benchmarks/results/live-done-gate-v4.json"),
+    (_COMPACT_CANARY_STAGED_NAME, "benchmarks/results/done-gate-layer5-compact.json"),
+    (_COMPACT_E2E_STAGED_NAME, "benchmarks/results/done-gate-layer6-compact.json"),
 )
 
 
@@ -1368,6 +1418,170 @@ def _live_e2e_manifest(staging_dir: Path) -> dict[str, Any] | None:
     }
 
 
+def _compact_canary(staging_dir: Path) -> dict[str, Any] | None:
+    """Desensitized, independently reviewable layer-5 compact artifact.
+
+    Carries the full per-scope verdict (scope/kind/passed/fresh/authorized/
+    read_only) and companion identity/heartbeat fields, plus the SHA256 of the
+    raw ``live-canary-certified.json`` it was derived from.  It commits none of
+    the raw token/Cookie/account/full-URL bytes the raw file may hold.
+    """
+    path = staging_dir / "live-canary-certified.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    companion_status = payload.get("companion_status") or {}
+    companions = companion_status.get("companions") or []
+    return {
+        "schema_version": "tripchord-done-gate-layer5-compact-v1",
+        "generated_at": payload.get("generated_at"),
+        "passed": payload.get("passed"),
+        "bridge_token_present": payload.get("bridge_token_present"),
+        "scopes": [
+            {
+                "scope": entry.get("scope"),
+                "kind": entry.get("kind"),
+                "passed": entry.get("passed"),
+                "fresh": entry.get("fresh"),
+                "authorized": entry.get("authorized"),
+                "read_only": entry.get("read_only"),
+            }
+            for entry in payload.get("scopes", [])
+        ],
+        "companion_status": {
+            "status": companion_status.get("status"),
+            "stale_after_seconds": companion_status.get("stale_after_seconds"),
+            "companions": [
+                {
+                    "companion_id": comp.get("companion_id"),
+                    "providers": comp.get("providers"),
+                    "authorized_scope_keys": comp.get("authorized_scope_keys"),
+                    "is_fresh": comp.get("is_fresh"),
+                    "age_seconds": comp.get("age_seconds"),
+                    "build_sha256": (comp.get("build_identity") or {}).get(
+                        "build_sha256"
+                    ),
+                }
+                for comp in companions
+            ],
+        },
+        "raw_evidence": {
+            "file": "live-canary-certified.json",
+            "committed": False,
+            "sha256": _sha256_file(path),
+        },
+    }
+
+
+def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
+    """Desensitized, independently reviewable layer-6 compact artifact.
+
+    Carries the run status, repo revision, timeout/runner/event-injection
+    contracts, runtime identity and Companion preflight — never the raw
+    request/quote/URL/account content of the E2E run.
+    """
+    path = staging_dir / "live-done-gate-v4.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    rb = payload.get("runtime_before_run") or {}
+    rp = rb.get("runtime_provenance") or {}
+    cp = payload.get("companion_preflight") or {}
+    companions = cp.get("companions") or []
+    return {
+        "schema_version": "tripchord-done-gate-layer6-compact-v1",
+        "captured_at": payload.get("captured_at"),
+        "run_status": payload.get("run_status"),
+        "done_gate_passed": (payload.get("done_gate") or {}).get("passed"),
+        "repo_revision": payload.get("repo_revision"),
+        "start_revision": payload.get("start_revision"),
+        "failure": payload.get("failure"),
+        "timeout_contract": payload.get("timeout_contract"),
+        "runner_contract": payload.get("runner_contract"),
+        "event_injection_contract": payload.get("event_injection_contract"),
+        "api_payload_candidate_set_sha256": payload.get(
+            "api_payload_candidate_set_sha256"
+        ),
+        "scenario_sha256": payload.get("scenario_sha256"),
+        "runtime_before_run": {
+            "model_provider": rb.get("model_provider"),
+            "primary_model": rb.get("primary_model"),
+            "model_enabled": rb.get("model_enabled"),
+            "model_required": rb.get("model_required"),
+            "runtime_provenance": {
+                "repo_toplevel": rp.get("repo_toplevel"),
+                "commit_sha": rp.get("commit_sha"),
+                "dependency_lock_sha256": rp.get("dependency_lock_sha256"),
+                "live_system_source_sha256": rp.get("live_system_source_sha256"),
+                "python_version": rp.get("python_version"),
+                "started_at": rp.get("started_at"),
+            },
+        },
+        "companion_preflight": {
+            "status": cp.get("status"),
+            "companions": [
+                {
+                    "companion_id": comp.get("companion_id"),
+                    "authorized_scope_keys": comp.get("authorized_scope_keys"),
+                }
+                for comp in companions
+            ],
+        },
+        "raw_evidence": {
+            "file": "live-done-gate-v4.json",
+            "committed": False,
+            "sha256": _sha256_file(path),
+        },
+    }
+
+
+def _generate_compact_evidence(staging_dir: Path) -> None:
+    """Write desensitized layer-5/6 compact artifacts into staging.
+
+    Runs before the required-input gate and before the evidence commit, so the
+    committed trail carries independently reviewable layer-5/6 evidence instead
+    of only a ``committed=false`` raw hash (C-114).  Raw evidence that exists
+    but cannot be compacted is a hard failure (exit 2), never a silent skip.
+    """
+    canary = _compact_canary(staging_dir)
+    e2e = _compact_live_e2e(staging_dir)
+    if (staging_dir / "live-canary-certified.json").is_file() and canary is None:
+        raise GateStateChangedError(
+            "cannot produce desensitized layer-5 compact artifact from "
+            "live-canary-certified.json"
+        )
+    if (staging_dir / "live-done-gate-v4.json").is_file() and e2e is None:
+        raise GateStateChangedError(
+            "cannot produce desensitized layer-6 compact artifact from "
+            "live-done-gate-v4.json"
+        )
+    for staged_name, payload in (
+        (_COMPACT_CANARY_STAGED_NAME, canary),
+        (_COMPACT_E2E_STAGED_NAME, e2e),
+    ):
+        if payload is None:
+            continue
+        target = staging_dir / staged_name
+        target.write_text(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        # Raw evidence staging is owner-only; the derived compact artifacts are
+        # generated later, so re-secure them to 0600 as well.
+        target.chmod(0o600)
+
+
 def _evidence_manifest(
     staging_dir: Path,
     report: GateReport,
@@ -1407,12 +1621,17 @@ def _write_manifest(manifest: dict[str, Any]) -> Path:
 # trail can be produced.  This list is part of the evidence contract: layer-5/6
 # raw evidence must exist — and must never be silently omitted via gitignore —
 # before ``passed=true`` can be claimed and an evidence commit produced.
+# The desensitized layer-5/6 compact artifacts are contract-required too (C-114):
+# a ``committed=false`` raw hash must never be the only layer-5/6 evidence in
+# the repository.
 _REQUIRED_EVIDENCE_INPUTS: tuple[str, ...] = (
     "product-acceptance.json",
     "browser-e2e.json",
     "browser-e2e-screenshot.png",
     "live-canary-certified.json",
     "live-done-gate-v4.json",
+    _COMPACT_CANARY_STAGED_NAME,
+    _COMPACT_E2E_STAGED_NAME,
 )
 
 
@@ -1499,6 +1718,31 @@ def _verify_evidence_contract(
             raise GateStateChangedError(
                 f"evidence commit E file {rel} sha256 mismatch with staged original"
             )
+    # C-114: when a layer-5/6 compact artifact exists in staging it is
+    # contract-required committed evidence — the manifest must record it as
+    # committed and E must actually carry it (never only a committed=false raw
+    # hash).  Raw originals may stay out of the repo; the compact must not.
+    for staged_name, tracked_rel in _EVIDENCE_TRACKED_PATHS:
+        if "compact" not in staged_name or not (staging_dir / staged_name).is_file():
+            continue
+        if tracked_rel not in tree:
+            raise GateStateChangedError(
+                f"evidence commit E {evidence_commit} missing committed "
+                f"compact artifact {tracked_rel}"
+            )
+        entry = next(
+            (
+                candidate
+                for candidate in manifest["files"]
+                if candidate.get("tracked_path") == tracked_rel
+            ),
+            None,
+        )
+        if entry is None or entry.get("committed") is not True:
+            raise GateStateChangedError(
+                f"evidence commit E manifest does not record compact artifact "
+                f"{tracked_rel} as committed"
+            )
 
 
 def _git_parent(commit: str) -> str:
@@ -1543,19 +1787,6 @@ def _restore_tracked_file(rel: str) -> None:
             pass
 
 
-def _unstage_paths(paths: list[str]) -> None:
-    """Drop any index entries this phase staged for ``paths`` (index-only, no
-    working-tree change) so a failed commit leaves the repository clean."""
-    if not paths:
-        return
-    try:
-        _git("restore", "--staged", "--", *paths, check=False)
-    except GateStateChangedError:
-        # git restore unavailable/refused is not fatal for the fail-closed
-        # contract; the working-tree rollback still restores the files.
-        pass
-
-
 def _commit_evidence(
     staging_dir: Path,
     report: GateReport,
@@ -1570,15 +1801,25 @@ def _commit_evidence(
     into the report so the authoritative record names both S and E, while never
     claiming E was tested at S.
 
-    Atomicity: neither phase moves the branch.  Both E and the pointer commit P
-    are materialized with ``git commit-tree`` off the current index tree, and
-    the branch only advances through a single compare-and-swap
-    ``git update-ref HEAD <P> <S>`` at the very end.  A failure in either phase,
-    the add, the write-tree, the commit-tree, or the update-ref therefore never
-    leaves the final HEAD on an intermediate E, never leaves a dirty
-    index/worktree, and never leaves a ``passed=true`` report without a
-    committed evidence trail: on any failure the working-tree writes are rolled
-    back to their HEAD state, the index is reset to HEAD, and the gate exits 2.
+    Atomicity: neither phase moves the branch.  All staging happens against a
+    *temporary* ``GIT_INDEX_FILE`` (the real index is never dirtied by the
+    evidence adds), E and the pointer commit P are materialized with
+    ``git commit-tree`` off that temp tree, and the branch only advances through
+    a single compare-and-swap ``git update-ref HEAD <P> <S>`` at the very end.
+    A failure in either phase, the add, the write-tree, the commit-tree, the
+    final secret scan, or the update-ref therefore never leaves the final HEAD
+    on an intermediate E, never leaves a dirty index/worktree, and never leaves
+    a ``passed=true`` report without a committed evidence trail: on any failure
+    the working-tree writes are rolled back to their HEAD state, the real index
+    is reset to the tested revision, and the gate exits 2.
+
+    Tail-safety (C-114): every fallible validation — the final comprehensive
+    secret scan (after all report/manifest/compact evidence is written), the
+    real-index sync to the pointer tree, and the worktree-clean porcelain check
+    — happens BEFORE the CAS.  ``update-ref`` is the last state change, so no
+    operation after it can make the flow report failure while leaving ``P``
+    installed.  Rollback never uses silent ``check=False`` resets: a rollback
+    failure is surfaced alongside the original error.
 
     Requires a clean start tree: the gate already verified end==start, and this
     phase must not sweep unrelated working-tree changes into E.
@@ -1623,7 +1864,11 @@ def _commit_evidence(
     # failure can restore the working tree to its HEAD state (fail-closed on
     # disk: no passed=true report without a committed evidence trail).
     written: list[Path] = [tracked_report_path]
-    staged_paths: list[str] = []
+    # Temp GIT_INDEX_FILE: the real index is only ever touched once, by the
+    # pre-CAS ``read-tree`` sync, so a failure during staging leaves the real
+    # index byte-for-byte at the tested revision.
+    index_tmp = tempfile.mkdtemp(prefix="gate-index-")
+    index_env = {"GIT_INDEX_FILE": str(Path(index_tmp) / "index")}
     try:
         # The report goes into E with tested_commit_sha=S and evidence_commit unset.
         _dump(report, tracked_report_path)
@@ -1631,22 +1876,23 @@ def _commit_evidence(
         written.extend(ROOT / rel for rel in copied)
         # Evidence-contract manifest: records every staging original by SHA256
         # (including the git-ignored live-* files E may not carry) plus the
-        # redacted layer-5/6 verdict fields.  The ignored raw evidence is thus
-        # never silently dropped from the audit trail even though E cannot
-        # commit its bytes.
+        # redacted layer-5/6 verdict fields and the committed compact
+        # artifacts.  The ignored raw evidence is thus never silently dropped
+        # from the audit trail even though E cannot commit its bytes.
         manifest = _evidence_manifest(staging_dir, report)
         manifest_target = _write_manifest(manifest)
         written.append(manifest_target)
         copied.append(_MANIFEST_REL)
         if not copied:
             raise GateStateChangedError("no staged evidence to commit")
-        # Phase 1: stage only evidence paths and materialize E via commit-tree.
-        # HEAD is NOT moved yet — a phase-1 failure can never leave an
-        # intermediate commit on the branch.  Every git call hard-checks its
-        # exit code: a failed add/write-tree/commit-tree aborts the phase.
-        _git("add", "--", *copied, check=True)
-        staged_paths = list(copied)
-        e_tree = _git("write-tree", check=True).stdout.strip()
+        # Phase 1: stage only evidence paths into the TEMP index and materialize
+        # E via commit-tree.  HEAD is NOT moved yet and the real index is NOT
+        # touched — a phase-1 failure can never leave an intermediate commit or
+        # a dirty real index.  Every git call hard-checks its exit code: a
+        # failed add/write-tree/commit-tree aborts the phase.
+        _git("read-tree", report.tested_commit_sha, check=True, env_extra=index_env)
+        _git("add", "--", *copied, check=True, env_extra=index_env)
+        e_tree = _git("write-tree", check=True, env_extra=index_env).stdout.strip()
         if not e_tree:
             raise GateStateChangedError("evidence tree unreadable after write-tree")
         evidence_commit = _git(
@@ -1667,13 +1913,20 @@ def _commit_evidence(
         _verify_evidence_contract(evidence_commit, staging_dir, manifest)
         # Phase 2: record evidence_commit=E in the report, re-stamp the manifest
         # with the evidence-commit SHA, and materialize the pointer commit P.
-        # Still no branch move: P is created but HEAD is untouched.
+        # Still no branch move and no real-index write: P is created but HEAD is
+        # untouched.
         report.evidence_commit = evidence_commit
         _dump(report, tracked_report_path)
         _write_manifest(_evidence_manifest(staging_dir, report, evidence_commit=evidence_commit))
-        _git("add", "--", str(tracked_report_path.relative_to(ROOT)), _MANIFEST_REL, check=True)
-        staged_paths.extend([str(tracked_report_path.relative_to(ROOT)), _MANIFEST_REL])
-        p_tree = _git("write-tree", check=True).stdout.strip()
+        _git(
+            "add",
+            "--",
+            str(tracked_report_path.relative_to(ROOT)),
+            _MANIFEST_REL,
+            check=True,
+            env_extra=index_env,
+        )
+        p_tree = _git("write-tree", check=True, env_extra=index_env).stdout.strip()
         if not p_tree:
             raise GateStateChangedError("pointer tree unreadable after write-tree")
         pointer_commit = _git(
@@ -1704,42 +1957,78 @@ def _commit_evidence(
             raise GateStateChangedError(
                 "phase 2 manifest tested_commit_sha does not match the tested revision"
             )
+        # C-114 ordering fix: the final comprehensive secret scan runs AFTER every
+        # report / manifest / compact evidence file is written and BEFORE the
+        # CAS, so a leak in the last-written artifacts can never reach the
+        # branch.  Scan errors report only category + file name.
+        _final_evidence_secret_scan(staging_dir, written)
+        # All remaining fallible validations happen HERE, before the CAS:
+        # 1. Drop the temp index (no longer needed) and sync the REAL index to
+        #    the pointer tree, so once HEAD moves the index matches it.
+        shutil.rmtree(index_tmp, ignore_errors=True)
+        index_tmp = ""  # already cleaned; the finally block must not re-run it
+        _git("read-tree", pointer_commit, check=True)
+        # 2. Worktree-clean proof: every porcelain line must be a staged change
+        #    (first column set, second column a space) and nothing may be
+        #    untracked.  index==P and worktree==P by construction, so a clean
+        #    pre-CAS porcelain proves the post-CAS tree is clean too.
+        porcelain = _git("status", "--porcelain", check=True).stdout
+        for line in porcelain.splitlines():
+            if line.startswith("??"):
+                raise GateStateChangedError(
+                    "pre-CAS check failed: untracked file present before the "
+                    "atomic ref update"
+                )
+            if len(line) >= 2 and line[1] != " ":
+                raise GateStateChangedError(
+                    "pre-CAS check failed: unstaged change present before the "
+                    "atomic ref update"
+                )
         # Atomic commit point: compare-and-swap HEAD from the tested revision S
         # to P.  If a concurrent writer moved HEAD in the meantime, update-ref
         # fails (non-zero exit, check=True) and the whole phase aborts — the
         # branch never lands on an intermediate E and never loses the
-        # concurrent writer's commit.  This is the ONLY moment HEAD moves.
+        # concurrent writer's commit.  This is the ONLY moment HEAD moves and
+        # the LAST state change: nothing fallible runs after it.
         _git("update-ref", "HEAD", pointer_commit, report.tested_commit_sha, check=True)
-        final = _git_snapshot()
-        if final.commit_sha != pointer_commit:
-            raise GateStateChangedError("HEAD moved after the atomic ref update")
-        if final.worktree_dirty:
-            raise GateStateChangedError(
-                "evidence commit left the worktree dirty; refusing to certify"
-            )
         return evidence_commit
     except (GateStateChangedError, OSError) as exc:
         # Fail closed on disk too: never leave a report claiming passed=true
         # with no evidence trail.  HEAD was never moved before the atomic
-        # update-ref, so restore every file this phase wrote and reset the index
-        # to HEAD, then propagate the failure.
-        # The report object must also forget the in-flight evidence_commit: the
-        # trail was never installed, so any delivered report says None.
+        # update-ref, so restore every file this phase wrote and reset the real
+        # index to the tested revision, then propagate the failure.  Rollback
+        # uses only check=True git calls: a rollback failure is surfaced, never
+        # silently swallowed (C-114).
         report.evidence_commit = None
+        restore_errors: list[str] = []
         for target in written:
             try:
                 rel = str(target.relative_to(ROOT))
-            except ValueError:
-                continue
-            _restore_tracked_file(rel)
-        # Mixed reset: index back to HEAD (no working-tree writes; the files
-        # above were already restored).  Belt-and-suspenders alongside
-        # _unstage_paths so a failed phase never leaves a dirty index.
-        _git("reset", "-q", check=False)
-        _unstage_paths(staged_paths)
+                _restore_tracked_file(rel)
+            except (GateStateChangedError, OSError) as restore_exc:
+                restore_errors.append(f"{target.name}: {restore_exc}")
+        # Mixed reset to the tested revision (no working-tree writes; the files
+        # above were already restored).  Only ever needed if the pre-CAS
+        # read-tree ran; the temp index means no other real-index write exists.
+        try:
+            _git(
+                "reset", "-q", report.tested_commit_sha or start.commit_sha, check=True
+            )
+        except GateStateChangedError as reset_exc:
+            restore_errors.append(f"index reset: {reset_exc}")
+        if restore_errors:
+            raise GateStateChangedError(
+                f"{exc} (evidence rollback also failed: "
+                f"{'; '.join(restore_errors)})"
+            ) from exc
         if isinstance(exc, OSError):
             raise GateStateChangedError(f"evidence commit I/O failure: {exc}") from exc
         raise
+    finally:
+        # Best-effort temp-index cleanup; ignore_errors=True keeps this
+        # non-fallible so it can never turn a committed gate into a failure.
+        if index_tmp:
+            shutil.rmtree(index_tmp, ignore_errors=True)
 
 
 def _print_report(report: GateReport, output_path: Path, quiet: bool) -> None:
@@ -1857,10 +2146,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.commit_evidence:
         try:
+            # C-114: derive the desensitized layer-5/6 compact artifacts from
+            # the raw evidence BEFORE the required-input gate, so the committed
+            # trail carries independently reviewable layer-5/6 evidence instead
+            # of only a committed=false raw hash.
+            _generate_compact_evidence(staging_dir)
             # Evidence-contract gate: the fixed required raw inputs (including
-            # layer-5/6 raw evidence) must all exist before any committed trail
-            # is produced.  A missing required input hard-fails exit 2 rather
-            # than silently omitting the file from the manifest.
+            # layer-5/6 raw evidence and their compact artifacts) must all exist
+            # before any committed trail is produced.  A missing required input
+            # hard-fails exit 2 rather than silently omitting the file from the
+            # manifest.
             _verify_required_evidence_inputs(staging_dir)
             start = _git_snapshot()
             _commit_evidence(staging_dir, report, start=start)

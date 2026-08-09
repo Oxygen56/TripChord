@@ -1006,9 +1006,13 @@ def test_commit_evidence_fails_when_head_moves_after_entry_snapshot(
 def test_commit_evidence_fails_on_real_git_add_error(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """Counter-example: a real ``git add`` failure (an existing index.lock)
-    must abort the phase, and the working tree must be rolled back so no
-    passed=true report without an evidence commit is left on disk."""
+    """Counter-example: a real git failure (an existing .git/index.lock) must
+    abort the phase, and the working tree must be rolled back so no passed=true
+    report without an evidence commit is left on disk.
+
+    With the temp ``GIT_INDEX_FILE`` staging, the real-index sync right before
+    the atomic CAS is what the lock blocks — a real, unmonkeypatched git
+    failure that still exercises the fail-closed rollback."""
     _patch_root(monkeypatch, clean_repo)
     staging_dir.mkdir()
     (staging_dir / "product-acceptance.json").write_text(
@@ -1155,9 +1159,10 @@ def test_restore_tracked_file_handles_binary_blob(
 def test_commit_evidence_rollback_handles_binary_evidence(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """Counter-example: a real ``git add`` failure during the evidence commit
-    must roll the working tree back cleanly even when a binary PNG is among the
-    written evidence — the rollback must not crash on the binary blob."""
+    """Counter-example: a real git failure (an existing .git/index.lock blocking
+    the pre-CAS real-index sync) during the evidence commit must roll the
+    working tree back cleanly even when a binary PNG is among the written
+    evidence — the rollback must not crash on the binary blob."""
     _patch_root(monkeypatch, clean_repo)
     staging_dir.mkdir()
     (staging_dir / "product-acceptance.json").write_text(
@@ -1672,15 +1677,162 @@ def test_main_exits_2_when_layer5_raw_evidence_missing(
 def test_verify_required_evidence_inputs_accepts_full_set(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """The required-input verifier accepts a complete staging set and fails
-    closed on any missing member."""
+    """The required-input verifier accepts a complete staging set (raw evidence
+    plus the derived layer-5/6 compact artifacts) and fails closed on any
+    missing member."""
     _patch_root(monkeypatch, clean_repo)
     _populate_required_evidence(staging_dir)
+    gate._generate_compact_evidence(staging_dir)
     gate._verify_required_evidence_inputs(staging_dir)  # no raise
 
     (staging_dir / "browser-e2e.json").unlink()
     with pytest.raises(gate.GateStateChangedError, match="browser-e2e.json"):
         gate._verify_required_evidence_inputs(staging_dir)
+
+    # The compact artifacts are contract-required too (C-114): a staging set
+    # missing a layer-5/6 compact must fail the gate, not just the raw file.
+    (staging_dir / gate._COMPACT_E2E_STAGED_NAME).unlink()
+    with pytest.raises(
+        gate.GateStateChangedError, match=gate._COMPACT_E2E_STAGED_NAME
+    ):
+        gate._verify_required_evidence_inputs(staging_dir)
+
+
+def test_compact_canary_drops_raw_detail_fields(staging_dir: Path) -> None:
+    """C-114 counter-example: the desensitized layer-5 compact artifact must
+    carry only the safe structured verdict fields, never free-text detail or
+    raw detail/URL bytes that could hide account/session material."""
+    staging_dir.mkdir()
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(
+            {
+                "passed": True,
+                "bridge_token_present": True,
+                "generated_at": "2026-08-10T00:00:00+00:00",
+                "scopes": [
+                    {
+                        "scope": "ctrip:flight",
+                        "kind": "ota",
+                        "passed": True,
+                        "fresh": True,
+                        "authorized": True,
+                        "read_only": True,
+                        "detail": "https://flights.ctrip.com/online/list?sid=SESSIONVALUE123",
+                    }
+                ],
+                "companion_status": {
+                    "status": "ok",
+                    "stale_after_seconds": 30,
+                    "companions": [
+                        {
+                            "companion_id": "comp-1",
+                            "providers": ["p"],
+                            "authorized_scope_keys": ["x"],
+                            "is_fresh": True,
+                            "age_seconds": 3,
+                            "build_identity": {"build_sha256": "abc123"},
+                        }
+                    ],
+                },
+                "extra_raw_field": "anything",
+            }
+        ),
+        encoding="utf-8",
+    )
+    compact = gate._compact_canary(staging_dir)
+    assert compact is not None
+    assert compact["scopes"][0]["scope"] == "ctrip:flight"
+    assert compact["scopes"][0]["passed"] is True
+    # Free-text detail / raw extra fields are never copied into the compact.
+    assert "detail" not in compact["scopes"][0]
+    assert "extra_raw_field" not in compact
+    assert "sid=" not in json.dumps(compact)
+    assert "SESSIONVALUE123" not in json.dumps(compact)
+    assert compact["raw_evidence"]["file"] == "live-canary-certified.json"
+    assert compact["raw_evidence"]["committed"] is False
+
+
+def test_main_commits_desensitized_layer5_6_compact_artifacts(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-114 evidence-contract counter-example: the committed trail must carry
+    independently reviewable desensitized layer-5/6 compact artifacts — never
+    only a committed=false raw hash — and E must contain them."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    # Reproduce the real repository's rule: raw live-* evidence is gitignored,
+    # so only the compact artifacts can (and must) be committed.
+    (clean_repo / ".gitignore").write_text(
+        "/benchmarks/results/live-*\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(clean_repo), "add", ".gitignore"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "commit", "-q", "-m", "ignore live evidence"],
+        check=True,
+    )
+    _populate_required_evidence(staging_dir)
+
+    rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
+    assert rc == 0
+
+    head = _head(clean_repo)
+    tree = subprocess.run(
+        ["git", "-C", str(clean_repo), "ls-tree", "-r", "--name-only", head],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    for rel in (
+        "benchmarks/results/done-gate-layer5-compact.json",
+        "benchmarks/results/done-gate-layer6-compact.json",
+    ):
+        assert rel in tree, f"compact artifact missing from committed tree: {rel}"
+    manifest = json.loads(
+        (clean_repo / gate._MANIFEST_REL).read_text(encoding="utf-8")
+    )
+    by_name = {entry["name"]: entry for entry in manifest["files"]}
+    assert by_name[gate._COMPACT_CANARY_STAGED_NAME]["committed"] is True
+    assert by_name[gate._COMPACT_E2E_STAGED_NAME]["committed"] is True
+    # The raw layer-5/6 files are still not committed (gitignored).
+    assert by_name["live-canary-certified.json"]["committed"] is False
+    assert by_name["live-done-gate-v4.json"]["committed"] is False
+    # The compact artifacts are independently reviewable structured JSON.
+    compact = json.loads(
+        (
+            clean_repo
+            / "benchmarks"
+            / "results"
+            / "done-gate-layer5-compact.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert compact["schema_version"].startswith("tripchord-done-gate-layer5")
+    assert _porcelain(clean_repo) == ""
+
+
+def test_main_exits_2_when_compact_artifact_missing(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-114 evidence-contract counter-example: a passing run whose compact
+    artifact is absent (as if compact generation was skipped) must exit 2 at the
+    contract gate and produce no commit — a committed=false raw hash alone is
+    never enough layer-5/6 evidence."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _populate_required_evidence(staging_dir)
+    # Simulate compact generation dropping the layer-6 compact.
+    real_generate = gate._generate_compact_evidence
+
+    def generate_without_e2e_compact(staging: Path) -> None:
+        real_generate(staging)
+        (staging / gate._COMPACT_E2E_STAGED_NAME).unlink()
+
+    monkeypatch.setattr(gate, "_generate_compact_evidence", generate_without_e2e_compact)
+
+    head_before = _head(clean_repo)
+    rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
+    assert rc == 2
+    assert _head(clean_repo) == head_before
+    assert _porcelain(clean_repo) == ""
 
 
 def test_verify_evidence_contract_fails_closed_on_incomplete_manifest_fields(
@@ -1836,6 +1988,24 @@ def test_secret_scan_flags_authorization_header(
         gate.run_gate(staging_dir)
 
 
+def test_secret_scan_flags_cookie_header(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """A3 counter-example (C-114): a Cookie header value in evidence fails the
+    gate even when the bridge token itself is absent and the value never
+    appears as raw bytes of an active secret."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        '{"trace": {"headers": "Cookie: '
+        'JSESSIONID=abcdefghijklmnopqrstuvwxyz123456"}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.GateStateChangedError, match="Authorization/Cookie"):
+        gate.run_gate(staging_dir)
+
+
 def test_secret_scan_flags_account_identifier(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
@@ -1892,6 +2062,43 @@ def test_secret_scan_allows_redacted_evidence(
         encoding="utf-8",
     )
     gate.run_gate(staging_dir)  # no raise
+
+
+def test_commit_evidence_catches_last_step_report_leak(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-114 counter-example: a secret that leaks only into the report written
+    at the very end of the evidence phase must abort the commit before the CAS.
+
+    run_gate's staging scan runs before the report exists, so only the final
+    comprehensive scan (which runs after every report/manifest/compact write and
+    before the atomic ref update) can see the leak — the ordering fix that keeps
+    a passed=true report with a leaked secret from ever being committed."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _populate_required_evidence(staging_dir)
+    token = "F" * 64
+    monkeypatch.setattr(gate, "_bridge_token", lambda: token)
+    monkeypatch.setattr(
+        gate,
+        "layer6_full_e2e",
+        lambda *args: gate.LayerResult(
+            name="6_full_e2e", passed=True, detail=token
+        ),
+    )
+
+    head_before = _head(clean_repo)
+    rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
+
+    assert rc == 2
+    assert _head(clean_repo) == head_before
+    assert _porcelain(clean_repo) == ""
+    # The delivered report on disk must carry the voided verdict, never the leak.
+    payload = json.loads(
+        (staging_dir / "product-v1-done-gate.json").read_text(encoding="utf-8")
+    )
+    assert payload["passed"] is False
+    assert payload["evidence_commit"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -2032,3 +2239,80 @@ def test_commit_evidence_success_moves_head_once_atomically(
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert payload["evidence_commit"] == evidence_commit
     assert payload["passed"] is True
+
+
+def test_commit_evidence_no_fallible_op_after_cas(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-114 counter-example (CAS 成功后检查异常): after the atomic update-ref
+    CAS succeeds there must be NO fallible operation left.
+
+    The old tail called ``_git_snapshot()`` and ran fail-able checks after the
+    CAS — a failure there would raise, the rollback would then restore files to
+    the already-installed pointer commit P, and the flow would report failure
+    while a passed=true report was committed at P.  Injecting a failure on a
+    second snapshot proves the tail check is gone: the gate commits cleanly and
+    no post-CAS operation can flip success into a voided-but-installed state."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+
+    real_snapshot = gate._git_snapshot
+    seen = 0
+
+    def fake_snapshot(*args: object, **kwargs: object) -> gate.GitSnapshot:
+        nonlocal seen
+        seen += 1
+        if seen == 2:
+            raise gate.GateStateChangedError(
+                "post-CAS snapshot would fail (old tail check)"
+            )
+        return real_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(gate, "_git_snapshot", fake_snapshot)
+
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+
+    # The gate succeeded: HEAD advanced to P, the tree is clean, and the
+    # committed report carries passed=true with the evidence trail.
+    assert _head(clean_repo) != start.commit_sha
+    assert _porcelain(clean_repo) == ""
+    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["evidence_commit"] == evidence_commit
+    assert payload["passed"] is True
+
+
+def test_commit_evidence_rollback_surfaces_reset_failure(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-114 counter-example: a failed rollback is never silently swallowed —
+    the rollback reset must be check=True so a dirty index cannot be left behind
+    while the gate reports only the original failure."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+    _inject_git_failure(monkeypatch, "update-ref")
+
+    real_git = gate._git
+    seen_reset = 0
+
+    def failing_reset(*args: str, **kwargs: object) -> subprocess.CompletedProcess:
+        nonlocal seen_reset
+        if args and args[0] == "reset":
+            seen_reset += 1
+            proc = subprocess.CompletedProcess(
+                args, returncode=1, stdout=b"", stderr=b"reset failed"
+            )
+            if kwargs.get("check"):
+                raise gate.GateStateChangedError("git reset failed with exit 1")
+            return proc
+        return real_git(*args, **kwargs)
+
+    # Chain: _inject_git_failure handles the update-ref, this wrapper handles
+    # the rollback reset.
+    monkeypatch.setattr(gate, "_git", failing_reset)
+
+    with pytest.raises(gate.GateStateChangedError, match="rollback also failed"):
+        gate._commit_evidence(staging_dir, report, start=start)
+    assert seen_reset >= 1
