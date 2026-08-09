@@ -571,3 +571,269 @@ def test_commit_evidence_refuses_dirty_start(
     )
     with pytest.raises(gate.GateStateChangedError, match="dirty worktree"):
         gate._commit_evidence(staging_dir, report, start=dirty_start)
+
+
+# ---------------------------------------------------------------------------
+# round 14 follow-up: four fail-closed hard gates, real temp-repo lifecycle
+# ---------------------------------------------------------------------------
+# The supervisor's independent review found four fail-closed gaps that the
+# monkeypatch-heavy suite could not prove.  These counter-examples exercise the
+# real git lifecycle (real temp repo, real commits, real hook failures, real
+# file parsing) and assert exit 2 end-to-end through ``main()``.  Only the
+# layer *execution* is stubbed — the layer body would otherwise require the
+# full product stack — the git/evidence/commit machinery is real.
+
+
+def test_git_check_raises_on_nonzero_exit(tmp_path: Path) -> None:
+    """Defect fix: ``_git(..., check=True)`` must fail closed on a non-zero
+    git exit instead of returning an unreadable stdout that callers consume as
+    'unknown'."""
+    with pytest.raises(gate.GateStateChangedError, match="exit 128"):
+        gate._git("rev-parse", "HEAD", cwd=tmp_path, check=True)
+
+
+def test_main_exits_2_when_evidence_commit_fails(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """Real git lifecycle counter-example: a failed ``git commit`` (a real
+    pre-commit hook that exits non-zero) during the evidence-commit phase must
+    abort the gate with exit 2 — a commit failure must never be swallowed and
+    reported as a pass."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    staging_dir.mkdir()
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    hook = clean_repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    rc = gate.main(
+        ["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"]
+    )
+
+    assert rc == 2
+
+
+def test_main_exits_2_when_head_moves_before_evidence_commit(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """Real git lifecycle counter-example: if a concurrent writer moves HEAD
+    between the run and the evidence-commit phase, the commit-phase snapshot
+    must disagree with the tested commit and the gate must exit 2 (TOCTOU)."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    staging_dir.mkdir()
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+
+    real_dump = gate._dump
+    moved = False
+
+    def dump_then_move(report: gate.GateReport, output_path: Path) -> Path:
+        nonlocal moved
+        if not moved:
+            moved = True
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(clean_repo),
+                    "commit",
+                    "--allow-empty",
+                    "-q",
+                    "-m",
+                    "concurrent writer moved HEAD",
+                ],
+                check=True,
+            )
+        return real_dump(report, output_path)
+
+    monkeypatch.setattr(gate, "_dump", dump_then_move)
+
+    rc = gate.main(
+        ["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"]
+    )
+
+    assert rc == 2
+
+
+def test_main_exits_2_when_output_is_tracked_path(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """Real git lifecycle counter-example: a tracked repository path must be
+    rejected as ``--output`` (exit 2) — the gate must never write evidence
+    into a path that could rewrite tracked files after the clean check."""
+    _patch_root(monkeypatch, clean_repo)
+    tracked_output = clean_repo / "tracked.txt"
+
+    rc = gate.main(
+        [
+            "--staging-dir",
+            str(staging_dir),
+            "--output",
+            str(tracked_output),
+            "--quiet",
+        ]
+    )
+
+    assert rc == 2
+
+
+def test_main_exits_2_when_output_is_unignored_in_repo_path(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """An untracked-but-not-ignored in-repo path must also be rejected as
+    ``--output`` (exit 2)."""
+    _patch_root(monkeypatch, clean_repo)
+    unignored_output = clean_repo / "unignored-dir" / "gate.json"
+    unignored_output.parent.mkdir()
+
+    rc = gate.main(
+        [
+            "--staging-dir",
+            str(staging_dir),
+            "--output",
+            str(unignored_output),
+            "--quiet",
+        ]
+    )
+
+    assert rc == 2
+
+
+def test_main_exits_2_when_runner_evidence_missing_fields(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """Real git lifecycle counter-example: a layer-6 evidence bundle whose
+    ``repo_revision`` omits ``toplevel`` and ``run_status`` must fail closed —
+    the gate must not accept a runner that cannot name the repository or
+    confirm completion."""
+    _patch_root(monkeypatch, clean_repo)
+    for name in (
+        "layer1_reproducibility",
+        "layer2_replay",
+        "layer3_clean_chrome_fixtures",
+        "layer4_model_smoke",
+        "layer5_real_canary",
+    ):
+        monkeypatch.setattr(
+            gate,
+            name,
+            lambda *args, name=name: gate.LayerResult(name=name, passed=True),
+        )
+    staging_dir.mkdir()
+    evidence_path = staging_dir / "live-done-gate-v4.json"
+    evidence: dict[str, object] = {
+        "run_status": None,
+        "passed": True,
+        "repo_revision": {
+            "toplevel": None,
+            "branch": "main",
+            "commit_sha": _head(clean_repo),
+            "worktree_dirty": False,
+        },
+        "runtime_before_run": {
+            "runtime_provenance": {
+                "repo_toplevel": str(clean_repo),
+                "commit_sha": _head(clean_repo),
+                "dependency_lock_sha256": None,
+                "live_system_source_sha256": None,
+                "started_at": "2026-08-10T00:00:00+00:00",
+                "pid": 4242,
+                "python_version": "3.12",
+                "python_executable": "/usr/bin/python3",
+            }
+        },
+    }
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        timeout: int | None = None,
+        env: dict[str, str] | None = None,
+    ) -> tuple[int, str]:
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        return 0, ""
+
+    monkeypatch.setattr(gate, "_run", fake_run)
+    monkeypatch.setenv("TRIPCHORD_BROWSER_BRIDGE_TOKEN", "t" * 40)
+    monkeypatch.setenv("TRIPCHORD_ACK_MODEL_COST", "1")
+
+    rc = gate.main(["--staging-dir", str(staging_dir), "--quiet"])
+
+    assert rc == 2
+
+
+def test_commit_evidence_refuses_toplevel_mismatch(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """Direct guard test: the commit-phase snapshot must name the same
+    repository the report records."""
+    _patch_root(monkeypatch, clean_repo)
+    staging_dir.mkdir()
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha=_head(clean_repo),
+        toplevel="/elsewhere",
+        worktree_dirty=False,
+    )
+    start = _expected_snapshot(clean_repo)
+    with pytest.raises(gate.GateStateChangedError, match="toplevel"):
+        gate._commit_evidence(staging_dir, report, start=start)
+
+
+def test_commit_evidence_refuses_tested_sha_mismatch(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """Direct guard test: the commit-phase HEAD must equal the tested commit."""
+    _patch_root(monkeypatch, clean_repo)
+    staging_dir.mkdir()
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha="d" * 40,
+        toplevel=str(clean_repo),
+        worktree_dirty=False,
+    )
+    start = _expected_snapshot(clean_repo)
+    with pytest.raises(gate.GateStateChangedError, match="tested commit"):
+        gate._commit_evidence(staging_dir, report, start=start)
+
+
+def test_runner_revision_mismatches_missing_toplevel(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    """Defect fix: a runner that could not determine its repository must fail
+    closed instead of being accepted with ``toplevel=None``."""
+    _patch_root(monkeypatch, clean_repo)
+    evidence = _matching_evidence(clean_repo)
+    evidence["repo_revision"]["toplevel"] = None  # type: ignore[index]
+    mismatches = gate._runner_revision_mismatches(
+        evidence, _expected_snapshot(clean_repo), clean_repo
+    )
+    assert any("toplevel" in item for item in mismatches)
+
+
+def test_runner_revision_mismatches_missing_run_status(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    """Defect fix: a runner that did not report completion must fail closed
+    instead of being accepted with ``run_status=None``."""
+    _patch_root(monkeypatch, clean_repo)
+    evidence = _matching_evidence(clean_repo)
+    evidence["run_status"] = None  # type: ignore[index]
+    mismatches = gate._runner_revision_mismatches(
+        evidence, _expected_snapshot(clean_repo), clean_repo
+    )
+    assert any("run_status" in item for item in mismatches)

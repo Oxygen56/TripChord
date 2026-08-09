@@ -139,12 +139,13 @@ def _git(
     *args: str,
     cwd: Path | None = None,
     timeout: int = 10,
+    check: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     # ``ROOT`` is resolved at call time (not bound as a default) so tests and
     # embedders can point the gate at a different repository via monkeypatch.
     cwd = cwd or ROOT
     try:
-        return subprocess.run(
+        result = subprocess.run(
             ["git", "-C", str(cwd), *args],
             env=_git_safe_env(),
             capture_output=True,
@@ -154,15 +155,31 @@ def _git(
         )
     except (subprocess.SubprocessError, FileNotFoundError) as exc:
         raise GateStateChangedError(f"git is unavailable or timed out: {exc}") from exc
+    if check and result.returncode != 0:
+        # Fail closed on any non-zero git exit: a revision or tree state that
+        # cannot be read must never be silently consumed as "clean/unknown".
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        raise GateStateChangedError(
+            f"git {' '.join(args)} failed with exit {result.returncode}: "
+            f"{stderr or stdout or '(no output)'}"
+        )
+    return result
 
 
 def _git_snapshot(cwd: Path | None = None) -> GitSnapshot:
-    """Read toplevel + HEAD + full porcelain in one safe, un-redirected pass."""
+    """Read toplevel + HEAD + full porcelain in one safe, un-redirected pass.
+
+    The toplevel / HEAD / porcelain reads are required: a failure to read them
+    means the revision cannot be proven and the gate must not proceed.
+    ``symbolic-ref -q`` is the one allowed failure — a detached HEAD is a valid
+    state that simply has no branch name.
+    """
     cwd = cwd or ROOT
-    toplevel = _git("rev-parse", "--show-toplevel", cwd=cwd)
-    head = _git("rev-parse", "HEAD", cwd=cwd)
-    branch = _git("symbolic-ref", "--short", "-q", "HEAD", cwd=cwd)
-    status = _git("status", "--porcelain", cwd=cwd)
+    toplevel = _git("rev-parse", "--show-toplevel", cwd=cwd, check=True)
+    head = _git("rev-parse", "HEAD", cwd=cwd, check=True)
+    branch = _git("symbolic-ref", "--short", "-q", "HEAD", cwd=cwd, check=False)
+    status = _git("status", "--porcelain", cwd=cwd, check=True)
     return GitSnapshot(
         toplevel=toplevel.stdout.strip() or None,
         branch=branch.stdout.strip() or None,
@@ -679,12 +696,17 @@ def _runner_revision_mismatches(
         mismatches.append(
             f"runner repo_revision.worktree_dirty = {repo.get('worktree_dirty')!r} (must be False)"
         )
-    if root is not None and repo.get("toplevel") not in (None, str(root), os.fspath(root)):
+    # toplevel and run_status are mandatory fields: a runner that could not
+    # determine which repository it exercised, or did not finish, must fail
+    # closed instead of being accepted by omission.
+    if repo.get("toplevel") is None:
+        mismatches.append("runner repo_revision.toplevel is missing (must name the repo root)")
+    elif root is not None and repo.get("toplevel") not in (str(root), os.fspath(root)):
         mismatches.append(
             f"runner repo_revision.toplevel {repo.get('toplevel')!r} != {os.fspath(root)!r}"
         )
     run_status = runner_evidence.get("run_status")
-    if run_status not in (None, "completed"):
+    if run_status != "completed":
         mismatches.append(f"runner run_status = {run_status!r} (must be 'completed')")
     if runner_evidence.get("passed") is not True:
         mismatches.append(
@@ -834,6 +856,52 @@ def _new_staging_dir() -> Path:
     return path
 
 
+def _require_outside_or_ignored(path: Path, label: str) -> None:
+    """Reject evidence write paths that could dirty the certified repository.
+
+    ``path`` must either sit outside the repository toplevel, or be a
+    git-ignored path inside it.  A tracked or un-ignored in-repo path is
+    rejected (exit 2): the gate would otherwise be able to rewrite tracked
+    files after the end-of-run clean check and certify a tree it dirtied
+    itself.
+    """
+    top = _git("rev-parse", "--show-toplevel", check=True).stdout.strip()
+    if not top:
+        raise GateStateChangedError(
+            f"cannot validate {label} {path}: repo toplevel unreadable"
+        )
+    top_path = Path(top).resolve()
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path.absolute()
+    try:
+        resolved.relative_to(top_path)
+    except ValueError:
+        return  # outside the repository: allowed
+    rel = resolved.relative_to(top_path)
+    if str(rel) == ".":
+        # The repo root itself is never a legal evidence write target.
+        raise GateStateChangedError(
+            f"{label} {path} is the repository root; evidence must be written "
+            "outside the repo or into a git-ignored directory"
+        )
+    # A tracked path (already in the index) must be rejected outright.
+    tracked = _git("ls-files", "--error-unmatch", "--", str(rel), check=False)
+    if tracked.returncode == 0:
+        raise GateStateChangedError(
+            f"{label} {path} is a tracked repository path; evidence must be "
+            "written outside the repo or into a git-ignored directory"
+        )
+    # Anything else inside the repo must be git-ignored.
+    ignored = _git("check-ignore", "-q", "--", str(rel), check=False)
+    if ignored.returncode != 0:
+        raise GateStateChangedError(
+            f"{label} {path} is inside the repository but not git-ignored; "
+            "evidence must be written outside the repo or into a git-ignored directory"
+        )
+
+
 def run_gate(
     staging_dir: Path,
     *,
@@ -965,11 +1033,26 @@ def _commit_evidence(
 
     Requires a clean start tree: the gate already verified end==start, and this
     phase must not sweep unrelated working-tree changes into E.
+
+    The commit-phase snapshot must also still name the repository and the exact
+    tested revision the report records (TOCTOU guard): if HEAD moved or the
+    evidence would land in a different repository between the run and this
+    phase, the audit trail cannot claim it certifies ``tested_commit_sha``.
     """
     if start.worktree_dirty:
         raise GateStateChangedError(
             "refusing to commit evidence from a dirty worktree: E must contain "
             "only evidence paths, not unrelated uncommitted changes"
+        )
+    if report.toplevel is not None and start.toplevel != report.toplevel:
+        raise GateStateChangedError(
+            f"refusing to commit evidence: commit-phase toplevel "
+            f"{start.toplevel!r} != report toplevel {report.toplevel!r}"
+        )
+    if report.tested_commit_sha is not None and start.commit_sha != report.tested_commit_sha:
+        raise GateStateChangedError(
+            f"refusing to commit evidence: commit-phase HEAD {start.commit_sha!r} "
+            f"!= tested commit {report.tested_commit_sha!r}"
         )
     tracked_report_path = ROOT / "benchmarks" / "results" / "product-v1-done-gate.json"
     # The report goes into E with tested_commit_sha=S and evidence_commit unset.
@@ -978,13 +1061,16 @@ def _commit_evidence(
     copied.append(str(tracked_report_path.relative_to(ROOT)))
     if not copied:
         raise GateStateChangedError("no staged evidence to commit")
-    # Phase 1: stage only evidence paths and create E.
-    _git("add", "--", *copied)
+    # Phase 1: stage only evidence paths and create E.  Both git calls hard-
+    # check the exit code: a failed add/commit must abort the phase, never be
+    # silently consumed and reported as a success.
+    _git("add", "--", *copied, check=True)
     _git(
         "commit",
         "-m",
         f"Done-Gate evidence for tested commit {report.tested_commit_sha} "
         f"({report.generated_at})",
+        check=True,
     )
     evidence_commit = _git_snapshot().commit_sha
     if not evidence_commit:
@@ -992,12 +1078,13 @@ def _commit_evidence(
     # Phase 2: record evidence_commit=E in the report and point the audit trail.
     report.evidence_commit = evidence_commit
     _dump(report, tracked_report_path)
-    _git("add", "--", str(tracked_report_path.relative_to(ROOT)))
+    _git("add", "--", str(tracked_report_path.relative_to(ROOT)), check=True)
     _git(
         "commit",
         "-m",
         f"Record Done-Gate evidence_commit={evidence_commit} for tested commit "
         f"{report.tested_commit_sha}",
+        check=True,
     )
     return evidence_commit
 
@@ -1074,6 +1161,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
+        # The gate may only write evidence outside the repo or into git-ignored
+        # paths; a tracked or un-ignored in-repo target is a fail-closed reject.
+        _require_outside_or_ignored(staging_dir, "staging dir")
+        if args.output is not None:
+            _require_outside_or_ignored(args.output, "output path")
         report = run_gate(staging_dir, commit=args.commit)
     except GateStateChangedError as exc:
         if args.quiet:
@@ -1090,9 +1182,14 @@ def main(argv: list[str] | None = None) -> int:
             start = _git_snapshot()
             _commit_evidence(staging_dir, report, start=start)
         except GateStateChangedError as exc:
-            # Report already dumped; surface the commit-phase failure but keep
-            # the run verdict intact.
-            print(f"evidence commit skipped: {exc}", file=sys.stderr)
+            # The run verdict is intact but the evidence commit is missing:
+            # a committed report must never claim an evidence trail that does
+            # not exist, so the phase failure hard-fails the whole gate (exit 2)
+            # even when the layers themselves all passed.
+            print(f"evidence commit failed: {exc}", file=sys.stderr)
+            _dump(report, output_path)
+            _print_report(report, output_path, args.quiet)
+            return 2
         # Re-dump so the delivered report carries evidence_commit=E.
         _dump(report, output_path)
 
