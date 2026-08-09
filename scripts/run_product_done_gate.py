@@ -140,16 +140,20 @@ def _git(
     cwd: Path | None = None,
     timeout: int = 10,
     check: bool = False,
-) -> subprocess.CompletedProcess[str]:
+    binary: bool = False,
+) -> subprocess.CompletedProcess[bytes]:
     # ``ROOT`` is resolved at call time (not bound as a default) so tests and
     # embedders can point the gate at a different repository via monkeypatch.
+    # ``binary=True`` returns raw bytes on stdout/stderr (e.g. ``git show`` of
+    # a PNG blob); the default text mode must never be used on binary content
+    # because UTF-8 decoding crashes the caller.
     cwd = cwd or ROOT
     try:
         result = subprocess.run(
             ["git", "-C", str(cwd), *args],
             env=_git_safe_env(),
             capture_output=True,
-            text=True,
+            text=not binary,
             timeout=timeout,
             check=False,
         )
@@ -158,8 +162,14 @@ def _git(
     if check and result.returncode != 0:
         # Fail closed on any non-zero git exit: a revision or tree state that
         # cannot be read must never be silently consumed as "clean/unknown".
-        stderr = (result.stderr or "").strip()
-        stdout = (result.stdout or "").strip()
+        stderr = result.stderr or ""
+        stdout = result.stdout or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        stderr = stderr.strip()
+        stdout = stdout.strip()
         raise GateStateChangedError(
             f"git {' '.join(args)} failed with exit {result.returncode}: "
             f"{stderr or stdout or '(no output)'}"
@@ -1042,6 +1052,13 @@ def _copy_staged_evidence(staging_dir: Path) -> list[str]:
         if not staged.is_file():
             continue
         target = ROOT / tracked_rel
+        # Skip targets the repository ignores: ``git add`` fails closed on
+        # ignored paths, so copying one into the tracked tree would abort the
+        # commit phase and leave untrackable disk junk.  Such evidence stays in
+        # the (already ignored) staging dir — the committed E carries only the
+        # committable evidence.
+        if _git("check-ignore", "-q", "--", tracked_rel, check=False).returncode == 0:
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(staged, target)
         copied.append(tracked_rel)
@@ -1086,10 +1103,12 @@ def _restore_tracked_file(rel: str) -> None:
     when HEAD does not track it), so a failed commit-phase leaves no dirty
     uncommitted report/evidence behind on disk."""
     target = ROOT / rel
-    probe = _git("show", f"HEAD:{rel}", check=False)
+    # ``binary=True``: the restored blob may be a PNG screenshot, and decoding
+    # raw blob bytes as UTF-8 would crash the rollback instead of restoring it.
+    probe = _git("show", f"HEAD:{rel}", check=False, binary=True)
     if probe.returncode == 0:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(probe.stdout.encode("utf-8"))
+        target.write_bytes(probe.stdout)
     else:
         try:
             target.unlink()

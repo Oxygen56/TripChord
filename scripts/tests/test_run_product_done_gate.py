@@ -1014,6 +1014,170 @@ def test_main_commit_evidence_failure_marks_report_failed_on_disk(
     assert _porcelain(clean_repo) == ""
 
 
+def test_commit_evidence_skips_gitignored_evidence(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """Counter-example: the repository ignores ``benchmarks/results/live-*``,
+    so the evidence commit must skip those targets (a ``git add`` on an ignored
+    path fails closed and aborts the phase) while still committing the
+    committable evidence — E never claims to carry the ignored files."""
+    _patch_root(monkeypatch, clean_repo)
+    (clean_repo / ".gitignore").write_text(
+        "/benchmarks/results/live-*\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(clean_repo), "add", ".gitignore"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "commit", "-q", "-m", "ignore live evidence"],
+        check=True,
+    )
+    staging_dir.mkdir()
+    for name in (
+        "product-acceptance.json",
+        "browser-e2e.json",
+        "browser-e2e-screenshot.png",
+        "live-canary-certified.json",
+        "live-done-gate-v4.json",
+    ):
+        (staging_dir / name).write_bytes(b"{}\n" if name.endswith(".json") else b"PNG")
+
+    tested_sha = _head(clean_repo)
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha=tested_sha,
+        toplevel=str(clean_repo),
+        branch="main",
+        worktree_dirty=False,
+        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        passed=True,
+        summary="all applicable Done-Gate layers passed",
+        boundary="",
+    )
+    start = _expected_snapshot(clean_repo)
+
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+
+    # The ignored live-* evidence is NOT part of E's tree.
+    diff = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "diff",
+            "--name-only",
+            tested_sha,
+            evidence_commit,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert diff != ""
+    for path in diff.splitlines():
+        assert "live-" not in path, f"ignored evidence committed: {path}"
+    # Committable evidence and the report landed; the tree is clean.
+    assert (clean_repo / "benchmarks" / "results" / "product-acceptance.json").is_file()
+    assert (clean_repo / "benchmarks" / "results" / "browser-e2e-screenshot.png").is_file()
+    assert _porcelain(clean_repo) == ""
+    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["evidence_commit"] == evidence_commit
+
+
+def test_restore_tracked_file_handles_binary_blob(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    """Counter-example: ``_restore_tracked_file`` must restore a binary blob
+    (PNG) byte-for-byte without crashing on UTF-8 decoding of raw bytes."""
+    _patch_root(monkeypatch, clean_repo)
+    png = clean_repo / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02" * 10)
+    subprocess.run(["git", "-C", str(clean_repo), "add", "shot.png"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "commit", "-q", "-m", "add png"], check=True
+    )
+    original = png.read_bytes()
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\xff\xfe\xfd" * 10)
+    gate._restore_tracked_file("shot.png")
+    assert png.read_bytes() == original
+    assert _porcelain(clean_repo) == ""
+
+
+def test_commit_evidence_rollback_handles_binary_evidence(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """Counter-example: a real ``git add`` failure during the evidence commit
+    must roll the working tree back cleanly even when a binary PNG is among the
+    written evidence — the rollback must not crash on the binary blob."""
+    _patch_root(monkeypatch, clean_repo)
+    staging_dir.mkdir()
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    (staging_dir / "browser-e2e-screenshot.png").write_bytes(
+        b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02" * 10
+    )
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha=_head(clean_repo),
+        toplevel=str(clean_repo),
+        branch="main",
+        worktree_dirty=False,
+        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        passed=True,
+        summary="all applicable Done-Gate layers passed",
+        boundary="",
+    )
+    start = _expected_snapshot(clean_repo)
+    (clean_repo / ".git" / "index.lock").write_text("locked\n", encoding="utf-8")
+
+    with pytest.raises(gate.GateStateChangedError, match="failed"):
+        gate._commit_evidence(staging_dir, report, start=start)
+
+    # No tracked report/evidence left behind, and no crash on the binary blob.
+    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
+    assert not report_path.exists()
+    assert _porcelain(clean_repo) == ""
+
+
+def test_main_commit_evidence_skips_gitignored_evidence_end_to_end(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """End-to-end: a clean run whose staged evidence includes git-ignored
+    live-* files must still commit the committable evidence and exit 0 — the
+    gate never aborts on ignored evidence it cannot commit."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    (clean_repo / ".gitignore").write_text(
+        "/benchmarks/results/live-*\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(clean_repo), "add", ".gitignore"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "commit", "-q", "-m", "ignore live evidence"],
+        check=True,
+    )
+    staging_dir.mkdir()
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    (staging_dir / "browser-e2e-screenshot.png").write_bytes(b"PNG")
+    (staging_dir / "live-canary-certified.json").write_text(
+        '{"scopes": []}\n', encoding="utf-8"
+    )
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        '{"run_status": "completed"}\n', encoding="utf-8"
+    )
+
+    rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
+    assert rc == 0
+    report_path = staging_dir / "product-v1-done-gate.json"
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["passed"] is True
+    assert payload["evidence_commit"] is not None
+    assert _porcelain(clean_repo) == ""
+
+
 def test_runner_runtime_provenance_mismatches_bad_python_version(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path
 ) -> None:
