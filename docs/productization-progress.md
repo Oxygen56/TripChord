@@ -86,6 +86,7 @@
 |---|---|
 | `uv run ruff check .` | All checks passed（0 错误） |
 | `uv run python scripts/tests/run_tests_clean_env.py scripts/tests/test_run_product_done_gate.py`（clean-env） | 400 passed，退出码 0——含 level 0–4 双重/三重编码三层反例（producer `_desensitize` / consumer `_sanitize_canary_diag_field` / final `_secret_scan_bytes`）、解析失败 fail-closed 反例、深度预算溢出反例、`pending user authorization`/`cookie:` 文本正例边界 |
+| `uv run python scripts/tests/run_tests_clean_env.py apps/api/tests`（clean-env 全量回归） | 1253 passed，退出码 0（含 scripts/tests + apps/api/tests） |
 | `git rev-parse HEAD` | `945b2b0`（本修复提交：新增 `tripchord/_secret_redact.py` + 全链接线 + 回归反例） |
 | `launchctl kickstart -k gui/<uid>/com.tripchord.live-api` | API 受控重启绑定**最终 HEAD=`945b2b0`**；`/api/v1/agents/runtime` provenance `commit_sha`/`dependency_lock_sha256`/`live_system_source_sha256` 三哈希与本地树完全匹配、pid 81224（机器证据见最终结果评论） |
 | `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence` | 从零重跑严格六层门（run_id=`2e21f57d70fe`），tested_commit_sha=`945b2b0`：层 1/2/3/4 PASS、层 5 FAIL（pending user authorization：5 个浏览器 scope 无 Companion 心跳）、层 6 FAIL（pending user authorization / runner `failed_before_done_gate`）；`passed=false` 退出码 2、`evidence_commit=null`、工作树干净；证据 `.runtime/done-gate-evidence/gate-20260810T232057Z-2e21f57d70fe/product-v1-done-gate.json` |
