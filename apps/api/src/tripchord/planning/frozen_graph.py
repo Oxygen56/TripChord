@@ -23,11 +23,15 @@ never mutate the canonical contract in place.
 
 from __future__ import annotations
 
+import hashlib
+import re
+from datetime import date
 from functools import lru_cache
 
 from tripchord.planning.flexible_dates import (
     LIVE_V5_PLATFORM_QUERY_KINDS,
     LIVE_V5_PLATFORMS,
+    FlexibleTravelWindow,
     QueryTaskKind,
 )
 from tripchord.planning.stay_plans import system_stay_plan_candidate_set
@@ -114,3 +118,82 @@ def frozen_v4_icom_task_ids() -> frozenset[str]:
 def frozen_v4_tasks_per_pair() -> int:
     """Canonical per-pair browser query task count (one task per Source id)."""
     return len(frozen_v4_browser_source_ids())
+
+
+# The frozen live-v4 scenario's deterministic travel window (``benchmarks/
+# scenarios/live-hgh-mle-aug-2026-v4.json``): HGH→MLE, every departure in
+# August 2026, five-to-eight nights, two adults in one room, CNY.  The canonical
+# ``date-pair:`` id derivation (``frozen_v4_pair_id_digest`` /
+# ``frozen_v4_pair_id_is_canonical``) is the single source BOTH the producer's
+# ``_check_v4_source_graph`` and the layer-6 validator use — a foreign pair id,
+# a swapped pair or a missing/extra pair all fail closed even when every count
+# and member list lines up.
+#
+# The actual sealed pair-id SET of a real run is not a fixed constant: the API
+# applies ``minimum_departure_lead_days=7`` to the frozen window at run time and
+# the pair execution refines the exploration anchors, so the run's three
+# ``date-pair:`` ids depend on when it runs.  The layer-6 compact therefore
+# carries the run's own sealed pair ids from the job control plane
+# (``checkpoint_bound_pair_ids``) and the validator requires the compact's
+# ``pair_ids`` to equal that set EXACTLY — a compact with foreign / swapped /
+# missing / extra ids rejects even when every id is well-formed.
+_FROZEN_V4_TRAVEL_WINDOW = FlexibleTravelWindow(
+    origin="杭州",
+    destination="马累",
+    origin_code="HGH",
+    destination_code="MLE",
+    earliest_departure=date(2026, 8, 1),
+    latest_departure=date(2026, 8, 31),
+    min_nights=5,
+    max_nights=8,
+    adults=2,
+    rooms=1,
+    currency="CNY",
+)
+
+
+# A well-formed ``date-pair:`` id: ``date-pair:<departure>:<return>:<12-hex>``.
+_PAIR_ID_FORMAT_RE = re.compile(
+    r"^date-pair:(\d{4}-\d{2}-\d{2}):(\d{4}-\d{2}-\d{2}):([0-9a-f]{12})$"
+)
+
+
+def frozen_v4_pair_id_digest(departure: date, return_date: date) -> str:
+    """Recompute the canonical 12-hex pair-id digest from the frozen window.
+
+    Mirrors ``FlexibleDateExplorer._pair_id`` (``planning/flexible_dates.py``):
+    the digest is ``sha256(origin|destination|departure|return|adults|rooms|
+    currency)[:12]`` over the frozen scenario's constants.  Any pair id whose
+    digest does not recompute from these constants is not a real frozen-scenario
+    pair id — it is foreign, regardless of how well-formed it looks.
+    """
+    raw = (
+        f"{_FROZEN_V4_TRAVEL_WINDOW.origin}|{_FROZEN_V4_TRAVEL_WINDOW.destination}|"
+        f"{departure.isoformat()}|{return_date.isoformat()}|"
+        f"{_FROZEN_V4_TRAVEL_WINDOW.adults}|{_FROZEN_V4_TRAVEL_WINDOW.rooms}|"
+        f"{_FROZEN_V4_TRAVEL_WINDOW.currency}"
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()[:12]
+
+
+def frozen_v4_pair_id_is_canonical(pair_id: object) -> bool:
+    """True only for a well-formed frozen-scenario ``date-pair:`` id.
+
+    The producer (``agents/live_done_gate_v4.py``), the compact
+    (``scripts/run_product_done_gate.py``) and the layer-6 validator all derive
+    pair-id validity from this single function, so an id that is not a canonical
+    frozen-scenario id fails closed everywhere.  ``pair-1`` and every other
+    arbitrary string, plus any well-formed id whose digest does not recompute
+    from the frozen constants, are rejected.
+    """
+    if not isinstance(pair_id, str):
+        return False
+    match = _PAIR_ID_FORMAT_RE.fullmatch(pair_id)
+    if match is None:
+        return False
+    try:
+        departure = date.fromisoformat(match.group(1))
+        return_date = date.fromisoformat(match.group(2))
+    except ValueError:
+        return False
+    return match.group(3) == frozen_v4_pair_id_digest(departure, return_date)

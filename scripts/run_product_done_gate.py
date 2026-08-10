@@ -52,6 +52,7 @@ from tripchord.planning.frozen_graph import (
     FROZEN_V4_PAIR_COUNT,
     frozen_v4_browser_source_ids,
     frozen_v4_icom_task_ids,
+    frozen_v4_pair_id_is_canonical,
     frozen_v4_query_shapes,
     frozen_v4_tasks_per_pair,
 )
@@ -1309,6 +1310,48 @@ _CANARY_DIAG_SCHEMA_VERSION = "tripchord-certified-ota-canary-v1"
 # A failure diagnostic older than this is a STALE failure (a prior run's crash),
 # never evidence of the current canary run (Block 2 freshness binding).
 _CANARY_DIAG_MAX_AGE_SECONDS = 1800
+# The authoritative interpreter identity a canary failure diagnostic must match
+# EXACTLY (C-122 supervision 01:10 Block 3).  The canary runs as a child of this
+# gate under the same project interpreter, so the diagnosis's ``runtime.python``
+# must equal THIS process's ``sys.version_info[:3]`` and ``runtime.platform``
+# must equal ``sys.platform`` — a foreign ``EVIL-RUNTIME`` / ``EVIL-PLATFORM``
+# can never pass by being merely non-empty.
+_CANARY_DIAG_EXPECTED_PYTHON = ".".join(str(part) for part in sys.version_info[:3])
+_CANARY_DIAG_EXPECTED_PLATFORM = sys.platform
+# Upper bound for a free-form diagnostic field (summary / exception_class /
+# stage) carried into the committed report — a crafted 10 MB summary cannot bloat
+# or smuggle the committed trail (consumer whitelist, Block 3).
+_CANARY_DIAG_FIELD_MAX_CHARS = 512
+# The consumer's own whitelist patterns (never trust the producer's
+# desensitization alone): any URL is collapsed to ``<url>`` and any 32+ character
+# run of token characters (hex hashes, base64-ish secrets, ``S*40``-style junk)
+# is collapsed to ``<redacted>`` before a free-form field reaches the committed
+# report (C-122 supervision 01:10 Block 3).
+_CANARY_DIAG_URL_RE = re.compile(r"https?://[^\s\"'<>)\[\]{}]+")
+_CANARY_DIAG_TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9_\-=]{32,}")
+
+
+def _sanitize_canary_diag_field(value: str, fallback: str) -> str:
+    """Whitelist a free-form canary diagnostic field for the committed report.
+
+    The classification is carried into the layer-5 detail and the committed
+    report, so the consumer re-sanitizes every free-form diagnostic string
+    before it lands: env-secret / URL / phone / account / tracking patterns are
+    redacted (``_redact_output``), any remaining URL is collapsed to ``<url>``,
+    any 32+ token-shaped run is collapsed to ``<redacted>``, control characters
+    are stripped, and the result is bounded in length.  A credential-bearing
+    summary can never reach the committed trail as-is (C-122 supervision 01:10
+    Block 3).
+    """
+    value = _redact_output(value)
+    value = _CANARY_DIAG_URL_RE.sub("<url>", value)
+    value = _CANARY_DIAG_TOKEN_RUN_RE.sub("<redacted>", value)
+    value = re.sub(r"[\x00-\x1f\x7f]", " ", value).strip()
+    if not value:
+        return fallback
+    if len(value) > _CANARY_DIAG_FIELD_MAX_CHARS:
+        value = value[:_CANARY_DIAG_FIELD_MAX_CHARS] + "…"
+    return value
 
 
 def _consume_canary_failure_diagnostic(
@@ -1381,8 +1424,23 @@ def _consume_canary_failure_diagnostic(
     runtime = run_identity.get("runtime")
     if not isinstance(runtime, dict):
         return None, "canary failure diagnostic missing runtime identity"
-    if not runtime.get("python") or not runtime.get("platform"):
-        return None, "canary failure diagnostic runtime identity is incomplete"
+    # C-122 supervision 01:10 Block 3 counter-example: the diagnosis runtime must
+    # be bound EXACTLY to the ACTUAL run's authoritative interpreter identity —
+    # not merely non-empty.  ``EVIL-RUNTIME`` / ``EVIL-PLATFORM`` (or a python
+    # version that does not equal this gate's own ``sys.version_info[:3]``) is a
+    # forged diagnosis and fails closed.
+    diag_python = runtime.get("python")
+    diag_platform = runtime.get("platform")
+    if (
+        diag_python != _CANARY_DIAG_EXPECTED_PYTHON
+        or diag_platform != _CANARY_DIAG_EXPECTED_PLATFORM
+    ):
+        return None, (
+            "canary failure diagnostic runtime identity "
+            f"{diag_python!r}/{diag_platform!r} != this run's authoritative "
+            f"runtime {_CANARY_DIAG_EXPECTED_PYTHON!r}/"
+            f"{_CANARY_DIAG_EXPECTED_PLATFORM!r}"
+        )
     generated_at = diagnostic.get("generated_at")
     if not isinstance(generated_at, str) or not generated_at:
         return None, "canary failure diagnostic missing generated_at"
@@ -1401,11 +1459,21 @@ def _consume_canary_failure_diagnostic(
     summary = diagnostic.get("summary")
     if not isinstance(summary, str) or not summary:
         summary = "no exception detail"
+    # C-122 supervision 01:10 Block 3: the classification is carried into the
+    # committed report, so every free-form diagnostic field is re-sanitized by
+    # the CONSUMER (this function) — a credential-bearing summary, exception
+    # class or stage is redacted / collapsed / bounded before it lands.
+    summary = _sanitize_canary_diag_field(summary, "no exception detail")
+    exception_class = _sanitize_canary_diag_field(
+        exception_class, "unknown exception"
+    )
+    stage = _sanitize_canary_diag_field(stage, "unknown stage")
     classification = (
         f"canary failure diagnostic consumed: stage={stage} "
         f"exception={exception_class} summary={summary} "
         f"run_id={diag_run_id} tested_sha={diag_sha[:12]} "
-        f"runtime=python {runtime.get('python')}/{runtime.get('platform')} "
+        f"runtime=python {_CANARY_DIAG_EXPECTED_PYTHON}/"
+        f"{_CANARY_DIAG_EXPECTED_PLATFORM} "
         f"generated_at={generated_dt.isoformat()}"
     )
     return classification, None
@@ -1730,6 +1798,27 @@ _V4_FROZEN_TASKS_PER_PAIR = frozen_v4_tasks_per_pair()
 _V4_FROZEN_BROWSER_SOURCE_IDS = frozen_v4_browser_source_ids()
 _V4_FROZEN_QUERY_SHAPES = frozen_v4_query_shapes()
 _V4_FROZEN_ICOM_TASK_IDS = frozen_v4_icom_task_ids()
+
+# C-122 supervision 01:10: pair-id canonical binding.  The SEALED pair-id set of
+# a real run is not a fixed constant — the API applies ``minimum_departure_
+# lead_days=7`` to the frozen window at run time and the pair execution refines
+# the exploration anchors, so the three ``date-pair:`` ids depend on when the
+# run happens.  The layer-6 validator therefore:
+#
+#   * requires every compact ``pair_id`` to be a CANONICAL frozen-scenario id
+#     (``frozen_v4_pair_id_is_canonical``: well-formed ``date-pair:`` format and
+#     a digest that recomputes from the frozen scenario constants), which
+#     rejects arbitrary foreign ids like ``pair-1``, and
+#   * requires the compact's ``pair_ids`` SET to equal the run's checkpoint-bound
+#     sealed pair ids EXACTLY (``checkpoint_bound_pair_ids`` — an independent
+#     job-control-plane record carried in the compact), which rejects a foreign
+#     pair, a wrong-pair swap, and a missing/extra pair even when every id is
+#     well-formed.
+#
+# The producer's ``_check_v4_source_graph`` uses the SAME ``frozen_v4_pair_id_
+# is_canonical`` derivation on its ``run.pair_runs`` ids, so a run that produced
+# a foreign / malformed / wrong-digest pair id fails closed on the producer side
+# too.
 
 
 def _resolve_live_state_db(explicit: Path | None = None) -> Path:
@@ -3083,6 +3172,7 @@ _LAYER6_REQUIRED_EVIDENCE_FIELDS: dict[str, frozenset[str]] = {
             "expected_query_shapes",
             "expected_icom_task_ids",
             "pair_ids",
+            "checkpoint_bound_pair_ids",
             "total_planned_task_count",
             "per_pair",
         }
@@ -3242,6 +3332,10 @@ _LAYER6_EVIDENCE_SCHEMAS: dict[str, dict[str, Any]] = {
         "expected_query_shapes": {"_item": _EVIDENCE_SCALAR},
         "expected_icom_task_ids": {"_item": _EVIDENCE_SCALAR},
         "pair_ids": {"_item": _EVIDENCE_SCALAR},
+        # C-122 supervision 01:10: the run's checkpoint-bound sealed pair ids —
+        # an independent job-control-plane record the compact must carry so the
+        # validator can reject a foreign / swapped / missing / extra pair set.
+        "checkpoint_bound_pair_ids": {"_item": _EVIDENCE_SCALAR},
         "total_planned_task_count": _EVIDENCE_SCALAR,
         # C-122 HG-G: the frozen-scenario per-pair breakdown — every nested field
         # is whitelisted so a forged 64-hex or an unknown nested binding cannot
@@ -3435,15 +3529,25 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
     companions = cp.get("companions") or []
     dg = payload.get("done_gate") or {}
     checks = dg.get("checks") or []
-    done_gate = {
-        "passed": dg.get("passed"),
-        "check_count": len(checks),
-        "passed_check_count": sum(
-            1
-            for check in checks
-            if isinstance(check, dict) and check.get("passed") is True
-        ),
-        "checks": [
+    # C-122 supervision 01:10: the run's checkpoint-bound sealed pair ids from
+    # the job control plane (the terminal job's pair checkpoints), merged into
+    # the v4_source_graph evidence so the compact carries an independent record
+    # of what the run ACTUALLY sealed alongside the producer's own ``pair_ids``.
+    checkpoint_pairs: list[str] = []
+    checkpoint_binding = (
+        (payload.get("context") or {}).get("pair_checkpoint_binding") or {}
+    )
+    for binding in checkpoint_binding.get("bindings") or ():
+        if isinstance(binding, dict) and isinstance(binding.get("date_pair_id"), str):
+            checkpoint_pairs.append(binding["date_pair_id"])
+    compact_checks: list[dict[str, Any]] = []
+    for check in checks:
+        if not isinstance(check, dict) or not check.get("name"):
+            continue
+        item_evidence = _desensitized_check_evidence(check, payload)
+        if check.get("name") == "v4_source_graph" and checkpoint_pairs:
+            item_evidence["checkpoint_bound_pair_ids"] = list(checkpoint_pairs)
+        compact_checks.append(
             {
                 "name": check.get("name"),
                 "passed": check.get("passed"),
@@ -3455,11 +3559,18 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
                 ],
                 # C-122 Fix 3: the desensitized, recomputable per-item structured
                 # evidence each check carries — never a bare verdict list.
-                "evidence": _desensitized_check_evidence(check, payload),
+                "evidence": item_evidence,
             }
+        )
+    done_gate = {
+        "passed": dg.get("passed"),
+        "check_count": len(checks),
+        "passed_check_count": sum(
+            1
             for check in checks
-            if isinstance(check, dict) and check.get("name")
-        ],
+            if isinstance(check, dict) and check.get("passed") is True
+        ),
+        "checks": compact_checks,
     }
     return {
         "schema_version": _LAYER6_COMPACT_SCHEMA,
@@ -4237,6 +4348,43 @@ def _verify_layer6_check_semantics(
                 f"{check_name!r} pair_ids != the frozen scenario's exact "
                 f"{_V4_FROZEN_DATE_PAIR_COUNT} date pairs "
                 f"(got {len(pair_ids)})"
+            )
+        # C-122 supervision 01:10 counter-example: every pair id must be a
+        # CANONICAL frozen-scenario date-pair id — well-formed ``date-pair:``
+        # format and a digest that recomputes from the frozen scenario constants
+        # plus the id's own dates.  A compact whose pair ids were replaced with
+        # arbitrary unique foreign values like ``pair-1`` (or a well-formed id
+        # with a wrong digest) fails closed even when every count and member
+        # shape is preserved.  ``frozen_v4_pair_id_is_canonical`` is the same
+        # single derivation the producer's ``_check_v4_source_graph`` uses.
+        for pair_id in pair_ids:
+            if not frozen_v4_pair_id_is_canonical(pair_id):
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{check_name!r} pair id {pair_id!r} is not a canonical "
+                    "frozen-scenario date-pair id (format or digest mismatch)"
+                )
+        # C-122 supervision 01:10 counter-example: the pair-id SET must equal the
+        # run's checkpoint-bound sealed pair ids EXACTLY.  ``checkpoint_bound_
+        # pair_ids`` is the independent job-control-plane record of the pairs the
+        # run actually sealed (the terminal job's pair checkpoints), carried in
+        # the compact alongside the producer's ``pair_ids``.  A compact with a
+        # foreign pair, a wrong-pair swap, or a missing/extra pair fails closed
+        # even when every id is individually well-formed.
+        checkpoint_pair_ids = evidence.get("checkpoint_bound_pair_ids")
+        if not isinstance(checkpoint_pair_ids, list) or len(checkpoint_pair_ids) != len(
+            pair_ids
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_bound_pair_ids does not cover "
+                "exactly the frozen pair set"
+            )
+        if set(checkpoint_pair_ids) != set(pair_ids):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} pair_ids set != the run's checkpoint-bound "
+                "sealed pair set (foreign, swapped, missing or extra pair)"
             )
         # The per-pair breakdown must cover EXACTLY the frozen pair set, with the
         # exact producer-consistent per-pair task counts.
@@ -6435,6 +6583,71 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
                     for entry in files
                     if isinstance(entry, dict) and isinstance(entry.get("name"), str)
                 }
+                # C-122 supervision 01:10 Block 2 counter-examples: the name SET
+                # is not the whole contract.  Every fixed evidence name must also
+                # carry its EXACT canonical tracked_path AND its canonical
+                # committed flag (recomputed here with ``git check-ignore`` — the
+                # same derivation the publisher's ``_manifest_files`` uses), and
+                # every committed entry's sha256/size must recompute to the
+                # ACTUAL blob E committed (the per-entry loop above already
+                # recomputes against the entry's own path; the canonical binding
+                # below pins the path so a compact renamed / relocated, a raw
+                # committed-flag flip, or a wrong hash/size fails closed even when
+                # every individual field shape still reads correctly.
+                canonical_committed: dict[str, bool] = {
+                    staged_name: (
+                        _git(
+                            "check-ignore", "-q", "--", tracked_rel, check=False
+                        ).returncode
+                        != 0
+                    )
+                    for staged_name, tracked_rel in _EVIDENCE_TRACKED_PATHS
+                }
+                for staged_name, tracked_rel in _EVIDENCE_TRACKED_PATHS:
+                    entry = by_name.get(staged_name)
+                    if entry is None:
+                        problems.append(
+                            f"evidence commit E manifest missing fixed evidence "
+                            f"file {staged_name!r}"
+                        )
+                        continue
+                    actual_rel = entry.get("tracked_path")
+                    if actual_rel != tracked_rel:
+                        problems.append(
+                            f"evidence commit E manifest file {staged_name!r} "
+                            f"tracked_path {actual_rel!r} != the canonical "
+                            f"contract {tracked_rel!r} (relocated)"
+                        )
+                    expected_committed = canonical_committed[staged_name]
+                    actual_committed = entry.get("committed")
+                    if actual_committed != expected_committed:
+                        problems.append(
+                            f"evidence commit E manifest file {staged_name!r} "
+                            f"committed {actual_committed!r} != the canonical "
+                            f"contract {expected_committed!r} (committed flag "
+                            "flipped)"
+                        )
+                    if expected_committed and actual_rel == tracked_rel:
+                        canonical_blob = _git(
+                            "show",
+                            f"{evidence_commit}:{tracked_rel}",
+                            check=True,
+                            binary=True,
+                        )
+                        if hashlib.sha256(canonical_blob.stdout).hexdigest() != entry.get(
+                            "sha256"
+                        ):
+                            problems.append(
+                                f"evidence commit E manifest file {staged_name!r} "
+                                "sha256 does not match the committed blob at the "
+                                "canonical path"
+                            )
+                        if len(canonical_blob.stdout) != entry.get("size_bytes"):
+                            problems.append(
+                                f"evidence commit E manifest file {staged_name!r} "
+                                "size_bytes does not match the committed blob at "
+                                "the canonical path"
+                            )
                 for staged_name, tracked_rel in _EVIDENCE_TRACKED_PATHS:
                     if "compact" not in staged_name:
                         continue
