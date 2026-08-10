@@ -250,6 +250,47 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+# Sensitive-value classes that must never reach a report, a print, or an error
+# message verbatim (C-118): exact secret values, Authorization/Cookie values,
+# account identifiers, phone numbers and full tracking URLs.  ``_redact_output``
+# replaces the matched span with ``[REDACTED]``; it is applied at the *source*
+# (subprocess output, exception text) so a failed gate and a non-committing run
+# never write or print the raw bytes.
+def _redact_output(text: str) -> str:
+    redacted = text or ""
+    for secret in _evidence_secrets():
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    redacted = _AUTH_COOKIE_PATTERN.sub("[REDACTED]", redacted)
+    redacted = _ACCOUNT_ID_PATTERN.sub("[REDACTED]", redacted)
+    redacted = _PHONE_PATTERN.sub("[REDACTED]", redacted)
+    redacted = _TRACKING_URL_PATTERN.sub(
+        lambda match: (
+            "[REDACTED]" if _is_tracking_url_leak(match.group(0)) else match.group(0)
+        ),
+        redacted,
+    )
+    return redacted
+
+
+def _redact_report(report: GateReport) -> GateReport:
+    """In-place redaction of every layer detail / sub-check detail in a report.
+
+    Idempotent: redacting already-redacted text is a no-op, so the same report
+    object can be dumped repeatedly (staging, tracked tree, re-dump) and every
+    serialized copy is equally safe.  ``asdict`` JSON stays valid because
+    redaction is applied to the string *fields*, never to the serialized JSON
+    document.
+    """
+    for layer in report.layers:
+        if layer.detail:
+            layer.detail = _redact_output(layer.detail)
+        for check in layer.sub_checks:
+            if isinstance(check, dict) and check.get("detail"):
+                check["detail"] = _redact_output(str(check["detail"]))
+    return report
+
+
 def _run(
     cmd: list[str],
     *,
@@ -266,7 +307,7 @@ def _run(
             timeout=timeout,
             env=env,
         )
-        combined = (result.stdout or "") + (result.stderr or "")
+        combined = _redact_output((result.stdout or "") + (result.stderr or ""))
         return result.returncode, combined[-2000:]
     except subprocess.TimeoutExpired:
         return 124, f"timed out after {timeout}s"
@@ -945,16 +986,21 @@ def layer5_real_canary(staging_dir: Path) -> LayerResult:
     )
     passed = False
     canary_failures: list[str] = []
+    # C-118: the certified canary must BOTH exit 0 AND carry a passed=true JSON
+    # with the exact six certified scopes each fresh/authorized/read-only/passed.
+    # A non-zero exit cannot be papered over by a forged all-green JSON, and a
+    # canary that exits 0 while reporting a failed/stale/unauthorized/incomplete
+    # scope set must fail the layer (C-114 review R2).
+    if code != 0:
+        canary_failures.append(
+            f"canary process exited {code} (must exit 0 with certified JSON)"
+        )
     try:
         report = json.loads(evidence_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         report = None
         canary_failures.append("canary evidence JSON missing or unreadable")
     if report is not None:
-        # Layer verdict is driven by the certified canary JSON, never by the
-        # process exit code alone: a canary that exits 0 while reporting a
-        # failed/stale/unauthorized/incomplete scope set must fail the layer
-        # (C-114 review R2).
         scopes = report.get("scopes")
         if not isinstance(scopes, list) or not scopes:
             canary_failures.append("canary carries no scopes")
@@ -988,6 +1034,14 @@ def layer5_real_canary(staging_dir: Path) -> LayerResult:
             missing = sorted(_CERTIFIED_OTA_SCOPES - present)
             if missing:
                 canary_failures.append("missing certified scopes: " + ", ".join(missing))
+            # C-118: the certified canary must declare EXACTLY the six certified
+            # scopes — an extra/ad-hoc scope is not certified and must fail the
+            # layer rather than inflate coverage.
+            extra = sorted(present - _CERTIFIED_OTA_SCOPES)
+            if extra:
+                canary_failures.append(
+                    "non-certified extra scopes: " + ", ".join(extra)
+                )
         if report.get("passed") is not True:
             canary_failures.append("canary passed != true")
         status = report.get("companion_status")
@@ -1145,6 +1199,97 @@ def _live_state_lease_preflight(db_path: Path) -> list[str]:
             residual.append(
                 f"job {job_id} status={status} holds lease until {expires.isoformat()}"
             )
+    return residual
+
+
+# Residual Browser-Bridge state classes (C-118).  The persisted bridge-state
+# JSON (BrowserBridgePersistedState, schema v2) tracks Companion tasks and
+# reload/control requests independently of the planning ``jobs`` table: a task
+# still ``queued``/``claimed`` or a control request still ``queued``/
+# ``draining``/``dispatched``/``accepted`` is in-flight work a fresh live run
+# would race with.  Reading only this file can prove bridge-lease isolation that
+# a ``tripchord.db`` planning-jobs query cannot.
+_BRIDGE_TASK_RESIDUAL_STATES = frozenset({"queued", "claimed"})
+_BRIDGE_CONTROL_RESIDUAL_STATES = frozenset(
+    {"queued", "draining", "dispatched", "accepted"}
+)
+_BRIDGE_STATE_ENV = "TRIPCHORD_BROWSER_BRIDGE_STATE_PATH"
+
+
+def _resolve_bridge_state_path(explicit: Path | None = None) -> Path | None:
+    """The persisted Browser-Bridge state JSON path for the lease preflight.
+
+    ``TRIPCHORD_BROWSER_BRIDGE_STATE_PATH`` is the env var the bridge provider
+    itself uses (``browser_bridge.BROWSER_BRIDGE_STATE_PATH_ENV``); when unset
+    there is no persisted bridge state to contend with and the preflight has
+    nothing to prove.  An explicit ``--bridge-state-path``-style override wins.
+    """
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(_BRIDGE_STATE_ENV, "").strip()
+    return Path(raw) if raw else None
+
+
+def _bridge_state_lease_preflight(state_path: Path | None = None) -> list[str]:
+    """Read-only Browser-Bridge state preflight: residual queued/claimed work.
+
+    Reads the persisted bridge-state JSON at ``TRIPCHORD_BROWSER_BRIDGE_STATE_PATH``
+    strictly read-only and reports every non-terminal task (``queued``/``claimed``)
+    and pending reorder control request (``queued``/``draining``/``dispatched``/
+    ``accepted``) that a fresh live run would contend with (C-118).  The bridge
+    stores these states independently of the planning ``jobs`` table, so the
+    layer-6 residual-lease gate must read this file, not only ``tripchord.db``.
+    Returns an empty list when bridge state is isolated; each entry names one
+    residual item (id + state).
+    """
+    if state_path is None:
+        state_path = _resolve_bridge_state_path()
+    if state_path is None:
+        return []  # no persisted bridge state configured; nothing to contend
+    if state_path.is_symlink():
+        return [
+            f"bridge-state path {state_path} is a symlink; refusing to read "
+            "lease state through a symlink"
+        ]
+    if not state_path.is_file():
+        return [
+            f"bridge-state file {state_path} missing; cannot prove bridge lease "
+            "isolation"
+        ]
+    _verify_evidence_file_safety(state_path, "bridge-state")
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [
+            f"bridge-state file {state_path} unreadable "
+            f"({exc.__class__.__name__}); cannot prove bridge lease isolation"
+        ]
+    if not isinstance(payload, dict):
+        return [
+            f"bridge-state file {state_path} is not a JSON object; cannot prove "
+            "bridge lease isolation"
+        ]
+    residual: list[str] = []
+    tasks = payload.get("tasks")
+    if isinstance(tasks, list):
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            state = task.get("state")
+            if isinstance(state, str) and state in _BRIDGE_TASK_RESIDUAL_STATES:
+                residual.append(
+                    f"bridge task {task.get('id')!r} state={state} is queued/claimed"
+                )
+    reloads = payload.get("reload_requests")
+    if isinstance(reloads, list):
+        for item in reloads:
+            if not isinstance(item, dict):
+                continue
+            state = item.get("state")
+            if isinstance(state, str) and state in _BRIDGE_CONTROL_RESIDUAL_STATES:
+                residual.append(
+                    f"bridge reload {item.get('id')!r} state={state} is pending reorder"
+                )
     return residual
 
 
@@ -1333,9 +1478,14 @@ def layer6_full_e2e(
                 "authorise the bounded live model cost, then re-run"
             ),
         )
+    # C-118: the residual-lease gate reads BOTH the planning job store AND the
+    # persisted Browser-Bridge state JSON.  The bridge keeps its own queued/
+    # claimed task and pending-reorder state outside the ``jobs`` table, so a
+    # fresh live run must not start while either holds in-flight work.
     lease_problems = _live_state_lease_preflight(
         _resolve_live_state_db(live_state_db)
     )
+    lease_problems += _bridge_state_lease_preflight()
     if lease_problems:
         return LayerResult(
             name="6_full_e2e",
@@ -1499,40 +1649,47 @@ def _reject_target_conflict(path: Path, label: str, kind: str) -> None:
     onto an existing directory, would otherwise surface a raw OSError outside
     the gate's error contract instead of a contractized exit 2.
 
-    A pre-existing staging directory must be *empty* (C-114 R3): evidence is
-    staged only into a directory this run created and populated itself.  An
-    existing non-empty directory is rejected so stale files from an earlier run
-    can never be swept into this run's committed trail.
+    The check is lstat-based so a symlink is never followed: a planted symlink
+    at the target could redirect the mkdir or the atomic rename to attacker-
+    chosen bytes, so it is rejected outright (C-118).
+
+    A pre-existing staging directory is ALWAYS rejected, even when empty
+    (C-118): the staging root must be created exclusively by this run so no
+    stale or pre-planted file can ever be swept into this run's committed
+    trail.  Exclusivity is enforced here (fail-closed) and again by the
+    non-``exist_ok`` ``mkdir`` in ``main``.
     """
     try:
-        exists = path.exists()
-        is_dir = path.is_dir()
-    except OSError:
-        exists, is_dir = False, False
-    if not exists:
+        st = path.lstat()
+    except FileNotFoundError:
         return
-    if kind == "dir" and not is_dir:
+    except OSError as exc:
         raise GateStateChangedError(
-            f"{label} {path} exists and is not a directory; refusing to create "
-            "a directory over a file"
+            f"{label} {path} cannot be inspected ({exc.__class__.__name__}); "
+            "refusing to write over an unreadable target"
+        ) from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise GateStateChangedError(
+            f"{label} {path} is a symlink; refusing to write evidence through a "
+            "symlink target"
         )
-    if kind == "dir" and is_dir:
-        # Exclusivity (R3): only a directory this run created and initially
-        # emptied is acceptable — an existing non-empty staging dir would mix
-        # stale evidence into the new run.
-        try:
-            has_entries = any(path.iterdir())
-        except OSError as exc:
+    if kind == "dir":
+        if not stat.S_ISDIR(st.st_mode):
             raise GateStateChangedError(
-                f"{label} {path} exists but cannot be enumerated; refusing to "
-                f"reuse an unreadable staging dir: {exc}"
-            ) from exc
-        if has_entries:
-            raise GateStateChangedError(
-                f"{label} {path} already exists and is not empty; refusing to "
-                "write this run's evidence into a reused staging directory"
+                f"{label} {path} exists and is not a directory; refusing to "
+                "create a directory over a file"
             )
-    if kind == "file" and is_dir:
+        # Exclusivity (C-118): an existing staging dir — empty or not — would
+        # either mix stale evidence into the new run or accept a directory this
+        # run did not itself create.  Only a freshly-created exclusive dir is
+        # acceptable.
+        raise GateStateChangedError(
+            f"{label} {path} already exists; the staging dir must be created "
+            "exclusively by this run"
+        )
+    # kind == "file": an existing regular file is an acceptable atomic-replace
+    # target, but a directory is not.
+    if stat.S_ISDIR(st.st_mode):
         raise GateStateChangedError(
             f"{label} {path} exists and is a directory; refusing to write a "
             "report over a directory"
@@ -1622,8 +1779,16 @@ def run_gate(
 
 
 def _dump(report: GateReport, output_path: Path = OUTPUT_PATH) -> Path:
+    # Every serialized report is redacted in place first (C-118): subprocess
+    # output is already redacted at the source, and any remaining direct-detail
+    # leak is neutralized here so no exit path — commit or not — can write or
+    # print a raw secret.  Idempotent, so repeated dumps of the same report are
+    # equally safe.
+    _redact_report(report)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = output_path.with_suffix(".json.tmp")
+    tmp = output_path.with_name(
+        f".{output_path.name}.{uuid.uuid4().hex[:8]}.tmp"
+    )
     payload = json.dumps(
         asdict(report),
         ensure_ascii=False,
@@ -1637,6 +1802,23 @@ def _dump(report: GateReport, output_path: Path = OUTPUT_PATH) -> Path:
     tmp.chmod(0o600)
     os.replace(tmp, output_path)
     return output_path
+
+
+def _write_atomic(path: Path, text: str, mode: int = 0o600) -> Path:
+    """Atomically write ``text`` to ``path`` sealed to ``mode`` (C-118).
+
+    Writes to a uniquely-named sibling tmp in the target directory, seals the
+    tmp to the requested mode, then ``os.replace``s it over the target.  A
+    reader never observes a partially-written file, and the final permissions
+    are independent of the host umask.  The tmp name embeds a uuid so concurrent
+    runs cannot collide.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.chmod(mode)
+    os.replace(tmp, path)
+    return path
 
 
 # Compact artifact names: deliberately NOT matching the git-ignored
@@ -2033,19 +2215,19 @@ def _generate_compact_evidence(staging_dir: Path) -> None:
     ):
         if payload is None:
             continue
-        target = staging_dir / staged_name
-        target.write_text(
+        # Atomic + owner-only from the start (C-118): the tmp is sealed to 0600
+        # before the rename, so no window exposes a partially-written compact
+        # artifact with looser permissions than the final file.
+        _write_atomic(
+            staging_dir / staged_name,
             json.dumps(
                 payload,
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
             ),
-            encoding="utf-8",
+            mode=0o600,
         )
-        # Raw evidence staging is owner-only; the derived compact artifacts are
-        # generated later, so re-secure them to 0600 as well.
-        target.chmod(0o600)
 
 
 def _evidence_manifest(
@@ -2072,16 +2254,19 @@ def _evidence_manifest(
 
 
 def _write_manifest(manifest: dict[str, Any]) -> Path:
-    target = ROOT / _MANIFEST_REL
-    target.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(
-        manifest,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+    # Atomic + owner-only (C-118): the manifest is part of the committed trail,
+    # so it must never be observable partially written or with looser
+    # permissions than 0600.
+    return _write_atomic(
+        ROOT / _MANIFEST_REL,
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        mode=0o600,
     )
-    target.write_text(payload, encoding="utf-8")
-    return target
 
 
 # Fixed required raw-evidence inputs the gate must certify before any committed
@@ -2121,6 +2306,156 @@ def _verify_required_evidence_inputs(staging_dir: Path) -> None:
         raise GateStateChangedError(
             "evidence contract: required raw evidence input(s) missing from "
             f"staging dir {staging_dir}: {', '.join(missing)}"
+        )
+
+
+def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -> None:
+    """C-118: hard-verify the committed layer-5 compact from E's blob.
+
+    Requires the exact six certified scopes — no fewer, no extra — each
+    passed/fresh/authorized/read_only, plus the coverage thresholds naming the
+    same six scopes with all observed/passed counts equal.  A compact that omits
+    a scope, adds a non-certified scope, or records any scope as not
+    passed/fresh/authorized/read_only fails the phase closed.
+    """
+    expected = sorted(_CERTIFIED_OTA_SCOPES)
+    coverage = compact.get("coverage")
+    if not isinstance(coverage, dict):
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} lacks coverage "
+            "thresholds"
+        )
+    if coverage.get("expected_scope_count") != len(expected):
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} expected_scope_count "
+            f"!= {len(expected)}"
+        )
+    if sorted(coverage.get("expected_scopes") or []) != expected:
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} expected_scopes "
+            "does not equal the six certified scopes"
+        )
+    if coverage.get("observed_scope_count") != len(expected):
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} observed_scope_count "
+            f"!= {len(expected)}"
+        )
+    if coverage.get("passed_scope_count") != len(expected):
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} passed_scope_count "
+            f"!= {len(expected)}"
+        )
+    if coverage.get("missing"):
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} reports missing "
+            f"scopes: {', '.join(sorted(coverage['missing']))}"
+        )
+    scopes = compact.get("scopes")
+    if not isinstance(scopes, list) or len(scopes) != len(expected):
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} scope list count "
+            f"!= {len(expected)}"
+        )
+    present: set[str] = set()
+    for entry in scopes:
+        if not isinstance(entry, dict):
+            continue
+        scope = entry.get("scope")
+        if isinstance(scope, str):
+            present.add(scope)
+        if not (
+            entry.get("passed") is True
+            and entry.get("fresh") is True
+            and entry.get("authorized") is True
+            and entry.get("read_only") is True
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} scope "
+                f"{entry.get('scope')!r} not passed/fresh/authorized/read_only"
+            )
+    if present != set(expected):
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} scope set != the "
+            "six certified scopes"
+        )
+
+
+def _verify_layer6_compact_contract(tracked_rel: str, compact: dict[str, Any]) -> None:
+    """C-118: hard-verify the committed layer-6 compact from E's blob.
+
+    Requires the exact fifteen done-gate checks, all passed, with
+    ``passed=true`` and all counts equal to 15, plus the repo / runtime /
+    Companion identity and the event-injection / timeout / runner contracts.
+    A compact missing a required check, carrying a non-passed check, or missing
+    an identity/binding field fails the phase closed.
+    """
+    done_gate = compact.get("done_gate")
+    if not isinstance(done_gate, dict):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} lacks the "
+            "done-gate report"
+        )
+    if done_gate.get("passed") is not True:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} done_gate.passed "
+            "!= true"
+        )
+    if done_gate.get("check_count") != 15:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} check_count != 15"
+        )
+    if done_gate.get("passed_check_count") != 15:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} "
+            "passed_check_count != 15"
+        )
+    checks = done_gate.get("checks")
+    if not isinstance(checks, list) or len(checks) != 15:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} check set count "
+            "!= 15"
+        )
+    present: set[str] = set()
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        name = check.get("name")
+        if isinstance(name, str):
+            present.add(name)
+        if check.get("passed") is not True:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check.get('name')!r} not passed"
+            )
+    if present != _V4_DONE_GATE_CHECK_NAMES:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} required check "
+            "names do not match the fifteen done-gate checks"
+        )
+    # Repo / runtime / Companion identity plus the event-injection / timeout /
+    # runner contracts: the independently reviewable bindings a passing layer-6
+    # must preserve in the committed trail.
+    for key in (
+        "repo_revision",
+        "runtime_before_run",
+        "companion_preflight",
+        "event_injection_contract",
+        "timeout_contract",
+        "runner_contract",
+    ):
+        if compact.get(key) is None:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} missing {key!r}"
+            )
+    if not isinstance(compact.get("repo_revision"), dict):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} repo_revision is "
+            "not an object"
+        )
+    if not isinstance(compact.get("runtime_before_run"), dict):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} runtime_before_run "
+            "is not an object"
         )
 
 
@@ -2228,23 +2563,15 @@ def _verify_evidence_contract(
                 f"evidence commit E compact artifact {tracked_rel} has no "
                 "schema_version"
             )
+        # C-118: verify the committed compact CONTENT from E's blob against the
+        # strong contract — layer-5 exact six scopes each passed/fresh/
+        # authorized/read_only, layer-6 exact fifteen checks all passed plus the
+        # identity/binding fields.  A forged or partial compact fails the phase
+        # closed here, not at some later consumer.
         if staged_name == _COMPACT_CANARY_STAGED_NAME:
-            coverage = compact.get("coverage")
-            if not isinstance(coverage, dict) or not isinstance(
-                coverage.get("expected_scopes"), list
-            ):
-                raise GateStateChangedError(
-                    f"evidence commit E layer-5 compact {tracked_rel} lacks "
-                    "coverage thresholds"
-                )
+            _verify_layer5_compact_contract(tracked_rel, compact)
         elif staged_name == _COMPACT_E2E_STAGED_NAME:
-            done_gate = compact.get("done_gate")
-            checks = done_gate.get("checks") if isinstance(done_gate, dict) else None
-            if not isinstance(checks, list):
-                raise GateStateChangedError(
-                    f"evidence commit E layer-6 compact {tracked_rel} lacks the "
-                    "done-gate check set"
-                )
+            _verify_layer6_compact_contract(tracked_rel, compact)
 
 
 def _git_parent(commit: str) -> str:
@@ -2313,7 +2640,8 @@ def _commit_evidence(
     on an intermediate E, never leaves a dirty index/worktree, and never leaves
     a ``passed=true`` report without a committed evidence trail: on any failure
     the working-tree writes are rolled back to their HEAD state, the real index
-    is reset to the tested revision, and the gate exits 2.
+    is re-synced to CURRENT HEAD (never moved back to the old tested revision —
+    C-118), and the gate exits 2.
 
     Tail-safety (C-114): every fallible validation — the final comprehensive
     secret scan (after all report/manifest/compact evidence is written), the
@@ -2509,15 +2837,17 @@ def _commit_evidence(
                 _restore_tracked_file(rel)
             except (GateStateChangedError, OSError) as restore_exc:
                 restore_errors.append(f"{target.name}: {restore_exc}")
-        # Mixed reset to the tested revision (no working-tree writes; the files
-        # above were already restored).  Only ever needed if the pre-CAS
-        # read-tree ran; the temp index means no other real-index write exists.
+        # Restore the REAL index to CURRENT HEAD's tree — never to the tested
+        # revision (C-118).  A concurrent commit that landed after the entry
+        # snapshot is real work and must not be silently moved back to the old
+        # tested SHA; ``read-tree <current HEAD>`` re-syncs the index to
+        # whatever HEAD actually is now without moving the branch at all.
         try:
-            _git(
-                "reset", "-q", report.tested_commit_sha or start.commit_sha, check=True
-            )
+            current_head = _git("rev-parse", "HEAD", check=True).stdout.strip()
+            if current_head:
+                _git("read-tree", current_head, check=True)
         except GateStateChangedError as reset_exc:
-            restore_errors.append(f"index reset: {reset_exc}")
+            restore_errors.append(f"index restore: {reset_exc}")
         if restore_errors:
             raise GateStateChangedError(
                 f"{exc} (evidence rollback also failed: "
@@ -2559,6 +2889,20 @@ def _print_report(report: GateReport, output_path: Path, quiet: bool) -> None:
     print(f"\nverdict: {report.summary}")
     print(f"boundary: {report.boundary}")
     print(f"evidence: {output_path}")
+
+
+def _safe_print_report(report: GateReport, output_path: Path, quiet: bool) -> None:
+    """Best-effort report printing (C-118 Gap 1).
+
+    After the CAS has installed a ``passed=true`` pointer commit, nothing
+    fallible may run that can flip the exit or surface a raw traceback.  A
+    print failure (e.g. ``BrokenPipeError`` on a closed stdout) is swallowed;
+    the authoritative verdict already lives in the committed report.
+    """
+    try:
+        _print_report(report, output_path, quiet)
+    except (BrokenPipeError, OSError):
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2627,8 +2971,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.output is not None:
             _require_outside_or_ignored(args.output, "output path")
             _reject_target_conflict(args.output, "output path", kind="file")
-        # Only now is it safe to create the write targets.
-        staging_dir.mkdir(parents=True, exist_ok=True)
+        # Only now is it safe to create the write targets — exclusively (C-118).
+        # The fail-closed conflict check above guarantees the path does not
+        # exist, so a non-``exist_ok`` mkdir is safe; a concurrent writer that
+        # creates the dir between the check and this mkdir surfaces as
+        # FileExistsError and fails the gate closed rather than reusing a
+        # foreign directory.
+        staging_dir.mkdir(parents=True, mode=0o700)
         # Owner-only from creation: raw evidence never world/group-readable.
         staging_dir.chmod(0o700)
         if args.output is not None:
@@ -2641,19 +2990,46 @@ def main(argv: list[str] | None = None) -> int:
         )
     except (GateStateChangedError, OSError) as exc:
         if args.quiet:
-            print(json.dumps({"passed": False, "summary": str(exc)}, sort_keys=True))
+            print(
+                json.dumps(
+                    {"passed": False, "summary": _redact_output(str(exc))},
+                    sort_keys=True,
+                )
+            )
         else:
             print(f"TripChord product v1.0 Done-Gate  {_now()}")
-            print(f"gate aborted: {exc}", file=sys.stderr)
+            # C-118: never echo the raw error text — it may carry a subprocess
+            # line, a path or a value that reads as sensitive.
+            print(f"gate aborted: {_redact_output(str(exc))}", file=sys.stderr)
         return 2
 
-    _dump(report, output_path)
+    try:
+        _dump(report, output_path)
+    except (GateStateChangedError, OSError) as exc:
+        # A report that cannot be dumped must surface as exit 2, never as a raw
+        # traceback.  No evidence commit has happened yet, so no passed=true
+        # pointer is at risk (C-118 Gap 1).
+        print(f"gate aborted: {_redact_output(str(exc))}", file=sys.stderr)
+        return 2
+    # C-118: every exit path scans the final report AFTER it is written.  The
+    # dump already redacted the payload, so a leak here is a class the
+    # redaction does not cover — fail closed AND remove the report so nothing
+    # sensitive stays on disk.
+    try:
+        _secret_scan_paths([output_path], _evidence_secrets(), "report")
+    except GateStateChangedError as exc:
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"gate aborted: {_redact_output(str(exc))}", file=sys.stderr)
+        return 2
     try:
         # Re-secure the staging tree after layers wrote it: dir 0700, every raw
         # evidence + report file 0600.  A hardening failure fails the gate.
         _harden_staging_permissions(staging_dir)
     except GateStateChangedError as exc:
-        print(f"staging hardening failed: {exc}", file=sys.stderr)
+        print(f"staging hardening failed: {_redact_output(str(exc))}", file=sys.stderr)
         return 2
 
     if args.commit_evidence and not report.passed:
@@ -2662,7 +3038,7 @@ def main(argv: list[str] | None = None) -> int:
         # are left byte-for-byte unchanged — no _commit_evidence, no report
         # write to the tracked results tree.  The staging report already
         # carries the failed verdict, so exit 2 directly.
-        _print_report(report, output_path, args.quiet)
+        _safe_print_report(report, output_path, args.quiet)
         return 2
 
     if args.commit_evidence:
@@ -2685,7 +3061,7 @@ def main(argv: list[str] | None = None) -> int:
             # a committed report must never claim an evidence trail that does
             # not exist, so the phase failure hard-fails the whole gate (exit 2)
             # even when the layers themselves all passed.
-            print(f"evidence commit failed: {exc}", file=sys.stderr)
+            print(f"evidence commit failed: {_redact_output(str(exc))}", file=sys.stderr)
             # Fail closed on disk too: never deliver a report that claims
             # passed=true while the evidence trail is missing.  The process
             # already exits 2; the on-disk JSON must carry the same verdict.
@@ -2696,12 +3072,18 @@ def main(argv: list[str] | None = None) -> int:
                 else "evidence commit failed; gate result voided"
             )
             _dump(report, output_path)
-            _print_report(report, output_path, args.quiet)
+            _safe_print_report(report, output_path, args.quiet)
             return 2
-        # Re-dump so the delivered report carries evidence_commit=E.
-        _dump(report, output_path)
+        # Re-dump so the delivered report carries evidence_commit=E.  After the
+        # CAS the authoritative committed report already carries the verdict, so
+        # this local staging copy is best-effort ONLY: a failure here must never
+        # flip the exit once passed=true is installed (C-118 Gap 1).
+        try:
+            _dump(report, output_path)
+        except (GateStateChangedError, OSError):
+            pass
 
-    _print_report(report, output_path, args.quiet)
+    _safe_print_report(report, output_path, args.quiet)
     return 0 if report.passed else 2
 
 

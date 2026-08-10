@@ -110,9 +110,101 @@ def _populating_passing_layers(
         )
 
 
+def _populating_passing_layers_without(
+    monkeypatch: pytest.MonkeyPatch, staging_dir: Path, *missing_names: str
+) -> None:
+    """Like ``_populating_passing_layers`` but a set of required evidence inputs
+    is removed AFTER the layers write them, modelling a run that never produced
+    those inputs (C-118: evidence-contract counter-examples)."""
+
+    def layer1(
+        *args: object,
+        sd: Path = staging_dir,
+        names: tuple[str, ...] = missing_names,
+    ) -> gate.LayerResult:
+        _populate_required_evidence(sd)
+        for name in names:
+            (sd / name).unlink(missing_ok=True)
+        return gate.LayerResult(name="layer1_reproducibility", passed=True)
+
+    monkeypatch.setattr(gate, "layer1_reproducibility", layer1)
+    for name in (
+        "layer2_replay",
+        "layer3_clean_chrome_fixtures",
+        "layer4_model_smoke",
+        "layer5_real_canary",
+        "layer6_full_e2e",
+    ):
+        monkeypatch.setattr(
+            gate,
+            name,
+            lambda *args, name=name, **kwargs: gate.LayerResult(
+                name=name, passed=True
+            ),
+        )
+
+
+def _realistic_e2e_evidence() -> dict[str, object]:
+    """A full passing layer-6 runner bundle that survives the strong compact
+    contract (C-118): ``run_status`` completed, the 15-item ``done_gate`` all
+    passed, and the repo / runtime / Companion identity plus the
+    event-injection / timeout / runner contracts the committed layer-6 compact
+    must preserve.  Values are synthetic and secret-free."""
+    return {
+        "schema_version": "tripchord-live-v4-done-gate-report",
+        "run_status": "completed",
+        "repo_revision": {
+            "toplevel": "/repo",
+            "branch": "main",
+            "commit_sha": "a" * 40,
+            "worktree_dirty": False,
+        },
+        "runtime_before_run": {
+            "model_provider": "test-provider",
+            "primary_model": "test-model",
+            "model_enabled": True,
+            "model_required": True,
+            "runtime_provenance": {
+                "repo_toplevel": "/repo",
+                "commit_sha": "a" * 40,
+                "dependency_lock_sha256": None,
+                "live_system_source_sha256": None,
+                "python_version": "3.12",
+                "started_at": "2026-08-10T00:00:00+00:00",
+            },
+        },
+        "companion_preflight": {
+            "status": "ok",
+            "companions": [
+                {
+                    "companion_id": "comp-1",
+                    "authorized_scope_keys": [
+                        "ctrip:flight",
+                        "ctrip:lodging",
+                        "qunar:flight",
+                        "qunar:lodging",
+                        "tongcheng:flight",
+                    ],
+                }
+            ],
+        },
+        "done_gate": _matching_done_gate(),
+        "event_injection_contract": {"attempted": 0, "succeeded": 0},
+        "timeout_contract": {"window_seconds": 300},
+        "runner_contract": {"schema_version": "tripchord-live-v4-runner-v1"},
+    }
+
+
 def _populate_required_evidence(staging_dir: Path) -> None:
     """Write the fixed required raw-evidence inputs into staging so main()'s
-    evidence-contract gate passes and the commit phase is actually exercised."""
+    evidence-contract gate passes and the commit phase is actually exercised.
+
+    The layer-5/6 raw files carry REALISTIC passing verdicts (C-118): the
+    desensitized compact artifacts derived from them must survive the strong
+    blob-read-back contract — the six certified scopes each fresh/authorized/
+    read-only/passed for layer 5, and the full fifteen done-gate checks all
+    passed plus the repo/runtime/Companion identity for layer 6.
+    """
     staging_dir.mkdir(exist_ok=True)
     (staging_dir / "product-acceptance.json").write_text(
         '{"passed": true}\n', encoding="utf-8"
@@ -120,18 +212,10 @@ def _populate_required_evidence(staging_dir: Path) -> None:
     (staging_dir / "browser-e2e.json").write_text('{"passed": true}\n', encoding="utf-8")
     (staging_dir / "browser-e2e-screenshot.png").write_bytes(b"PNG")
     (staging_dir / "live-canary-certified.json").write_text(
-        json.dumps(
-            {
-                "passed": True,
-                "bridge_token_present": True,
-                "scopes": [{"scope": "x", "passed": True}],
-                "companion_status": {"companions": []},
-            }
-        ),
-        encoding="utf-8",
+        json.dumps(_matching_canary()), encoding="utf-8"
     )
     (staging_dir / "live-done-gate-v4.json").write_text(
-        '{"run_status": "completed"}\n', encoding="utf-8"
+        json.dumps(_realistic_e2e_evidence()), encoding="utf-8"
     )
 
 
@@ -948,8 +1032,7 @@ def test_main_exits_2_when_evidence_commit_fails(
     failure must never be swallowed and reported as a pass, and the branch must
     stay on the tested revision."""
     _patch_root(monkeypatch, clean_repo)
-    _passing_layers(monkeypatch)
-    _populate_required_evidence(staging_dir)
+    _populating_passing_layers(monkeypatch, staging_dir)
     _inject_git_failure(monkeypatch, "commit-tree", when=1)
 
     head_before = _head(clean_repo)
@@ -969,8 +1052,7 @@ def test_main_exits_2_when_head_moves_before_evidence_commit(
     between the run and the evidence-commit phase, the commit-phase snapshot
     must disagree with the tested commit and the gate must exit 2 (TOCTOU)."""
     _patch_root(monkeypatch, clean_repo)
-    _passing_layers(monkeypatch)
-    _populate_required_evidence(staging_dir)
+    _populating_passing_layers(monkeypatch, staging_dir)
 
     real_dump = gate._dump
     moved = False
@@ -1261,18 +1343,20 @@ def test_main_exits_2_when_staging_is_non_empty_dir(
     assert (stale / "product-acceptance.json").read_text() == '{"passed": true}\n'
 
 
-def test_main_accepts_existing_empty_staging_dir(
+def test_main_rejects_existing_empty_staging_dir(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, tmp_path: Path
 ) -> None:
-    """C-114 R3: an existing-but-empty ``--staging-dir`` is acceptable (the gate
-    still populates it itself); only non-empty reuse is refused."""
+    """C-118: an existing ``--staging-dir`` — even empty — is rejected with
+    exit 2: the staging root must be created exclusively by this run so no
+    pre-planted or stale file can ever be swept into the committed trail."""
     _patch_root(monkeypatch, clean_repo)
     empty = tmp_path / "staging-empty"
     empty.mkdir()
-    _populating_passing_layers(monkeypatch, empty)
+    before = _porcelain(clean_repo)
     rc = gate.main(["--staging-dir", str(empty), "--quiet"])
-    assert rc == 0
-    assert (empty / "product-v1-done-gate.json").is_file()
+    assert rc == 2
+    assert _porcelain(clean_repo) == before
+    assert not (empty / "product-v1-done-gate.json").exists()
 
 
 def test_new_staging_dir_embeds_unique_run_id() -> None:
@@ -2187,10 +2271,7 @@ def test_main_exits_2_when_required_evidence_missing(
     2 at the contract gate and must NOT produce any commit — the missing file
     is never silently omitted from the committed trail."""
     _patch_root(monkeypatch, clean_repo)
-    _passing_layers(monkeypatch)
-    _populate_required_evidence(staging_dir)
-    # Delete the layer-6 raw evidence — the contract-required input.
-    (staging_dir / "live-done-gate-v4.json").unlink()
+    _populating_passing_layers_without(monkeypatch, staging_dir, "live-done-gate-v4.json")
 
     head_before = _head(clean_repo)
     rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
@@ -2206,9 +2287,9 @@ def test_main_exits_2_when_layer5_raw_evidence_missing(
     """Evidence-contract counter-example: missing layer-5 raw evidence
     (live-canary-certified.json) also hard-fails the contract gate exit 2."""
     _patch_root(monkeypatch, clean_repo)
-    _passing_layers(monkeypatch)
-    _populate_required_evidence(staging_dir)
-    (staging_dir / "live-canary-certified.json").unlink()
+    _populating_passing_layers_without(
+        monkeypatch, staging_dir, "live-canary-certified.json"
+    )
 
     head_before = _head(clean_repo)
     rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
@@ -2448,7 +2529,7 @@ def test_verify_evidence_contract_rejects_blank_compact_content(
         "blank compact",
         check=True,
     )
-    with pytest.raises(gate.GateStateChangedError, match="done-gate check set"):
+    with pytest.raises(gate.GateStateChangedError, match="done-gate report"):
         gate._verify_evidence_contract(_head(clean_repo), staging_dir, manifest)
 
 
@@ -2878,16 +2959,15 @@ def test_secret_scan_allows_redacted_evidence(
     gate.run_gate(staging_dir)  # no raise
 
 
-def test_commit_evidence_catches_last_step_report_leak(
+def test_commit_evidence_neutralizes_last_step_report_leak(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """C-114 counter-example: a secret that leaks only into the report written
-    at the very end of the evidence phase must abort the commit before the CAS.
-
-    run_gate's staging scan runs before the report exists, so only the final
-    comprehensive scan (which runs after every report/manifest/compact write and
-    before the atomic ref update) can see the leak — the ordering fix that keeps
-    a passed=true report with a leaked secret from ever being committed."""
+    """C-118 Gap 3 counter-example: a secret that appears only in the report
+    written at the very end of the evidence phase is NEUTRALIZED at dump
+    redaction — the gate never commits, writes or prints the raw bytes, and the
+    committed + delivered reports carry ``[REDACTED]`` instead.  This is
+    strictly stronger than catching a leak after the fact: no exit path can
+    leave the secret on disk or in stdout at all."""
     _patch_root(monkeypatch, clean_repo)
     _populating_passing_layers(monkeypatch, staging_dir)
     token = "F" * 64
@@ -2900,18 +2980,22 @@ def test_commit_evidence_catches_last_step_report_leak(
         ),
     )
 
-    head_before = _head(clean_repo)
     rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
 
-    assert rc == 2
-    assert _head(clean_repo) == head_before
+    assert rc == 0
     assert _porcelain(clean_repo) == ""
-    # The delivered report on disk must carry the voided verdict, never the leak.
-    payload = json.loads(
-        (staging_dir / "product-v1-done-gate.json").read_text(encoding="utf-8")
+    # The committed report carries evidence_commit=E and the redacted detail.
+    tracked_text = (
+        clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
+    ).read_text(encoding="utf-8")
+    assert token not in tracked_text
+    assert "[REDACTED]" in tracked_text
+    # The delivered staging report is equally clean.
+    staging_text = (staging_dir / "product-v1-done-gate.json").read_text(
+        encoding="utf-8"
     )
-    assert payload["passed"] is False
-    assert payload["evidence_commit"] is None
+    assert token not in staging_text
+    assert "[REDACTED]" in staging_text
 
 
 # ---------------------------------------------------------------------------
@@ -3096,36 +3180,478 @@ def test_commit_evidence_no_fallible_op_after_cas(
     assert payload["passed"] is True
 
 
-def test_commit_evidence_rollback_surfaces_reset_failure(
+def test_commit_evidence_rollback_surfaces_readtree_failure(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """C-114 counter-example: a failed rollback is never silently swallowed —
-    the rollback reset must be check=True so a dirty index cannot be left behind
-    while the gate reports only the original failure."""
+    """C-118 counter-example: a failed rollback is never silently swallowed —
+    the rollback index restore (``read-tree`` of current HEAD) must be
+    check=True so a dirty index cannot be left behind while the gate reports
+    only the original failure.  The rollback must NEVER ``git reset`` back to
+    the old tested revision."""
     _patch_root(monkeypatch, clean_repo)
     _populate_required_evidence(staging_dir)
     report, start = _passing_report_and_start(clean_repo)
-    _inject_git_failure(monkeypatch, "update-ref")
 
     real_git = gate._git
-    seen_reset = 0
+    update_ref_failed = [False]
+    seen_rollback_restore = [0]
 
-    def failing_reset(*args: str, **kwargs: object) -> subprocess.CompletedProcess:
-        nonlocal seen_reset
-        if args and args[0] == "reset":
-            seen_reset += 1
+    def failing_git(*args: str, **kwargs: object) -> subprocess.CompletedProcess:
+        if args and args[0] == "update-ref":
+            update_ref_failed[0] = True
             proc = subprocess.CompletedProcess(
-                args, returncode=1, stdout=b"", stderr=b"reset failed"
+                args, returncode=1, stdout=b"", stderr=b"update-ref failed"
             )
             if kwargs.get("check"):
-                raise gate.GateStateChangedError("git reset failed with exit 1")
+                raise gate.GateStateChangedError("git update-ref failed with exit 1")
+            return proc
+        # The rollback index restore is the first no-GIT_INDEX_FILE read-tree
+        # AFTER the CAS failed.  The pre-CAS real-index sync (read-tree of the
+        # pointer tree) runs before update-ref, so it is not the rollback.
+        if (
+            args
+            and args[0] == "read-tree"
+            and not kwargs.get("env_extra")
+            and update_ref_failed[0]
+            and seen_rollback_restore[0] == 0
+        ):
+            seen_rollback_restore[0] += 1
+            proc = subprocess.CompletedProcess(
+                args, returncode=1, stdout=b"", stderr=b"read-tree failed"
+            )
+            if kwargs.get("check"):
+                raise gate.GateStateChangedError("git read-tree failed with exit 1")
             return proc
         return real_git(*args, **kwargs)
 
-    # Chain: _inject_git_failure handles the update-ref, this wrapper handles
-    # the rollback reset.
-    monkeypatch.setattr(gate, "_git", failing_reset)
+    monkeypatch.setattr(gate, "_git", failing_git)
 
     with pytest.raises(gate.GateStateChangedError, match="rollback also failed"):
         gate._commit_evidence(staging_dir, report, start=start)
-    assert seen_reset >= 1
+    assert seen_rollback_restore[0] == 1
+
+
+def test_commit_evidence_rollback_preserves_concurrent_head(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-118 counter-example: when the update-ref CAS fails because a concurrent
+    writer moved HEAD, the rollback restores the index to CURRENT HEAD — it
+    never resets the branch back to the old tested revision, which would
+    silently discard the concurrent commit."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+
+    real_git = gate._git
+    moved = [False]
+
+    def concurrent_cas(*args: str, **kwargs: object) -> subprocess.CompletedProcess:
+        # Move HEAD right before the atomic update-ref so git's own CAS fails:
+        # update-ref's expected-old value (the tested revision) no longer
+        # matches current HEAD.
+        if args and args[0] == "update-ref" and not moved[0]:
+            moved[0] = True
+            subprocess.run(
+                ["git", "-C", str(clean_repo), "commit", "--allow-empty", "-q",
+                 "-m", "concurrent writer moved HEAD"],
+                check=True,
+            )
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(gate, "_git", concurrent_cas)
+
+    with pytest.raises(gate.GateStateChangedError):
+        gate._commit_evidence(staging_dir, report, start=start)
+
+    # The branch must still sit on the concurrent writer's commit — the
+    # rollback re-synced the index to it and never moved HEAD back to S.
+    assert _head(clean_repo) != start.commit_sha
+    assert moved[0] is True
+    assert _porcelain(clean_repo) == ""
+
+
+# ---------------------------------------------------------------------------
+# C-118 eight hard-gap counter-examples (each paired with a real failing
+# reproduction in review C-116 / the supervisor pass)
+# ---------------------------------------------------------------------------
+
+
+def test_main_post_cas_redump_failure_does_not_flip_exit(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-118 Gap 1 counter-example: after the atomic update-ref CAS installs the
+    passed=true pointer commit, the post-CAS report re-dump is best-effort ONLY
+    — a failure there must never flip the process to exit 2 while a passed=true
+    pointer is already committed.
+
+    The old tail dumped the report AFTER the CAS without a guard; a dump failure
+    then exited 2 with a committed passed=true report on the branch (the exact
+    contradiction the review found).  The first three dumps are: the pre-commit
+    staging dump, the E-report dump and the P-report dump inside _commit_evidence.
+    The fourth is the post-CAS re-dump — it is the one that may fail."""
+    _patch_root(monkeypatch, clean_repo)
+    _populating_passing_layers(monkeypatch, staging_dir)
+    head_before = _head(clean_repo)
+
+    real_dump = gate._dump
+    dump_count = [0]
+
+    def flaky_dump(report: gate.GateReport, output_path: Path | None = None) -> Path:
+        dump_count[0] += 1
+        if dump_count[0] == 4:
+            raise OSError("post-CAS re-dump failed")
+        return real_dump(report, output_path)
+
+    monkeypatch.setattr(gate, "_dump", flaky_dump)
+
+    rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
+
+    assert rc == 0  # the CAS already happened; the re-dump is best-effort
+    assert dump_count[0] == 4
+    assert _porcelain(clean_repo) == ""
+    # The committed pointer report carries passed=true and evidence_commit=E.
+    tracked = json.loads(
+        (clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert tracked["passed"] is True
+    assert tracked["evidence_commit"]
+    assert _head(clean_repo) != head_before
+
+
+def test_layer5_fails_when_canary_exits_nonzero_despite_green_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-118 Gap 2 counter-example: a canary process that exits non-zero while
+    leaving an all-green certified JSON must fail the layer — the process exit
+    code is part of the canary contract and a forged JSON cannot paper over it."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, ""))
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(_matching_canary()), encoding="utf-8"
+    )
+    result = gate.layer5_real_canary(staging_dir)
+    assert result.passed is False
+    assert any("exit" in (check.get("detail") or "") for check in result.sub_checks)
+
+
+def test_layer5_rejects_extra_scopes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-118 Gap 2 counter-example: a canary that adds a non-certified extra
+    scope must fail the layer — coverage is the exact six certified scopes, and
+    an ad-hoc scope inflates it."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (0, ""))
+    canary = _matching_canary()
+    canary["scopes"].append(  # type: ignore[union-attr]
+        {
+            "scope": "ctrip:car",
+            "kind": "companion_heartbeat",
+            "passed": True,
+            "fresh": True,
+            "authorized": True,
+            "read_only": True,
+        }
+    )
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(canary), encoding="utf-8"
+    )
+    result = gate.layer5_real_canary(staging_dir)
+    assert result.passed is False
+    assert any("extra" in (check.get("detail") or "") for check in result.sub_checks)
+
+
+def test_main_failed_gate_report_is_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_repo: Path,
+    staging_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """C-118 Gap 3 counter-example: a failed gate whose layer detail carries a
+    secret must never write or print the raw bytes — the on-disk report and the
+    printed output both carry ``[REDACTED]`` instead.
+
+    Redaction runs at dump (in-place on the report) so every later consumer —
+    the secret scan, the failed-gate print, the on-disk JSON — only ever sees
+    neutralized bytes."""
+    _patch_root(monkeypatch, clean_repo)
+    _populating_passing_layers(monkeypatch, staging_dir)
+    token = "F" * 64
+    monkeypatch.setattr(gate, "_bridge_token", lambda: token)
+    monkeypatch.setattr(
+        gate,
+        "layer6_full_e2e",
+        lambda *args, **kwargs: gate.LayerResult(
+            name="6_full_e2e", passed=False, detail=f"secret={token}"
+        ),
+    )
+
+    rc = gate.main(["--staging-dir", str(staging_dir)])
+
+    assert rc == 2
+    report_text = (staging_dir / "product-v1-done-gate.json").read_text(
+        encoding="utf-8"
+    )
+    assert token not in report_text
+    assert "[REDACTED]" in report_text
+    captured = capsys.readouterr()
+    assert token not in captured.out and token not in captured.err
+    assert "[REDACTED]" in captured.out
+
+
+def test_bridge_state_lease_preflight_detects_queued_work(tmp_path: Path) -> None:
+    """C-118 Gap 4 counter-example: the bridge keeps queued/claimed task and
+    pending reorder state outside the planning ``jobs`` table, so the layer-6
+    residual-lease preflight must read the persisted bridge-state JSON — not
+    only ``tripchord.db``."""
+    state_path = tmp_path / "bridge-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "tasks": [
+                    {"id": "task-1", "state": "queued"},
+                    {"id": "task-2", "state": "claimed"},
+                ],
+                "reload_requests": [{"id": "r-1", "state": "dispatched"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    residual = gate._bridge_state_lease_preflight(state_path)
+    assert len(residual) == 3
+    assert any("task-1" in item and "queued" in item for item in residual)
+    assert any("task-2" in item and "claimed" in item for item in residual)
+    assert any("r-1" in item and "dispatched" in item for item in residual)
+
+
+def test_bridge_state_lease_preflight_accepts_terminal_states(tmp_path: Path) -> None:
+    """C-118 Gap 4 positive: terminal task and reload states are not residual —
+    a bridge with only succeeded/blocked/failed/cancelled tasks and applied/
+    failed/expired reorders is isolated."""
+    state_path = tmp_path / "bridge-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "tasks": [
+                    {"id": "t1", "state": "succeeded"},
+                    {"id": "t2", "state": "blocked"},
+                    {"id": "t3", "state": "failed"},
+                    {"id": "t4", "state": "cancelled"},
+                ],
+                "reload_requests": [
+                    {"id": "r1", "state": "applied"},
+                    {"id": "r2", "state": "failed"},
+                    {"id": "r3", "state": "expired"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert gate._bridge_state_lease_preflight(state_path) == []
+
+
+def test_bridge_state_lease_preflight_fails_closed_on_missing_file(
+    tmp_path: Path,
+) -> None:
+    """C-118 Gap 4 counter-example: a configured-but-missing bridge-state file
+    cannot prove lease isolation and must fail closed."""
+    missing = tmp_path / "does-not-exist.json"
+    residual = gate._bridge_state_lease_preflight(missing)
+    assert residual
+    assert "missing" in residual[0]
+
+
+def test_resolve_bridge_state_path_honors_explicit_and_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-118 Gap 4 wiring: an explicit override wins; otherwise the
+    ``TRIPCHORD_BROWSER_BRIDGE_STATE_PATH`` env var decides; unset means no
+    persisted bridge state to contend with."""
+    explicit = tmp_path / "explicit.json"
+    assert gate._resolve_bridge_state_path(explicit) == explicit
+    monkeypatch.setenv(gate._BRIDGE_STATE_ENV, str(tmp_path / "env.json"))
+    assert gate._resolve_bridge_state_path() == tmp_path / "env.json"
+    monkeypatch.delenv(gate._BRIDGE_STATE_ENV)
+    assert gate._resolve_bridge_state_path() is None
+
+
+def test_layer6_fails_when_bridge_state_holds_residual_work(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_repo: Path,
+    tmp_path: Path,
+    staging_dir: Path,
+) -> None:
+    """C-118 Gap 4 integration: layer 6 refuses a fresh E2E when the persisted
+    bridge-state JSON holds queued/claimed work even with a clean planning DB."""
+    staging_dir.mkdir()
+    db_path = tmp_path / "live.db"
+    _make_jobs_db(db_path, [])
+    state_path = tmp_path / "bridge-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "tasks": [{"id": "task-x", "state": "queued"}],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(gate._BRIDGE_STATE_ENV, str(state_path))
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setenv("TRIPCHORD_ACK_MODEL_COST", "1")
+    start = _expected_snapshot(clean_repo)
+    result = gate.layer6_full_e2e(staging_dir, start, live_state_db=db_path)
+    assert result.passed is False
+    assert "bridge" in result.detail
+
+
+def test_main_rejects_staging_symlink(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, tmp_path: Path
+) -> None:
+    """C-118 Gap 6 counter-example: a ``--staging-dir`` that is a symlink is
+    rejected with exit 2 before any evidence is created — the lstat-based
+    conflict check never follows a planted symlink to attacker-chosen bytes."""
+    _patch_root(monkeypatch, clean_repo)
+    target = tmp_path / "real-staging"
+    target.mkdir()
+    symlink = tmp_path / "staging-link"
+    symlink.symlink_to(target, target_is_directory=True)
+    before = _porcelain(clean_repo)
+    rc = gate.main(["--staging-dir", str(symlink), "--quiet"])
+    assert rc == 2
+    assert _porcelain(clean_repo) == before
+    assert not (symlink / "product-v1-done-gate.json").exists()
+
+
+def _layer5_compact_fixture() -> dict[str, object]:
+    """A layer-5 compact that satisfies the strong C-118 blob contract: the six
+    certified scopes, exact coverage thresholds, all passed/fresh/authorized/
+    read-only."""
+    canary = _matching_canary()
+    return {
+        "schema_version": "tripchord-done-gate-layer5-compact-v2",
+        "coverage": {
+            "expected_scope_count": 6,
+            "expected_scopes": sorted(gate._CERTIFIED_OTA_SCOPES),
+            "observed_scope_count": 6,
+            "passed_scope_count": 6,
+            "missing": [],
+        },
+        "scopes": canary["scopes"],
+    }
+
+
+def test_verify_layer5_compact_contract_accepts_full_set() -> None:
+    """C-118 Gap 7 positive: the complete six-scope layer-5 compact passes the
+    blob read-back contract."""
+    gate._verify_layer5_compact_contract(
+        "done-gate-layer5-compact.json", _layer5_compact_fixture()
+    )
+
+
+def test_verify_layer5_compact_contract_rejects_incomplete_scope_set() -> None:
+    """C-118 Gap 7 counter-example: a compact missing a certified scope (coverage
+    reports it missing, the scope list is short) must fail the phase closed."""
+    compact = _layer5_compact_fixture()
+    compact["coverage"] = {  # type: ignore[assignment]
+        "expected_scope_count": 6,
+        "expected_scopes": sorted(gate._CERTIFIED_OTA_SCOPES),
+        "observed_scope_count": 5,
+        "passed_scope_count": 5,
+        "missing": ["ctrip:lodging"],
+    }
+    compact["scopes"] = compact["scopes"][:-1]  # type: ignore[assignment]
+    with pytest.raises(
+        gate.GateStateChangedError, match="observed_scope_count != 6"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_non_certified_scope() -> None:
+    """C-118 Gap 7 counter-example: a compact whose scope set is not exactly the
+    six certified scopes (an ad-hoc scope swaps in for a certified one) fails."""
+    compact = _layer5_compact_fixture()
+    scopes = compact["scopes"]  # type: ignore[assignment]
+    scopes[0] = {  # type: ignore[index]
+        "scope": "ctrip:car",
+        "kind": "companion_heartbeat",
+        "passed": True,
+        "fresh": True,
+        "authorized": True,
+        "read_only": True,
+    }
+    with pytest.raises(gate.GateStateChangedError, match="six certified scopes"):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def _layer6_compact_fixture() -> dict[str, object]:
+    """A layer-6 compact that satisfies the strong C-118 blob contract: the
+    fifteen done-gate checks all passed plus the repo / runtime / Companion
+    identity and the event-injection / timeout / runner contracts."""
+    done_gate = _matching_done_gate()
+    done_gate["check_count"] = 15  # type: ignore[index]
+    done_gate["passed_check_count"] = 15  # type: ignore[index]
+    return {
+        "schema_version": "tripchord-done-gate-layer6-compact-v2",
+        "done_gate": done_gate,
+        "repo_revision": {
+            "toplevel": "/repo",
+            "branch": "main",
+            "commit_sha": "a" * 40,
+            "worktree_dirty": False,
+        },
+        "runtime_before_run": {
+            "runtime_provenance": {
+                "repo_toplevel": "/repo",
+                "commit_sha": "a" * 40,
+            }
+        },
+        "companion_preflight": {"status": "ok", "companions": []},
+        "event_injection_contract": {"attempted": 0, "succeeded": 0},
+        "timeout_contract": {"window_seconds": 300},
+        "runner_contract": {"schema_version": "tripchord-live-v4-runner-v1"},
+    }
+
+
+def test_verify_layer6_compact_contract_accepts_full_passing_set() -> None:
+    """C-118 Gap 7 positive: the full fifteen-check layer-6 compact passes the
+    blob read-back contract."""
+    gate._verify_layer6_compact_contract(
+        "done-gate-layer6-compact.json", _layer6_compact_fixture()
+    )
+
+
+def test_verify_layer6_compact_contract_rejects_non_passing_check() -> None:
+    """C-118 Gap 7 counter-example: a compact with one non-passed done-gate
+    check must fail the phase closed."""
+    compact = _layer6_compact_fixture()
+    compact["done_gate"]["checks"][0]["passed"] = False  # type: ignore[index]
+    with pytest.raises(gate.GateStateChangedError, match="not passed"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json", compact
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_missing_identity() -> None:
+    """C-118 Gap 7 counter-example: a compact that drops the repo/runtime/
+    Companion identity or a binding contract fails closed even when the checks
+    all pass."""
+    compact = _layer6_compact_fixture()
+    del compact["runner_contract"]
+    with pytest.raises(gate.GateStateChangedError, match="runner_contract"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json", compact
+        )
