@@ -1170,6 +1170,18 @@ def _validate_terminal_pair_checkpoints(
                 "state": checkpoint.state.value,
                 "query_task_ids": list(execution_task_ids),
                 "query_task_ids_sha256": _canonical_sha256(list(execution_task_ids)),
+                # C-122 round-19 (gap 4): the FULL business-summary fields, so
+                # the layer-6 validator can independently recompute
+                # ``run_summary_sha256`` from the binding's carried fields via
+                # the checkpoint model's authoritative ``_run_summary`` digest —
+                # a doctored summary can never pass with a copied digest.
+                "run_purpose": checkpoint.run_purpose,
+                "finalization_state": checkpoint.finalization_state,
+                "decision_state": checkpoint.decision_state,
+                "source_task_count": checkpoint.source_task_count,
+                "exploration_seal_passed": checkpoint.exploration_seal_passed,
+                "all_platforms_complete": checkpoint.all_platforms_complete,
+                "failure_class": checkpoint.failure_class,
                 "run_summary_sha256": checkpoint.run_summary_sha256,
                 "captured_at": checkpoint.captured_at.isoformat(),
                 "checkpoint_sha256": checkpoint.checkpoint_sha256,

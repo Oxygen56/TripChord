@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import subprocess
@@ -217,6 +218,15 @@ def _realistic_e2e_evidence() -> dict[str, object]:
         },
         "done_gate": _matching_done_gate(),
         "api_payload_candidate_set_sha256": "a" * 64,
+        # C-122 round-19 (gap 4): the raw request identity the compact builder
+        # lifts into the layer-6 compact — the checkpoint binding's request SHA
+        # is bound to this api_payload_sha256, so a foreign request-payload
+        # binding fails closed.
+        "request_identity": {
+            "scenario_sha256": "a" * 64,
+            "api_payload_sha256": _FIXTURE_REQUEST_SHA256,
+            "digests_are_distinct_contracts": True,
+        },
         "scenario_sha256": "a" * 64,
         "event_injection_contract": {
             "mode": "synthetic_sold_out_fault_injection",
@@ -290,6 +300,41 @@ def _populate_required_evidence(staging_dir: Path) -> None:
     (staging_dir / "live-done-gate-v4.json").write_text(
         json.dumps(raw_e2e), encoding="utf-8"
     )
+
+
+def _populate_full_required_evidence(
+    monkeypatch: pytest.MonkeyPatch, staging_dir: Path
+) -> None:
+    """Full canonical staging for a passing publish (C-122 round-19 02:56
+    supervision / gap 3): every fixed evidence input — the raw layer-5/6
+    evidence, the acceptance / e2e artifacts and the screenshot — plus the
+    derived layer-5/6 compact artifacts.
+
+    The manifest contract is the FIXED full evidence set and the publish
+    preflight no longer derives the expected names from whatever staging
+    happens to hold, so any commit-phase test must stage the complete set
+    (including the compacts) or the publish fails closed.  A persisted
+    bridge-state file is simulated so the layer-6 compact's bridge-state lease
+    bindings carry a valid sha256 (C-122 Fix 2); the module-level bridge
+    snapshots are cleared so the compact derives from THIS test's file bytes.
+    """
+    bridge_state_path = staging_dir.parent / "bridge-state.json"
+    bridge_state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": [],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(gate._BRIDGE_STATE_ENV, str(bridge_state_path))
+    gate._BRIDGE_STATE_SNAPSHOT = None
+    gate._BRIDGE_STATE_SNAPSHOT_AFTER = None
+    _populate_required_evidence(staging_dir)
+    gate._generate_compact_evidence(staging_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -543,16 +588,37 @@ def _fixture_checkpoint_binding() -> dict[str, object]:
     model's authoritative recomputable ``checkpoint_sha256`` over its OWN carried
     fields, an ordered digest chain with a recomputable chain digest, and ONE
     request identity shared by every binding (C-122 supervision 18:13 Fix 4).
-    The validator recomputes every digest from these carried fields, so the
-    fixture must be genuinely self-consistent — a copied / doctored digest fails
-    the same-raw counter-example."""
+    C-122 round-19 (gap 4): each binding is a ``completed`` checkpoint whose
+    per-group query-task set is EXACTLY the canonical frozen graph's browser
+    Source-id set, and whose ``run_summary_sha256`` recomputes from the carried
+    business-summary fields via the checkpoint model's authoritative ``_run_summary``
+    digest.  The validator recomputes every digest from these carried fields, so
+    the fixture must be genuinely self-consistent — a copied / doctored digest
+    fails the same-raw counter-example."""
     from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
 
     bindings: list[dict[str, object]] = []
     for index, pair_id in enumerate(_FIXTURE_PAIR_IDS):
         departure_s, return_s = _FIXTURE_PAIR_DATES[index]
-        query_task_ids = [f"source-ctrip-flight-{index}"]
+        query_task_ids = sorted(gate._V4_FROZEN_BROWSER_SOURCE_IDS)
         captured_at = "2026-08-10T00:00:00+00:00"
+        # C-122 round-19 (gap 4): the full business-summary fields for a
+        # COMPLETED checkpoint — run_purpose / finalization / decision typed, a
+        # source-task count equal to the frozen per-pair query count, both
+        # completion flags true, and NO failure class.
+        run_summary_fields = {
+            "state": "completed",
+            "run_purpose": "exploration_and_publication",
+            "finalization_state": "finalized",
+            "decision_state": "recommended",
+            "source_task_count": len(query_task_ids),
+            "exploration_seal_passed": True,
+            "all_platforms_complete": True,
+            "failure_class": None,
+        }
+        run_summary_sha256 = LivePlanningPairCheckpoint._digest(
+            LivePlanningPairCheckpoint._run_summary(run_summary_fields)
+        )
         summary = LivePlanningPairCheckpoint._checkpoint_summary(
             {
                 "schema_version": "live-pair-checkpoint-v1",
@@ -563,7 +629,7 @@ def _fixture_checkpoint_binding() -> dict[str, object]:
                 "return_date": return_s,
                 "state": "completed",
                 "query_task_ids": query_task_ids,
-                "run_summary_sha256": "e" * 64,
+                "run_summary_sha256": run_summary_sha256,
                 "captured_at": captured_at,
             }
         )
@@ -577,7 +643,14 @@ def _fixture_checkpoint_binding() -> dict[str, object]:
                 "state": "completed",
                 "query_task_ids": query_task_ids,
                 "query_task_ids_sha256": gate._canonical_sha256(query_task_ids),
-                "run_summary_sha256": "e" * 64,
+                "run_purpose": run_summary_fields["run_purpose"],
+                "finalization_state": run_summary_fields["finalization_state"],
+                "decision_state": run_summary_fields["decision_state"],
+                "source_task_count": run_summary_fields["source_task_count"],
+                "exploration_seal_passed": run_summary_fields["exploration_seal_passed"],
+                "all_platforms_complete": run_summary_fields["all_platforms_complete"],
+                "failure_class": run_summary_fields["failure_class"],
+                "run_summary_sha256": run_summary_sha256,
                 "captured_at": captured_at,
                 "checkpoint_sha256": checkpoint_sha256,
                 "request_sha256": _FIXTURE_REQUEST_SHA256,
@@ -1497,7 +1570,10 @@ def test_layer5_redacts_short_and_structured_secret_shapes(
     )
     diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
     akia_key = "AKIAIOSFODNN7EXAMPLE"
-    dotted = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LXVzZXIifQ.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+    dotted = (
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LXVzZXIifQ."
+        "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+    )
     short_secret = "token=xJ3kQm9pR2sW"
     diagnostic["summary"] = (
         f"upstream refused aws_key={akia_key} jwt={dotted} {short_secret} "
@@ -1517,6 +1593,319 @@ def test_layer5_redacts_short_and_structured_secret_shapes(
     assert dotted not in detail
     assert "xJ3kQm9pR2sW" not in detail
     assert "<redacted>" in detail
+
+
+def test_layer5_redacts_shortest_and_prefixed_secret_shapes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 supervision 02:56 (Block 2) counter-example: the consumer's
+    sanitizer must ALSO collapse the shapes the 32+ run / 6-char KV floor /
+    6-char dotted floor miss — a 3-char ``token=abc`` assignment, a GitHub
+    ``ghp_`` prefixed token, a short Bearer form and a dotted token whose last
+    segment is only 3 chars.  None may reach the committed layer-5 detail."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    diag_path = _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    ghp_token = "ghp_abcdef1234567890"
+    short_bearer = "Bearer abcd1234"
+    short_jwt = "eyJh.eyJzd.abc"
+    short_kv = "token=abc"
+    diagnostic["summary"] = (
+        f"upstream refused {ghp_token} {short_bearer} {short_jwt} {short_kv} "
+        "for booking 9988776655"
+    )
+    diag_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    diag_checks = [
+        c for c in result.sub_checks if c.get("name") == "canary_failure_diagnostic"
+    ]
+    assert diag_checks, "a valid (this-run, fresh) diagnostic still keeps its classification"
+    detail = diag_checks[0]["detail"]
+    assert ghp_token not in detail
+    assert "abcd1234" not in detail
+    assert short_jwt not in detail
+    assert short_kv not in detail
+    assert "<redacted>" in detail
+
+
+def test_canary_producer_seal_desensitizes_short_credential_shapes(
+    tmp_path: Path,
+) -> None:
+    """C-122 supervision 02:56 (Block 2) counter-example: the PRODUCER's own
+    ``_seal_failure_diagnostic`` must sanitize short / structured credential
+    shapes in the artifact it writes to disk — an AKIA key, a GitHub ``ghp_``
+    token, a short ``token=abc``, a short dotted JWT, a short Bearer form and a
+    credential-bearing URL must NEVER appear raw in the sealed ``<output>
+    .failure.json`` ``summary`` field (previously only 32+ runs were masked)."""
+    from benchmarks import live_canary_certified as canary
+
+    output = tmp_path / "live-canary-certified.json"
+    akia_key = "AKIAIOSFODNN7EXAMPLE"
+    ghp_token = "ghp_abcdef1234567890"
+    short_bearer = "Bearer abcd1234"
+    short_jwt = "eyJh.eyJzd.abc"
+    short_kv = "token=abc"
+    url = "https://evil.example/oauth2/callback?code=shortsecret123"
+    message = (
+        f"upstream 401 aws_key={akia_key} gh={ghp_token} {short_bearer} "
+        f"jwt={short_jwt} {short_kv} {url}"
+    )
+    diag_path = canary._seal_failure_diagnostic(
+        "evaluate",
+        RuntimeError(message),
+        output,
+        run_id="abc123def456",
+        tested_sha="a" * 40,
+    )
+    assert diag_path.is_file()
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    summary = diagnostic["summary"]
+    assert akia_key not in summary
+    assert "abcdef1234567890" not in summary
+    assert "abcd1234" not in summary
+    assert short_jwt not in summary
+    assert short_kv not in summary
+    assert "evil.example" not in summary
+    assert "<redacted>" in summary
+
+
+def test_canary_producer_desensitize_catches_short_credential_shapes() -> None:
+    """C-122 supervision 02:56 (Block 2): the producer's ``_desensitize`` — the
+    sanitizer the canary's stderr crash paths and iCom replay error paths use —
+    collapses every short / structured credential shape, so a failure message
+    can never echo them on stderr either."""
+    from benchmarks import live_canary_certified as canary
+
+    for raw, forbidden in (
+        ("aws_key=AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+        ("token ghp_abcdef1234567890", "ghp_abcdef1234567890"),
+        ("credential github_pat_abcDEF123456_XY", "github_pat_abcDEF123456_XY"),
+        ("auth Bearer abcd1234", "abcd1234"),
+        ("jwt=eyJh.eyJzd.abc", "eyJh.eyJzd.abc"),
+        ("password=abc", "password=abc"),
+        ("https://evil.example/cb?token=shortsecret123", "evil.example"),
+    ):
+        out = canary._desensitize(raw)
+        assert forbidden not in out, f"{forbidden!r} leaked in {out!r}"
+        assert "<redacted>" in out or "<url>" in out
+
+
+def test_canary_producer_desensitize_catches_whole_header_forms() -> None:
+    """C-122 supervision 03:46 (Block 1) + 04:14 counter-example (stderr layer):
+    the producer's ``_desensitize`` must mask whole header FIELDS name-and-value
+    together — a ``Basic`` base64 body (the opaque-KV pattern stops at the space
+    after ``Basic`` and would leave the base64 visible), a ``;``-joined cookie
+    pair, an ``X-API-Key`` and ``Set-Cookie`` / ``Proxy-Authorization`` values
+    must never survive on stderr with the credential body intact.  04:14: any
+    non-empty value is masked whole — no ``{4,}`` character floor
+    (``Cookie:a=b`` / ``X-API-Key:abc``) and a leading quote does not preserve
+    the body (``Authorization: "Basic YWJjZA=="`` / ``Set-Cookie: "sid=abc;
+    HttpOnly"`` / ``X-API-Key: "abc123"``)."""
+    from benchmarks import live_canary_certified as canary
+
+    for raw, forbidden in (
+        (
+            "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+            "dXNlcjpwYXNzd29yZA==",
+        ),
+        (
+            "Cookie: sessionid=abc123; csrftoken=xyz789",
+            "sessionid=abc123",
+        ),
+        (
+            "X-API-Key: sk-live-abc123def456",
+            "sk-live-abc123def456",
+        ),
+        (
+            "Set-Cookie: session=def456; HttpOnly",
+            "session=def456",
+        ),
+        (
+            "Proxy-Authorization: Bearer abcd1234wxyz",
+            "abcd1234wxyz",
+        ),
+        # C-122 supervision 04:14: short (3-char) values and quoted bodies.
+        (
+            "Cookie:a=b",
+            "a=b",
+        ),
+        (
+            "X-API-Key:abc",
+            "abc",
+        ),
+        (
+            'Authorization: "Basic YWJjZA=="',
+            "YWJjZA==",
+        ),
+        (
+            'Set-Cookie: "sid=abc; HttpOnly"',
+            "sid=abc",
+        ),
+        (
+            'X-API-Key: "abc123"',
+            "abc123",
+        ),
+    ):
+        out = canary._desensitize(raw)
+        assert forbidden not in out, f"{forbidden!r} leaked in {out!r}"
+        assert "<redacted>" in out
+
+
+def test_canary_producer_seal_desensitizes_whole_header_forms(
+    tmp_path: Path,
+) -> None:
+    """C-122 supervision 03:46 (Block 1) + 04:14 counter-example (raw failure
+    JSON layer): the PRODUCER's own ``_seal_failure_diagnostic`` must mask whole
+    Authorization / Cookie / X-API-Key header fields name-and-value together in
+    the ``<output>.failure.json`` ``summary`` — a ``Basic`` base64 credential
+    body, a cookie pair and an API-key header must NEVER appear raw in the
+    committed diagnostic, including the 04:14 short (3-char) and quoted forms
+    (``Cookie:a=b`` / ``X-API-Key:abc`` / ``Authorization: "Basic YWJjZA=="`` /
+    ``Set-Cookie: "sid=abc; HttpOnly"`` / ``X-API-Key: "abc123"``)."""
+    from benchmarks import live_canary_certified as canary
+
+    output = tmp_path / "live-canary-certified.json"
+    basic_body = "dXNlcjpwYXNzd29yZA=="
+    cookie_body = "sessionid=abc123; csrftoken=xyz789"
+    api_key = "sk-live-abc123def456"
+    message = (
+        f"upstream 401 Authorization: Basic {basic_body} "
+        f"Cookie: {cookie_body} X-API-Key: {api_key} "
+        'Cookie:a=b X-API-Key:abc Authorization: "Basic YWJjZA==" '
+        'Set-Cookie: "sid=abc; HttpOnly" X-API-Key: "abc123"'
+    )
+    diag_path = canary._seal_failure_diagnostic(
+        "evaluate",
+        RuntimeError(message),
+        output,
+        run_id="abc123def456",
+        tested_sha="a" * 40,
+    )
+    assert diag_path.is_file()
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    summary = diagnostic["summary"]
+    assert basic_body not in summary
+    assert cookie_body not in summary
+    assert api_key not in summary
+    assert "YWJjZA==" not in summary
+    assert "a=b" not in summary
+    assert "abc123" not in summary
+    assert "<redacted>" in summary
+
+
+def test_layer5_redacts_whole_header_forms_from_final_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 supervision 03:46 (Block 1) + 04:14 counter-example (final report
+    layer): the CONSUMER's sanitizer must mask whole Authorization / Cookie /
+    X-API-Key header fields name-and-value together before the layer-5 detail
+    lands in the committed report — a ``Basic`` base64 body and a ``;``-joined
+    cookie pair must never reach the committed layer-5 detail as-is, and the
+    04:14 short (3-char) / quoted forms (``Cookie:a=b`` / ``X-API-Key:abc`` /
+    ``Authorization: "Basic YWJjZA=="`` / ``Set-Cookie: "sid=abc; HttpOnly"`` /
+    ``X-API-Key: "abc123"``) must not either."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "x9y8z7w6v5u4"
+    tested_sha = "a" * 40
+    diag_path = _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    basic_body = "dXNlcjpwYXNzd29yZA=="
+    cookie_body = "sessionid=abc123; csrftoken=xyz789"
+    api_key = "sk-live-abc123def456"
+    diagnostic["summary"] = (
+        f"upstream refused Authorization: Basic {basic_body} "
+        f"Cookie: {cookie_body} X-API-Key: {api_key} "
+        'Cookie:a=b X-API-Key:abc Authorization: "Basic YWJjZA==" '
+        'Set-Cookie: "sid=abc; HttpOnly" X-API-Key: "abc123"'
+    )
+    diag_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    diag_checks = [
+        c for c in result.sub_checks if c.get("name") == "canary_failure_diagnostic"
+    ]
+    assert diag_checks, "a valid (this-run, fresh) diagnostic still keeps its classification"
+    detail = diag_checks[0]["detail"]
+    assert basic_body not in detail
+    assert cookie_body not in detail
+    assert api_key not in detail
+    assert "YWJjZA==" not in detail
+    assert "a=b" not in detail
+    assert "abc123" not in detail
+    assert "REDACTED" in detail
+
+
+def test_secret_scan_rejects_whole_header_forms_in_failure_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """C-122 supervision 03:46 (Block 1) + 04:14 defense-in-depth: even if a
+    producer bypass were to write a whole Authorization / Cookie / X-API-Key
+    header into a free-form diagnostic, the staging secret scan must fail the
+    gate closed before the file is certified — including the 04:14 short
+    (3-char) / quoted forms (``Cookie:a=b`` / ``X-API-Key:abc`` /
+    ``Authorization: "Basic YWJjZA=="`` / ``Set-Cookie: "sid=abc; HttpOnly"`` /
+    ``X-API-Key: "abc123"``)."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    diag = staging_dir / "live-canary-certified.json.failure.json"
+    diag.write_text(
+        json.dumps(
+            {
+                "schema_version": "x",
+                "summary": (
+                    "Authorization: Basic dXNlcjpwYXNzd29yZA== "
+                    "X-API-Key: sk-live-abc123def456 "
+                    'Cookie:a=b X-API-Key:abc '
+                    'Authorization: "Basic YWJjZA==" '
+                    'Set-Cookie: "sid=abc; HttpOnly" X-API-Key: "abc123"'
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.GateStateChangedError, match="secret leak"):
+        gate._secret_scan_staging(staging_dir, gate._SecretNeedles(()))
+
+
+def test_secret_scan_rejects_short_credential_shapes_in_failure_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """C-122 supervision 02:56 (Block 2): defense-in-depth — even if a producer
+    bypass were to write a short credential into a free-form diagnostic, the
+    staging secret scan must fail the gate closed before the file is certified."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    diag = staging_dir / "live-canary-certified.json.failure.json"
+    diag.write_text(
+        json.dumps(
+            {
+                "schema_version": "x",
+                "summary": "token=abc ghp_abcdef1234567890 AKIAIOSFODNN7EXAMPLE",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.GateStateChangedError, match="secret leak"):
+        gate._secret_scan_staging(staging_dir, gate._SecretNeedles(()))
 
 
 def test_layer5_rejects_canary_diagnostic_with_unknown_top_level_field(
@@ -1750,16 +2139,7 @@ def test_commit_evidence_two_phase(
     gate ref ``refs/tripchord/done-gate/<run_id>`` appears, atomically, at the
     very end.  E/P are never installed as the branch tip."""
     _patch_root(monkeypatch, clean_repo)
-    staging_dir.mkdir()
-    (staging_dir / "product-acceptance.json").write_text('{"passed": true}\n', encoding="utf-8")
-    (staging_dir / "browser-e2e.json").write_text('{"passed": true}\n', encoding="utf-8")
-    (staging_dir / "browser-e2e-screenshot.png").write_bytes(b"PNG")
-    (staging_dir / "live-canary-certified.json").write_text(
-        '{"scopes": []}\n', encoding="utf-8"
-    )
-    (staging_dir / "live-done-gate-v4.json").write_text(
-        '{"run_status": "completed"}\n', encoding="utf-8"
-    )
+    _populate_full_required_evidence(monkeypatch, staging_dir)
 
     tested_sha = _head(clean_repo)
     report = gate.GateReport(
@@ -2583,6 +2963,88 @@ def test_verify_gate_ref_rejects_committed_file_flipped_to_raw(
         "committed" in problem and "flipped" in problem
         for problem in verdict["problems"]
     )
+
+
+def _pointer_commit_preflight_report(
+    clean_repo: Path, tested_sha: str
+) -> gate.GateReport:
+    """A report that binds the same tested revision / run id a forged P2's
+    committed report carries, so ``_verify_pointer_committed_blobs`` reaches the
+    manifest-contract checks instead of failing on a binding mismatch."""
+    return gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha=tested_sha,
+        run_id=_TEST_RUN_ID,
+        toplevel=str(clean_repo),
+        branch="main",
+        worktree_dirty=False,
+        layers=gate._passing_layers(),
+        passed=True,
+        summary="all applicable Done-Gate layers passed",
+        boundary="",
+    )
+
+
+def test_verify_pointer_committed_blobs_rejects_relocated_manifest_path(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, tmp_path: Path
+) -> None:
+    """C-122 supervision 03:46 (Block 2) counter-example: the P publish preflight
+    (``_verify_pointer_committed_blobs``) must enforce the SAME canonical
+    manifest contract the resolver enforces — a forged P2 whose manifest relocates
+    a compact's ``tracked_path`` off the canonical contract must be rejected at
+    the preflight, not certified and only later caught by ``verify_gate_ref``."""
+    e2, p2 = _forge_repointed_chain(
+        monkeypatch,
+        clean_repo,
+        staging_dir,
+        tmp_path,
+        mutate_e_manifest=_gap3_manifest_relocate_entry,
+    )
+    report = _pointer_commit_preflight_report(clean_repo, _head(clean_repo))
+    with pytest.raises(
+        gate.GateStateChangedError, match=r"tracked_path .* \(relocated\)"
+    ):
+        gate._verify_pointer_committed_blobs(
+            p2,
+            report,
+            e2,
+            gate._evidence_index_entries(
+                staging_dir,
+                report_stage=staging_dir / gate._REPORT_STAGED_NAME,
+                manifest_stage=staging_dir / gate._MANIFEST_STAGED_NAME,
+            ),
+            staging_dir,
+        )
+
+
+def test_verify_pointer_committed_blobs_rejects_committed_flag_flipped(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, tmp_path: Path
+) -> None:
+    """C-122 supervision 03:46 (Block 2) counter-example: the P publish preflight
+    must reject a forged P2 whose manifest flips a fixed committed file's
+    ``committed`` flag — a committed artifact can never masquerade as a hash-only
+    raw origin in P, just as the resolver rejects it."""
+    e2, p2 = _forge_repointed_chain(
+        monkeypatch,
+        clean_repo,
+        staging_dir,
+        tmp_path,
+        mutate_e_manifest=_gap3_manifest_flip_committed,
+    )
+    report = _pointer_commit_preflight_report(clean_repo, _head(clean_repo))
+    with pytest.raises(gate.GateStateChangedError, match="committed flag flipped"):
+        gate._verify_pointer_committed_blobs(
+            p2,
+            report,
+            e2,
+            gate._evidence_index_entries(
+                staging_dir,
+                report_stage=staging_dir / gate._REPORT_STAGED_NAME,
+                manifest_stage=staging_dir / gate._MANIFEST_STAGED_NAME,
+            ),
+            staging_dir,
+        )
 
 
 def test_verify_gate_ref_rule_drift_does_not_flip_verification(
@@ -3693,10 +4155,7 @@ def test_commit_evidence_succeeds_when_head_moves_after_entry_snapshot(
     commit survives untouched and only the gate ref appears — HEAD/branch/index/
     worktree are never rewritten."""
     _patch_root(monkeypatch, clean_repo)
-    staging_dir.mkdir()
-    (staging_dir / "product-acceptance.json").write_text(
-        '{"passed": true}\n', encoding="utf-8"
-    )
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report = gate.GateReport(
         schema_version=gate.EVIDENCE_SCHEMA,
         generated_at="2026-08-10T00:00:00+00:00",
@@ -3742,10 +4201,7 @@ def test_commit_evidence_succeeds_while_index_lock_is_held(
     touching the lock, without moving the branch, and without disturbing the
     index/worktree.  Only the dedicated gate ref appears atomically."""
     _patch_root(monkeypatch, clean_repo)
-    staging_dir.mkdir()
-    (staging_dir / "product-acceptance.json").write_text(
-        '{"passed": true}\n', encoding="utf-8"
-    )
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report = gate.GateReport(
         schema_version=gate.EVIDENCE_SCHEMA,
         generated_at="2026-08-10T00:00:00+00:00",
@@ -3819,15 +4275,7 @@ def test_commit_evidence_skips_gitignored_evidence(
         ["git", "-C", str(clean_repo), "commit", "-q", "-m", "ignore live evidence"],
         check=True,
     )
-    staging_dir.mkdir()
-    for name in (
-        "product-acceptance.json",
-        "browser-e2e.json",
-        "browser-e2e-screenshot.png",
-        "live-canary-certified.json",
-        "live-done-gate-v4.json",
-    ):
-        (staging_dir / name).write_bytes(b"{}\n" if name.endswith(".json") else b"PNG")
+    _populate_full_required_evidence(monkeypatch, staging_dir)
 
     tested_sha = _head(clean_repo)
     report = gate.GateReport(
@@ -3907,10 +4355,9 @@ def test_commit_evidence_publishes_binary_evidence_with_branch_ref_locked(
     + update-index --cacheinfo, never a worktree write), carried in E/P, and the
     gate succeeds while the branch ref stays locked and untouched."""
     _patch_root(monkeypatch, clean_repo)
-    staging_dir.mkdir()
-    (staging_dir / "product-acceptance.json").write_text(
-        '{"passed": true}\n', encoding="utf-8"
-    )
+    _populate_full_required_evidence(monkeypatch, staging_dir)
+    # The binary PNG is the point of this counter-example — keep the specific
+    # bytes so the committed blob readback is a byte-for-byte match.
     png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02" * 10
     (staging_dir / "browser-e2e-screenshot.png").write_bytes(png_bytes)
     report = gate.GateReport(
@@ -4064,32 +4511,8 @@ def test_commit_evidence_manifest_records_ignored_and_committed(
         ["git", "-C", str(clean_repo), "commit", "-q", "-m", "ignore live evidence"],
         check=True,
     )
-    staging_dir.mkdir()
-    (staging_dir / "product-acceptance.json").write_text(
-        '{"passed": true}\n', encoding="utf-8"
-    )
-    (staging_dir / "live-canary-certified.json").write_text(
-        json.dumps(
-            {
-                "passed": True,
-                "bridge_token_present": True,
-                "scopes": [{"scope": "x", "passed": True}],
-                "companion_status": {
-                    "companions": [
-                        {
-                            "companion_id": "comp-1",
-                            "providers": ["p"],
-                            "authorized_scope_keys": ["x"],
-                            "is_fresh": True,
-                            "age_seconds": 3,
-                            "build_identity": {"build_sha256": "abc123"},
-                        }
-                    ]
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+    _populate_full_required_evidence(monkeypatch, staging_dir)
+
     tested_sha = _head(clean_repo)
     report = gate.GateReport(
         schema_version=gate.EVIDENCE_SCHEMA,
@@ -4188,10 +4611,7 @@ def test_verify_evidence_contract_fails_closed_on_missing_committed_file(
     """A2 counter-example: the contract verify must hard-fail when E carries the
     manifest but is missing a file the manifest marks committed."""
     _patch_root(monkeypatch, clean_repo)
-    staging_dir.mkdir()
-    (staging_dir / "product-acceptance.json").write_text(
-        '{"passed": true}\n', encoding="utf-8"
-    )
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     tested_sha = _head(clean_repo)
     report = gate.GateReport(
         schema_version=gate.EVIDENCE_SCHEMA,
@@ -4900,7 +5320,7 @@ def test_verify_evidence_contract_rejects_blank_compact_content(
     the contract-required content (layer-5 coverage / layer-6 check set) must
     fail the post-commit re-verify — a blank or hash-only artifact is not enough."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     blank_payload = '{"schema_version": "tripchord-done-gate-layer6-compact-v2"}\n'
     staged_compact = staging_dir / gate._COMPACT_E2E_STAGED_NAME
     staged_compact.write_text(blank_payload, encoding="utf-8")
@@ -5041,7 +5461,7 @@ def test_verify_evidence_contract_fails_closed_on_incomplete_manifest_fields(
     E's manifest omits a required contract field (field-completeness of the
     committed trail), even when every committed file hash matches."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     tested_sha = _head(clean_repo)
     report = gate.GateReport(
         schema_version=gate.EVIDENCE_SCHEMA,
@@ -5595,6 +6015,15 @@ def test_secret_scan_allows_64hex_under_field_path_whitelist() -> None:
         gate._reject_unknown_64hex_values(data, "evidence", "e.json")  # no raise
 
 
+def test_secret_scan_allows_64hex_under_api_payload_sha256_path() -> None:
+    """C-122 supervision 03:46 (Block 3): a real layer-6 compact carries the raw
+    request payload's own SHA at the committed ``api_payload_sha256`` path — the
+    secret scan must trust it (whitelisted), never reject a genuine publish as an
+    unknown opaque 64-hex token."""
+    data = json.dumps({"api_payload_sha256": "a" * 64}).encode("utf-8")
+    gate._reject_unknown_64hex_values(data, "evidence", "e.json")  # no raise
+
+
 def test_secret_scan_rejects_64hex_under_digest_named_unproduced_key() -> None:
     """C-122 round-18 HG-F counter-example: a key merely NAMED ``*_sha256`` /
     ``*_hash`` / ``*_digest`` / ``*_fingerprint`` is NOT enough — a 64-hex under
@@ -5922,7 +6351,7 @@ def test_commit_evidence_phase1_add_failure_is_atomic(
     side-channel equivalent of ``git add``) leaves the branch on the tested
     revision, no intermediate commit, no gate ref, and a clean index/worktree."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
     _inject_git_failure(monkeypatch, "update-index", when=1)
 
@@ -5937,7 +6366,7 @@ def test_commit_evidence_phase1_commit_failure_is_atomic(
     """A4 counter-example: a failed phase-1 ``commit-tree`` leaves the branch on
     the tested revision — E is never installed as HEAD."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
     _inject_git_failure(monkeypatch, "commit-tree", when=1)
 
@@ -5953,7 +6382,7 @@ def test_commit_evidence_phase2_commit_failure_is_atomic(
     materialized) leaves the branch on the tested revision — E is never
     installed, so no intermediate commit pollutes the branch history."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
     _inject_git_failure(monkeypatch, "commit-tree", when=2)
 
@@ -5970,7 +6399,7 @@ def test_commit_evidence_update_ref_failure_is_atomic(
     were fully materialized — the branch only advances atomically or not at
     all."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
     _inject_git_failure(monkeypatch, "update-ref")
 
@@ -5988,7 +6417,7 @@ def test_commit_evidence_success_creates_ref_once_atomically(
     create-only gate ref ``refs/tripchord/done-gate/<run_id>`` -> P with
     P^=E and E^=S."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
 
     evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
@@ -6021,7 +6450,7 @@ def test_commit_evidence_no_fallible_op_after_cas(
     after it, so a failure there can never flip a published gate into a
     voided-but-published state."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
 
     real_git = gate._git
@@ -6064,7 +6493,7 @@ def test_commit_evidence_construction_crash_at_each_stage_publishes_nothing(
     unreachable objects and no visible repo change.  An unexpected exception
     (RuntimeError, the way a real crash surfaces) escapes the commit phase."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
 
     crash_points = {
         "phase1_stage": "_verify_evidence_file_safety",
@@ -6131,7 +6560,7 @@ def test_commit_evidence_same_sha_other_branch_switch_leaves_both_untouched(
     and the evidence trail is published through the dedicated ref with P^=E,
     E^=S."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
     tested_sha = start.commit_sha
 
@@ -6196,7 +6625,7 @@ def test_commit_evidence_concurrent_commit_parent_tree_index_preserved(
     after the gate's final secret scan; the commit itself and the resulting
     ref/index state are all real, unmonkeypatched git behavior."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
     tested_sha = start.commit_sha
 
@@ -6295,7 +6724,7 @@ def test_commit_evidence_leaves_concurrent_staged_index_untouched(
     staged file survives byte-for-byte, the branch never moves, and only the
     dedicated gate ref appears."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
     tested_sha = start.commit_sha
 
@@ -6351,7 +6780,7 @@ def test_commit_evidence_success_leaves_head_index_worktree_consistent(
     no index sync exists to race at all.  The evidence trail lives only on the
     dedicated gate ref."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
 
     evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
@@ -6638,7 +7067,7 @@ def test_commit_evidence_rejects_tampered_e_manifest(
     when E's manifest is re-parsed from the committed blob.  The branch never
     moves and the index/worktree stay clean."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
 
     real_write_manifest = gate._write_manifest
@@ -6684,7 +7113,7 @@ def test_commit_evidence_rejects_non_json_pointer_report(
     schema.  A non-JSON P report (tampered at the phase-2 dump) fails closed
     before the CAS — the branch never moves."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
     staged_report_path = staging_dir / gate._REPORT_STAGED_NAME
 
@@ -6720,7 +7149,7 @@ def test_commit_evidence_fails_closed_when_whitelist_bytes_change_after_final_sc
     fail the phase closed — the gate refuses to commit a tree that differs from
     what it scanned, instead of silently committing different bytes."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     report, start = _passing_report_and_start(clean_repo)
     staged_report_path = staging_dir / gate._REPORT_STAGED_NAME
 
@@ -6806,6 +7235,164 @@ def test_main_no_post_cas_dump_local_report_carries_evidence_commit(
     )
     assert committed["evidence_commit"] == local["evidence_commit"]
     assert committed["passed"] is True
+
+
+def _gap3_manifest_rename_entry(
+    manifest: dict[str, object],
+) -> dict[str, object]:
+    """Gap-3 counter-example: rename a fixed evidence entry to a foreign name —
+    the name set no longer matches the fixed contract."""
+    for entry in manifest["files"]:  # type: ignore[index]
+        if isinstance(entry, dict) and entry.get("name") == "browser-e2e.json":
+            entry["name"] = "browser-e2e-renamed.json"
+            return manifest
+    return manifest
+
+
+def _gap3_manifest_drop_entry(
+    manifest: dict[str, object],
+) -> dict[str, object]:
+    """Gap-3 counter-example: drop a fixed evidence entry from the file set."""
+    manifest["files"] = [  # type: ignore[index]
+        entry
+        for entry in manifest["files"]  # type: ignore[index]
+        if not (isinstance(entry, dict) and entry.get("name") == "browser-e2e.json")
+    ]
+    return manifest
+
+
+def _gap3_manifest_smuggle_entry(
+    manifest: dict[str, object],
+) -> dict[str, object]:
+    """Gap-3 counter-example: smuggle a foreign evidence entry into the set."""
+    manifest["files"].append(  # type: ignore[index]
+        {
+            "name": "smuggled-evidence.json",
+            "tracked_path": "benchmarks/results/smuggled-evidence.json",
+            "sha256": "a" * 64,
+            "size_bytes": 0,
+            "committed": True,
+        }
+    )
+    return manifest
+
+
+def _gap3_manifest_relocate_entry(
+    manifest: dict[str, object],
+) -> dict[str, object]:
+    """Gap-3 counter-example: relocate a compact's tracked_path off the canonical
+    contract path — the name set and every field shape still read correctly."""
+    for entry in manifest["files"]:  # type: ignore[index]
+        if (
+            isinstance(entry, dict)
+            and entry.get("name") == gate._COMPACT_CANARY_STAGED_NAME
+        ):
+            entry["tracked_path"] = "benchmarks/results/moved-layer5-compact.json"
+            return manifest
+    return manifest
+
+
+def _gap3_manifest_flip_committed(
+    manifest: dict[str, object],
+) -> dict[str, object]:
+    """Gap-3 counter-example: flip a fixed committed artifact's committed flag to
+    false (hash-only raw) — no fixed contract permits a committed artifact to
+    masquerade as a git-ignored original."""
+    for entry in manifest["files"]:  # type: ignore[index]
+        if isinstance(entry, dict) and entry.get("name") == "product-acceptance.json":
+            entry["committed"] = False
+            return manifest
+    return manifest
+
+
+def _gap3_manifest_bad_field_set(
+    manifest: dict[str, object],
+) -> dict[str, object]:
+    """Gap-3 counter-example: a file entry with an unexpected extra field."""
+    for entry in manifest["files"]:  # type: ignore[index]
+        if isinstance(entry, dict) and entry.get("name") == "product-acceptance.json":
+            entry["smuggled_field"] = True
+            return manifest
+    return manifest
+
+
+def _gap3_manifest_duplicate_name(
+    manifest: dict[str, object],
+) -> dict[str, object]:
+    """Gap-3 counter-example: a duplicate evidence file name in the set."""
+    files = manifest["files"]  # type: ignore[index]
+    if files:
+        files.append(dict(files[0]))
+    return manifest
+
+
+@pytest.mark.parametrize(
+    "label,mutate,needle",
+    [
+        (
+            "renamed evidence file",
+            _gap3_manifest_rename_entry,
+            "not a fixed evidence-contract name",
+        ),
+        ("missing evidence file", _gap3_manifest_drop_entry, "file-name set"),
+        (
+            "smuggled extra evidence file",
+            _gap3_manifest_smuggle_entry,
+            "not a fixed evidence-contract name",
+        ),
+        ("relocated tracked_path", _gap3_manifest_relocate_entry, "relocated"),
+        (
+            "flipped committed flag",
+            _gap3_manifest_flip_committed,
+            "committed flag flipped",
+        ),
+        (
+            "unexpected field set",
+            _gap3_manifest_bad_field_set,
+            "unexpected field set",
+        ),
+        ("duplicate file name", _gap3_manifest_duplicate_name, "repeats file name"),
+    ],
+)
+def test_gap3_manifest_contract_publish_and_resolver_reject_identically(
+    label: str,
+    mutate: Callable[[dict[str, object]], dict[str, object]],
+    needle: str,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_repo: Path,
+    staging_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """C-122 round-19 02:56 supervision (gap 3): the SINGLE canonical manifest
+    validator means the publish preflight (``_verify_evidence_contract``) and the
+    consumer resolver (``verify_gate_ref``) reject the SAME structural violation
+    with the SAME message — a renamed / missing / smuggled evidence entry, a
+    relocated ``tracked_path``, a flipped ``committed`` flag, an unexpected field
+    set, or a duplicate name can never be published on one side and accepted on
+    the other."""
+    e2, _p2 = _forge_repointed_chain(
+        monkeypatch,
+        clean_repo,
+        staging_dir,
+        tmp_path,
+        mutate_e_manifest=mutate,
+    )
+    # Resolver-side: the consumer rejects the forged E/P chain.
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is False, f"{label}: resolver accepted the forgery"
+    assert any(
+        needle in problem for problem in verdict["problems"]
+    ), f"{label}: resolver problems {verdict['problems']!r} missing {needle!r}"
+    # Publish-side: the producer's post-commit preflight rejects the SAME forged
+    # E commit with the SAME structural violation.
+    tested_sha = _head(clean_repo)
+    with pytest.raises(gate.GateStateChangedError) as exc_info:
+        gate._verify_evidence_contract(
+            e2, staging_dir, tested_commit_sha=tested_sha, run_id=_TEST_RUN_ID
+        )
+    assert needle in str(exc_info.value), (
+        f"{label}: publish-side raised {exc_info.value!r} missing {needle!r}"
+    )
 
 
 def test_main_local_report_dump_failure_fails_closed(
@@ -7621,6 +8208,10 @@ def _layer6_compact_fixture() -> dict[str, object]:
             ],
         },
         "api_payload_candidate_set_sha256": "a" * 64,
+        # C-122 round-19 (gap 4): the raw request payload SHA the checkpoint
+        # binding's request identity must bind to (matches the fixture's
+        # checkpoint request_sha256).
+        "api_payload_sha256": _FIXTURE_REQUEST_SHA256,
         "scenario_sha256": "a" * 64,
         "event_injection_contract": {
             "mode": "synthetic_sold_out_fault_injection",
@@ -8613,30 +9204,251 @@ def test_verify_layer6_compact_contract_rejects_checkpoint_binding_wrong_request
 
 
 def test_verify_layer6_compact_contract_rejects_same_raw_copied_digest() -> None:
-    """C-122 supervision 18:13 counter-example (same-raw self-consistent
-    forgery): a compact that copies a producer's digests VERBATIM without the
-    underlying content must REJECT — the validator RECOMPUTES every digest from
-    the binding's carried fields, so doctored content with a stale copied
-    digest fails closed."""
+    """C-122 supervision 18:13 + round-19 gap-4 counter-example (same-raw
+    self-consistent forgery): a compact that copies a producer's digests
+    VERBATIM without the underlying content must REJECT — the validator
+    RECOMPUTES every digest from the binding's carried fields, so a doctored
+    business summary with a stale copied ``run_summary_sha256`` fails closed."""
 
     def mutate(checks: Any) -> None:
         for check in checks:
             if check["name"] == "v4_source_graph":
                 binding = check["evidence"]["checkpoint_binding"]
-                # Doctor the query-task set but keep the query-task hash AND the
-                # checkpoint digest as the producer's verbatim values — only the
-                # checkpoint content recomputation can catch this forgery.
-                binding["bindings"][0]["query_task_ids"] = [
-                    "source-ctrip-lodging-hotels"
-                ]
-                binding["bindings"][0]["query_task_ids_sha256"] = gate._canonical_sha256(
-                    binding["bindings"][0]["query_task_ids"]
+                # Doctor a business-summary field (source-task count) but keep
+                # the run_summary digest AND the checkpoint digest as the
+                # producer's verbatim values — only the full business-summary
+                # recomputation can catch this forgery.
+                binding["bindings"][0]["source_task_count"] = 1
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="run_summary_sha256 does not recompute",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_checkpoint_binding_foreign_api_payload() -> None:
+    """C-122 round-19 (gap 4) counter-example (foreign request-payload binding):
+    a compact whose carried ``api_payload_sha256`` does not match the checkpoint
+    binding's request identity must REJECT — the checkpoint chain is bound to
+    the raw API payload the run submitted, not merely a self-declared SHA."""
+
+    compact = _layer6_compact_fixture()
+    compact["api_payload_sha256"] = "e" * 64
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="request_sha256 does not bind to the compact's api_payload_sha256",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_checkpoint_binding_non_completed_state() -> None:
+    """C-122 round-19 (gap 4) counter-example (non-completed state): a
+    checkpoint binding whose entry state is not ``completed`` must REJECT even
+    when every digest is internally consistent — a failed/pending checkpoint
+    cannot certify a passing gate."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                binding = check["evidence"]["checkpoint_binding"]
+                binding["bindings"][0]["state"] = "failed"
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="state 'failed' != 'completed'",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_checkpoint_binding_rejects_wrong_group_count() -> None:
+    """C-122 round-19 (gap 4) counter-example (wrong group count): a checkpoint
+    binding with FOUR bindings cannot be the frozen three-date-pair seal — the
+    exact-count check rejects it even when the bindings cover a four-id pair
+    set."""
+
+    binding = _fixture_checkpoint_binding()
+    binding["bindings"] = binding["bindings"] + [dict(binding["bindings"][-1])]
+    pair_ids = [
+        *_FIXTURE_PAIR_IDS,
+        _frozen_v4_fixture_pair_id("2026-08-31", "2026-09-08"),
+    ]
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="has 4 bindings != the frozen scenario's exact 3 date pairs",
+    ):
+        gate._verify_layer6_checkpoint_binding(
+            "done-gate-layer6-compact.json",
+            "v4_source_graph",
+            {"checkpoint_binding": binding},
+            pair_ids,
+        )
+
+
+def test_verify_layer6_checkpoint_binding_rejects_passed_false() -> None:
+    """C-122 supervision 03:46 (Block 3) counter-example: a checkpoint binding
+    whose header records ``passed=false`` must REJECT even when the bindings
+    list is a fully well-formed three-group chain — a non-passing seal cannot
+    certify a passing gate."""
+
+    binding = _fixture_checkpoint_binding()
+    binding["passed"] = False
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="checkpoint_binding passed False != true",
+    ):
+        gate._verify_layer6_checkpoint_binding(
+            "done-gate-layer6-compact.json",
+            "v4_source_graph",
+            {"checkpoint_binding": binding},
+            list(_FIXTURE_PAIR_IDS),
+        )
+
+
+def test_verify_layer6_checkpoint_binding_rejects_wrong_count_claim() -> None:
+    """C-122 supervision 03:46 (Block 3) counter-example: a checkpoint binding
+    whose header claims ``count=999`` must REJECT — the carried count must agree
+    with the verified three-group chain, not be a self-declared number."""
+
+    binding = _fixture_checkpoint_binding()
+    binding["count"] = 999
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="checkpoint_binding count 999 != the frozen scenario's exact 3 date pairs",
+    ):
+        gate._verify_layer6_checkpoint_binding(
+            "done-gate-layer6-compact.json",
+            "v4_source_graph",
+            {"checkpoint_binding": binding},
+            list(_FIXTURE_PAIR_IDS),
+        )
+
+
+@pytest.mark.parametrize(
+    ("count_value", "expected_repr"),
+    [
+        (True, "True"),
+        (3.0, "3.0"),
+        ("3", "'3'"),
+    ],
+)
+def test_verify_layer6_checkpoint_binding_rejects_non_integer_count(
+    count_value: object, expected_repr: str
+) -> None:
+    """C-122 supervision 04:14 counter-example (strict type lock): ``count`` must
+    be a STRICT JSON integer equal to 3 — ``True`` (bool, ``True == 1``), ``3.0``
+    (float, ``3.0 != 3`` is False) and the string ``"3"`` must all REJECT even
+    though each numerically equals / stringifies to three."""
+
+    binding = _fixture_checkpoint_binding()
+    binding["count"] = count_value
+    expected = (
+        rf"checkpoint_binding count {re.escape(expected_repr)} "
+        r"!= the frozen scenario's exact 3 date pairs"
+    )
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match=expected,
+    ):
+        gate._verify_layer6_checkpoint_binding(
+            "done-gate-layer6-compact.json",
+            "v4_source_graph",
+            {"checkpoint_binding": binding},
+            list(_FIXTURE_PAIR_IDS),
+        )
+
+
+@pytest.mark.parametrize(
+    "passed_value",
+    [1, 1.0, "true", True, False],
+)
+def test_verify_layer6_checkpoint_binding_rejects_non_strict_true_passed(
+    passed_value: object,
+) -> None:
+    """C-122 supervision 04:14 counter-example (strict type lock): ``passed``
+    must be the boolean singleton ``True`` — ``1``, ``1.0``, the string
+    ``"true"`` and ``False`` all REJECT; only ``True`` (the control) passes."""
+
+    binding = _fixture_checkpoint_binding()
+    binding["passed"] = passed_value
+    if passed_value is True:
+        gate._verify_layer6_checkpoint_binding(
+            "done-gate-layer6-compact.json",
+            "v4_source_graph",
+            {"checkpoint_binding": binding},
+            list(_FIXTURE_PAIR_IDS),
+        )
+        return
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match=rf"checkpoint_binding passed {re.escape(repr(passed_value))} != true",
+    ):
+        gate._verify_layer6_checkpoint_binding(
+            "done-gate-layer6-compact.json",
+            "v4_source_graph",
+            {"checkpoint_binding": binding},
+            list(_FIXTURE_PAIR_IDS),
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_checkpoint_binding_foreign_query_member() -> None:
+    """C-122 round-19 (gap 4) counter-example (foreign query member): a
+    checkpoint binding whose per-group query-task set contains a FOREIGN Source
+    id must REJECT even when every digest is recomputed consistently — the
+    per-group set must equal the canonical frozen graph exactly."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                binding = check["evidence"]["checkpoint_binding"]
+                entry = binding["bindings"][0]
+                entry["query_task_ids"] = sorted(
+                    set(entry["query_task_ids"]) | {"source-ctrip-extra-forgery"}
+                )
+                entry["query_task_ids_sha256"] = gate._canonical_sha256(
+                    entry["query_task_ids"]
+                )
+                from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
+
+                entry["checkpoint_sha256"] = LivePlanningPairCheckpoint._digest(
+                    LivePlanningPairCheckpoint._checkpoint_summary(
+                        {
+                            "schema_version": "live-pair-checkpoint-v1",
+                            "request_sha256": entry["request_sha256"],
+                            "sequence": entry["sequence"],
+                            "date_pair_id": entry["date_pair_id"],
+                            "departure_date": entry["departure_date"],
+                            "return_date": entry["return_date"],
+                            "state": entry["state"],
+                            "query_task_ids": entry["query_task_ids"],
+                            "run_summary_sha256": entry["run_summary_sha256"],
+                            "captured_at": entry["captured_at"],
+                        }
+                    )
+                )
+                binding["ordered_checkpoint_sha256"][0] = entry["checkpoint_sha256"]
+                binding["checkpoint_chain_sha256"] = gate._canonical_sha256(
+                    binding["ordered_checkpoint_sha256"]
                 )
 
     compact = _layer6_compact_with_evidence_mutated(mutate)
     with pytest.raises(
         gate.GateStateChangedError,
-        match="checkpoint_sha256 does not recompute",
+        match="query_task_ids member set != the canonical frozen graph",
     ):
         gate._verify_layer6_compact_contract(
             "done-gate-layer6-compact.json",
@@ -8682,6 +9494,55 @@ def test_frozen_v4_pair_id_generation_enforces_time_contract() -> None:
         frozen_v4_pair_id(date(2026, 8, 20), date(2026, 8, 15))
     with pytest.raises(ValueError, match="below the frozen scenario's minimum"):
         frozen_v4_pair_id(date(2026, 8, 11), date(2026, 8, 12))
+
+
+def test_frozen_v4_pair_id_real_generation_path_enforces_time_contract() -> None:
+    """C-122 supervision 02:56: the frozen time contract is wired into the REAL
+    generation path — ``FlexibleDateExplorer._pair_id`` (the method production
+    exploration calls) must delegate to ``frozen_v4_pair_id`` for the frozen
+    scenario window and RAISE on an out-of-contract pair BEFORE a digest is ever
+    produced.  A 2030 departure / reversed dates / 1/9/10-night pair rejected
+    only at acceptance side is the gap this closes: the same counter-examples
+    must fail at GENERATION time too."""
+
+    from datetime import date
+
+    from tripchord.planning.flexible_dates import FlexibleDateExplorer
+    from tripchord.planning.frozen_graph import _FROZEN_V4_TRAVEL_WINDOW
+
+    explorer = FlexibleDateExplorer()
+    frozen_window = _FROZEN_V4_TRAVEL_WINDOW
+
+    # An in-contract pair routes through the canonical helper and yields the
+    # canonical fixture id (the digest is identical to the generic derivation).
+    assert (
+        explorer._pair_id(frozen_window, date(2026, 8, 11), date(2026, 8, 16))
+        == _frozen_v4_fixture_pair_id("2026-08-11", "2026-08-16")
+    )
+
+    # Out-of-contract pairs RAISE at generation time (ValueError, before any
+    # digest is returned) — the real path, not the standalone helper.
+    with pytest.raises(ValueError, match="after the frozen window's latest"):
+        explorer._pair_id(frozen_window, date(2030, 1, 1), date(2030, 1, 6))
+    with pytest.raises(ValueError, match="not after departure"):
+        explorer._pair_id(frozen_window, date(2026, 8, 20), date(2026, 8, 15))
+    with pytest.raises(ValueError, match="below the frozen scenario's minimum"):
+        explorer._pair_id(frozen_window, date(2026, 8, 11), date(2026, 8, 12))
+    with pytest.raises(ValueError, match="above the frozen scenario's maximum"):
+        explorer._pair_id(frozen_window, date(2026, 8, 11), date(2026, 8, 20))
+    with pytest.raises(ValueError, match="above the frozen scenario's maximum"):
+        explorer._pair_id(frozen_window, date(2026, 8, 11), date(2026, 8, 21))
+
+    # The routing is precise: a FOREIGN window (different destination) keeps the
+    # generic generation path and must NOT inherit the frozen contract — a 2030
+    # pair for a non-frozen scenario is generated, not rejected.
+    foreign_window = frozen_window.model_copy(
+        update={"destination": "普吉岛", "destination_code": "HKT"}
+    )
+    foreign_id = explorer._pair_id(
+        foreign_window, date(2030, 1, 1), date(2030, 1, 6)
+    )
+    assert foreign_id.startswith("date-pair:2030-01-01:2030-01-06:")
 
 
 def test_verify_layer6_compact_contract_rejects_wrong_pair_swap() -> None:
@@ -9154,7 +10015,7 @@ def _commit_compact_to_evidence_commit(
     counterexample keeps repo==runtime==S and fails ONLY on its violation.
     Returns E's sha."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
+    _populate_full_required_evidence(monkeypatch, staging_dir)
     tested_sha = _head(clean_repo)
     compact = compact_factory(tested_sha)
     payload = json.dumps(compact, ensure_ascii=False, sort_keys=True)

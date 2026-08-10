@@ -60,6 +60,47 @@ _ICOM_REPLAY_DELAY_SECONDS = 0.5
 # stderr or the committed evidence — a canary failure must never echo a secret.
 _TOKEN_SHAPE_RE = re.compile(r"[A-Za-z0-9_\-=]{32,}")
 
+# C-122 supervision 02:56 (Block 2): the 32+ run alone misses short Bearer/JWT,
+# AKIA/GitHub-style and ``token=``-short-opaque credentials that can otherwise
+# hit disk (``<output>.failure.json``) or stderr.  These structured shape
+# patterns mirror the consumer's ``_sanitize_canary_diag_field``
+# (``scripts/run_product_done_gate.py``) — keep both sets in sync so the
+# producer artifact is already sanitized BEFORE the consumer re-checks it.
+_CANARY_DIAG_URL_RE = re.compile(r"https?://[^\s\"'<>)\[\]{}]+")
+_CANARY_DIAG_AKIA_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
+_CANARY_DIAG_PREFIX_TOKEN_RE = re.compile(
+    r"(?i)\b(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-|xoxa-|"
+    r"sk-|rk-)[A-Za-z0-9_\-]{6,}"
+)
+_CANARY_DIAG_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-.]{4,}")
+_CANARY_DIAG_DOTTED_TOKEN_RE = re.compile(
+    r"\b[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]{3,}\b"
+)
+_CANARY_DIAG_OPAQUE_KV_RE = re.compile(
+    r"(?i)\b(?:token|password|passwd|secret|apikey|api_key|access_key|"
+    r"secret_key|client_secret|authorization|bearer|private_key|session_key)\b"
+    r"\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
+)
+# C-122 supervision 03:46 (Block 1): whole-header/field redaction.  The shape
+# patterns above still let a credential BODY slip through when the value is
+# short or carries ``;`` / spaces — ``Cookie: session=abc; csrftoken=xyz`` keeps
+# ``csrftoken=xyz``, ``Authorization: Basic dXNlcjpwYXNzd29yZA==`` keeps the
+# base64 body (``_CANARY_DIAG_OPAQUE_KV_RE`` stops at the space after ``Basic``)
+# and ``X-API-Key:`` / ``Proxy-Authorization:`` / ``Set-Cookie:`` are not named
+# at all.  This pattern masks the WHOLE header field (name + ``:``/``=`` +
+# value, up to the next newline) so the credential and its body are
+# removed together — mirrors the consumer's ``_AUTH_COOKIE_PATTERN`` in
+# ``scripts/run_product_done_gate.py`` (keep both in sync).  Over-redaction is
+# the fail-closed direction.
+# C-122 supervision 04:14: any non-empty value is masked whole — no {4,}
+# character floor (``Cookie:a=b`` / ``X-API-Key:abc``) and no quote stops the
+# span (``Authorization: "Basic YWJjZA=="`` / ``Set-Cookie: "sid=abc;
+# HttpOnly"`` / ``X-API-Key: "abc123"`` must all collapse to ``<redacted>``).
+_CANARY_DIAG_WHOLE_HEADER_RE = re.compile(
+    r"(?i)\b(?:proxy[-_ ]authorization|set[-_ ]cookie|x-api-key|api[-_ ]key|"
+    r"authorization|cookie)\b\s*[:=]\s*[^\r\n]+"
+)
+
 # C-122 round-19 (2026-08-11 17:03 supervisor veto): the certified canary scope
 # contract is DERIVED from the authoritative registry — never hardcoded.
 # ``registry.certified_scopes()`` returns exactly the CERTIFIED_ACTIVE set: five
@@ -227,8 +268,30 @@ def _browser_scope_canary(
 
 
 def _desensitize(text: str) -> str:
-    """Redact token-shaped substrings from a diagnostic message."""
-    return _TOKEN_SHAPE_RE.sub("<redacted>", text)
+    """Redact every credential SHAPE from a diagnostic message before it can
+    reach stderr or the committed evidence (C-122 supervision 02:56 Block 2).
+
+    Structured, fail-closed sanitization — not just long token runs: URLs are
+    collapsed to ``<url>``, and AKIA-style AWS keys, well-known token prefixes
+    (``ghp_`` / ``github_pat_`` / ``glpat-`` / ``xoxb-`` / ``sk-``), short
+    ``Bearer <token>`` forms, dotted JWTs and short opaque ``token=`` /
+    ``bearer=`` / ``password=`` assignments are all collapsed to ``<redacted>``.
+    Whole header fields — ``Authorization`` / ``Proxy-Authorization`` /
+    ``Cookie`` / ``Set-Cookie`` / ``X-API-Key`` — are masked name-and-value
+    together, so a ``Basic`` base64 body or a ``;``-joined cookie pair can never
+    survive with a partially-redacted header (C-122 supervision 03:46 Block 1).
+    Mirrors the consumer's ``_sanitize_canary_diag_field`` so the producer
+    artifact is already sanitized on disk and on stderr before the gate re-checks
+    it."""
+    text = _CANARY_DIAG_WHOLE_HEADER_RE.sub("<redacted>", text)
+    text = _CANARY_DIAG_URL_RE.sub("<url>", text)
+    text = _TOKEN_SHAPE_RE.sub("<redacted>", text)
+    text = _CANARY_DIAG_AKIA_RE.sub("<redacted>", text)
+    text = _CANARY_DIAG_PREFIX_TOKEN_RE.sub("<redacted>", text)
+    text = _CANARY_DIAG_BEARER_RE.sub("<redacted>", text)
+    text = _CANARY_DIAG_DOTTED_TOKEN_RE.sub("<redacted>", text)
+    text = _CANARY_DIAG_OPAQUE_KV_RE.sub("<redacted>", text)
+    return text
 
 
 async def _icom_scope_canary() -> dict[str, Any]:

@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
+from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
 from tripchord.planning.frozen_graph import (
     FROZEN_V4_PAIR_COUNT,
     frozen_v4_browser_source_ids,
@@ -59,7 +60,6 @@ from tripchord.planning.frozen_graph import (
 )
 from tripchord.platform.registry import build_default_registry
 from tripchord.runtime_provenance import local_expected_provenance, provenance_mismatches
-from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "benchmarks" / "results"
@@ -802,11 +802,20 @@ def _evidence_secrets() -> tuple[str, ...]:
 
 # Authorization / Cookie header-or-field values that are not already redacted.
 # ``[REDACTED]`` is 11 chars and contains brackets, so it never matches the
-# {12,} alnum body requirement.
+# value requirement.  C-122 supervision 03:46 (Block 1): the set is the
+# five whole-header fields a diagnostic may carry — Authorization,
+# Proxy-Authorization, Cookie, Set-Cookie, X-API-Key — and each is masked
+# NAME-AND-VALUE TOGETHER: the value runs to the next newline, so a
+# ``Basic`` base64 body, a short ``token=`` opaque value or a ``;``-joined
+# cookie pair can never survive with a partially-redacted header (a bare
+# ``authorization: bearer <short>`` body escaped the old {12,}/{16,} floors).
+# C-122 supervision 04:14: any non-empty value is masked whole — no {4,}
+# character floor (``Cookie:a=b`` / ``X-API-Key:abc``) and no quote stops the
+# span (``Authorization: "Basic YWJjZA=="`` / ``Set-Cookie: "sid=abc;
+# HttpOnly"`` / ``X-API-Key: "abc123"`` must all collapse to the marker).
 _AUTH_COOKIE_PATTERN = re.compile(
-    r"(?i)(?:authorization|cookie)\s*[:=]\s*[\"']?"
-    r"(?:bearer|basic)\s+[A-Za-z0-9+/=_\-]{12,}|"
-    r"(?:authorization|cookie)\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{16,}",
+    r"(?i)(?:proxy-authorization|set-cookie|x-api-key|authorization|cookie)"
+    r"\s*[:=]\s*[^\r\n]+",
     re.MULTILINE,
 )
 
@@ -869,8 +878,14 @@ _DIGEST_BINDING_PATHS: frozenset[str] = frozenset(
         # the browser-bridge payload.
         "companion_status.companions[].build_identity.build_sha256",
         # Layer-6 compact: candidate-set / scenario bindings, runtime-provenance
-        # digests, the bridge-state lease hashes and the raw-original hash.
+        # digests, the bridge-state lease hashes, the raw-original hash and the
+        # raw request payload's own SHA (``api_payload_sha256`` — the checkpoint
+        # binding's request identity, C-122 round-19 gap 4 / supervision 03:46
+        # Block 3).  A real compact carries it at this exact committed path, so
+        # an unlisted path would make the secret scan reject every genuine
+        # publish.
         "api_payload_candidate_set_sha256",
+        "api_payload_sha256",
         "scenario_sha256",
         "runtime_before_run.runtime_provenance.dependency_lock_sha256",
         "runtime_before_run.runtime_provenance.live_system_source_sha256",
@@ -1237,6 +1252,30 @@ def _secret_scan_bytes(
             raise GateStateChangedError(
                 f"secret leak: {kind} in {label} file {name}"
             )
+    # C-122 supervision 02:56 (Block 2): short / structured credential SHAPES
+    # are leaks even when no KNOWN secret value is present and the value is
+    # under the 32-char run threshold — AKIA-style AWS keys, well-known token
+    # prefixes (``ghp_`` / ``github_pat_`` / ``glpat-`` / ``xoxb-`` / ``sk-``),
+    # dotted three-segment JWTs, short ``Bearer <token>`` forms and short opaque
+    # ``token=abc`` assignments.  These shape scans are applied ONLY to free-form
+    # diagnostic files (``<output>.failure.json``) where such text is a real
+    # credential signal — a structured evidence file legitimately carries URLs /
+    # query strings / dotted domains, so a global shape scan would false-positive
+    # the gate.  A producer that fails to sanitize its diagnostic still fails the
+    # gate closed before certification.
+    if name.endswith(".failure.json"):
+        for pattern, kind in (
+            (_CANARY_DIAG_WHOLE_HEADER_RE, "whole Authorization/Cookie header"),
+            (_CANARY_DIAG_AKIA_RE, "AKIA-style access key"),
+            (_CANARY_DIAG_PREFIX_TOKEN_RE, "prefixed token"),
+            (_CANARY_DIAG_DOTTED_TOKEN_RE, "dotted bearer token"),
+            (_CANARY_DIAG_BEARER_RE, "short Bearer token"),
+            (_CANARY_DIAG_OPAQUE_KV_RE, "short opaque token assignment"),
+        ):
+            if pattern.search(masked_text):
+                raise GateStateChangedError(
+                    f"secret leak: {kind} in {label} file {name}"
+                )
     for match in _TRACKING_URL_PATTERN.finditer(text):
         if _is_tracking_url_leak(match.group(0)):
             raise GateStateChangedError(
@@ -1350,13 +1389,45 @@ _CANARY_DIAG_FIELD_MAX_CHARS = 512
 _CANARY_DIAG_URL_RE = re.compile(r"https?://[^\s\"'<>)\[\]{}]+")
 _CANARY_DIAG_TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9_\-=]{32,}")
 _CANARY_DIAG_AKIA_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
-_CANARY_DIAG_DOTTED_TOKEN_RE = re.compile(
-    r"\b[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]{6,}\b"
+# C-122 supervision 02:56 (Block 2): well-known short token PREFIXES — GitHub
+# personal/oauth/install tokens (``ghp_`` / ``gho_`` / ``ghu_`` / ``ghs_`` /
+# ``ghr_`` / ``github_pat_``), GitLab ``glpat-``, Slack ``xoxb-`` / ``xoxp-`` /
+# ``xoxa-``, OpenAI ``sk-`` — each is UNDER the 32-char run threshold and is
+# missed by the token-run / dotted patterns.  Same shape the producer's
+# ``_desensitize`` (``benchmarks/live_canary_certified.py``) collapses.
+_CANARY_DIAG_PREFIX_TOKEN_RE = re.compile(
+    r"(?i)\b(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-|xoxa-|"
+    r"sk-|rk-)[A-Za-z0-9_\-]{6,}"
 )
+# A short ``Bearer <token>`` form — ``Bearer abcd1234`` has no ``=``/``:`` so the
+# opaque-KV pattern cannot catch it, and a <32-char token evades the run pattern.
+_CANARY_DIAG_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-.]{4,}")
+# C-122 supervision 02:56 (Block 2): a dotted three-segment bearer token / JWT
+# whose last segment is as short as 3 chars is a credential too — the 32-char run
+# pattern misses it and the previous ``{6,}`` last-segment floor let short JWTs
+# through.
+_CANARY_DIAG_DOTTED_TOKEN_RE = re.compile(
+    r"\b[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]{3,}\b"
+)
+# C-122 supervision 02:56 (Block 2): a SHORT opaque ``token=abc`` /
+# ``password=abc`` / ``bearer=xyz`` assignment (value as short as 3 chars) is a
+# credential too — the previous ``{6,}`` value floor let ``token=abc`` through.
 _CANARY_DIAG_OPAQUE_KV_RE = re.compile(
     r"(?i)\b(?:token|password|passwd|secret|apikey|api_key|access_key|"
     r"secret_key|client_secret|authorization|bearer|private_key|session_key)\b"
-    r"\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{6,}"
+    r"\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
+)
+# C-122 supervision 03:46 (Block 1): whole-header/field masking — Authorization /
+# Proxy-Authorization / Cookie / Set-Cookie / X-API-Key are masked name-and-value
+# together (value runs to the next newline / quote).  The opaque-KV pattern above
+# stops at the first space (``authorization: Basic <base64>`` keeps the base64
+# body) and never names ``set-cookie`` / ``x-api-key`` / ``proxy-authorization``;
+# a ``;``-joined cookie pair likewise survives it.  Mirrors the producer's
+# ``_desensitize`` (``benchmarks/live_canary_certified.py``) and
+# ``_AUTH_COOKIE_PATTERN`` — keep all three in sync.
+_CANARY_DIAG_WHOLE_HEADER_RE = re.compile(
+    r"(?i)\b(?:proxy[-_ ]authorization|set[-_ ]cookie|x-api-key|api[-_ ]key|"
+    r"authorization|cookie)\b\s*[:=]\s*[^\r\n]+"
 )
 # The diagnostic's STRUCTURED schema — a fail-closed whitelist: any unknown
 # top-level / run_identity / runtime field makes the diagnostic foreign and is
@@ -1388,14 +1459,19 @@ def _sanitize_canary_diag_field(value: str, fallback: str) -> str:
     redacted (``_redact_output``), any remaining URL is collapsed to ``<url>``,
     any 32+ token-shaped run is collapsed to ``<redacted>``, AKIA-style access
     keys / dotted bearer tokens / short opaque ``token=`` assignments are
-    collapsed too, control characters are stripped, and the result is bounded in
-    length.  A credential-bearing summary — forged or otherwise — can never reach
-    the committed trail as-is (C-122 supervision 01:10 Block 3 + 18:13).
+    collapsed too, whole header fields are masked name-and-value together
+    (C-122 supervision 03:46 Block 1), control characters are stripped, and the
+    result is bounded in length.  A credential-bearing summary — forged or
+    otherwise — can never reach the committed trail as-is (C-122 supervision
+    01:10 Block 3 + 18:13).
     """
     value = _redact_output(value)
+    value = _CANARY_DIAG_WHOLE_HEADER_RE.sub("<redacted>", value)
     value = _CANARY_DIAG_URL_RE.sub("<url>", value)
     value = _CANARY_DIAG_TOKEN_RUN_RE.sub("<redacted>", value)
     value = _CANARY_DIAG_AKIA_RE.sub("<redacted>", value)
+    value = _CANARY_DIAG_PREFIX_TOKEN_RE.sub("<redacted>", value)
+    value = _CANARY_DIAG_BEARER_RE.sub("<redacted>", value)
     value = _CANARY_DIAG_DOTTED_TOKEN_RE.sub("<redacted>", value)
     value = _CANARY_DIAG_OPAQUE_KV_RE.sub("<redacted>", value)
     value = re.sub(r"[\x00-\x1f\x7f]", " ", value).strip()
@@ -3703,6 +3779,18 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
                     "state": binding.get("state"),
                     "query_task_ids": binding.get("query_task_ids"),
                     "query_task_ids_sha256": binding.get("query_task_ids_sha256"),
+                    # C-122 round-19 (gap 4): the FULL business summary fields —
+                    # the checkpoint model's ``_run_summary`` digest recomputes
+                    # ``run_summary_sha256`` from these exact fields, so a
+                    # doctored summary (wrong source-task count, flipped
+                    # completion flag) can never pass with a copied digest.
+                    "run_purpose": binding.get("run_purpose"),
+                    "finalization_state": binding.get("finalization_state"),
+                    "decision_state": binding.get("decision_state"),
+                    "source_task_count": binding.get("source_task_count"),
+                    "exploration_seal_passed": binding.get("exploration_seal_passed"),
+                    "all_platforms_complete": binding.get("all_platforms_complete"),
+                    "failure_class": binding.get("failure_class"),
                     "run_summary_sha256": binding.get("run_summary_sha256"),
                     "captured_at": binding.get("captured_at"),
                     "checkpoint_sha256": binding.get("checkpoint_sha256"),
@@ -3768,6 +3856,13 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
         "event_injection_contract": payload.get("event_injection_contract"),
         "api_payload_candidate_set_sha256": payload.get(
             "api_payload_candidate_set_sha256"
+        ),
+        # C-122 round-19 (gap 4): the compact also carries the raw request
+        # payload's own SHA (``request_identity.api_payload_sha256``), so the
+        # checkpoint binding's request identity is bound to the ACTUAL API
+        # payload the run submitted — not merely a self-declared request SHA.
+        "api_payload_sha256": (payload.get("request_identity") or {}).get(
+            "api_payload_sha256"
         ),
         "scenario_sha256": payload.get("scenario_sha256"),
         "runtime_before_run": {
@@ -3860,8 +3955,15 @@ def _evidence_manifest(
     Never carries the absolute host ``toplevel`` (C-122 round-18 gate-6): a
     committed artifact must not reveal the host filesystem layout, so the
     manifest names only repo-relative identifiers and hashes.
+
+    C-122 round-19 (02:56 supervision / gap 3): the generated manifest is
+    validated by the SAME canonical validator the publish preflight and the
+    resolver use, so a manifest that generation itself builds but that violates
+    the canonical contract — a missing/renamed/smuggled evidence entry, a
+    relocated ``tracked_path`` or a flipped ``committed`` flag — fails closed at
+    generation time instead of being written and caught later.
     """
-    return {
+    manifest = {
         "schema_version": _MANIFEST_SCHEMA,
         "tested_commit_sha": report.tested_commit_sha,
         "run_id": report.run_id,
@@ -3874,6 +3976,16 @@ def _evidence_manifest(
             "6_full_e2e": _live_e2e_manifest(staging_dir),
         },
     }
+    problems: list[str] = []
+    _validate_evidence_manifest(
+        manifest, label="evidence manifest generation", problems=problems
+    )
+    if problems:
+        raise GateStateChangedError(
+            "generated evidence manifest violates the canonical contract: "
+            f"{problems[0]}"
+        )
+    return manifest
 
 
 def _write_manifest(manifest: dict[str, Any], target: Path) -> Path:
@@ -3892,6 +4004,123 @@ def _write_manifest(manifest: dict[str, Any], target: Path) -> Path:
         ),
         mode=0o600,
     )
+
+
+def _validate_evidence_manifest(
+    manifest: object,
+    *,
+    label: str,
+    problems: list[str],
+) -> None:
+    """The SINGLE canonical evidence-manifest structural validator (C-122
+    round-19 02:56 supervision / gap 3).
+
+    Generation (``_evidence_manifest``), the E/P publish preflight
+    (``_verify_evidence_contract``) and the resolver (``verify_gate_ref``) all
+    enforce the manifest contract through THIS one function, so publish-side and
+    resolver-side can never disagree on a renamed / missing / smuggled evidence
+    file, a relocated ``tracked_path`` or a flipped ``committed`` flag.
+
+    Enforces the STRUCTURAL contract only — nothing git-coupled:
+      * top-level ``schema_version`` is exactly ``_MANIFEST_SCHEMA`` with the
+        required binding fields (``tested_commit_sha`` / ``run_id`` / ``files``
+        / ``layer_verdicts``) present;
+      * ``files`` is a list of objects with the EXACT field set
+        {name, tracked_path, sha256, size_bytes, committed};
+      * file names are unique and the name set is EXACTLY the fixed
+        ``_EVIDENCE_TRACKED_PATHS`` set — never derived from whatever happens
+        to exist in a staging dir (the gap-3 flaw in the publish preflight);
+      * each entry's ``tracked_path`` is the canonical path for that name and
+        ``committed`` is the canonical ``_EVIDENCE_COMMITTED_CONTRACT`` flag;
+      * per-file ``sha256`` is a valid 64-hex digest, ``size_bytes`` a real int.
+
+    Git-coupled recomputes (blob sha256 / size, presence in E's tree, secret
+    re-scans) are the callers' job, run AFTER this returns.  Appends a
+    ``problems`` entry per violation; never raises.
+    """
+    if not isinstance(manifest, dict):
+        problems.append(f"{label} is not an object")
+        return
+    if manifest.get("schema_version") != _MANIFEST_SCHEMA:
+        problems.append(
+            f"{label} schema_version {manifest.get('schema_version')!r} != "
+            f"{_MANIFEST_SCHEMA}"
+        )
+    for key in ("tested_commit_sha", "run_id", "files", "layer_verdicts"):
+        if key not in manifest:
+            problems.append(f"{label} missing required field {key!r}")
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        problems.append(f"{label} files field is not a list")
+        return
+    fixed_names = {staged_name for staged_name, _ in _EVIDENCE_TRACKED_PATHS}
+    canonical_tracked = dict(_EVIDENCE_TRACKED_PATHS)
+    seen: set[str] = set()
+    for entry in files:
+        if not isinstance(entry, dict):
+            problems.append(f"{label} has a non-object file entry")
+            continue
+        if set(entry) != {"name", "tracked_path", "sha256", "size_bytes", "committed"}:
+            problems.append(
+                f"{label} file entry has an unexpected field set {sorted(entry)}"
+            )
+        entry_name = entry.get("name")
+        entry_sha = entry.get("sha256")
+        entry_size = entry.get("size_bytes")
+        entry_committed = entry.get("committed")
+        if not isinstance(entry_name, str) or not entry_name:
+            problems.append(f"{label} has a file with no name")
+            continue
+        if entry_name in seen:
+            problems.append(f"{label} repeats file name {entry_name!r}")
+        seen.add(entry_name)
+        if entry_name not in fixed_names:
+            problems.append(
+                f"{label} file {entry_name!r} is not a fixed evidence-contract name"
+            )
+        else:
+            canonical_rel = canonical_tracked[entry_name]
+            entry_rel = entry.get("tracked_path")
+            if entry_rel != canonical_rel:
+                problems.append(
+                    f"{label} file {entry_name!r} tracked_path {entry_rel!r} != "
+                    f"the canonical contract {canonical_rel!r} (relocated)"
+                )
+            expected_committed = _EVIDENCE_COMMITTED_CONTRACT[entry_name]
+            if entry_committed != expected_committed:
+                problems.append(
+                    f"{label} file {entry_name!r} committed {entry_committed!r} != "
+                    f"the canonical contract {expected_committed!r} (committed "
+                    "flag flipped)"
+                )
+        if (
+            not isinstance(entry_sha, str)
+            or _HEX_HASH_RE.fullmatch(entry_sha) is None
+            or len(entry_sha) != 64
+        ):
+            problems.append(
+                f"{label} file {entry_name!r} sha256 is not a valid 64-hex digest"
+            )
+        if not isinstance(entry_size, int) or isinstance(entry_size, bool):
+            problems.append(
+                f"{label} file {entry_name!r} size_bytes is not an integer"
+            )
+        if not isinstance(entry_committed, bool):
+            problems.append(
+                f"{label} file {entry_name!r} committed is not a boolean"
+            )
+    if seen != fixed_names:
+        problems.append(
+            f"{label} file-name set {sorted(seen)} != the fixed evidence "
+            f"contract set {sorted(fixed_names)}"
+        )
+    verdicts = manifest.get("layer_verdicts")
+    if not isinstance(verdicts, dict):
+        problems.append(f"{label} layer_verdicts field must be an object")
+    else:
+        for key in ("5_real_canary", "6_full_e2e"):
+            if key not in verdicts:
+                problems.append(f"{label} layer_verdicts missing {key!r}")
 
 
 # Fixed required raw-evidence inputs the gate must certify before any committed
@@ -4254,7 +4483,12 @@ def _canonical_sha256(payload: object) -> str:
 
 
 def _verify_layer6_checkpoint_binding(
-    tracked_rel: str, check_name: str, evidence: dict[str, Any], pair_ids: list[Any]
+    tracked_rel: str,
+    check_name: str,
+    evidence: dict[str, Any],
+    pair_ids: list[Any],
+    *,
+    api_payload_sha256: str | None = None,
 ) -> None:
     """C-122 supervision 18:13 (Fix 4): independently verify the compact's
     checkpoint binding — chain integrity, date window, request identity and
@@ -4270,7 +4504,17 @@ def _verify_layer6_checkpoint_binding(
       - the chain digest recomputes from the ordered list,
       - each binding's dates must satisfy the canonical frozen time contract
         (shared with Fix 1) and agree with the pair id's own embedded dates,
-      - every binding shares ONE request identity (the run's request SHA),
+      - every binding shares ONE request identity (the run's request SHA), and
+        when the compact carries ``api_payload_sha256`` that identity is bound
+        to the raw request payload's own SHA (C-122 round-19 gap 4),
+      - each binding is a ``completed`` checkpoint and the bindings cover
+        EXACTLY the frozen pair count with the canonical per-group query-task
+        set — a non-completed checkpoint, a 2/4-group chain or a foreign query
+        member cannot certify a passing gate,
+      - each ``run_summary_sha256`` RECOMPUTES from the binding's carried
+        business-summary fields via the checkpoint model's authoritative
+        ``_run_summary`` digest — a doctored summary with a copied digest fails
+        closed (C-122 round-19 gap 4),
       - each ``checkpoint_sha256`` recomputes from the binding's own carried
         fields using the checkpoint model's authoritative digest — a
         same-raw self-consistent forgery that copies a producer's digests
@@ -4291,6 +4535,43 @@ def _verify_layer6_checkpoint_binding(
             f"evidence commit E layer-6 compact {tracked_rel} check "
             f"{check_name!r} checkpoint_binding bindings do not cover exactly "
             "the frozen pair set"
+        )
+    # C-122 round-19 (gap 4): the checkpoint binding must cover EXACTLY the
+    # frozen live-v4 pair count — a 2-group / 4-group chain cannot be the
+    # sealed three-date-pair execution even when it is internally consistent.
+    if len(bindings) != _V4_FROZEN_DATE_PAIR_COUNT:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} check "
+            f"{check_name!r} checkpoint_binding has {len(bindings)} bindings != "
+            f"the frozen scenario's exact {_V4_FROZEN_DATE_PAIR_COUNT} date pairs"
+        )
+    # C-122 supervision 03:46 (Block 3): the binding's own PASSED/COUNT record
+    # must certify a completed, exactly-three-group seal — a ``passed=false`` or
+    # ``count=999`` claim is a forged header no matter how well-formed the
+    # bindings list is.  ``count`` must agree with the verified binding count
+    # (and therefore with the frozen pair count) rather than being re-derived.
+    if binding.get("passed") is not True:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} check "
+            f"{check_name!r} checkpoint_binding passed "
+            f"{binding.get('passed')!r} != true (a non-passing checkpoint "
+            "seal cannot certify a passing gate)"
+        )
+    # C-122 supervision 04:14: ``count`` must be a STRICT JSON integer equal to
+    # the frozen pair count — ``!=`` alone would accept ``3.0`` (``3.0 != 3`` is
+    # False) and ``True`` (``True == 1``), and a string ``"3"`` is not an int.
+    # Reject bool / float / string explicitly, fail-closed.
+    count = binding.get("count")
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or count != _V4_FROZEN_DATE_PAIR_COUNT
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} check "
+            f"{check_name!r} checkpoint_binding count "
+            f"{count!r} != the frozen scenario's exact "
+            f"{_V4_FROZEN_DATE_PAIR_COUNT} date pairs"
         )
     ordered = binding.get("ordered_checkpoint_sha256")
     if (
@@ -4390,7 +4671,7 @@ def _verify_layer6_checkpoint_binding(
                 f"evidence commit E layer-6 compact {tracked_rel} check "
                 f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
                 "has unparsable departure/return dates"
-            )
+            ) from None
         if not frozen_v4_pair_id_dates_canonical(departure, return_d):
             raise GateStateChangedError(
                 f"evidence commit E layer-6 compact {tracked_rel} check "
@@ -4418,6 +4699,28 @@ def _verify_layer6_checkpoint_binding(
                 f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
                 "request_sha256 does not match the binding's request identity"
             )
+        # C-122 round-19 (gap 4): the binding's request identity must ALSO bind
+        # to the compact's carried ``api_payload_sha256`` (the raw request
+        # payload the run submitted).  A chain whose request SHA is not the
+        # compact's API-payload SHA is a foreign request-payload binding.
+        if api_payload_sha256 is not None and entry_request != api_payload_sha256:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "request_sha256 does not bind to the compact's "
+                "api_payload_sha256 (foreign request-payload binding)"
+            )
+        # C-122 round-19 (gap 4): only a COMPLETED checkpoint can certify a
+        # passing gate — a failed / pending checkpoint with a passing verdict is
+        # a forged seal no matter how well-formed its digests are.
+        entry_state = entry.get("state")
+        if entry_state != "completed":
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                f"state {entry_state!r} != 'completed' (a non-completed "
+                "checkpoint cannot certify a passing gate)"
+            )
         # Content recomputation (C-122 supervision 18:13 same-raw forgery): each
         # ``checkpoint_sha256`` must RECOMPUTE from the binding's own carried
         # fields via the checkpoint model's authoritative digest.  A compact
@@ -4439,6 +4742,24 @@ def _verify_layer6_checkpoint_binding(
                     f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
                     f"missing {key}"
                 )
+        # C-122 round-19 (gap 4): the full business-summary fields must be
+        # carried so ``run_summary_sha256`` is independently recomputable —
+        # a binding that drops the summary fields is not a reviewable checkpoint.
+        for key in (
+            "run_purpose",
+            "finalization_state",
+            "decision_state",
+            "source_task_count",
+            "exploration_seal_passed",
+            "all_platforms_complete",
+            "failure_class",
+        ):
+            if key not in entry:
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                    f"missing {key}"
+                )
         query_ids = entry.get("query_task_ids")
         if not isinstance(query_ids, list) or not query_ids:
             raise GateStateChangedError(
@@ -4451,6 +4772,43 @@ def _verify_layer6_checkpoint_binding(
                 f"evidence commit E layer-6 compact {tracked_rel} check "
                 f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
                 "query_task_ids_sha256 does not recompute from query_task_ids"
+            )
+        # C-122 round-19 (gap 4): the per-group query-task set must be EXACTLY
+        # the canonical frozen graph's browser Source-id set.  A binding with a
+        # foreign / missing / swapped query member is not the frozen per-pair
+        # plan — even when the digest chain is internally consistent.
+        if set(query_ids) != _V4_FROZEN_BROWSER_SOURCE_IDS:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "query_task_ids member set != the canonical frozen graph "
+                "browser Source-id set (foreign, missing or swapped member)"
+            )
+        # C-122 round-19 (gap 4): the full business-summary recompute —
+        # ``run_summary_sha256`` must RECOMPUTE from the binding's carried
+        # summary fields via the checkpoint model's authoritative ``_run_summary``
+        # digest.  A doctored summary (wrong source-task count, flipped
+        # completion flag) with a copied digest fails closed here.
+        run_summary_recomputed = LivePlanningPairCheckpoint._digest(
+            LivePlanningPairCheckpoint._run_summary(
+                {
+                    "state": entry_state,
+                    "run_purpose": entry.get("run_purpose"),
+                    "finalization_state": entry.get("finalization_state"),
+                    "decision_state": entry.get("decision_state"),
+                    "source_task_count": entry.get("source_task_count"),
+                    "exploration_seal_passed": entry.get("exploration_seal_passed"),
+                    "all_platforms_complete": entry.get("all_platforms_complete"),
+                    "failure_class": entry.get("failure_class"),
+                }
+            )
+        )
+        if run_summary_recomputed != entry.get("run_summary_sha256"):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "run_summary_sha256 does not recompute from its carried "
+                "run-summary fields (doctored summary or copied digest)"
             )
         checkpoint_summary = LivePlanningPairCheckpoint._checkpoint_summary(
             {
@@ -4482,7 +4840,11 @@ def _verify_layer6_checkpoint_binding(
 
 
 def _verify_layer6_check_semantics(
-    tracked_rel: str, check_name: str, evidence: dict[str, Any]
+    tracked_rel: str,
+    check_name: str,
+    evidence: dict[str, Any],
+    *,
+    api_payload_sha256: str | None = None,
 ) -> None:
     """C-122 acceptance: a passing check's compacted evidence must be
     semantically consistent with its verdict — never just field-presence."""
@@ -4815,9 +5177,15 @@ def _verify_layer6_check_semantics(
         # re-verify chain integrity / the canonical date window / the request
         # identity / per-checkpoint content — a reordered chain, a wrong date, a
         # wrong request or a same-raw copied-digest forgery fails closed even
-        # when every id is canonical and the set matches.
+        # when every id is canonical and the set matches.  C-122 round-19
+        # (gap 4): the binding's request identity is additionally bound to the
+        # compact's ``api_payload_sha256`` when the compact carries it.
         _verify_layer6_checkpoint_binding(
-            tracked_rel, check_name, evidence, pair_ids
+            tracked_rel,
+            check_name,
+            evidence,
+            pair_ids,
+            api_payload_sha256=api_payload_sha256,
         )
         # The per-pair breakdown must cover EXACTLY the frozen pair set, with the
         # exact producer-consistent per-pair task counts.
@@ -5216,6 +5584,20 @@ def _verify_layer6_compact_contract(
             f"evidence commit E layer-6 compact {tracked_rel} required check "
             "names do not match the fifteen done-gate checks"
         )
+    # C-122 round-19 (gap 4): the compact must carry the raw request payload's
+    # own SHA — a missing / malformed api_payload_sha256 voids the checkpoint
+    # binding's request identity (the producer names it in request_identity).
+    api_payload_sha = compact.get("api_payload_sha256")
+    if (
+        api_payload_sha is None
+        or not isinstance(api_payload_sha, str)
+        or _HEX_HASH_RE.fullmatch(api_payload_sha) is None
+        or len(api_payload_sha) != 64
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} api_payload_sha256 "
+            "is missing or not a valid sha256"
+        )
     # C-122 Fix 3: every check must carry its desensitized, recomputable
     # per-item structured evidence, and each check's binding fields must be
     # present — a compact that reduces a check to a bare verdict (empty or
@@ -5257,11 +5639,16 @@ def _verify_layer6_compact_contract(
         # C-122 acceptance: semantic consistency of each passing check — the
         # recorded evidence must prove the verdict, not merely exist.
         if isinstance(name, str):
-            _verify_layer6_check_semantics(tracked_rel, name, item_evidence)
+            _verify_layer6_check_semantics(
+                tracked_rel, name, item_evidence, api_payload_sha256=api_payload_sha
+            )
     # Recomputable SHA bindings: the candidate-set SHA and the scenario SHA are
     # REQUIRED and must be well-formed 64-hex (a missing binding voids the
     # compact), and the prefrozen-candidate binding in the compact must agree
-    # with the report's top-level api_payload_candidate_set_sha256.
+    # with the report's top-level api_payload_candidate_set_sha256.  C-122
+    # round-19 (gap 4): the compact must ALSO carry the raw request payload's
+    # own SHA so the checkpoint binding's request identity is bound to the
+    # actual API payload the run submitted.
     candidate_sha = compact.get("api_payload_candidate_set_sha256")
     if (
         candidate_sha is None
@@ -5608,26 +5995,20 @@ def _verify_evidence_contract(
         raise GateStateChangedError(
             f"evidence commit E manifest {_MANIFEST_REL} is not an object"
         )
-    # C-122 round-18 gate-4: the manifest schema_version must be EXACT, not just
-    # present — a forged or pre-release manifest converges to a gate failure.
-    if manifest.get("schema_version") != _MANIFEST_SCHEMA:
-        raise GateStateChangedError(
-            f"evidence commit E manifest schema_version "
-            f"{manifest.get('schema_version')!r} != {_MANIFEST_SCHEMA}"
-        )
-    # Field-completeness of the committed manifest itself: it must carry the
-    # contract's required keys AND bind S + run_id.
-    for key in (
-        "schema_version",
-        "tested_commit_sha",
-        "run_id",
-        "files",
-        "layer_verdicts",
-    ):
-        if key not in manifest:
-            raise GateStateChangedError(
-                f"evidence commit E manifest missing required field {key!r}"
-            )
+    # C-122 round-19 (02:56 supervision / gap 3): the E manifest's STRUCTURAL
+    # contract — schema_version, required fields, per-file field set / types /
+    # uniqueness, the EXACT fixed evidence file-name set (never derived from
+    # whatever happens to exist in a staging dir), the canonical tracked_path
+    # and the canonical committed flag — is enforced by the SINGLE canonical
+    # validator shared with generation and the resolver.  Publish-side and
+    # resolver-side can no longer disagree on a renamed / missing / smuggled
+    # evidence file, a relocated path or a flipped committed flag.
+    manifest_problems: list[str] = []
+    _validate_evidence_manifest(
+        manifest, label="evidence commit E manifest", problems=manifest_problems
+    )
+    if manifest_problems:
+        raise GateStateChangedError(manifest_problems[0])
     if manifest.get("tested_commit_sha") != tested_commit_sha:
         raise GateStateChangedError(
             "evidence commit E manifest tested_commit_sha does not bind the "
@@ -5637,91 +6018,10 @@ def _verify_evidence_contract(
         raise GateStateChangedError(
             "evidence commit E manifest run_id does not bind the run"
         )
-    files = manifest["files"]
-    if not isinstance(files, list):
-        raise GateStateChangedError(
-            "evidence commit E manifest files field must be a list"
-        )
-    # Gate-4: every file entry must be a well-formed object with the exact
-    # fixed field set, unique names, and a valid 64-hex hash.  ``files=[None]``
-    # / a fake entry / a duplicate name all converge to a gate failure.
-    seen_names: set[str] = set()
-    for entry in files:
-        if not isinstance(entry, dict):
-            raise GateStateChangedError(
-                "evidence commit E manifest has a non-object file entry"
-            )
-        if set(entry) != {"name", "tracked_path", "sha256", "size_bytes", "committed"}:
-            raise GateStateChangedError(
-                f"evidence commit E manifest file entry has an unexpected field "
-                f"set {sorted(entry)}"
-            )
-        entry_name = entry["name"]
-        tracked_path = entry["tracked_path"]
-        entry_sha = entry["sha256"]
-        entry_size = entry["size_bytes"]
-        entry_committed = entry["committed"]
-        if not isinstance(entry_name, str) or not entry_name:
-            raise GateStateChangedError(
-                "evidence commit E manifest file entry has no valid name"
-            )
-        if entry_name in seen_names:
-            raise GateStateChangedError(
-                f"evidence commit E manifest repeats file name {entry_name!r} "
-                "(file names must be unique)"
-            )
-        seen_names.add(entry_name)
-        if not isinstance(tracked_path, str) or not tracked_path:
-            raise GateStateChangedError(
-                f"evidence commit E manifest file {entry_name!r} has no "
-                "tracked_path"
-            )
-        if (
-            not isinstance(entry_sha, str)
-            or _HEX_HASH_RE.fullmatch(entry_sha) is None
-            or len(entry_sha) != 64
-        ):
-            raise GateStateChangedError(
-                f"evidence commit E manifest file {entry_name!r} sha256 is not "
-                "a valid 64-hex digest"
-            )
-        if not isinstance(entry_size, int) or isinstance(entry_size, bool):
-            raise GateStateChangedError(
-                f"evidence commit E manifest file {entry_name!r} size_bytes is "
-                "not an integer"
-            )
-        if not isinstance(entry_committed, bool):
-            raise GateStateChangedError(
-                f"evidence commit E manifest file {entry_name!r} committed is "
-                "not a boolean"
-            )
     # Gate-3: recompute every manifest hash from the CURRENT staging bytes — a
     # raw/compact/report that changed after the manifest was written fails
     # closed here instead of publishing a stale hash.
     _verify_manifest_recomputes(staging_dir, manifest, "evidence commit E")
-    # Gate-4: the manifest's file-name set must be exactly the set of staged
-    # tracked evidence that exists right now — no phantom entries, no missing
-    # staged file silently dropped from the trail.
-    expected_names = {
-        staged_name
-        for staged_name, _ in _EVIDENCE_TRACKED_PATHS
-        if (staging_dir / staged_name).is_file()
-    }
-    if seen_names != expected_names:
-        raise GateStateChangedError(
-            "evidence commit E manifest file-name set "
-            f"{sorted(seen_names)} != the staged evidence set {sorted(expected_names)}"
-        )
-    verdicts = manifest["layer_verdicts"]
-    if not isinstance(verdicts, dict):
-        raise GateStateChangedError(
-            "evidence commit E manifest layer_verdicts field must be an object"
-        )
-    for key in ("5_real_canary", "6_full_e2e"):
-        if key not in verdicts:
-            raise GateStateChangedError(
-                f"evidence commit E manifest layer_verdicts missing {key!r}"
-            )
     for entry in manifest["files"]:
         if not entry["committed"]:
             continue
@@ -5927,6 +6227,24 @@ def _verify_pointer_committed_blobs(
         raise GateStateChangedError(
             "pointer commit P manifest run_id does not bind the run"
         )
+    # C-122 supervision 03:46 (Block 2): P's publish preflight must enforce the
+    # SAME canonical manifest contract as generation, E's preflight and the
+    # resolver — a P phase that relocates a ``tracked_path``, flips a
+    # ``committed`` flag, renames / drops / smuggles an evidence file or carries
+    # an unbound sha256/size must fail closed here, not be certified and then
+    # rejected by the official resolver.  The structural contract (schema,
+    # exact file-name set, canonical name→tracked_path→committed map, per-file
+    # sha256/size) is enforced by ``_validate_evidence_manifest``; the
+    # S/E/run_id bindings above and the git-coupled blob recomputes below remain
+    # the caller's job.
+    manifest_problems: list[str] = []
+    _validate_evidence_manifest(
+        committed_manifest,
+        label="pointer commit P manifest",
+        problems=manifest_problems,
+    )
+    if manifest_problems:
+        raise GateStateChangedError(manifest_problems[0])
     # Gate-3: recompute every P-manifest file hash from the CURRENT staging
     # bytes — a raw/compact that changed after the phase-2 manifest was written
     # fails closed here instead of publishing a stale hash.
@@ -6817,42 +7135,24 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
                 )
             except GateStateChangedError as exc:
                 problems.append(str(exc))
-            if p_manifest.get("schema_version") != _MANIFEST_SCHEMA:
-                problems.append(
-                    f"pointer commit P manifest schema_version "
-                    f"{p_manifest.get('schema_version')!r} != {_MANIFEST_SCHEMA}"
-                )
             if p_manifest.get("tested_commit_sha") != tested_commit_sha:
                 problems.append("pointer commit P manifest tested_commit_sha does not bind S")
             if p_manifest.get("evidence_commit") != evidence_commit:
                 problems.append("pointer commit P manifest evidence_commit does not bind E")
             if p_manifest.get("run_id") != run_id:
                 problems.append("pointer commit P manifest run_id does not bind the run")
-            # C-122 HG-H: the P manifest's file contract must be EXACT — the
+            # C-122 round-19 (02:56 supervision / gap 3): the P manifest's
+            # STRUCTURAL contract — schema_version, required fields, the EXACT
             # fixed evidence file-name set, unique names, valid per-file
-            # sha256/size/committed fields.  A P manifest that smuggles an extra
-            # file entry (or drops / renames one) is a forged pointer commit.
-            p_files = p_manifest.get("files")
-            if not isinstance(p_files, list):
-                problems.append("pointer commit P manifest files field is not a list")
-            else:
-                _verify_manifest_files_contract(
-                    p_files, problems, "pointer commit P manifest"
-                )
-                p_seen = {
-                    entry["name"]
-                    for entry in p_files
-                    if isinstance(entry, dict) and isinstance(entry.get("name"), str)
-                }
-                p_fixed_names = {
-                    staged_name for staged_name, _ in _EVIDENCE_TRACKED_PATHS
-                }
-                if p_seen != p_fixed_names:
-                    problems.append(
-                        f"pointer commit P manifest file-name set "
-                        f"{sorted(p_seen)} != the fixed evidence contract set "
-                        f"{sorted(p_fixed_names)}"
-                    )
+            # sha256/size/committed fields AND the canonical tracked_path /
+            # committed flag per name — is enforced by the SAME canonical
+            # validator as E's publish preflight and the E resolver.  A P
+            # manifest that smuggles an extra file entry (or drops / renames
+            # one / relocates a path / flips a committed flag) is a forged
+            # pointer commit.
+            _validate_evidence_manifest(
+                p_manifest, label="pointer commit P manifest", problems=problems
+            )
         # 3. E's committed manifest is the COMPLETE publisher contract (C-122
         # HG-C): it binds S / run_id, lists exactly the fixed evidence file set
         # with the exact field set and per-file size, records every committed
@@ -6877,84 +7177,39 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
                 )
             except GateStateChangedError as exc:
                 problems.append(str(exc))
-            if e_manifest.get("schema_version") != _MANIFEST_SCHEMA:
-                problems.append(
-                    f"evidence commit E manifest schema_version "
-                    f"{e_manifest.get('schema_version')!r} != {_MANIFEST_SCHEMA}"
-                )
             if e_manifest.get("tested_commit_sha") != tested_commit_sha:
                 problems.append("evidence commit E manifest tested_commit_sha does not bind S")
             if e_manifest.get("run_id") != run_id:
                 problems.append("evidence commit E manifest run_id does not bind the run")
-            verdicts = e_manifest.get("layer_verdicts")
-            if not isinstance(verdicts, dict) or not isinstance(
-                verdicts.get("5_real_canary"), dict
-            ) or not isinstance(verdicts.get("6_full_e2e"), dict):
-                problems.append(
-                    "evidence commit E manifest layer_verdicts missing "
-                    "5_real_canary / 6_full_e2e"
-                )
+            # C-122 round-19 (02:56 supervision / gap 3): the E manifest's
+            # STRUCTURAL contract — schema_version, required fields, per-file
+            # field set / types / uniqueness, the EXACT fixed evidence file-name
+            # set, the canonical tracked_path and the canonical committed flag —
+            # is enforced by the SAME canonical validator as generation and the
+            # publish preflight.  Resolver-side rejects exactly what publish-side
+            # rejects, so a renamed / missing / smuggled / relocated /
+            # flag-flipped evidence entry can never be published on one side and
+            # accepted on the other.
+            _validate_evidence_manifest(
+                e_manifest, label="evidence commit E manifest", problems=problems
+            )
             files = e_manifest.get("files")
-            if not isinstance(files, list):
-                problems.append("evidence commit E manifest files field is not a list")
-            else:
+            if isinstance(files, list):
                 e_tree = _git(
                     "ls-tree", "-r", "--name-only", evidence_commit, check=True
                 ).stdout.splitlines()
                 e_tree_set = set(e_tree)
-                seen: set[str] = set()
                 for entry in files:
                     if not isinstance(entry, dict):
-                        problems.append("evidence commit E manifest has a non-object file entry")
-                        continue
-                    if set(entry) != {
-                        "name",
-                        "tracked_path",
-                        "sha256",
-                        "size_bytes",
-                        "committed",
-                    }:
-                        problems.append(
-                            f"evidence commit E manifest file entry has an unexpected "
-                            f"field set {sorted(entry)}"
-                        )
+                        continue  # structural contract already flagged it
                     entry_name = entry.get("name")
                     entry_sha = entry.get("sha256")
                     entry_size = entry.get("size_bytes")
                     entry_committed = entry.get("committed")
                     if not isinstance(entry_name, str) or not entry_name:
-                        problems.append("evidence commit E manifest has a file with no name")
                         continue
-                    if entry_name in seen:
-                        problems.append(
-                            f"evidence commit E manifest repeats file name {entry_name!r}"
-                        )
-                    seen.add(entry_name)
-                    if (
-                        not isinstance(entry_sha, str)
-                        or _HEX_HASH_RE.fullmatch(entry_sha) is None
-                        or len(entry_sha) != 64
-                    ):
-                        problems.append(
-                            f"evidence commit E manifest file {entry_name!r} sha256 is not "
-                            "a valid 64-hex digest"
-                        )
-                    if not isinstance(entry_size, int) or isinstance(entry_size, bool):
-                        problems.append(
-                            f"evidence commit E manifest file {entry_name!r} size_bytes "
-                            "is not an integer"
-                        )
-                    if not isinstance(entry_committed, bool):
-                        problems.append(
-                            f"evidence commit E manifest file {entry_name!r} committed "
-                            "is not a boolean"
-                        )
                     rel = entry.get("tracked_path")
                     if not isinstance(rel, str) or not rel:
-                        problems.append(
-                            f"evidence commit E manifest file {entry_name!r} has no "
-                            "tracked_path"
-                        )
                         continue
                     if entry_committed is not True:
                         # Git-ignored raw evidence is listed by hash only.  Its
@@ -6999,88 +7254,18 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
                             )
                         except GateStateChangedError as exc:
                             problems.append(str(exc))
-                # C-122 HG-C: the manifest's file-name set must be EXACTLY the
-                # fixed evidence contract set — a trail that drops a required
-                # evidence file (raw, compact, report-adjacent) is incomplete.
-                fixed_names = {
-                    staged_name for staged_name, _ in _EVIDENCE_TRACKED_PATHS
-                }
-                if seen != fixed_names:
-                    problems.append(
-                        f"evidence commit E manifest file-name set {sorted(seen)} != "
-                        f"the fixed evidence contract set {sorted(fixed_names)}"
-                    )
                 # C-122 HG-C: required compacts — the layer-5/6 compact artifacts
                 # must be committed evidence, their strong contract verified from
                 # E's blob, and each compact's raw_evidence.sha256 cross-checked
-                # against the manifest's recorded hash for the raw file.
+                # against the manifest's recorded hash for the raw file.  The
+                # per-name tracked_path / committed binding is enforced by the
+                # canonical validator above, so the compact requirement below can
+                # trust ``by_name`` to carry the canonical paths and flags.
                 by_name = {
                     entry["name"]: entry
                     for entry in files
                     if isinstance(entry, dict) and isinstance(entry.get("name"), str)
                 }
-                # C-122 supervision 01:10 Block 2 counter-examples: the name SET
-                # is not the whole contract.  Every fixed evidence name must also
-                # carry its EXACT canonical tracked_path AND its canonical
-                # committed flag.  C-122 supervision 18:13 (规则漂移): the
-                # canonical committed flag is the FIXED authoritative contract,
-                # NEVER recomputed from the worktree ``.gitignore`` — an edited
-                # ignore rule must not flip the verification of an
-                # already-published S/E/P trail.  And every committed entry's
-                # sha256/size must recompute to the ACTUAL blob E committed (the
-                # per-entry loop above already recomputes against the entry's
-                # own path; the canonical binding below pins the path so a
-                # compact renamed / relocated, a raw committed-flag flip, or a
-                # wrong hash/size fails closed even when every individual field
-                # shape still reads correctly.
-                canonical_committed: dict[str, bool] = dict(
-                    _EVIDENCE_COMMITTED_CONTRACT
-                )
-                for staged_name, tracked_rel in _EVIDENCE_TRACKED_PATHS:
-                    entry = by_name.get(staged_name)
-                    if entry is None:
-                        problems.append(
-                            f"evidence commit E manifest missing fixed evidence "
-                            f"file {staged_name!r}"
-                        )
-                        continue
-                    actual_rel = entry.get("tracked_path")
-                    if actual_rel != tracked_rel:
-                        problems.append(
-                            f"evidence commit E manifest file {staged_name!r} "
-                            f"tracked_path {actual_rel!r} != the canonical "
-                            f"contract {tracked_rel!r} (relocated)"
-                        )
-                    expected_committed = canonical_committed[staged_name]
-                    actual_committed = entry.get("committed")
-                    if actual_committed != expected_committed:
-                        problems.append(
-                            f"evidence commit E manifest file {staged_name!r} "
-                            f"committed {actual_committed!r} != the canonical "
-                            f"contract {expected_committed!r} (committed flag "
-                            "flipped)"
-                        )
-                    if expected_committed and actual_rel == tracked_rel:
-                        canonical_blob = _git(
-                            "show",
-                            f"{evidence_commit}:{tracked_rel}",
-                            check=True,
-                            binary=True,
-                        )
-                        if hashlib.sha256(canonical_blob.stdout).hexdigest() != entry.get(
-                            "sha256"
-                        ):
-                            problems.append(
-                                f"evidence commit E manifest file {staged_name!r} "
-                                "sha256 does not match the committed blob at the "
-                                "canonical path"
-                            )
-                        if len(canonical_blob.stdout) != entry.get("size_bytes"):
-                            problems.append(
-                                f"evidence commit E manifest file {staged_name!r} "
-                                "size_bytes does not match the committed blob at "
-                                "the canonical path"
-                            )
                 for staged_name, tracked_rel in _EVIDENCE_TRACKED_PATHS:
                     if "compact" not in staged_name:
                         continue

@@ -158,6 +158,40 @@ _PAIR_ID_FORMAT_RE = re.compile(
 )
 
 
+def _is_frozen_v4_window(window: object) -> bool:
+    """True when ``window`` is the frozen live-v4 scenario's travel window.
+
+    C-122 supervision 02:56 (round-19 continuation): the frozen time contract
+    must be enforced in the REAL generation path — ``FlexibleDateExplorer._pair_id``
+    delegates to ``frozen_v4_pair_id`` exactly when this returns true.  The
+    API raises ``earliest_departure`` to the run-time
+    ``minimum_departure_lead_days`` boundary before exploration, so it is
+    allowed to differ from the canonical 2026-08-01 (any later date inside the
+    frozen window keeps the scenario identity); every OTHER contract field must
+    match exactly, so a foreign window (different city, night range, party, or
+    currency) keeps the generic pair-id generation and can never inherit the
+    frozen contract's digests.
+    """
+    frozen = _FROZEN_V4_TRAVEL_WINDOW
+    if not isinstance(window, FlexibleTravelWindow):
+        return False
+    if window is frozen:
+        return True
+    return (
+        window.origin == frozen.origin
+        and window.destination == frozen.destination
+        and window.origin_code == frozen.origin_code
+        and window.destination_code == frozen.destination_code
+        and window.earliest_departure >= frozen.earliest_departure
+        and window.latest_departure == frozen.latest_departure
+        and window.min_nights == frozen.min_nights
+        and window.max_nights == frozen.max_nights
+        and window.adults == frozen.adults
+        and window.rooms == frozen.rooms
+        and window.currency == frozen.currency
+    )
+
+
 def frozen_v4_pair_id_digest(departure: date, return_date: date) -> str:
     """Recompute the canonical 12-hex pair-id digest from the frozen window.
 

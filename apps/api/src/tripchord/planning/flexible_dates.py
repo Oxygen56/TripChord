@@ -699,6 +699,21 @@ class FlexibleDateExplorer:
         departure: date,
         return_date: date,
     ) -> str:
+        # C-122 supervision 02:56 (round-19 continuation): the frozen live-v4
+        # scenario's date-pair generation MUST route through the canonical
+        # ``frozen_v4_pair_id`` helper, which enforces the frozen time contract
+        # (2026-08 departure, return > departure, 5-8 nights) BEFORE the digest
+        # is computed — a 2030 departure / reversed dates / 1/9/10-night pair
+        # raises here at generation time, not only at acceptance.  Function-level
+        # import avoids a module cycle: ``frozen_graph`` derives its canonical
+        # sets FROM this module.
+        from tripchord.planning.frozen_graph import (
+            _is_frozen_v4_window,
+            frozen_v4_pair_id,
+        )
+
+        if _is_frozen_v4_window(window):
+            return frozen_v4_pair_id(departure, return_date)
         raw = (
             f"{window.origin}|{window.destination}|"
             f"{departure.isoformat()}|{return_date.isoformat()}|"
