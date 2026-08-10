@@ -77,8 +77,8 @@
 | `uv run python scripts/tests/run_tests_clean_env.py benchmarks/tests apps/browser-companion/tests` | 421 passed，退出码 0 |
 | `cd apps/web && npm test` | 24 passed，退出码 0 |
 | `uv run pytest apps/api/tests/test_icom_transfer.py` | 11 passed——`TRAVEL_DATE` 改为相对今天 +30 天（日期炸弹修复：旧的固定 2026-08-10 在当天到来后 departure 已过、转换被静默置 None） |
-| `launchctl kickstart -k gui/<uid>/com.tripchord.live-api` | 受控重启绑定**本提交（round-18 最终 HEAD）**，provenance 三哈希匹配、pid 存活（机器证据见 gate run 发布的 side-channel evidence 与最终结果评论） |
-| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence` | 从零重跑严格六层门，绑定 round-18 最终 HEAD；`passed=false` 与证据提交如实记录在最终结果评论 |
+| `launchctl kickstart -k gui/<uid>/com.tripchord.live-api` | 受控重启绑定**本提交（round-18 最终 HEAD）**，`/api/v1/agents/runtime` provenance 三哈希匹配、pid 存活（机器证据见 `/api/v1/agents/runtime` 与最终结果评论） |
+| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence` | 从零重跑严格六层门（run_id=`cb38768b287b`），测试 63847b5（round-18 六硬门修复提交，非最终 HEAD）；`passed=false`、`evidence_commit=null`、无 side-channel ref 发布；证据见 `.runtime/done-gate-evidence/gate-20260810T051411Z-cb38768b287b/product-v1-done-gate.json` |
 
 ## 当前可对外声明
 
