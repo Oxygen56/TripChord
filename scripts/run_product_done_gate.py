@@ -1540,6 +1540,13 @@ _BROWSER_OTA_PROVIDERS = frozenset(
     scope.split(":", 1)[0] for scope in _CERTIFIED_OTA_SCOPES
 )
 
+# C-122 HG-G: the frozen live-v4 scenario seals EXACTLY three date pairs, each
+# executing the same fixed per-pair browser-source / query-task / iCom-source
+# plan (mirror of the producer's ``len(run.pair_runs) != 3`` contract in
+# apps/api/src/tripchord/agents/live_done_gate_v4.py).  The layer-6 compact
+# validator uses this to reject a forged 1-pair / 1-task source graph.
+_V4_FROZEN_DATE_PAIR_COUNT = 3
+
 
 def _resolve_live_state_db(explicit: Path | None = None) -> Path:
     """The durable live-state SQLite file a live run must not pollute (C-114 R7).
@@ -2885,6 +2892,7 @@ _LAYER6_REQUIRED_EVIDENCE_FIELDS: dict[str, frozenset[str]] = {
             "expected_icom_task_ids",
             "pair_ids",
             "total_planned_task_count",
+            "per_pair",
         }
     ),
     "stage_aware_exploration_publication_contract": frozenset(
@@ -3043,6 +3051,17 @@ _LAYER6_EVIDENCE_SCHEMAS: dict[str, dict[str, Any]] = {
         "expected_icom_task_ids": {"_item": _EVIDENCE_SCALAR},
         "pair_ids": {"_item": _EVIDENCE_SCALAR},
         "total_planned_task_count": _EVIDENCE_SCALAR,
+        # C-122 HG-G: the frozen-scenario per-pair breakdown — every nested field
+        # is whitelisted so a forged 64-hex or an unknown nested binding cannot
+        # ride into the committed compact.
+        "per_pair": {
+            "_item": {
+                "pair_id": _EVIDENCE_SCALAR,
+                "browser_source_task_count": _EVIDENCE_SCALAR,
+                "query_task_count": _EVIDENCE_SCALAR,
+                "icom_source_task_count": _EVIDENCE_SCALAR,
+            }
+        },
     },
     "stage_aware_exploration_publication_contract": {
         "exploration_count": _EVIDENCE_SCALAR,
@@ -3918,7 +3937,6 @@ def _verify_layer6_check_semantics(
         for key, label in (
             ("expected_query_shapes", "expected_query_shapes"),
             ("expected_icom_task_ids", "expected_icom_task_ids"),
-            ("pair_ids", "pair_ids"),
         ):
             items = evidence.get(key)
             if not isinstance(items, list) or not items:
@@ -3931,6 +3949,93 @@ def _verify_layer6_check_semantics(
                     f"evidence commit E layer-6 compact {tracked_rel} check "
                     f"{check_name!r} {label} are not unique"
                 )
+        # C-122 HG-G: the frozen-scenario exact binding.  The producer seals the
+        # v4 source graph for EXACTLY the three frozen date pairs, with the SAME
+        # fixed per-pair browser-source/query-task count and the SAME iCom-source
+        # count on every pair, and declares ``total_planned_task_count`` as the
+        # sum of those per-pair query-task counts.  A compact that omits the
+        # per-pair breakdown, carries a 1-pair / 1-task graph, or declares a
+        # total that does not equal the per-pair sum is a forged graph and fails
+        # closed even though every field is non-empty / unique / positive.
+        pair_ids = evidence.get("pair_ids")
+        if not isinstance(pair_ids, list) or not pair_ids:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} pair_ids is empty"
+            )
+        if len(pair_ids) != len(set(pair_ids)):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} pair_ids are not unique"
+            )
+        if len(pair_ids) != _V4_FROZEN_DATE_PAIR_COUNT:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} pair_ids != the frozen scenario's exact "
+                f"{_V4_FROZEN_DATE_PAIR_COUNT} date pairs "
+                f"(got {len(pair_ids)})"
+            )
+        # The per-pair breakdown must cover EXACTLY the frozen pair set, with the
+        # exact producer-consistent per-pair task counts.
+        per_pair = evidence.get("per_pair")
+        if not isinstance(per_pair, list) or len(per_pair) != len(pair_ids):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} per_pair breakdown != the frozen pair set"
+            )
+        per_pair_ids: set[str] = set()
+        for entry in per_pair:
+            if not isinstance(entry, dict):
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{check_name!r} per_pair contains a non-object entry"
+                )
+            entry_pair_id = entry.get("pair_id")
+            if not isinstance(entry_pair_id, str) or not entry_pair_id:
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{check_name!r} per_pair entry has no pair_id"
+                )
+            if entry_pair_id in per_pair_ids:
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{check_name!r} per_pair repeats pair {entry_pair_id!r}"
+                )
+            per_pair_ids.add(entry_pair_id)
+            for key, label in (
+                ("browser_source_task_count", "browser source task count"),
+                ("query_task_count", "query task count"),
+            ):
+                count = entry.get(key)
+                if (
+                    not isinstance(count, int)
+                    or isinstance(count, bool)
+                    or count != expected_tasks
+                ):
+                    raise GateStateChangedError(
+                        f"evidence commit E layer-6 compact {tracked_rel} check "
+                        f"{check_name!r} pair {entry_pair_id!r} {label} != the "
+                        "frozen per-pair browser task count"
+                    )
+            icom_count = entry.get("icom_source_task_count")
+            if (
+                not isinstance(icom_count, int)
+                or isinstance(icom_count, bool)
+                or icom_count != len(evidence.get("expected_icom_task_ids") or ())
+            ):
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{check_name!r} pair {entry_pair_id!r} icom source task "
+                    "count != the frozen per-pair iCom task set size"
+                )
+        if per_pair_ids != set(pair_ids):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} per_pair ids != the frozen pair set"
+            )
+        # The declared total must be recomputable as the sum of the per-pair
+        # query-task counts — a graph claiming 1 pair / 1 task / total=1 can
+        # never satisfy this exact contract.
         total_planned = evidence.get("total_planned_task_count")
         if (
             not isinstance(total_planned, int)
@@ -3941,6 +4046,17 @@ def _verify_layer6_check_semantics(
                 f"evidence commit E layer-6 compact {tracked_rel} check "
                 f"{check_name!r} total_planned_task_count is not a positive "
                 "integer"
+            )
+        recomputed_total = sum(
+            entry.get("query_task_count", 0)
+            for entry in per_pair
+            if isinstance(entry, dict)
+        )
+        if total_planned != recomputed_total:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} total_planned_task_count {total_planned} != "
+                f"the per-pair query-task sum {recomputed_total}"
             )
     elif check_name == "stage_aware_exploration_publication_contract":
         # C-122 round-18 gate-2: the fixed stage contract — three sealed
@@ -4035,10 +4151,14 @@ def _verify_layer6_check_semantics(
                 f"{check_name!r} all_platforms_complete is not true"
             )
         coverage_mode = evidence.get("coverage_mode")
-        if not isinstance(coverage_mode, str) or not coverage_mode:
+        # C-122 HG-G: the strict-coverage receipt only ever records the STRICT
+        # coverage mode — a degraded / loose mode (or a missing / empty value)
+        # contradicts a passing strict-coverage check and fails closed, even
+        # when every other platform-completion field is present.
+        if coverage_mode != "strict":
             raise GateStateChangedError(
                 f"evidence commit E layer-6 compact {tracked_rel} check "
-                f"{check_name!r} coverage_mode is missing or empty"
+                f"{check_name!r} coverage_mode {coverage_mode!r} != 'strict'"
             )
     elif check_name == "icom_exploration_and_publication_evidence":
         # C-122 round-18 gate-2: the icom exploration coverage must be a TRUE
@@ -5503,6 +5623,60 @@ def _latest_gate_run_id() -> str:
     )
 
 
+def _verify_manifest_files_contract(
+    files: list[Any], problems: list[str], label: str
+) -> None:
+    """Validate one committed manifest's ``files`` list entry-by-entry.
+
+    C-122 HG-H: the P manifest is itself a committed artifact the consumer must
+    authenticate — this is the exact per-entry field contract the E manifest
+    already enforces (fixed field set, unique names, valid 64-hex sha256,
+    integer size, boolean committed).  A forged pointer commit whose manifest
+    smuggles a secret-looking field name, drops a fixed file or renames an entry
+    fails closed here.  Appends a ``problems`` entry per violation; never raises.
+    """
+    seen: set[str] = set()
+    for entry in files:
+        if not isinstance(entry, dict):
+            problems.append(f"{label} has a non-object file entry")
+            continue
+        if set(entry) != {"name", "tracked_path", "sha256", "size_bytes", "committed"}:
+            problems.append(
+                f"{label} file entry has an unexpected field set {sorted(entry)}"
+            )
+        entry_name = entry.get("name")
+        entry_sha = entry.get("sha256")
+        entry_size = entry.get("size_bytes")
+        entry_committed = entry.get("committed")
+        if not isinstance(entry_name, str) or not entry_name:
+            problems.append(f"{label} has a file with no name")
+            continue
+        if entry_name in seen:
+            problems.append(f"{label} repeats file name {entry_name!r}")
+        seen.add(entry_name)
+        if (
+            not isinstance(entry_sha, str)
+            or _HEX_HASH_RE.fullmatch(entry_sha) is None
+            or len(entry_sha) != 64
+        ):
+            problems.append(
+                f"{label} file {entry_name!r} sha256 is not a valid 64-hex digest"
+            )
+        if not isinstance(entry_size, int) or isinstance(entry_size, bool):
+            problems.append(
+                f"{label} file {entry_name!r} size_bytes is not an integer"
+            )
+        if not isinstance(entry_committed, bool):
+            problems.append(
+                f"{label} file {entry_name!r} committed is not a boolean"
+            )
+        rel = entry.get("tracked_path")
+        if not isinstance(rel, str) or not rel:
+            problems.append(
+                f"{label} file {entry_name!r} has no tracked_path"
+            )
+
+
 def verify_gate_ref(run_id: str) -> dict[str, Any]:
     """Machine-gate consumer entry: resolve and verify a published evidence trail.
 
@@ -5665,9 +5839,25 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
                 problems.append(
                     "pointer commit P report layer set != the six fixed layer names"
                 )
-        # 2. P's committed manifest binds S / E / run_id (exact schema).
+        # 2. P's committed manifest binds S / E / run_id (exact schema) AND is
+        # itself re-scanned from its committed bytes for a credential field name /
+        # unknown 64-hex value (C-122 HG-H).  The P manifest is a committed
+        # artifact that a hijacked publish can reach — the consumer must not
+        # trust the publish-time scan alone.
         p_manifest = _committed_json_blob(pointer_commit, _MANIFEST_REL, problems, "P manifest")
         if isinstance(p_manifest, dict):
+            p_manifest_blob = _git(
+                "show", f"{pointer_commit}:{_MANIFEST_REL}", check=True, binary=True
+            ).stdout
+            try:
+                _reject_credential_field_names(
+                    p_manifest_blob, "committed evidence", _MANIFEST_REL
+                )
+                _reject_unknown_64hex_values(
+                    p_manifest_blob, "committed evidence", _MANIFEST_REL
+                )
+            except GateStateChangedError as exc:
+                problems.append(str(exc))
             if p_manifest.get("schema_version") != _MANIFEST_SCHEMA:
                 problems.append(
                     f"pointer commit P manifest schema_version "
@@ -5679,6 +5869,31 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
                 problems.append("pointer commit P manifest evidence_commit does not bind E")
             if p_manifest.get("run_id") != run_id:
                 problems.append("pointer commit P manifest run_id does not bind the run")
+            # C-122 HG-H: the P manifest's file contract must be EXACT — the
+            # fixed evidence file-name set, unique names, valid per-file
+            # sha256/size/committed fields.  A P manifest that smuggles an extra
+            # file entry (or drops / renames one) is a forged pointer commit.
+            p_files = p_manifest.get("files")
+            if not isinstance(p_files, list):
+                problems.append("pointer commit P manifest files field is not a list")
+            else:
+                _verify_manifest_files_contract(
+                    p_files, problems, "pointer commit P manifest"
+                )
+                p_seen = {
+                    entry["name"]
+                    for entry in p_files
+                    if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+                }
+                p_fixed_names = {
+                    staged_name for staged_name, _ in _EVIDENCE_TRACKED_PATHS
+                }
+                if p_seen != p_fixed_names:
+                    problems.append(
+                        f"pointer commit P manifest file-name set "
+                        f"{sorted(p_seen)} != the fixed evidence contract set "
+                        f"{sorted(p_fixed_names)}"
+                    )
         # 3. E's committed manifest is the COMPLETE publisher contract (C-122
         # HG-C): it binds S / run_id, lists exactly the fixed evidence file set
         # with the exact field set and per-file size, records every committed
@@ -5933,6 +6148,45 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
                                     "raw_evidence.sha256 does not match the "
                                     "manifest's recorded hash for the raw file"
                                 )
+        # C-122 HG-H: P must be E plus ONLY the report/manifest re-stamp — no
+        # extra blob smuggled into P, no evidence file dropped from E, and no
+        # silent content change in any other committed path.  A hijacked P that
+        # carries an extra blob or mutates a committed evidence file behind the
+        # published ref fails closed even though the report/manifest bindings
+        # still read correctly.
+        e_tree_paths = _git(
+            "ls-tree", "-r", "--name-only", evidence_commit, check=True
+        ).stdout.splitlines()
+        p_tree_paths = _git(
+            "ls-tree", "-r", "--name-only", pointer_commit, check=True
+        ).stdout.splitlines()
+        e_path_set = set(e_tree_paths)
+        p_path_set = set(p_tree_paths)
+        removed = e_path_set - p_path_set
+        if removed:
+            problems.append(
+                f"pointer commit P dropped E's committed path(s): {sorted(removed)}"
+            )
+        unexpected = (p_path_set - e_path_set) - {_REPORT_REL, _MANIFEST_REL}
+        if unexpected:
+            problems.append(
+                f"pointer commit P added unexpected path(s) beyond the "
+                f"report/manifest re-stamp: {sorted(unexpected)}"
+            )
+        for rel in sorted(e_path_set & p_path_set):
+            if rel in {_REPORT_REL, _MANIFEST_REL}:
+                continue
+            e_blob = _git(
+                "show", f"{evidence_commit}:{rel}", check=True, binary=True
+            ).stdout
+            p_blob = _git(
+                "show", f"{pointer_commit}:{rel}", check=True, binary=True
+            ).stdout
+            if e_blob != p_blob:
+                problems.append(
+                    f"pointer commit P changed E's committed file {rel} "
+                    "(only the report/manifest may differ between E and P)"
+                )
     except GateStateChangedError as exc:
         # Git became unavailable mid-verify (fail-closed, never a false pass).
         problems.append(str(exc))

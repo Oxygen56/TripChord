@@ -407,6 +407,21 @@ def _check_v4_source_graph(
                 if run.query_plan is not None
                 else None
             ),
+            # C-122 HG-G: the frozen-scenario per-pair breakdown — the exact
+            # per-pair browser-source / query-task / iCom-source counts the
+            # producer binds (each of the 3 frozen date pairs executes the same
+            # fixed task plan).  The layer-6 compact validator recomputes
+            # ``total_planned_task_count`` as the sum over these per-pair query
+            # counts, so a forged graph with 1 pair / 1 task cannot be accepted.
+            "per_pair": [
+                {
+                    "pair_id": pair_id,
+                    "browser_source_task_count": expected_browser_tasks,
+                    "query_task_count": expected_browser_tasks,
+                    "icom_source_task_count": len(expected_icom_tasks),
+                }
+                for pair_id in pair_ids
+            ],
         },
     )
 

@@ -520,6 +520,29 @@ def _per_check_evidence(name: str) -> dict[str, object]:
             "expected_icom_task_ids": ["public-transfer-icom-ctrip-1"],
             "pair_ids": ["pair-1", "pair-2", "pair-3"],
             "total_planned_task_count": 15,
+            # C-122 HG-G: the frozen-scenario per-pair breakdown — 3 pairs x 5
+            # browser/query tasks + 1 iCom task each, with the declared total
+            # recomputable as the per-pair query-task sum.
+            "per_pair": [
+                {
+                    "pair_id": "pair-1",
+                    "browser_source_task_count": 5,
+                    "query_task_count": 5,
+                    "icom_source_task_count": 1,
+                },
+                {
+                    "pair_id": "pair-2",
+                    "browser_source_task_count": 5,
+                    "query_task_count": 5,
+                    "icom_source_task_count": 1,
+                },
+                {
+                    "pair_id": "pair-3",
+                    "browser_source_task_count": 5,
+                    "query_task_count": 5,
+                    "icom_source_task_count": 1,
+                },
+            ],
         },
         "stage_aware_exploration_publication_contract": {
             "exploration_count": 3,
@@ -1692,6 +1715,94 @@ def _forge_repointed_chain(
     return e2, p2
 
 
+def _forge_pointer_tamper(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_repo: Path,
+    staging_dir: Path,
+    tmp_path: Path,
+    *,
+    mutate_index: Callable[[Path, dict[str, str]], None],
+) -> tuple[str, str]:
+    """Publish a real trail, then forge a P2 whose tree is E's tree with P's
+    report/manifest (still bound to E) plus whatever ``mutate_index`` applies to
+    a temp index seeded from E, and repoint the gate ref at P2.
+
+    ``mutate_index(repo, env)`` mutates the temp index (``GIT_INDEX_FILE``) —
+    adding an extra blob, re-staging a tampered manifest, changing a committed
+    evidence blob, etc.  The consumer resolver sees a coherent P2 -> E -> S chain
+    whose violation is exactly the tree difference the counter-example targets
+    (C-122 HG-H).  Returns (evidence_commit, forged_p2).
+    """
+    report, start, tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+    p_sha = _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit
+    )
+    index = tmp_path / "pointer-tamper-index"
+    env = dict(os.environ, GIT_INDEX_FILE=str(index))
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "read-tree", evidence_commit],
+        env=env,
+        check=True,
+    )
+    # Restore P's report/manifest (bound to E) so the pointer still binds E —
+    # the ONLY intended difference from E is the tamper the test applies.
+    for rel in (gate._REPORT_REL, gate._MANIFEST_REL):
+        data = _cat_blob(clean_repo, f"{p_sha}:{rel}")
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(clean_repo),
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"100644,{_hash_blob(clean_repo, data)},{rel}",
+            ],
+            env=env,
+            check=True,
+        )
+    mutate_index(clean_repo, env)
+    p2_tree = subprocess.run(
+        ["git", "-C", str(clean_repo), "write-tree"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    p2 = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "commit-tree",
+            p2_tree,
+            "-p",
+            evidence_commit,
+            "-m",
+            "forged pointer commit",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "update-ref",
+            f"refs/tripchord/done-gate/{_TEST_RUN_ID}",
+            p2,
+            p_sha,
+        ],
+        check=True,
+    )
+    return evidence_commit, p2
+
+
 def test_verify_gate_ref_rejects_merge_pointer_commit(
     monkeypatch: pytest.MonkeyPatch,
     clean_repo: Path,
@@ -2048,6 +2159,106 @@ def test_verify_gate_ref_rejects_digest_named_unproduced_64hex_in_manifest(
     verdict = gate.verify_gate_ref(_TEST_RUN_ID)
     assert verdict["verified"] is False
     assert any("unknown 64-hex value" in problem for problem in verdict["problems"])
+
+
+def test_verify_gate_ref_rejects_p_extra_blob(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, tmp_path: Path
+) -> None:
+    """C-122 HG-H counter-example: a pointer commit P that SMUGGLES an extra blob
+    beyond the report/manifest re-stamp must fail closed — P is only allowed to
+    differ from E in the two expected paths."""
+    def mutate_index(repo: Path, env: dict[str, str]) -> None:
+        blob = _hash_blob(repo, b'{"smuggled": true}')
+        subprocess.run(
+            [
+                "git", "-C", str(repo), "update-index", "--add", "--cacheinfo",
+                f"100644,{blob},benchmarks/results/smuggled-extra.json",
+            ],
+            env=env,
+            check=True,
+        )
+
+    _forge_pointer_tamper(
+        monkeypatch, clean_repo, staging_dir, tmp_path, mutate_index=mutate_index
+    )
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is False
+    assert any("added unexpected path" in problem for problem in verdict["problems"])
+
+
+def test_verify_gate_ref_rejects_credential_field_in_p_manifest(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, tmp_path: Path
+) -> None:
+    """C-122 HG-H counter-example: P's committed manifest carrying a credential
+    field name is a leak — the consumer must re-scan P's manifest blob, not just
+    E's manifest, so a hijacked pointer commit cannot hide a secret in its own
+    manifest."""
+    def mutate_index(repo: Path, env: dict[str, str]) -> None:
+        p_sha = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", f"refs/tripchord/done-gate/{_TEST_RUN_ID}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        manifest = json.loads(_cat_blob(repo, f"{p_sha}:{gate._MANIFEST_REL}"))
+        manifest["session_token"] = "stale-token-shape"
+        blob = _hash_blob(
+            repo, json.dumps(manifest, sort_keys=True).encode("utf-8")
+        )
+        subprocess.run(
+            [
+                "git", "-C", str(repo), "update-index", "--add", "--cacheinfo",
+                f"100644,{blob},{gate._MANIFEST_REL}",
+            ],
+            env=env,
+            check=True,
+        )
+
+    _forge_pointer_tamper(
+        monkeypatch, clean_repo, staging_dir, tmp_path, mutate_index=mutate_index
+    )
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is False
+    assert any("credential field name" in problem for problem in verdict["problems"])
+
+
+def test_verify_gate_ref_rejects_p_tree_diff_non_allowed_path(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, tmp_path: Path
+) -> None:
+    """C-122 HG-H counter-example: a pointer commit P that MUTATES a committed
+    evidence file (not the report/manifest) must fail closed — the P↔E tree diff
+    may only ever touch the report/manifest re-stamp."""
+    def mutate_index(repo: Path, env: dict[str, str]) -> None:
+        rel = "benchmarks/results/done-gate-layer6-compact.json"
+        # Read the current E-committed blob via the pointer's parent.
+        parent = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", f"refs/tripchord/done-gate/{_TEST_RUN_ID}^"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        original = json.loads(_cat_blob(repo, f"{parent}:{rel}"))
+        # Drop the frozen per-pair breakdown: a silent mutation of committed
+        # evidence that must never ride into P behind the report/manifest.
+        for check in original["done_gate"]["checks"]:
+            if check["name"] == "v4_source_graph":
+                check["evidence"].pop("per_pair", None)
+        blob = _hash_blob(repo, json.dumps(original, sort_keys=True).encode("utf-8"))
+        subprocess.run(
+            [
+                "git", "-C", str(repo), "update-index", "--add", "--cacheinfo",
+                f"100644,{blob},{rel}",
+            ],
+            env=env,
+            check=True,
+        )
+
+    _forge_pointer_tamper(
+        monkeypatch, clean_repo, staging_dir, tmp_path, mutate_index=mutate_index
+    )
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is False
+    assert any("changed E's committed file" in problem for problem in verdict["problems"])
 
 
 def test_clean_env_launcher_scrubs_secrets(tmp_path: Path) -> None:
@@ -7219,6 +7430,101 @@ def test_verify_layer6_compact_contract_rejects_duplicate_browser_source_ids() -
     with pytest.raises(
         gate.GateStateChangedError, match="not unique"
     ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_1pair_1task_graph() -> None:
+    """C-122 HG-G counter-example (supervision real-run): a v4 source graph
+    collapsed to 1 pair / 1 browser task / total=1 must REJECT — the compact
+    must bind the frozen scenario's exact 3-pair set, per-pair counts and
+    total=per-pair sum, never just non-empty / unique / positive values."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                check["evidence"]["pair_ids"] = ["pair-1"]  # type: ignore[index]
+                check["evidence"]["expected_browser_tasks_per_pair"] = 1  # type: ignore[index]
+                check["evidence"]["expected_browser_source_ids"] = ["source-ctrip-flight"]  # type: ignore[index]
+                check["evidence"]["expected_query_shapes"] = ["ctrip:flight"]  # type: ignore[index]
+                check["evidence"]["expected_icom_task_ids"] = ["public-transfer-icom-ctrip-1"]  # type: ignore[index]
+                check["evidence"]["total_planned_task_count"] = 1  # type: ignore[index]
+                check["evidence"]["per_pair"] = [  # type: ignore[index]
+                    {
+                        "pair_id": "pair-1",
+                        "browser_source_task_count": 1,
+                        "query_task_count": 1,
+                        "icom_source_task_count": 1,
+                    }
+                ]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="frozen scenario's exact",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_missing_per_pair_breakdown() -> None:
+    """C-122 HG-G counter-example: dropping the per-pair breakdown from a passing
+    v4 source graph must fail closed — the frozen-scenario per-pair contract is
+    required evidence, not an optional binding."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                check["evidence"].pop("per_pair", None)  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="per_pair"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_total_not_equal_pair_sum() -> None:
+    """C-122 HG-G counter-example: a v4 source graph whose declared total does not
+    equal the sum of the per-pair query-task counts must fail closed — the total
+    must be recomputable from the per-pair breakdown (5+5+5=15 here)."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                check["evidence"]["total_planned_task_count"] = 14  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError, match="per-pair query-task sum"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_coverage_mode_degraded() -> None:
+    """C-122 HG-G counter-example (supervision real-run): a strict-coverage check
+    that records coverage_mode=degraded must REJECT — the strict coverage receipt
+    only ever carries coverage_mode=strict."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "strict_selected_plan_platform_coverage":
+                check["evidence"]["coverage_mode"] = "degraded"  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="!= 'strict'"):
         gate._verify_layer6_compact_contract(
             "done-gate-layer6-compact.json",
             compact,
