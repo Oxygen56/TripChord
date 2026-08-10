@@ -48,6 +48,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
+from tripchord._secret_redact import (
+    RecursiveJsonBudgetError,
+    bounded_json_mask,
+    iter_json_levels,
+)
 from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
 from tripchord.planning.frozen_graph import (
     FROZEN_V4_PAIR_COUNT,
@@ -831,8 +836,8 @@ def _evidence_secrets() -> tuple[str, ...]:
 # scan keeps the broad ``_CANARY_DIAG_WHOLE_HEADER_RE`` for mid-line masking.)
 _AUTH_COOKIE_PATTERN = re.compile(
     r"(?i)(?:^[ \t]*|[\"'{[(,:\\])(?:proxy-authorization|set-cookie|x-api-key|"
-    r"authorization|cookie)\s*(?:\\[\"']?|[\"'])?\s*[:=]\s*"
-    r"(?:\\[\"']?|[\"'])?[^\r\n]+",
+    r"authorization|cookie)\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
+    r"(?:\\*[\"']?|[\"'])?[^\r\n]+",
     re.MULTILINE,
 )
 
@@ -955,33 +960,61 @@ def _reject_credential_field_names(data: bytes, label: str, name: str) -> None:
     carry the field at all.  Only committed JSON artifacts are structurally
     walked; a non-JSON file (a PNG, a raw provider dump) cannot have JSON field
     names and still passes through the byte + pattern scan below.
+
+    C-122 supervision 06:58: the walk is BOUNDED-RECURSIVE over JSON-string
+    values too — a credential field name smuggled through multiple ``json.dumps``
+    layers (``{"outer": "{\\"Authorization\\": …}"}``) sits inside a DECODED
+    nested level, not in the top-level structure, so every decoded level is
+    walked.  A structural-start string that does not parse (a truncated /
+    obfuscated JSON attempt) and a walk that overflows the depth/node/size
+    budgets both fail closed.
     """
     try:
-        parsed = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        return  # not a JSON document; the byte/pattern scan still applies
-    if not isinstance(parsed, (dict, list)):
-        return
-    stack: list[Any] = [parsed]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if (
-                    isinstance(key, str)
-                    and (
-                        _CREDENTIAL_FIELD_RE.search(key)
-                        or key.strip().lower() in _BARE_CREDENTIAL_FIELD_NAMES
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return  # not UTF-8 text; the byte/pattern scan still applies
+    try:
+        for level_text, depth, malformed in iter_json_levels(text):
+            # A malformed NESTED level (a truncated / obfuscated JSON-string
+            # attempt hiding a credential) fails closed; a non-JSON TOP-LEVEL is
+            # not a JSON artifact and passes through to the byte/pattern scan and
+            # the schema check, exactly like a non-JSON file.
+            if malformed and depth >= 1:
+                raise GateStateChangedError(
+                    f"secret leak: malformed nested JSON in {label} file {name}"
+                )
+            try:
+                parsed = json.loads(level_text)
+            except ValueError:
+                continue  # not JSON text at this level; the pattern scan applies
+            if not isinstance(parsed, (dict, list)):
+                continue
+            stack: list[Any] = [parsed]
+            while stack:
+                node = stack.pop()
+                if isinstance(node, dict):
+                    for key, value in node.items():
+                        if (
+                            isinstance(key, str)
+                            and (
+                                _CREDENTIAL_FIELD_RE.search(key)
+                                or key.strip().lower() in _BARE_CREDENTIAL_FIELD_NAMES
+                            )
+                        ):
+                            raise GateStateChangedError(
+                                f"secret leak: credential field name {key!r} in "
+                                f"{label} file {name}"
+                            )
+                        if isinstance(value, (dict, list)):
+                            stack.append(value)
+                elif isinstance(node, list):
+                    stack.extend(
+                        item for item in node if isinstance(item, (dict, list))
                     )
-                ):
-                    raise GateStateChangedError(
-                        f"secret leak: credential field name {key!r} in {label} "
-                        f"file {name}"
-                    )
-                if isinstance(value, (dict, list)):
-                    stack.append(value)
-        elif isinstance(node, list):
-            stack.extend(item for item in node if isinstance(item, (dict, list)))
+    except RecursiveJsonBudgetError:
+        raise GateStateChangedError(
+            f"secret leak: nested JSON budget exceeded in {label} file {name}"
+        ) from None
 
 
 def _reject_unknown_64hex_values(data: bytes, label: str, name: str) -> None:
@@ -998,30 +1031,53 @@ def _reject_unknown_64hex_values(data: bytes, label: str, name: str) -> None:
     is a leak too.  Only committed JSON artifacts are walked; the compact
     desensitizer already redacts 64-hex outside hash positions, so this is the
     second line of defence for the verbatim-copied evidence files.
+
+    C-122 supervision 06:58: the walk is BOUNDED-RECURSIVE over JSON-string
+    values too, and a structural-start string that does not parse (a truncated /
+    obfuscated JSON attempt) or a walk that overflows the depth/node/size
+    budgets both fail closed.
     """
     try:
-        parsed = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        return  # not a JSON document; the byte/pattern scan still applies
-    stack: list[tuple[Any, str]] = [(parsed, "")]
-    while stack:
-        node, path = stack.pop()
-        if isinstance(node, dict):
-            for key, value in node.items():
-                seg = str(key).strip().lower().replace("-", "_")
-                child_path = f"{path}.{seg}" if path else seg
-                if isinstance(value, str) and _SHA256_HEX_RE.fullmatch(value):
-                    if child_path not in _DIGEST_BINDING_PATHS:
-                        raise GateStateChangedError(
-                            f"secret leak: unknown 64-hex value under field "
-                            f"path {child_path!r} in {label} file {name}"
-                        )
-                elif isinstance(value, (dict, list)):
-                    stack.append((value, child_path))
-        elif isinstance(node, list):
-            stack.extend(
-                (item, f"{path}[]") for item in node if isinstance(item, (dict, list))
-            )
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return  # not UTF-8 text; the byte/pattern scan still applies
+    try:
+        for level_text, depth, malformed in iter_json_levels(text):
+            # A malformed NESTED level fails closed; a non-JSON TOP-LEVEL is not
+            # a JSON artifact and passes through to the byte/pattern scan.
+            if malformed and depth >= 1:
+                raise GateStateChangedError(
+                    f"secret leak: malformed nested JSON in {label} file {name}"
+                )
+            try:
+                parsed = json.loads(level_text)
+            except ValueError:
+                continue  # not JSON text at this level; the pattern scan applies
+            stack: list[tuple[Any, str]] = [(parsed, "")]
+            while stack:
+                node, path = stack.pop()
+                if isinstance(node, dict):
+                    for key, value in node.items():
+                        seg = str(key).strip().lower().replace("-", "_")
+                        child_path = f"{path}.{seg}" if path else seg
+                        if isinstance(value, str) and _SHA256_HEX_RE.fullmatch(value):
+                            if child_path not in _DIGEST_BINDING_PATHS:
+                                raise GateStateChangedError(
+                                    f"secret leak: unknown 64-hex value under field "
+                                    f"path {child_path!r} in {label} file {name}"
+                                )
+                        elif isinstance(value, (dict, list)):
+                            stack.append((value, child_path))
+                elif isinstance(node, list):
+                    stack.extend(
+                        (item, f"{path}[]")
+                        for item in node
+                        if isinstance(item, (dict, list))
+                    )
+    except RecursiveJsonBudgetError:
+        raise GateStateChangedError(
+            f"secret leak: nested JSON budget exceeded in {label} file {name}"
+        ) from None
 
 # ISO-8601 date/datetime (``2026-08-13``, ``2026-08-13T10:00:00Z``, …).  A
 # public read-only API may legitimately carry such a value in a query (e.g. a
@@ -1298,6 +1354,53 @@ def _secret_scan_bytes(
             raise GateStateChangedError(
                 f"secret leak: tracking URL in {label} file {name}"
             )
+    # C-122 supervision 06:58: BOUNDED-RECURSIVE JSON scan.  A credential
+    # smuggled through multiple ``json.dumps`` layers gains one backslash layer
+    # per dump, so the raw-byte patterns above stop seeing it after the first
+    # escape — the SAME pattern set is re-applied at every DECODED level.  The
+    # walker has hard depth/node/size budgets (never unbounded recursion or
+    # waiting); a structural-start string that does not parse (a truncated /
+    # obfuscated JSON attempt) and a budget overflow both fail closed.
+    try:
+        for level_text, depth, malformed in iter_json_levels(text):
+            if depth == 0:
+                continue  # the raw top-level scan above already covered this
+            if malformed:
+                raise GateStateChangedError(
+                    f"secret leak: malformed nested JSON in {label} file {name}"
+                )
+            level_masked = _mask_hex_hash_spans(level_text)
+            for pattern, kind in (
+                (_AUTH_COOKIE_PATTERN, "Authorization/Cookie"),
+                (_ACCOUNT_ID_PATTERN, "account identifier"),
+                (_PHONE_PATTERN, "phone number"),
+            ):
+                if pattern.search(level_masked):
+                    raise GateStateChangedError(
+                        f"secret leak: {kind} in nested JSON in {label} file {name}"
+                    )
+            if name.endswith(".failure.json"):
+                for pattern, kind in (
+                    (_CANARY_DIAG_WHOLE_HEADER_RE, "whole Authorization/Cookie header"),
+                    (_CANARY_DIAG_AKIA_RE, "AKIA-style access key"),
+                    (_CANARY_DIAG_PREFIX_TOKEN_RE, "prefixed token"),
+                    (_CANARY_DIAG_DOTTED_TOKEN_RE, "dotted bearer token"),
+                    (_CANARY_DIAG_BEARER_RE, "short Bearer token"),
+                    (_CANARY_DIAG_OPAQUE_KV_RE, "short opaque token assignment"),
+                ):
+                    if pattern.search(level_masked):
+                        raise GateStateChangedError(
+                            f"secret leak: {kind} in nested JSON in {label} file {name}"
+                        )
+            for match in _TRACKING_URL_PATTERN.finditer(level_text):
+                if _is_tracking_url_leak(match.group(0)):
+                    raise GateStateChangedError(
+                        f"secret leak: tracking URL in nested JSON in {label} file {name}"
+                    )
+    except RecursiveJsonBudgetError:
+        raise GateStateChangedError(
+            f"secret leak: nested JSON budget exceeded in {label} file {name}"
+        ) from None
 
 
 def _secret_scan_paths(
@@ -1435,7 +1538,7 @@ _CANARY_DIAG_DOTTED_TOKEN_RE = re.compile(
 _CANARY_DIAG_OPAQUE_KV_RE = re.compile(
     r"(?i)\b(?:token|password|passwd|secret|apikey|api_key|access_key|"
     r"secret_key|client_secret|authorization|bearer|private_key|session_key)\b"
-    r"\s*(?:\\[\"']?|[\"'])?\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
+    r"\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
 )
 # C-122 supervision 03:46 (Block 1): whole-header/field masking — Authorization /
 # Proxy-Authorization / Cookie / Set-Cookie / X-API-Key are masked name-and-value
@@ -1451,8 +1554,8 @@ _CANARY_DIAG_OPAQUE_KV_RE = re.compile(
 # WHOLE — never split at the quote.
 _CANARY_DIAG_WHOLE_HEADER_RE = re.compile(
     r"(?i)\b(?:proxy[-_ ]authorization|set[-_ ]cookie|x-api-key|api[-_ ]key|"
-    r"authorization|cookie)\b\s*(?:\\[\"']?|[\"'])?\s*[:=]\s*"
-    r"(?:\\[\"']?|[\"'])?[^\r\n]+"
+    r"authorization|cookie)\b\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
+    r"(?:\\*[\"']?|[\"'])?[^\r\n]+"
 )
 # The diagnostic's STRUCTURED schema — a fail-closed whitelist: any unknown
 # top-level / run_identity / runtime field makes the diagnostic foreign and is
@@ -1493,6 +1596,25 @@ def _sanitize_canary_diag_field(value: str, fallback: str) -> str:
     credential-bearing summary — forged or otherwise — can never reach the
     committed trail as-is (C-122 supervision 01:10 Block 3 + 18:13).
     """
+    value = bounded_json_mask(value, mask_level=_canary_diag_mask_level)
+    value = re.sub(r"[\x00-\x1f\x7f]", " ", value).strip()
+    if not value:
+        return fallback
+    if len(value) > _CANARY_DIAG_FIELD_MAX_CHARS:
+        value = value[:_CANARY_DIAG_FIELD_MAX_CHARS] + "…"
+    return value
+
+
+def _canary_diag_mask_level(value: str) -> str:
+    """Mask ONE free-form text level of a canary diagnostic field.
+
+    The env-secret / URL / phone / account / tracking redaction
+    (``_redact_output``), the whole-header masking and the short / structured
+    credential-shape chain — the same set ``_sanitize_canary_diag_field`` has
+    always applied, factored out so the BOUNDED-RECURSIVE JSON walker
+    (``tripchord._secret_redact.bounded_json_mask``, C-122 supervision 06:58)
+    can apply it at every decoded level of a multi-``json.dumps`` summary.
+    """
     value = _redact_output(value)
     value = _CANARY_DIAG_WHOLE_HEADER_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_URL_RE.sub("<url>", value)
@@ -1502,11 +1624,6 @@ def _sanitize_canary_diag_field(value: str, fallback: str) -> str:
     value = _CANARY_DIAG_BEARER_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_DOTTED_TOKEN_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_OPAQUE_KV_RE.sub("[REDACTED]", value)
-    value = re.sub(r"[\x00-\x1f\x7f]", " ", value).strip()
-    if not value:
-        return fallback
-    if len(value) > _CANARY_DIAG_FIELD_MAX_CHARS:
-        value = value[:_CANARY_DIAG_FIELD_MAX_CHARS] + "…"
     return value
 
 

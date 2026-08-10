@@ -6075,6 +6075,173 @@ def test_layer5_redacts_quoted_key_json_dict_forms_from_final_report(
     assert "[REDACTED]" in detail
 
 
+def _layered_json(secret_obj: dict, levels: int) -> str:
+    """Build a ``json.dumps``-encoded chain ``levels`` deep.
+
+    Each extra level wraps the previous JSON STRING as a value in a new dict and
+    dumps again, so level N is what a credential smuggler lands when they
+    ``json.dumps`` the diagnostic N times — each dump adds one backslash layer.
+    """
+    text = json.dumps(secret_obj)
+    for _ in range(levels):
+        text = json.dumps({"outer": text})
+    return text
+
+
+def test_canary_producer_desensitize_catches_double_triple_encoded_json() -> None:
+    """C-122 supervision 06:58 counter-example (stderr / producer layer): the
+    producer's ``_desensitize`` must mask a credential even when it is smuggled
+    through MULTIPLE ``json.dumps`` layers — level 2 (double) and level 3
+    (triple) encoded ``{"outer": "{\\"Authorization\\": \\"Basic YWJjZA==\\", …}"}``
+    must never reach stderr or the sealed failure diagnostic."""
+    from benchmarks import live_canary_certified as canary
+
+    secret = {"Authorization": "Basic YWJjZA==", "Cookie": "a=b"}
+    for level in (0, 1, 2, 3, 4):
+        raw = _layered_json(secret, level)
+        out = canary._desensitize(raw)
+        assert "YWJjZA==" not in out, f"level {level} leaked base64: {out!r}"
+        assert "a=b" not in out, f"level {level} leaked cookie value: {out!r}"
+        assert "[REDACTED]" in out, f"level {level} not masked: {out!r}"
+
+
+def test_canary_consumer_sanitize_catches_double_triple_encoded_json() -> None:
+    """C-122 supervision 06:58 counter-example (consumer layer): the CONSUMER's
+    ``_sanitize_canary_diag_field`` must re-mask a credential smuggled through
+    multiple ``json.dumps`` layers (level 2 / 3 / 4) so it can never reach the
+    committed layer-5 detail."""
+    secret = {"Authorization": "Basic YWJjZA==", "Cookie": "a=b"}
+    for level in (0, 1, 2, 3, 4):
+        raw = _layered_json(secret, level)
+        out = gate._sanitize_canary_diag_field(raw, "fallback")
+        assert "YWJjZA==" not in out, f"level {level} leaked base64: {out!r}"
+        assert "a=b" not in out, f"level {level} leaked cookie value: {out!r}"
+        assert "[REDACTED]" in out, f"level {level} not masked: {out!r}"
+
+
+def test_secret_scan_rejects_double_triple_encoded_json() -> None:
+    """C-122 supervision 06:58 counter-example (final scan layer): the bounded
+    recursive JSON scan must fail the gate closed on a credential smuggled
+    through multiple ``json.dumps`` layers — for BOTH a free-form
+    ``.failure.json`` staging diagnostic (``credential_field_check=False``) and a
+    committed JSON artifact (``credential_field_check=True``)."""
+    secret = {"Authorization": "Basic YWJjZA==", "Cookie": "a=b"}
+    for level in (0, 1, 2, 3, 4):
+        raw = _layered_json(secret, level).encode()
+        # .failure.json staging path — raw-byte + recursive pattern scan only.
+        with pytest.raises(gate.GateStateChangedError, match="Authorization/Cookie"):
+            gate._secret_scan_bytes(
+                raw,
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+        # Committed JSON artifact path — includes the field-name rejector.
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw,
+                gate._SecretNeedles(()),
+                "committed evidence",
+                f"evidence-{level}.json",
+                credential_field_check=True,
+            )
+
+
+def test_secret_scan_rejects_malformed_nested_json_fail_closed() -> None:
+    """C-122 supervision 06:58 counter-example: a structural-start string that
+    does NOT parse — a truncated / obfuscated JSON attempt hiding a credential —
+    must fail closed, never pass silently."""
+    secret = {"Authorization": "Basic YWJjZA==", "Cookie": "a=b"}
+    # The outermost json.dumps is VALID; the JSON-string VALUE is truncated
+    # mid-value, so the recursive walker sees a malformed nested level.
+    inner = json.dumps(secret)[:-4]  # chop ``a=b" }`` -> unterminated JSON
+    raw = json.dumps({"summary": inner})
+    with pytest.raises(gate.GateStateChangedError):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_secret_scan_rejects_depth_budget_overflow_fail_closed() -> None:
+    """C-122 supervision 06:58 counter-example: a nested-JSON chain DEEPER than
+    the hard depth budget must fail closed (``RecursiveJsonBudgetError``), never
+    run unbounded recursion or silently pass."""
+    from tripchord._secret_redact import _MAX_JSON_SCAN_DEPTH
+
+    raw = json.dumps({"ok": 1})
+    for _ in range(_MAX_JSON_SCAN_DEPTH + 3):
+        raw = json.dumps({"outer": raw})
+    with pytest.raises(gate.GateStateChangedError, match="budget exceeded"):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "deep.json",
+            credential_field_check=True,
+        )
+    with pytest.raises(gate.GateStateChangedError, match="budget exceeded"):
+        gate._reject_credential_field_names(raw.encode(), b"x", "deep.json")
+
+
+def test_secret_scan_keeps_pending_authorization_and_cookie_prose() -> None:
+    """C-122 supervision 06:58 positive counter-example: ``authorization`` /
+    ``cookie`` are also English words, so the legitimate scope detail prose
+    ``pending user authorization: …`` and ``the cookie: …`` (field name preceded
+    by a SPACE / ordinary prose, not a header position) must NOT fail the scan —
+    the field-position prefix guard (line start / quote / delimiter) still
+    separates a real header FIELD from prose."""
+    prose = (
+        "pending user authorization: no connected Companion declares "
+        "provider 'ctrip'; pair the Companion and re-run"
+    )
+    cookie_prose = "we use a cookie to remember your session"
+    gate._secret_scan_bytes(
+        prose.encode(),
+        gate._SecretNeedles(()),
+        "evidence",
+        "prose.txt",
+        credential_field_check=False,
+    )  # must not raise
+    gate._secret_scan_bytes(
+        cookie_prose.encode(),
+        gate._SecretNeedles(()),
+        "evidence",
+        "cookie-prose.txt",
+        credential_field_check=False,
+    )  # must not raise
+    # The consumer sanitizer conservatively masks the ``authorization:`` keyword
+    # SPAN but the prose PREFIX survives (fail-closed direction), while ``cookie``
+    # with no ``:``/``=`` after it is plain English and passes through untouched —
+    # the explicit ``authorization:``/``cookie:`` text-allowed boundary.
+    sanitized = gate._sanitize_canary_diag_field(prose, "fallback")
+    assert "pending user" in sanitized
+    cookie_sanitized = gate._sanitize_canary_diag_field(cookie_prose, "fallback")
+    assert cookie_sanitized == cookie_prose
+
+
+def test_secret_scan_rejects_double_encoded_authorization_in_structured_json(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 supervision 06:58 end-to-end counter-example: a double-encoded
+    ``Authorization`` header smuggled inside a staged structured evidence file
+    fails the gate even though the RAW bytes carry the value only as escaped
+    JSON."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    (staging_dir / "live-canary-certified.json").write_text(
+        _layered_json({"Authorization": "Basic YWJjZA==", "Cookie": "a=b"}, 2),
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.GateStateChangedError, match="Authorization/Cookie"):
+        gate.run_gate(staging_dir)
+
+
 def test_secret_scan_flags_model_api_key_from_env(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:

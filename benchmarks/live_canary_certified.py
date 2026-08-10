@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from tripchord._secret_redact import bounded_json_mask
 from tripchord.platform.registry import build_default_registry
 from tripchord.providers.browser_bridge import BRIDGE_TOKEN_HEADER
 from tripchord.providers.icom_transfer import (
@@ -79,7 +80,7 @@ _CANARY_DIAG_DOTTED_TOKEN_RE = re.compile(
 _CANARY_DIAG_OPAQUE_KV_RE = re.compile(
     r"(?i)\b(?:token|password|passwd|secret|apikey|api_key|access_key|"
     r"secret_key|client_secret|authorization|bearer|private_key|session_key)\b"
-    r"\s*(?:\\[\"']?|[\"'])?\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
+    r"\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
 )
 # C-122 supervision 03:46 (Block 1): whole-header/field redaction.  The shape
 # patterns above still let a credential BODY slip through when the value is
@@ -104,8 +105,8 @@ _CANARY_DIAG_OPAQUE_KV_RE = re.compile(
 # ``_CANARY_DIAG_WHOLE_HEADER_RE`` (keep both in sync).
 _CANARY_DIAG_WHOLE_HEADER_RE = re.compile(
     r"(?i)\b(?:proxy[-_ ]authorization|set[-_ ]cookie|x-api-key|api[-_ ]key|"
-    r"authorization|cookie)\b\s*(?:\\[\"']?|[\"'])?\s*[:=]\s*"
-    r"(?:\\[\"']?|[\"'])?[^\r\n]+"
+    r"authorization|cookie)\b\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
+    r"(?:\\*[\"']?|[\"'])?[^\r\n]+"
 )
 
 # C-122 round-19 (2026-08-11 17:03 supervisor veto): the certified canary scope
@@ -292,7 +293,19 @@ def _desensitize(text: str) -> str:
     survive with a partially-redacted header (C-122 supervision 03:46 Block 1).
     Mirrors the consumer's ``_sanitize_canary_diag_field`` so the producer
     artifact is already sanitized on disk and on stderr before the gate re-checks
-    it."""
+    it.
+
+    C-122 supervision 06:58: the whole message is BOUNDED-RECURSIVE JSON masked
+    (``tripchord._secret_redact.bounded_json_mask``) — a credential smuggled
+    through multiple ``json.dumps`` layers is masked at EVERY decoded level, a
+    structural-start string that does not parse and a depth/node/size budget
+    overflow both fail closed to ``[REDACTED]``.
+    """
+    return bounded_json_mask(text, mask_level=_desensitize_level)
+
+
+def _desensitize_level(text: str) -> str:
+    """Mask ONE free-form text level with the credential-shape regex chain."""
     text = _CANARY_DIAG_WHOLE_HEADER_RE.sub("[REDACTED]", text)
     text = _CANARY_DIAG_URL_RE.sub("<url>", text)
     text = _TOKEN_SHAPE_RE.sub("[REDACTED]", text)
