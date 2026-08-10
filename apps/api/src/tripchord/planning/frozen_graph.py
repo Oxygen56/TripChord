@@ -166,6 +166,11 @@ def frozen_v4_pair_id_digest(departure: date, return_date: date) -> str:
     currency)[:12]`` over the frozen scenario's constants.  Any pair id whose
     digest does not recompute from these constants is not a real frozen-scenario
     pair id — it is foreign, regardless of how well-formed it looks.
+
+    This is the pure digest computation.  ``frozen_v4_pair_id`` is the
+    generation entry point that enforces the canonical time contract BEFORE the
+    digest is computed (it raises on an out-of-contract pair), and
+    ``frozen_v4_pair_id_is_canonical`` enforces the SAME contract on acceptance.
     """
     raw = (
         f"{_FROZEN_V4_TRAVEL_WINDOW.origin}|{_FROZEN_V4_TRAVEL_WINDOW.destination}|"
@@ -174,6 +179,74 @@ def frozen_v4_pair_id_digest(departure: date, return_date: date) -> str:
         f"{_FROZEN_V4_TRAVEL_WINDOW.currency}"
     )
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
+
+
+def frozen_v4_pair_id_contract_violation(
+    departure: date, return_date: date
+) -> str | None:
+    """The canonical time contract's violation reason, or ``None`` when the pair
+    satisfies it (C-122 supervision 18:13).
+
+    The frozen maldives scenario seals ONLY August-2026 departures that return
+    five-to-eight nights later: departure within
+    ``[earliest_departure, latest_departure]``, ``return_date > departure`` and
+    ``min_nights <= (return_date - departure).days <= max_nights``.  A 2030
+    departure, a reversed (return <= departure) pair and a 1/9/10-night stay all
+    violate it — the SAME reason string drives the producer's
+    ``_check_v4_source_graph``, the compact and the layer-6 validator, so an
+    out-of-contract pair fails closed everywhere before its digest is accepted.
+    """
+    if departure < _FROZEN_V4_TRAVEL_WINDOW.earliest_departure:
+        return (
+            f"departure {departure.isoformat()} before the frozen window's "
+            f"earliest {_FROZEN_V4_TRAVEL_WINDOW.earliest_departure.isoformat()}"
+        )
+    if departure > _FROZEN_V4_TRAVEL_WINDOW.latest_departure:
+        return (
+            f"departure {departure.isoformat()} after the frozen window's "
+            f"latest {_FROZEN_V4_TRAVEL_WINDOW.latest_departure.isoformat()}"
+        )
+    if return_date <= departure:
+        return (
+            f"return {return_date.isoformat()} is not after departure "
+            f"{departure.isoformat()}"
+        )
+    nights = (return_date - departure).days
+    if nights < _FROZEN_V4_TRAVEL_WINDOW.min_nights:
+        return (
+            f"{nights} nights below the frozen scenario's minimum "
+            f"{_FROZEN_V4_TRAVEL_WINDOW.min_nights}"
+        )
+    if nights > _FROZEN_V4_TRAVEL_WINDOW.max_nights:
+        return (
+            f"{nights} nights above the frozen scenario's maximum "
+            f"{_FROZEN_V4_TRAVEL_WINDOW.max_nights}"
+        )
+    return None
+
+
+def frozen_v4_pair_id_dates_canonical(departure: date, return_date: date) -> bool:
+    """True only when the pair satisfies the canonical time contract."""
+    return frozen_v4_pair_id_contract_violation(departure, return_date) is None
+
+
+def frozen_v4_pair_id(departure: date, return_date: date) -> str:
+    """Generate a canonical frozen-scenario ``date-pair:`` id.
+
+    The canonical generation entry point: it enforces the time contract BEFORE
+    the digest is computed, raising ``ValueError`` with the violation reason for
+    any out-of-contract pair (C-122 supervision 18:13 — the contract must be
+    enforced before digest generation, not only at acceptance).
+    """
+    violation = frozen_v4_pair_id_contract_violation(departure, return_date)
+    if violation is not None:
+        raise ValueError(
+            f"not a canonical frozen-scenario pair: {violation}"
+        )
+    return (
+        f"date-pair:{departure.isoformat()}:{return_date.isoformat()}:"
+        f"{frozen_v4_pair_id_digest(departure, return_date)}"
+    )
 
 
 def frozen_v4_pair_id_is_canonical(pair_id: object) -> bool:
@@ -185,6 +258,13 @@ def frozen_v4_pair_id_is_canonical(pair_id: object) -> bool:
     frozen-scenario id fails closed everywhere.  ``pair-1`` and every other
     arbitrary string, plus any well-formed id whose digest does not recompute
     from the frozen constants, are rejected.
+
+    C-122 supervision 18:13: the canonical TIME CONTRACT is part of validity —
+    a well-formed id with a recomputing digest but an out-of-contract window
+    (2030 departure, reversed dates, or a 1/9/10-night stay) is REJECTED the
+    same way a foreign digest is.  This is the single authoritative contract
+    shared by the producer, the compact and the layer-6 validator, enforced at
+    acceptance for any id (before the digest it claims is ever trusted).
     """
     if not isinstance(pair_id, str):
         return False
@@ -195,5 +275,7 @@ def frozen_v4_pair_id_is_canonical(pair_id: object) -> bool:
         departure = date.fromisoformat(match.group(1))
         return_date = date.fromisoformat(match.group(2))
     except ValueError:
+        return False
+    if not frozen_v4_pair_id_dates_canonical(departure, return_date):
         return False
     return match.group(3) == frozen_v4_pair_id_digest(departure, return_date)

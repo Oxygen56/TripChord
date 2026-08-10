@@ -243,15 +243,10 @@ def _realistic_e2e_evidence() -> dict[str, object]:
         # v4_source_graph evidence so the pair-id set is bound to an independent
         # checkpoint, not just the producer's own claim.  The fixture keeps the
         # bindings in agreement with the compact's pair_ids (all three canonical).
-        "context": {
-            "pair_checkpoint_binding": {
-                "bindings": [
-                    {"date_pair_id": _FIXTURE_PAIR_IDS[0]},
-                    {"date_pair_id": _FIXTURE_PAIR_IDS[1]},
-                    {"date_pair_id": _FIXTURE_PAIR_IDS[2]},
-                ]
-            }
-        },
+        # C-122 supervision 18:13 (Fix 4): the raw binding also carries the full
+        # chain / dates / request / content so the compact can re-derive the
+        # complete desensitized checkpoint binding.
+        "context": {"pair_checkpoint_binding": _fixture_checkpoint_binding()},
     }
 
 
@@ -514,7 +509,7 @@ def _frozen_v4_fixture_pair_id(departure: str, return_date: str) -> str:
     canonical digest function, so the fixture always matches what the real
     producer seals for the frozen maldives scenario (C-122 supervision 01:10
     Block 1).  The three dates mirror a real run's effective-window seal (run
-    date 2026-08-04 + 7-day lead): 08-11→08-15, 08-21→08-26, 08-31→09-07.
+    date 2026-08-04 + 7-day lead): 08-11→08-16, 08-21→08-26, 08-31→09-07.
     """
     digest = frozen_v4_pair_id_digest(
         date.fromisoformat(departure), date.fromisoformat(return_date)
@@ -525,10 +520,78 @@ def _frozen_v4_fixture_pair_id(departure: str, return_date: str) -> str:
 # The passing fixture's pair-id set: the run's own checkpoint-bound sealed set.
 # Ordered deterministically so per_pair indexes line up with ``pair_ids``.
 _FIXTURE_PAIR_IDS = (
-    _frozen_v4_fixture_pair_id("2026-08-11", "2026-08-15"),
+    _frozen_v4_fixture_pair_id("2026-08-11", "2026-08-16"),
     _frozen_v4_fixture_pair_id("2026-08-21", "2026-08-26"),
     _frozen_v4_fixture_pair_id("2026-08-31", "2026-09-07"),
 )
+
+# The shared fixture request identity every checkpoint binding must carry (the
+# run's request SHA — C-122 supervision 18:13 wrong-request counter-example).
+_FIXTURE_REQUEST_SHA256 = "f" * 64
+# The per-pair dates mirror ``_FIXTURE_PAIR_IDS`` (in the same order), so each
+# binding's dates agree with its pair id's own embedded dates.
+_FIXTURE_PAIR_DATES = (
+    ("2026-08-11", "2026-08-16"),
+    ("2026-08-21", "2026-08-26"),
+    ("2026-08-31", "2026-09-07"),
+)
+
+
+def _fixture_checkpoint_binding() -> dict[str, object]:
+    """A self-consistent desensitized checkpoint binding for the passing
+    fixture: three bindings (one per frozen pair), each carrying the checkpoint
+    model's authoritative recomputable ``checkpoint_sha256`` over its OWN carried
+    fields, an ordered digest chain with a recomputable chain digest, and ONE
+    request identity shared by every binding (C-122 supervision 18:13 Fix 4).
+    The validator recomputes every digest from these carried fields, so the
+    fixture must be genuinely self-consistent — a copied / doctored digest fails
+    the same-raw counter-example."""
+    from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
+
+    bindings: list[dict[str, object]] = []
+    for index, pair_id in enumerate(_FIXTURE_PAIR_IDS):
+        departure_s, return_s = _FIXTURE_PAIR_DATES[index]
+        query_task_ids = [f"source-ctrip-flight-{index}"]
+        captured_at = "2026-08-10T00:00:00+00:00"
+        summary = LivePlanningPairCheckpoint._checkpoint_summary(
+            {
+                "schema_version": "live-pair-checkpoint-v1",
+                "request_sha256": _FIXTURE_REQUEST_SHA256,
+                "sequence": index + 1,
+                "date_pair_id": pair_id,
+                "departure_date": departure_s,
+                "return_date": return_s,
+                "state": "completed",
+                "query_task_ids": query_task_ids,
+                "run_summary_sha256": "e" * 64,
+                "captured_at": captured_at,
+            }
+        )
+        checkpoint_sha256 = LivePlanningPairCheckpoint._digest(summary)
+        bindings.append(
+            {
+                "sequence": index + 1,
+                "date_pair_id": pair_id,
+                "departure_date": departure_s,
+                "return_date": return_s,
+                "state": "completed",
+                "query_task_ids": query_task_ids,
+                "query_task_ids_sha256": gate._canonical_sha256(query_task_ids),
+                "run_summary_sha256": "e" * 64,
+                "captured_at": captured_at,
+                "checkpoint_sha256": checkpoint_sha256,
+                "request_sha256": _FIXTURE_REQUEST_SHA256,
+            }
+        )
+    ordered = [str(b["checkpoint_sha256"]) for b in bindings]
+    return {
+        "passed": True,
+        "count": len(bindings),
+        "ordered_checkpoint_sha256": ordered,
+        "checkpoint_chain_sha256": gate._canonical_sha256(ordered),
+        "request_sha256": _FIXTURE_REQUEST_SHA256,
+        "bindings": bindings,
+    }
 
 
 def _per_check_evidence(name: str) -> dict[str, object]:
@@ -562,6 +625,11 @@ def _per_check_evidence(name: str) -> dict[str, object]:
             # extra pair set even when every id is well-formed.  For the passing
             # fixture the producer's pair_ids and the checkpoint record agree.
             "checkpoint_bound_pair_ids": list(_FIXTURE_PAIR_IDS),
+            # C-122 supervision 18:13 (Fix 4): the compact must also carry the
+            # full desensitized checkpoint binding — chain / dates / request /
+            # content — so the validator independently re-verifies chain
+            # integrity, the canonical date window and the request identity.
+            "checkpoint_binding": _fixture_checkpoint_binding(),
             "total_planned_task_count": gate._V4_FROZEN_TASKS_PER_PAIR * 3,
             # C-122 HG-G: the frozen-scenario per-pair breakdown — 3 pairs x 13
             # browser/query tasks + 4 iCom tasks each, with the declared total
@@ -1406,6 +1474,143 @@ def test_layer5_sanitizes_credential_bearing_canary_failure_summary(
     assert "abcdef0123456789abcdef0123456789abcdef01" not in detail
     assert "13812345678" not in detail
     assert "<url>" in detail and "<redacted>" in detail
+
+
+def test_layer5_redacts_short_and_structured_secret_shapes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 supervision 18:13 counter-example (dotted token / AKIA-like / short
+    opaque token=): a failure summary carrying an AKIA-style AWS access key
+    (20 chars), a dotted bearer token whose first two segments are each under the
+    32-char run threshold, and a SHORT ``token=value`` assignment must ALL be
+    collapsed to ``<redacted>`` by the consumer — none may reach the committed
+    layer-5 detail as-is."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    diag_path = _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    akia_key = "AKIAIOSFODNN7EXAMPLE"
+    dotted = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LXVzZXIifQ.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+    short_secret = "token=xJ3kQm9pR2sW"
+    diagnostic["summary"] = (
+        f"upstream refused aws_key={akia_key} jwt={dotted} {short_secret} "
+        "for booking 9988776655"
+    )
+    diag_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    diag_checks = [
+        c for c in result.sub_checks if c.get("name") == "canary_failure_diagnostic"
+    ]
+    assert diag_checks, "a valid (this-run, fresh) diagnostic still keeps its classification"
+    detail = diag_checks[0]["detail"]
+    assert akia_key not in detail
+    assert dotted not in detail
+    assert "xJ3kQm9pR2sW" not in detail
+    assert "<redacted>" in detail
+
+
+def test_layer5_rejects_canary_diagnostic_with_unknown_top_level_field(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 supervision 18:13 counter-example (未知字段): a failure diagnostic
+    carrying an UNKNOWN top-level field must FAIL CLOSED — the diagnostic is a
+    structured contract, so an extra smuggled field (credential dump, producer
+    bypass) is rejected before its summary is consumed, even when every known
+    field is valid and current."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    diag_path = _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    diagnostic["smuggled_payload"] = {"secret": "x" * 40}
+    diag_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    joined = " ; ".join(str(c.get("detail", "")) for c in result.sub_checks)
+    assert "unknown field(s)" in joined and "smuggled_payload" in joined
+    assert not any(
+        c.get("name") == "canary_failure_diagnostic" for c in result.sub_checks
+    )
+
+
+def test_layer5_rejects_canary_diagnostic_with_unknown_run_identity_field(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 supervision 18:13 counter-example (未知字段): a failure diagnostic
+    whose ``run_identity`` carries an unknown field fails closed the same way — a
+    structured whitelist applies to every nested object, not just the top level."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    diag_path = _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    diagnostic["run_identity"]["forged_claim"] = "EVIL-OWNER"
+    diag_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    joined = " ; ".join(str(c.get("detail", "")) for c in result.sub_checks)
+    assert "run_identity carries unknown field(s)" in joined
+    assert "forged_claim" in joined
+    assert not any(
+        c.get("name") == "canary_failure_diagnostic" for c in result.sub_checks
+    )
+
+
+def test_layer5_rejects_canary_diagnostic_with_unknown_runtime_field(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 supervision 18:13 counter-example (未知字段): a failure diagnostic
+    whose ``run_identity.runtime`` carries an unknown field fails closed — the
+    runtime identity is an exact contract, never an open bag."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    diag_path = _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    diagnostic["run_identity"]["runtime"]["env_dump"] = "EVIL"
+    diag_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    joined = " ; ".join(str(c.get("detail", "")) for c in result.sub_checks)
+    assert "runtime carries unknown field(s)" in joined
+    assert "env_dump" in joined
+    assert not any(
+        c.get("name") == "canary_failure_diagnostic" for c in result.sub_checks
+    )
 
 
 def test_layer5_rejects_stale_canary_failure_diagnostic(
@@ -2371,6 +2576,78 @@ def test_verify_gate_ref_rejects_committed_file_flipped_to_raw(
         staging_dir,
         tmp_path,
         mutate_e_manifest=mutate,
+    )
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is False
+    assert any(
+        "committed" in problem and "flipped" in problem
+        for problem in verdict["problems"]
+    )
+
+
+def test_verify_gate_ref_rule_drift_does_not_flip_verification(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, tmp_path: Path
+) -> None:
+    """C-122 supervision 18:13 counter-example (规则漂移): after a CORRECT trail
+    is published, editing the worktree ``.gitignore`` so a committed evidence
+    file (done-gate-layer6-compact.json) is now ignored must NOT flip the
+    verification — the canonical committed flag is the fixed authoritative
+    contract, never a re-read of the current ignore rule."""
+    _forge_repointed_chain(
+        monkeypatch,
+        clean_repo,
+        staging_dir,
+        tmp_path,
+        mutate_e_manifest=lambda manifest: manifest,
+    )
+    # Rule drift AFTER the trail is published: ignore the previously-committed
+    # layer-6 compact.  The published S/E/P trail is unchanged.
+    (clean_repo / ".gitignore").write_text(
+        "/benchmarks/results/live-*\n"
+        "/benchmarks/results/done-gate-layer6-compact.json\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(clean_repo), "add", ".gitignore"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "commit", "-q", "-m", "drift ignore rule"],
+        check=True,
+    )
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is True
+
+
+def test_verify_gate_ref_rule_drift_cannot_hide_forged_committed_flag(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, tmp_path: Path
+) -> None:
+    """C-122 supervision 18:13 counter-example (规则漂移 attack): a forged
+    manifest that lists the layer-6 compact as committed=false must fail closed
+    EVEN WHEN the worktree ``.gitignore`` is edited to agree with the forgery —
+    the committed flag comes from the fixed contract (committed=True for the
+    compacts), so rule drift can never launder a forged committed flag into a
+    passing verification."""
+    def mutate(manifest: dict[str, object]) -> dict[str, object]:
+        for entry in manifest["files"]:  # type: ignore[index]
+            if entry["name"] == gate._COMPACT_E2E_STAGED_NAME:
+                entry["committed"] = False
+        return manifest
+
+    _forge_repointed_chain(
+        monkeypatch,
+        clean_repo,
+        staging_dir,
+        tmp_path,
+        mutate_e_manifest=mutate,
+    )
+    # Rule drift agreeing with the forgery: the layer-6 compact is now ignored.
+    (clean_repo / ".gitignore").write_text(
+        "/benchmarks/results/live-*\n"
+        "/benchmarks/results/done-gate-layer6-compact.json\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(clean_repo), "add", ".gitignore"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "commit", "-q", "-m", "drift ignore rule"],
+        check=True,
     )
     verdict = gate.verify_gate_ref(_TEST_RUN_ID)
     assert verdict["verified"] is False
@@ -8150,6 +8427,261 @@ def test_verify_layer6_compact_contract_rejects_foreign_pair_ids() -> None:
             compact,
             tested_commit_sha="a" * 40,
         )
+
+
+def test_verify_layer6_compact_contract_rejects_2030_departure() -> None:
+    """C-122 supervision 18:13 counter-example (2030): a v4 source graph whose
+    pair ids are well-formed ``date-pair:`` ids with recomputing digests but a
+    departure OUTSIDE the frozen August-2026 window must REJECT — the canonical
+    TIME CONTRACT (departure within [2026-08-01, 2026-08-31]) is part of pair-id
+    validity, enforced at acceptance exactly like the digest."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                future = _frozen_v4_fixture_pair_id("2030-01-01", "2030-01-06")
+                check["evidence"]["pair_ids"] = [  # type: ignore[index]
+                    future,
+                    _FIXTURE_PAIR_IDS[1],
+                    _FIXTURE_PAIR_IDS[2],
+                ]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="is not a canonical frozen-scenario date-pair id",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_reversed_dates() -> None:
+    """C-122 supervision 18:13 counter-example (reversed dates): a well-formed
+    pair id whose return date is NOT after its departure must REJECT — the
+    canonical time contract requires ``return > departure``."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                reversed_pair = _frozen_v4_fixture_pair_id(
+                    "2026-08-20", "2026-08-15"
+                )
+                check["evidence"]["pair_ids"] = [  # type: ignore[index]
+                    reversed_pair,
+                    _FIXTURE_PAIR_IDS[1],
+                    _FIXTURE_PAIR_IDS[2],
+                ]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="is not a canonical frozen-scenario date-pair id",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+@pytest.mark.parametrize(
+    ("departure", "return_date", "nights"),
+    [
+        ("2026-08-11", "2026-08-12", 1),
+        ("2026-08-11", "2026-08-20", 9),
+        ("2026-08-11", "2026-08-21", 10),
+    ],
+)
+def test_verify_layer6_compact_contract_rejects_out_of_contract_nights(
+    departure: str, return_date: str, nights: int
+) -> None:
+    """C-122 supervision 18:13 counter-example (1/9/10 nights): a well-formed
+    pair id whose stay length is outside the frozen 5-8 night contract must
+    REJECT — only five-to-eight-night pairs are canonical frozen-scenario
+    pairs."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                bad_nights = _frozen_v4_fixture_pair_id(departure, return_date)
+                check["evidence"]["pair_ids"] = [  # type: ignore[index]
+                    bad_nights,
+                    _FIXTURE_PAIR_IDS[1],
+                    _FIXTURE_PAIR_IDS[2],
+                ]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="is not a canonical frozen-scenario date-pair id",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_reordered_checkpoint_chain() -> None:
+    """C-122 supervision 18:13 counter-example (reordered chain): a checkpoint
+    binding whose ordered digest chain is REORDERED must REJECT even when the
+    attacker recomputes the chain digest — the ordered chain must be the
+    bindings' own digests in the SAME positional order, and each binding's
+    ``sequence`` must equal its position (1..N)."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                binding = check["evidence"]["checkpoint_binding"]
+                entries = binding["bindings"]
+                # Swap the first and last bindings in place AND swap the ordered
+                # digest list to match, AND recompute the chain digest — only
+                # the positional/sequence binding can catch this re-combination.
+                entries[0], entries[2] = entries[2], entries[0]
+                binding["ordered_checkpoint_sha256"] = [
+                    entries[0]["checkpoint_sha256"],
+                    entries[1]["checkpoint_sha256"],
+                    entries[2]["checkpoint_sha256"],
+                ]
+                binding["checkpoint_chain_sha256"] = gate._canonical_sha256(
+                    binding["ordered_checkpoint_sha256"]
+                )
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="reordered chain"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_checkpoint_binding_wrong_date() -> None:
+    """C-122 supervision 18:13 counter-example (wrong date): a checkpoint
+    binding whose carried dates DISAGREE with the dates embedded in the pair id
+    itself must REJECT — the binding's dates must satisfy the canonical frozen
+    time contract AND agree with the pair id's own dates."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                binding = check["evidence"]["checkpoint_binding"]
+                # Doctored dates that are STILL a canonical frozen pair (a
+                # different valid pair's dates) — only the pair-id/date
+                # agreement check can catch this swap.
+                binding["bindings"][0]["departure_date"] = "2026-08-01"
+                binding["bindings"][0]["return_date"] = "2026-08-06"
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError, match="dates disagree with the pair id"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_checkpoint_binding_wrong_request() -> None:
+    """C-122 supervision 18:13 counter-example (wrong request): a checkpoint
+    binding whose per-binding request identity is FOREIGN must REJECT — every
+    binding must carry the SAME request SHA as the binding container, and the
+    chain must be bound to one request identity."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                binding = check["evidence"]["checkpoint_binding"]
+                # A foreign request identity on one binding — the binding no
+                # longer matches the container's request identity.
+                binding["bindings"][1]["request_sha256"] = "e" * 64
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="request_sha256 does not match the binding's request identity",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_same_raw_copied_digest() -> None:
+    """C-122 supervision 18:13 counter-example (same-raw self-consistent
+    forgery): a compact that copies a producer's digests VERBATIM without the
+    underlying content must REJECT — the validator RECOMPUTES every digest from
+    the binding's carried fields, so doctored content with a stale copied
+    digest fails closed."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                binding = check["evidence"]["checkpoint_binding"]
+                # Doctor the query-task set but keep the query-task hash AND the
+                # checkpoint digest as the producer's verbatim values — only the
+                # checkpoint content recomputation can catch this forgery.
+                binding["bindings"][0]["query_task_ids"] = [
+                    "source-ctrip-lodging-hotels"
+                ]
+                binding["bindings"][0]["query_task_ids_sha256"] = gate._canonical_sha256(
+                    binding["bindings"][0]["query_task_ids"]
+                )
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="checkpoint_sha256 does not recompute",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_frozen_v4_pair_id_generation_enforces_time_contract() -> None:
+    """C-122 supervision 18:13: the canonical generation entry point enforces
+    the time contract BEFORE digest generation — ``frozen_v4_pair_id`` raises
+    ``ValueError`` for a 2030 / reversed / 1-night pair, and the acceptance
+    predicate ``frozen_v4_pair_id_is_canonical`` rejects the same ids the
+    producer and layer-6 validator rely on."""
+
+    from tripchord.planning.frozen_graph import (
+        frozen_v4_pair_id,
+        frozen_v4_pair_id_is_canonical,
+    )
+
+    # The passing fixture pair (08-11→08-16, five nights) is canonical.
+    passing = _frozen_v4_fixture_pair_id("2026-08-11", "2026-08-16")
+    assert frozen_v4_pair_id_is_canonical(passing)
+
+    assert frozen_v4_pair_id_is_canonical(
+        _frozen_v4_fixture_pair_id("2030-01-01", "2030-01-06")
+    ) is False
+    assert frozen_v4_pair_id_is_canonical(
+        _frozen_v4_fixture_pair_id("2026-08-20", "2026-08-15")
+    ) is False
+    for departure, return_date in (
+        ("2026-08-11", "2026-08-12"),  # 1 night
+        ("2026-08-11", "2026-08-20"),  # 9 nights
+        ("2026-08-11", "2026-08-21"),  # 10 nights
+    ):
+        assert frozen_v4_pair_id_is_canonical(
+            _frozen_v4_fixture_pair_id(departure, return_date)
+        ) is False
+
+    with pytest.raises(ValueError, match="after the frozen window's latest"):
+        frozen_v4_pair_id(date(2030, 1, 1), date(2030, 1, 6))
+    with pytest.raises(ValueError, match="not after departure"):
+        frozen_v4_pair_id(date(2026, 8, 20), date(2026, 8, 15))
+    with pytest.raises(ValueError, match="below the frozen scenario's minimum"):
+        frozen_v4_pair_id(date(2026, 8, 11), date(2026, 8, 12))
 
 
 def test_verify_layer6_compact_contract_rejects_wrong_pair_swap() -> None:

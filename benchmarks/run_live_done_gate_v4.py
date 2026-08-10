@@ -1168,9 +1168,27 @@ def _validate_terminal_pair_checkpoints(
                 "departure_date": checkpoint.departure_date.isoformat(),
                 "return_date": checkpoint.return_date.isoformat(),
                 "state": checkpoint.state.value,
+                "query_task_ids": list(execution_task_ids),
                 "query_task_ids_sha256": _canonical_sha256(list(execution_task_ids)),
+                "run_summary_sha256": checkpoint.run_summary_sha256,
+                "captured_at": checkpoint.captured_at.isoformat(),
                 "checkpoint_sha256": checkpoint.checkpoint_sha256,
+                "request_sha256": checkpoint.request_sha256,
             }
+        )
+    # C-122 supervision 18:13 (wrong request): every checkpoint must carry ONE
+    # request identity bound to the terminal job's own request SHA — a foreign
+    # request binding is a forged checkpoint chain even when the digests line up.
+    request_sha256s = {checkpoint.request_sha256 for checkpoint in checkpoints}
+    if len(request_sha256s) != 1:
+        raise RuntimeError(
+            "live-v4 terminal pair checkpoints do not share one request identity"
+        )
+    request_sha256 = next(iter(request_sha256s))
+    if snapshot.request_sha256 is not None and request_sha256 != snapshot.request_sha256:
+        raise RuntimeError(
+            "live-v4 terminal pair checkpoint request SHA is not bound to the "
+            "terminal job's request identity"
         )
     return {
         "passed": True,
@@ -1179,6 +1197,7 @@ def _validate_terminal_pair_checkpoints(
         "checkpoint_chain_sha256": _canonical_sha256(
             [checkpoint.checkpoint_sha256 for checkpoint in checkpoints]
         ),
+        "request_sha256": request_sha256,
         "bindings": bindings,
     }
 

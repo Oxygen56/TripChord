@@ -43,7 +43,7 @@ import tempfile
 import uuid
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -52,12 +52,14 @@ from tripchord.planning.frozen_graph import (
     FROZEN_V4_PAIR_COUNT,
     frozen_v4_browser_source_ids,
     frozen_v4_icom_task_ids,
+    frozen_v4_pair_id_dates_canonical,
     frozen_v4_pair_id_is_canonical,
     frozen_v4_query_shapes,
     frozen_v4_tasks_per_pair,
 )
 from tripchord.platform.registry import build_default_registry
 from tripchord.runtime_provenance import local_expected_provenance, provenance_mismatches
+from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "benchmarks" / "results"
@@ -876,6 +878,20 @@ _DIGEST_BINDING_PATHS: frozenset[str] = frozenset(
         "bridge_state_lease_postcheck.sha256",
         "raw_evidence.sha256",
         "done_gate.checks[].evidence.candidate_set_sha256",
+        # C-122 Fix 4: the desensitized checkpoint binding the compact carries —
+        # the ordered per-checkpoint digest chain, the chain digest, the request
+        # identity and each binding's content hashes.  Every value here is a
+        # recomputable content-addressable binding the layer-6 validator
+        # re-verifies from the carried fields (chain recompute / date window /
+        # request identity / per-checkpoint content), so each is trusted at its
+        # exact committed path.
+        "done_gate.checks[].evidence.checkpoint_binding.ordered_checkpoint_sha256[]",
+        "done_gate.checks[].evidence.checkpoint_binding.checkpoint_chain_sha256",
+        "done_gate.checks[].evidence.checkpoint_binding.request_sha256",
+        "done_gate.checks[].evidence.checkpoint_binding.bindings[].checkpoint_sha256",
+        "done_gate.checks[].evidence.checkpoint_binding.bindings[].request_sha256",
+        "done_gate.checks[].evidence.checkpoint_binding.bindings[].run_summary_sha256",
+        "done_gate.checks[].evidence.checkpoint_binding.bindings[].query_task_ids_sha256",
     }
 )
 
@@ -1326,9 +1342,41 @@ _CANARY_DIAG_FIELD_MAX_CHARS = 512
 # desensitization alone): any URL is collapsed to ``<url>`` and any 32+ character
 # run of token characters (hex hashes, base64-ish secrets, ``S*40``-style junk)
 # is collapsed to ``<redacted>`` before a free-form field reaches the committed
-# report (C-122 supervision 01:10 Block 3).
+# report (C-122 supervision 01:10 Block 3).  C-122 supervision 18:13 adds the
+# short / structured shapes the 32+ run misses: AKIA-style AWS access keys
+# (20 chars), dotted bearer tokens (``header.payload.signature`` JWTs whose first
+# two segments are each under 32 chars and survive the run pattern), and short
+# opaque ``token=value`` / ``password=value`` assignments.
 _CANARY_DIAG_URL_RE = re.compile(r"https?://[^\s\"'<>)\[\]{}]+")
 _CANARY_DIAG_TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9_\-=]{32,}")
+_CANARY_DIAG_AKIA_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
+_CANARY_DIAG_DOTTED_TOKEN_RE = re.compile(
+    r"\b[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]{6,}\b"
+)
+_CANARY_DIAG_OPAQUE_KV_RE = re.compile(
+    r"(?i)\b(?:token|password|passwd|secret|apikey|api_key|access_key|"
+    r"secret_key|client_secret|authorization|bearer|private_key|session_key)\b"
+    r"\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{6,}"
+)
+# The diagnostic's STRUCTURED schema — a fail-closed whitelist: any unknown
+# top-level / run_identity / runtime field makes the diagnostic foreign and is
+# rejected before its summary is ever consumed (C-122 supervision 18:13:
+# 未知字段 fail-closed).
+_CANARY_DIAG_ALLOWED_TOP_LEVEL = frozenset(
+    {
+        "schema_version",
+        "diagnostic_kind",
+        "stage",
+        "exception_class",
+        "summary",
+        "run_identity",
+        "generated_at",
+    }
+)
+_CANARY_DIAG_ALLOWED_RUN_IDENTITY = frozenset(
+    {"script", "output", "run_id", "tested_sha", "runtime"}
+)
+_CANARY_DIAG_ALLOWED_RUNTIME = frozenset({"python", "platform"})
 
 
 def _sanitize_canary_diag_field(value: str, fallback: str) -> str:
@@ -1338,14 +1386,18 @@ def _sanitize_canary_diag_field(value: str, fallback: str) -> str:
     report, so the consumer re-sanitizes every free-form diagnostic string
     before it lands: env-secret / URL / phone / account / tracking patterns are
     redacted (``_redact_output``), any remaining URL is collapsed to ``<url>``,
-    any 32+ token-shaped run is collapsed to ``<redacted>``, control characters
-    are stripped, and the result is bounded in length.  A credential-bearing
-    summary can never reach the committed trail as-is (C-122 supervision 01:10
-    Block 3).
+    any 32+ token-shaped run is collapsed to ``<redacted>``, AKIA-style access
+    keys / dotted bearer tokens / short opaque ``token=`` assignments are
+    collapsed too, control characters are stripped, and the result is bounded in
+    length.  A credential-bearing summary — forged or otherwise — can never reach
+    the committed trail as-is (C-122 supervision 01:10 Block 3 + 18:13).
     """
     value = _redact_output(value)
     value = _CANARY_DIAG_URL_RE.sub("<url>", value)
     value = _CANARY_DIAG_TOKEN_RUN_RE.sub("<redacted>", value)
+    value = _CANARY_DIAG_AKIA_RE.sub("<redacted>", value)
+    value = _CANARY_DIAG_DOTTED_TOKEN_RE.sub("<redacted>", value)
+    value = _CANARY_DIAG_OPAQUE_KV_RE.sub("<redacted>", value)
     value = re.sub(r"[\x00-\x1f\x7f]", " ", value).strip()
     if not value:
         return fallback
@@ -1392,6 +1444,16 @@ def _consume_canary_failure_diagnostic(
         return None, f"canary failure diagnostic unreadable or invalid JSON: {exc}"
     if not isinstance(diagnostic, dict):
         return None, "canary failure diagnostic is not an object"
+    # C-122 supervision 18:13 counter-example (未知字段): the diagnostic is a
+    # STRUCTURED contract — any unknown top-level / run_identity / runtime field
+    # makes it a foreign or smuggling structure and fails closed before its
+    # summary is consumed, even when every known field looks valid.
+    unknown_top_level = set(diagnostic) - _CANARY_DIAG_ALLOWED_TOP_LEVEL
+    if unknown_top_level:
+        return None, (
+            "canary failure diagnostic carries unknown field(s): "
+            f"{', '.join(sorted(unknown_top_level))}"
+        )
     if diagnostic.get("schema_version") != _CANARY_DIAG_SCHEMA_VERSION:
         return None, "canary failure diagnostic schema_version mismatch"
     if diagnostic.get("diagnostic_kind") != "canary_failure":
@@ -1405,6 +1467,12 @@ def _consume_canary_failure_diagnostic(
     run_identity = diagnostic.get("run_identity")
     if not isinstance(run_identity, dict):
         return None, "canary failure diagnostic missing run_identity"
+    unknown_identity_fields = set(run_identity) - _CANARY_DIAG_ALLOWED_RUN_IDENTITY
+    if unknown_identity_fields:
+        return None, (
+            "canary failure diagnostic run_identity carries unknown field(s): "
+            f"{', '.join(sorted(unknown_identity_fields))}"
+        )
     diag_run_id = run_identity.get("run_id")
     if not isinstance(diag_run_id, str) or not diag_run_id:
         return None, "canary failure diagnostic missing run_id"
@@ -1424,6 +1492,12 @@ def _consume_canary_failure_diagnostic(
     runtime = run_identity.get("runtime")
     if not isinstance(runtime, dict):
         return None, "canary failure diagnostic missing runtime identity"
+    unknown_runtime_fields = set(runtime) - _CANARY_DIAG_ALLOWED_RUNTIME
+    if unknown_runtime_fields:
+        return None, (
+            "canary failure diagnostic runtime carries unknown field(s): "
+            f"{', '.join(sorted(unknown_runtime_fields))}"
+        )
     # C-122 supervision 01:10 Block 3 counter-example: the diagnosis runtime must
     # be bound EXACTLY to the ACTUAL run's authoritative interpreter identity —
     # not merely non-empty.  ``EVIL-RUNTIME`` / ``EVIL-PLATFORM`` (or a python
@@ -2876,6 +2950,38 @@ _EVIDENCE_TRACKED_PATHS: tuple[tuple[str, str], ...] = (
     (_COMPACT_E2E_STAGED_NAME, "benchmarks/results/done-gate-layer6-compact.json"),
 )
 
+# The authoritative committed-evidence contract (C-122 supervision 18:13
+# 规则漂移 counter-example).  WHICH evidence files E/P carry is FIXED by the
+# S-tree publish rule, NEVER derived from the current worktree ``.gitignore``:
+# raw sensitive ``live-*`` origins stay hash-only (``committed=False``, recorded
+# by SHA256 in the manifest), while the desensitized layer-5/6 compacts and the
+# acceptance / e2e artifacts are committed evidence (``committed=True``).  The
+# publisher (``_manifest_files`` / ``_evidence_index_entries``) and the consumer
+# (``verify_gate_ref``) derive the flag from THIS one contract, so editing the
+# ``.gitignore`` — ignoring a committed file or un-ignoring a raw — can never
+# flip the committed flag on an already-published S/E/P trail, and a manifest
+# whose committed flag disagrees with the contract fails closed even when the
+# worktree rule happens to agree with it.
+_EVIDENCE_COMMITTED_CONTRACT: dict[str, bool] = {
+    "product-acceptance.json": True,
+    "browser-e2e.json": True,
+    "browser-e2e-screenshot.png": True,
+    "live-canary-certified.json": False,
+    "live-done-gate-v4.json": False,
+    _COMPACT_CANARY_STAGED_NAME: True,
+    _COMPACT_E2E_STAGED_NAME: True,
+}
+# Every tracked path must be covered by the contract — a new evidence name added
+# without a committed-flag ruling is a contract drift and must fail loudly at
+# import time, not silently at publish time.
+if set(name for name, _ in _EVIDENCE_TRACKED_PATHS) != set(
+    _EVIDENCE_COMMITTED_CONTRACT
+):
+    raise RuntimeError(
+        "evidence committed contract does not cover exactly the tracked evidence "
+        "paths (rule-drift guard)"
+    )
+
 
 # The committed-evidence contract manifest.  The manifest is the *only* record
 # of the git-ignored sensitive live-* evidence that E may not carry: it lists
@@ -2949,16 +3055,16 @@ def _manifest_files(staging_dir: Path) -> list[dict[str, Any]]:
         if not staged.is_file():
             continue
         _verify_evidence_file_safety(staged, "evidence")
-        ignored = (
-            _git("check-ignore", "-q", "--", tracked_rel, check=False).returncode == 0
-        )
+        # C-122 supervision 18:13 (规则漂移): ``committed`` comes from the FIXED
+        # authoritative contract, never from ``git check-ignore`` — a worktree
+        # ``.gitignore`` edit must not flip the published committed flag.
         files.append(
             {
                 "name": staged_name,
                 "tracked_path": tracked_rel,
                 "sha256": _sha256_file(staged),
                 "size_bytes": staged.stat().st_size,
-                "committed": not ignored,
+                "committed": _EVIDENCE_COMMITTED_CONTRACT[staged_name],
             }
         )
     return files
@@ -3173,6 +3279,11 @@ _LAYER6_REQUIRED_EVIDENCE_FIELDS: dict[str, frozenset[str]] = {
             "expected_icom_task_ids",
             "pair_ids",
             "checkpoint_bound_pair_ids",
+            # C-122 supervision 18:13 (Fix 4): the compact must carry the full
+            # desensitized checkpoint binding (chain / dates / request / content)
+            # so the layer-6 validator can independently re-verify it — a compact
+            # without the binding fails closed before any semantic check.
+            "checkpoint_binding",
             "total_planned_task_count",
             "per_pair",
         }
@@ -3336,6 +3447,33 @@ _LAYER6_EVIDENCE_SCHEMAS: dict[str, dict[str, Any]] = {
         # an independent job-control-plane record the compact must carry so the
         # validator can reject a foreign / swapped / missing / extra pair set.
         "checkpoint_bound_pair_ids": {"_item": _EVIDENCE_SCALAR},
+        # C-122 supervision 18:13 (Fix 4): the complete desensitized checkpoint
+        # binding.  Every nested field is whitelisted so a forged 64-hex or an
+        # unknown nested binding cannot ride into the committed compact; the
+        # validator RECOMPUTES the chain digest / date window / request identity
+        # / per-checkpoint content from these carried fields.
+        "checkpoint_binding": {
+            "passed": _EVIDENCE_SCALAR,
+            "count": _EVIDENCE_SCALAR,
+            "ordered_checkpoint_sha256": {"_item": _EVIDENCE_HASH},
+            "checkpoint_chain_sha256": _EVIDENCE_HASH,
+            "request_sha256": _EVIDENCE_HASH,
+            "bindings": {
+                "_item": {
+                    "sequence": _EVIDENCE_SCALAR,
+                    "date_pair_id": _EVIDENCE_SCALAR,
+                    "departure_date": _EVIDENCE_SCALAR,
+                    "return_date": _EVIDENCE_SCALAR,
+                    "state": _EVIDENCE_SCALAR,
+                    "query_task_ids": {"_item": _EVIDENCE_SCALAR},
+                    "query_task_ids_sha256": _EVIDENCE_HASH,
+                    "run_summary_sha256": _EVIDENCE_HASH,
+                    "captured_at": _EVIDENCE_SCALAR,
+                    "checkpoint_sha256": _EVIDENCE_HASH,
+                    "request_sha256": _EVIDENCE_HASH,
+                }
+            },
+        },
         "total_planned_task_count": _EVIDENCE_SCALAR,
         # C-122 HG-G: the frozen-scenario per-pair breakdown — every nested field
         # is whitelisted so a forged 64-hex or an unknown nested binding cannot
@@ -3533,13 +3671,56 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
     # the job control plane (the terminal job's pair checkpoints), merged into
     # the v4_source_graph evidence so the compact carries an independent record
     # of what the run ACTUALLY sealed alongside the producer's own ``pair_ids``.
+    # C-122 supervision 18:13 (Fix 4): the compact must ALSO carry the complete
+    # DESENSITIZED checkpoint binding — the ordered checkpoint digest chain, the
+    # chain digest, the request identity and each binding's dates / state /
+    # content hashes / sequence / checkpoint digest — so a reviewer can
+    # independently re-verify chain integrity, the canonical date window and the
+    # request identity from the compact alone (a reordered / wrong-date /
+    # wrong-request / same-raw-copied digest forgery fails closed).
     checkpoint_pairs: list[str] = []
-    checkpoint_binding = (
+    checkpoint_binding_dict: dict[str, Any] = {}
+    raw_checkpoint_binding = (
         (payload.get("context") or {}).get("pair_checkpoint_binding") or {}
     )
-    for binding in checkpoint_binding.get("bindings") or ():
-        if isinstance(binding, dict) and isinstance(binding.get("date_pair_id"), str):
-            checkpoint_pairs.append(binding["date_pair_id"])
+    if isinstance(raw_checkpoint_binding, dict):
+        desensitized_bindings: list[dict[str, Any]] = []
+        for binding in raw_checkpoint_binding.get("bindings") or ():
+            if not isinstance(binding, dict):
+                continue
+            date_pair_id = binding.get("date_pair_id")
+            if isinstance(date_pair_id, str):
+                checkpoint_pairs.append(date_pair_id)
+            # Structural / hashed / date-only fields only — the same fields the
+            # checkpoint model's own ``checkpoint_sha256`` recomputes from, never
+            # raw request/quote/URL/account content.
+            desensitized_bindings.append(
+                {
+                    "sequence": binding.get("sequence"),
+                    "date_pair_id": date_pair_id,
+                    "departure_date": binding.get("departure_date"),
+                    "return_date": binding.get("return_date"),
+                    "state": binding.get("state"),
+                    "query_task_ids": binding.get("query_task_ids"),
+                    "query_task_ids_sha256": binding.get("query_task_ids_sha256"),
+                    "run_summary_sha256": binding.get("run_summary_sha256"),
+                    "captured_at": binding.get("captured_at"),
+                    "checkpoint_sha256": binding.get("checkpoint_sha256"),
+                    "request_sha256": binding.get("request_sha256"),
+                }
+            )
+        checkpoint_binding_dict = {
+            "passed": raw_checkpoint_binding.get("passed"),
+            "count": raw_checkpoint_binding.get("count"),
+            "ordered_checkpoint_sha256": raw_checkpoint_binding.get(
+                "ordered_checkpoint_sha256"
+            ),
+            "checkpoint_chain_sha256": raw_checkpoint_binding.get(
+                "checkpoint_chain_sha256"
+            ),
+            "request_sha256": raw_checkpoint_binding.get("request_sha256"),
+            "bindings": desensitized_bindings,
+        }
     compact_checks: list[dict[str, Any]] = []
     for check in checks:
         if not isinstance(check, dict) or not check.get("name"):
@@ -3547,6 +3728,8 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
         item_evidence = _desensitized_check_evidence(check, payload)
         if check.get("name") == "v4_source_graph" and checkpoint_pairs:
             item_evidence["checkpoint_bound_pair_ids"] = list(checkpoint_pairs)
+            if checkpoint_binding_dict.get("bindings"):
+                item_evidence["checkpoint_binding"] = checkpoint_binding_dict
         compact_checks.append(
             {
                 "name": check.get("name"),
@@ -4058,6 +4241,246 @@ def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
         )
 
 
+def _canonical_sha256(payload: object) -> str:
+    """The canonical JSON SHA-256 digest (matches the producer's ``_canonical_
+    sha256`` in ``benchmarks/run_live_done_gate_v4.py``)."""
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _verify_layer6_checkpoint_binding(
+    tracked_rel: str, check_name: str, evidence: dict[str, Any], pair_ids: list[Any]
+) -> None:
+    """C-122 supervision 18:13 (Fix 4): independently verify the compact's
+    checkpoint binding — chain integrity, date window, request identity and
+    per-checkpoint content — from the compact's OWN carried fields.
+
+    The compact must carry the complete DESENSITIZED checkpoint binding:
+    ``ordered_checkpoint_sha256`` (the ordered per-checkpoint digests),
+    ``checkpoint_chain_sha256``, ``request_sha256`` and one ``bindings`` entry
+    per pair with ``date_pair_id`` / dates / ``state`` / ``query_task_ids`` /
+    content hashes / ``checkpoint_sha256``.  The validator RECOMPUTES every
+    digest instead of trusting it:
+
+      - the chain digest recomputes from the ordered list,
+      - each binding's dates must satisfy the canonical frozen time contract
+        (shared with Fix 1) and agree with the pair id's own embedded dates,
+      - every binding shares ONE request identity (the run's request SHA),
+      - each ``checkpoint_sha256`` recomputes from the binding's own carried
+        fields using the checkpoint model's authoritative digest — a
+        same-raw self-consistent forgery that copies a producer's digests
+        verbatim without the underlying content fails closed, and a reordered /
+        wrong-date / wrong-request chain is rejected even when every digest
+        looks well-formed.
+    """
+    binding = evidence.get("checkpoint_binding")
+    if not isinstance(binding, dict):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} check "
+            f"{check_name!r} checkpoint_binding is missing (Fix 4 requires the "
+            "full desensitized checkpoint binding)"
+        )
+    bindings = binding.get("bindings")
+    if not isinstance(bindings, list) or len(bindings) != len(pair_ids):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} check "
+            f"{check_name!r} checkpoint_binding bindings do not cover exactly "
+            "the frozen pair set"
+        )
+    ordered = binding.get("ordered_checkpoint_sha256")
+    if (
+        not isinstance(ordered, list)
+        or len(ordered) != len(pair_ids)
+        or any(not isinstance(item, str) or not item for item in ordered)
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} check "
+            f"{check_name!r} checkpoint_binding ordered_checkpoint_sha256 is "
+            "not the full ordered per-checkpoint digest chain"
+        )
+    chain_sha = binding.get("checkpoint_chain_sha256")
+    if not isinstance(chain_sha, str) or not chain_sha:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} check "
+            f"{check_name!r} checkpoint_binding missing checkpoint_chain_sha256"
+        )
+    # Chain integrity: the chain digest must RECOMPUTE from the ordered list —
+    # a reordered chain that merely re-labels its digests is a forgery.
+    if chain_sha != _canonical_sha256(ordered):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} check "
+            f"{check_name!r} checkpoint_binding checkpoint_chain_sha256 does "
+            "not recompute from ordered_checkpoint_sha256 (reordered chain)"
+        )
+    binding_request = binding.get("request_sha256")
+    if not isinstance(binding_request, str) or not binding_request:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} check "
+            f"{check_name!r} checkpoint_binding missing request_sha256"
+        )
+    binding_pair_ids: set[str] = set()
+    for index, entry in enumerate(bindings):
+        if not isinstance(entry, dict):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding contains a non-object entry"
+            )
+        entry_pair_id = entry.get("date_pair_id")
+        if not isinstance(entry_pair_id, str) or not entry_pair_id:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry missing date_pair_id"
+            )
+        if entry_pair_id not in set(pair_ids):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} is "
+                "not one of the frozen pair ids"
+            )
+        binding_pair_ids.add(entry_pair_id)
+        # Chain positional binding (C-122 supervision 18:13 reordered chain): the
+        # ordered digest chain must be the bindings' OWN digests in the SAME
+        # positional order, and each binding's ``sequence`` must equal its
+        # position (1..N).  A chain that swaps bindings around and RECOMPUTES its
+        # chain digest — sequence 3 leading, sequence 2, sequence 1 — still fails
+        # closed here even though every digest recomputes from its own binding.
+        entry_sequence = entry.get("sequence")
+        if entry_sequence != index + 1:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                f"sequence {entry_sequence!r} != its position {index + 1} "
+                "(reordered chain)"
+            )
+        entry_checkpoint_sha = entry.get("checkpoint_sha256")
+        if not isinstance(entry_checkpoint_sha, str) or not entry_checkpoint_sha:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "missing checkpoint_sha256"
+            )
+        if ordered[index] != entry_checkpoint_sha:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding ordered_checkpoint_sha256 "
+                f"at position {index} does not equal the binding's own "
+                f"checkpoint_sha256 (reordered chain)"
+            )
+        # Date window + pair-id/date agreement (C-122 supervision 18:13 wrong
+        # date): the binding's dates must satisfy the canonical frozen time
+        # contract AND agree with the dates embedded in the pair id itself.
+        departure_s = entry.get("departure_date")
+        return_s = entry.get("return_date")
+        if not isinstance(departure_s, str) or not isinstance(return_s, str):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "missing departure/return dates"
+            )
+        try:
+            departure = date.fromisoformat(departure_s)
+            return_d = date.fromisoformat(return_s)
+        except ValueError:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "has unparsable departure/return dates"
+            )
+        if not frozen_v4_pair_id_dates_canonical(departure, return_d):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "dates violate the canonical frozen time contract"
+            )
+        pair_match = re.fullmatch(
+            r"date-pair:(\d{4}-\d{2}-\d{2}):(\d{4}-\d{2}-\d{2}):[0-9a-f]{12}",
+            entry_pair_id,
+        )
+        if pair_match is not None and (
+            pair_match.group(1) != departure_s or pair_match.group(2) != return_s
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "dates disagree with the pair id's own embedded dates"
+            )
+        # Request identity: every binding carries the SAME request SHA as the
+        # binding container — a foreign request binding is a forged chain.
+        entry_request = entry.get("request_sha256")
+        if entry_request != binding_request:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "request_sha256 does not match the binding's request identity"
+            )
+        # Content recomputation (C-122 supervision 18:13 same-raw forgery): each
+        # ``checkpoint_sha256`` must RECOMPUTE from the binding's own carried
+        # fields via the checkpoint model's authoritative digest.  A compact
+        # that copies a producer's digests verbatim without the underlying
+        # content — a wrong sequence, a doctored query-task set, a foreign
+        # run_summary — fails closed here.
+        for key in (
+            "sequence",
+            "state",
+            "query_task_ids",
+            "query_task_ids_sha256",
+            "run_summary_sha256",
+            "captured_at",
+            "checkpoint_sha256",
+        ):
+            if key not in entry:
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                    f"missing {key}"
+                )
+        query_ids = entry.get("query_task_ids")
+        if not isinstance(query_ids, list) or not query_ids:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "query_task_ids is empty or missing"
+            )
+        if _canonical_sha256(list(query_ids)) != entry.get("query_task_ids_sha256"):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "query_task_ids_sha256 does not recompute from query_task_ids"
+            )
+        checkpoint_summary = LivePlanningPairCheckpoint._checkpoint_summary(
+            {
+                "schema_version": "live-pair-checkpoint-v1",
+                "request_sha256": entry_request,
+                "sequence": entry.get("sequence"),
+                "date_pair_id": entry_pair_id,
+                "departure_date": departure_s,
+                "return_date": return_s,
+                "state": entry.get("state"),
+                "query_task_ids": list(query_ids),
+                "run_summary_sha256": entry.get("run_summary_sha256"),
+                "captured_at": entry.get("captured_at"),
+            }
+        )
+        recomputed = LivePlanningPairCheckpoint._digest(checkpoint_summary)
+        if recomputed != entry.get("checkpoint_sha256"):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "checkpoint_sha256 does not recompute from its carried fields "
+                "(same-raw copied digest or doctored content)"
+            )
+    if binding_pair_ids != set(pair_ids):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} check "
+            f"{check_name!r} checkpoint_binding pair set != the frozen pair set"
+        )
+
+
 def _verify_layer6_check_semantics(
     tracked_rel: str, check_name: str, evidence: dict[str, Any]
 ) -> None:
@@ -4362,7 +4785,8 @@ def _verify_layer6_check_semantics(
                 raise GateStateChangedError(
                     f"evidence commit E layer-6 compact {tracked_rel} check "
                     f"{check_name!r} pair id {pair_id!r} is not a canonical "
-                    "frozen-scenario date-pair id (format or digest mismatch)"
+                    "frozen-scenario date-pair id (format, digest or "
+                    "time-contract mismatch)"
                 )
         # C-122 supervision 01:10 counter-example: the pair-id SET must equal the
         # run's checkpoint-bound sealed pair ids EXACTLY.  ``checkpoint_bound_
@@ -4386,6 +4810,15 @@ def _verify_layer6_check_semantics(
                 f"{check_name!r} pair_ids set != the run's checkpoint-bound "
                 "sealed pair set (foreign, swapped, missing or extra pair)"
             )
+        # C-122 supervision 18:13 (Fix 4): the compact must also carry the full
+        # desensitized checkpoint binding, and the validator must independently
+        # re-verify chain integrity / the canonical date window / the request
+        # identity / per-checkpoint content — a reordered chain, a wrong date, a
+        # wrong request or a same-raw copied-digest forgery fails closed even
+        # when every id is canonical and the set matches.
+        _verify_layer6_checkpoint_binding(
+            tracked_rel, check_name, evidence, pair_ids
+        )
         # The per-pair breakdown must cover EXACTLY the frozen pair set, with the
         # exact producer-consistent per-pair task counts.
         per_pair = evidence.get("per_pair")
@@ -5596,7 +6029,10 @@ def _evidence_index_entries(
         staged = staging_dir / staged_name
         if not staged.is_file():
             continue
-        if _git("check-ignore", "-q", "--", tracked_rel, check=False).returncode == 0:
+        # C-122 supervision 18:13 (规则漂移): committability comes from the FIXED
+        # authoritative contract, never from ``git check-ignore`` — a worktree
+        # ``.gitignore`` edit must not change what E/P carry.
+        if not _EVIDENCE_COMMITTED_CONTRACT[staged_name]:
             continue
         entries.append((tracked_rel, staged))
     return entries
@@ -6586,23 +7022,20 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
                 # C-122 supervision 01:10 Block 2 counter-examples: the name SET
                 # is not the whole contract.  Every fixed evidence name must also
                 # carry its EXACT canonical tracked_path AND its canonical
-                # committed flag (recomputed here with ``git check-ignore`` — the
-                # same derivation the publisher's ``_manifest_files`` uses), and
-                # every committed entry's sha256/size must recompute to the
-                # ACTUAL blob E committed (the per-entry loop above already
-                # recomputes against the entry's own path; the canonical binding
-                # below pins the path so a compact renamed / relocated, a raw
-                # committed-flag flip, or a wrong hash/size fails closed even when
-                # every individual field shape still reads correctly.
-                canonical_committed: dict[str, bool] = {
-                    staged_name: (
-                        _git(
-                            "check-ignore", "-q", "--", tracked_rel, check=False
-                        ).returncode
-                        != 0
-                    )
-                    for staged_name, tracked_rel in _EVIDENCE_TRACKED_PATHS
-                }
+                # committed flag.  C-122 supervision 18:13 (规则漂移): the
+                # canonical committed flag is the FIXED authoritative contract,
+                # NEVER recomputed from the worktree ``.gitignore`` — an edited
+                # ignore rule must not flip the verification of an
+                # already-published S/E/P trail.  And every committed entry's
+                # sha256/size must recompute to the ACTUAL blob E committed (the
+                # per-entry loop above already recomputes against the entry's
+                # own path; the canonical binding below pins the path so a
+                # compact renamed / relocated, a raw committed-flag flip, or a
+                # wrong hash/size fails closed even when every individual field
+                # shape still reads correctly.
+                canonical_committed: dict[str, bool] = dict(
+                    _EVIDENCE_COMMITTED_CONTRACT
+                )
                 for staged_name, tracked_rel in _EVIDENCE_TRACKED_PATHS:
                     entry = by_name.get(staged_name)
                     if entry is None:
