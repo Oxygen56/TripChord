@@ -1547,6 +1547,17 @@ _BROWSER_OTA_PROVIDERS = frozenset(
 # validator uses this to reject a forged 1-pair / 1-task source graph.
 _V4_FROZEN_DATE_PAIR_COUNT = 3
 
+# C-122 round-18 HG-G2 (supervision 16:03): the frozen per-pair browser-source /
+# query-task count the layer-6 v4 source graph seals on EVERY frozen date pair.
+# The real frozen maldives scenario schedules 13 browser queries per pair (the 6
+# enabled ctrip kinds + the 6 enabled qunar kinds + tongcheng's single flight),
+# so a compact that shrinks the per-pair count to 1, or declares a per-pair task
+# count whose ID sets carry a different number of Source ids / query shapes, is a
+# forged graph and must fail closed even though every field is non-empty /
+# unique / positive.  Binding the ID-set lengths to this frozen count is the
+# HG-G2 counter-example fix.
+_V4_FROZEN_TASKS_PER_PAIR = 13
+
 
 def _resolve_live_state_db(explicit: Path | None = None) -> Path:
     """The durable live-state SQLite file a live run must not pollute (C-114 R7).
@@ -3918,6 +3929,17 @@ def _verify_layer6_check_semantics(
                 f"{check_name!r} expected_browser_tasks_per_pair is not a "
                 "positive integer"
             )
+        # C-122 HG-G2 (supervision 16:03 counter-example A): the per-pair count
+        # must equal the frozen scenario's exact browser task count — a graph
+        # shrunk to 1 task per pair (3 pair x 1 task / total=3) is a forged
+        # graph and fails closed even though every field is positive.
+        if expected_tasks != _V4_FROZEN_TASKS_PER_PAIR:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} expected_browser_tasks_per_pair "
+                f"{expected_tasks} != the frozen scenario's exact per-pair "
+                f"browser task count {_V4_FROZEN_TASKS_PER_PAIR}"
+            )
         source_ids = evidence.get("expected_browser_source_ids")
         if not isinstance(source_ids, list) or not source_ids:
             raise GateStateChangedError(
@@ -3928,6 +3950,17 @@ def _verify_layer6_check_semantics(
             raise GateStateChangedError(
                 f"evidence commit E layer-6 compact {tracked_rel} check "
                 f"{check_name!r} expected_browser_source_ids are not unique"
+            )
+        # C-122 HG-G2 (supervision 16:03 counter-example B): the declared per-pair
+        # task count must be bound to exactly one Source id per task — a graph
+        # declaring 5 tasks while listing only 1 Source id is forged and fails
+        # closed.
+        if len(source_ids) != expected_tasks:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} expected_browser_source_ids length "
+                f"{len(source_ids)} != the frozen per-pair browser task count "
+                f"{expected_tasks} — one Source id per task is required"
             )
         # C-122 round-18 HG-E: a passing v4 source graph must also carry the
         # query-shape contract, the iCom Source-task id set, the planned date
@@ -3949,6 +3982,18 @@ def _verify_layer6_check_semantics(
                     f"evidence commit E layer-6 compact {tracked_rel} check "
                     f"{check_name!r} {label} are not unique"
                 )
+        # C-122 HG-G2 (supervision 16:03 counter-example B): the declared per-pair
+        # task count must also be bound to exactly one query shape per task — a
+        # graph declaring 5 tasks while listing only 1 query shape is forged and
+        # fails closed.
+        query_shapes = evidence.get("expected_query_shapes")
+        if len(query_shapes) != expected_tasks:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} expected_query_shapes length "
+                f"{len(query_shapes)} != the frozen per-pair browser task count "
+                f"{expected_tasks} — one query shape per task is required"
+            )
         # C-122 HG-G: the frozen-scenario exact binding.  The producer seals the
         # v4 source graph for EXACTLY the three frozen date pairs, with the SAME
         # fixed per-pair browser-source/query-task count and the SAME iCom-source
@@ -5677,6 +5722,80 @@ def _verify_manifest_files_contract(
             )
 
 
+def _verify_p_manifest_binds_e(
+    p_manifest: dict[str, Any],
+    e_manifest: dict[str, Any],
+    evidence_commit: str,
+    problems: list[str],
+) -> None:
+    """C-122 round-18 HG-H2: cross-bind every P manifest file entry to the E
+    canonical manifest entry of the same name AND to the real committed blob.
+
+    A forged pointer commit whose manifest records an arbitrary (but well-formed)
+    64-hex sha256, size 0, and committed=false for every evidence file passes the
+    field-shape contract (_verify_manifest_files_contract) — the entries still
+    need to be the SAME evidence E actually committed.  Each P entry must match
+    E's canonical entry field-for-field (tracked_path / committed / sha256 /
+    size_bytes) and, for committed entries, recompute to the blob in E's tree.
+    Appends a ``problems`` entry per violation; never raises for a verification
+    failure (a git failure raises GateStateChangedError, fail-closed).
+    """
+    p_files = p_manifest.get("files")
+    e_files = e_manifest.get("files")
+    if not isinstance(p_files, list):
+        problems.append("pointer commit P manifest files field is not a list")
+        return
+    if not isinstance(e_files, list):
+        problems.append("evidence commit E manifest files field is not a list")
+        return
+    e_by_name: dict[str, dict[str, Any]] = {}
+    for entry in e_files:
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+            e_by_name[entry["name"]] = entry
+    for p_entry in p_files:
+        if not isinstance(p_entry, dict):
+            continue  # field-shape contract already flagged it
+        p_name = p_entry.get("name")
+        if not isinstance(p_name, str) or not p_name:
+            continue  # field-shape contract already flagged it
+        e_entry = e_by_name.get(p_name)
+        if e_entry is None:
+            problems.append(
+                f"pointer commit P manifest file {p_name!r} has no matching "
+                "entry in E's canonical manifest"
+            )
+            continue
+        for field in ("tracked_path", "committed", "sha256", "size_bytes"):
+            p_val = p_entry.get(field)
+            e_val = e_entry.get(field)
+            if p_val != e_val:
+                problems.append(
+                    f"pointer commit P manifest file {p_name!r} {field} "
+                    f"{p_val!r} != E canonical manifest {e_val!r}"
+                )
+        # Bind committed entries to the real blob: recompute from E's tree.
+        if e_entry.get("committed") is True:
+            rel = e_entry.get("tracked_path")
+            if not isinstance(rel, str) or not rel:
+                continue
+            blob = _git(
+                "show", f"{evidence_commit}:{rel}", check=True, binary=True
+            ).stdout
+            actual_sha = hashlib.sha256(blob).hexdigest()
+            actual_size = len(blob)
+            if p_entry.get("sha256") != actual_sha:
+                problems.append(
+                    f"pointer commit P manifest file {p_name!r} sha256 does not "
+                    "match E's committed blob"
+                )
+            if p_entry.get("size_bytes") != actual_size:
+                problems.append(
+                    f"pointer commit P manifest file {p_name!r} size_bytes "
+                    f"{p_entry.get('size_bytes')!r} != E's committed blob "
+                    f"{actual_size}"
+                )
+
+
 def verify_gate_ref(run_id: str) -> dict[str, Any]:
     """Machine-gate consumer entry: resolve and verify a published evidence trail.
 
@@ -6148,6 +6267,15 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
                                     "raw_evidence.sha256 does not match the "
                                     "manifest's recorded hash for the raw file"
                                 )
+        # C-122 round-18 HG-H2 (supervision 16:03): per-entry binding between P's
+        # manifest and the E canonical manifest + the real committed blob.  A
+        # forged P manifest that records an arbitrary-but-well-formed sha256, size
+        # 0, and committed=false for every file passes the field-shape contract
+        # above — the entries must instead be EXACTLY the evidence E committed.
+        if isinstance(p_manifest, dict) and isinstance(e_manifest, dict):
+            _verify_p_manifest_binds_e(
+                p_manifest, e_manifest, evidence_commit, problems
+            )
         # C-122 HG-H: P must be E plus ONLY the report/manifest re-stamp — no
         # extra blob smuggled into P, no evidence file dropped from E, and no
         # silent content change in any other committed path.  A hijacked P that

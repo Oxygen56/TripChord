@@ -502,45 +502,71 @@ def _per_check_evidence(name: str) -> dict[str, object]:
             "evidence_refs": [f"sha256:{candidate_sha}"],
         },
         "v4_source_graph": {
-            "expected_browser_tasks_per_pair": 5,
+            # The frozen maldives scenario schedules 13 browser queries per pair
+            # (6 enabled ctrip kinds + 6 enabled qunar kinds + tongcheng's single
+            # flight) with 4 iCom Source tasks per pair; the validator binds the
+            # Source-id / query-shape set lengths to this exact count (C-122
+            # HG-G2).
+            "expected_browser_tasks_per_pair": 13,
             "expected_browser_source_ids": [
                 "source-ctrip-flight",
+                "source-ctrip-lodging-full-stay",
+                "source-ctrip-lodging-first-night",
+                "source-ctrip-lodging-middle-stay",
+                "source-ctrip-lodging-last-night",
+                "source-ctrip-lodging-hulhumale-full-stay",
                 "source-qunar-flight",
+                "source-qunar-lodging-full-stay",
+                "source-qunar-lodging-first-night",
+                "source-qunar-lodging-middle-stay",
+                "source-qunar-lodging-last-night",
+                "source-qunar-lodging-hulhumale-full-stay",
                 "source-tongcheng-flight",
-                "source-ctrip-lodging-seg-1",
-                "source-qunar-lodging-seg-1",
             ],
             "expected_query_shapes": [
                 "ctrip:flight",
                 "ctrip:lodging_full_stay",
+                "ctrip:lodging_first_night",
+                "ctrip:lodging_middle_stay",
+                "ctrip:lodging_last_night",
+                "ctrip:lodging_hulhumale_full_stay",
                 "qunar:flight",
                 "qunar:lodging_full_stay",
+                "qunar:lodging_first_night",
+                "qunar:lodging_middle_stay",
+                "qunar:lodging_last_night",
+                "qunar:lodging_hulhumale_full_stay",
                 "tongcheng:flight",
             ],
-            "expected_icom_task_ids": ["public-transfer-icom-ctrip-1"],
+            "expected_icom_task_ids": [
+                "public-transfer-icom-ctrip-1",
+                "public-transfer-icom-ctrip-2",
+                "public-transfer-icom-qunar-1",
+                "public-transfer-icom-qunar-2",
+            ],
             "pair_ids": ["pair-1", "pair-2", "pair-3"],
-            "total_planned_task_count": 15,
-            # C-122 HG-G: the frozen-scenario per-pair breakdown — 3 pairs x 5
-            # browser/query tasks + 1 iCom task each, with the declared total
+            "total_planned_task_count": 39,
+            # C-122 HG-G: the frozen-scenario per-pair breakdown — 3 pairs x 13
+            # browser/query tasks + 4 iCom tasks each, with the declared total
             # recomputable as the per-pair query-task sum.
             "per_pair": [
                 {
                     "pair_id": "pair-1",
-                    "browser_source_task_count": 5,
-                    "query_task_count": 5,
-                    "icom_source_task_count": 1,
+                    "browser_source_task_count": 13,
+                    "query_task_count": 13,
+                    "icom_source_task_count": 4,
                 },
                 {
                     "pair_id": "pair-2",
-                    "browser_source_task_count": 5,
-                    "query_task_count": 5,
-                    "icom_source_task_count": 1,
+                    "browser_source_task_count": 13,
+                    "query_task_count": 13,
+                    "icom_source_task_count": 4,
                 },
                 {
                     "pair_id": "pair-3",
-                    "browser_source_task_count": 5,
-                    "query_task_count": 5,
-                    "icom_source_task_count": 1,
+                    "browser_source_task_count": 13,
+                    "query_task_count": 13,
+                    "icom_source_task_count": 4,
                 },
             ],
         },
@@ -2220,6 +2246,52 @@ def test_verify_gate_ref_rejects_credential_field_in_p_manifest(
     verdict = gate.verify_gate_ref(_TEST_RUN_ID)
     assert verdict["verified"] is False
     assert any("credential field name" in problem for problem in verdict["problems"])
+
+
+def test_verify_gate_ref_rejects_p_manifest_unbound_file_entries(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, tmp_path: Path
+) -> None:
+    """C-122 round-18 HG-H2 (supervision 16:03) counter-example: a forged pointer
+    commit P whose manifest records a WELL-FORMED but unbound file contract —
+    every file carrying the same arbitrary 64-hex sha256, size 0, and
+    committed=false — must fail closed.  P's manifest entries must be EXACTLY the
+    evidence E canonically committed (same tracked_path/committed/sha256/size
+    and, for committed entries, the real blob hash), not merely pass the field
+    shape contract."""
+    def mutate_index(repo: Path, env: dict[str, str]) -> None:
+        p_sha = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", f"refs/tripchord/done-gate/{_TEST_RUN_ID}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        manifest = json.loads(_cat_blob(repo, f"{p_sha}:{gate._MANIFEST_REL}"))
+        arbitrary = "a" * 64
+        for entry in manifest["files"]:
+            entry["sha256"] = arbitrary
+            entry["size_bytes"] = 0
+            entry["committed"] = False
+        blob = _hash_blob(
+            repo, json.dumps(manifest, sort_keys=True).encode("utf-8")
+        )
+        subprocess.run(
+            [
+                "git", "-C", str(repo), "update-index", "--add", "--cacheinfo",
+                f"100644,{blob},{gate._MANIFEST_REL}",
+            ],
+            env=env,
+            check=True,
+        )
+
+    _forge_pointer_tamper(
+        monkeypatch, clean_repo, staging_dir, tmp_path, mutate_index=mutate_index
+    )
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is False
+    assert any(
+        "E canonical manifest" in problem or "committed blob" in problem
+        for problem in verdict["problems"]
+    )
 
 
 def test_verify_gate_ref_rejects_p_tree_diff_non_allowed_path(
@@ -7473,6 +7545,124 @@ def test_verify_layer6_compact_contract_rejects_1pair_1task_graph() -> None:
         )
 
 
+def test_verify_layer6_compact_contract_rejects_3pair_1task_graph() -> None:
+    """C-122 round-18 supervision 16:03 counter-example A: a v4 source graph that
+    keeps the frozen 3-pair set but shrinks EVERY pair to 1 browser/query/iCom
+    task (3 pair x 1 task, total=3) must REJECT — the per-pair count must equal
+    the frozen scenario's exact browser task count, never just be positive."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                check["evidence"]["expected_browser_tasks_per_pair"] = 1  # type: ignore[index]
+                check["evidence"]["expected_browser_source_ids"] = ["source-ctrip-flight"]  # type: ignore[index]
+                check["evidence"]["expected_query_shapes"] = ["ctrip:flight"]  # type: ignore[index]
+                check["evidence"]["expected_icom_task_ids"] = ["public-transfer-icom-ctrip-1"]  # type: ignore[index]
+                check["evidence"]["total_planned_task_count"] = 3  # type: ignore[index]
+                check["evidence"]["per_pair"] = [  # type: ignore[index]
+                    {
+                        "pair_id": "pair-1",
+                        "browser_source_task_count": 1,
+                        "query_task_count": 1,
+                        "icom_source_task_count": 1,
+                    },
+                    {
+                        "pair_id": "pair-2",
+                        "browser_source_task_count": 1,
+                        "query_task_count": 1,
+                        "icom_source_task_count": 1,
+                    },
+                    {
+                        "pair_id": "pair-3",
+                        "browser_source_task_count": 1,
+                        "query_task_count": 1,
+                        "icom_source_task_count": 1,
+                    },
+                ]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="frozen scenario's exact per-pair browser task count",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_count_not_bound_to_id_sets() -> None:
+    """C-122 round-18 supervision 16:03 counter-example B: a v4 source graph whose
+    declared per-pair task count is not bound to the actual Source-id / query-shape
+    sets (expected_tasks=13 but only 1 Source id and 1 query shape) must REJECT —
+    the count must equal the ID-set lengths, one Source id / query shape per task."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                check["evidence"]["expected_browser_source_ids"] = ["source-ctrip-flight"]  # type: ignore[index]
+                check["evidence"]["expected_query_shapes"] = ["ctrip:flight"]  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="expected_browser_source_ids length",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_query_shapes_not_bound_to_count() -> None:
+    """C-122 round-18 supervision 16:03 counter-example B (query-shape side): a
+    v4 source graph carrying the frozen Source-id set but only 1 query shape must
+    REJECT — the query-shape set must also be one-per-task."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                check["evidence"]["expected_query_shapes"] = ["ctrip:flight"]  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="expected_query_shapes length",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_5_tasks_1_id_each() -> None:
+    """C-122 round-18 supervision 16:03 counter-example B (exact form): a v4
+    source graph that declares expected_tasks=5 while its Source-id / query-shape
+    sets each carry only 1 entry must REJECT — a count that the ID sets do not
+    actually realize is a forged graph."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                check["evidence"]["expected_browser_tasks_per_pair"] = 5  # type: ignore[index]
+                check["evidence"]["expected_browser_source_ids"] = ["source-ctrip-flight"]  # type: ignore[index]
+                check["evidence"]["expected_query_shapes"] = ["ctrip:flight"]  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="frozen scenario's exact per-pair browser task count",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
 def test_verify_layer6_compact_contract_rejects_missing_per_pair_breakdown() -> None:
     """C-122 HG-G counter-example: dropping the per-pair breakdown from a passing
     v4 source graph must fail closed — the frozen-scenario per-pair contract is
@@ -7495,7 +7685,7 @@ def test_verify_layer6_compact_contract_rejects_missing_per_pair_breakdown() -> 
 def test_verify_layer6_compact_contract_rejects_total_not_equal_pair_sum() -> None:
     """C-122 HG-G counter-example: a v4 source graph whose declared total does not
     equal the sum of the per-pair query-task counts must fail closed — the total
-    must be recomputable from the per-pair breakdown (5+5+5=15 here)."""
+    must be recomputable from the per-pair breakdown (13+13+13=39 here)."""
 
     def mutate(checks: Any) -> None:
         for check in checks:

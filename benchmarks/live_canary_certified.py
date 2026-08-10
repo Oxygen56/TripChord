@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -43,6 +44,20 @@ COMPANION_STATUS_TIMEOUT_SECONDS = 5.0
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 DEFAULT_OUTPUT = RESULTS_DIR / "live-canary-certified.json"
 SCHEMA_VERSION = "tripchord-certified-ota-canary-v1"
+
+# C-122 round-18 HG-I (supervision 16:03): a provider failure must never crash
+# the canary without a diagnostic trail.  The iCom public-API probe is the only
+# network-touching scope, so it gets a bounded recovery replay (the search may
+# fail transiently); after the replay budget is exhausted the scope is recorded
+# as failed with the attempt count instead of raising, and the top-level seal
+# below writes a 0600 failure diagnostic only if something escapes anyway.
+_ICOM_REPLAY_ATTEMPTS = 3
+_ICOM_REPLAY_DELAY_SECONDS = 0.5
+
+# Any value that LOOKS like a bearer token / key (>=32 chars of letters, digits,
+# ``_``, ``-``, ``=``) is redacted from a diagnostic summary before it can reach
+# stderr or the committed evidence — a canary failure must never echo a secret.
+_TOKEN_SHAPE_RE = re.compile(r"[A-Za-z0-9_\-=]{32,}")
 
 # C-122 HG-A (2026-08-10 13:40 supervisor veto): the certified canary scope
 # contract = the six BROWSER Companion OTA scopes (incl. ``tongcheng:lodging``)
@@ -206,17 +221,54 @@ def _browser_scope_canary(
     }
 
 
+def _desensitize(text: str) -> str:
+    """Redact token-shaped substrings from a diagnostic message."""
+    return _TOKEN_SHAPE_RE.sub("<redacted>", text)
+
+
 async def _icom_scope_canary() -> dict[str, Any]:
-    """Real read-only public API canary for icom:transfer (no Companion needed)."""
+    """Real read-only public API canary for icom:transfer (no Companion needed).
+
+    The search is network-touching and may fail transiently, so it is replayed a
+    bounded number of times (recovery replay).  If the replay budget is exhausted
+    the scope is recorded as FAILED with the attempt count and a desensitized
+    reason — the exception never propagates (C-122 round-18 HG-I).
+    """
     provider = IComTransferProvider()
+    query = IComTransferQuery(
+        travel_date=date.today() + timedelta(days=3),
+        origin=IComLocation.AIRPORT,
+        destination=IComLocation.MAAFUSHI,
+        adults=2,
+    )
+    attempts = 0
+    last_error: str | None = None
+    last_exc_type: str | None = None
     try:
-        query = IComTransferQuery(
-            travel_date=date.today() + timedelta(days=3),
-            origin=IComLocation.AIRPORT,
-            destination=IComLocation.MAAFUSHI,
-            adults=2,
-        )
-        result = await provider.search(query)
+        result = None
+        for attempts in range(1, _ICOM_REPLAY_ATTEMPTS + 1):
+            try:
+                result = await provider.search(query)
+                break
+            except Exception as exc:  # network / HTTP / provider parsing
+                last_error = _desensitize(str(exc))
+                last_exc_type = type(exc).__name__
+                if attempts < _ICOM_REPLAY_ATTEMPTS:
+                    await asyncio.sleep(_ICOM_REPLAY_DELAY_SECONDS)
+        if result is None:
+            return {
+                "passed": False,
+                "kind": "icom_public_api",
+                "fresh": True,
+                "authorized": True,
+                "read_only": True,
+                "replay_attempts": attempts,
+                "exception_class": last_exc_type,
+                "detail": (
+                    f"icom public API search failed after {attempts} replay "
+                    f"attempts: {last_error or 'unknown provider error'}"
+                ),
+            }
         options = result.options
         if not options:
             return {
@@ -347,12 +399,51 @@ def _dump(report: dict[str, Any], output: Path) -> Path:
     except BaseException:
         os.close(descriptor)
         raise
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(report, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, output)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, output)
+    except BaseException:
+        # Never leave a partial 0600 temp file behind on a failed dump.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return output
+
+
+def _seal_failure_diagnostic(
+    stage: str,
+    exc: BaseException,
+    output: Path,
+) -> Path:
+    """Atomically write a 0600 failure diagnostic (stage, exception class,
+    desensitized summary, run identity) and NEVER echo a secret.
+
+    C-122 round-18 HG-I (supervision 16:03): a canary failure must be AUDITABLE.
+    When anything escapes ``evaluate`` / ``_dump``, ``main`` captures it at the
+    top level, records the stage and exception class with a token-shaped-substring
+    redacted summary, and seals it next to the output as ``<output>.failure.json``
+    with the same 0600 atomic dump used for the report itself.  The raw exception
+    text never reaches stderr or the committed trail unfiltered.
+    """
+    diagnostic: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "diagnostic_kind": "canary_failure",
+        "stage": stage,
+        "exception_class": type(exc).__name__,
+        "summary": _desensitize(str(exc)) if str(exc) else "no exception detail",
+        "run_identity": {
+            "script": Path(__file__).name,
+            "output": str(output),
+        },
+        "generated_at": _now(),
+    }
+    diag_path = output.with_suffix(output.suffix + ".failure.json")
+    return _dump(diagnostic, diag_path)
 
 
 def main() -> int:
@@ -365,10 +456,38 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
 
-    report = asyncio.run(
-        evaluate(api_base=args.api_base, bridge_token=args.bridge_token)
-    )
-    output = _dump(report, args.output)
+    try:
+        report = asyncio.run(
+            evaluate(api_base=args.api_base, bridge_token=args.bridge_token)
+        )
+    except BaseException as exc:
+        # Top-level seal: the canary crashed mid-evaluate.  Never echo the raw
+        # exception (it may contain a token); write the audit diagnostic and
+        # fail the process so layer 5 cannot be papered over.  The seal itself is
+        # best-effort — a disk that can no longer write must still fail loudly.
+        try:
+            _seal_failure_diagnostic("evaluate", exc, args.output)
+        except BaseException:
+            pass
+        print(
+            f"canary failed during evaluate ({type(exc).__name__}): "
+            f"{_desensitize(str(exc)) if str(exc) else 'no detail'}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        output = _dump(report, args.output)
+    except BaseException as exc:
+        try:
+            _seal_failure_diagnostic("dump", exc, args.output)
+        except BaseException:
+            pass
+        print(
+            f"canary failed writing evidence ({type(exc).__name__}): "
+            f"{_desensitize(str(exc)) if str(exc) else 'no detail'}",
+            file=sys.stderr,
+        )
+        return 1
     print(json.dumps(report, ensure_ascii=False, indent=2))
     print(f"evidence: {output}", file=sys.stderr)
     return 0 if report["passed"] else 2
