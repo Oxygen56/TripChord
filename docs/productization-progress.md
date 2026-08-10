@@ -67,6 +67,19 @@
 | Companion 自动重配 | supervisor_running=true、outcome=`waiting_for_control_capable_companion`、attempt_count=0；companion status 0 companions/disconnected；bridge-state `tasks=[]`/`reload_requests=[]` 无残留；未配对任何 Companion（用户侧动作，本轮不伪造；详见第十七轮评审 §6） |
 | `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence` | run_id=`ff7492050865`、tested_commit_sha=`048ba57`：层 1/2/3/4 PASS、层 5 FAIL（5 浏览器 scope 无 Companion 心跳，`icom:transfer` 真实公共 API 7 选项 PASS）、层 6 FAIL（pending user authorization、runner `failed_before_done_gate`）；`passed=false` 退出码 2、evidence_commit=None、工作树干净；15 项 done_gate checks 未运行；详见第十七轮评审 §7 |
 
+### 第十八轮（C-122，Round-18 六项硬门复核修复）验证结果
+
+| 命令 | 结果 |
+|---|---|
+| `uv run ruff check .` | All checks passed（0 错误） |
+| `uv run pytest scripts/tests/test_run_product_done_gate.py` | 249 passed——含六项硬门反例：层 5 六 scope 逐项 kind/provider/正整数 iCom options/报价 sample/Companion 绑定/心跳回执/严格 64hex build 指纹；层 6 十五项逐项语义（source 图任务数/唯一 id、stage 3+2 合同、source==snapshot、3 间隔 3 provider 重叠、三 OTA 集合、iCom 全覆盖 + 非空发布目标）；resolver 固定六层名/skipped=false/`--latest` 参数冲突/发布回执丢失与对账读失败终态；secret scan 裸 token/cookie/secret/browser_token 字段名与未知 64hex 拒绝、E/P 提交固定非个人身份；naive lease/naive saved_at fail-closed、正负偏移反例 |
+| `uv run python scripts/tests/run_tests_clean_env.py apps/api/tests`（clean-env 全量回归） | 1128 passed，退出码 0（含 scripts/tests + apps/api/tests） |
+| `uv run python scripts/tests/run_tests_clean_env.py benchmarks/tests apps/browser-companion/tests` | 421 passed，退出码 0 |
+| `cd apps/web && npm test` | 24 passed，退出码 0 |
+| `uv run pytest apps/api/tests/test_icom_transfer.py` | 11 passed——`TRAVEL_DATE` 改为相对今天 +30 天（日期炸弹修复：旧的固定 2026-08-10 在当天到来后 departure 已过、转换被静默置 None） |
+| `launchctl kickstart -k gui/<uid>/com.tripchord.live-api` | 受控重启绑定**本提交（round-18 最终 HEAD）**，provenance 三哈希匹配、pid 存活（机器证据见 gate run 发布的 side-channel evidence 与最终结果评论） |
+| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence` | 从零重跑严格六层门，绑定 round-18 最终 HEAD；`passed=false` 与证据提交如实记录在最终结果评论 |
+
 ## 当前可对外声明
 
 - v0.5/v0.6/v0.7 接入生产路径：reprice/handoff 端点 + 前端两步 handoff 流；预订保护 gate 被 Verifier/ReVerifier 与 live_system 事件重规划共同消费（v0.6 收尾完成）；SDK 冷却/一致性 API 接线。

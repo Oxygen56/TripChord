@@ -251,3 +251,57 @@ Done-Gate 求值异常等无法形成完整门报告的错误才写成
 仍可用于证明各自范围内的调度、约束、安全和训练工程能力，但它们均不能升级为当前 strict
 三平台库存证据。历史 v3/canary 成功包同样不能覆盖当前 v4 合同；测试通过也不等于真实平台
 DOM 契约已通过。
+
+## 证据链验签（resolver）与 refspec / 保留策略
+
+`--commit-evidence` 通过后，最终验收的**权威记录是旁路 gate ref
+`refs/tripchord/done-gate/<run_id>`**，而不是被跟踪的
+`benchmarks/results/product-v1-done-gate.json` 便利副本。该副本只用于人读交付物，任何机器门
+消费都不得把它当作最新权威——它可能指向一次已废弃的旧运行，真正的权威是带 `run_id` 的
+gate ref 指向的指针提交 P。
+
+### 验签入口
+
+```bash
+# 按 run_id 验签一条已发布证据链（P -> E -> S + 每个已提交证据 blob 的 sha256）
+uv run python scripts/run_product_done_gate.py --verify-ref <run_id>
+
+# 解析命名空间下最近发布的一条
+uv run python scripts/run_product_done_gate.py --verify-ref --latest
+```
+
+`--verify-ref` 只读：不跑任何 layer、不写 staging、不动 worktree。退出码 `0` = 链与所有
+blob 校验通过；`2` = 未通过（ref 不存在、P/E/S 父子链断裂、report/manifest schema 不符、
+report 未绑定 S/E/run_id/gate_ref、某提交证据 blob 的 sha256 与 E manifest 不一致等），并
+输出单个 JSON 判定 `{"verified": bool, "problems": [...]}`。
+
+**gate ref 必须是 direct ref。** 发布（create-only）用不解引用语义（`git update-ref
+--no-deref`）且发布前对预置 direct ref 或 symref 一律按冲突拒绝；验签同样只接受 direct ref，
+`gate_ref -> victim` 的符号引用一律判定为劫持（`verified=false`），即使解引用后的 OID 与 P 相
+符也不能算通过——证据必须落在 gate ref 自身名下，而不是某个 victim ref。
+
+### 正常 clone / fetch 所需 refspec
+
+普通 `git clone` / `git fetch` 只抓取 heads 与 tags，**不会**抓取 `refs/tripchord/*` 命名空间。
+要拿到旁路证据链，必须显式抓取该命名空间：
+
+```bash
+# 一次性抓取
+git fetch origin '+refs/tripchord/*:refs/tripchord/*'
+
+# 或写入本地配置，使后续 fetch 默认包含
+git config --add remote.origin.fetch '+refs/tripchord/*:refs/tripchord/*'
+```
+
+### 保留 / 清理策略
+
+- 已发布的 gate ref 与其 P/E/S 提交是**不可变证据**。在产品 v1.0 验收窗口（含发布后审计期）
+  内一律保留，不做删除或改写；证据需要随时可复验。
+- 清理只允许在以下两种情况，且都必须在 `docs/claim-ledger.md` 留下决策记录：
+  1. 发布后的超期归档（例如 v1.0 正式签收满 N 个月后，由维护者决定整段归档）；
+  2. 判定某次运行作废（例如取证发现密钥泄漏导致该 run 证据不可信）时，删除该 run 的
+     gate ref 并记录原因——作废仅通过删除 ref + 记录实现，绝不改写既有提交。
+- 删除一个 gate ref 不会立即清除对象；`git gc` 在无 ref 保护时才会回收 P/E/S 及其 blob。
+  发布前的失败运行只留下不可达对象，不产生任何可见状态，可被常规 `git gc` 安全回收。
+- 严禁把 `refs/tripchord/done-gate/<run_id>` 指向任何非本次发布指针，或把旧
+  `benchmarks/results/product-v1-done-gate.json` 的结论冒充为最新权威。

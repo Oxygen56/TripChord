@@ -5,12 +5,19 @@ import json
 import os
 import sqlite3
 import subprocess
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from scripts import run_product_done_gate as gate
+
+# C-122 P0 side-channel publish (2026-08-10 11:00): evidence is published through
+# a namespaced ref ``refs/tripchord/done-gate/<run_id>`` created atomically at the
+# very end, while the product branch / HEAD / real index / worktree stay
+# byte-for-byte read-only.  A 12-hex run_id is required to name the ref.
+_TEST_RUN_ID = "a1b2c3d4e5f6"
 
 
 def _init_git_repo(root: Path) -> None:
@@ -62,19 +69,19 @@ def _patch_root(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
 
 
 def _passing_layers(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (
-        "layer1_reproducibility",
-        "layer2_replay",
-        "layer3_clean_chrome_fixtures",
-        "layer4_model_smoke",
-        "layer5_real_canary",
-        "layer6_full_e2e",
+    for attr, layer_name in (
+        ("layer1_reproducibility", "1_reproducibility"),
+        ("layer2_replay", "2_replay"),
+        ("layer3_clean_chrome_fixtures", "3_clean_chrome_fixtures"),
+        ("layer4_model_smoke", "4_model_smoke"),
+        ("layer5_real_canary", "5_real_canary"),
+        ("layer6_full_e2e", "6_full_e2e"),
     ):
         monkeypatch.setattr(
             gate,
-            name,
-            lambda *args, name=name, **kwargs: gate.LayerResult(
-                name=name, passed=True
+            attr,
+            lambda *args, layer_name=layer_name, **kwargs: gate.LayerResult(
+                name=layer_name, passed=True
             ),
         )
 
@@ -86,26 +93,43 @@ def _populating_passing_layers(
     modelling the real flow (C-114 R3): main() creates an initially-empty staging
     dir, then the layers populate it — the tests never hand main() a pre-filled
     dir, because the gate refuses reused non-empty staging."""
+    # A real runtime always has a persisted bridge-state file (docs/operations.md
+    # pins TRIPCHORD_BROWSER_BRIDGE_STATE_PATH); simulate it so the layer-6
+    # compact's bridge_state_lease_preflight binding carries a valid sha256
+    # (C-122 Fix 2).  The file lives out-of-repo so it never dirties porcelain.
+    bridge_state_path = staging_dir.parent / "bridge-state.json"
+    bridge_state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": [],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(gate._BRIDGE_STATE_ENV, str(bridge_state_path))
     monkeypatch.setattr(
         gate,
         "layer1_reproducibility",
         lambda *args, sd=staging_dir: (
             _populate_required_evidence(sd),
-            gate.LayerResult(name="layer1_reproducibility", passed=True),
+            gate.LayerResult(name="1_reproducibility", passed=True),
         )[1],
     )
-    for name in (
-        "layer2_replay",
-        "layer3_clean_chrome_fixtures",
-        "layer4_model_smoke",
-        "layer5_real_canary",
-        "layer6_full_e2e",
+    for attr, layer_name in (
+        ("layer2_replay", "2_replay"),
+        ("layer3_clean_chrome_fixtures", "3_clean_chrome_fixtures"),
+        ("layer4_model_smoke", "4_model_smoke"),
+        ("layer5_real_canary", "5_real_canary"),
+        ("layer6_full_e2e", "6_full_e2e"),
     ):
         monkeypatch.setattr(
             gate,
-            name,
-            lambda *args, name=name, **kwargs: gate.LayerResult(
-                name=name, passed=True
+            attr,
+            lambda *args, layer_name=layer_name, **kwargs: gate.LayerResult(
+                name=layer_name, passed=True
             ),
         )
 
@@ -125,21 +149,21 @@ def _populating_passing_layers_without(
         _populate_required_evidence(sd)
         for name in names:
             (sd / name).unlink(missing_ok=True)
-        return gate.LayerResult(name="layer1_reproducibility", passed=True)
+        return gate.LayerResult(name="1_reproducibility", passed=True)
 
     monkeypatch.setattr(gate, "layer1_reproducibility", layer1)
-    for name in (
-        "layer2_replay",
-        "layer3_clean_chrome_fixtures",
-        "layer4_model_smoke",
-        "layer5_real_canary",
-        "layer6_full_e2e",
+    for attr, layer_name in (
+        ("layer2_replay", "2_replay"),
+        ("layer3_clean_chrome_fixtures", "3_clean_chrome_fixtures"),
+        ("layer4_model_smoke", "4_model_smoke"),
+        ("layer5_real_canary", "5_real_canary"),
+        ("layer6_full_e2e", "6_full_e2e"),
     ):
         monkeypatch.setattr(
             gate,
-            name,
-            lambda *args, name=name, **kwargs: gate.LayerResult(
-                name=name, passed=True
+            attr,
+            lambda *args, layer_name=layer_name, **kwargs: gate.LayerResult(
+                name=layer_name, passed=True
             ),
         )
 
@@ -174,25 +198,60 @@ def _realistic_e2e_evidence() -> dict[str, object]:
             },
         },
         "companion_preflight": {
-            "status": "ok",
+            "status": "connected",
+            "stale_after_seconds": 45,
             "companions": [
                 {
                     "companion_id": "comp-1",
+                    "providers": ["ctrip", "qunar", "tongcheng"],
+                    "is_fresh": True,
+                    "age_seconds": 3,
                     "authorized_scope_keys": [
                         "ctrip:flight",
                         "ctrip:lodging",
                         "qunar:flight",
                         "qunar:lodging",
                         "tongcheng:flight",
+                        "icom:transfer",
                     ],
                 }
             ],
         },
         "done_gate": _matching_done_gate(),
-        "event_injection_contract": {"attempted": 0, "succeeded": 0},
-        "timeout_contract": {"window_seconds": 300},
-        "runner_contract": {"schema_version": "tripchord-live-v4-runner-v1"},
+        "api_payload_candidate_set_sha256": "a" * 64,
+        "scenario_sha256": "a" * 64,
+        "event_injection_contract": {
+            "mode": "synthetic_sold_out_fault_injection",
+            "source": "tripchord-done-gate-synthetic-fault",
+            "platform_sold_out_observed": False,
+            "platform_price_change_observed": False,
+            "verified_change_scope": (
+                "different_available_replacement_identity_not_platform_sold_out"
+            ),
+            "claim_boundary": "only_affected_component_recheck",
+        },
+        "timeout_contract": {
+            "server_execution_timeout_seconds": 3600,
+            "client_wait_timeout_seconds": 3600,
+            "minimum_client_margin_seconds": 30,
+        },
+        "runner_contract": {
+            "require_model_enhancement": True,
+            "maximum_quote_age_minutes": 15,
+            "minimum_recommendable_options": 2,
+        },
     }
+
+
+def _repo_head_or_none() -> str | None:
+    """The HEAD sha of the patched repo root, or None when it is not a repo —
+    the raw layer-6 fixture models the REAL flow where the runner snapshots the
+    tested revision, so its compact must bind the repo that is actually
+    committed (C-122 acceptance: repo == runtime == S)."""
+    try:
+        return gate._git("rev-parse", "HEAD", check=True).stdout.strip()
+    except Exception:
+        return None
 
 
 def _populate_required_evidence(staging_dir: Path) -> None:
@@ -214,8 +273,13 @@ def _populate_required_evidence(staging_dir: Path) -> None:
     (staging_dir / "live-canary-certified.json").write_text(
         json.dumps(_matching_canary()), encoding="utf-8"
     )
+    raw_e2e = _realistic_e2e_evidence()
+    head = _repo_head_or_none()
+    if head is not None:
+        raw_e2e["repo_revision"]["commit_sha"] = head  # type: ignore[index]
+        raw_e2e["runtime_before_run"]["runtime_provenance"]["commit_sha"] = head  # type: ignore[index]
     (staging_dir / "live-done-gate-v4.json").write_text(
-        json.dumps(_realistic_e2e_evidence()), encoding="utf-8"
+        json.dumps(raw_e2e), encoding="utf-8"
     )
 
 
@@ -357,18 +421,18 @@ def test_run_gate_aborts_when_layer_dirties_tracked_tree(
     make the gate abort with exit-2 semantics instead of silently certifying a
     tree the gate itself dirtied."""
     _patch_root(monkeypatch, clean_repo)
-    for name in (
-        "layer1_reproducibility",
-        "layer3_clean_chrome_fixtures",
-        "layer4_model_smoke",
-        "layer5_real_canary",
-        "layer6_full_e2e",
+    for attr, layer_name in (
+        ("layer1_reproducibility", "1_reproducibility"),
+        ("layer3_clean_chrome_fixtures", "3_clean_chrome_fixtures"),
+        ("layer4_model_smoke", "4_model_smoke"),
+        ("layer5_real_canary", "5_real_canary"),
+        ("layer6_full_e2e", "6_full_e2e"),
     ):
         monkeypatch.setattr(
             gate,
-            name,
-            lambda *args, name=name, **kwargs: gate.LayerResult(
-                name=name, passed=True
+            attr,
+            lambda *args, layer_name=layer_name, **kwargs: gate.LayerResult(
+                name=layer_name, passed=True
             ),
         )
 
@@ -388,18 +452,18 @@ def test_run_gate_aborts_when_head_moves_mid_run(
     """Counter-example (defect fix ④): if HEAD changes while the gate runs, the
     end snapshot must disagree with the start snapshot and the gate aborts."""
     _patch_root(monkeypatch, clean_repo)
-    for name in (
-        "layer2_replay",
-        "layer3_clean_chrome_fixtures",
-        "layer4_model_smoke",
-        "layer5_real_canary",
-        "layer6_full_e2e",
+    for attr, layer_name in (
+        ("layer2_replay", "2_replay"),
+        ("layer3_clean_chrome_fixtures", "3_clean_chrome_fixtures"),
+        ("layer4_model_smoke", "4_model_smoke"),
+        ("layer5_real_canary", "5_real_canary"),
+        ("layer6_full_e2e", "6_full_e2e"),
     ):
         monkeypatch.setattr(
             gate,
-            name,
-            lambda *args, name=name, **kwargs: gate.LayerResult(
-                name=name, passed=True
+            attr,
+            lambda *args, layer_name=layer_name, **kwargs: gate.LayerResult(
+                name=layer_name, passed=True
             ),
         )
 
@@ -431,10 +495,160 @@ def _expected_snapshot(root: Path) -> gate.GitSnapshot:
     )
 
 
+def _per_check_evidence(name: str) -> dict[str, object]:
+    """The structured, recomputable binding evidence each passing layer-6 check
+    carries — field names match the live-v4 runner's evidence dicts (C-122
+    Fix 3).  Values are synthetic and secret-free."""
+    candidate_sha = "a" * 64
+    return {
+        "prefrozen_stay_plan_candidate_set": {
+            "candidate_set_sha256": candidate_sha,
+            "evidence_refs": [f"sha256:{candidate_sha}"],
+        },
+        "v4_source_graph": {
+            "expected_browser_tasks_per_pair": 5,
+            "expected_browser_source_ids": [
+                "source-ctrip-flight",
+                "source-qunar-flight",
+                "source-tongcheng-flight",
+                "source-ctrip-lodging-seg-1",
+                "source-qunar-lodging-seg-1",
+            ],
+            "expected_query_shapes": [
+                "ctrip:flight",
+                "ctrip:lodging_full_stay",
+                "qunar:flight",
+                "qunar:lodging_full_stay",
+                "tongcheng:flight",
+            ],
+            "expected_icom_task_ids": ["public-transfer-icom-ctrip-1"],
+            "pair_ids": ["pair-1", "pair-2", "pair-3"],
+            "total_planned_task_count": 15,
+        },
+        "stage_aware_exploration_publication_contract": {
+            "exploration_count": 3,
+            "publication_count": 2,
+            "publication_option_ids": ["opt-1", "opt-2"],
+        },
+        "stay_inventory_four_state_contract": {
+            "minimum_exact_providers_per_selected_segment": 2,
+            "inventory_states": [
+                "exact_quote",
+                "confirmed_empty",
+                "bounded_no_exact_quote",
+                "bounded_provider_pending",
+            ],
+        },
+        "planner_verifier_repair_master_stay_plan_chain": {
+            "evidence_refs": ["stay-plan:plan-1"],
+        },
+        "recommendable_date_pair_stay_plan_options": {
+            "freshness_ttl_seconds": 600,
+            "freshness_by_option": {
+                "opt-1": [
+                    {
+                        "component_id": "stay-1",
+                        "captured_at": "2026-08-10T00:00:00+00:00",
+                        "expires_at": "2026-08-10T00:10:00+00:00",
+                        "age_seconds_at_post_event_gate": 5,
+                        "ttl_seconds": 600,
+                        "fresh_at_post_event_gate": True,
+                    }
+                ],
+                "opt-2": [
+                    {
+                        "component_id": "stay-2",
+                        "captured_at": "2026-08-10T00:00:00+00:00",
+                        "expires_at": "2026-08-10T00:10:00+00:00",
+                        "age_seconds_at_post_event_gate": 5,
+                        "ttl_seconds": 600,
+                        "fresh_at_post_event_gate": True,
+                    }
+                ],
+            },
+        },
+        "icom_exploration_and_publication_evidence": {
+            "publication_target_task_ids": ["public-transfer-icom-ctrip-1"],
+            "exploration_full_coverage": {"passed": True},
+        },
+        "all_recommended_publication_closures": {
+            "options": {
+                "opt-1": {
+                    "evidence_scope": "publication",
+                    "planner_verifier_repair": {"passed": True},
+                    "budget_and_selected_evidence": {"passed": True},
+                    "public_transfer_evidence": {"passed": True},
+                }
+            }
+        },
+        "real_v4_browser_source_evidence": {
+            "source_task_count": 5,
+            "snapshot_count": 5,
+            "successful_snapshot_count": 5,
+            "bounded_or_empty_task_count": 0,
+        },
+        "flight_search_outcome_contract": {
+            "provider_outcome_states": {
+                "ctrip": "quote_found",
+                "qunar": "comparison_price_only",
+                "tongcheng": "bounded_no_exact_quote",
+            },
+            "exact_provider_count": 1,
+            "comparison_provider_count": 1,
+            "price_bearing_provider_count": 2,
+        },
+        "observed_cross_platform_overlap": {
+            "interval_count": 3,
+            "max_overlapping_tasks": 3,
+            "max_overlapping_providers": 3,
+        },
+        "strict_selected_plan_platform_coverage": {
+            "selected_stay_plan_id": "plan-1",
+            "providers": ["ctrip", "qunar", "tongcheng"],
+            "coverage_mode": "strict",
+            "all_platforms_complete": True,
+        },
+        "planner_verifier_repair_orchestrator": {
+            "graph_chain_ok": True,
+            "reverify_node_present": True,
+            "recritic_stage_completed": True,
+            "planning_handoff_present": True,
+            "stage_handoffs_match": True,
+            "identity_chain_ok": True,
+            "reason_chain_ok": True,
+            "independent_audit_present": True,
+            "independent_audit_passed": True,
+            "independent_check_count": 5,
+            "planner_candidate_id": "cand-1",
+            "initial_verifier_candidate_id": "cand-1",
+            "repaired_candidate_id": None,
+            "reverified_candidate_id": "cand-1",
+            "decision_states": ["accept"],
+            "repair_execution_mode": "verified_noop",
+        },
+        "exact_budget_and_selected_evidence": {
+            "computed_total_cents": 1000,
+            "declared_total_cents": 1000,
+            "evidence_ref_count": 5,
+            "selected_icom_transfer_count": 0,
+            "supplemental_usd_cents": None,
+            "published_base_fare_boundary_ok": True,
+        },
+        "event_injection_repair_reverify_master": {
+            "dynamic_replan": {"passed": True},
+            "read_only_graph": {"passed": True},
+            "initial_stay_plan_id": "plan-1",
+            "event_final_stay_plan_id": "plan-1",
+        },
+    }[name]
+
+
 def _matching_done_gate() -> dict[str, object]:
     """A passing layer-6 ``done_gate`` report in the real runner schema:
     ``passed`` plus the full 15-item check set, each item passed (the actual
-    ``LiveV4DoneGateReport`` shape — there is no top-level ``passed``)."""
+    ``LiveV4DoneGateReport`` shape — there is no top-level ``passed``).  Each
+    item carries the structured per-check evidence its semantic group verifies
+    (C-122 Fix 3)."""
     check_names = (
         "prefrozen_stay_plan_candidate_set",
         "v4_source_graph",
@@ -452,12 +666,49 @@ def _matching_done_gate() -> dict[str, object]:
         "exact_budget_and_selected_evidence",
         "event_injection_repair_reverify_master",
     )
+    checks = []
+    for name in check_names:
+        evidence = _per_check_evidence(name)
+        refs = evidence.get("evidence_refs")
+        checks.append(
+            {
+                "name": name,
+                "passed": True,
+                "summary": "ok",
+                "evidence_refs": list(refs) if isinstance(refs, list) else [],
+                "evidence": evidence,
+            }
+        )
+    return {"passed": True, "checks": checks}
+
+
+def _per_scope_canary_evidence(scope: str) -> dict[str, object]:
+    """The desensitized per-scope evidence binding a passing canary carries:
+    companion-heartbeat identity for browser scopes, the read-only query sample
+    for icom (C-122 Fix 3).  Values are synthetic and secret-free."""
+    if scope == "icom:transfer":
+        return {
+            "searched_at": "2026-08-10T00:00:00+00:00",
+            "options": 3,
+            "sample": {
+                "service_name": "speed-boat",
+                "departure_at": "2026-08-13T09:00:00+00:00",
+                "fare_amount": "150",
+                "currency": "USD",
+            },
+            "source_url_count": 3,
+        }
     return {
-        "passed": True,
-        "checks": [
-            {"name": name, "passed": True, "summary": "ok", "evidence_refs": []}
-            for name in check_names
-        ],
+        "companion_id": "comp-1",
+        "providers": ["ctrip", "qunar", "tongcheng"],
+        "authorized_scope_keys": [scope],
+        "is_fresh": True,
+        "age_seconds": 3,
+        "adapter_version": "test-adapter",
+        "contract_version": "tripchord-browser-bridge-v2",
+        # C-122 round-18 gate-1: the heartbeat receipt also names the runtime
+        # instance that performed the handshake.
+        "runtime_instance_id": "runtime-1",
     }
 
 
@@ -477,14 +728,23 @@ def _matching_canary() -> dict[str, object]:
         "passed": True,
         "bridge_token_present": True,
         "scopes": [
-            {
-                "scope": scope,
-                "kind": kind,
-                "passed": True,
-                "fresh": True,
-                "authorized": True,
-                "read_only": True,
-            }
+            (
+                {
+                    "scope": scope,
+                    "kind": kind,
+                    # C-122 round-18 gate-1: the certified canary carries the real
+                    # provider of each scope (the scope's platform prefix).
+                    "provider": scope.split(":", 1)[0],
+                    "passed": True,
+                    "fresh": True,
+                    "authorized": True,
+                    "read_only": True,
+                    # C-122 Fix 3: each scope carries its desensitized per-scope
+                    # evidence binding (companion heartbeat / read-only query
+                    # sample) in the raw canary, which the compact preserves.
+                    "evidence": _per_scope_canary_evidence(scope),
+                }
+            )
             for scope, kind in scopes
         ],
         "companion_status": {
@@ -872,9 +1132,11 @@ def test_layer3_browser_e2e_real_run_passes(
 def test_commit_evidence_two_phase(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """The evidence commit E must contain only evidence paths, the report must
-    record tested_commit_sha=S and evidence_commit=E, and neither may claim E
-    was tested at S."""
+    """C-122 P0 side-channel publish: the evidence commits E (parent=S) and P
+    (parent=E) are built entirely off the shared worktree — the product branch /
+    HEAD / real index / worktree stay byte-for-byte at S and only the dedicated
+    gate ref ``refs/tripchord/done-gate/<run_id>`` appears, atomically, at the
+    very end.  E/P are never installed as the branch tip."""
     _patch_root(monkeypatch, clean_repo)
     staging_dir.mkdir()
     (staging_dir / "product-acceptance.json").write_text('{"passed": true}\n', encoding="utf-8")
@@ -892,10 +1154,11 @@ def test_commit_evidence_two_phase(
         schema_version=gate.EVIDENCE_SCHEMA,
         generated_at="2026-08-10T00:00:00+00:00",
         tested_commit_sha=tested_sha,
+        run_id=_TEST_RUN_ID,
         toplevel=str(clean_repo),
         branch="main",
         worktree_dirty=False,
-        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        layers=gate._passing_layers(),
         passed=True,
         summary="all applicable Done-Gate layers passed",
         boundary="",
@@ -904,49 +1167,447 @@ def test_commit_evidence_two_phase(
 
     evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
 
-    # Phase 1: E exists as a child of the tested commit, then phase 2 pointer.
-    log = subprocess.run(
-        ["git", "-C", str(clean_repo), "log", "--oneline", "-3"],
+    # The branch never moved and only the gate ref was created: HEAD/index/
+    # worktree at S, P^=E, E^=S, evidence commits unreachable from the branch.
+    pointer_sha = _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit
+    )
+
+    # P's committed tree carries the report + manifest + evidence files.
+    tree = subprocess.run(
+        ["git", "-C", str(clean_repo), "ls-tree", "-r", "--name-only", pointer_sha],
         capture_output=True,
         text=True,
         check=True,
-    ).stdout
-    lines = [line.strip() for line in log.strip().splitlines()]
-    assert len(lines) == 3  # baseline -> E -> pointer
+    ).stdout.splitlines()
+    for rel in (
+        "benchmarks/results/product-acceptance.json",
+        "benchmarks/results/browser-e2e.json",
+        "benchmarks/results/browser-e2e-screenshot.png",
+        gate._REPORT_REL,
+        gate._MANIFEST_REL,
+    ):
+        assert rel in tree, f"missing committed evidence path in P: {rel}"
 
-    # The authoritative report (in the tracked results tree) records both SHAs
-    # and keeps them distinct.
-    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
-    payload = json.loads(report_path.read_text(encoding="utf-8"))
-    assert payload["tested_commit_sha"] == tested_sha
-    assert payload["evidence_commit"] == evidence_commit
-    assert payload["evidence_commit"] != tested_sha
-    assert payload["passed"] is True
+    # The authoritative report in P records tested_commit_sha=S and
+    # evidence_commit=E, distinct, and binds the gate ref.
+    committed = json.loads(
+        subprocess.run(
+            ["git", "-C", str(clean_repo), "show", f"{pointer_sha}:{gate._REPORT_REL}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
+    assert committed["tested_commit_sha"] == tested_sha
+    assert committed["evidence_commit"] == evidence_commit
+    assert committed["evidence_commit"] != tested_sha
+    assert committed["passed"] is True
+    assert committed["gate_ref"] == f"refs/tripchord/done-gate/{_TEST_RUN_ID}"
 
-    # The evidence files landed in E's tree (tracked now).
-    assert (clean_repo / "benchmarks" / "results" / "product-acceptance.json").is_file()
-    assert (clean_repo / "benchmarks" / "results" / "browser-e2e-screenshot.png").is_file()
+    # The staged (delivered) report in the exclusive staging dir is the same
+    # file P committed — never a tracked-worktree copy.
+    staged = json.loads(
+        (staging_dir / gate._REPORT_STAGED_NAME).read_text(encoding="utf-8")
+    )
+    assert staged["evidence_commit"] == evidence_commit
+    assert staged["passed"] is True
 
-    # Working tree clean after the two-phase commit.
-    status = subprocess.run(
-        ["git", "-C", str(clean_repo), "status", "--porcelain"],
+
+# ---------------------------------------------------------------------------
+# C-122 round-18 gate-7: formal resolver / verification entry
+# (verify P->E->S and every committed blob from refs/tripchord/done-gate/<run_id>)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_gate_ref_verifies_published_chain(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 round-18 gate-7 positive: after a real side-channel publish,
+    ``verify_gate_ref`` resolves ``refs/tripchord/done-gate/<run_id>`` and
+    verifies the full P->E->S chain plus every committed evidence blob against
+    the committed manifests."""
+    report, start, tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+    pointer_sha = _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit
+    )
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is True
+    assert verdict["pointer_commit"] == pointer_sha
+    assert verdict["evidence_commit"] == evidence_commit
+    assert verdict["tested_commit_sha"] == tested_sha
+    assert verdict["gate_ref"] == f"refs/tripchord/done-gate/{_TEST_RUN_ID}"
+
+
+def test_verify_gate_ref_fails_closed_on_unpublished_run_id(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    """C-122 round-18 gate-7 counter-example: a run_id with no published gate ref
+    is a verified=False verdict naming the missing ref — never a pass."""
+    _patch_root(monkeypatch, clean_repo)
+    verdict = gate.verify_gate_ref("ffffffffffff")
+    assert verdict["verified"] is False
+    assert any("does not exist" in problem for problem in verdict["problems"])
+
+
+def test_verify_gate_ref_detects_ref_repointed_off_pointer(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 round-18 gate-7 counter-example: if the gate ref is repointed away
+    from the pointer commit P (here, onto E), the chain P->E->S no longer holds
+    and the resolver fails closed instead of trusting the ref."""
+    report, start, tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+    pointer_sha = _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit
+    )
+    # Repoint the ref at E: the resolver must fail closed (E's committed report
+    # carries no evidence_commit binding, and the chain from E is no longer P).
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "update-ref",
+            f"refs/tripchord/done-gate/{_TEST_RUN_ID}",
+            evidence_commit,
+            pointer_sha,
+        ],
+        check=True,
+    )
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is False
+    assert verdict["problems"]
+
+
+def test_verify_gate_ref_latest_resolves_single_ref(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 round-18 gate-7: ``--latest`` resolution finds the only published
+    ref under the namespace."""
+    report, start, _tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    gate._commit_evidence(staging_dir, report, start=start)
+    assert gate._latest_gate_run_id() == _TEST_RUN_ID
+
+
+def test_main_verify_ref_mode_prints_verdict(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, capsys
+) -> None:
+    """C-122 round-18 gate-7: the ``--verify-ref`` CLI mode prints a single JSON
+    verdict and returns 0 for a verified trail, 2 for an unknown run_id — and it
+    never touches the worktree (no staging dir, no layers)."""
+    report, start, _tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    gate._commit_evidence(staging_dir, report, start=start)
+    rc = gate.main(["--verify-ref", _TEST_RUN_ID])
+    captured = capsys.readouterr()
+    verdict = json.loads(captured.out)
+    assert rc == 0
+    assert verdict["verified"] is True
+    # An unknown run_id is exit 2 with a fail-closed verdict.
+    rc = gate.main(["--verify-ref", "ffffffffffff"])
+    captured = capsys.readouterr()
+    verdict = json.loads(captured.out)
+    assert rc == 2
+    assert verdict["verified"] is False
+
+
+def test_main_latest_without_verify_ref_fails_closed(capsys) -> None:
+    """C-122 round-18 gate-3 counter-example: a bare ``--latest`` is a parameter
+    mistake — it can only pick which published run to verify — and must fail
+    closed with a JSON problem payload and exit 2 instead of silently ignoring
+    the flag."""
+    rc = gate.main(["--latest"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    verdict = json.loads(captured.out)
+    assert "--latest requires --verify-ref" in verdict["problems"]
+
+
+def test_commit_evidence_rejects_foreign_layer_name(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 round-18 gate-3 counter-example: the publishing side re-parses P's
+    authoritative report from the committed blob and requires the layer set to be
+    EXACTLY the six fixed names — a renamed/replaced/foreign layer is not a
+    done-gate pass even when every layer says passed=true/skipped=false, and
+    nothing is published."""
+    report, start, tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    report.layers = [
+        gate.LayerResult(name="7_extra", passed=True, skipped=False),
+        gate.LayerResult(name="2_replay", passed=True, skipped=False),
+        gate.LayerResult(name="3_clean_chrome_fixtures", passed=True, skipped=False),
+        gate.LayerResult(name="4_model_smoke", passed=True, skipped=False),
+        gate.LayerResult(name="5_real_canary", passed=True, skipped=False),
+        gate.LayerResult(name="6_full_e2e", passed=True, skipped=False),
+    ]
+    with pytest.raises(gate.GateStateChangedError, match="six fixed layer names"):
+        gate._commit_evidence(staging_dir, report, start=start)
+    _assert_phase_failure_is_atomic(clean_repo, staging_dir, tested_sha)
+
+
+def test_commit_evidence_rejects_skipped_layer_in_pointer_report(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 round-18 gate-3 counter-example: a layer recorded as skipped=true in
+    the pointer report fails closed on the publishing side — a certified pass
+    must bind every layer with skipped=false, not merely list six layers."""
+    report, start, tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    report.layers = [
+        gate.LayerResult(name="1_reproducibility", passed=True, skipped=False),
+        gate.LayerResult(name="2_replay", passed=True, skipped=False),
+        gate.LayerResult(name="3_clean_chrome_fixtures", passed=True, skipped=False),
+        gate.LayerResult(name="4_model_smoke", passed=True, skipped=False),
+        gate.LayerResult(name="5_real_canary", passed=True, skipped=False),
+        gate.LayerResult(name="6_full_e2e", passed=True, skipped=True),
+    ]
+    with pytest.raises(gate.GateStateChangedError, match="is not skipped=false"):
+        gate._commit_evidence(staging_dir, report, start=start)
+    _assert_phase_failure_is_atomic(clean_repo, staging_dir, tested_sha)
+
+
+def test_verify_gate_ref_fails_closed_on_foreign_layer_set(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_repo: Path,
+    staging_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """C-122 round-18 gate-3 counter-example: the consumer resolver re-reads P's
+    authoritative report from the committed blob and requires the layer set to be
+    EXACTLY the six fixed names — a manually-forged pointer whose report renames
+    one layer is verified=False, never a pass."""
+    report, start, tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+    p_sha = _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit
+    )
+    # Rebuild P's tree with a tampered report (one layer renamed) and repoint the
+    # gate ref at the forged pointer; the chain P2->E->S still holds.
+    report_blob = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "cat-file",
+            "blob",
+            f"{p_sha}:{gate._REPORT_REL}",
+        ],
         capture_output=True,
-        text=True,
         check=True,
     ).stdout
-    assert status.strip() == ""
-
-    # Only evidence paths changed between tested_sha and evidence_commit.
-    diff = subprocess.run(
-        ["git", "-C", str(clean_repo), "diff", "--name-only", tested_sha, evidence_commit],
+    data = json.loads(report_blob.decode("utf-8"))
+    data["layers"][0]["name"] = "7_foreign"
+    forged_blob = subprocess.run(
+        ["git", "-C", str(clean_repo), "hash-object", "-w", "--stdin"],
+        input=json.dumps(data).encode("utf-8"),
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    index = tmp_path / "idx"
+    env = dict(os.environ, GIT_INDEX_FILE=str(index))
+    subprocess.run(["git", "-C", str(clean_repo), "read-tree", p_sha], env=env, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"100644,{forged_blob.decode()},{gate._REPORT_REL}",
+        ],
+        env=env,
+        check=True,
+    )
+    tree2 = subprocess.run(
+        ["git", "-C", str(clean_repo), "write-tree"],
+        env=env,
         capture_output=True,
         text=True,
         check=True,
     ).stdout.strip()
-    assert diff != ""
-    for path in diff.splitlines():
-        assert path.startswith("benchmarks/results/"), f"non-evidence path in E: {path}"
-    assert "tracked.txt" not in diff
+    p2 = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "commit-tree",
+            tree2,
+            "-p",
+            evidence_commit,
+            "-m",
+            "tampered pointer (foreign layer)",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "update-ref",
+            f"refs/tripchord/done-gate/{_TEST_RUN_ID}",
+            p2,
+            p_sha,
+        ],
+        check=True,
+    )
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is False
+    assert any(
+        "six fixed layer names" in problem for problem in verdict["problems"]
+    )
+
+
+def test_clean_env_launcher_scrubs_secrets(tmp_path: Path) -> None:
+    """C-122 round-18 gate-8: the out-of-process clean-env launcher removes
+    every secret-bearing variable BEFORE the child pytest process starts and
+    keeps non-secret runtime variables untouched — no real credential can reach
+    a test fixture frame or traceback."""
+    import importlib.util
+
+    launcher_path = (
+        Path(gate.__file__).resolve().parent / "tests" / "run_tests_clean_env.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "run_tests_clean_env", str(launcher_path)
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    scrubbed = module._scrub_secrets(
+        {
+            "OPENAI_API_KEY": "sk-real",
+            "TRIPCHORD_BROWSER_BRIDGE_TOKEN": "real-token",
+            "COOKIE": "real-cookie",
+            "PATH": "/usr/bin",
+            "DATABASE_URL": "sqlite+aiosqlite:///./live.db",
+            "VIRTUAL_ENV": "/opt/venv",
+        }
+    )
+    assert "OPENAI_API_KEY" not in scrubbed
+    assert "TRIPCHORD_BROWSER_BRIDGE_TOKEN" not in scrubbed
+    assert "COOKIE" not in scrubbed
+    assert scrubbed["PATH"] == "/usr/bin"
+    assert scrubbed["DATABASE_URL"] == "sqlite+aiosqlite:///./live.db"
+    assert scrubbed["VIRTUAL_ENV"] == "/opt/venv"
+
+
+def _minimal_evidence_commit_args(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> tuple[gate.GateReport, gate.GitSnapshot, str]:
+    """Shared setup for a valid ``_commit_evidence`` call: minimal passing
+    evidence in staging and a clean-start snapshot.  Returns (report, start,
+    tested_sha)."""
+    _patch_root(monkeypatch, clean_repo)
+    staging_dir.mkdir(exist_ok=True)
+    (staging_dir / "product-acceptance.json").write_text(
+        '{"passed": true}\n', encoding="utf-8"
+    )
+    (staging_dir / "browser-e2e.json").write_text('{"passed": true}\n', encoding="utf-8")
+    (staging_dir / "browser-e2e-screenshot.png").write_bytes(b"PNG")
+    (staging_dir / "live-canary-certified.json").write_text(
+        '{"scopes": []}\n', encoding="utf-8"
+    )
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        '{"run_status": "completed"}\n', encoding="utf-8"
+    )
+    tested_sha = _head(clean_repo)
+    report = gate.GateReport(
+        schema_version=gate.EVIDENCE_SCHEMA,
+        generated_at="2026-08-10T00:00:00+00:00",
+        tested_commit_sha=tested_sha,
+        run_id=_TEST_RUN_ID,
+        toplevel=str(clean_repo),
+        branch="main",
+        worktree_dirty=False,
+        layers=gate._passing_layers(),
+        passed=True,
+        summary="all applicable Done-Gate layers passed",
+        boundary="",
+    )
+    start = _expected_snapshot(clean_repo)
+    return report, start, tested_sha
+
+
+def test_commit_evidence_writes_local_report_with_evidence_commit(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 Fix 7 + P0: the delivered local report copy is generated BEFORE the
+    publish carrying evidence_commit=E (and the gate ref) — never re-dumped after
+    the atomic ref creation.  HEAD stays at S; only the gate ref appears."""
+    report, start, tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    out = staging_dir.parent / "delivered" / "report.json"
+    evidence_commit = gate._commit_evidence(
+        staging_dir, report, start=start, local_report_path=out
+    )
+    assert out.is_file()
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["evidence_commit"] == evidence_commit
+    assert payload["evidence_commit"] != tested_sha
+    assert payload["passed"] is True
+    assert payload["gate_ref"] == f"refs/tripchord/done-gate/{_TEST_RUN_ID}"
+    _assert_side_channel_published(clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit)
+
+
+def test_commit_evidence_local_report_write_failure_is_not_silent(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 Fix 7 counter-example: if the delivered local report cannot be
+    written, the commit phase FAILS CLOSED (HEAD never moves) instead of
+    proceeding with a silently-missing local report."""
+    report, start, tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    # The parent of the local report path is a regular file — mkdir fails.
+    blocker = staging_dir.parent / "blocker"
+    blocker.write_text("not a dir", encoding="utf-8")
+    out = blocker / "report.json"
+    with pytest.raises(gate.GateStateChangedError):
+        gate._commit_evidence(
+            staging_dir, report, start=start, local_report_path=out
+        )
+    assert _head(clean_repo) == tested_sha
+
+
+def test_commit_evidence_scans_local_report_before_cas(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 Fix 7 counter-example: a secret in the delivered report fails the
+    commit BEFORE the CAS (HEAD unchanged) and the leaked local report copy is
+    removed — the local report is scanned in known-E, not produced after the
+    branch move."""
+    token = "sk-bridge-0123456789abcdefghijklmnopqrstuvwxyz"
+    monkeypatch.setenv("TRIPCHORD_BROWSER_BRIDGE_TOKEN", token)
+    report, start, tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    report.summary = f"summary carries {token}"
+    out = staging_dir.parent / "leaky-report.json"
+    with pytest.raises(gate.GateStateChangedError, match="secret value"):
+        gate._commit_evidence(
+            staging_dir, report, start=start, local_report_path=out
+        )
+    assert _head(clean_repo) == tested_sha
+    assert not out.exists()
 
 
 def test_commit_evidence_refuses_dirty_start(
@@ -1137,17 +1798,19 @@ def test_main_exits_2_when_runner_evidence_missing_fields(
     the gate must not accept a runner that cannot name the repository or
     confirm completion."""
     _patch_root(monkeypatch, clean_repo)
-    for name in (
-        "layer1_reproducibility",
-        "layer2_replay",
-        "layer3_clean_chrome_fixtures",
-        "layer4_model_smoke",
-        "layer5_real_canary",
+    for attr, layer_name in (
+        ("layer1_reproducibility", "1_reproducibility"),
+        ("layer2_replay", "2_replay"),
+        ("layer3_clean_chrome_fixtures", "3_clean_chrome_fixtures"),
+        ("layer4_model_smoke", "4_model_smoke"),
+        ("layer5_real_canary", "5_real_canary"),
     ):
         monkeypatch.setattr(
             gate,
-            name,
-            lambda *args, name=name: gate.LayerResult(name=name, passed=True),
+            attr,
+            lambda *args, layer_name=layer_name: gate.LayerResult(
+                name=layer_name, passed=True
+            ),
         )
     staging_dir.mkdir()
     evidence_path = staging_dir / "live-done-gate-v4.json"
@@ -1398,12 +2061,15 @@ def test_main_exits_2_when_output_is_directory_conflict(
     assert _porcelain(clean_repo) == before
 
 
-def test_commit_evidence_fails_when_head_moves_after_entry_snapshot(
+def test_commit_evidence_succeeds_when_head_moves_after_entry_snapshot(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """Counter-example: HEAD moves *after* the entry snapshot but before the
-    commit — the re-verify must abort before writing anything, leaving the
-    tree untouched."""
+    """C-122 P0 counter-example: HEAD moving *after* the entry snapshot (a
+    concurrent ``git commit`` landing while the gate builds E/P) does NOT disturb
+    the publish.  E's parent is pinned to the tested revision S via
+    ``commit-tree -p S``, never by re-reading the branch, so the concurrent
+    commit survives untouched and only the gate ref appears — HEAD/branch/index/
+    worktree are never rewritten."""
     _patch_root(monkeypatch, clean_repo)
     staging_dir.mkdir()
     (staging_dir / "product-acceptance.json").write_text(
@@ -1413,38 +2079,46 @@ def test_commit_evidence_fails_when_head_moves_after_entry_snapshot(
         schema_version=gate.EVIDENCE_SCHEMA,
         generated_at="2026-08-10T00:00:00+00:00",
         tested_commit_sha=_head(clean_repo),
+        run_id=_TEST_RUN_ID,
         toplevel=str(clean_repo),
         branch="main",
         worktree_dirty=False,
-        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        layers=gate._passing_layers(),
         passed=True,
         summary="all applicable Done-Gate layers passed",
         boundary="",
     )
+    tested_sha = report.tested_commit_sha
+    assert tested_sha is not None
     start = _expected_snapshot(clean_repo)
     # Concurrent writer moves HEAD after the entry snapshot.
     subprocess.run(
         ["git", "-C", str(clean_repo), "commit", "--allow-empty", "-q", "-m", "moved"],
         check=True,
     )
-    with pytest.raises(gate.GateStateChangedError, match="HEAD moved"):
-        gate._commit_evidence(staging_dir, report, start=start)
-    # No tracked report was written and the porcelain is unchanged.
-    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
-    assert not report_path.exists()
+    moved_sha = _head(clean_repo)
+    assert moved_sha != tested_sha
+
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+
+    # The publish succeeds and the concurrent commit is untouched: HEAD is the
+    # concurrent writer's commit (never rewound to S, never advanced to P/E),
+    # the tree is clean, and the gate ref carries P^=E, E^=S.
+    assert _head(clean_repo) == moved_sha
     assert _porcelain(clean_repo) == ""
+    _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit, expected_head=moved_sha
+    )
 
 
-def test_commit_evidence_fails_on_real_git_add_error(
+def test_commit_evidence_succeeds_while_index_lock_is_held(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """Counter-example: a real git failure (an existing .git/index.lock) must
-    abort the phase, and the working tree must be rolled back so no passed=true
-    report without an evidence commit is left on disk.
-
-    With the temp ``GIT_INDEX_FILE`` staging, the real-index sync right before
-    the atomic CAS is what the lock blocks — a real, unmonkeypatched git
-    failure that still exercises the fail-closed rollback."""
+    """C-122 P0 counter-example: an active ``.git/index.lock`` (a concurrent git
+    process mid-index-write) is IRRELEVANT to the side-channel publish — the gate
+    never reads or writes the shared real index, so it must succeed without
+    touching the lock, without moving the branch, and without disturbing the
+    index/worktree.  Only the dedicated gate ref appears atomically."""
     _patch_root(monkeypatch, clean_repo)
     staging_dir.mkdir()
     (staging_dir / "product-acceptance.json").write_text(
@@ -1454,24 +2128,31 @@ def test_commit_evidence_fails_on_real_git_add_error(
         schema_version=gate.EVIDENCE_SCHEMA,
         generated_at="2026-08-10T00:00:00+00:00",
         tested_commit_sha=_head(clean_repo),
+        run_id=_TEST_RUN_ID,
         toplevel=str(clean_repo),
         branch="main",
         worktree_dirty=False,
-        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        layers=gate._passing_layers(),
         passed=True,
         summary="all applicable Done-Gate layers passed",
         boundary="",
     )
+    tested_sha = report.tested_commit_sha
+    assert tested_sha is not None
     start = _expected_snapshot(clean_repo)
-    (clean_repo / ".git" / "index.lock").write_text("locked\n", encoding="utf-8")
+    index_lock = clean_repo / ".git" / "index.lock"
+    index_lock.write_text("locked\n", encoding="utf-8")
 
-    with pytest.raises(gate.GateStateChangedError, match="failed"):
-        gate._commit_evidence(staging_dir, report, start=start)
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
 
-    # Fail-closed on disk: no tracked report/evidence was left behind.
-    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
-    assert not report_path.exists()
-    assert _porcelain(clean_repo) == ""
+    # The publish succeeded while the shared index was locked: the branch never
+    # moved, the concurrent holder's lock file survives untouched (the gate
+    # never removed another process's lock), and the real index still matches
+    # HEAD.  The only persistent change is the gate ref.
+    assert _head(clean_repo) == tested_sha
+    assert index_lock.exists()
+    assert index_lock.read_text(encoding="utf-8") == "locked\n"
+    _assert_side_channel_published(clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit)
 
 
 def test_main_commit_evidence_failure_marks_report_failed_on_disk(
@@ -1493,6 +2174,7 @@ def test_main_commit_evidence_failure_marks_report_failed_on_disk(
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert payload["passed"] is False
     assert payload["evidence_commit"] is None
+    assert payload["gate_ref"] is None
     assert "evidence commit failed" in payload["summary"]
     # The repository was rolled back to a clean tree after the failure.
     assert _porcelain(clean_repo) == ""
@@ -1501,10 +2183,11 @@ def test_main_commit_evidence_failure_marks_report_failed_on_disk(
 def test_commit_evidence_skips_gitignored_evidence(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """Counter-example: the repository ignores ``benchmarks/results/live-*``,
-    so the evidence commit must skip those targets (a ``git add`` on an ignored
-    path fails closed and aborts the phase) while still committing the
-    committable evidence — E never claims to carry the ignored files."""
+    """Counter-example: the repository ignores ``benchmarks/results/live-*``, so
+    the side-channel evidence commits must skip those targets (recorded by hash
+    in the manifest as committed=false) while still carrying the committable
+    evidence — E/P never claim to carry the ignored files, and the raw ignored
+    originals stay in the exclusive staging dir."""
     _patch_root(monkeypatch, clean_repo)
     (clean_repo / ".gitignore").write_text(
         "/benchmarks/results/live-*\n", encoding="utf-8"
@@ -1529,10 +2212,11 @@ def test_commit_evidence_skips_gitignored_evidence(
         schema_version=gate.EVIDENCE_SCHEMA,
         generated_at="2026-08-10T00:00:00+00:00",
         tested_commit_sha=tested_sha,
+        run_id=_TEST_RUN_ID,
         toplevel=str(clean_repo),
         branch="main",
         worktree_dirty=False,
-        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        layers=gate._passing_layers(),
         passed=True,
         summary="all applicable Done-Gate layers passed",
         boundary="",
@@ -1540,32 +2224,36 @@ def test_commit_evidence_skips_gitignored_evidence(
     start = _expected_snapshot(clean_repo)
 
     evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+    pointer_sha = _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit
+    )
 
-    # The ignored live-* evidence is NOT part of E's tree.
-    diff = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(clean_repo),
-            "diff",
-            "--name-only",
-            tested_sha,
-            evidence_commit,
-        ],
+    # The ignored live-* evidence is NOT part of P's tree.
+    tree = subprocess.run(
+        ["git", "-C", str(clean_repo), "ls-tree", "-r", "--name-only", pointer_sha],
         capture_output=True,
         text=True,
         check=True,
-    ).stdout.strip()
-    assert diff != ""
-    for path in diff.splitlines():
-        assert "live-" not in path, f"ignored evidence committed: {path}"
-    # Committable evidence and the report landed; the tree is clean.
-    assert (clean_repo / "benchmarks" / "results" / "product-acceptance.json").is_file()
-    assert (clean_repo / "benchmarks" / "results" / "browser-e2e-screenshot.png").is_file()
+    ).stdout.splitlines()
+    assert not any("live-" in p for p in tree), f"ignored evidence committed: {tree}"
+    # Committable evidence, report and manifest landed in P; the worktree is
+    # untouched (nothing tracked was written).
+    for rel in (
+        "benchmarks/results/product-acceptance.json",
+        "benchmarks/results/browser-e2e-screenshot.png",
+        gate._REPORT_REL,
+        gate._MANIFEST_REL,
+    ):
+        assert rel in tree, f"missing committed evidence path in P: {rel}"
     assert _porcelain(clean_repo) == ""
-    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
-    payload = json.loads(report_path.read_text(encoding="utf-8"))
-    assert payload["evidence_commit"] == evidence_commit
+    assert not (clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json").exists()
+    # The staging manifest records the ignored raw originals by hash only.
+    manifest = json.loads(
+        (staging_dir / gate._MANIFEST_STAGED_NAME).read_text(encoding="utf-8")
+    )
+    by_name = {entry["name"]: entry for entry in manifest["files"]}
+    assert by_name["live-canary-certified.json"]["committed"] is False
+    assert by_name["live-done-gate-v4.json"]["committed"] is False
 
 
 def test_restore_tracked_file_handles_binary_blob(
@@ -1587,43 +2275,67 @@ def test_restore_tracked_file_handles_binary_blob(
     assert _porcelain(clean_repo) == ""
 
 
-def test_commit_evidence_rollback_handles_binary_evidence(
+def test_commit_evidence_publishes_binary_evidence_with_branch_ref_locked(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """Counter-example: a real git failure (an existing .git/index.lock blocking
-    the pre-CAS real-index sync) during the evidence commit must roll the
-    working tree back cleanly even when a binary PNG is among the written
-    evidence — the rollback must not crash on the binary blob."""
+    """C-122 P0 counter-example: a pre-existing lock on the PRODUCT branch ref
+    (``refs/heads/main.lock``) is IRRELEVANT to the side-channel publish — the
+    gate never updates the branch, only the namespaced ``refs/tripchord/done-gate/
+    <run_id>``.  The binary PNG evidence is staged via the temp index (hash-object
+    + update-index --cacheinfo, never a worktree write), carried in E/P, and the
+    gate succeeds while the branch ref stays locked and untouched."""
     _patch_root(monkeypatch, clean_repo)
     staging_dir.mkdir()
     (staging_dir / "product-acceptance.json").write_text(
         '{"passed": true}\n', encoding="utf-8"
     )
-    (staging_dir / "browser-e2e-screenshot.png").write_bytes(
-        b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02" * 10
-    )
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02" * 10
+    (staging_dir / "browser-e2e-screenshot.png").write_bytes(png_bytes)
     report = gate.GateReport(
         schema_version=gate.EVIDENCE_SCHEMA,
         generated_at="2026-08-10T00:00:00+00:00",
         tested_commit_sha=_head(clean_repo),
+        run_id=_TEST_RUN_ID,
         toplevel=str(clean_repo),
         branch="main",
         worktree_dirty=False,
-        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        layers=gate._passing_layers(),
         passed=True,
         summary="all applicable Done-Gate layers passed",
         boundary="",
     )
+    tested_sha = report.tested_commit_sha
+    assert tested_sha is not None
     start = _expected_snapshot(clean_repo)
-    (clean_repo / ".git" / "index.lock").write_text("locked\n", encoding="utf-8")
+    # Lock the product branch ref — under the old index-lock design git's own
+    # update-ref CAS failed for real; under the side-channel design the gate
+    # never touches this ref, so the publish must still succeed.
+    branch = subprocess.run(
+        ["git", "-C", str(clean_repo), "symbolic-ref", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    branch_lock = clean_repo / ".git" / f"refs/heads/{branch}.lock"
+    branch_lock.write_text("locked\n", encoding="utf-8")
 
-    with pytest.raises(gate.GateStateChangedError, match="failed"):
-        gate._commit_evidence(staging_dir, report, start=start)
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
 
-    # No tracked report/evidence left behind, and no crash on the binary blob.
-    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
-    assert not report_path.exists()
-    assert _porcelain(clean_repo) == ""
+    # The publish succeeded while the branch ref was locked: HEAD/index/worktree
+    # at S, the branch lock survives untouched, and P carries the binary PNG
+    # byte-for-byte.
+    pointer_sha = _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit
+    )
+    assert branch_lock.exists()
+    assert branch_lock.read_text(encoding="utf-8") == "locked\n"
+    png_rel = "benchmarks/results/browser-e2e-screenshot.png"
+    committed_png = subprocess.run(
+        ["git", "-C", str(clean_repo), "show", f"{pointer_sha}:{png_rel}"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert committed_png == png_bytes
 
 
 def test_main_commit_evidence_skips_gitignored_evidence_end_to_end(
@@ -1761,10 +2473,11 @@ def test_commit_evidence_manifest_records_ignored_and_committed(
         schema_version=gate.EVIDENCE_SCHEMA,
         generated_at="2026-08-10T00:00:00+00:00",
         tested_commit_sha=tested_sha,
+        run_id=_TEST_RUN_ID,
         toplevel=str(clean_repo),
         branch="main",
         worktree_dirty=False,
-        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        layers=gate._passing_layers(),
         passed=True,
         summary="all applicable Done-Gate layers passed",
         boundary="",
@@ -1772,10 +2485,13 @@ def test_commit_evidence_manifest_records_ignored_and_committed(
     start = _expected_snapshot(clean_repo)
 
     evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+    pointer_sha = _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit
+    )
 
-    # E contains the manifest + committable evidence, never the ignored live-*.
+    # P contains the manifest + committable evidence, never the ignored live-*.
     tree = subprocess.run(
-        ["git", "-C", str(clean_repo), "ls-tree", "-r", "--name-only", evidence_commit],
+        ["git", "-C", str(clean_repo), "ls-tree", "-r", "--name-only", pointer_sha],
         capture_output=True,
         text=True,
         check=True,
@@ -1783,9 +2499,10 @@ def test_commit_evidence_manifest_records_ignored_and_committed(
     assert gate._MANIFEST_REL in tree
     assert "benchmarks/results/product-acceptance.json" in tree
     assert not any("live-" in p for p in tree)
-    # The manifest records both committed and ignored originals by hash.
+    # The manifest (staged + committed in P) records both committed and ignored
+    # originals by hash.
     manifest = json.loads(
-        (clean_repo / gate._MANIFEST_REL).read_text(encoding="utf-8")
+        (staging_dir / gate._MANIFEST_STAGED_NAME).read_text(encoding="utf-8")
     )
     by_name = {entry["name"]: entry for entry in manifest["files"]}
     assert by_name["product-acceptance.json"]["committed"] is True
@@ -1821,12 +2538,11 @@ def test_verify_evidence_contract_fails_closed_on_missing_manifest(
         toplevel=str(clean_repo),
         branch="main",
         worktree_dirty=False,
-        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        layers=gate._passing_layers(),
         passed=True,
         summary="all applicable Done-Gate layers passed",
         boundary="",
     )
-    manifest = gate._evidence_manifest(staging_dir, report)
     # Commit E WITHOUT the manifest (as if the manifest write was skipped).
     target = clean_repo / "benchmarks" / "results" / "product-acceptance.json"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1839,7 +2555,9 @@ def test_verify_evidence_contract_fails_closed_on_missing_manifest(
     e_commit = _head(clean_repo)
 
     with pytest.raises(gate.GateStateChangedError, match="missing required manifest"):
-        gate._verify_evidence_contract(e_commit, staging_dir, manifest)
+        gate._verify_evidence_contract(
+            e_commit, staging_dir, tested_commit_sha=tested_sha, run_id=report.run_id
+        )
 
 
 def test_verify_evidence_contract_fails_closed_on_missing_committed_file(
@@ -1860,7 +2578,7 @@ def test_verify_evidence_contract_fails_closed_on_missing_committed_file(
         toplevel=str(clean_repo),
         branch="main",
         worktree_dirty=False,
-        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        layers=gate._passing_layers(),
         passed=True,
         summary="all applicable Done-Gate layers passed",
         boundary="",
@@ -1880,7 +2598,9 @@ def test_verify_evidence_contract_fails_closed_on_missing_committed_file(
     e_commit = _head(clean_repo)
 
     with pytest.raises(gate.GateStateChangedError, match="missing committed file"):
-        gate._verify_evidence_contract(e_commit, staging_dir, manifest)
+        gate._verify_evidence_contract(
+            e_commit, staging_dir, tested_commit_sha=tested_sha, run_id=report.run_id
+        )
 
 
 def test_layer5_bridge_token_env_only_not_argv(
@@ -1937,8 +2657,15 @@ def test_layer6_bridge_token_env_only_not_argv(
     monkeypatch.setattr(gate, "_runtime_provenance_mismatches", lambda *a, **k: [])
     monkeypatch.setattr(gate, "_extract_build_fingerprint", lambda *a, **k: None)
     # This test exercises token-via-env propagation, not the R7 lease preflight;
-    # isolate the preflight to a clean live state.
+    # isolate both the DB and the bridge-state preflights to a clean live state
+    # (C-122 Fix 2: the bridge preflight binds the live .runtime file by default,
+    # so an unpatched call would read the host's real bridge state).
     monkeypatch.setattr(gate, "_live_state_lease_preflight", lambda *a, **k: [])
+    monkeypatch.setattr(gate, "_bridge_state_lease_preflight", lambda *a, **k: [])
+    # C-122 round-18 item 6: the post-run bridge-state postcheck is a fresh
+    # read; this test exercises token propagation, not lease state, so both
+    # lease reads are isolated to clean state.
+    monkeypatch.setattr(gate, "_bridge_state_postcheck", lambda *a, **k: [])
     start = _expected_snapshot(clean_repo)
     (staging_dir / "live-done-gate-v4.json").write_text(
         json.dumps(
@@ -2067,6 +2794,55 @@ def test_live_state_lease_preflight_passes_on_clean_db(tmp_path: Path) -> None:
     assert gate._live_state_lease_preflight(db_path) == []
 
 
+def test_live_state_lease_preflight_negative_offset_future_lease_is_residual(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-18 counter-example: an aware lease with a NEGATIVE UTC offset
+    whose wall clock is just in the past is actually still in the future once
+    converted.  ``replace(tzinfo=UTC)`` relabels the wall clock and would MISS
+    this residual; ``astimezone(UTC)`` must detect it."""
+    db_path = tmp_path / "live.db"
+    wall = datetime.now(UTC) - timedelta(hours=1)
+    lease = wall.replace(tzinfo=timezone(timedelta(hours=-8))).isoformat()
+    _make_jobs_db(db_path, [("job-neg", "queued", lease)])
+    residual = gate._live_state_lease_preflight(db_path)
+    assert residual
+    assert "job-neg" in residual[0]
+
+
+def test_live_state_lease_preflight_positive_offset_past_lease_is_not_residual(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-18 counter-example: an aware lease with a POSITIVE UTC offset
+    whose wall clock is just in the future is actually already past once
+    converted.  ``replace(tzinfo=UTC)`` would falsely flag it residual (a safe
+    false positive, but wrong); ``astimezone(UTC)`` must clear it."""
+    db_path = tmp_path / "live.db"
+    wall = datetime.now(UTC) + timedelta(hours=1)
+    lease = wall.replace(tzinfo=timezone(timedelta(hours=8))).isoformat()
+    _make_jobs_db(db_path, [("job-pos", "running", lease)])
+    assert gate._live_state_lease_preflight(db_path) == []
+
+
+def test_live_state_lease_preflight_naive_lease_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-18 gate-5 counter-example: a NAIVE lease (bare wall clock, no
+    timezone) is ambiguous — ``astimezone(UTC)`` on a naive datetime silently
+    relabels it as host-local, misjudging any non-UTC live state.  A lease
+    without an explicit zone must be treated as residual (fail-closed), never
+    cleared."""
+    db_path = tmp_path / "live.db"
+    # A naive lease one hour in the FUTURE wall-clock; if it were silently
+    # relabelled host-local it would look unexpired and be mis-cleared.
+    naive = (datetime.now(UTC) + timedelta(hours=1)).replace(tzinfo=None).isoformat()
+    _make_jobs_db(db_path, [("job-naive", "queued", naive)])
+    residual = gate._live_state_lease_preflight(db_path)
+    assert residual
+    assert "job-naive" in residual[0]
+    assert "naive" in residual[0].lower()
+
+
 def test_live_state_lease_preflight_ignores_expired_leases(
     tmp_path: Path,
 ) -> None:
@@ -2151,11 +2927,25 @@ def test_layer6_lease_preflight_passes_on_clean_live_state(
     tmp_path: Path,
     staging_dir: Path,
 ) -> None:
-    """R7 integration: a clean live-state DB passes the preflight and the layer
-    proceeds to the E2E runner (which then drives the verdict)."""
+    """R7 integration: a clean live-state DB and an isolated clean bridge-state
+    file pass the preflight and the layer proceeds to the E2E runner (which
+    then drives the verdict)."""
     staging_dir.mkdir()
     db_path = tmp_path / "live.db"
     _make_jobs_db(db_path, [])
+    bridge_state_path = tmp_path / "bridge-state.json"
+    bridge_state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": [],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(gate._BRIDGE_STATE_ENV, str(bridge_state_path))
     monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
     monkeypatch.setenv("TRIPCHORD_ACK_MODEL_COST", "1")
     monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (0, ""))
@@ -2310,7 +3100,7 @@ def test_verify_required_evidence_inputs_accepts_full_set(
     gate._verify_required_evidence_inputs(staging_dir)  # no raise
 
     (staging_dir / "browser-e2e.json").unlink()
-    with pytest.raises(gate.GateStateChangedError, match="browser-e2e.json"):
+    with pytest.raises(gate.GateStateChangedError, match=r"browser-e2e\.json"):
         gate._verify_required_evidence_inputs(staging_dir)
 
     # The compact artifacts are contract-required too (C-114): a staging set
@@ -2492,36 +3282,30 @@ def test_verify_evidence_contract_rejects_blank_compact_content(
     blank_payload = '{"schema_version": "tripchord-done-gate-layer6-compact-v2"}\n'
     staged_compact = staging_dir / gate._COMPACT_E2E_STAGED_NAME
     staged_compact.write_text(blank_payload, encoding="utf-8")
+    tested_sha = _head(clean_repo)
     manifest = {
-        "schema_version": "tripchord-product-v1-done-gate-manifest",
-        "tested_commit_sha": _head(clean_repo),
+        "schema_version": gate._MANIFEST_SCHEMA,
+        "tested_commit_sha": tested_sha,
         "run_id": "test-run",
-        "evidence_commit": _head(clean_repo),
+        "evidence_commit": tested_sha,
         "generated_at": "2026-08-10T00:00:00+00:00",
-        "toplevel": str(clean_repo),
         "branch": "main",
-        "files": [
-            {
-                "name": gate._COMPACT_E2E_STAGED_NAME,
-                "tracked_path": gate._EVIDENCE_TRACKED_PATHS[-1][1],
-                "sha256": gate._sha256_file(staged_compact),
-                "size_bytes": len(blank_payload),
-                "committed": True,
-            }
-        ],
+        "files": gate._manifest_files(staging_dir),
         "layer_verdicts": {"5_real_canary": {}, "6_full_e2e": {}},
     }
-    # E (== HEAD) carries the manifest plus a compact artifact with no done-gate
-    # check set.
+    # E (== HEAD) carries the manifest plus every staged evidence file the
+    # manifest records — mirroring the real commit flow — so the compact-content
+    # check below is isolated from the file-set / committed-file checks.
     results = clean_repo / "benchmarks" / "results"
     results.mkdir(parents=True, exist_ok=True)
-    rel = gate._EVIDENCE_TRACKED_PATHS[-1][1]
-    blank = results / Path(rel).name
-    blank.write_text(blank_payload, encoding="utf-8")
+    for staged_name, tracked_rel in gate._EVIDENCE_TRACKED_PATHS:
+        staged = staging_dir / staged_name
+        if staged.is_file():
+            (results / Path(tracked_rel).name).write_bytes(staged.read_bytes())
     (results / Path(gate._MANIFEST_REL).name).write_text(
         json.dumps(manifest), encoding="utf-8"
     )
-    gate._git("add", "--", rel, gate._MANIFEST_REL, check=True)
+    gate._git("add", "--", str(results), check=True)
     gate._git(
         "commit",
         "-q",
@@ -2530,7 +3314,10 @@ def test_verify_evidence_contract_rejects_blank_compact_content(
         check=True,
     )
     with pytest.raises(gate.GateStateChangedError, match="done-gate report"):
-        gate._verify_evidence_contract(_head(clean_repo), staging_dir, manifest)
+        gate._verify_evidence_contract(
+            _head(clean_repo), staging_dir, tested_commit_sha=tested_sha,
+            run_id="test-run",
+        )
 
 
 def test_main_commits_desensitized_layer5_6_compact_artifacts(
@@ -2552,12 +3339,21 @@ def test_main_commits_desensitized_layer5_6_compact_artifacts(
         check=True,
     )
 
+    head_before = _head(clean_repo)
     rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
     assert rc == 0
 
-    head = _head(clean_repo)
+    # The compact artifacts are committed on the SIDE-CHANNEL pointer commit P,
+    # never on the product branch: HEAD stays at the tested revision and the
+    # dedicated gate ref names P.
+    run_id = json.loads(
+        (staging_dir / "product-v1-done-gate.json").read_text(encoding="utf-8")
+    )["run_id"]
+    pointer_sha = _publish_ref(clean_repo, run_id)
+    assert pointer_sha is not None
+    assert _head(clean_repo) == head_before
     tree = subprocess.run(
-        ["git", "-C", str(clean_repo), "ls-tree", "-r", "--name-only", head],
+        ["git", "-C", str(clean_repo), "ls-tree", "-r", "--name-only", pointer_sha],
         capture_output=True,
         text=True,
         check=True,
@@ -2566,9 +3362,9 @@ def test_main_commits_desensitized_layer5_6_compact_artifacts(
         "benchmarks/results/done-gate-layer5-compact.json",
         "benchmarks/results/done-gate-layer6-compact.json",
     ):
-        assert rel in tree, f"compact artifact missing from committed tree: {rel}"
+        assert rel in tree, f"compact artifact missing from P tree: {rel}"
     manifest = json.loads(
-        (clean_repo / gate._MANIFEST_REL).read_text(encoding="utf-8")
+        (staging_dir / gate._MANIFEST_STAGED_NAME).read_text(encoding="utf-8")
     )
     by_name = {entry["name"]: entry for entry in manifest["files"]}
     assert by_name[gate._COMPACT_CANARY_STAGED_NAME]["committed"] is True
@@ -2578,12 +3374,13 @@ def test_main_commits_desensitized_layer5_6_compact_artifacts(
     assert by_name["live-done-gate-v4.json"]["committed"] is False
     # The compact artifacts are independently reviewable structured JSON.
     compact = json.loads(
-        (
-            clean_repo
-            / "benchmarks"
-            / "results"
-            / "done-gate-layer5-compact.json"
-        ).read_text(encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(clean_repo), "show",
+             f"{pointer_sha}:benchmarks/results/done-gate-layer5-compact.json"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
     )
     assert compact["schema_version"].startswith("tripchord-done-gate-layer5")
     assert _porcelain(clean_repo) == ""
@@ -2631,7 +3428,7 @@ def test_verify_evidence_contract_fails_closed_on_incomplete_manifest_fields(
         toplevel=str(clean_repo),
         branch="main",
         worktree_dirty=False,
-        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        layers=gate._passing_layers(),
         passed=True,
         summary="all applicable Done-Gate layers passed",
         boundary="",
@@ -2653,7 +3450,9 @@ def test_verify_evidence_contract_fails_closed_on_incomplete_manifest_fields(
     e_commit = _head(clean_repo)
 
     with pytest.raises(gate.GateStateChangedError, match="layer_verdicts"):
-        gate._verify_evidence_contract(e_commit, staging_dir, manifest)
+        gate._verify_evidence_contract(
+            e_commit, staging_dir, tested_commit_sha=tested_sha, run_id=report.run_id
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2748,7 +3547,7 @@ def test_secret_scan_fails_closed_on_unreadable_file(
             gate.GateStateChangedError, match="cannot read evidence file"
         ):
             gate._secret_scan_staging(
-                staging_dir, ("nope",)
+                staging_dir, gate._SecretNeedles(("nope",))
             )
     finally:
         unreadable.chmod(0o600)
@@ -2772,7 +3571,7 @@ def test_secret_scan_covers_all_model_api_key_envs(
         '{"key": "sk-ant-xyz789"}\n', encoding="utf-8"
     )
     with pytest.raises(gate.GateStateChangedError, match="secret value found"):
-        gate._secret_scan_staging(staging_dir, secrets)
+        gate._secret_scan_staging(staging_dir, gate._SecretNeedles(secrets))
 
 
 def test_harden_staging_rejects_symlink_subdir(
@@ -2823,6 +3622,82 @@ def test_dump_output_atomic_0600_outside_staging(tmp_path: Path) -> None:
     gate._dump(report, out)
     assert out.exists()
     assert out.stat().st_mode & 0o777 == 0o600
+
+
+def test_files_are_0600_from_creation_even_under_umask_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 Fix 5 counter-example: evidence and report files are 0600 from the
+    instant of creation — not ``write_text`` at umask defaults followed by a
+    chmod.  With the umask cleared, a ``write_text``-style write would land at
+    0644; the sealed fd writers must still land at 0600."""
+    old_umask = os.umask(0)
+    try:
+        sealed = tmp_path / "sealed.bin"
+        gate._write_sealed_bytes(sealed, b"secret", 0o600)
+        assert sealed.stat().st_mode & 0o777 == 0o600
+
+        atomic = tmp_path / "atomic.json"
+        gate._write_atomic(atomic, '{"ok": true}')
+        assert atomic.stat().st_mode & 0o777 == 0o600
+
+        report = gate.GateReport(
+            schema_version=gate.EVIDENCE_SCHEMA,
+            generated_at="2026-08-10T00:00:00+00:00",
+            tested_commit_sha="a" * 40,
+            run_id="test-run",
+            passed=False,
+            summary="x",
+        )
+        dumped = tmp_path / "report.json"
+        gate._dump(report, dumped)
+        assert dumped.stat().st_mode & 0o777 == 0o600
+    finally:
+        os.umask(old_umask)
+
+
+def test_sealed_write_is_0600_even_under_restrictive_umask(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 round-18 counter-example: under ``umask 0777`` a bare
+    ``os.open(..., mode=0o600)`` would create a 0000 file the owner cannot even
+    read.  The fd write must ``os.fchmod`` the exact mode so the evidence is
+    0600 regardless of how restrictive the umask is."""
+    old_umask = os.umask(0o777)
+    try:
+        sealed = tmp_path / "sealed.bin"
+        gate._write_sealed_bytes(sealed, b"secret", 0o600)
+        assert sealed.stat().st_mode & 0o777 == 0o600
+        assert sealed.read_bytes() == b"secret"
+
+        atomic = tmp_path / "atomic.json"
+        gate._write_atomic(atomic, '{"ok": true}')
+        assert atomic.stat().st_mode & 0o777 == 0o600
+    finally:
+        os.umask(old_umask)
+
+
+def test_restore_tracked_file_seals_0600(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    """C-122 Fix 5 counter-example: a rollback-restored tracked evidence file is
+    0600 from creation — never a umask-default copy of the committed blob."""
+    _patch_root(monkeypatch, clean_repo)
+    rel = "benchmarks/results/product-acceptance.json"
+    (gate.ROOT / rel).parent.mkdir(parents=True, exist_ok=True)
+    (gate.ROOT / rel).write_text('{"old": true}', encoding="utf-8")
+    gate._git("add", "--", rel, check=True)
+    gate._git("commit", "-m", "seed evidence", check=True)
+    (gate.ROOT / rel).write_text('{"dirty": true}', encoding="utf-8")
+
+    old_umask = os.umask(0)
+    try:
+        gate._restore_tracked_file(rel)
+    finally:
+        os.umask(old_umask)
+    restored = gate.ROOT / rel
+    assert restored.read_text(encoding="utf-8") == '{"old": true}'
+    assert restored.stat().st_mode & 0o777 == 0o600
 
 
 def test_secret_scan_flags_tracking_url_query(
@@ -2933,6 +3808,75 @@ def test_secret_scan_flags_model_api_key_from_env(
         gate.run_gate(staging_dir)
 
 
+def test_secret_scan_does_not_flag_hex_digest_with_phone_like_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 counter-example: a 64-hex sha256 whose digits happen to contain a
+    phone-shaped run must NOT be flagged as a phone number — a computed digest
+    is recomputable evidence, never an account identifier, and the same hash
+    value in a report/manifest/compact must not make the regression flaky."""
+    _patch_root(monkeypatch, tmp_path)
+    phone_run = "13581234567"
+    digest = "a" * 10 + phone_run + "c" * (64 - 10 - len(phone_run))
+    assert len(digest) == 64
+    file = tmp_path / "evidence.json"
+    file.write_text(json.dumps({"sha256": digest}), encoding="utf-8")
+    gate._secret_scan_paths([file], gate._SecretNeedles(()), "test")  # must not raise
+
+
+def test_secret_scan_still_flags_real_phone_number(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 counter-example: masking recomputable hex digests must not hide a
+    genuine bare Chinese mobile number in evidence — the phone scan still fires."""
+    _patch_root(monkeypatch, tmp_path)
+    file = tmp_path / "evidence.json"
+    file.write_text(json.dumps({"contact": "13812345678"}), encoding="utf-8")
+    with pytest.raises(gate.GateStateChangedError, match="phone number"):
+        gate._secret_scan_paths([file], gate._SecretNeedles(()), "test")
+
+
+def test_secret_needles_repr_never_exposes_values() -> None:
+    """C-122 round-18 security contract: the scan needle container's repr must
+    never expand the secret bytes, so a failing traceback cannot leak them."""
+    needles = gate._SecretNeedles(("super-secret-token-abc123",))
+    assert "super-secret-token-abc123" not in repr(needles)
+    assert "super-secret-token-abc123" not in str(needles)
+    assert "needles=1" in repr(needles)
+
+
+def test_secret_scan_rejects_plaintext_tuple_argument(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 round-18 security contract: the scan API must refuse a plaintext
+    tuple — a repr-able tuple of secrets is exactly the leak the round-18 review
+    forbade.  A TypeError surfaces at the boundary, never a silent accept."""
+    _patch_root(monkeypatch, tmp_path)
+    file = tmp_path / "evidence.json"
+    file.write_text('{"k": "v"}\n', encoding="utf-8")
+    with pytest.raises(TypeError, match="_SecretNeedles"):
+        gate._secret_scan_paths([file], ("plaintext-secret",), "test")  # type: ignore[arg-type]
+
+
+def test_secret_scan_rejects_plaintext_tuple_in_staging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 round-18: the staging wrapper carries the same type guard."""
+    _patch_root(monkeypatch, tmp_path)
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    (staging_dir / "evidence.json").write_text('{"k": "v"}\n', encoding="utf-8")
+    with pytest.raises(TypeError, match="_SecretNeedles"):
+        gate._secret_scan_staging(staging_dir, ("plaintext-secret",))  # type: ignore[arg-type]
+
+
+def test_secret_needles_iterates_bytes() -> None:
+    """C-122 round-18: the needle container yields encoded bytes ready for a
+    substring scan, and deduplicates empty values."""
+    needles = gate._SecretNeedles(("abc", "", "abc", "xyz"))
+    assert list(needles) == [b"abc", b"xyz"]
+
+
 def test_secret_scan_allows_redacted_evidence(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
@@ -2957,6 +3901,170 @@ def test_secret_scan_allows_redacted_evidence(
         encoding="utf-8",
     )
     gate.run_gate(staging_dir)  # no raise
+
+
+def test_secret_scan_rejects_bare_credential_field_name() -> None:
+    """C-122 round-18 gate-4 counter-example: a committed JSON artifact carrying
+    a BARE credential field name (``token`` / ``cookie`` / ``secret`` /
+    ``browser_token``) is a leak even when its value is already redacted or
+    hash-shaped — the field name itself must never enter a Git object."""
+    for field_name in ("token", "cookie", "secret", "browser_token"):
+        data = json.dumps({"ok": True, field_name: "sk-abc"}).encode("utf-8")
+        with pytest.raises(
+            gate.GateStateChangedError, match="credential field name"
+        ):
+            gate._reject_credential_field_names(data, "evidence", "e.json")
+
+
+def test_secret_scan_allows_nested_credential_like_structural_keys() -> None:
+    """C-122 round-18 gate-4: a credential-shaped field name is only rejected on
+    an EXACT bare match or the credential regex — a benign key that merely
+    contains the letters (e.g. ``browser_tasks``, ``token_count``) is not a
+    leak."""
+    data = json.dumps(
+        {"browser_tasks": [{"task_id": "t-1"}], "token_count": 3}
+    ).encode("utf-8")
+    gate._reject_credential_field_names(data, "evidence", "e.json")  # no raise
+
+
+def test_secret_scan_rejects_unknown_64hex_under_scalar_key() -> None:
+    """C-122 round-18 gate-4 counter-example: a bare 64-hex opaque value under a
+    NON-digest key is indistinguishable from a bearer-token-shaped secret and must
+    fail closed — only an explicit digest/binding key may hold a 64-hex value."""
+    data = json.dumps({"provider": "ctrip", "value": "a" * 64}).encode("utf-8")
+    with pytest.raises(
+        gate.GateStateChangedError, match="unknown 64-hex value"
+    ):
+        gate._reject_unknown_64hex_values(data, "evidence", "e.json")
+
+
+def test_secret_scan_allows_64hex_under_digest_binding_key() -> None:
+    """C-122 round-18 gate-4: a 64-hex value inside an explicit digest-binding
+    key (``candidate_set_sha256``, ``build_fingerprint``) is a content-addressable
+    binding and must pass the field-level scan untouched."""
+    for key in (
+        "candidate_set_sha256",
+        "build_sha256",
+        "runtime_commit_sha",
+        "asset_fingerprint",
+        "record_hash",
+        "build_digest",
+    ):
+        data = json.dumps({key: "a" * 64}).encode("utf-8")
+        gate._reject_unknown_64hex_values(data, "evidence", "e.json")  # no raise
+
+
+def test_secret_scan_rejects_unknown_64hex_nested_in_list() -> None:
+    """C-122 round-18 gate-4 counter-example: the walker descends into lists too —
+    a 64-hex under a non-digest key nested inside an array of objects is still a
+    leak."""
+    data = json.dumps(
+        {"checks": [{"name": "c1", "opaque": "a" * 64}]}
+    ).encode("utf-8")
+    with pytest.raises(
+        gate.GateStateChangedError, match="unknown 64-hex value"
+    ):
+        gate._reject_unknown_64hex_values(data, "evidence", "e.json")
+
+
+def test_evidence_commits_use_fixed_non_personal_identity(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 round-18 gate-4: E and P are authored under the fixed non-personal
+    identity (TripChord Done-Gate / done-gate@tripchord.invalid), never the
+    ambient repo/user git config — so the published trail cannot be attributed to
+    a human author and a hostile ambient config cannot author it either."""
+    report, start, tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+    p_sha = _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit
+    )
+    for commit_sha in (evidence_commit, p_sha):
+        info = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(clean_repo),
+                "show",
+                "-s",
+                "--format=%an%x00%ae%x00%cn%x00%ce",
+                commit_sha,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip().split("\x00")
+        assert info == [
+            "TripChord Done-Gate",
+            "done-gate@tripchord.invalid",
+            "TripChord Done-Gate",
+            "done-gate@tripchord.invalid",
+        ]
+
+
+def test_secret_scan_flags_short_alphanumeric_session_account(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 Fix 4 counter-example: a short alphanumeric session or account value
+    in a query string must fail the gate.  Length and 4+ digit-number heuristics
+    alone cannot see ``?session=abc123xyz`` or ``?user=alice123`` — the scan must
+    be fail-closed by default (safe-key allowlist + hard session/account keys)."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    for url in (
+        "https://flights.ctrip.com/online/list?session=abc123xyz",
+        "https://accounts.ctrip.com/login?user=alice123",
+        "https://book.qunar.com/pay?account=user_42",
+    ):
+        (staging_dir / "live-done-gate-v4.json").write_text(
+            json.dumps({"result": {"source_urls": [url]}}), encoding="utf-8"
+        )
+        with pytest.raises(gate.GateStateChangedError, match="tracking URL"):
+            gate.run_gate(staging_dir)
+
+
+def test_secret_scan_flags_unknown_query_key_by_default(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 Fix 4 counter-example: a non-blank query value under a key that is
+    neither on the safe allowlist nor a known session/account key is still a
+    leak (default deny) — e.g. a bespoke ``?memberCode=alice123`` style param."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps(
+            {"result": {"source_urls": [
+                "https://flights.ctrip.com/online/list?memberCode=alice123"
+            ]}}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.GateStateChangedError, match="tracking URL"):
+        gate.run_gate(staging_dir)
+
+
+def test_secret_scan_flags_safe_key_with_opaque_value(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 Fix 4 counter-example: a safe allowlisted key is not a free pass —
+    an opaque (long / non-short-code) value under ``?q=`` still leaks."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps(
+            {"result": {"source_urls": [
+                "https://flights.ctrip.com/online/list?q=SkJf9a2cBxW1qTzV4mNp8dQ"
+            ]}}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.GateStateChangedError, match="tracking URL"):
+        gate.run_gate(staging_dir)
 
 
 def test_commit_evidence_neutralizes_last_step_report_leak(
@@ -2984,18 +4092,26 @@ def test_commit_evidence_neutralizes_last_step_report_leak(
 
     assert rc == 0
     assert _porcelain(clean_repo) == ""
-    # The committed report carries evidence_commit=E and the redacted detail.
-    tracked_text = (
-        clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
-    ).read_text(encoding="utf-8")
-    assert token not in tracked_text
-    assert "[REDACTED]" in tracked_text
-    # The delivered staging report is equally clean.
+    # The committed report (in P) carries evidence_commit=E and the redacted
+    # detail; the delivered staging report is equally clean.
     staging_text = (staging_dir / "product-v1-done-gate.json").read_text(
         encoding="utf-8"
     )
     assert token not in staging_text
     assert "[REDACTED]" in staging_text
+    pointer_sha = _publish_ref(clean_repo, json.loads(staging_text)["run_id"])
+    assert pointer_sha is not None
+    committed_text = subprocess.run(
+        ["git", "-C", str(clean_repo), "show", f"{pointer_sha}:{gate._REPORT_REL}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert token not in committed_text
+    assert "[REDACTED]" in committed_text
+    # HEAD stays at the tested revision — the leak-neutralized report lives only
+    # on the side-channel ref.
+    assert _head(clean_repo) != pointer_sha
 
 
 # ---------------------------------------------------------------------------
@@ -3009,10 +4125,11 @@ def _passing_report_and_start(clean_repo: Path) -> tuple[gate.GateReport, gate.G
         schema_version=gate.EVIDENCE_SCHEMA,
         generated_at="2026-08-10T00:00:00+00:00",
         tested_commit_sha=tested_sha,
+        run_id=_TEST_RUN_ID,
         toplevel=str(clean_repo),
         branch="main",
         worktree_dirty=False,
-        layers=[gate.LayerResult(name="6_full_e2e", passed=True)],
+        layers=gate._passing_layers(),
         passed=True,
         summary="all applicable Done-Gate layers passed",
         boundary="",
@@ -3020,14 +4137,93 @@ def _passing_report_and_start(clean_repo: Path) -> tuple[gate.GateReport, gate.G
     return report, _expected_snapshot(clean_repo)
 
 
+def _publish_ref(root: Path, run_id: str) -> str | None:
+    """Resolve the side-channel gate ref, or None when it was never created."""
+    ref = f"refs/tripchord/done-gate/{run_id}"
+    probe = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", ref],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        return None
+    return probe.stdout.strip()
+
+
+def _assert_side_channel_published(
+    root: Path,
+    run_id: str,
+    tested_sha: str,
+    evidence_commit: str,
+    expected_head: str | None = None,
+) -> str:
+    """C-122 P0: after a successful side-channel publish the product branch /
+    HEAD / real index / worktree are byte-for-byte at S (or at a concurrent
+    writer's commit, when ``expected_head`` is given) — the ONLY persistent
+    change is the atomically-created gate ref -> P with P^=E and E^=S.  Returns
+    the pointer-commit SHA P so callers can inspect P's committed tree."""
+    if expected_head is None:
+        assert _head(root) == tested_sha, "HEAD moved on a side-channel publish"
+    else:
+        assert _head(root) == expected_head, "concurrent HEAD not preserved"
+    assert _porcelain(root) == "", "side-channel publish left a dirty tree"
+    idx = subprocess.run(
+        ["git", "-C", str(root), "diff-index", "--cached", "--quiet", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    assert idx.returncode == 0, "real index changed on a side-channel publish"
+    p_sha = _publish_ref(root, run_id)
+    assert p_sha is not None, f"gate ref refs/tripchord/done-gate/{run_id} missing"
+    parent_p = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", f"{p_sha}^"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert parent_p == evidence_commit, "P^ != E on a side-channel publish"
+    parent_e = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", f"{evidence_commit}^"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert parent_e == tested_sha, "E^ != S on a side-channel publish"
+    # The product branch history is untouched — evidence commits are never
+    # reachable from HEAD (side-channel only, never the branch tip).
+    log = subprocess.run(
+        ["git", "-C", str(root), "log", "--format=%s", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "Done-Gate evidence" not in log
+    assert "evidence_commit=" not in log
+    # No tracked report/evidence was ever written into the shared worktree.
+    assert not (
+        root / "benchmarks" / "results" / "product-v1-done-gate.json"
+    ).exists()
+    return p_sha
+
+
 def _assert_phase_failure_is_atomic(
-    clean_repo: Path, staging_dir: Path, tested_sha: str
+    clean_repo: Path,
+    staging_dir: Path,
+    tested_sha: str,
+    run_id: str = _TEST_RUN_ID,
 ) -> None:
     """After any phase-1/phase-2/add/update-ref failure the branch must still be
     at the tested revision, the object graph may not expose an intermediate E on
-    the branch, and the index + worktree must be byte-for-byte clean."""
+    the branch, the index + worktree must be byte-for-byte clean, and the
+    side-channel gate ref must NOT have been created (nothing was published)."""
     assert _head(clean_repo) == tested_sha, "branch moved on a failed commit phase"
     assert _porcelain(clean_repo) == "", "failed commit phase left a dirty tree"
+    idx = subprocess.run(
+        ["git", "-C", str(clean_repo), "diff-index", "--cached", "--quiet", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    assert idx.returncode == 0, "real index changed on a failed commit phase"
     # No intermediate commit may be reachable from the branch tip.
     log = subprocess.run(
         ["git", "-C", str(clean_repo), "log", "--oneline", "HEAD"],
@@ -3037,17 +4233,22 @@ def _assert_phase_failure_is_atomic(
     ).stdout
     assert "Done-Gate evidence" not in log
     assert "evidence_commit=" not in log
+    # The side-channel ref was never created — a failed phase publishes nothing.
+    assert _publish_ref(clean_repo, run_id) is None, (
+        "gate ref created on a failed commit phase"
+    )
 
 
 def test_commit_evidence_phase1_add_failure_is_atomic(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """A4 counter-example: a failed phase-1 ``git add`` leaves the branch on the
-    tested revision, no intermediate commit, and a clean index/worktree."""
+    """A4 counter-example: a failed phase-1 temp-index ``update-index`` (the
+    side-channel equivalent of ``git add``) leaves the branch on the tested
+    revision, no intermediate commit, no gate ref, and a clean index/worktree."""
     _patch_root(monkeypatch, clean_repo)
     _populate_required_evidence(staging_dir)
     report, start = _passing_report_and_start(clean_repo)
-    _inject_git_failure(monkeypatch, "add", when=1)
+    _inject_git_failure(monkeypatch, "update-index", when=1)
 
     with pytest.raises(gate.GateStateChangedError):
         gate._commit_evidence(staging_dir, report, start=start)
@@ -3102,23 +4303,354 @@ def test_commit_evidence_update_ref_failure_is_atomic(
     _assert_phase_failure_is_atomic(clean_repo, staging_dir, start.commit_sha)
 
 
-def test_commit_evidence_success_moves_head_once_atomically(
+def test_commit_evidence_success_creates_ref_once_atomically(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """A4 positive control: on success HEAD lands exactly on the pointer commit
-    P whose parent is E, E's parent is the tested revision, and the tree is
-    clean — the atomic trail S -> E -> P is exactly what update-ref installed."""
+    """C-122 P0 positive control: on success HEAD does NOT move — the product
+    branch stays at the tested revision S, the real index stays in sync with it,
+    the worktree stays clean, and the ONLY atomic persistent change is the
+    create-only gate ref ``refs/tripchord/done-gate/<run_id>`` -> P with
+    P^=E and E^=S."""
     _patch_root(monkeypatch, clean_repo)
     _populate_required_evidence(staging_dir)
     report, start = _passing_report_and_start(clean_repo)
 
     evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
 
-    head = _head(clean_repo)
-    assert head != start.commit_sha
-    # P's parent is E, E's parent is S.
+    pointer_sha = _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, start.commit_sha, evidence_commit
+    )
+    # P's committed authoritative report records evidence_commit=E, passed=true
+    # and the gate-ref binding.
+    committed = json.loads(
+        subprocess.run(
+            ["git", "-C", str(clean_repo), "show", f"{pointer_sha}:{gate._REPORT_REL}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
+    assert committed["evidence_commit"] == evidence_commit
+    assert committed["passed"] is True
+    assert committed["gate_ref"] == f"refs/tripchord/done-gate/{_TEST_RUN_ID}"
+
+
+def test_commit_evidence_no_fallible_op_after_cas(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-114 + C-122 P0 counter-example (CAS 成功后检查异常): after the atomic
+    create-only ``update-ref`` of the gate ref succeeds there must be NO fallible
+    operation left.  The side-channel publish's update-ref is literally the last
+    ``_git`` invocation — nothing (snapshot, verify, scan, restore, re-dump) runs
+    after it, so a failure there can never flip a published gate into a
+    voided-but-published state."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+
+    real_git = gate._git
+    calls: list[tuple[str, ...]] = []
+
+    def recording_git(*args: str, **kwargs: object) -> subprocess.CompletedProcess:
+        calls.append(args)
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(gate, "_git", recording_git)
+
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+    pointer_sha = _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, start.commit_sha, evidence_commit
+    )
+
+    # The publish update-ref ran exactly once, as the LAST git invocation, and
+    # used ``--no-deref`` so a symref racing in cannot push P into a victim ref
+    # (C-122 P0 symbolic-ref hijack guard).
+    ref_calls = [c for c in calls if c and c[0] == "update-ref"]
+    assert len(ref_calls) == 1
+    assert ref_calls[0][1:] == (
+        "--no-deref",
+        f"refs/tripchord/done-gate/{_TEST_RUN_ID}",
+        pointer_sha,
+        "0" * 40,
+    )
+    assert calls[-1] == ref_calls[0], "a git call ran AFTER the publish update-ref"
+    # The gate succeeded with the product branch untouched.
+
+
+def test_commit_evidence_construction_crash_at_each_stage_publishes_nothing(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 P0 counter-example: a process crashing at ANY construction stage —
+    phase 1 staging, phase 2 (after E is materialized), between P and the
+    publish, or at the publish itself — leaves the shared repo byte-for-byte at
+    S.  The shared worktree is never written and the gate ref is only created by
+    the final atomic update-ref, so a crash before that point leaves at most
+    unreachable objects and no visible repo change.  An unexpected exception
+    (RuntimeError, the way a real crash surfaces) escapes the commit phase."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+
+    crash_points = {
+        "phase1_stage": "_verify_evidence_file_safety",
+        "phase2_after_e": "_verify_evidence_contract",
+        "after_p_before_publish": "_final_evidence_secret_scan",
+        "at_publish": "update-ref",
+    }
+    for label, target in crash_points.items():
+        report, start = _passing_report_and_start(clean_repo)
+        tested_sha = start.commit_sha
+
+        # Each crash point is patched in an isolated context so a crash from a
+        # previous iteration can never leak into this one.
+        with monkeypatch.context() as isolated:
+            if target == "update-ref":
+                real_git = gate._git
+
+                def crashing_git(
+                    *args: str,
+                    _real_git=real_git,
+                    _label: str = label,
+                    **kwargs: object,
+                ) -> subprocess.CompletedProcess:
+                    if args and args[0] == "update-ref":
+                        raise RuntimeError(f"simulated crash at {_label}")
+                    return _real_git(*args, **kwargs)
+
+                isolated.setattr(gate, "_git", crashing_git)
+            else:
+
+                def crash(
+                    *args: object, _label: str = label, **kwargs: object
+                ) -> object:
+                    raise RuntimeError(f"simulated crash at {_label}")
+
+                isolated.setattr(gate, target, crash)
+
+            with pytest.raises(RuntimeError, match=f"simulated crash at {label}"):
+                gate._commit_evidence(staging_dir, report, start=start)
+
+        assert _head(clean_repo) == tested_sha, f"HEAD moved on crash at {label}"
+        assert _porcelain(clean_repo) == "", f"dirty tree on crash at {label}"
+        idx = subprocess.run(
+            ["git", "-C", str(clean_repo), "diff-index", "--cached", "--quiet", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        assert idx.returncode == 0, f"real index changed on crash at {label}"
+        assert _publish_ref(clean_repo, _TEST_RUN_ID) is None, (
+            f"gate ref created on crash at {label}"
+        )
+        assert not (
+            clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
+        ).exists(), f"tracked report written on crash at {label}"
+
+
+def test_commit_evidence_same_sha_other_branch_switch_leaves_both_untouched(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 P0 counter-example: a concurrent checkout of a DIFFERENT branch at
+    the SAME SHA must NOT disturb the side-channel publish.  The gate never
+    updates HEAD or the branch refs — only the namespaced gate ref — so HEAD
+    stays on 'other' after the concurrent switch, BOTH branches still sit at S,
+    and the evidence trail is published through the dedicated ref with P^=E,
+    E^=S."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+    tested_sha = start.commit_sha
+
+    # A sibling branch at the SAME commit, with HEAD on it.
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "branch", "other", "main"], check=True
+    )
+
+    real_final_scan = gate._final_evidence_secret_scan
+
+    def checkout_other_after_final_scan(staging: Path, tracked: object) -> None:
+        # The real final scan runs first, then a real concurrent ``git
+        # symbolic-ref`` switches HEAD to another branch at the same SHA before
+        # the gate publishes.  ``git symbolic-ref`` is a ref-only op, so it
+        # succeeds and the gate never rewrites it.
+        real_final_scan(staging, tracked)  # type: ignore[arg-type]
+        subprocess.run(
+            ["git", "-C", str(clean_repo), "symbolic-ref", "HEAD", "refs/heads/other"],
+            check=True,
+        )
+
+    monkeypatch.setattr(
+        gate, "_final_evidence_secret_scan", checkout_other_after_final_scan
+    )
+
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+
+    # The publish succeeded: HEAD is on 'other' (the concurrent switch survived
+    # untouched), BOTH branches sit at S, the worktree is clean, and the gate
+    # ref carries the evidence trail.
+    sym = subprocess.run(
+        ["git", "-C", str(clean_repo), "symbolic-ref", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert sym == "other"
+    assert _head(clean_repo) == tested_sha
+    for ref in ("refs/heads/main", "refs/heads/other"):
+        tip = subprocess.run(
+            ["git", "-C", str(clean_repo), "rev-parse", ref],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert tip == tested_sha, f"{ref} moved on a side-channel publish"
+    assert _porcelain(clean_repo) == ""
+    _assert_side_channel_published(clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit)
+
+
+def test_commit_evidence_concurrent_commit_parent_tree_index_preserved(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 P0 counter-example: a REAL concurrent commit racing the gate's
+    commit phase is completely unaffected AND the side-channel publish still
+    succeeds.  The concurrent writer commits on top of the tested revision; the
+    gate never touches HEAD/branch/real index/worktree, so the concurrent
+    commit's parent, tree and index state all survive byte-for-byte, and the
+    evidence trail lands on the dedicated gate ref (P^=E, E^=S) instead.
+
+    The monkeypatch only runs a real ``git add``/``git commit`` at the boundary
+    after the gate's final secret scan; the commit itself and the resulting
+    ref/index state are all real, unmonkeypatched git behavior."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+    tested_sha = start.commit_sha
+
+    concurrent_sha: list[str | None] = [None]
+
+    real_final_scan = gate._final_evidence_secret_scan
+
+    def concurrent_commit_after_final_scan(
+        staging: Path, tracked_paths: object
+    ) -> None:
+        # Run the gate's real final scan first, then a real concurrent writer
+        # commits on top of the tested revision.
+        real_final_scan(staging, tracked_paths)  # type: ignore[arg-type]
+        (clean_repo / "concurrent.txt").write_text(
+            "concurrent work\n", encoding="utf-8"
+        )
+        subprocess.run(
+            ["git", "-C", str(clean_repo), "add", "concurrent.txt"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(clean_repo), "commit", "-q", "-m", "concurrent"],
+            check=True,
+        )
+        concurrent_sha[0] = _head(clean_repo)
+
+    monkeypatch.setattr(
+        gate, "_final_evidence_secret_scan", concurrent_commit_after_final_scan
+    )
+
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+
+    assert concurrent_sha[0] is not None
+    # 1. The branch sits on the concurrent commit, never on P/E/S.
+    assert _head(clean_repo) == concurrent_sha[0]
+    # 2. The concurrent commit's parent is the tested revision S — it was not
+    #    rebased or absorbed.
+    parent = subprocess.run(
+        ["git", "-C", str(clean_repo), "rev-parse", f"{concurrent_sha[0]}^"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert parent == tested_sha
+    # 3. The concurrent commit's tree carries exactly its own file — the gate's
+    #    staged evidence never leaked into it.
+    tree_files = subprocess.run(
+        ["git", "-C", str(clean_repo), "ls-tree", "--name-only", concurrent_sha[0]],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert "concurrent.txt" in tree_files
+    assert not any("benchmarks/results" in f for f in tree_files)
+    # 4. The real index matches the concurrent commit's tree — the gate never
+    #    clobbered the concurrent index state.
+    idx = subprocess.run(
+        ["git", "-C", str(clean_repo), "diff-index", "--cached", "--quiet",
+         concurrent_sha[0]],
+        capture_output=True,
+        text=True,
+    )
+    assert idx.returncode == 0
+    # 5. The worktree is clean and the gate's own evidence files were never
+    #    written into the shared tree; only the concurrent commit's file
+    #    remains, committed.
+    assert _porcelain(clean_repo) == ""
+    assert not (
+        clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
+    ).exists()
+    # 6. No evidence commit is reachable from the concurrent tip — the trail is
+    #    only on the dedicated side-channel ref.
+    log = subprocess.run(
+        ["git", "-C", str(clean_repo), "log", "--oneline"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "Done-Gate evidence" not in log
+    assert concurrent_sha[0] is not None
+    _assert_side_channel_published(
+        clean_repo,
+        _TEST_RUN_ID,
+        tested_sha,
+        evidence_commit,
+        expected_head=concurrent_sha[0],
+    )
+
+
+def test_commit_evidence_leaves_concurrent_staged_index_untouched(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 P0 counter-example: when a concurrent writer has STAGED (not
+    committed) work in the real index, the side-channel publish must NOT clobber
+    that staged state — the gate never reads or writes the real index.  The
+    staged file survives byte-for-byte, the branch never moves, and only the
+    dedicated gate ref appears."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+    tested_sha = start.commit_sha
+
+    # A concurrent writer stages a file in the real index.
+    (clean_repo / "staged.txt").write_text("staged work\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(clean_repo), "add", "staged.txt"], check=True)
+
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+
+    # The publish succeeded: the branch never moved, and the concurrent staged
+    # work is still staged exactly as the writer left it.
+    assert _head(clean_repo) == tested_sha
+    staged = subprocess.run(
+        ["git", "-C", str(clean_repo), "diff", "--cached", "--name-only"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert staged == "staged.txt"
+    # The gate's own report/evidence were never written into the shared tree;
+    # only the writer's staged file remains (as an index entry, never
+    # committed).
+    assert not (
+        clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
+    ).exists()
+    # The side-channel trail was published (P^=E, E^=S) without touching the
+    # index; HEAD stays at S.
+    p_sha = _publish_ref(clean_repo, _TEST_RUN_ID)
+    assert p_sha is not None
     parent_p = subprocess.run(
-        ["git", "-C", str(clean_repo), "rev-parse", f"{head}^"],
+        ["git", "-C", str(clean_repo), "rev-parse", f"{p_sha}^"],
         capture_output=True,
         text=True,
         check=True,
@@ -3130,144 +4662,414 @@ def test_commit_evidence_success_moves_head_once_atomically(
         text=True,
         check=True,
     ).stdout.strip()
-    assert parent_e == start.commit_sha
-    assert _porcelain(clean_repo) == ""
-    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
-    payload = json.loads(report_path.read_text(encoding="utf-8"))
-    assert payload["evidence_commit"] == evidence_commit
-    assert payload["passed"] is True
+    assert parent_e == tested_sha
 
 
-def test_commit_evidence_no_fallible_op_after_cas(
+def test_commit_evidence_success_leaves_head_index_worktree_consistent(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """C-114 counter-example (CAS 成功后检查异常): after the atomic update-ref
-    CAS succeeds there must be NO fallible operation left.
-
-    The old tail called ``_git_snapshot()`` and ran fail-able checks after the
-    CAS — a failure there would raise, the rollback would then restore files to
-    the already-installed pointer commit P, and the flow would report failure
-    while a passed=true report was committed at P.  Injecting a failure on a
-    second snapshot proves the tail check is gone: the gate commits cleanly and
-    no post-CAS operation can flip success into a voided-but-installed state."""
+    """C-122 P0 positive control: on a successful side-channel publish the
+    HEAD/index/worktree must all agree AND stay at the tested revision S — the
+    gate never advances HEAD to P/E, never writes the real index, and never
+    touches the worktree, so ``diff-index --cached`` against HEAD is quiet and
+    no index sync exists to race at all.  The evidence trail lives only on the
+    dedicated gate ref."""
     _patch_root(monkeypatch, clean_repo)
     _populate_required_evidence(staging_dir)
     report, start = _passing_report_and_start(clean_repo)
-
-    real_snapshot = gate._git_snapshot
-    seen = 0
-
-    def fake_snapshot(*args: object, **kwargs: object) -> gate.GitSnapshot:
-        nonlocal seen
-        seen += 1
-        if seen == 2:
-            raise gate.GateStateChangedError(
-                "post-CAS snapshot would fail (old tail check)"
-            )
-        return real_snapshot(*args, **kwargs)
-
-    monkeypatch.setattr(gate, "_git_snapshot", fake_snapshot)
 
     evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
 
-    # The gate succeeded: HEAD advanced to P, the tree is clean, and the
-    # committed report carries passed=true with the evidence trail.
-    assert _head(clean_repo) != start.commit_sha
+    head = _head(clean_repo)
+    # 1. HEAD stays exactly at the tested revision S — never P/E.
+    assert head == start.commit_sha
+    # 2. The real index matches HEAD's tree (HEAD/index consistent, untouched).
+    idx = subprocess.run(
+        ["git", "-C", str(clean_repo), "diff-index", "--cached", "--quiet", head],
+        capture_output=True,
+        text=True,
+    )
+    assert idx.returncode == 0
+    # 3. The worktree is clean too (HEAD/worktree consistent, untouched).
     assert _porcelain(clean_repo) == ""
-    report_path = clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
-    payload = json.loads(report_path.read_text(encoding="utf-8"))
-    assert payload["evidence_commit"] == evidence_commit
-    assert payload["passed"] is True
+    # 4. The dedicated gate ref carries the atomic trail S -> E -> P.
+    _assert_side_channel_published(clean_repo, _TEST_RUN_ID, start.commit_sha, evidence_commit)
 
 
-def test_commit_evidence_rollback_surfaces_readtree_failure(
-    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+def _pointer_commit(clean_repo: Path, parent_sha: str) -> str:
+    """A real child commit (same tree as ``parent_sha``) usable as a pointer P."""
+    return subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "commit-tree",
+            f"{parent_sha}^{{tree}}",
+            "-p",
+            parent_sha,
+            "-m",
+            "P",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def test_publish_gate_ref_rejects_preset_direct_ref(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
 ) -> None:
-    """C-118 counter-example: a failed rollback is never silently swallowed —
-    the rollback index restore (``read-tree`` of current HEAD) must be
-    check=True so a dirty index cannot be left behind while the gate reports
-    only the original failure.  The rollback must NEVER ``git reset`` back to
-    the old tested revision."""
+    """C-122 P0 symref-hijack guard: a PRE-SEEDED direct gate ref is a conflict —
+    ``_publish_gate_ref`` refuses the create-only publish into it and leaves the
+    ref, HEAD, index and worktree byte-for-byte untouched."""
     _patch_root(monkeypatch, clean_repo)
-    _populate_required_evidence(staging_dir)
-    report, start = _passing_report_and_start(clean_repo)
+    gate_ref = f"refs/tripchord/done-gate/{_TEST_RUN_ID}"
+    tested_sha = _head(clean_repo)
+    pointer = _pointer_commit(clean_repo, tested_sha)
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "update-ref", gate_ref, tested_sha], check=True
+    )
+    with pytest.raises(gate.GateStateChangedError, match="preset as direct"):
+        gate._publish_gate_ref(gate_ref, pointer, {})
+    # The preset ref is unchanged (never overwritten by P).
+    assert subprocess.run(
+        ["git", "-C", str(clean_repo), "rev-parse", gate_ref],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip() == tested_sha
+    # Product branch / HEAD / worktree all unchanged.
+    assert _head(clean_repo) == tested_sha
+    assert _porcelain(clean_repo) == ""
 
+
+def test_publish_gate_ref_rejects_preset_symref_leaves_victim_untouched(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    """C-122 P0 symref-hijack counter-example: with the gate ref PRE-SEEDED as a
+    symbolic ref -> victim (a victim ref that does NOT exist yet — the state in
+    which a dereferencing ``update-ref`` would CREATE the victim holding P), the
+    publish must FAIL.  The passing evidence must never land at the victim name,
+    and the symref itself must not be silently converted to a direct ref."""
+    _patch_root(monkeypatch, clean_repo)
+    gate_ref = f"refs/tripchord/done-gate/{_TEST_RUN_ID}"
+    tested_sha = _head(clean_repo)
+    pointer = _pointer_commit(clean_repo, tested_sha)
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "symbolic-ref", gate_ref, "refs/heads/victim"],
+        check=True,
+    )
+    with pytest.raises(gate.GateStateChangedError, match="symbolic-ref hijack"):
+        gate._publish_gate_ref(gate_ref, pointer, {})
+    # 1. The victim was never created.
+    probe = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/victim",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode != 0, "victim ref was created by the publish"
+    # 2. The gate ref is still the SAME symref (not silently converted to P).
+    sym = subprocess.run(
+        ["git", "-C", str(clean_repo), "symbolic-ref", gate_ref],
+        capture_output=True,
+        text=True,
+    )
+    assert sym.returncode == 0
+    assert sym.stdout.strip() == "refs/heads/victim"
+    # 3. Product branch / HEAD / worktree all unchanged.
+    assert _head(clean_repo) == tested_sha
+    assert _porcelain(clean_repo) == ""
+
+
+def test_publish_gate_ref_receipt_lost_but_publish_landed(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    """C-122 round-18 gate-3 terminal state: the ``update-ref`` receipt is LOST
+    (a timeout/caller-side error surfaces after the update landed), but the
+    read-only reconciliation sees the ref holding exactly P — the publish
+    counts as success and returns normally, never a spurious fail."""
+    _patch_root(monkeypatch, clean_repo)
+    gate_ref = f"refs/tripchord/done-gate/{_TEST_RUN_ID}"
+    tested_sha = _head(clean_repo)
+    pointer = _pointer_commit(clean_repo, tested_sha)
     real_git = gate._git
-    update_ref_failed = [False]
-    seen_rollback_restore = [0]
 
-    def failing_git(*args: str, **kwargs: object) -> subprocess.CompletedProcess:
+    def _lost_receipt(*args: object, **kwargs: object) -> object:
         if args and args[0] == "update-ref":
-            update_ref_failed[0] = True
-            proc = subprocess.CompletedProcess(
-                args, returncode=1, stdout=b"", stderr=b"update-ref failed"
-            )
-            if kwargs.get("check"):
-                raise gate.GateStateChangedError("git update-ref failed with exit 1")
-            return proc
-        # The rollback index restore is the first no-GIT_INDEX_FILE read-tree
-        # AFTER the CAS failed.  The pre-CAS real-index sync (read-tree of the
-        # pointer tree) runs before update-ref, so it is not the rollback.
-        if (
-            args
-            and args[0] == "read-tree"
-            and not kwargs.get("env_extra")
-            and update_ref_failed[0]
-            and seen_rollback_restore[0] == 0
-        ):
-            seen_rollback_restore[0] += 1
-            proc = subprocess.CompletedProcess(
-                args, returncode=1, stdout=b"", stderr=b"read-tree failed"
-            )
-            if kwargs.get("check"):
-                raise gate.GateStateChangedError("git read-tree failed with exit 1")
-            return proc
+            # Simulate the update LANDING but the receipt being lost: run the
+            # real update-ref, then raise as if the call timed out.
+            real_git(*args, **kwargs)
+            raise gate.GateStateChangedError("update-ref timed out")
         return real_git(*args, **kwargs)
 
-    monkeypatch.setattr(gate, "_git", failing_git)
+    monkeypatch.setattr(gate, "_git", _lost_receipt)
+    gate._publish_gate_ref(gate_ref, pointer, {})  # must NOT raise
+    # The reconciliation accepted the landed publish: ref == P.
+    assert subprocess.run(
+        ["git", "-C", str(clean_repo), "rev-parse", gate_ref],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip() == pointer
 
-    with pytest.raises(gate.GateStateChangedError, match="rollback also failed"):
-        gate._commit_evidence(staging_dir, report, start=start)
-    assert seen_rollback_restore[0] == 1
+
+def test_publish_gate_ref_reconciliation_read_failure_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    """C-122 round-18 gate-3 terminal state: the ``update-ref`` fails AND the
+    read-only reconciliation probe itself fails (git unreadable) — the outcome
+    is genuinely unknowable, so the publish fails closed instead of guessing."""
+    _patch_root(monkeypatch, clean_repo)
+    gate_ref = f"refs/tripchord/done-gate/{_TEST_RUN_ID}"
+    tested_sha = _head(clean_repo)
+    pointer = _pointer_commit(clean_repo, tested_sha)
+
+    def _failing_publish(*args: object, **kwargs: object) -> object:
+        if args and args[0] == "update-ref":
+            raise gate.GateStateChangedError("update-ref failed")
+        raise gate.GateStateChangedError("git is unavailable")  # probe also fails
+
+    monkeypatch.setattr(gate, "_git", _failing_publish)
+    with pytest.raises(gate.GateStateChangedError, match="git is unavailable"):
+        gate._publish_gate_ref(gate_ref, pointer, {})
 
 
-def test_commit_evidence_rollback_preserves_concurrent_head(
+def test_commit_evidence_symref_hijack_fails_closed_and_leaves_everything_untouched(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """C-118 counter-example: when the update-ref CAS fails because a concurrent
-    writer moved HEAD, the rollback restores the index to CURRENT HEAD — it
-    never resets the branch back to the old tested revision, which would
-    silently discard the concurrent commit."""
+    """C-122 P0 REAL temp-repo counter-example through the FULL commit path: with
+    the gate ref pre-seeded as a symref -> victim, ``_commit_evidence`` runs the
+    entire staging/commit phase but the create-only publish FAILS CLOSED.  The
+    victim ref and the gate ref are never rewritten, the product branch / HEAD /
+    real index / worktree stay byte-for-byte at S, and the failed report carries
+    no evidence_commit / gate_ref claim."""
+    report, start, tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    gate_ref = f"refs/tripchord/done-gate/{_TEST_RUN_ID}"
+    subprocess.run(
+        ["git", "-C", str(clean_repo), "symbolic-ref", gate_ref, "refs/heads/victim"],
+        check=True,
+    )
+    with pytest.raises(gate.GateStateChangedError, match="symbolic-ref hijack"):
+        gate._commit_evidence(staging_dir, report, start=start)
+    # 1. The victim was never created (a dereferencing publish would have
+    #    materialised it holding P).
+    probe = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/victim",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode != 0, "victim ref was created by the evidence commit"
+    # 2. The gate ref is still the same symref — untouched, not converted.
+    sym = subprocess.run(
+        ["git", "-C", str(clean_repo), "symbolic-ref", gate_ref],
+        capture_output=True,
+        text=True,
+    )
+    assert sym.returncode == 0
+    assert sym.stdout.strip() == "refs/heads/victim"
+    # 3. HEAD stays at S and the worktree stays clean.
+    assert _head(clean_repo) == tested_sha
+    assert _porcelain(clean_repo) == ""
+    # 4. The real index still matches HEAD (never read-tree'd/clobbered).
+    idx = subprocess.run(
+        ["git", "-C", str(clean_repo), "diff-index", "--cached", "--quiet", tested_sha],
+        capture_output=True,
+        text=True,
+    )
+    assert idx.returncode == 0
+    # 5. The failed report claims no evidence_commit / gate_ref.
+    assert report.evidence_commit is None
+    assert report.gate_ref is None
+
+
+def test_verify_gate_ref_rejects_symref_hijack(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 P0 symref-hijack guard: a gate ref that has been turned into a
+    symbolic ref must fail verification closed — a dereferenced read would hand
+    back the victim's OID and masquerade as a published trail."""
+    report, start, tested_sha = _minimal_evidence_commit_args(
+        monkeypatch, clean_repo, staging_dir
+    )
+    evidence_commit = gate._commit_evidence(staging_dir, report, start=start)
+    _pointer_sha = _assert_side_channel_published(
+        clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit
+    )
+    # Hijack: convert the published direct ref into a symref -> main.
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "symbolic-ref",
+            f"refs/tripchord/done-gate/{_TEST_RUN_ID}",
+            "refs/heads/main",
+        ],
+        check=True,
+    )
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is False
+    assert any("symbolic ref" in problem for problem in verdict["problems"])
+    # The dereferenced OID happens to be a real commit, but that must NOT pass.
+    assert "pointer_commit" not in verdict
+
+
+def test_latest_gate_run_id_skips_symref_hijack(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path
+) -> None:
+    """C-122 P0 symref-hijack guard: ``--latest`` resolution must never resolve
+    to a symbolic ref under the gate namespace — with only a hijack symref
+    present it raises instead of pretending a run was published."""
+    _patch_root(monkeypatch, clean_repo)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean_repo),
+            "symbolic-ref",
+            "refs/tripchord/done-gate/999999999999",
+            "refs/heads/main",
+        ],
+        check=True,
+    )
+    with pytest.raises(gate.GateStateChangedError, match="no published gate refs"):
+        gate._latest_gate_run_id()
+
+
+def test_commit_evidence_rejects_tampered_e_manifest(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 round-18 (10:00 review #2) counter-example: a TAMPERED E manifest —
+    a committed-file hash altered before phase 1 — must fail the phase closed
+    when E's manifest is re-parsed from the committed blob.  The branch never
+    moves and the index/worktree stay clean."""
     _patch_root(monkeypatch, clean_repo)
     _populate_required_evidence(staging_dir)
     report, start = _passing_report_and_start(clean_repo)
 
-    real_git = gate._git
-    moved = [False]
+    real_write_manifest = gate._write_manifest
+    phase = [0]
 
-    def concurrent_cas(*args: str, **kwargs: object) -> subprocess.CompletedProcess:
-        # Move HEAD right before the atomic update-ref so git's own CAS fails:
-        # update-ref's expected-old value (the tested revision) no longer
-        # matches current HEAD.
-        if args and args[0] == "update-ref" and not moved[0]:
-            moved[0] = True
-            subprocess.run(
-                ["git", "-C", str(clean_repo), "commit", "--allow-empty", "-q",
-                 "-m", "concurrent writer moved HEAD"],
-                check=True,
-            )
-        return real_git(*args, **kwargs)
+    def tampered_write(manifest: dict[str, Any], target: Path) -> Path:
+        phase[0] += 1
+        if phase[0] == 1:
+            # Phase-1 manifest: corrupt the first committed file's sha256 so E's
+            # committed manifest can no longer match the committed bytes.
+            manifest = dict(manifest)
+            files = list(manifest.get("files") or [])
+            for index, entry in enumerate(files):
+                if entry.get("committed") is True:
+                    files[index] = dict(entry)
+                    files[index]["sha256"] = "0" * 64
+                    break
+            manifest["files"] = files
+        return real_write_manifest(manifest, target)
 
-    monkeypatch.setattr(gate, "_git", concurrent_cas)
+    monkeypatch.setattr(gate, "_write_manifest", tampered_write)
 
-    with pytest.raises(gate.GateStateChangedError):
+    with pytest.raises(gate.GateStateChangedError, match="sha256"):
         gate._commit_evidence(staging_dir, report, start=start)
 
-    # The branch must still sit on the concurrent writer's commit — the
-    # rollback re-synced the index to it and never moved HEAD back to S.
-    assert _head(clean_repo) != start.commit_sha
-    assert moved[0] is True
+    # Fail closed: the branch never moved, and no evidence commit is reachable.
+    assert _head(clean_repo) == start.commit_sha
     assert _porcelain(clean_repo) == ""
+    log = subprocess.run(
+        ["git", "-C", str(clean_repo), "log", "--oneline"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "Done-Gate evidence" not in log
+
+
+def test_commit_evidence_rejects_non_json_pointer_report(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 round-18 (10:00 review #2) counter-example: P's authoritative report
+    must be parsed from the committed blob and be valid JSON with the full
+    schema.  A non-JSON P report (tampered at the phase-2 dump) fails closed
+    before the CAS — the branch never moves."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+    staged_report_path = staging_dir / gate._REPORT_STAGED_NAME
+
+    real_dump = gate._dump
+
+    def tampered_p_dump(report_obj: gate.GateReport, output_path: Path) -> Path:
+        if (
+            report_obj.evidence_commit is not None
+            and output_path == staged_report_path
+        ):
+            # Phase-2 staged report: poison it so P's committed blob is not JSON.
+            gate._write_atomic(output_path, "{not valid json", 0o600)
+            return output_path
+        return real_dump(report_obj, output_path)
+
+    monkeypatch.setattr(gate, "_dump", tampered_p_dump)
+
+    with pytest.raises(
+        gate.GateStateChangedError, match="authoritative report is not valid JSON"
+    ):
+        gate._commit_evidence(staging_dir, report, start=start)
+
+    # Fail closed: the branch never moved, the tree is clean.
+    assert _head(clean_repo) == start.commit_sha
+    assert _porcelain(clean_repo) == ""
+
+
+def test_commit_evidence_fails_closed_when_whitelist_bytes_change_after_final_scan(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 round-18 (10:00 review #2) counter-example: a whitelist path's bytes
+    changed AFTER the final secret scan (the TOCTOU between scan and CAS) must
+    fail the phase closed — the gate refuses to commit a tree that differs from
+    what it scanned, instead of silently committing different bytes."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    report, start = _passing_report_and_start(clean_repo)
+    staged_report_path = staging_dir / gate._REPORT_STAGED_NAME
+
+    real_final_scan = gate._final_evidence_secret_scan
+
+    def scan_then_mutate(staging: Path, tracked_paths: object) -> None:
+        real_final_scan(staging, tracked_paths)  # type: ignore[arg-type]
+        # A concurrent writer mutates the staged report right after the scan,
+        # before the gate's publish — the bytes P committed (from the pre-scan
+        # file) no longer match the on-disk staging file.
+        with staged_report_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n// tampered after final scan\n")
+
+    monkeypatch.setattr(gate, "_final_evidence_secret_scan", scan_then_mutate)
+
+    with pytest.raises(
+        gate.GateStateChangedError, match="bytes differ from the scanned staging file"
+    ):
+        gate._commit_evidence(staging_dir, report, start=start)
+
+    # Fail closed: the branch never moved, the shared worktree is untouched, and
+    # no gate ref was published.
+    assert _head(clean_repo) == start.commit_sha
+    assert _porcelain(clean_repo) == ""
+    assert _publish_ref(clean_repo, _TEST_RUN_ID) is None
 
 
 # ---------------------------------------------------------------------------
@@ -3276,19 +5078,67 @@ def test_commit_evidence_rollback_preserves_concurrent_head(
 # ---------------------------------------------------------------------------
 
 
-def test_main_post_cas_redump_failure_does_not_flip_exit(
+def test_main_no_post_cas_dump_local_report_carries_evidence_commit(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
-    """C-118 Gap 1 counter-example: after the atomic update-ref CAS installs the
-    passed=true pointer commit, the post-CAS report re-dump is best-effort ONLY
-    — a failure there must never flip the process to exit 2 while a passed=true
-    pointer is already committed.
+    """C-122 Fix 7 + P0 counter-example: the delivered report is finalized BEFORE
+    the publish — there is no post-CAS re-dump to swallow.  Exactly three dumps
+    run (the pre-commit staging report, the phase-1 E report and the phase-2 P
+    report; the delivered local report IS the phase-2 staged file), and the
+    local report on disk carries evidence_commit=E and the gate-ref binding
+    matching the committed report.  HEAD stays at S — only the gate ref
+    appears."""
+    _patch_root(monkeypatch, clean_repo)
+    _populating_passing_layers(monkeypatch, staging_dir)
+    head_before = _head(clean_repo)
 
-    The old tail dumped the report AFTER the CAS without a guard; a dump failure
-    then exited 2 with a committed passed=true report on the branch (the exact
-    contradiction the review found).  The first three dumps are: the pre-commit
-    staging dump, the E-report dump and the P-report dump inside _commit_evidence.
-    The fourth is the post-CAS re-dump — it is the one that may fail."""
+    real_dump = gate._dump
+    dump_count = [0]
+
+    def counting_dump(report: gate.GateReport, output_path: Path | None = None) -> Path:
+        dump_count[0] += 1
+        return real_dump(report, output_path)
+
+    monkeypatch.setattr(gate, "_dump", counting_dump)
+
+    rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
+
+    assert rc == 0
+    assert dump_count[0] == 3
+    assert _porcelain(clean_repo) == ""
+    assert _head(clean_repo) == head_before
+    # No tracked report was ever written into the shared worktree.
+    assert not (
+        clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json"
+    ).exists()
+    local = json.loads(
+        (staging_dir / "product-v1-done-gate.json").read_text(encoding="utf-8")
+    )
+    assert local["passed"] is True
+    assert local["evidence_commit"]
+    assert local["gate_ref"] == f"refs/tripchord/done-gate/{local['run_id']}"
+    # The published pointer commit's report agrees with the delivered local one.
+    pointer_sha = _publish_ref(clean_repo, local["run_id"])
+    assert pointer_sha is not None
+    committed = json.loads(
+        subprocess.run(
+            ["git", "-C", str(clean_repo), "show", f"{pointer_sha}:{gate._REPORT_REL}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
+    assert committed["evidence_commit"] == local["evidence_commit"]
+    assert committed["passed"] is True
+
+
+def test_main_local_report_dump_failure_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 Fix 7 counter-example: if the delivered local report cannot be
+    dumped inside the commit phase, the whole gate fails exit 2 and HEAD never
+    moves — the local report is generated pre-CAS and is not a silent
+    best-effort step."""
     _patch_root(monkeypatch, clean_repo)
     _populating_passing_layers(monkeypatch, staging_dir)
     head_before = _head(clean_repo)
@@ -3298,26 +5148,16 @@ def test_main_post_cas_redump_failure_does_not_flip_exit(
 
     def flaky_dump(report: gate.GateReport, output_path: Path | None = None) -> Path:
         dump_count[0] += 1
-        if dump_count[0] == 4:
-            raise OSError("post-CAS re-dump failed")
+        if dump_count[0] == 3:  # the delivered local report dump in _commit_evidence
+            raise OSError("local report dump failed")
         return real_dump(report, output_path)
 
     monkeypatch.setattr(gate, "_dump", flaky_dump)
 
     rc = gate.main(["--staging-dir", str(staging_dir), "--commit-evidence", "--quiet"])
 
-    assert rc == 0  # the CAS already happened; the re-dump is best-effort
-    assert dump_count[0] == 4
-    assert _porcelain(clean_repo) == ""
-    # The committed pointer report carries passed=true and evidence_commit=E.
-    tracked = json.loads(
-        (clean_repo / "benchmarks" / "results" / "product-v1-done-gate.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert tracked["passed"] is True
-    assert tracked["evidence_commit"]
-    assert _head(clean_repo) != head_before
+    assert rc == 2
+    assert _head(clean_repo) == head_before
 
 
 def test_layer5_fails_when_canary_exits_nonzero_despite_green_json(
@@ -3415,6 +5255,7 @@ def test_bridge_state_lease_preflight_detects_queued_work(tmp_path: Path) -> Non
         json.dumps(
             {
                 "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
                 "tasks": [
                     {"id": "task-1", "state": "queued"},
                     {"id": "task-2", "state": "claimed"},
@@ -3440,6 +5281,7 @@ def test_bridge_state_lease_preflight_accepts_terminal_states(tmp_path: Path) ->
         json.dumps(
             {
                 "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
                 "tasks": [
                     {"id": "t1", "state": "succeeded"},
                     {"id": "t2", "state": "blocked"},
@@ -3469,18 +5311,192 @@ def test_bridge_state_lease_preflight_fails_closed_on_missing_file(
     assert "missing" in residual[0]
 
 
+def test_bridge_state_lease_preflight_fails_closed_on_bad_schema(
+    tmp_path: Path,
+) -> None:
+    """C-122 Fix 2 counter-examples: an empty object, a wrong schema version,
+    non-array tasks/reload_requests and an unknown task state each fail closed —
+    none of them can prove bridge lease isolation and none is silently skipped."""
+    # Empty object.
+    empty = tmp_path / "empty.json"
+    empty.write_text("{}", encoding="utf-8")
+    residual = gate._bridge_state_lease_preflight(empty)
+    assert any("empty object" in item for item in residual)
+    # Wrong schema version.
+    wrong_schema = tmp_path / "wrong-schema.json"
+    wrong_schema.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v1",
+                "tasks": [],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    residual = gate._bridge_state_lease_preflight(wrong_schema)
+    assert any("schema_version" in item for item in residual)
+    # tasks is not an array.
+    tasks_not_array = tmp_path / "tasks-not-array.json"
+    tasks_not_array.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": {"id": "x", "state": "queued"},
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    residual = gate._bridge_state_lease_preflight(tasks_not_array)
+    assert any("tasks is not an array" in item for item in residual)
+    # reload_requests is not an array.
+    reloads_not_array = tmp_path / "reloads-not-array.json"
+    reloads_not_array.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": [],
+                "reload_requests": {"id": "r", "state": "queued"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    residual = gate._bridge_state_lease_preflight(reloads_not_array)
+    assert any("reload_requests is not an array" in item for item in residual)
+    # Unknown task state.
+    unknown_state = tmp_path / "unknown-state.json"
+    unknown_state.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": [{"id": "t1", "state": "in_transit"}],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    residual = gate._bridge_state_lease_preflight(unknown_state)
+    assert any("unknown state 'in_transit'" in item for item in residual)
+    # Unknown reload state.
+    unknown_reload = tmp_path / "unknown-reload.json"
+    unknown_reload.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": [],
+                "reload_requests": [{"id": "r1", "state": "reloading"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    residual = gate._bridge_state_lease_preflight(unknown_reload)
+    assert any("unknown state 'reloading'" in item for item in residual)
+
+
+def test_bridge_state_lease_preflight_naive_saved_at_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-18 gate-5 counter-example: a NAIVE ``saved_at`` (bare wall
+    clock, no UTC offset) cannot prove the persisted bridge state is current and
+    fails closed — the real v2 schema requires a timezone-aware timestamp
+    (``browser_bridge._require_timezone``), so a naive one is residual, never
+    silently accepted."""
+    state_path = tmp_path / "bridge-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T12:00:00",
+                "tasks": [],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    residual = gate._bridge_state_lease_preflight(state_path)
+    assert any(
+        "saved_at" in item and "timezone-aware" in item for item in residual
+    )
+
+
+def test_bridge_state_lease_preflight_missing_saved_at_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-18 gate-5 counter-example: a bridge-state file with NO
+    ``saved_at`` timestamp cannot prove it is current and fails closed."""
+    state_path = tmp_path / "bridge-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "tasks": [],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    residual = gate._bridge_state_lease_preflight(state_path)
+    assert any(
+        "saved_at" in item and "timezone-aware" in item for item in residual
+    )
+
+
+def test_bridge_state_lease_preflight_positive_offset_saved_at_accepted(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-18 gate-5: a ``saved_at`` carrying a POSITIVE UTC offset
+    (``+08:00`` — the host live-state zone) is timezone-aware and passes the
+    timezone gate; only the wall-clock-relabelling comparison would misjudge it.
+    The presence of the offset is what certifies the timestamp is comparable."""
+    state_path = tmp_path / "bridge-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T20:00:00+08:00",
+                "tasks": [],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    residual = gate._bridge_state_lease_preflight(state_path)
+    assert not any("saved_at" in item for item in residual)
+
+
+def test_bridge_state_lease_preflight_default_binds_live_runtime_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 Fix 2: with no env var set, the preflight resolves to the live
+    API's own ``.runtime/browser-bridge-state.json`` — a missing default file
+    fails closed (it cannot prove lease isolation), it never passes vacuously."""
+    monkeypatch.delenv(gate._BRIDGE_STATE_ENV, raising=False)
+    monkeypatch.setattr(gate, "ROOT", tmp_path)
+    residual = gate._bridge_state_lease_preflight()
+    assert residual
+    assert "missing" in residual[0]
+    assert str(tmp_path / ".runtime" / "browser-bridge-state.json") in residual[0]
+
+
 def test_resolve_bridge_state_path_honors_explicit_and_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """C-118 Gap 4 wiring: an explicit override wins; otherwise the
-    ``TRIPCHORD_BROWSER_BRIDGE_STATE_PATH`` env var decides; unset means no
-    persisted bridge state to contend with."""
+    ``TRIPCHORD_BROWSER_BRIDGE_STATE_PATH`` env var decides; with neither set
+    the preflight still binds to the live API's own
+    ``.runtime/browser-bridge-state.json`` (C-122 Fix 2) — never a vacuous
+    pass."""
     explicit = tmp_path / "explicit.json"
     assert gate._resolve_bridge_state_path(explicit) == explicit
     monkeypatch.setenv(gate._BRIDGE_STATE_ENV, str(tmp_path / "env.json"))
     assert gate._resolve_bridge_state_path() == tmp_path / "env.json"
     monkeypatch.delenv(gate._BRIDGE_STATE_ENV)
-    assert gate._resolve_bridge_state_path() is None
+    assert gate._resolve_bridge_state_path() == gate.ROOT / ".runtime" / "browser-bridge-state.json"
 
 
 def test_layer6_fails_when_bridge_state_holds_residual_work(
@@ -3499,6 +5515,7 @@ def test_layer6_fails_when_bridge_state_holds_residual_work(
         json.dumps(
             {
                 "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
                 "tasks": [{"id": "task-x", "state": "queued"}],
                 "reload_requests": [],
             }
@@ -3512,6 +5529,166 @@ def test_layer6_fails_when_bridge_state_holds_residual_work(
     result = gate.layer6_full_e2e(staging_dir, start, live_state_db=db_path)
     assert result.passed is False
     assert "bridge" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# C-122 round-18 item 6: post-run bridge-state postcheck (second read-only
+# snapshot; the run must leave no residual queued/claimed/reload behind)
+# ---------------------------------------------------------------------------
+
+
+def test_bridge_state_postcheck_accepts_terminal_states(tmp_path: Path) -> None:
+    """C-122 round-18 item 6 positive: a clean post-run bridge state (only
+    terminal task/reload states) is not residual — the run consumed its lease."""
+    state_path = tmp_path / "bridge-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": [{"id": "t1", "state": "succeeded"}],
+                "reload_requests": [{"id": "r1", "state": "applied"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert gate._bridge_state_postcheck(state_path) == []
+    assert gate._BRIDGE_STATE_SNAPSHOT_AFTER is not None
+    assert gate._BRIDGE_STATE_SNAPSHOT_AFTER["file"] == state_path.name
+    assert gate._BRIDGE_STATE_SNAPSHOT_AFTER["residual"] == []
+
+
+def test_bridge_state_postcheck_fails_closed_on_missing_file(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-18 item 6 counter-example: a missing post-run bridge-state
+    file cannot prove the run left no residual and fails closed."""
+    missing = tmp_path / "does-not-exist.json"
+    residual = gate._bridge_state_postcheck(missing)
+    assert residual
+    assert "missing" in residual[0]
+
+
+def test_bridge_state_postcheck_detects_queued_work(tmp_path: Path) -> None:
+    """C-122 round-18 item 6 counter-example: queued/claimed tasks or pending
+    reorder left after the run are residual — the run did not consume its lease."""
+    state_path = tmp_path / "bridge-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": [{"id": "task-x", "state": "queued"}],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    residual = gate._bridge_state_postcheck(state_path)
+    assert any("queued" in item for item in residual)
+    assert gate._BRIDGE_STATE_SNAPSHOT_AFTER is not None
+    assert gate._BRIDGE_STATE_SNAPSHOT_AFTER["residual"] == residual
+
+
+def test_bridge_state_postcheck_keeps_separate_snapshot(tmp_path: Path) -> None:
+    """C-122 round-18 item 6: the post-run snapshot is stored separately from the
+    pre-run snapshot — one never overwrites the other, so the compact can certify
+    the isolation proof from BOTH sides of the run."""
+    clean = tmp_path / "before.json"
+    clean.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": [],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    dirty = tmp_path / "after.json"
+    dirty.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": [{"id": "task-x", "state": "queued"}],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    gate._BRIDGE_STATE_SNAPSHOT = None
+    gate._BRIDGE_STATE_SNAPSHOT_AFTER = None
+    try:
+        gate._bridge_state_lease_preflight(clean)
+        gate._bridge_state_postcheck(dirty)
+        assert gate._BRIDGE_STATE_SNAPSHOT is not None
+        assert gate._BRIDGE_STATE_SNAPSHOT["residual"] == []
+        assert gate._BRIDGE_STATE_SNAPSHOT_AFTER is not None
+        assert any("queued" in item for item in gate._BRIDGE_STATE_SNAPSHOT_AFTER["residual"])
+    finally:
+        gate._BRIDGE_STATE_SNAPSHOT = None
+        gate._BRIDGE_STATE_SNAPSHOT_AFTER = None
+
+
+def test_layer6_fails_when_postcheck_finds_residual_work(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_repo: Path,
+    tmp_path: Path,
+    staging_dir: Path,
+) -> None:
+    """C-122 round-18 item 6 integration: the pre-run bridge state is clean (the
+    preflight passes and the E2E runs), but the run leaves queued work behind —
+    the post-run postcheck then fails the layer closed."""
+    staging_dir.mkdir()
+    db_path = tmp_path / "live.db"
+    _make_jobs_db(db_path, [])
+    bridge_state_path = tmp_path / "bridge-state.json"
+
+    def fake_run(cmd: list[str], **kwargs: object) -> tuple[int, str]:
+        # Model a run that leaves a queued bridge task behind (orphaned work).
+        bridge_state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "tripchord-browser-bridge-state-v2",
+                    "saved_at": "2026-08-10T00:00:00+00:00",
+                    "tasks": [{"id": "orphan-1", "state": "queued"}],
+                    "reload_requests": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return 0, ""
+
+    # A clean pre-run state: the preflight must pass so the layer reaches the
+    # runner, then the postcheck (after fake_run) reads the mutated file.
+    bridge_state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": [],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(gate._BRIDGE_STATE_ENV, str(bridge_state_path))
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setenv("TRIPCHORD_ACK_MODEL_COST", "1")
+    monkeypatch.setattr(gate, "_run", fake_run)
+    monkeypatch.setattr(gate, "_runner_revision_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr(gate, "_runtime_provenance_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr(gate, "_extract_build_fingerprint", lambda *a, **k: None)
+    start = _expected_snapshot(clean_repo)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps({"run_status": "completed", "done_gate": _matching_done_gate()}),
+        encoding="utf-8",
+    )
+    result = gate.layer6_full_e2e(staging_dir, start, live_state_db=db_path)
+    assert result.passed is False
+    assert "postcheck" in result.detail
 
 
 def test_main_rejects_staging_symlink(
@@ -3537,8 +5714,23 @@ def _layer5_compact_fixture() -> dict[str, object]:
     certified scopes, exact coverage thresholds, all passed/fresh/authorized/
     read-only."""
     canary = _matching_canary()
+    cs = canary["companion_status"]
+    companions = [
+        {
+            "companion_id": comp["companion_id"],
+            "providers": comp["providers"],
+            "authorized_scope_keys": comp["authorized_scope_keys"],
+            "is_fresh": comp["is_fresh"],
+            "age_seconds": comp["age_seconds"],
+            "build_sha256": (comp.get("build_identity") or {}).get("build_sha256"),
+        }
+        for comp in cs["companions"]
+    ]
     return {
         "schema_version": "tripchord-done-gate-layer5-compact-v2",
+        "generated_at": "2026-08-10T00:00:00+00:00",
+        "passed": canary["passed"],
+        "bridge_token_present": canary["bridge_token_present"],
         "coverage": {
             "expected_scope_count": 6,
             "expected_scopes": sorted(gate._CERTIFIED_OTA_SCOPES),
@@ -3547,6 +5739,16 @@ def _layer5_compact_fixture() -> dict[str, object]:
             "missing": [],
         },
         "scopes": canary["scopes"],
+        "companion_status": {
+            "status": cs["status"],
+            "stale_after_seconds": cs["stale_after_seconds"],
+            "companions": companions,
+        },
+        "raw_evidence": {
+            "file": "live-canary-certified.json",
+            "committed": False,
+            "sha256": "a" * 64,
+        },
     }
 
 
@@ -3590,6 +5792,7 @@ def test_verify_layer5_compact_contract_rejects_non_certified_scope() -> None:
         "fresh": True,
         "authorized": True,
         "read_only": True,
+        "evidence": {"companion_id": "comp-1"},
     }
     with pytest.raises(gate.GateStateChangedError, match="six certified scopes"):
         gate._verify_layer5_compact_contract(
@@ -3598,31 +5801,73 @@ def test_verify_layer5_compact_contract_rejects_non_certified_scope() -> None:
 
 
 def _layer6_compact_fixture() -> dict[str, object]:
-    """A layer-6 compact that satisfies the strong C-118 blob contract: the
-    fifteen done-gate checks all passed plus the repo / runtime / Companion
-    identity and the event-injection / timeout / runner contracts."""
+    """A layer-6 compact that satisfies the strong C-118/C-122 blob contract:
+    the fifteen done-gate checks all passed, each carrying its structured
+    per-item evidence, plus the repo / runtime / Companion identity, the
+    candidate-set / scenario SHA bindings and the event-injection / timeout /
+    runner contracts."""
     done_gate = _matching_done_gate()
     done_gate["check_count"] = 15  # type: ignore[index]
     done_gate["passed_check_count"] = 15  # type: ignore[index]
     return {
         "schema_version": "tripchord-done-gate-layer6-compact-v2",
+        "run_status": "completed",
         "done_gate": done_gate,
         "repo_revision": {
-            "toplevel": "/repo",
             "branch": "main",
             "commit_sha": "a" * 40,
             "worktree_dirty": False,
         },
         "runtime_before_run": {
+            "model_provider": "test-provider",
+            "primary_model": "test-model",
             "runtime_provenance": {
-                "repo_toplevel": "/repo",
                 "commit_sha": "a" * 40,
-            }
+            },
         },
-        "companion_preflight": {"status": "ok", "companions": []},
-        "event_injection_contract": {"attempted": 0, "succeeded": 0},
-        "timeout_contract": {"window_seconds": 300},
-        "runner_contract": {"schema_version": "tripchord-live-v4-runner-v1"},
+        "companion_preflight": {
+            "status": "connected",
+            "stale_after_seconds": 45,
+            "companions": [
+                {
+                    "companion_id": "comp-1",
+                    "authorized_scope_keys": sorted(
+                        {
+                            "ctrip:flight",
+                            "ctrip:lodging",
+                            "qunar:flight",
+                            "qunar:lodging",
+                            "tongcheng:flight",
+                            "icom:transfer",
+                        }
+                    ),
+                }
+            ],
+        },
+        "api_payload_candidate_set_sha256": "a" * 64,
+        "scenario_sha256": "a" * 64,
+        "event_injection_contract": {
+            "mode": "synthetic_sold_out_fault_injection",
+            "source": "tripchord-done-gate-synthetic-fault",
+        },
+        "timeout_contract": {"server_execution_timeout_seconds": 3600},
+        "runner_contract": {"require_model_enhancement": True},
+        "bridge_state_lease_preflight": {
+            # A repo-relative identifier whose file does not exist in the real
+            # repo tree, so the contract's live-recompute check is skipped for
+            # the fixture (dedicated tests exercise recompute with their own
+            # file under a monkeypatched ROOT).
+            "file": ".runtime/done-gate-test-fixture-bridge-state.json",
+            "sha256": "a" * 64,
+            "residual": [],
+        },
+        # C-122 round-18 item 6: the POST-run lease binding is contract-required
+        # too — the run must leave no residual queued/claimed/reload behind.
+        "bridge_state_lease_postcheck": {
+            "file": ".runtime/done-gate-test-fixture-bridge-state.json",
+            "sha256": "a" * 64,
+            "residual": [],
+        },
     }
 
 
@@ -3630,7 +5875,9 @@ def test_verify_layer6_compact_contract_accepts_full_passing_set() -> None:
     """C-118 Gap 7 positive: the full fifteen-check layer-6 compact passes the
     blob read-back contract."""
     gate._verify_layer6_compact_contract(
-        "done-gate-layer6-compact.json", _layer6_compact_fixture()
+        "done-gate-layer6-compact.json",
+        _layer6_compact_fixture(),
+        tested_commit_sha="a" * 40,
     )
 
 
@@ -3641,7 +5888,9 @@ def test_verify_layer6_compact_contract_rejects_non_passing_check() -> None:
     compact["done_gate"]["checks"][0]["passed"] = False  # type: ignore[index]
     with pytest.raises(gate.GateStateChangedError, match="not passed"):
         gate._verify_layer6_compact_contract(
-            "done-gate-layer6-compact.json", compact
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
         )
 
 
@@ -3653,5 +5902,1058 @@ def test_verify_layer6_compact_contract_rejects_missing_identity() -> None:
     del compact["runner_contract"]
     with pytest.raises(gate.GateStateChangedError, match="runner_contract"):
         gate._verify_layer6_compact_contract(
-            "done-gate-layer6-compact.json", compact
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
         )
+
+
+def test_verify_layer6_compact_contract_rejects_missing_bridge_binding() -> None:
+    """C-122 Fix 2 counter-example: a compact that drops the bridge-state
+    lease-preflight binding (the checked file path + SHA256) fails closed even
+    when the fifteen checks all pass — the isolation proof must be in the trail."""
+    compact = _layer6_compact_fixture()
+    del compact["bridge_state_lease_preflight"]
+    with pytest.raises(
+        gate.GateStateChangedError, match="bridge_state_lease_preflight"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_missing_postcheck_binding() -> None:
+    """C-122 round-18 item 6 counter-example: a compact that drops the POST-run
+    bridge-state lease binding fails closed even when the pre-run binding and
+    all fifteen checks pass — the run must prove it consumed its lease."""
+    compact = _layer6_compact_fixture()
+    del compact["bridge_state_lease_postcheck"]
+    with pytest.raises(
+        gate.GateStateChangedError, match="bridge_state_lease_postcheck"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_postcheck_residual() -> None:
+    """C-122 round-18 item 6 counter-example: a post-run bridge-state binding
+    that records residual queued/claimed work fails closed — the E2E must not
+    leave in-flight bridge work behind."""
+    compact = _layer6_compact_fixture()
+    compact["bridge_state_lease_postcheck"] = {
+        "file": ".runtime/done-gate-test-fixture-bridge-state.json",
+        "sha256": "a" * 64,
+        "residual": ["bridge task task-x state=queued is queued/claimed"],
+    }
+    with pytest.raises(
+        gate.GateStateChangedError, match="residual is not an empty list"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_empty_per_check_evidence() -> None:
+    """C-122 Fix 3 counter-example: a compact that reduces a done-gate check to a
+    bare verdict (empty per-item evidence) must fail the phase closed."""
+    compact = _layer6_compact_fixture()
+    compact["done_gate"]["checks"][1]["evidence"] = {}  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError, match="no per-item structured evidence"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_missing_binding_field() -> None:
+    """C-122 Fix 3 counter-example: a check whose structured evidence drops a
+    required recomputable binding field fails closed."""
+    compact = _layer6_compact_fixture()
+    del compact["done_gate"]["checks"][0]["evidence"]["candidate_set_sha256"]  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError, match="missing required binding field"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_wrong_candidate_sha() -> None:
+    """C-122 Fix 3 counter-example: a malformed (non-64-hex) candidate-set SHA in
+    the compact fails closed — the binding must be well-formed to be recomputable."""
+    compact = _layer6_compact_fixture()
+    compact["api_payload_candidate_set_sha256"] = "not-a-sha"  # type: ignore[assignment]
+    with pytest.raises(
+        gate.GateStateChangedError, match="not a valid sha256"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_mismatched_candidate_sha() -> None:
+    """C-122 Fix 3 counter-example: the prefrozen candidate-set binding in the
+    compact disagreeing with the top-level api_payload_candidate_set_sha256 fails
+    closed — a wrong SHA can never certify the frozen candidate set."""
+    compact = _layer6_compact_fixture()
+    compact["done_gate"]["checks"][0]["evidence"]["candidate_set_sha256"] = "b" * 64  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError, match="does not match api_payload"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_bad_commit_sha() -> None:
+    """C-122 Fix 3 counter-example: a compact whose repo/runtime git SHA is not a
+    valid 40-hex commit fails closed."""
+    compact = _layer6_compact_fixture()
+    compact["repo_revision"]["commit_sha"] = "deadbeef"  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError, match="40-hex git SHA"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_not_completed() -> None:
+    """C-122 Fix 3 counter-example: a compact that does not claim run_status
+    completed cannot certify a passing gate."""
+    compact = _layer6_compact_fixture()
+    compact["run_status"] = "done_gate_failed"  # type: ignore[assignment]
+    with pytest.raises(
+        gate.GateStateChangedError, match="run_status"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_bad_companion_preflight() -> None:
+    """C-122 Fix 3 counter-example: a compact whose Companion preflight lacks the
+    freshness window or any companion identity fails closed."""
+    compact = _layer6_compact_fixture()
+    compact["companion_preflight"] = {"status": "ok", "companions": []}  # type: ignore[assignment]
+    with pytest.raises(
+        gate.GateStateChangedError, match="stale_after_seconds"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_bad_event_contract() -> None:
+    """C-122 Fix 3 counter-example: a compact whose event-injection contract is
+    reduced to an empty object fails closed."""
+    compact = _layer6_compact_fixture()
+    compact["event_injection_contract"] = {}  # type: ignore[assignment]
+    with pytest.raises(
+        gate.GateStateChangedError, match="event_injection_contract lacks a mode"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_schema_version_mismatch() -> None:
+    """C-122 acceptance counter-example: a compact claiming an older or unknown
+    schema version must fail closed — the producer and validator must share the
+    same schema version, or the committed evidence cannot be trusted."""
+    compact = _layer6_compact_fixture()
+    compact["schema_version"] = "tripchord-done-gate-layer6-compact-v1"  # type: ignore[assignment]
+    with pytest.raises(gate.GateStateChangedError, match="schema_version"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_repo_runtime_sha_mismatch() -> None:
+    """C-122 acceptance counter-example: repo_revision.commit_sha disagreeing
+    with runtime_provenance.commit_sha fails closed — the runtime identity must
+    name the same revision the compact claims to have tested."""
+    compact = _layer6_compact_fixture()
+    compact["runtime_before_run"]["runtime_provenance"]["commit_sha"] = "b" * 40  # type: ignore[index]
+    with pytest.raises(gate.GateStateChangedError, match="repo_revision"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_repo_tested_sha_mismatch() -> None:
+    """C-122 acceptance counter-example: repo_revision.commit_sha disagreeing
+    with the run's tested_commit_sha (S) fails closed — the compact must bind the
+    exact code that was exercised."""
+    compact = _layer6_compact_fixture()
+    compact["repo_revision"]["commit_sha"] = "b" * 40  # type: ignore[index]
+    compact["runtime_before_run"]["runtime_provenance"]["commit_sha"] = "b" * 40  # type: ignore[index]
+    with pytest.raises(gate.GateStateChangedError, match="!= tested_commit_sha"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_missing_candidate_sha() -> None:
+    """C-122 acceptance counter-example: a compact that drops the candidate-set
+    SHA binding fails closed — a missing candidate SHA voids the frozen-plan
+    binding."""
+    compact = _layer6_compact_fixture()
+    del compact["api_payload_candidate_set_sha256"]  # type: ignore[misc]
+    with pytest.raises(
+        gate.GateStateChangedError, match="missing or not a valid sha256"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_missing_scenario_sha() -> None:
+    """C-122 acceptance counter-example: a compact that drops the scenario SHA
+    binding fails closed."""
+    compact = _layer6_compact_fixture()
+    del compact["scenario_sha256"]  # type: ignore[misc]
+    with pytest.raises(gate.GateStateChangedError, match="scenario_sha256"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+# --- semantic counter-examples (field existence is not enough) ----------------
+
+
+def _layer6_compact_with_evidence_mutated(mutate: Any) -> dict[str, object]:
+    """A passing layer-6 compact whose per-check evidence is mutated by
+    ``mutate`` — every semantic counter-example keeps repo==runtime==S and all
+    other checks intact, so the ONLY failure is the mutated semantic field."""
+    compact = _layer6_compact_fixture()
+    mutate(compact["done_gate"]["checks"])  # type: ignore[index]
+    return compact
+
+
+def test_verify_layer6_compact_contract_rejects_graph_chain_not_ok() -> None:
+    """C-122 acceptance counter-example: a passing planner-verifier-repair check
+    whose evidence records graph_chain_ok=false must fail closed."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "planner_verifier_repair_orchestrator":
+                check["evidence"]["graph_chain_ok"] = False  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="graph_chain_ok"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_budget_mismatch() -> None:
+    """C-122 acceptance counter-example: computed budget differing from the
+    declared budget must fail closed."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "exact_budget_and_selected_evidence":
+                check["evidence"]["computed_total_cents"] = 2000  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="computed_total_cents"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_dynamic_replan_not_passed() -> None:
+    """C-122 acceptance counter-example: a dynamic replan sub-item recorded as
+    not-passed inside a passing master check must fail closed."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "event_injection_repair_reverify_master":
+                check["evidence"]["dynamic_replan"]["passed"] = False  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="dynamic_replan"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_exact_provider_below_threshold() -> None:
+    """C-122 red-line counter-example: exact_provider_count below the dual-platform
+    exact-quote threshold must fail closed — the evidence can never certify a
+    passing gate."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "flight_search_outcome_contract":
+                check["evidence"]["exact_provider_count"] = 0  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="exact_provider_count"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_pending_or_evil_provider() -> None:
+    """C-122 acceptance counter-example: any provider outcome state that is not a
+    terminal flight-search state (pending, evil, terminal, …) must fail closed."""
+    for bad_state in ("pending", "evil", "terminal"):
+
+        def mutate(checks: Any, state: str = bad_state) -> None:
+            for check in checks:
+                if check["name"] == "flight_search_outcome_contract":
+                    check["evidence"]["provider_outcome_states"]["ctrip"] = state  # type: ignore[index]
+
+        compact = _layer6_compact_with_evidence_mutated(mutate)
+        with pytest.raises(gate.GateStateChangedError, match="outcome state"):
+            gate._verify_layer6_compact_contract(
+                "done-gate-layer6-compact.json",
+                compact,
+                tested_commit_sha="a" * 40,
+            )
+
+
+def test_verify_layer6_compact_contract_rejects_zero_browser_tasks() -> None:
+    """C-122 round-18 gate-2 counter-example: a v4 source graph with a non-positive
+    browser-task-per-pair count cannot prove the fixed per-pair query plan and
+    fails closed."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                check["evidence"]["expected_browser_tasks_per_pair"] = 0  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError, match="not a positive integer"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_duplicate_browser_source_ids() -> None:
+    """C-122 round-18 gate-2 counter-example: duplicated expected browser Source
+    ids are a forged plan and fail closed."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                check["evidence"]["expected_browser_source_ids"] = [  # type: ignore[index]
+                    "source-ctrip-flight",
+                    "source-ctrip-flight",
+                ]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError, match="not unique"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_wrong_stage_counts() -> None:
+    """C-122 round-18 gate-2 counter-example: a stage contract that does not seal
+    exactly three explorations and two publication refreshes fails closed — the
+    fixed stage contract is a semantic invariant, not a record count."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "stage_aware_exploration_publication_contract":
+                check["evidence"]["exploration_count"] = 2  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError, match="seal exactly 3 explorations"
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_source_snapshot_mismatch() -> None:
+    """C-122 round-18 gate-2 counter-example: snapshot_count differing from
+    source_task_count breaks the evidence chain and fails closed."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "real_v4_browser_source_evidence":
+                check["evidence"]["snapshot_count"] = 4  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="snapshot_count"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_insufficient_overlap_intervals() -> None:
+    """C-122 round-18 gate-2 counter-example: an overlap proof with fewer than
+    three time intervals cannot prove real concurrency and fails closed."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "observed_cross_platform_overlap":
+                check["evidence"]["interval_count"] = 2  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="3-provider concurrent"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_single_provider_overlap() -> None:
+    """C-122 round-18 gate-2 counter-example: an overlap proof whose maximum
+    distinct concurrent providers is not exactly three (a single-provider overlap
+    masquerading as cross-platform) fails closed."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "observed_cross_platform_overlap":
+                check["evidence"]["max_overlapping_providers"] = 1  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="max_providers"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_partial_platform_set() -> None:
+    """C-122 round-18 gate-2 counter-example: strict coverage naming a partial or
+    foreign provider set (missing a platform, or adding an unknown one) fails
+    closed — the completion receipt must name exactly the fixed three OTA
+    platforms."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "strict_selected_plan_platform_coverage":
+                check["evidence"]["providers"] = ["ctrip", "qunar"]  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="fixed three-OTA"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_icom_coverage_not_passed() -> None:
+    """C-122 round-18 gate-2 counter-example: icom exploration coverage recorded
+    as ``{"passed": false}`` cannot back a passing check and fails closed."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "icom_exploration_and_publication_evidence":
+                check["evidence"]["exploration_full_coverage"]["passed"] = False  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="not passed"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_empty_publication_targets() -> None:
+    """C-122 round-18 gate-2 counter-example: an icom check with no publication
+    target task ids cannot bind the publication refresh and fails closed."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "icom_exploration_and_publication_evidence":
+                check["evidence"]["publication_target_task_ids"] = []  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(gate.GateStateChangedError, match="is empty"):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+# --- compact -> E -> P blob readback counter-examples -------------------------
+
+
+def _commit_compact_to_evidence_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_repo: Path,
+    staging_dir: Path,
+    compact_factory: Any,
+) -> str:
+    """Commit a crafted layer-6 compact blob into evidence commit E (HEAD) with a
+    manifest binding it as committed, then re-read it exactly as the post-commit
+    gate does.  ``compact_factory(tested_sha)`` builds the compact — a semantic
+    counterexample keeps repo==runtime==S and fails ONLY on its violation.
+    Returns E's sha."""
+    _patch_root(monkeypatch, clean_repo)
+    _populate_required_evidence(staging_dir)
+    tested_sha = _head(clean_repo)
+    compact = compact_factory(tested_sha)
+    payload = json.dumps(compact, ensure_ascii=False, sort_keys=True)
+    staged_compact = staging_dir / gate._COMPACT_E2E_STAGED_NAME
+    staged_compact.write_text(payload, encoding="utf-8")
+    manifest = {
+        "schema_version": gate._MANIFEST_SCHEMA,
+        "tested_commit_sha": tested_sha,
+        "run_id": "test-run",
+        "evidence_commit": tested_sha,
+        "generated_at": "2026-08-10T00:00:00+00:00",
+        "branch": "main",
+        "files": gate._manifest_files(staging_dir),
+        "layer_verdicts": {"5_real_canary": {}, "6_full_e2e": {}},
+    }
+    results = clean_repo / "benchmarks" / "results"
+    results.mkdir(parents=True, exist_ok=True)
+    for staged_name, tracked_rel in gate._EVIDENCE_TRACKED_PATHS:
+        staged = staging_dir / staged_name
+        if staged.is_file():
+            (results / Path(tracked_rel).name).write_bytes(staged.read_bytes())
+    (results / Path(gate._MANIFEST_REL).name).write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    gate._git("add", "--", str(results), check=True)
+    gate._git("commit", "-q", "-m", "crafted compact evidence", check=True)
+    gate._verify_evidence_contract(
+        _head(clean_repo), staging_dir, tested_commit_sha=tested_sha, run_id="test-run"
+    )
+    return _head(clean_repo)
+
+
+def test_blob_readback_rejects_semantic_violation(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 acceptance blob readback counter-example: the compact committed in E,
+    when re-read from the blob at the phase-closed gate, rejects a check whose
+    evidence is semantically inconsistent with its passing verdict."""
+
+    def build(tested_sha: str) -> dict[str, object]:
+        compact = _layer6_compact_fixture()
+        compact["repo_revision"]["commit_sha"] = tested_sha  # type: ignore[index]
+        compact["runtime_before_run"]["runtime_provenance"]["commit_sha"] = tested_sha  # type: ignore[index]
+        for check in compact["done_gate"]["checks"]:  # type: ignore[index]
+            if check["name"] == "exact_budget_and_selected_evidence":
+                check["evidence"]["computed_total_cents"] = 1  # type: ignore[index]
+        return compact
+
+    with pytest.raises(gate.GateStateChangedError, match="computed_total_cents"):
+        _commit_compact_to_evidence_commit(
+            monkeypatch, clean_repo, staging_dir, build
+        )
+
+
+def test_blob_readback_rejects_sha_mismatch(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 acceptance blob readback counter-example: the compact committed in E
+    whose repo revision names a different commit than the run's tested SHA fails
+    closed when re-read from the blob."""
+
+    def build(tested_sha: str) -> dict[str, object]:
+        compact = _layer6_compact_fixture()
+        compact["repo_revision"]["commit_sha"] = "b" * 40  # type: ignore[index]
+        compact["runtime_before_run"]["runtime_provenance"]["commit_sha"] = "b" * 40  # type: ignore[index]
+        return compact
+
+    with pytest.raises(gate.GateStateChangedError, match="!= tested_commit_sha"):
+        _commit_compact_to_evidence_commit(
+            monkeypatch, clean_repo, staging_dir, build
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_empty_scope_evidence() -> None:
+    """C-122 Fix 3 counter-example: a layer-5 compact whose scope is reduced to a
+    bare verdict (no per-scope evidence binding) fails closed."""
+    compact = _layer5_compact_fixture()
+    scopes = compact["scopes"]  # type: ignore[assignment]
+    scopes[0] = {  # type: ignore[index]
+        "scope": "ctrip:flight",
+        "kind": "companion_heartbeat",
+        "provider": "ctrip",
+        "passed": True,
+        "fresh": True,
+        "authorized": True,
+        "read_only": True,
+        "evidence": {},
+    }
+    with pytest.raises(
+        gate.GateStateChangedError, match="no per-scope evidence binding"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_valid_six_plus_none() -> None:
+    """C-122 Fix 6 counter-example: the six valid scopes plus one extra ``None``
+    entry (input array length 7) must fail closed — the array is exactly six."""
+    compact = _layer5_compact_fixture()
+    compact["coverage"] = {  # type: ignore[assignment]
+        "expected_scope_count": 6,
+        "expected_scopes": sorted(gate._CERTIFIED_OTA_SCOPES),
+        "observed_scope_count": 6,
+        "passed_scope_count": 6,
+        "missing": [],
+    }
+    compact["scopes"] = compact["scopes"] + [None]  # type: ignore[list-item, operator]
+    with pytest.raises(gate.GateStateChangedError, match="scope list count != 6"):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_duplicate_scope() -> None:
+    """C-122 Fix 6 counter-example: a scope name repeated in the input array
+    fails closed — six entries must be six distinct scopes."""
+    compact = _layer5_compact_fixture()
+    scopes = compact["scopes"]  # type: ignore[assignment]
+    duplicate = dict(scopes[0])  # type: ignore[arg-type]
+    scopes[1] = duplicate  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError, match="scope names must be unique"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_malformed_entry() -> None:
+    """C-122 Fix 6 counter-example: a malformed (non-object) scope entry fails
+    closed instead of being skipped."""
+    compact = _layer5_compact_fixture()
+    compact["scopes"][0] = "ctrip:flight"  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError, match="malformed scope entry"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_missing_scope_name() -> None:
+    """C-122 Fix 6 counter-example: an object with no scope name is malformed
+    and fails closed."""
+    compact = _layer5_compact_fixture()
+    entry = dict(compact["scopes"][0])  # type: ignore[arg-type]
+    del entry["scope"]  # type: ignore[index]
+    compact["scopes"][0] = entry  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError, match="missing or invalid scope name"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_browser_scope_without_companion() -> None:
+    """C-122 Fix 6 counter-example: a browser scope whose evidence carries no
+    Companion identity (per-item authentication) fails closed."""
+    compact = _layer5_compact_fixture()
+    scopes = compact["scopes"]  # type: ignore[assignment]
+    scopes[0] = {  # type: ignore[index]
+        "scope": "ctrip:flight",
+        "kind": "companion_heartbeat",
+        "provider": "ctrip",
+        "passed": True,
+        "fresh": True,
+        "authorized": True,
+        "read_only": True,
+        "evidence": {"authorized_scope_keys": ["ctrip:flight"]},
+    }
+    with pytest.raises(
+        gate.GateStateChangedError, match="no Companion identity"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_unauthorized_browser_scope() -> None:
+    """C-122 Fix 6 counter-example: a browser scope whose Companion does not
+    authorize this exact scope key (per-item authentication) fails closed."""
+    compact = _layer5_compact_fixture()
+    scopes = compact["scopes"]  # type: ignore[assignment]
+    scopes[0] = {  # type: ignore[index]
+        "scope": "ctrip:flight",
+        "kind": "companion_heartbeat",
+        "provider": "ctrip",
+        "passed": True,
+        "fresh": True,
+        "authorized": True,
+        "read_only": True,
+        "evidence": {
+            "companion_id": "comp-1",
+            "authorized_scope_keys": ["qunar:flight"],
+        },
+    }
+    with pytest.raises(
+        gate.GateStateChangedError, match="not authorized by its Companion evidence"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_icom_without_query_sample() -> None:
+    """C-122 Fix 6 counter-example: the icom scope whose evidence carries no
+    read-only query sample (per-item authentication) fails closed."""
+    compact = _layer5_compact_fixture()
+    scopes = compact["scopes"]  # type: ignore[assignment]
+    scopes[5] = {  # type: ignore[index]
+        "scope": "icom:transfer",
+        "kind": "icom_public_api",
+        "provider": "icom",
+        "passed": True,
+        "fresh": True,
+        "authorized": True,
+        "read_only": True,
+        "evidence": {"options": 3, "source_url_count": 3},
+    }
+    with pytest.raises(
+        gate.GateStateChangedError, match="sample must carry service_name"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_scope_without_kind() -> None:
+    """C-122 round-18 gate-1 counter-example: a scope entry with no canary
+    ``kind`` (forged/missing canary origin) fails closed — the kind must be the
+    one the certified canary actually produced."""
+    compact = _layer5_compact_fixture()
+    entry = dict(compact["scopes"][0])  # type: ignore[arg-type]
+    del entry["kind"]  # type: ignore[index]
+    compact["scopes"][0] = entry  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError, match="carries no canary kind"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_scope_without_provider() -> None:
+    """C-122 round-18 gate-1 counter-example: a scope entry with no ``provider``
+    (missing canary kind origin) fails closed — every scope must name the real
+    platform that produced it."""
+    compact = _layer5_compact_fixture()
+    entry = dict(compact["scopes"][0])  # type: ignore[arg-type]
+    del entry["provider"]  # type: ignore[index]
+    compact["scopes"][0] = entry  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError, match="provider None != expected 'ctrip'"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_wrong_provider() -> None:
+    """C-122 round-18 gate-1 counter-example: a scope whose provider does not
+    match its platform prefix fails closed — a qunar scope cannot claim it came
+    from ctrip."""
+    compact = _layer5_compact_fixture()
+    entry = dict(compact["scopes"][0])  # type: ignore[arg-type]
+    entry["provider"] = "qunar"  # type: ignore[index]
+    compact["scopes"][0] = entry  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError, match="provider 'qunar' != expected 'ctrip'"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_icom_zero_options() -> None:
+    """C-122 round-18 gate-1 counter-example: a passing icom scope whose evidence
+    carries no positive option count (0 / negative / non-int) fails closed."""
+    compact = _layer5_compact_fixture()
+    scopes = compact["scopes"]  # type: ignore[assignment]
+    scopes[5] = {  # type: ignore[index]
+        "scope": "icom:transfer",
+        "kind": "icom_public_api",
+        "provider": "icom",
+        "passed": True,
+        "fresh": True,
+        "authorized": True,
+        "read_only": True,
+        "evidence": {"options": 0, "sample": _per_scope_canary_evidence("icom:transfer")["sample"]},
+    }
+    with pytest.raises(
+        gate.GateStateChangedError, match="no positive option count"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_icom_sample_missing_quote() -> None:
+    """C-122 round-18 gate-1 counter-example: an icom sample reduced to a
+    service name alone (no price / currency / departure time) is not a real
+    quote and fails closed."""
+    compact = _layer5_compact_fixture()
+    scopes = compact["scopes"]  # type: ignore[assignment]
+    scopes[5] = {  # type: ignore[index]
+        "scope": "icom:transfer",
+        "kind": "icom_public_api",
+        "provider": "icom",
+        "passed": True,
+        "fresh": True,
+        "authorized": True,
+        "read_only": True,
+        "evidence": {
+            "options": 3,
+            "sample": {"service_name": "speed-boat"},
+        },
+    }
+    with pytest.raises(
+        gate.GateStateChangedError, match="sample must carry service_name"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_browser_scope_foreign_companion() -> None:
+    """C-122 round-18 gate-1 counter-example: a browser scope bound to a
+    Companion the compact's own companion_status never lists fails closed — the
+    scope may not name a fresh Companion that is not connected."""
+    compact = _layer5_compact_fixture()
+    scopes = compact["scopes"]  # type: ignore[assignment]
+    scopes[0] = {  # type: ignore[index]
+        "scope": "ctrip:flight",
+        "kind": "companion_heartbeat",
+        "provider": "ctrip",
+        "passed": True,
+        "fresh": True,
+        "authorized": True,
+        "read_only": True,
+        "evidence": {
+            "companion_id": "foreign-comp",
+            "authorized_scope_keys": ["ctrip:flight"],
+            "adapter_version": "test-adapter",
+        },
+    }
+    with pytest.raises(
+        gate.GateStateChangedError, match="not in the connected companion_status"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_browser_scope_no_receipt() -> None:
+    """C-122 round-18 gate-1 counter-example: a browser scope whose Companion
+    evidence names an identity but carries no heartbeat receipt
+    (adapter_version / contract_version / runtime_instance_id) fails closed."""
+    compact = _layer5_compact_fixture()
+    scopes = compact["scopes"]  # type: ignore[assignment]
+    scopes[0] = {  # type: ignore[index]
+        "scope": "ctrip:flight",
+        "kind": "companion_heartbeat",
+        "provider": "ctrip",
+        "passed": True,
+        "fresh": True,
+        "authorized": True,
+        "read_only": True,
+        "evidence": {
+            "companion_id": "comp-1",
+            "authorized_scope_keys": ["ctrip:flight"],
+        },
+    }
+    with pytest.raises(
+        gate.GateStateChangedError, match="no heartbeat receipt"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_build_sha_not_strict_64hex() -> None:
+    """C-122 round-18 gate-1 counter-example: a Companion build fingerprint that
+    is not an exact 64-hex sha256 (32-hex, 48-hex, uppercase hex all rejected)
+    fails closed — the build binding must be the precise digest."""
+    compact = _layer5_compact_fixture()
+    companion = compact["companion_status"]["companions"][0]  # type: ignore[index]
+    companion["build_sha256"] = "a" * 32  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError, match="64-hex build_sha256"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_desensitize_check_value_redacts_tokens_keeps_bindings() -> None:
+    """C-122 acceptance: the schema-driven desensitizer redacts URL-bearing and
+    token-like strings AND any 64-hex in a non-hash position, keeps explicit
+    content-addressable hash bindings, and drops unknown nested keys — never a
+    recursive copy of the raw evidence dict."""
+    schema = {
+        "count": gate._EVIDENCE_SCALAR,
+        "provider": gate._EVIDENCE_SCALAR,
+        "candidate_set_sha256": gate._EVIDENCE_HASH,
+        "source_url": gate._EVIDENCE_SCALAR,
+        "bearer_token": gate._EVIDENCE_SCALAR,
+        "unknown_field": gate._EVIDENCE_SCALAR,
+        "nested": {
+            "pair_id": gate._EVIDENCE_SCALAR,
+            "raw": gate._EVIDENCE_SCALAR,
+            "secret_hex": gate._EVIDENCE_SCALAR,
+        },
+    }
+    evidence = {
+        "count": 3,
+        "provider": "ctrip",
+        "candidate_set_sha256": "a" * 64,
+        "source_url": "https://flights.ctrip.com/booking?dep=BJS&arr=SHA",
+        "bearer_token": (
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+            "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+        ),
+        "sneaky_top_level": {"recursive": "copy"},
+        "nested": {
+            "pair_id": "pair-1",
+            "raw": "http://127.0.0.1:8000/api/v1/x",
+            "secret_hex": "c" * 64,
+            "sneaky": {"also": "dropped"},
+        },
+    }
+    redacted = gate._desensitize_check_value(evidence, schema)
+    assert redacted["count"] == 3
+    assert redacted["provider"] == "ctrip"
+    assert redacted["candidate_set_sha256"] == "a" * 64
+    assert redacted["nested"]["pair_id"] == "pair-1"
+    assert redacted["source_url"].startswith("url#")
+    assert redacted["bearer_token"].startswith("secret#")
+    assert redacted["nested"]["raw"].startswith("url#")
+    assert redacted["nested"]["secret_hex"].startswith("secret#")
+    # Unknown keys are never recursively copied into the compact.
+    assert "sneaky_top_level" not in redacted
+    assert "sneaky" not in redacted["nested"]
+
+
+def test_desensitize_check_value_hex_only_survives_hash_position() -> None:
+    """C-122 acceptance: a 64-hex string is only a safe content-addressable
+    binding inside an explicit ``_EVIDENCE_HASH`` field; in an arbitrary scalar
+    position it is redacted as a token-shaped secret."""
+    hash_schema = {"candidate_set_sha256": gate._EVIDENCE_HASH}
+    scalar_schema = {"some_token": gate._EVIDENCE_SCALAR}
+    kept = gate._desensitize_check_value(
+        {"candidate_set_sha256": "a" * 64}, hash_schema
+    )
+    assert kept["candidate_set_sha256"] == "a" * 64
+    redacted = gate._desensitize_check_value({"some_token": "a" * 64}, scalar_schema)
+    assert redacted["some_token"].startswith("secret#")
+
+
+def test_desensitized_check_evidence_injects_candidate_sha() -> None:
+    """C-122 Fix 3: the compact builder injects the recomputable candidate-set
+    SHA binding for the prefrozen-candidate check from the report top-level."""
+    candidate_sha = "a" * 64
+    raw_check = {
+        "name": "prefrozen_stay_plan_candidate_set",
+        "passed": True,
+        "summary": "ok",
+        "evidence_refs": [f"sha256:{candidate_sha}"],
+    }
+    payload = {"api_payload_candidate_set_sha256": candidate_sha}
+    evidence = gate._desensitized_check_evidence(raw_check, payload)
+    assert evidence["candidate_set_sha256"] == candidate_sha
+    assert evidence["evidence_refs"] == [f"sha256:{candidate_sha}"]
+
+
+def test_desensitized_check_evidence_never_empty() -> None:
+    """C-122 Fix 3: a check with neither evidence nor refs still carries a
+    non-empty structural item so the committed trail is never a bare verdict."""
+    evidence = gate._desensitized_check_evidence(
+        {"name": "v4_source_graph", "passed": True, "summary": "ok"}, {}
+    )
+    assert isinstance(evidence, dict)
+    assert evidence
+
+
+def test_compact_live_e2e_preserves_per_check_evidence(tmp_path: Path) -> None:
+    """C-122 Fix 3 end-to-end: the layer-6 compact builder preserves the
+    desensitized per-check structured evidence and injects the candidate-set SHA
+    binding, so the compact is never a bare 15-boolean verdict list."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "live-done-gate-v4.json").write_text(
+        json.dumps(_realistic_e2e_evidence()), encoding="utf-8"
+    )
+    compact = gate._compact_live_e2e(staging)
+    assert compact is not None
+    assert compact["done_gate"]["check_count"] == 15
+    checks_by_name = {
+        check["name"]: check for check in compact["done_gate"]["checks"]
+    }
+    for check in compact["done_gate"]["checks"]:
+        assert isinstance(check.get("evidence"), dict) and check["evidence"]
+    prefrozen = checks_by_name["prefrozen_stay_plan_candidate_set"]
+    assert prefrozen["evidence"]["candidate_set_sha256"] == "a" * 64
+    strict = checks_by_name["strict_selected_plan_platform_coverage"]
+    assert strict["evidence"]["providers"] == ["ctrip", "qunar", "tongcheng"]
+    assert compact["companion_preflight"]["stale_after_seconds"] == 45

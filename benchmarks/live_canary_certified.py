@@ -316,10 +316,21 @@ async def evaluate(
 def _dump(report: dict[str, Any], output: Path) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
+    # Seal 0600 from birth (no write-then-chmod window) and fsync before the
+    # atomic rename, so the raw canary evidence is never world/group-readable
+    # and never observed partially written (C-122 Fix 5).
+    descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        # fchmod pins the exact mode on the fd so a restrictive umask (e.g.
+        # 0777) cannot produce a 0000 file the owner cannot read (C-122 round-18).
+        os.fchmod(descriptor, 0o600)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, output)
     return output
 

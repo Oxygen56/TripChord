@@ -23,7 +23,11 @@ from tripchord.providers.icom_transfer import (
     to_package_transfer_option,
 )
 
-TRAVEL_DATE = date(2026, 8, 10)
+# Relative to today: a schedule 30 days out is always in the future, so the
+# departure has never passed when the test runs (C-122 round-18 date-bomb fix —
+# the old hardcoded 2026-08-10 became "already departed" the moment that date
+# arrived, silently nulling every to_package_transfer_option conversion).
+TRAVEL_DATE = date.today() + timedelta(days=30)
 
 
 def _meta(message: str = "Success") -> dict[str, object]:
@@ -196,8 +200,8 @@ async def test_success_normalizes_official_public_transfer_with_field_evidence()
     assert option.operator == "iCom Tours"
     assert option.vessel_name == "iCom Brown"
     assert option.route == "Airport -> Maafushi"
-    assert option.departure_at.isoformat() == "2026-08-10T07:30:00+05:00"
-    assert option.arrival_at.isoformat() == "2026-08-10T08:15:00+05:00"
+    assert option.departure_at.isoformat() == f"{TRAVEL_DATE.isoformat()}T07:30:00+05:00"
+    assert option.arrival_at.isoformat() == f"{TRAVEL_DATE.isoformat()}T08:15:00+05:00"
     assert option.departure_at.utcoffset() == timedelta(hours=5)
     assert option.capacity == 45
     assert option.remaining_capacity == 45
@@ -208,7 +212,9 @@ async def test_success_normalizes_official_public_transfer_with_field_evidence()
     assert option.fare.currency == "USD"
     assert option.fare.basis == "per_person"
     assert option.fare.taxes_included is None
-    assert option.source_url.endswith("/api/v1/public/trips/schedules?date=2026-08-10")
+    assert option.source_url.endswith(
+        f"/api/v1/public/trips/schedules?date={TRAVEL_DATE.isoformat()}"
+    )
     assert option.captured_at.utcoffset() == timedelta(0)
     assert option.currency_policy_evidence is not None
     assert "displayed and charged" in option.currency_policy_evidence.statement

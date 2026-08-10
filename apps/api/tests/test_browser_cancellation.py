@@ -509,7 +509,9 @@ async def _assert_cancellation_converged(bridge: BrowserTaskBridge) -> None:
     assert await bridge.claim("late-companion", limit=6) == ()
 
 
-async def _wait_submissions(bridge: _TrackingBridge, expected: int, *, timeout: float = 5.0) -> None:
+async def _wait_submissions(
+    bridge: _TrackingBridge, expected: int, *, timeout: float = 5.0
+) -> None:
     deadline = asyncio.get_event_loop().time() + timeout
     while len(bridge.submitted_ids) < expected:
         remaining = deadline - asyncio.get_event_loop().time()

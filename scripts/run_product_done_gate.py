@@ -29,6 +29,7 @@ Layer reference (contract section 六 v1.0):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -40,10 +41,11 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from tripchord.runtime_provenance import local_expected_provenance, provenance_mismatches
@@ -119,6 +121,11 @@ class GateReport:
     tested_commit_sha: str | None
     run_id: str = ""
     evidence_commit: str | None = None
+    # Side-channel publish ref (C-122 P0 / 2026-08-10 11:00): consumers verify
+    # ``P^=E``, ``E^=S`` and this report's bindings through
+    # ``refs/tripchord/done-gate/<run_id>``.  The evidence commit is never the
+    # product branch HEAD.
+    gate_ref: str | None = None
     toplevel: str | None = None
     branch: str | None = None
     worktree_dirty: bool = False
@@ -148,6 +155,7 @@ def _git(
     check: bool = False,
     binary: bool = False,
     env_extra: dict[str, str] | None = None,
+    input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     # ``ROOT`` is resolved at call time (not bound as a default) so tests and
     # embedders can point the gate at a different repository via monkeypatch.
@@ -157,18 +165,23 @@ def _git(
     # ``env_extra`` injects variables (e.g. a controlled temp GIT_INDEX_FILE)
     # *after* ``_git_safe_env()`` drops caller-supplied GIT_* redirects: the
     # gate alone decides where the evidence index lives, never the environment.
+    # ``input_bytes`` feeds the EXACT scanned bytes to the child's stdin (e.g.
+    # ``git hash-object -w --stdin``) — binary mode is forced so the bytes are
+    # never decoded/encoded through the locale (C-122 round-18 gate-1).
     cwd = cwd or ROOT
     env = _git_safe_env()
     if env_extra:
         env = {**env, **env_extra}
+    force_binary = input_bytes is not None
     try:
         result = subprocess.run(
             ["git", "-C", str(cwd), *args],
             env=env,
             capture_output=True,
-            text=not binary,
+            text=not binary and not force_binary,
             timeout=timeout,
             check=False,
+            input=input_bytes,
         )
     except (subprocess.SubprocessError, FileNotFoundError) as exc:
         raise GateStateChangedError(f"git is unavailable or timed out: {exc}") from exc
@@ -313,6 +326,23 @@ def _run(
         return 124, f"timed out after {timeout}s"
     except FileNotFoundError:
         return 127, "command not found"
+
+
+# The six Done-Gate layer names, in order (C-122 round-18 gate-4: a passing P
+# report must carry EXACTLY these six unique layers, each passed/skipped bound).
+_ALL_LAYER_NAMES = (
+    "1_reproducibility",
+    "2_replay",
+    "3_clean_chrome_fixtures",
+    "4_model_smoke",
+    "5_real_canary",
+    "6_full_e2e",
+)
+
+
+def _passing_layers() -> list[LayerResult]:
+    """Six all-passing layers — the layer set a certified report must carry."""
+    return [LayerResult(name=name, passed=True) for name in _ALL_LAYER_NAMES]
 
 
 def layer1_reproducibility() -> LayerResult:
@@ -780,6 +810,132 @@ _ACCOUNT_ID_PATTERN = re.compile(
 # Chinese mobile number as a bare account identifier.
 _PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 
+# Credential-looking FIELD NAMES that must never appear in a committed evidence
+# artifact — even when their VALUE is hash-shaped or already redacted
+# (C-122 round-18 gate-1).  ``bridge_token_present`` / ``candidate_set_sha256``
+# / ``build_sha256`` are NOT matched: the token flags and digest fields are
+# legitimate committed contract fields, so the regex requires the credential
+# word to be a full key (or a ``_``/``-``-bounded final component), never a
+# substring of a digest/flag name.
+_CREDENTIAL_FIELD_RE = re.compile(
+    r"(?i)(?:^|[_-])("
+    r"access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|"
+    r"session[_-]?token|api[_-]?key|apikey|client[_-]?secret|"
+    r"secret[_-]?key|private[_-]?key|authorization|set[_-]?cookie|"
+    r"passw(?:ord|d)|session[_-]?id|account[_-]?secret|credentials?)"
+    r"(?:[_-]?|$)"
+)
+
+# BARE credential field names that must never appear in a committed evidence
+# artifact, checked by EXACT match (C-122 round-18 gate-4): ``token`` /
+# ``cookie`` / ``secret`` / ``browser_token`` are leak-shaped even when their
+# value is hash-shaped.  The regex above deliberately avoids these bare words so
+# legitimate flag/binding names (``bridge_token_present``,
+# ``candidate_set_sha256``) are not false-positives; the exact-name check below
+# closes that gap without reopening it.
+_BARE_CREDENTIAL_FIELD_NAMES = frozenset(
+    {"token", "cookie", "secret", "browser_token"}
+)
+
+# A JSON key that may legitimately carry a 64-hex content-addressable binding
+# (build fingerprint, candidate/scenario/bridge digest, commit/revision SHA).
+# The unknown-64-hex walker allows a 64-hex VALUE only under such a key — a
+# 64-hex under any other key is an opaque token-shaped secret (C-122 round-18
+# gate-4).
+_DIGEST_BINDING_KEY_TAIL_RE = re.compile(
+    r"(?i)(?:^|_)(?:sha256|sha|hash|digest|fingerprint)$"
+)
+
+# A 32-128 char pure-hex span is a recomputable digest (git SHA, sha256), never
+# a phone number or a numeric account identifier.  The pattern scan masks these
+# spans before applying the auth/cookie/account/phone patterns so a computed
+# hash that happens to contain a phone-shaped run of digits cannot false-positive
+# (C-122 Fix 4 keeps hex digests by design; the scan must agree).
+_HEX_HASH_SPAN_RE = re.compile(r"[0-9a-fA-F]{32,128}")
+
+
+def _mask_hex_hash_spans(text: str) -> str:
+    """Return ``text`` with every 32-128 char pure-hex span replaced by a
+    non-digit placeholder, so no computed digest can read as a phone number or
+    account identifier to the pattern scan."""
+    return _HEX_HASH_SPAN_RE.sub(
+        lambda match: "h" * (match.end() - match.start()), text
+    )
+
+
+def _reject_credential_field_names(data: bytes, label: str, name: str) -> None:
+    """Fail closed when a JSON evidence artifact carries a credential-looking
+    field name (``session_token``, ``access_token``, ``authorization``,
+    ``api_key``, ``client_secret``, or a BARE ``token`` / ``cookie`` /
+    ``secret`` / ``browser_token`` …).
+
+    C-122 round-18 gate-1: a credential field is a leak even when its value is
+    hash-shaped or already redacted — the compact/report/manifest must never
+    carry the field at all.  Only committed JSON artifacts are structurally
+    walked; a non-JSON file (a PNG, a raw provider dump) cannot have JSON field
+    names and still passes through the byte + pattern scan below.
+    """
+    try:
+        parsed = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return  # not a JSON document; the byte/pattern scan still applies
+    if not isinstance(parsed, (dict, list)):
+        return
+    stack: list[Any] = [parsed]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if (
+                    isinstance(key, str)
+                    and (
+                        _CREDENTIAL_FIELD_RE.search(key)
+                        or key.strip().lower() in _BARE_CREDENTIAL_FIELD_NAMES
+                    )
+                ):
+                    raise GateStateChangedError(
+                        f"secret leak: credential field name {key!r} in {label} "
+                        f"file {name}"
+                    )
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(item for item in node if isinstance(item, (dict, list)))
+
+
+def _reject_unknown_64hex_values(data: bytes, label: str, name: str) -> None:
+    """Fail closed when a committed JSON artifact carries an unknown 64-hex
+    value — a string of exactly 64 lowercase hex under a NON-digest-binding key.
+
+    C-122 round-18 gate-4: a bare 64-hex opaque value is indistinguishable from
+    a bearer-token-shaped secret and must never enter Git objects.  A 64-hex
+    VALUE is only trusted inside an explicit digest/binding key
+    (``*_sha256`` / ``*_hash`` / ``*_digest`` / ``*_fingerprint`` / ``sha256``
+    …); anywhere else it is a leak.  Only committed JSON artifacts are walked;
+    the compact desensitizer already redacts 64-hex outside hash positions, so
+    this is the second line of defence for the verbatim-copied evidence files.
+    """
+    try:
+        parsed = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return  # not a JSON document; the byte/pattern scan still applies
+    stack: list[tuple[Any, str]] = [(parsed, "")]
+    while stack:
+        node, _ = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, str) and _SHA256_HEX_RE.fullmatch(value):
+                    norm = str(key).strip().lower().replace("-", "_")
+                    if _DIGEST_BINDING_KEY_TAIL_RE.search(norm) is None:
+                        raise GateStateChangedError(
+                            f"secret leak: unknown 64-hex value under field "
+                            f"{key!r} in {label} file {name}"
+                        )
+                elif isinstance(value, (dict, list)):
+                    stack.append((value, str(key)))
+        elif isinstance(node, list):
+            stack.extend((item, "") for item in node if isinstance(item, (dict, list)))
+
 # ISO-8601 date/datetime (``2026-08-13``, ``2026-08-13T10:00:00Z``, …).  A
 # public read-only API may legitimately carry such a value in a query (e.g. a
 # schedules ``?date=``), so it must not be mistaken for an opaque numeric
@@ -790,11 +946,125 @@ _ISO_DATETIME_RE = re.compile(
 )
 
 
+# C-122 Fix 4: query params are redacted by default — a URL only passes when
+# every non-blank query value sits on the safe allowlist of benign structural /
+# scheduling keys (dates, counts, route/cabin codes, search terms) AND the value
+# itself is benign.  Session / account keys are a hard leak regardless of their
+# value's shape, covering session= and alphanumeric accounts (?user=alice123)
+# that length/``\d{4,}`` heuristics previously let through.
+_SAFE_QUERY_PARAM_KEYS = frozenset(
+    {
+        "date",
+        "from",
+        "to",
+        "dep",
+        "arr",
+        "departure",
+        "return",
+        "departuredate",
+        "returndate",
+        "traveldate",
+        "checkin",
+        "checkout",
+        "adult",
+        "adults",
+        "child",
+        "children",
+        "infant",
+        "infants",
+        "passengers",
+        "pax",
+        "page",
+        "pageindex",
+        "pagesize",
+        "size",
+        "limit",
+        "offset",
+        "type",
+        "sort",
+        "order",
+        "class",
+        "cabin",
+        "triptype",
+        "tripmode",
+        "lang",
+        "locale",
+        "currency",
+        "channel",
+        "d",
+        "a",
+        "q",
+        "keyword",
+        "dest",
+        "origin",
+        "searchid",
+        "traceid",
+        "requestid",
+        "r",
+        "scid",
+        "stn",
+    }
+)
+
+_SESSION_ACCOUNT_QUERY_KEYS = frozenset(
+    {
+        "session",
+        "sessionid",
+        "session_id",
+        "sid",
+        "token",
+        "accesstoken",
+        "access_token",
+        "auth",
+        "authorization",
+        "auth_token",
+        "sign",
+        "sig",
+        "signature",
+        "st",
+        "at",
+        "uid",
+        "userid",
+        "user_id",
+        "user",
+        "username",
+        "account",
+        "accountid",
+        "account_id",
+        "userinfo",
+        "user_info",
+        "login",
+        "passport",
+        "password",
+        "pwd",
+        "key",
+        "apikey",
+        "api_key",
+        "ticket",
+        "uuid",
+        "pay",
+        "callback",
+        "redirect",
+        "returnurl",
+        "openid",
+        "unionid",
+        "usertype",
+        "member",
+        "memberid",
+        "member_id",
+    }
+)
+
+
 def _is_tracking_url_leak(url: str) -> bool:
-    """True when a full URL carries a non-redacted query value that reads as a
-    session/account token — the tracking-URL leak the byte scan alone cannot
-    see.  Redacted values (``[REDACTED]``), benign short values and plain
-    ISO-8601 date values pass."""
+    """True when a full URL carries a query string the compact may not keep.
+
+    Fail-closed by default (C-122 Fix 4): a non-blank, non-redacted query value
+    is a leak unless its key is on the safe allowlist AND the value itself is
+    benign (ISO-8601 date, bounded numeric, or short route/cabin code).  Session
+    / account keys are leaks unconditionally — including short alphanumeric
+    accounts.  Redacted values (``[REDACTED]``) and blank values pass.
+    """
     try:
         parsed = urlsplit(url)
     except ValueError:
@@ -802,49 +1072,137 @@ def _is_tracking_url_leak(url: str) -> bool:
     if not parsed.query:
         return False
     for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        key_lower = key.lower()
         value = value.strip()
         if not value or value == "[REDACTED]":
             continue
-        if key.lower() in {
-            "sid",
-            "token",
-            "auth",
-            "sign",
-            "sig",
-            "st",
-            "at",
-            "uid",
-            "userinfo",
-            "user_info",
-            "pay",
-        }:
+        if key_lower in _SESSION_ACCOUNT_QUERY_KEYS:
             return True
-        # A plain ISO-8601 date/datetime is a schedule/filter value, never an
-        # opaque session/account token — skip it before the length and
-        # ``\d{4,}`` numeric-token rules (a datetime is naturally >16 chars and
-        # carries a 4-digit year, both of which would otherwise false-positive
-        # on public read-only API queries like ``?from=2026-08-13T07:30:00Z``).
-        if _ISO_DATETIME_RE.match(value):
-            continue
-        if len(value) >= 16:
+        if key_lower in _SAFE_QUERY_PARAM_KEYS:
+            # A safe key carrying an ISO date/datetime, a bounded numeric or a
+            # short route/cabin/search code is a schedule/filter value.  A safe
+            # key carrying a longer opaque value is still a leak.
+            if _ISO_DATETIME_RE.match(value):
+                continue
+            if re.fullmatch(r"\d{1,6}", value):
+                continue
+            if len(value) <= 12 and not re.search(r"\d{4,}", value):
+                continue
             return True
-        # A pure numeric run (e.g. ``1234567890``) is a session/account token;
-        # a calendar date is not.  ``\d{4,}`` alone cannot tell them apart.
-        if re.search(r"\d{4,}", value):
-            return True
+        # Default deny: any query key outside the safe allowlist with a
+        # non-blank, non-redacted value reads as a session/account leak.
+        return True
     return False
 
 
 _TRACKING_URL_PATTERN = re.compile(r"https?://[^\s\"'<>)\[\]{}]+")
 
 
+class _SecretNeedles:
+    """Encoded secret-scan needles whose repr never exposes the values.
+
+    C-122 round-18 security review: the scan API must not take a repr-able
+    plaintext ``tuple[str, ...]`` — a failing traceback would expand real secret
+    values verbatim into the log.  This container holds the needles as ``bytes``
+    and redacts its repr to a count, so a traceback can never surface them.
+    Iteration yields ``bytes`` needles ready for a substring scan.
+    """
+
+    __slots__ = ("_items",)
+
+    def __init__(self, secrets: Iterable[str]):
+        self._items: tuple[bytes, ...] = tuple(
+            dict.fromkeys(bytes(secret, "utf-8") for secret in secrets if secret)
+        )
+
+    def __iter__(self) -> Iterable[bytes]:
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __bool__(self) -> bool:
+        return bool(self._items)
+
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__} needles={len(self._items)}>"
+
+
+def _evidence_scan_needles() -> _SecretNeedles:
+    """Active secret values as scan-ready needles (bytes, non-repr-able)."""
+    return _SecretNeedles(_evidence_secrets())
+
+
+def _secret_scan_bytes(
+    data: bytes,
+    needles: _SecretNeedles,
+    label: str,
+    name: str,
+    *,
+    credential_field_check: bool = False,
+) -> None:
+    """Fail closed if a secret value or sensitive evidence pattern appears in
+    the exact bytes ``data`` (``name`` names the artifact for the error).
+
+    ``needles`` must be a ``_SecretNeedles`` container (never a plaintext tuple,
+    so a failing traceback cannot expand secret values — C-122 round-18).
+
+    Multi-class scan, not just a single token's bytes: exact secret values
+    (bridge token, model API keys), Authorization/Cookie values, account
+    identifiers (numeric ids, phone numbers), full tracking URLs with
+    non-redacted query values, and — for committed JSON artifacts — a
+    credential-looking field name.  A leak aborts the gate with exit-2 semantics
+    before any verdict is certified.  Scan errors report only the category and
+    the file name — never the matched bytes (C-114).
+    """
+    if not isinstance(needles, _SecretNeedles):
+        raise TypeError(
+            "secret scan needles must be _SecretNeedles, not a plaintext tuple "
+            "(C-122 round-18 security contract)"
+        )
+    for needle in tuple(needles):
+        if needle in data:
+            raise GateStateChangedError(
+                f"secret leak: secret value found in {label} file {name}"
+            )
+    if credential_field_check:
+        _reject_credential_field_names(data, label, name)
+        _reject_unknown_64hex_values(data, label, name)
+    text = data.decode("utf-8", errors="ignore")
+    # Mask recomputable hex digests (git SHAs, sha256) before the pattern
+    # scan: a hash that happens to contain a phone-shaped run of digits is
+    # not a leak, and a bare phone number is always decimal (never hex).
+    masked_text = _mask_hex_hash_spans(text)
+    for pattern, kind in (
+        (_AUTH_COOKIE_PATTERN, "Authorization/Cookie"),
+        (_ACCOUNT_ID_PATTERN, "account identifier"),
+        (_PHONE_PATTERN, "phone number"),
+    ):
+        if pattern.search(masked_text):
+            raise GateStateChangedError(
+                f"secret leak: {kind} in {label} file {name}"
+            )
+    for match in _TRACKING_URL_PATTERN.finditer(text):
+        if _is_tracking_url_leak(match.group(0)):
+            raise GateStateChangedError(
+                f"secret leak: tracking URL in {label} file {name}"
+            )
+
+
 def _secret_scan_paths(
     paths: Iterable[Path],
-    secrets: tuple[str, ...],
+    needles: _SecretNeedles,
     label: str,
+    *,
+    credential_field_check: bool = False,
 ) -> None:
     """Fail closed if a secret value or sensitive evidence pattern appears in
     any of ``paths``.
+
+    ``needles`` must be a ``_SecretNeedles`` container (never a plaintext tuple,
+    so a failing traceback cannot expand secret values — C-122 round-18).
+    ``credential_field_check=True`` additionally rejects a JSON artifact that
+    carries a credential-looking field name (committed evidence only).
 
     Multi-class scan, not just a single token's bytes: exact secret values
     (bridge token, model API keys), Authorization/Cookie values, account
@@ -854,7 +1212,6 @@ def _secret_scan_paths(
     semantics before any verdict is certified.  Scan errors report only the
     category and the file name — never the matched bytes (C-114).
     """
-    active = tuple(secret.encode("utf-8") for secret in secrets if secret)
     for path in sorted(paths, key=lambda p: str(p)):
         if not path.is_file():
             continue
@@ -868,34 +1225,21 @@ def _secret_scan_paths(
                 f"secret scan: cannot read {label} file {path.name} "
                 f"({exc.__class__.__name__}); refusing to certify evidence"
             ) from exc
-        for needle in active:
-            if needle in data:
-                raise GateStateChangedError(
-                    f"secret leak: secret value found in {label} file {path.name}"
-                )
-        text = data.decode("utf-8", errors="ignore")
-        for pattern, kind in (
-            (_AUTH_COOKIE_PATTERN, "Authorization/Cookie"),
-            (_ACCOUNT_ID_PATTERN, "account identifier"),
-            (_PHONE_PATTERN, "phone number"),
-        ):
-            if pattern.search(text):
-                raise GateStateChangedError(
-                    f"secret leak: {kind} in {label} file {path.name}"
-                )
-        for match in _TRACKING_URL_PATTERN.finditer(text):
-            if _is_tracking_url_leak(match.group(0)):
-                raise GateStateChangedError(
-                    f"secret leak: tracking URL in {label} file {path.name}"
-                )
+        _secret_scan_bytes(
+            data,
+            needles,
+            label,
+            path.name,
+            credential_field_check=credential_field_check,
+        )
 
 
-def _secret_scan_staging(staging_dir: Path, secrets: tuple[str, ...]) -> None:
+def _secret_scan_staging(staging_dir: Path, needles: _SecretNeedles) -> None:
     """Fail closed if a secret value or sensitive evidence pattern appears in
     staging evidence (every file under ``staging_dir``)."""
     _secret_scan_paths(
         (p for p in staging_dir.rglob("*") if p.is_file()),
-        secrets,
+        needles,
         "evidence",
     )
 
@@ -914,11 +1258,11 @@ def _final_evidence_secret_scan(
     evidence).  A leak that only appears in the last-written report or manifest
     is therefore caught before the branch moves, not after.
     """
-    secrets = _evidence_secrets()
-    _secret_scan_staging(staging_dir, secrets)
+    needles = _evidence_scan_needles()
+    _secret_scan_staging(staging_dir, needles)
     _secret_scan_paths(
         (p for p in tracked_paths if p.is_file()),
-        secrets,
+        needles,
         "committed evidence",
     )
 
@@ -972,7 +1316,7 @@ def layer5_real_canary(staging_dir: Path) -> LayerResult:
     # The bridge token travels to the canary via the inherited environment, NEVER
     # via argv: argv is visible in the process list and can leak into logs.  The
     # child script reads TRIPCHORD_BROWSER_BRIDGE_TOKEN as its default token.
-    code, out = _run(
+    code, _ = _run(
         [
             "uv",
             "run",
@@ -1005,13 +1349,31 @@ def layer5_real_canary(staging_dir: Path) -> LayerResult:
         if not isinstance(scopes, list) or not scopes:
             canary_failures.append("canary carries no scopes")
         else:
+            # C-122 round-18 item 4: the raw scope array must be EXACTLY the six
+            # certified scopes, each a dict with a unique non-empty name.  A
+            # canary that smuggles a string/None entry, a duplicate or an extra
+            # scope past the green checks fails the layer — nothing is silently
+            # skipped or deduped.
+            if len(scopes) != len(_CERTIFIED_OTA_SCOPES):
+                canary_failures.append(
+                    f"canary carries {len(scopes)} scope entries; exactly "
+                    f"{len(_CERTIFIED_OTA_SCOPES)} certified scopes required"
+                )
             present: set[str] = set()
+            seen: set[str] = set()
             for entry in scopes:
                 if not isinstance(entry, dict):
+                    canary_failures.append("canary scope entry is not an object")
                     continue
                 scope = entry.get("scope")
                 if not isinstance(scope, str) or not scope:
+                    canary_failures.append(
+                        "canary scope entry missing a non-empty scope name"
+                    )
                     continue
+                if scope in seen:
+                    canary_failures.append(f"duplicate canary scope: {scope}")
+                seen.add(scope)
                 present.add(scope)
                 ok = (
                     entry.get("passed") is True
@@ -1120,6 +1482,16 @@ _CERTIFIED_OTA_SCOPES = frozenset(
     }
 )
 
+# The fixed browser platform set the certified canary must complete: the three
+# OTA providers named by the non-icom certified scopes (C-122 round-18 gate-2).
+# The strict-coverage evidence and the real browser source evidence both bind to
+# exactly this set — never a forged or partial provider list.
+_BROWSER_OTA_PROVIDERS = frozenset(
+    scope.split(":", 1)[0]
+    for scope in _CERTIFIED_OTA_SCOPES
+    if not scope.startswith("icom:")
+)
+
 
 def _resolve_live_state_db(explicit: Path | None = None) -> Path:
     """The durable live-state SQLite file a live run must not pollute (C-114 R7).
@@ -1195,57 +1567,220 @@ def _live_state_lease_preflight(db_path: Path) -> list[str]:
                 f"job {job_id} status={status} has unparseable lease {lease_raw!r}"
             )
             continue
-        if expires.replace(tzinfo=UTC) > now:
+        # C-122 round-18 gate-5: a NAIVE lease is fail-closed.  ``fromisoformat``
+        # of a bare wall clock (no timezone) yields a naive datetime, and
+        # ``astimezone(UTC)`` on a naive value silently relabels it as host-local
+        # — a +08:00 live state would then be misjudged by eight hours.  A lease
+        # without an explicit zone cannot be compared safely, so it is residual.
+        if expires.tzinfo is None or expires.utcoffset() is None:
+            residual.append(
+                f"job {job_id} status={status} has a naive lease {lease_raw!r} "
+                "(no timezone; cannot compare safely)"
+            )
+            continue
+        # C-122 round-18: astimezone(UTC) CONVERTS an aware lease with a
+        # non-UTC offset; replace(tzinfo=UTC) would just relabel the wall clock,
+        # misjudging a +08:00 lease by eight hours.
+        if expires.astimezone(UTC) > now:
             residual.append(
                 f"job {job_id} status={status} holds lease until {expires.isoformat()}"
             )
     return residual
 
 
-# Residual Browser-Bridge state classes (C-118).  The persisted bridge-state
-# JSON (BrowserBridgePersistedState, schema v2) tracks Companion tasks and
-# reload/control requests independently of the planning ``jobs`` table: a task
-# still ``queued``/``claimed`` or a control request still ``queued``/
-# ``draining``/``dispatched``/``accepted`` is in-flight work a fresh live run
-# would race with.  Reading only this file can prove bridge-lease isolation that
-# a ``tripchord.db`` planning-jobs query cannot.
+# Residual Browser-Bridge state classes (C-118, C-122 Fix 2).  The persisted
+# bridge-state JSON (BrowserBridgePersistedState, schema v2) tracks Companion
+# tasks and reload/control requests independently of the planning ``jobs``
+# table: a task still ``queued``/``claimed`` or a control request still
+# ``queued``/``draining``/``dispatched``/``accepted`` is in-flight work a fresh
+# live run would race with.  Reading only this file can prove bridge-lease
+# isolation that a ``tripchord.db`` planning-jobs query cannot.
+#
+# Residual task semantics: ``queued`` and ``claimed`` are BOTH residual — a
+# ``claimed`` task is requeued on bridge restart (recoverable expired running,
+# browser_bridge._restore_persisted_state), so it must not be in flight when a
+# fresh live run starts.  There is no persisted ``requeued`` state string; a
+# claimed record is exactly the "will be requeued / recoverable expired
+# running" case the preflight must reject.
+_BRIDGE_TASK_STATES = frozenset(
+    {"queued", "claimed", "succeeded", "blocked", "failed", "cancelled"}
+)
 _BRIDGE_TASK_RESIDUAL_STATES = frozenset({"queued", "claimed"})
+_BRIDGE_CONTROL_STATES = frozenset(
+    {"queued", "draining", "dispatched", "accepted", "applied", "failed", "expired"}
+)
 _BRIDGE_CONTROL_RESIDUAL_STATES = frozenset(
     {"queued", "draining", "dispatched", "accepted"}
 )
+_BRIDGE_STATE_SCHEMA_VERSION = "tripchord-browser-bridge-state-v2"
 _BRIDGE_STATE_ENV = "TRIPCHORD_BROWSER_BRIDGE_STATE_PATH"
+# The bridge-state file the launchd live API actually persists (docs/operations.md
+# sets ``TRIPCHORD_BROWSER_BRIDGE_STATE_PATH="$PWD/.runtime/browser-bridge-state.json"``).
+_BRIDGE_STATE_DEFAULT_REL = ".runtime/browser-bridge-state.json"
 
 
-def _resolve_bridge_state_path(explicit: Path | None = None) -> Path | None:
+def _resolve_bridge_state_path(explicit: Path | None = None) -> Path:
     """The persisted Browser-Bridge state JSON path for the lease preflight.
 
-    ``TRIPCHORD_BROWSER_BRIDGE_STATE_PATH`` is the env var the bridge provider
-    itself uses (``browser_bridge.BROWSER_BRIDGE_STATE_PATH_ENV``); when unset
-    there is no persisted bridge state to contend with and the preflight has
-    nothing to prove.  An explicit ``--bridge-state-path``-style override wins.
+    C-122 Fix 2: the preflight must bind to the bridge-state file the live API
+    actually persists (``.runtime/browser-bridge-state.json``).  An explicit
+    ``--bridge-state-path``-style override wins; otherwise
+    ``TRIPCHORD_BROWSER_BRIDGE_STATE_PATH`` (the env var the bridge provider
+    itself honours, ``browser_bridge.BROWSER_BRIDGE_STATE_PATH_ENV``); when both
+    are unset the default ``.runtime`` file is used — never a vacuous "no
+    persisted bridge state to contend with" pass.
     """
     if explicit is not None:
         return explicit
     raw = os.environ.get(_BRIDGE_STATE_ENV, "").strip()
-    return Path(raw) if raw else None
+    if raw:
+        return Path(raw)
+    return ROOT / _BRIDGE_STATE_DEFAULT_REL
 
 
-def _bridge_state_lease_preflight(state_path: Path | None = None) -> list[str]:
-    """Read-only Browser-Bridge state preflight: residual queued/claimed work.
+# The immutable bridge-state byte snapshot bound by the most recent lease
+# preflight (C-122 round-18 item 3).  Set by ``_bridge_state_validate`` from
+# the exact bytes it read, so the layer-6 compact certifies the SAME snapshot
+# the preflight validated — never a second read after the long E2E run, during
+# which the live API legitimately repersists the file.
+_BRIDGE_STATE_SNAPSHOT: dict[str, Any] | None = None
 
-    Reads the persisted bridge-state JSON at ``TRIPCHORD_BROWSER_BRIDGE_STATE_PATH``
-    strictly read-only and reports every non-terminal task (``queued``/``claimed``)
-    and pending reorder control request (``queued``/``draining``/``dispatched``/
-    ``accepted``) that a fresh live run would contend with (C-118).  The bridge
-    stores these states independently of the planning ``jobs`` table, so the
-    layer-6 residual-lease gate must read this file, not only ``tripchord.db``.
-    Returns an empty list when bridge state is isolated; each entry names one
-    residual item (id + state).
+# A SECOND immutable bridge-state byte snapshot captured AFTER the layer-6 E2E
+# completes (C-122 round-18 item 6).  Set by ``_bridge_state_validate`` with
+# ``after=True`` so the committed trail carries the isolation proof from both
+# sides of the run: no residual queued/claimed/reload before it started, and
+# none left behind by the run itself.
+_BRIDGE_STATE_SNAPSHOT_AFTER: dict[str, Any] | None = None
+
+
+def _bridge_state_rel_identifier(path: Path) -> str:
+    """A repo-relative identifier for the bridge-state file — never the absolute
+    host path (C-122 round-18 item 3).  A file outside the repo tree is named by
+    its basename so no host path can leak into the committed trail.
+    """
+    try:
+        rel = os.path.relpath(path.resolve(), ROOT.resolve())
+    except (OSError, ValueError):
+        return path.name
+    if rel.startswith("..") or os.path.isabs(rel):
+        return path.name
+    return rel
+
+
+def _bridge_state_binding() -> dict[str, Any]:
+    """Repo-relative identifier + SHA256 + preflight result of the bridge-state
+    file the lease preflight binds to.
+
+    Written into the layer-6 compact so the committed trail records exactly
+    which bridge-state file was checked, its byte hash, and the preflight
+    outcome (the residual-problem list).  Only the hash and the residual result
+    — never the file's token/quote/URL bytes — leave the runtime.  When a
+    preflight captured an immutable snapshot for the currently-resolved path,
+    that snapshot is returned; otherwise the file is re-read (direct-call /
+    fallback path).
+    """
+    path = _resolve_bridge_state_path()
+    rel_id = _bridge_state_rel_identifier(path)
+    snapshot = _BRIDGE_STATE_SNAPSHOT
+    if (
+        snapshot is not None
+        and snapshot.get("file") == rel_id
+        and snapshot.get("sha256") is not None
+    ):
+        return {
+            "file": snapshot["file"],
+            "sha256": snapshot["sha256"],
+            "residual": list(snapshot.get("residual") or ()),
+        }
+    return {
+        "file": rel_id,
+        "sha256": _sha256_file(path) if path.is_file() else None,
+        "residual": [],
+    }
+
+
+def _bridge_state_after_binding() -> dict[str, Any]:
+    """Repo-relative identifier + SHA256 + postcheck result of the bridge-state
+    file captured AFTER the layer-6 E2E completed (C-122 round-18 item 6).
+
+    Written into the layer-6 compact so the committed trail records BOTH the
+    pre-run preflight binding and this post-run binding: the run started from a
+    lease-clean bridge and left no residual queued/claimed/reload behind.  Only
+    the hash and the residual result — never the file's token/quote/URL bytes —
+    leave the runtime.  When a postcheck captured an immutable snapshot for the
+    currently-resolved path, that snapshot is returned; otherwise the file is
+    re-read (direct-call / fallback path).
+    """
+    path = _resolve_bridge_state_path()
+    rel_id = _bridge_state_rel_identifier(path)
+    snapshot = _BRIDGE_STATE_SNAPSHOT_AFTER
+    if (
+        snapshot is not None
+        and snapshot.get("file") == rel_id
+        and snapshot.get("sha256") is not None
+    ):
+        return {
+            "file": snapshot["file"],
+            "sha256": snapshot["sha256"],
+            "residual": list(snapshot.get("residual") or ()),
+        }
+    return {
+        "file": rel_id,
+        "sha256": _sha256_file(path) if path.is_file() else None,
+        "residual": [],
+    }
+
+
+def _is_timezone_aware_iso(value: object) -> bool:
+    """True when ``value`` is an ISO-8601 string carrying a UTC offset.
+
+    The real v2 bridge-state schema requires timezone-aware datetimes
+    (``browser_bridge._require_timezone``); a naive timestamp cannot prove the
+    persisted state is current, so the preflight fails closed on one.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _bridge_state_validate(state_path: Path | None, *, after: bool) -> list[str]:
+    """Read-only Browser-Bridge state lease validation (preflight/postcheck).
+
+    Reads the persisted bridge-state JSON the live API actually persists and
+    reports every non-terminal task (``queued``/``claimed`` — the latter is
+    requeued on restart, i.e. recoverable expired running) and pending reorder
+    control request (``queued``/``draining``/``dispatched``/``accepted``) that a
+    fresh live run would contend with (C-118).  The bridge stores these states
+    independently of the planning ``jobs`` table, so the layer-6 residual-lease
+    gate must read this file, not only ``tripchord.db``.  When ``after`` is
+    true the SAME contract runs against a second read-only snapshot captured
+    AFTER the layer-6 E2E completes: a residual queued/claimed task or pending
+    reorder left behind proves the run did not consume its lease and is
+    reported (C-122 round-18 item 6).
+
+    Fail-closed contract: a missing file, a symlink, an unreadable file, an
+    empty object, a wrong ``schema_version``, a non-array
+    ``tasks``/``reload_requests``, a non-object entry, a missing state, or an
+    unknown task/reload state each mean the file cannot prove bridge lease
+    isolation and are reported as problems — never silently skipped.  Returns
+    an empty list only when the file exists, parses to the expected schema and
+    holds no residual work; each entry names one residual/schema problem.
+
+    Records the immutable byte snapshot the compact must reuse (rel-identifier,
+    sha256, residual) into ``_BRIDGE_STATE_SNAPSHOT`` (preflight) or
+    ``_BRIDGE_STATE_SNAPSHOT_AFTER`` (postcheck), so the pre-run and post-run
+    bindings each certify the exact bytes this validation read — never a second
+    read after the long E2E run, during which the live API legitimately
+    repersists the file (C-122 round-18 item 3/6).
     """
     if state_path is None:
         state_path = _resolve_bridge_state_path()
     if state_path is None:
-        return []  # no persisted bridge state configured; nothing to contend
+        return []  # unreachable in practice: _resolve_bridge_state_path always binds
     if state_path.is_symlink():
         return [
             f"bridge-state path {state_path} is a symlink; refusing to read "
@@ -1258,7 +1793,13 @@ def _bridge_state_lease_preflight(state_path: Path | None = None) -> list[str]:
         ]
     _verify_evidence_file_safety(state_path, "bridge-state")
     try:
-        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        # Bind the immutable byte snapshot: the sha256 the compact records must
+        # be computed from the SAME bytes the validation parses and validates,
+        # so a re-read after the long run can never certify a different snapshot
+        # (C-122 round-18 item 3).
+        payload_bytes = state_path.read_bytes()
+        payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        payload = json.loads(payload_bytes.decode("utf-8"))
     except (OSError, ValueError) as exc:
         return [
             f"bridge-state file {state_path} unreadable "
@@ -1269,28 +1810,130 @@ def _bridge_state_lease_preflight(state_path: Path | None = None) -> list[str]:
             f"bridge-state file {state_path} is not a JSON object; cannot prove "
             "bridge lease isolation"
         ]
+    if not payload:
+        return [
+            f"bridge-state file {state_path} is an empty object; cannot prove "
+            "bridge lease isolation"
+        ]
     residual: list[str] = []
+    if payload.get("schema_version") != _BRIDGE_STATE_SCHEMA_VERSION:
+        residual.append(
+            f"bridge-state file {state_path} schema_version "
+            f"{payload.get('schema_version')!r} != {_BRIDGE_STATE_SCHEMA_VERSION}"
+        )
+    # C-122 round-18 item 3/6: the real v2 schema requires a timezone-aware
+    # ``saved_at`` (browser_bridge._require_timezone).  A missing or naive
+    # timestamp cannot prove the state is current, so it fails closed — for
+    # both the pre-run and the post-run snapshot.
+    saved_at = payload.get("saved_at")
+    if not _is_timezone_aware_iso(saved_at):
+        residual.append(
+            f"bridge-state file {state_path} saved_at "
+            f"{saved_at!r} is not a timezone-aware timestamp"
+        )
     tasks = payload.get("tasks")
-    if isinstance(tasks, list):
-        for task in tasks:
+    if not isinstance(tasks, list):
+        residual.append(
+            f"bridge-state file {state_path} tasks is not an array "
+            f"({type(tasks).__name__})"
+        )
+    else:
+        for index, task in enumerate(tasks):
             if not isinstance(task, dict):
-                continue
-            state = task.get("state")
-            if isinstance(state, str) and state in _BRIDGE_TASK_RESIDUAL_STATES:
                 residual.append(
-                    f"bridge task {task.get('id')!r} state={state} is queued/claimed"
+                    f"bridge-state file {state_path} task #{index} is not an object"
+                )
+                continue
+            task_id = task.get("id")
+            if not isinstance(task_id, str) or not task_id:
+                residual.append(
+                    f"bridge-state file {state_path} task #{index} has no "
+                    "non-empty id"
+                )
+            state = task.get("state")
+            if not isinstance(state, str):
+                residual.append(
+                    f"bridge-state file {state_path} task {task_id!r} has no "
+                    "string state"
+                )
+                continue
+            if state not in _BRIDGE_TASK_STATES:
+                residual.append(
+                    f"bridge-state file {state_path} task {task_id!r} has unknown "
+                    f"state {state!r}"
+                )
+                continue
+            if state in _BRIDGE_TASK_RESIDUAL_STATES:
+                residual.append(
+                    f"bridge task {task_id!r} state={state} is queued/claimed"
                 )
     reloads = payload.get("reload_requests")
-    if isinstance(reloads, list):
-        for item in reloads:
+    if not isinstance(reloads, list):
+        residual.append(
+            f"bridge-state file {state_path} reload_requests is not an array "
+            f"({type(reloads).__name__})"
+        )
+    else:
+        for index, item in enumerate(reloads):
             if not isinstance(item, dict):
-                continue
-            state = item.get("state")
-            if isinstance(state, str) and state in _BRIDGE_CONTROL_RESIDUAL_STATES:
                 residual.append(
-                    f"bridge reload {item.get('id')!r} state={state} is pending reorder"
+                    f"bridge-state file {state_path} reload #{index} is not an object"
                 )
+                continue
+            item_id = item.get("id")
+            if not isinstance(item_id, str) or not item_id:
+                residual.append(
+                    f"bridge-state file {state_path} reload #{index} has no "
+                    "non-empty id"
+                )
+            state = item.get("state")
+            if not isinstance(state, str):
+                residual.append(
+                    f"bridge-state file {state_path} reload {item_id!r} has no "
+                    "string state"
+                )
+                continue
+            if state not in _BRIDGE_CONTROL_STATES:
+                residual.append(
+                    f"bridge-state file {state_path} reload {item_id!r} has "
+                    f"unknown state {state!r}"
+                )
+                continue
+            if state in _BRIDGE_CONTROL_RESIDUAL_STATES:
+                residual.append(
+                    f"bridge reload {item_id!r} state={state} is pending reorder"
+                )
+    # Record the immutable snapshot the compact must reuse, so preflight/postcheck
+    # and compact certify the same bytes (C-122 round-18 item 3/6).
+    snapshot_global = (
+        "_BRIDGE_STATE_SNAPSHOT_AFTER" if after else "_BRIDGE_STATE_SNAPSHOT"
+    )
+    globals()[snapshot_global] = {
+        "file": _bridge_state_rel_identifier(state_path),
+        "sha256": payload_sha256,
+        "residual": list(residual),
+    }
     return residual
+
+
+def _bridge_state_lease_preflight(state_path: Path | None = None) -> list[str]:
+    """Pre-run read-only Browser-Bridge state lease check (C-118).
+
+    See ``_bridge_state_validate`` with ``after=False``: the pre-run snapshot a
+    fresh live E2E must observe before it starts.
+    """
+    return _bridge_state_validate(state_path, after=False)
+
+
+def _bridge_state_postcheck(state_path: Path | None = None) -> list[str]:
+    """Post-run read-only Browser-Bridge state lease check (C-122 round-18 item 6).
+
+    Captures a SECOND immutable snapshot AFTER the layer-6 E2E completes, so the
+    committed trail holds the isolation proof from both sides of the run.  A
+    residual queued/claimed task or pending reorder after the run means the run
+    did not consume its lease — the layer-6 gate fails on a non-empty result.
+    """
+    return _bridge_state_validate(state_path, after=True)
 
 
 # The real ``run_live_done_gate_v4`` completion artifact carries its verdict in
@@ -1341,6 +1984,7 @@ def _done_gate_mismatches(runner_evidence: dict[str, Any]) -> list[str]:
         mismatches.append("runner done_gate.checks missing or empty")
         return mismatches
     present: set[str] = set()
+    seen: set[str] = set()
     failed: list[str] = []
     malformed = 0
     for item in checks:
@@ -1351,15 +1995,32 @@ def _done_gate_mismatches(runner_evidence: dict[str, Any]) -> list[str]:
         if not isinstance(name, str) or not name:
             malformed += 1
             continue
+        if name in seen:
+            mismatches.append(f"duplicate done-gate check: {name}")
+        seen.add(name)
         present.add(name)
         if item.get("passed") is not True:
             failed.append(name)
     if malformed:
         mismatches.append(f"runner done_gate.checks has {malformed} malformed item(s)")
+    # C-122 round-18 item 4: the raw check list must be exactly the fifteen
+    # required checks — no duplicates, no extra non-certified items.  A forged
+    # or inflated all-green summary can never pass.
+    if len(checks) != len(_V4_DONE_GATE_CHECK_NAMES):
+        mismatches.append(
+            f"runner done_gate.checks carries {len(checks)} item(s); exactly "
+            f"{len(_V4_DONE_GATE_CHECK_NAMES)} required"
+        )
     missing = sorted(_V4_DONE_GATE_CHECK_NAMES - present)
     if missing:
         mismatches.append(
             "runner done_gate.checks missing required items: " + ", ".join(missing)
+        )
+    extra = sorted(present - _V4_DONE_GATE_CHECK_NAMES)
+    if extra:
+        mismatches.append(
+            "runner done_gate.checks has extra non-certified item(s): "
+            + ", ".join(extra)
         )
     if failed:
         mismatches.append(
@@ -1513,6 +2174,16 @@ def layer6_full_e2e(
         timeout=4500,
     )
     mismatches: list[str] = []
+    # C-122 round-18 item 6: capture a SECOND read-only bridge-state snapshot
+    # AFTER the run completes and require it to hold no residual queued/claimed
+    # work or pending reorder — the E2E must consume its own lease.  The compact
+    # certifies this post-run binding alongside the pre-run preflight binding.
+    postcheck_problems = _bridge_state_postcheck()
+    if postcheck_problems:
+        mismatches.append(
+            "bridge-state postcheck failed (residual queued/claimed work or "
+            "pending reorder after the run): " + "; ".join(postcheck_problems)
+        )
     runner_evidence: dict[str, Any] = {}
     try:
         runner_evidence = json.loads(output_path.read_text(encoding="utf-8"))
@@ -1734,7 +2405,7 @@ def run_gate(
     # B1 secret scan: bridge token + model API keys must never reach logs or
     # evidence.  Fail closed (exit-2 semantics) before any verdict is certified
     # if a secret value or a sensitive evidence pattern does.
-    _secret_scan_staging(staging_dir, _evidence_secrets())
+    _secret_scan_staging(staging_dir, _evidence_scan_needles())
     applicable = _applicable(layers)
     passed = (
         not start.worktree_dirty
@@ -1794,29 +2465,53 @@ def _dump(report: GateReport, output_path: Path = OUTPUT_PATH) -> Path:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-    )
-    tmp.write_text(payload, encoding="utf-8")
+    ).encode("utf-8")
     # The report is owner-only even when ``--output`` points OUTSIDE the staging
-    # tree (C-114 R6): the tmp is sealed to 0600 before the atomic rename so the
-    # final file is 0600 regardless of the host umask or the target location.
-    tmp.chmod(0o600)
+    # tree (C-114 R6): the tmp is created sealed to 0600 (no chmod-after window,
+    # C-122 Fix 5) and atomically renamed, so the final file is 0600 regardless
+    # of the host umask or the target location.
+    _write_sealed_bytes(tmp, payload, 0o600)
     os.replace(tmp, output_path)
     return output_path
+
+
+def _write_sealed_bytes(path: Path, payload: bytes, mode: int = 0o600) -> None:
+    """Create ``path`` with ``mode`` in force from the instant of creation and
+    write ``payload`` to it.
+
+    ``os.open(path, O_WRONLY | O_CREAT | O_EXCL, mode)`` seals permissions at
+    birth — there is no ``write_text``-then-``chmod`` window where the file is
+    briefly world/group-readable, regardless of the host umask (C-122 Fix 5).
+    ``O_EXCL`` also guarantees the write never reuses a pre-existing (possibly
+    attacker-planted) file.
+
+    C-122 round-18: ``os.open`` still ANDs the requested mode with the process
+    umask, so a restrictive ``umask 0777`` would produce a 0000 file that even
+    the owner cannot read.  ``os.fchmod`` on the fresh fd pins the exact mode on
+    the inode itself, immune to the umask, before any bytes are written.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        os.fchmod(fd, mode)
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "wb", closefd=True) as handle:
+        handle.write(payload)
 
 
 def _write_atomic(path: Path, text: str, mode: int = 0o600) -> Path:
     """Atomically write ``text`` to ``path`` sealed to ``mode`` (C-118).
 
-    Writes to a uniquely-named sibling tmp in the target directory, seals the
-    tmp to the requested mode, then ``os.replace``s it over the target.  A
-    reader never observes a partially-written file, and the final permissions
-    are independent of the host umask.  The tmp name embeds a uuid so concurrent
-    runs cannot collide.
+    Writes to a uniquely-named sibling tmp in the target directory, sealed to
+    the requested mode from birth via ``_write_sealed_bytes``, then
+    ``os.replace``s it over the target.  A reader never observes a
+    partially-written file, and the final permissions are independent of the
+    host umask.  The tmp name embeds a uuid so concurrent runs cannot collide.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.chmod(mode)
+    _write_sealed_bytes(tmp, text.encode("utf-8"), mode)
     os.replace(tmp, path)
     return path
 
@@ -1826,6 +2521,11 @@ def _write_atomic(path: Path, text: str, mode: int = 0o600) -> Path:
 # independently reviewable layer-5/6 evidence (C-114).
 _COMPACT_CANARY_STAGED_NAME = "done-gate-layer5-compact.json"
 _COMPACT_E2E_STAGED_NAME = "done-gate-layer6-compact.json"
+# The single shared schema version the compact producer emits AND the blob
+# read-back validator requires — a compact built by any other schema version is
+# rejected (C-122 acceptance).
+_LAYER5_COMPACT_SCHEMA = "tripchord-done-gate-layer5-compact-v2"
+_LAYER6_COMPACT_SCHEMA = "tripchord-done-gate-layer6-compact-v2"
 
 _EVIDENCE_TRACKED_PATHS: tuple[tuple[str, str], ...] = (
     ("product-acceptance.json", "benchmarks/results/product-acceptance.json"),
@@ -1841,33 +2541,6 @@ _EVIDENCE_TRACKED_PATHS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _copy_staged_evidence(staging_dir: Path) -> list[str]:
-    """Copy staged evidence into the tracked results tree.
-
-    Returns repo-relative paths of the files copied (the report is handled by
-    the caller, not here).  Called only from the explicit ``--commit-evidence``
-    phase, after the run verified the tree is clean — never during the run.
-    """
-    copied: list[str] = []
-    for staged_name, tracked_rel in _EVIDENCE_TRACKED_PATHS:
-        staged = staging_dir / staged_name
-        if not staged.is_file():
-            continue
-        _verify_evidence_file_safety(staged, "evidence")
-        target = ROOT / tracked_rel
-        # Skip targets the repository ignores: ``git add`` fails closed on
-        # ignored paths, so copying one into the tracked tree would abort the
-        # commit phase and leave untrackable disk junk.  Such evidence is still
-        # recorded by hash in the committed evidence manifest, so it is never
-        # silently dropped from the audit trail.
-        if _git("check-ignore", "-q", "--", tracked_rel, check=False).returncode == 0:
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(staged, target)
-        copied.append(tracked_rel)
-    return copied
-
-
 # The committed-evidence contract manifest.  The manifest is the *only* record
 # of the git-ignored sensitive live-* evidence that E may not carry: it lists
 # the SHA256 + size of every staging original (committed or not) plus redacted
@@ -1877,6 +2550,49 @@ def _copy_staged_evidence(staging_dir: Path) -> list[str]:
 _MANIFEST_REL = "benchmarks/results/done-gate-evidence-manifest.json"
 _MANIFEST_SCHEMA = "tripchord-done-gate-evidence-manifest-v1"
 
+# Side-channel evidence publish (C-122 P0 / 2026-08-10 11:00 architecture
+# ruling).  The gate never mutates the product branch / HEAD / real index /
+# worktree: E and P are built from a temporary ``GIT_INDEX_FILE`` plus
+# ``git commit-tree``, and the ONLY action that affects persistent state is the
+# final atomic create-only ``git update-ref`` of a namespaced gate ref (old
+# value all-zero, so a pre-existing ref fails the publish closed).  Consumers
+# verify ``P^=E``, ``E^=S`` and the committed report/manifest bindings through
+# that ref; the evidence commit is never installed as the product branch HEAD.
+_DONE_GATE_REF_PREFIX = "refs/tripchord/done-gate"
+_ZERO_SHA = "0" * 40
+# The fixed non-personal identity stamped on the evidence commits E and P
+# (C-122 round-18 gate-4): the side-channel evidence trail must never be
+# attributed to a personal git identity.  The email uses the reserved
+# ``.invalid`` TLD so it can never route, and both values are pinned in the
+# commit env so ambient repo/user git config can never leak a personal name.
+_EVIDENCE_COMMIT_IDENTITY = {
+    "GIT_AUTHOR_NAME": "TripChord Done-Gate",
+    "GIT_AUTHOR_EMAIL": "done-gate@tripchord.invalid",
+    "GIT_COMMITTER_NAME": "TripChord Done-Gate",
+    "GIT_COMMITTER_EMAIL": "done-gate@tripchord.invalid",
+}
+# The two files every evidence commit carries: the authoritative report and the
+# evidence manifest.  ``product-v1-done-gate.json`` doubles as the delivered
+# report in main(); ``done-gate-evidence-manifest.json`` is the manifest source
+# for temp-index staging.
+_REPORT_REL = "benchmarks/results/product-v1-done-gate.json"
+_REPORT_STAGED_NAME = "product-v1-done-gate.json"
+_MANIFEST_STAGED_NAME = "done-gate-evidence-manifest.json"
+
+
+def _gate_ref(run_id: str) -> str:
+    """The side-channel namespace ref a run's evidence is published under.
+
+    Deterministic from ``run_id`` so a consumer can derive it from the report
+    alone.  Refuses a run_id that is not the gate's own 12-hex format so a
+    forged report cannot name an arbitrary ref.
+    """
+    if not _RUN_ID_RE.fullmatch(run_id):
+        raise GateStateChangedError(
+            f"refusing to publish evidence under invalid run_id {run_id!r}"
+        )
+    return f"{_DONE_GATE_REF_PREFIX}/{run_id}"
+
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -1884,6 +2600,10 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 16), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _manifest_files(staging_dir: Path) -> list[dict[str, Any]]:
@@ -2052,7 +2772,7 @@ def _compact_canary(staging_dir: Path) -> dict[str, Any] | None:
         "missing": sorted(set(expected) - seen),
     }
     return {
-        "schema_version": "tripchord-done-gate-layer5-compact-v2",
+        "schema_version": _LAYER5_COMPACT_SCHEMA,
         "generated_at": payload.get("generated_at"),
         "passed": payload.get("passed"),
         "bridge_token_present": payload.get("bridge_token_present"),
@@ -2100,6 +2820,316 @@ def _compact_canary(staging_dir: Path) -> dict[str, Any] | None:
     }
 
 
+# C-122 Fix 3: the compact must preserve desensitized, recomputable per-item
+# structured evidence for every layer-6 done-gate check — never a bare verdict
+# list.  These are the binding fields each check's evidence must carry in the
+# committed compact (names match the live-v4 runner's evidence dicts) so a
+# reviewer can recompute the check from the trail alone.
+_LAYER6_REQUIRED_EVIDENCE_FIELDS: dict[str, frozenset[str]] = {
+    "prefrozen_stay_plan_candidate_set": frozenset({"candidate_set_sha256"}),
+    "v4_source_graph": frozenset(
+        {"expected_browser_tasks_per_pair", "expected_browser_source_ids"}
+    ),
+    "stage_aware_exploration_publication_contract": frozenset(
+        {"exploration_count", "publication_count"}
+    ),
+    "stay_inventory_four_state_contract": frozenset(
+        {"minimum_exact_providers_per_selected_segment", "inventory_states"}
+    ),
+    "planner_verifier_repair_master_stay_plan_chain": frozenset({"evidence_refs"}),
+    "recommendable_date_pair_stay_plan_options": frozenset(
+        {"freshness_ttl_seconds", "freshness_by_option"}
+    ),
+    "icom_exploration_and_publication_evidence": frozenset(
+        {"publication_target_task_ids", "exploration_full_coverage"}
+    ),
+    "all_recommended_publication_closures": frozenset({"options"}),
+    "real_v4_browser_source_evidence": frozenset({"source_task_count", "snapshot_count"}),
+    "flight_search_outcome_contract": frozenset(
+        {
+            "provider_outcome_states",
+            "exact_provider_count",
+            "comparison_provider_count",
+            "price_bearing_provider_count",
+        }
+    ),
+    "observed_cross_platform_overlap": frozenset(
+        {"interval_count", "max_overlapping_providers"}
+    ),
+    "strict_selected_plan_platform_coverage": frozenset(
+        {"providers", "selected_stay_plan_id"}
+    ),
+    "planner_verifier_repair_orchestrator": frozenset(
+        {"graph_chain_ok", "reverify_node_present"}
+    ),
+    "exact_budget_and_selected_evidence": frozenset(
+        {"computed_total_cents", "declared_total_cents"}
+    ),
+    "event_injection_repair_reverify_master": frozenset(
+        {
+            "dynamic_replan",
+            "read_only_graph",
+            "initial_stay_plan_id",
+            "event_final_stay_plan_id",
+        }
+    ),
+}
+
+# Strings that match this are content-addressable bindings (sha256 / git SHAs /
+# UUIDs), never secrets — but ONLY inside an explicit hash field.  A 64-hex
+# string in an arbitrary scalar position is a token-shaped secret and is
+# redacted (C-122 acceptance).
+_HEX_HASH_RE = re.compile(r"^[0-9a-fA-F]{32,128}$")
+# A strict SHA-256 digest (exactly 64 lowercase hex).  Digest fields in the
+# committed evidence — Companion build fingerprint, bridge-state file hash,
+# manifest entry hashes - must be exact 64-hex, not the looser 32-128 range of
+# ``_HEX_HASH_RE`` (which is a secret-scanning shape, not a schema validator).
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+# Token-like strings: long, dense, no whitespace — covers base64url JWTs
+# (header.payload.signature) and bearer-token shapes.
+_TOKEN_ISH_RE = re.compile(r"^[A-Za-z0-9+/=_.\-]{48,}$")
+
+# Sentinel schemas for the per-check evidence whitelist DSL.
+_EVIDENCE_SCALAR = object()  # any scalar; strings are desensitized on the way out
+_EVIDENCE_HASH = object()  # a content-addressable hash binding (kept as-is)
+
+
+def _desensitize_check_scalar(value: str) -> str:
+    """Desensitize one scalar string carried by the compact's check evidence.
+
+    URL-bearing values, long token-like credentials and any pure 32-128 hex
+    string are all redacted: a hex string is only a safe content-addressable
+    binding inside an explicit ``_EVIDENCE_HASH`` field, never an arbitrary
+    scalar (C-122 acceptance)."""
+    if "://" in value or value.startswith(("http://", "https://", "www.")):
+        return f"url#{_sha256_hex(value)[:16]}"
+    if _HEX_HASH_RE.fullmatch(value) is not None or _TOKEN_ISH_RE.fullmatch(value) is not None:
+        return f"secret#{_sha256_hex(value)[:16]}"
+    return value
+
+
+def _desensitize_check_value(value: Any, schema: Any) -> Any:
+    """Copy ``value`` into the compact strictly guided by ``schema``.
+
+    Schema shapes:
+
+      * ``_EVIDENCE_SCALAR`` — keep any scalar (strings desensitized); a
+        list/dict in a scalar position is dropped (never a recursive copy).
+      * ``_EVIDENCE_HASH`` — keep a content-addressable binding string (hex
+        sha256 / git SHA, or a ``kind:<hex>`` reference); anything else is
+        desensitized like a scalar.
+      * ``{"_item": schema}`` — a list; each item copied against ``schema``.
+      * ``{"_dict": schema}`` — a dict whose VALUES are copied against
+        ``schema`` (keys are opaque identifiers, e.g. option ids).
+      * ``{key: schema, ...}`` — a dict; only the listed keys are copied.
+
+    Unknown keys are dropped everywhere, so the compact can never carry an
+    incidental recursive copy of the check's raw evidence dict (C-122
+    acceptance).
+    """
+    if schema is _EVIDENCE_SCALAR:
+        if isinstance(value, str):
+            return _desensitize_check_scalar(value)
+        if isinstance(value, (dict, list, tuple)):
+            return None
+        return value
+    if schema is _EVIDENCE_HASH:
+        if isinstance(value, str):
+            binding = value.rsplit(":", 1)[-1] if ":" in value else value
+            if _HEX_HASH_RE.fullmatch(binding) is not None:
+                return value
+            return _desensitize_check_scalar(value)
+        return value
+    if isinstance(schema, dict):
+        if "_item" in schema:
+            if not isinstance(value, list):
+                return None
+            item_schema = schema["_item"]
+            copied = [_desensitize_check_value(item, item_schema) for item in value]
+            return [item for item in copied if item is not None]
+        if "_dict" in schema:
+            if not isinstance(value, dict):
+                return None
+            sub = schema["_dict"]
+            out: dict[str, Any] = {}
+            for key, item in value.items():
+                item_copy = _desensitize_check_value(item, sub)
+                if item_copy is not None:
+                    out[str(key)] = item_copy
+            return out
+        if not isinstance(value, dict):
+            return None
+        out = {}
+        for key, sub in schema.items():
+            if key in value:
+                item_copy = _desensitize_check_value(value[key], sub)
+                if item_copy is not None:
+                    out[key] = item_copy
+        return out
+    return None
+
+
+# Per-check NESTED whitelist schemas for the compact.  The top-level field
+# whitelist (``_LAYER6_REQUIRED_EVIDENCE_FIELDS``) decides WHICH binding fields
+# a check may carry; this map describes the allowed sub-structure of the nested
+# ones (``options`` / ``dynamic_replan`` / ``freshness_by_option`` / …) so no
+# unknown nested field and no 64-hex token can ride into the committed compact
+# (C-122 acceptance).  Fields without an entry copy as ``_EVIDENCE_SCALAR``.
+_LAYER6_EVIDENCE_SCHEMAS: dict[str, dict[str, Any]] = {
+    "prefrozen_stay_plan_candidate_set": {
+        "candidate_set_sha256": _EVIDENCE_HASH,
+    },
+    "v4_source_graph": {
+        "expected_browser_tasks_per_pair": _EVIDENCE_SCALAR,
+        "expected_browser_source_ids": {"_item": _EVIDENCE_SCALAR},
+    },
+    "stage_aware_exploration_publication_contract": {
+        "exploration_count": _EVIDENCE_SCALAR,
+        "publication_count": _EVIDENCE_SCALAR,
+    },
+    "stay_inventory_four_state_contract": {
+        "minimum_exact_providers_per_selected_segment": _EVIDENCE_SCALAR,
+        "inventory_states": {"_item": _EVIDENCE_SCALAR},
+    },
+    "planner_verifier_repair_master_stay_plan_chain": {},
+    "recommendable_date_pair_stay_plan_options": {
+        "freshness_ttl_seconds": _EVIDENCE_SCALAR,
+        "freshness_by_option": {
+            "_dict": {
+                "_item": {
+                    "component_id": _EVIDENCE_SCALAR,
+                    "captured_at": _EVIDENCE_SCALAR,
+                    "expires_at": _EVIDENCE_SCALAR,
+                    "age_seconds_at_post_event_gate": _EVIDENCE_SCALAR,
+                    "ttl_seconds": _EVIDENCE_SCALAR,
+                    "fresh_at_post_event_gate": _EVIDENCE_SCALAR,
+                }
+            }
+        },
+    },
+    "icom_exploration_and_publication_evidence": {
+        "publication_target_task_ids": {"_item": _EVIDENCE_SCALAR},
+        "exploration_full_coverage": {"passed": _EVIDENCE_SCALAR},
+    },
+    "all_recommended_publication_closures": {
+        "options": {
+            "_dict": {
+                "evidence_scope": _EVIDENCE_SCALAR,
+                "planner_verifier_repair": {"passed": _EVIDENCE_SCALAR},
+                "budget_and_selected_evidence": {"passed": _EVIDENCE_SCALAR},
+                "public_transfer_evidence": {"passed": _EVIDENCE_SCALAR},
+            }
+        },
+    },
+    "real_v4_browser_source_evidence": {
+        "source_task_count": _EVIDENCE_SCALAR,
+        "snapshot_count": _EVIDENCE_SCALAR,
+    },
+    "flight_search_outcome_contract": {
+        "provider_outcome_states": {"_dict": _EVIDENCE_SCALAR},
+        "exact_provider_count": _EVIDENCE_SCALAR,
+        "comparison_provider_count": _EVIDENCE_SCALAR,
+        "price_bearing_provider_count": _EVIDENCE_SCALAR,
+    },
+    "observed_cross_platform_overlap": {
+        "interval_count": _EVIDENCE_SCALAR,
+        "max_overlapping_providers": _EVIDENCE_SCALAR,
+    },
+    "strict_selected_plan_platform_coverage": {
+        "providers": {"_item": _EVIDENCE_SCALAR},
+        "selected_stay_plan_id": _EVIDENCE_SCALAR,
+    },
+    "planner_verifier_repair_orchestrator": {
+        "graph_chain_ok": _EVIDENCE_SCALAR,
+        "reverify_node_present": _EVIDENCE_SCALAR,
+    },
+    "exact_budget_and_selected_evidence": {
+        "computed_total_cents": _EVIDENCE_SCALAR,
+        "declared_total_cents": _EVIDENCE_SCALAR,
+    },
+    "event_injection_repair_reverify_master": {
+        "dynamic_replan": {"passed": _EVIDENCE_SCALAR},
+        "read_only_graph": {"passed": _EVIDENCE_SCALAR},
+        "initial_stay_plan_id": _EVIDENCE_SCALAR,
+        "event_final_stay_plan_id": _EVIDENCE_SCALAR,
+    },
+}
+
+
+def _desensitized_check_evidence(
+    check: dict[str, Any], payload: dict[str, Any]
+) -> dict[str, Any]:
+    """The committed per-item structured evidence for one done-gate check.
+
+    Built from the check's per-name FIELD WHITELIST
+    (``_LAYER6_REQUIRED_EVIDENCE_FIELDS``) plus the NESTED schemas
+    (``_LAYER6_EVIDENCE_SCHEMAS``) — the recomputable observed+expected
+    bindings — plus any ``evidence_refs`` and the candidate-set SHA binding for
+    the prefrozen-candidate check.  Every nested level is copied strictly
+    through its schema, so the compact can only ever carry the known-safe
+    recomputable fields, never an incidental recursive copy of the check's raw
+    evidence dict, and no 64-hex token can pass through a non-hash position
+    (C-122 round-18 item 5 + acceptance).  Values are still desensitized on the
+    way out.
+    """
+    name = check.get("name")
+    whitelist = (
+        _LAYER6_REQUIRED_EVIDENCE_FIELDS.get(name, frozenset())
+        if isinstance(name, str)
+        else frozenset()
+    )
+    schemas = (
+        _LAYER6_EVIDENCE_SCHEMAS.get(name, {}) if isinstance(name, str) else {}
+    )
+    safe: dict[str, Any] = {}
+    raw_evidence = check.get("evidence")
+    if isinstance(raw_evidence, dict):
+        for key in whitelist:
+            if key == "evidence_refs" or key not in raw_evidence:
+                continue
+            copied = _desensitize_check_value(
+                raw_evidence[key], schemas.get(key, _EVIDENCE_SCALAR)
+            )
+            if copied is not None:
+                safe[key] = copied
+    refs = check.get("evidence_refs") or ()
+    ref_list = [str(ref) for ref in refs if isinstance(ref, str)]
+    if ref_list:
+        safe.setdefault("evidence_refs", ref_list)
+    if name == "prefrozen_stay_plan_candidate_set":
+        candidate_sha = payload.get("api_payload_candidate_set_sha256")
+        if isinstance(candidate_sha, str) and len(candidate_sha) == 64:
+            safe.setdefault("candidate_set_sha256", candidate_sha)
+    if not safe:
+        safe["verdict"] = "passed"
+    return safe
+
+
+def _whitelisted_repo_revision(repo_revision: Any) -> dict[str, Any]:
+    """Repo-relative revision fields for the compact — never the absolute host
+    ``toplevel`` (C-122 round-18 item 5).  Only the repo-relative identifiers
+    and hashes (branch / commit_sha / worktree_dirty, plus the start-revision
+    comparison) leave the runtime.
+    """
+    if not isinstance(repo_revision, dict):
+        return {}
+    safe: dict[str, Any] = {
+        key: repo_revision.get(key)
+        for key in ("branch", "commit_sha", "worktree_dirty")
+        if key in repo_revision
+    }
+    if repo_revision.get("revision_changed_during_run") is True:
+        safe["revision_changed_during_run"] = True
+        start = repo_revision.get("start_revision")
+        if isinstance(start, dict):
+            safe["start_revision"] = {
+                key: start.get(key)
+                for key in ("branch", "commit_sha", "worktree_dirty")
+                if key in start
+            }
+    return safe
+
+
 def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
     """Desensitized, independently reviewable layer-6 compact artifact.
 
@@ -2108,7 +3138,9 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
     evidence, and the event-injection repair/re-verify master), repo revision,
     timeout/runner/event-injection contracts, runtime identity and Companion
     preflight — never the raw request/quote/URL/account content of the E2E run
-    (C-114 R5).
+    (C-114 R5).  The compact carries only repo-relative identifiers and hashes;
+    absolute host paths (``toplevel`` / ``repo_toplevel``) are stripped
+    (C-122 round-18 item 5).
     """
     path = staging_dir / "live-done-gate-v4.json"
     if not path.is_file():
@@ -2136,18 +3168,25 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
                 "name": check.get("name"),
                 "passed": check.get("passed"),
                 "summary": check.get("summary"),
-                "evidence_refs": check.get("evidence_refs"),
+                "evidence_refs": [
+                    str(ref)
+                    for ref in (check.get("evidence_refs") or ())
+                    if isinstance(ref, str)
+                ],
+                # C-122 Fix 3: the desensitized, recomputable per-item structured
+                # evidence each check carries — never a bare verdict list.
+                "evidence": _desensitized_check_evidence(check, payload),
             }
             for check in checks
             if isinstance(check, dict) and check.get("name")
         ],
     }
     return {
-        "schema_version": "tripchord-done-gate-layer6-compact-v2",
+        "schema_version": _LAYER6_COMPACT_SCHEMA,
         "captured_at": payload.get("captured_at"),
         "run_status": payload.get("run_status"),
         "done_gate": done_gate,
-        "repo_revision": payload.get("repo_revision"),
+        "repo_revision": _whitelisted_repo_revision(payload.get("repo_revision")),
         "start_revision": payload.get("start_revision"),
         "failure": payload.get("failure"),
         "timeout_contract": payload.get("timeout_contract"),
@@ -2163,7 +3202,6 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
             "model_enabled": rb.get("model_enabled"),
             "model_required": rb.get("model_required"),
             "runtime_provenance": {
-                "repo_toplevel": rp.get("repo_toplevel"),
                 "commit_sha": rp.get("commit_sha"),
                 "dependency_lock_sha256": rp.get("dependency_lock_sha256"),
                 "live_system_source_sha256": rp.get("live_system_source_sha256"),
@@ -2173,6 +3211,7 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
         },
         "companion_preflight": {
             "status": cp.get("status"),
+            "stale_after_seconds": cp.get("stale_after_seconds"),
             "companions": [
                 {
                     "companion_id": comp.get("companion_id"),
@@ -2181,6 +3220,12 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
                 for comp in companions
             ],
         },
+        # C-122 Fix 2 + round-18 item 6: the lease-evidence bindings — the exact
+        # bridge-state file (path) checked BEFORE the run and AGAIN AFTER it,
+        # each with its SHA256 hash, so a reviewer can re-verify the isolation
+        # proof from both sides of the run from the committed trail.
+        "bridge_state_lease_preflight": _bridge_state_binding(),
+        "bridge_state_lease_postcheck": _bridge_state_after_binding(),
         "raw_evidence": {
             "file": "live-done-gate-v4.json",
             "committed": False,
@@ -2236,14 +3281,18 @@ def _evidence_manifest(
     *,
     evidence_commit: str | None = None,
 ) -> dict[str, Any]:
-    """Build the committed-evidence contract manifest for a passing gate."""
+    """Build the committed-evidence contract manifest for a passing gate.
+
+    Never carries the absolute host ``toplevel`` (C-122 round-18 gate-6): a
+    committed artifact must not reveal the host filesystem layout, so the
+    manifest names only repo-relative identifiers and hashes.
+    """
     return {
         "schema_version": _MANIFEST_SCHEMA,
         "tested_commit_sha": report.tested_commit_sha,
         "run_id": report.run_id,
         "evidence_commit": evidence_commit,
         "generated_at": report.generated_at,
-        "toplevel": report.toplevel,
         "branch": report.branch,
         "files": _manifest_files(staging_dir),
         "layer_verdicts": {
@@ -2253,12 +3302,14 @@ def _evidence_manifest(
     }
 
 
-def _write_manifest(manifest: dict[str, Any]) -> Path:
+def _write_manifest(manifest: dict[str, Any], target: Path) -> Path:
     # Atomic + owner-only (C-118): the manifest is part of the committed trail,
     # so it must never be observable partially written or with looser
-    # permissions than 0600.
+    # permissions than 0600.  ``target`` is the exclusive staging location (the
+    # shared worktree is never written — C-122 P0), from which the temp index
+    # is populated via hash-object + update-index.
     return _write_atomic(
-        ROOT / _MANIFEST_REL,
+        target,
         json.dumps(
             manifest,
             ensure_ascii=False,
@@ -2312,12 +3363,111 @@ def _verify_required_evidence_inputs(staging_dir: Path) -> None:
 def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -> None:
     """C-118: hard-verify the committed layer-5 compact from E's blob.
 
-    Requires the exact six certified scopes — no fewer, no extra — each
-    passed/fresh/authorized/read_only, plus the coverage thresholds naming the
-    same six scopes with all observed/passed counts equal.  A compact that omits
-    a scope, adds a non-certified scope, or records any scope as not
-    passed/fresh/authorized/read_only fails the phase closed.
+    Requires the exact six certified scopes — no fewer, no extra, each unique,
+    each passed/fresh/authorized/read_only — plus the coverage thresholds naming
+    the same six scopes with all observed/passed counts equal.  A compact that
+    omits a scope, adds a non-certified scope, repeats a scope, carries a
+    malformed (non-object / nameless) entry, or records any scope as not
+    passed/fresh/authorized/read_only fails the phase closed (C-122 Fix 6).
+
+    Every scope must also carry its per-scope authentication binding: a browser
+    scope proves it via a fresh Companion identity (``companion_id``) that
+    authorizes exactly this scope key (``authorized_scope_keys``); the icom
+    public-API scope proves it via a real read-only query ``sample``.  A scope
+    reduced to a bare verdict, or whose evidence does not bind it to an
+    authenticated identity for that scope, fails closed.
     """
+    if compact.get("schema_version") != _LAYER5_COMPACT_SCHEMA:
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} schema_version "
+            f"{compact.get('schema_version')!r} != {_LAYER5_COMPACT_SCHEMA} "
+            "(producer and validator must share the same schema version)"
+        )
+    # C-122 round-18 gate-5: semantic (not just non-empty) top-level validation
+    # — a compact must itself declare passed=true with the bridge token present
+    # (a real authenticated Companion session), backed by a connected/fresh
+    # Companion whose authorized scope set is EXACTLY the six certified scopes.
+    if compact.get("passed") is not True:
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} top-level passed "
+            "!= true"
+        )
+    if compact.get("bridge_token_present") is not True:
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} "
+            "bridge_token_present != true"
+        )
+    companion_status = compact.get("companion_status")
+    if not isinstance(companion_status, dict):
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} lacks "
+            "companion_status"
+        )
+    if companion_status.get("status") != "connected":
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} companion_status "
+            f"status {companion_status.get('status')!r} != 'connected'"
+        )
+    stale_after = companion_status.get("stale_after_seconds")
+    if (
+        not isinstance(stale_after, int)
+        or isinstance(stale_after, bool)
+        or stale_after <= 0
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} companion_status "
+            "has no positive stale_after_seconds"
+        )
+    companion_list = companion_status.get("companions")
+    if not isinstance(companion_list, list) or not companion_list:
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} companion_status "
+            "has no companions"
+        )
+    for companion in companion_list:
+        if not isinstance(companion, dict):
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} companion "
+                "status entry is not an object"
+            )
+        if not isinstance(companion.get("companion_id"), str) or not companion[
+            "companion_id"
+        ]:
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} companion "
+                "entry lacks a companion_id"
+            )
+        if companion.get("is_fresh") is not True:
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} companion "
+                "is not fresh"
+            )
+        companion_scopes = companion.get("authorized_scope_keys")
+        if not isinstance(companion_scopes, list) or set(companion_scopes) != set(
+            _CERTIFIED_OTA_SCOPES
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} companion "
+                "authorized_scope_keys != the six certified OTA scopes"
+            )
+        build_sha = companion.get("build_sha256")
+        if (
+            not isinstance(build_sha, str)
+            or _SHA256_HEX_RE.fullmatch(build_sha) is None
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} companion "
+                "lacks a valid 64-hex build_sha256"
+            )
+    # C-122 round-18: a browser scope's evidence Companion identity must be one
+    # of the top-level CONNECTED companions — a scope may not bind a "fresh
+    # Companion" that the compact's own companion_status never lists as
+    # connected/fresh.
+    top_companion_ids = {
+        companion.get("companion_id")
+        for companion in companion_list
+        if isinstance(companion, dict) and isinstance(companion.get("companion_id"), str)
+    }
     expected = sorted(_CERTIFIED_OTA_SCOPES)
     coverage = compact.get("coverage")
     if not isinstance(coverage, dict):
@@ -2358,11 +3508,30 @@ def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
         )
     present: set[str] = set()
     for entry in scopes:
+        # Fix 6: a malformed (non-object) entry fails closed — it is never
+        # silently skipped and left for the final set comparison to catch.
         if not isinstance(entry, dict):
-            continue
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} has a "
+                "malformed scope entry (not an object)"
+            )
         scope = entry.get("scope")
-        if isinstance(scope, str):
-            present.add(scope)
+        if not isinstance(scope, str) or not scope:
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} has a scope "
+                "entry with a missing or invalid scope name"
+            )
+        if scope in present:
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} repeats scope "
+                f"{scope!r} (scope names must be unique)"
+            )
+        if scope not in _CERTIFIED_OTA_SCOPES:
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} scope {scope!r} "
+                "is not one of the six certified scopes"
+            )
+        present.add(scope)
         if not (
             entry.get("passed") is True
             and entry.get("fresh") is True
@@ -2371,8 +3540,119 @@ def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
         ):
             raise GateStateChangedError(
                 f"evidence commit E layer-5 compact {tracked_rel} scope "
-                f"{entry.get('scope')!r} not passed/fresh/authorized/read_only"
+                f"{scope!r} not passed/fresh/authorized/read_only"
             )
+        # C-122 round-18: the scope entry must carry its real ``kind`` and
+        # ``provider`` (produced by the certified canary), never a forged or
+        # missing kind/provider.
+        scope_kind = entry.get("kind")
+        if not isinstance(scope_kind, str) or not scope_kind:
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} scope "
+                f"{scope!r} carries no canary kind"
+            )
+        scope_provider = entry.get("provider")
+        expected_provider = scope.split(":", 1)[0]
+        if not isinstance(scope_provider, str) or scope_provider != expected_provider:
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} scope "
+                f"{scope!r} provider {scope_provider!r} != expected "
+                f"{expected_provider!r}"
+            )
+        # C-122 Fix 3: each scope must carry its desensitized per-scope evidence
+        # binding (companion identity, heartbeat fields or the read-only query
+        # sample) in the committed compact — a scope reduced to a bare verdict
+        # fails closed.
+        scope_evidence = entry.get("evidence")
+        if not isinstance(scope_evidence, dict) or not scope_evidence:
+            raise GateStateChangedError(
+                f"evidence commit E layer-5 compact {tracked_rel} scope "
+                f"{scope!r} carries no per-scope evidence binding"
+            )
+        # C-122 Fix 6: per-item authentication.  A browser scope's evidence must
+        # name a Companion that authorizes exactly this scope; the icom scope's
+        # evidence must carry the read-only public query sample that produced
+        # the quote.
+        if scope.startswith("icom:"):
+            # C-122 round-18: a passing icom canary must prove a positive quote
+            # count AND the price/currency/departure-time fields of the quoted
+            # sample — a sample reduced to a service name alone is not a quote.
+            options = scope_evidence.get("options")
+            if (
+                not isinstance(options, int)
+                or isinstance(options, bool)
+                or options <= 0
+            ):
+                raise GateStateChangedError(
+                    f"evidence commit E layer-5 compact {tracked_rel} scope "
+                    f"{scope!r} carries no positive option count "
+                    "(positive options required)"
+                )
+            sample = scope_evidence.get("sample")
+            sample_fare = (
+                sample.get("fare_amount") if isinstance(sample, dict) else None
+            )
+            sample_currency = (
+                sample.get("currency") if isinstance(sample, dict) else None
+            )
+            sample_departure = (
+                sample.get("departure_at") if isinstance(sample, dict) else None
+            )
+            if (
+                not isinstance(sample, dict)
+                or not sample.get("service_name")
+                or not isinstance(sample_fare, str)
+                or not sample_fare
+                or not isinstance(sample_currency, str)
+                or not sample_currency
+                or not isinstance(sample_departure, str)
+                or not sample_departure
+            ):
+                raise GateStateChangedError(
+                    f"evidence commit E layer-5 compact {tracked_rel} scope "
+                    f"{scope!r} sample must carry service_name + fare_amount + "
+                    "currency + departure_at (real quote binding)"
+                )
+        else:
+            companion_id = scope_evidence.get("companion_id")
+            authorized = scope_evidence.get("authorized_scope_keys")
+            if not isinstance(companion_id, str) or not companion_id:
+                raise GateStateChangedError(
+                    f"evidence commit E layer-5 compact {tracked_rel} scope "
+                    f"{scope!r} carries no Companion identity "
+                    "(per-scope authentication)"
+                )
+            if companion_id not in top_companion_ids:
+                raise GateStateChangedError(
+                    f"evidence commit E layer-5 compact {tracked_rel} scope "
+                    f"{scope!r} Companion {companion_id!r} is not in the "
+                    "connected companion_status companions"
+                )
+            if not isinstance(authorized, list) or scope not in {
+                item for item in authorized if isinstance(item, str)
+            }:
+                raise GateStateChangedError(
+                    f"evidence commit E layer-5 compact {tracked_rel} scope "
+                    f"{scope!r} is not authorized by its Companion evidence "
+                    "(per-scope authentication)"
+                )
+            # C-122 round-18: the browser heartbeat receipt must be real and
+            # complete — beyond the identity, the evidence must carry at least
+            # one heartbeat-record field proving an actual Companion handshake
+            # (adapter/contract version or runtime instance id).
+            receipt_fields = (
+                scope_evidence.get("adapter_version"),
+                scope_evidence.get("contract_version"),
+                scope_evidence.get("runtime_instance_id"),
+            )
+            if not any(
+                isinstance(value, str) and value for value in receipt_fields
+            ):
+                raise GateStateChangedError(
+                    f"evidence commit E layer-5 compact {tracked_rel} scope "
+                    f"{scope!r} Companion evidence carries no heartbeat receipt "
+                    "(adapter_version/contract_version/runtime_instance_id)"
+                )
     if present != set(expected):
         raise GateStateChangedError(
             f"evidence commit E layer-5 compact {tracked_rel} scope set != the "
@@ -2380,7 +3660,364 @@ def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
         )
 
 
-def _verify_layer6_compact_contract(tracked_rel: str, compact: dict[str, Any]) -> None:
+def _verify_layer6_check_semantics(
+    tracked_rel: str, check_name: str, evidence: dict[str, Any]
+) -> None:
+    """C-122 acceptance: a passing check's compacted evidence must be
+    semantically consistent with its verdict — never just field-presence."""
+    if check_name == "planner_verifier_repair_orchestrator":
+        if evidence.get("graph_chain_ok") is not True:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} evidence graph_chain_ok is not true"
+            )
+        if evidence.get("reverify_node_present") is not True:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} evidence reverify_node_present is not true"
+            )
+    elif check_name == "exact_budget_and_selected_evidence":
+        computed = evidence.get("computed_total_cents")
+        declared = evidence.get("declared_total_cents")
+        if (
+            not isinstance(computed, int)
+            or isinstance(computed, bool)
+            or not isinstance(declared, int)
+            or isinstance(declared, bool)
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} budget totals are not integers"
+            )
+        if computed != declared:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} computed_total_cents != declared_total_cents"
+            )
+    elif check_name == "event_injection_repair_reverify_master":
+        dynamic = evidence.get("dynamic_replan")
+        if not isinstance(dynamic, dict) or dynamic.get("passed") is not True:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} dynamic_replan sub-item is not passed"
+            )
+        read_only = evidence.get("read_only_graph")
+        if not isinstance(read_only, dict) or read_only.get("passed") is not True:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} read_only_graph sub-item is not passed"
+            )
+        if evidence.get("initial_stay_plan_id") != evidence.get(
+            "event_final_stay_plan_id"
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} event replan changed the frozen stay plan"
+            )
+    elif check_name == "flight_search_outcome_contract":
+        states = evidence.get("provider_outcome_states")
+        if not isinstance(states, dict) or not states:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} provider_outcome_states is not a non-empty object"
+            )
+        allowed = {"quote_found", "comparison_price_only", "bounded_no_exact_quote"}
+        for provider, state in states.items():
+            if state not in allowed:
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{check_name!r} provider {provider!r} outcome state "
+                    f"{state!r} is not a terminal flight-search state"
+                )
+        exact = evidence.get("exact_provider_count")
+        price_bearing = evidence.get("price_bearing_provider_count")
+        # C-122 round-18 gate-5: the validator mirrors the producer contract —
+        # at least one exact provider AND >= 2 price-bearing providers
+        # (exact + comparison).  The red line 严禁降低双平台精确报价阈值 2 is
+        # enforced as ``price_bearing_provider_count >= 2`` here plus
+        # ``minimum_exact_providers_per_selected_segment >= 2`` in the inventory
+        # contract; the reviewer's literal ``exact_provider_count>=2`` would
+        # reject legitimate producer-certified runs with 1 exact + 1 comparison.
+        if not isinstance(exact, int) or isinstance(exact, bool) or exact < 1:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} exact_provider_count < 1"
+            )
+        if (
+            not isinstance(price_bearing, int)
+            or isinstance(price_bearing, bool)
+            or price_bearing < 2
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} price_bearing_provider_count < 2 "
+                "(dual-platform threshold)"
+            )
+    elif check_name == "stay_inventory_four_state_contract":
+        minimum = evidence.get("minimum_exact_providers_per_selected_segment")
+        if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 2:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} minimum_exact_providers_per_selected_segment "
+                "< 2 (dual-platform exact-quote threshold)"
+            )
+    elif check_name == "recommendable_date_pair_stay_plan_options":
+        ttl = evidence.get("freshness_ttl_seconds")
+        if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl <= 0:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} freshness_ttl_seconds is not a positive integer"
+            )
+        freshness = evidence.get("freshness_by_option")
+        if not isinstance(freshness, dict) or not freshness:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} freshness_by_option is empty"
+            )
+        for option_id, components in freshness.items():
+            if not isinstance(components, list) or not components:
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{check_name!r} option {option_id!r} has no freshness "
+                    "component evidence"
+                )
+            if any(
+                not isinstance(component, dict)
+                or component.get("fresh_at_post_event_gate") is not True
+                for component in components
+            ):
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{check_name!r} option {option_id!r} has a stale component"
+                )
+    elif check_name == "all_recommended_publication_closures":
+        options = evidence.get("options")
+        if not isinstance(options, dict) or not options:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} options is empty"
+            )
+        for option_id, option in options.items():
+            if not isinstance(option, dict):
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{check_name!r} option {option_id!r} is not an object"
+                )
+            for sub in (
+                "planner_verifier_repair",
+                "budget_and_selected_evidence",
+                "public_transfer_evidence",
+            ):
+                sub_value = option.get(sub)
+                if not isinstance(sub_value, dict) or sub_value.get("passed") is not True:
+                    raise GateStateChangedError(
+                        f"evidence commit E layer-6 compact {tracked_rel} check "
+                        f"{check_name!r} option {option_id!r} {sub} is not passed"
+                    )
+    elif check_name == "v4_source_graph":
+        # C-122 round-18 gate-2: a passing v4 source graph must carry a
+        # POSITIVE browser-task-per-pair count — 0 / negative / non-int counts
+        # cannot prove the fixed per-pair browser query plan.
+        expected_tasks = evidence.get("expected_browser_tasks_per_pair")
+        if (
+            not isinstance(expected_tasks, int)
+            or isinstance(expected_tasks, bool)
+            or expected_tasks < 1
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} expected_browser_tasks_per_pair is not a "
+                "positive integer"
+            )
+        source_ids = evidence.get("expected_browser_source_ids")
+        if not isinstance(source_ids, list) or not source_ids:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} expected_browser_source_ids is empty"
+            )
+        if len(source_ids) != len(set(source_ids)):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} expected_browser_source_ids are not unique"
+            )
+    elif check_name == "stage_aware_exploration_publication_contract":
+        # C-122 round-18 gate-2: the fixed stage contract — three sealed
+        # explorations and two publication refreshes — is a semantic invariant,
+        # not just a count of records.
+        exploration = evidence.get("exploration_count")
+        publication = evidence.get("publication_count")
+        if (
+            not isinstance(exploration, int)
+            or isinstance(exploration, bool)
+            or not isinstance(publication, int)
+            or isinstance(publication, bool)
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} exploration/publication counts are not integers"
+            )
+        if exploration != 3 or publication != 2:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} must seal exactly 3 explorations and 2 "
+                f"publication refreshes (got {exploration}/{publication})"
+            )
+    elif check_name == "real_v4_browser_source_evidence":
+        # C-122 round-18 gate-2: every browser Source task must carry exactly
+        # one snapshot — a count mismatch is a broken evidence chain, and
+        # negative/non-int counts are forged.
+        source_count = evidence.get("source_task_count")
+        snapshot_count = evidence.get("snapshot_count")
+        if (
+            not isinstance(source_count, int)
+            or isinstance(source_count, bool)
+            or source_count < 0
+            or not isinstance(snapshot_count, int)
+            or isinstance(snapshot_count, bool)
+            or snapshot_count < 0
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} source/snapshot counts are not non-negative integers"
+            )
+        if source_count != snapshot_count:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} snapshot_count {snapshot_count} != "
+                f"source_task_count {source_count}"
+            )
+    elif check_name == "observed_cross_platform_overlap":
+        # C-122 round-18 gate-2: a passing overlap proof requires at least three
+        # time intervals with THREE DISTINCT providers truly concurrent — a
+        # forged single-provider overlap must fail closed.
+        interval_count = evidence.get("interval_count")
+        max_providers = evidence.get("max_overlapping_providers")
+        if (
+            not isinstance(interval_count, int)
+            or isinstance(interval_count, bool)
+            or interval_count < 1
+            or not isinstance(max_providers, int)
+            or isinstance(max_providers, bool)
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} overlap counts are not integers"
+            )
+        if interval_count < 3 or max_providers != 3:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} does not prove 3-provider concurrent overlap "
+                f"(intervals={interval_count}, max_providers={max_providers})"
+            )
+    elif check_name == "strict_selected_plan_platform_coverage":
+        # C-122 round-18 gate-2: the strict coverage evidence must name EXACTLY
+        # the fixed three OTA platforms — a partial or foreign provider list is
+        # a forged completion receipt.
+        providers = evidence.get("providers")
+        if (
+            not isinstance(providers, list)
+            or len(providers) != len(_BROWSER_OTA_PROVIDERS)
+            or set(providers) != _BROWSER_OTA_PROVIDERS
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} providers != the fixed three-OTA platform set"
+            )
+    elif check_name == "icom_exploration_and_publication_evidence":
+        # C-122 round-18 gate-2: the icom exploration coverage must be a TRUE
+        # pass — a ``{"passed": false}`` (or any non-pass) binding cannot back a
+        # passing check.
+        coverage = evidence.get("exploration_full_coverage")
+        if (
+            not isinstance(coverage, dict)
+            or coverage.get("passed") is not True
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} exploration_full_coverage is not passed"
+            )
+        target_task_ids = evidence.get("publication_target_task_ids")
+        if not isinstance(target_task_ids, list) or not target_task_ids:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} publication_target_task_ids is empty"
+            )
+        if len(target_task_ids) != len(set(target_task_ids)):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} publication_target_task_ids are not unique"
+            )
+
+
+def _verify_bridge_state_binding(
+    compact: dict[str, Any], tracked_rel: str, key: str
+) -> None:
+    """Validate one bridge-state lease binding in a layer-6 compact.
+
+    Contract-required for BOTH the pre-run ``bridge_state_lease_preflight`` and
+    the post-run ``bridge_state_lease_postcheck`` bindings (C-122 Fix 2 +
+    round-18 item 6): a passing layer-6 gate must record the repo-relative
+    bridge-state file identifier (never an absolute host path), the SHA256 of
+    the exact bytes the snapshot validated, and the snapshot RESULT — an empty
+    residual list (lease isolation proven).  When the named file still exists,
+    the recorded SHA is recomputed against the actual bytes; a stale or forged
+    hash fails closed.  Raises ``GateStateChangedError`` on any violation.
+    """
+    binding = compact.get(key)
+    if not isinstance(binding, dict):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} lacks the "
+            f"{key} binding"
+        )
+    bridge_file = binding.get("file")
+    if (
+        not isinstance(bridge_file, str)
+        or not bridge_file
+        or os.path.isabs(bridge_file)
+        or any(part == ".." for part in Path(bridge_file).parts)
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} "
+            f"{key} has no repo-relative file identifier"
+        )
+    binding_sha = binding.get("sha256")
+    if (
+        not isinstance(binding_sha, str)
+        or len(binding_sha) != 64
+        or _HEX_HASH_RE.fullmatch(binding_sha) is None
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} "
+            f"{key} has no valid sha256"
+        )
+    binding_residual = binding.get("residual")
+    if not isinstance(binding_residual, list) or binding_residual:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} "
+            f"{key} residual is not an empty list "
+            "(lease isolation not proven)"
+        )
+    # Recompute the binding when the named file still exists: a recorded SHA
+    # that does not match the actual bytes of the repo-relative file is stale
+    # or forged.  When the file no longer exists (runtime cleanup), the recorded
+    # residual result above remains the binding proof.
+    bridge_live = ROOT / bridge_file
+    if bridge_live.is_file():
+        actual_sha = _sha256_file(bridge_live)
+        if actual_sha != binding_sha:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} "
+                f"{key} sha256 does not match the "
+                "current bridge-state file bytes"
+            )
+
+
+def _verify_layer6_compact_contract(
+    tracked_rel: str,
+    compact: dict[str, Any],
+    *,
+    tested_commit_sha: str | None = None,
+) -> None:
     """C-118: hard-verify the committed layer-6 compact from E's blob.
 
     Requires the exact fifteen done-gate checks, all passed, with
@@ -2388,7 +4025,20 @@ def _verify_layer6_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
     Companion identity and the event-injection / timeout / runner contracts.
     A compact missing a required check, carrying a non-passed check, or missing
     an identity/binding field fails the phase closed.
+
+    C-122 acceptance: the compact must use the SAME schema version the producer
+    emits, and validation is semantic, not just field-presence — a check whose
+    recorded evidence contradicts a passing verdict (broken planner chain,
+    mismatched budget, failed dynamic replan, sub-threshold exact providers,
+    pending/evil provider states, a repo/runtime/tested SHA mismatch, or a
+    missing candidate/scenario SHA binding) fails closed.
     """
+    if compact.get("schema_version") != _LAYER6_COMPACT_SCHEMA:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} schema_version "
+            f"{compact.get('schema_version')!r} != {_LAYER6_COMPACT_SCHEMA} "
+            "(producer and validator must share the same schema version)"
+        )
     done_gate = compact.get("done_gate")
     if not isinstance(done_gate, dict):
         raise GateStateChangedError(
@@ -2432,6 +4082,95 @@ def _verify_layer6_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
             f"evidence commit E layer-6 compact {tracked_rel} required check "
             "names do not match the fifteen done-gate checks"
         )
+    # C-122 Fix 3: every check must carry its desensitized, recomputable
+    # per-item structured evidence, and each check's binding fields must be
+    # present — a compact that reduces a check to a bare verdict (empty or
+    # missing evidence, dropped binding) fails closed.
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        name = check.get("name")
+        item_evidence = check.get("evidence")
+        if not isinstance(item_evidence, dict) or not item_evidence:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{name!r} carries no per-item structured evidence"
+            )
+        required = _LAYER6_REQUIRED_EVIDENCE_FIELDS.get(name)
+        if required:
+            missing = sorted(required - set(item_evidence))
+            if missing:
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{name!r} evidence missing required binding field(s): "
+                    + ", ".join(missing)
+                )
+            # C-122 round-18 item 5: a required binding field whose value is
+            # None or an empty container cannot be recomputed from the committed
+            # trail — it fails closed instead of passing on key-existence alone.
+            for key in sorted(required):
+                value = item_evidence.get(key)
+                if value is None:
+                    raise GateStateChangedError(
+                        f"evidence commit E layer-6 compact {tracked_rel} check "
+                        f"{name!r} evidence binding field {key!r} is None"
+                    )
+                if isinstance(value, (dict, list, tuple, str)) and not value:
+                    raise GateStateChangedError(
+                        f"evidence commit E layer-6 compact {tracked_rel} check "
+                        f"{name!r} evidence binding field {key!r} is empty"
+                    )
+        # C-122 acceptance: semantic consistency of each passing check — the
+        # recorded evidence must prove the verdict, not merely exist.
+        if isinstance(name, str):
+            _verify_layer6_check_semantics(tracked_rel, name, item_evidence)
+    # Recomputable SHA bindings: the candidate-set SHA and the scenario SHA are
+    # REQUIRED and must be well-formed 64-hex (a missing binding voids the
+    # compact), and the prefrozen-candidate binding in the compact must agree
+    # with the report's top-level api_payload_candidate_set_sha256.
+    candidate_sha = compact.get("api_payload_candidate_set_sha256")
+    if (
+        candidate_sha is None
+        or not isinstance(candidate_sha, str)
+        or _HEX_HASH_RE.fullmatch(candidate_sha) is None
+        or len(candidate_sha) != 64
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} "
+            "api_payload_candidate_set_sha256 is missing or not a valid sha256"
+        )
+    scenario_sha = compact.get("scenario_sha256")
+    if (
+        scenario_sha is None
+        or not isinstance(scenario_sha, str)
+        or _HEX_HASH_RE.fullmatch(scenario_sha) is None
+        or len(scenario_sha) != 64
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} scenario_sha256 "
+            "is missing or not a valid sha256"
+        )
+    for check in checks:
+        if not isinstance(check, dict) or check.get("name") != (
+            "prefrozen_stay_plan_candidate_set"
+        ):
+            continue
+        ev = check.get("evidence")
+        ev_binding = ev.get("candidate_set_sha256") if isinstance(ev, dict) else None
+        if (
+            not isinstance(ev_binding, str)
+            or len(ev_binding) != 64
+            or _HEX_HASH_RE.fullmatch(ev_binding) is None
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} "
+                "prefrozen_stay_plan_candidate_set has no valid candidate_set_sha256"
+            )
+        if candidate_sha is not None and ev_binding.lower() != candidate_sha.lower():
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} prefrozen "
+                "candidate-set SHA does not match api_payload_candidate_set_sha256"
+            )
     # Repo / runtime / Companion identity plus the event-injection / timeout /
     # runner contracts: the independently reviewable bindings a passing layer-6
     # must preserve in the committed trail.
@@ -2457,16 +4196,253 @@ def _verify_layer6_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
             f"evidence commit E layer-6 compact {tracked_rel} runtime_before_run "
             "is not an object"
         )
+    # C-122 Fix 2 + round-18 item 3/6: the lease-evidence bindings are
+    # contract-required for BOTH the pre-run preflight and the post-run
+    # postcheck — a passing layer-6 gate must record the repo-relative
+    # bridge-state file identifier, the SHA256 of the exact bytes each snapshot
+    # validated, and each snapshot RESULT (an empty residual list).  The
+    # identifier must be repo-relative (never an absolute host path) and the
+    # residual lists must be empty (lease isolation proven before AND after the
+    # run).
+    _verify_bridge_state_binding(
+        compact, tracked_rel, "bridge_state_lease_preflight"
+    )
+    _verify_bridge_state_binding(
+        compact, tracked_rel, "bridge_state_lease_postcheck"
+    )
+    # C-122 Fix 3: a completed run must be claimed as completed, and the
+    # identity / contract objects must carry their real binding fields — a
+    # compact with an empty or malformed identity object fails closed.
+    if compact.get("run_status") != "completed":
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} run_status "
+            f"{compact.get('run_status')!r} != 'completed'"
+        )
+    repo_revision = compact.get("repo_revision") or {}
+    repo_sha = repo_revision.get("commit_sha")
+    if (
+        not isinstance(repo_sha, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", repo_sha) is None
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} repo_revision."
+            "commit_sha is not a valid 40-hex git SHA"
+        )
+    if not isinstance(repo_revision.get("worktree_dirty"), bool) or repo_revision[
+        "worktree_dirty"
+    ] is not False:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} repo_revision "
+            "worktree_dirty is not False"
+        )
+    if "toplevel" in repo_revision:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} repo_revision "
+            "carries an absolute host toplevel (C-122 round-18 item 5)"
+        )
+    runtime_provenance = (compact.get("runtime_before_run") or {}).get(
+        "runtime_provenance"
+    )
+    if not isinstance(runtime_provenance, dict):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} runtime_before_run "
+            "lacks runtime_provenance"
+        )
+    runtime_sha = runtime_provenance.get("commit_sha")
+    if (
+        not isinstance(runtime_sha, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", runtime_sha) is None
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} runtime "
+            "provenance commit_sha is not a valid 40-hex git SHA"
+        )
+    if "repo_toplevel" in runtime_provenance:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} runtime "
+            "provenance carries an absolute host repo_toplevel "
+            "(C-122 round-18 item 5)"
+        )
+    # C-122 round-18 item 5: the runtime identity must name the SAME revision
+    # the compact claims to have tested — a mismatch voids the provenance.
+    if repo_sha.lower() != runtime_sha.lower():
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} repo_revision "
+            "commit_sha != runtime provenance commit_sha"
+        )
+    # C-122 acceptance: the compact's tested revision must ALSO bind the run's
+    # tested_commit_sha (S) — repo == runtime == S, or the compact cannot be
+    # attributed to the code that was exercised.
+    if tested_commit_sha is not None and repo_sha.lower() != tested_commit_sha.lower():
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} repo_revision "
+            f"commit_sha {repo_sha!r} != tested_commit_sha {tested_commit_sha!r}"
+        )
+    companion_preflight = compact.get("companion_preflight") or {}
+    stale_after = companion_preflight.get("stale_after_seconds")
+    if (
+        not isinstance(stale_after, int)
+        or isinstance(stale_after, bool)
+        or stale_after <= 0
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} companion_preflight "
+            "has no positive stale_after_seconds"
+        )
+    # C-122 round-18 item 5: the Companion preflight must carry a healthy
+    # status — a disconnected/failed companion cannot back the E2E evidence.
+    if companion_preflight.get("status") != "connected":
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} companion_preflight "
+            "status != 'connected'"
+        )
+    companions = companion_preflight.get("companions")
+    if not isinstance(companions, list) or not companions:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} companion_preflight "
+            "has no companions"
+        )
+    for companion in companions:
+        if not isinstance(companion, dict):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} companion "
+                "preflight entry is not an object"
+            )
+        if not isinstance(companion.get("companion_id"), str) or not companion[
+            "companion_id"
+        ]:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} companion "
+                "preflight entry lacks a companion_id"
+            )
+        scopes = companion.get("authorized_scope_keys")
+        if not isinstance(scopes, list) or set(scopes) != set(_CERTIFIED_OTA_SCOPES):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} companion "
+                "preflight authorized_scope_keys != the six certified OTA scopes "
+                "(C-122 round-18 item 5)"
+            )
+    event_injection = compact.get("event_injection_contract")
+    if not isinstance(event_injection, dict) or not isinstance(
+        event_injection.get("mode"), str
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} "
+            "event_injection_contract lacks a mode"
+        )
+    timeout_contract = compact.get("timeout_contract")
+    if not isinstance(timeout_contract, dict) or not isinstance(
+        timeout_contract.get("server_execution_timeout_seconds"), int
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} timeout_contract "
+            "lacks server_execution_timeout_seconds"
+        )
+    runner_contract = compact.get("runner_contract")
+    if not isinstance(runner_contract, dict) or not isinstance(
+        runner_contract.get("require_model_enhancement"), bool
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} runner_contract "
+            "lacks require_model_enhancement"
+        )
+
+
+def _verify_manifest_recomputes(
+    staging_dir: Path, manifest: dict[str, Any], label: str
+) -> None:
+    """C-122 round-18 gate-3: recompute every manifest file hash from the
+    CURRENT staging bytes and byte-compare with the committed manifest.
+
+    A raw / compact / report file that changed after the manifest was generated
+    would otherwise publish a stale hash — the committed manifest must record the
+    exact bytes that exist at publish time, not the bytes that existed when the
+    manifest was first written.  A missing staging file (should not happen in
+    the commit phase) and a mismatched hash both fail closed.
+    """
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise GateStateChangedError(
+            f"{label} manifest files field is not a list; cannot recompute hashes"
+        )
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise GateStateChangedError(
+                f"{label} manifest has a non-object file entry"
+            )
+        staged_name = entry.get("name")
+        recorded = entry.get("sha256")
+        if not isinstance(staged_name, str) or not staged_name:
+            raise GateStateChangedError(
+                f"{label} manifest file entry has no name"
+            )
+        if not isinstance(recorded, str) or len(recorded) != 64:
+            raise GateStateChangedError(
+                f"{label} manifest file {staged_name!r} has no valid sha256"
+            )
+        staged = staging_dir / staged_name
+        if not staged.is_file():
+            raise GateStateChangedError(
+                f"{label} manifest names {staged_name!r} but the staging file "
+                "no longer exists"
+            )
+        actual = _sha256_file(staged)
+        if actual.lower() != recorded.lower():
+            raise GateStateChangedError(
+                f"{label} manifest sha256 for {staged_name!r} does not match "
+                "the current staging bytes (raw/compact changed after the "
+                "manifest was generated); refusing to publish a stale hash"
+            )
+
+
+def _verify_compact_recomputed(staging_dir: Path) -> None:
+    """C-122 round-18 gate-3: regenerate the desensitized layer-5/6 compacts
+    from the CURRENT raw bytes and byte-compare against the staged artifacts.
+
+    Compact generation is a deterministic function of the raw evidence, so a
+    regenerated compact that differs from the to-be-committed artifact proves the
+    compact was derived from different raw bytes than those on disk — the
+    committed compact would certify a stale quote/run snapshot.  Fails closed.
+    """
+    for staged_name, generator, layer in (
+        (_COMPACT_CANARY_STAGED_NAME, _compact_canary, "layer-5"),
+        (_COMPACT_E2E_STAGED_NAME, _compact_live_e2e, "layer-6"),
+    ):
+        staged = staging_dir / staged_name
+        if not staged.is_file():
+            continue
+        recomputed = generator(staging_dir)
+        if recomputed is None:
+            raise GateStateChangedError(
+                f"cannot recompute {layer} compact {staged_name} from the "
+                "current raw evidence"
+            )
+        serialized = json.dumps(
+            recomputed, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if serialized != staged.read_bytes():
+            raise GateStateChangedError(
+                f"recomputed {layer} compact {staged_name} differs from the "
+                "staged artifact (raw changed after compact generation); "
+                "refusing to publish stale compact evidence"
+            )
 
 
 def _verify_evidence_contract(
     evidence_commit: str,
     staging_dir: Path,
-    manifest: dict[str, Any],
+    *,
+    tested_commit_sha: str | None,
+    run_id: str,
 ) -> None:
     """Hard-verify E actually contains the contract-required manifest and every
     file the manifest marks committed (with a matching SHA256).  Any missing or
-    corrupted committed evidence fails the phase closed (exit 2)."""
+    corrupted committed evidence fails the phase closed (exit 2).
+
+    C-122 round-18 (10:00 review #2): the manifest is re-parsed from E's
+    COMMITTED blob — never trusted from in-memory state — and must bind the
+    tested revision S and the run_id, or the audit trail cannot be independently
+    re-verified from the commit alone."""
     tree = _git(
         "ls-tree", "-r", "--name-only", evidence_commit, check=True
     ).stdout.strip().splitlines()
@@ -2474,12 +4450,32 @@ def _verify_evidence_contract(
         raise GateStateChangedError(
             f"evidence commit E {evidence_commit} missing required manifest"
         )
-    # Field-completeness of the manifest itself: the committed manifest must
-    # carry the contract's required keys, or the audit trail cannot be
-    # independently re-verified from the commit alone.
+    manifest_blob = _git(
+        "show", f"{evidence_commit}:{_MANIFEST_REL}", check=True, binary=True
+    ).stdout
+    try:
+        manifest = json.loads(manifest_blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise GateStateChangedError(
+            f"evidence commit E manifest {_MANIFEST_REL} is not valid JSON"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise GateStateChangedError(
+            f"evidence commit E manifest {_MANIFEST_REL} is not an object"
+        )
+    # C-122 round-18 gate-4: the manifest schema_version must be EXACT, not just
+    # present — a forged or pre-release manifest converges to a gate failure.
+    if manifest.get("schema_version") != _MANIFEST_SCHEMA:
+        raise GateStateChangedError(
+            f"evidence commit E manifest schema_version "
+            f"{manifest.get('schema_version')!r} != {_MANIFEST_SCHEMA}"
+        )
+    # Field-completeness of the committed manifest itself: it must carry the
+    # contract's required keys AND bind S + run_id.
     for key in (
         "schema_version",
         "tested_commit_sha",
+        "run_id",
         "files",
         "layer_verdicts",
     ):
@@ -2487,16 +4483,90 @@ def _verify_evidence_contract(
             raise GateStateChangedError(
                 f"evidence commit E manifest missing required field {key!r}"
             )
-    if not isinstance(manifest["files"], list):
+    if manifest.get("tested_commit_sha") != tested_commit_sha:
+        raise GateStateChangedError(
+            "evidence commit E manifest tested_commit_sha does not bind the "
+            "tested revision"
+        )
+    if manifest.get("run_id") != run_id:
+        raise GateStateChangedError(
+            "evidence commit E manifest run_id does not bind the run"
+        )
+    files = manifest["files"]
+    if not isinstance(files, list):
         raise GateStateChangedError(
             "evidence commit E manifest files field must be a list"
         )
-    for entry in manifest["files"]:
-        for key in ("name", "tracked_path", "sha256", "size_bytes", "committed"):
-            if key not in entry:
-                raise GateStateChangedError(
-                    f"evidence commit E manifest file entry missing field {key!r}"
-                )
+    # Gate-4: every file entry must be a well-formed object with the exact
+    # fixed field set, unique names, and a valid 64-hex hash.  ``files=[None]``
+    # / a fake entry / a duplicate name all converge to a gate failure.
+    seen_names: set[str] = set()
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise GateStateChangedError(
+                "evidence commit E manifest has a non-object file entry"
+            )
+        if set(entry) != {"name", "tracked_path", "sha256", "size_bytes", "committed"}:
+            raise GateStateChangedError(
+                f"evidence commit E manifest file entry has an unexpected field "
+                f"set {sorted(entry)}"
+            )
+        entry_name = entry["name"]
+        tracked_path = entry["tracked_path"]
+        entry_sha = entry["sha256"]
+        entry_size = entry["size_bytes"]
+        entry_committed = entry["committed"]
+        if not isinstance(entry_name, str) or not entry_name:
+            raise GateStateChangedError(
+                "evidence commit E manifest file entry has no valid name"
+            )
+        if entry_name in seen_names:
+            raise GateStateChangedError(
+                f"evidence commit E manifest repeats file name {entry_name!r} "
+                "(file names must be unique)"
+            )
+        seen_names.add(entry_name)
+        if not isinstance(tracked_path, str) or not tracked_path:
+            raise GateStateChangedError(
+                f"evidence commit E manifest file {entry_name!r} has no "
+                "tracked_path"
+            )
+        if (
+            not isinstance(entry_sha, str)
+            or _HEX_HASH_RE.fullmatch(entry_sha) is None
+            or len(entry_sha) != 64
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E manifest file {entry_name!r} sha256 is not "
+                "a valid 64-hex digest"
+            )
+        if not isinstance(entry_size, int) or isinstance(entry_size, bool):
+            raise GateStateChangedError(
+                f"evidence commit E manifest file {entry_name!r} size_bytes is "
+                "not an integer"
+            )
+        if not isinstance(entry_committed, bool):
+            raise GateStateChangedError(
+                f"evidence commit E manifest file {entry_name!r} committed is "
+                "not a boolean"
+            )
+    # Gate-3: recompute every manifest hash from the CURRENT staging bytes — a
+    # raw/compact/report that changed after the manifest was written fails
+    # closed here instead of publishing a stale hash.
+    _verify_manifest_recomputes(staging_dir, manifest, "evidence commit E")
+    # Gate-4: the manifest's file-name set must be exactly the set of staged
+    # tracked evidence that exists right now — no phantom entries, no missing
+    # staged file silently dropped from the trail.
+    expected_names = {
+        staged_name
+        for staged_name, _ in _EVIDENCE_TRACKED_PATHS
+        if (staging_dir / staged_name).is_file()
+    }
+    if seen_names != expected_names:
+        raise GateStateChangedError(
+            "evidence commit E manifest file-name set "
+            f"{sorted(seen_names)} != the staged evidence set {sorted(expected_names)}"
+        )
     verdicts = manifest["layer_verdicts"]
     if not isinstance(verdicts, dict):
         raise GateStateChangedError(
@@ -2571,7 +4641,165 @@ def _verify_evidence_contract(
         if staged_name == _COMPACT_CANARY_STAGED_NAME:
             _verify_layer5_compact_contract(tracked_rel, compact)
         elif staged_name == _COMPACT_E2E_STAGED_NAME:
-            _verify_layer6_compact_contract(tracked_rel, compact)
+            _verify_layer6_compact_contract(
+                tracked_rel, compact, tested_commit_sha=tested_commit_sha
+            )
+
+
+def _verify_pointer_committed_blobs(
+    pointer_commit: str,
+    report: GateReport,
+    evidence_commit: str,
+    staging_entries: Iterable[tuple[str, Path]],
+    staging_dir: Path,
+) -> None:
+    """Re-parse P's authoritative report + manifest from the COMMITTED blobs and
+    re-verify every staged path's bytes match what was committed.
+
+    C-122 round-18 (10:00 review #2) + C-122 P0 (2026-08-10 11:00): the
+    authoritative record is P's committed report — parsed from the blob (valid
+    JSON) and bound to the full schema (``passed=True``, tested S, evidence E,
+    gate ref, run_id, non-empty layers).  P's committed manifest must likewise
+    bind S/E/run_id/gate ref.  And each staged path must carry the SAME bytes in
+    P as in the scanned staging file right now: the final secret scan happened
+    after these writes, so a byte change after the scan (TOCTOU between scan
+    and the publish) would mean the gate publishes a tree it never scanned —
+    that fails closed instead of being silently published.
+
+    Runs immediately before the atomic publish ref update, while nothing
+    fallible remains after it."""
+    report_blob = _git(
+        "show", f"{pointer_commit}:{_REPORT_REL}",
+        check=True, binary=True,
+    ).stdout
+    try:
+        committed_report = json.loads(report_blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise GateStateChangedError(
+            "pointer commit P authoritative report is not valid JSON"
+        ) from exc
+    if not isinstance(committed_report, dict):
+        raise GateStateChangedError(
+            "pointer commit P authoritative report is not an object"
+        )
+    # Full-schema binding of the authoritative report in P.
+    # Gate-4: the report schema_version must be EXACT and the layer set must be
+    # exactly the six unique layer names, each passed=true/skipped=false.
+    if committed_report.get("schema_version") != EVIDENCE_SCHEMA:
+        raise GateStateChangedError(
+            f"pointer commit P report schema_version "
+            f"{committed_report.get('schema_version')!r} != {EVIDENCE_SCHEMA}"
+        )
+    if committed_report.get("passed") is not True:
+        raise GateStateChangedError(
+            "pointer commit P report does not record passed=true"
+        )
+    if committed_report.get("tested_commit_sha") != report.tested_commit_sha:
+        raise GateStateChangedError(
+            "pointer commit P report tested_commit_sha does not bind the "
+            "tested revision"
+        )
+    if committed_report.get("evidence_commit") != evidence_commit:
+        raise GateStateChangedError(
+            "pointer commit P report evidence_commit does not bind E"
+        )
+    if committed_report.get("run_id") != report.run_id:
+        raise GateStateChangedError(
+            "pointer commit P report run_id does not bind the run"
+        )
+    if committed_report.get("gate_ref") != _gate_ref(report.run_id):
+        raise GateStateChangedError(
+            "pointer commit P report gate_ref does not bind the side-channel "
+            "publish ref"
+        )
+    committed_layers = committed_report.get("layers")
+    if not isinstance(committed_layers, list) or len(committed_layers) != 6:
+        raise GateStateChangedError(
+            f"pointer commit P report layers must be exactly six, got "
+            f"{len(committed_layers) if isinstance(committed_layers, list) else 'non-list'}"
+        )
+    layer_names: set[str] = set()
+    for layer in committed_layers:
+        if not isinstance(layer, dict):
+            raise GateStateChangedError(
+                "pointer commit P report has a non-object layer"
+            )
+        layer_name = layer.get("name")
+        if not isinstance(layer_name, str) or not layer_name:
+            raise GateStateChangedError(
+                "pointer commit P report has a layer with no name"
+            )
+        if layer_name in layer_names:
+            raise GateStateChangedError(
+                f"pointer commit P report repeats layer {layer_name!r} "
+                "(layer names must be unique)"
+            )
+        layer_names.add(layer_name)
+        if layer.get("passed") is not True:
+            raise GateStateChangedError(
+                f"pointer commit P report layer {layer_name!r} is not passed=true"
+            )
+        if layer.get("skipped") is not False:
+            raise GateStateChangedError(
+                f"pointer commit P report layer {layer_name!r} is not skipped=false"
+            )
+    # C-122 round-18 gate-3: the layer set must be EXACTLY the six fixed layer
+    # names — a renamed / replaced / foreign layer is not a done-gate pass even
+    # when the count and the passed/skipped flags match.
+    if layer_names != set(_ALL_LAYER_NAMES):
+        raise GateStateChangedError(
+            "pointer commit P report layer set != the six fixed layer names"
+        )
+    # P's committed manifest must bind S/E/run_id too, with the exact schema.
+    manifest_blob = _git(
+        "show", f"{pointer_commit}:{_MANIFEST_REL}", check=True, binary=True
+    ).stdout
+    try:
+        committed_manifest = json.loads(manifest_blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise GateStateChangedError(
+            f"pointer commit P manifest {_MANIFEST_REL} is not valid JSON"
+        ) from exc
+    if not isinstance(committed_manifest, dict):
+        raise GateStateChangedError(
+            f"pointer commit P manifest {_MANIFEST_REL} is not an object"
+        )
+    if committed_manifest.get("schema_version") != _MANIFEST_SCHEMA:
+        raise GateStateChangedError(
+            f"pointer commit P manifest schema_version "
+            f"{committed_manifest.get('schema_version')!r} != {_MANIFEST_SCHEMA}"
+        )
+    if committed_manifest.get("tested_commit_sha") != report.tested_commit_sha:
+        raise GateStateChangedError(
+            "pointer commit P manifest tested_commit_sha does not bind the "
+            "tested revision"
+        )
+    if committed_manifest.get("evidence_commit") != evidence_commit:
+        raise GateStateChangedError(
+            "pointer commit P manifest evidence_commit does not bind E"
+        )
+    if committed_manifest.get("run_id") != report.run_id:
+        raise GateStateChangedError(
+            "pointer commit P manifest run_id does not bind the run"
+        )
+    # Gate-3: recompute every P-manifest file hash from the CURRENT staging
+    # bytes — a raw/compact that changed after the phase-2 manifest was written
+    # fails closed here instead of publishing a stale hash.
+    _verify_manifest_recomputes(staging_dir, committed_manifest, "pointer commit P")
+    # Staged-path bytes: the committed blob must equal the scanned staging-file
+    # bytes.  A path P does not carry (a git-ignored raw evidence copy) is
+    # recorded by hash in the manifest instead and is exempt.
+    for rel, staged in staging_entries:
+        blob = _git(
+            "show", f"{pointer_commit}:{rel}", check=False, binary=True
+        )
+        if blob.returncode != 0:
+            continue
+        if hashlib.sha256(blob.stdout).hexdigest() != _sha256_file(staged):
+            raise GateStateChangedError(
+                f"staged path {rel} bytes differ from the scanned staging file: "
+                "refusing to publish a tree that differs from what was scanned"
+            )
 
 
 def _git_parent(commit: str) -> str:
@@ -2608,12 +4836,216 @@ def _restore_tracked_file(rel: str) -> None:
     probe = _git("show", f"HEAD:{rel}", check=False, binary=True)
     if probe.returncode == 0:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(probe.stdout)
+        # Restore through a sealed tmp (0600 from birth, C-122 Fix 5) renamed
+        # over the target, so a restored blob is never briefly world-readable
+        # and a pre-existing on-disk file is never written in place.
+        tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex[:8]}.tmp")
+        _write_sealed_bytes(tmp, probe.stdout, 0o600)
+        os.replace(tmp, target)
     else:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             target.unlink()
-        except FileNotFoundError:
-            pass
+
+
+def _evidence_index_entries(
+    staging_dir: Path,
+    *,
+    report_stage: Path,
+    manifest_stage: Path,
+) -> list[tuple[str, Path]]:
+    """(repo-rel-path, staging-file) pairs E and P must carry.
+
+    The authoritative report and the evidence manifest always land in E/P; each
+    committable (non-git-ignored) staged evidence file joins them.  Raw
+    git-ignored live-* evidence stays in the exclusive staging dir and is
+    recorded by hash in the manifest only — E/P are side-channel commits, never
+    the product branch (C-122 P0).
+    """
+    entries: list[tuple[str, Path]] = [
+        (_REPORT_REL, report_stage),
+        (_MANIFEST_REL, manifest_stage),
+    ]
+    for staged_name, tracked_rel in _EVIDENCE_TRACKED_PATHS:
+        staged = staging_dir / staged_name
+        if not staged.is_file():
+            continue
+        if _git("check-ignore", "-q", "--", tracked_rel, check=False).returncode == 0:
+            continue
+        entries.append((tracked_rel, staged))
+    return entries
+
+
+def _stage_blob_into_temp_index(
+    rel: str,
+    source: Path,
+    index_env: dict[str, str],
+    needles: _SecretNeedles,
+) -> None:
+    """Scan-then-write one staging file into the object DB and add it to the
+    temp index at ``rel`` — without ever touching the shared worktree (C-122
+    P0).
+
+    C-122 round-18 gate-1 ordering: the EXACT bytes that will become the blob
+    are read and secret-scanned in memory FIRST; only a passing scan pipes the
+    same bytes via ``git hash-object -w --stdin``.  A rejected artifact never
+    enters the object graph, so a sensitive compact/report can never become a
+    dangling blob after a late scan failure.  ``git update-index --add
+    --cacheinfo`` is an index-only operation, so the real worktree file at
+    ``rel`` is never created or modified and the product branch / HEAD / real
+    index / worktree stay byte-identical from start to finish.
+    """
+    _verify_evidence_file_safety(source, "evidence")
+    try:
+        data = source.read_bytes()
+    except OSError as exc:
+        raise GateStateChangedError(
+            f"cannot read evidence file {source.name} for staging "
+            f"({exc.__class__.__name__})"
+        ) from exc
+    # A committed artifact must not carry a credential-looking field name
+    # (report / manifest / the committable evidence paths in E/P); raw
+    # git-ignored live-* dumps are value-scanned but not structurally walked.
+    committed_artifact = rel in {
+        _REPORT_REL,
+        _MANIFEST_REL,
+    } or any(rel == tracked_rel for _, tracked_rel in _EVIDENCE_TRACKED_PATHS)
+    _secret_scan_bytes(
+        data,
+        needles,
+        "evidence",
+        source.name,
+        credential_field_check=committed_artifact,
+    )
+    blob = _git(
+        "hash-object", "-w", "--stdin", check=True, env_extra=index_env,
+        input_bytes=data,
+    ).stdout.strip().decode("utf-8", errors="replace")
+    if not blob:
+        raise GateStateChangedError(f"cannot hash evidence file {source.name}")
+    _git(
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"100644,{blob},{rel}",
+        check=True,
+        env_extra=index_env,
+    )
+
+
+def _stage_evidence_into_temp_index(
+    staging_dir: Path,
+    index_env: dict[str, str],
+    needles: _SecretNeedles,
+    *,
+    report_stage: Path,
+    manifest_stage: Path,
+) -> None:
+    """Populate the temp index with every file E must carry (report, manifest,
+    committable evidence), read directly from the staging files."""
+    for rel, staged in _evidence_index_entries(
+        staging_dir, report_stage=report_stage, manifest_stage=manifest_stage
+    ):
+        _stage_blob_into_temp_index(rel, staged, index_env, needles)
+
+
+def _probe_gate_ref_state(
+    gate_ref: str, env_extra: dict[str, str] | None = None
+) -> str:
+    """Return the gate ref's persistent state for a create-only publish decision.
+
+    The probe answers ``"absent"`` / ``"symref:<target>"`` / ``"direct:<oid>"``
+    and NEVER trusts a dereferenced read for the type decision:
+
+      * ``symbolic-ref -q`` answers first — a symref is reported as the symref
+        it is, even when its target ref is missing (a plain ``rev-parse`` would
+        then return nothing and masquerade as absent) or exists (``rev-parse``
+        would hand back the VICTIM's OID and masquerade as a direct ref at that
+        OID).
+      * Only when the ref is NOT a symref does ``rev-parse --verify`` decide
+        between absent and a direct ref.
+
+    C-122 P0 symbolic-ref hijack guard: a pre-seeded symref
+    ``refs/tripchord/done-gate/<run_id> -> <victim>`` must be rejected as a
+    conflict before the publish AND in the read-only reconciliation — the
+    evidence P must never land at the victim name, and a symref silently
+    converted to a direct ref by ``update-ref --no-deref`` must not count as a
+    clean create.  The success condition for the publish is always: the ref is
+    a DIRECT ref holding exactly the expected OID.
+    """
+    sym = _git("symbolic-ref", "-q", gate_ref, check=False, env_extra=env_extra)
+    if sym.returncode == 0:
+        target = (sym.stdout or "").strip()
+        return f"symref:{target}" if target else "symref"
+    oid = _git(
+        "rev-parse", "--verify", "--quiet", gate_ref, check=False, env_extra=env_extra
+    ).stdout.strip()
+    return f"direct:{oid}" if oid else "absent"
+
+
+def _publish_gate_ref(
+    gate_ref: str, pointer_commit: str, commit_env: dict[str, str]
+) -> None:
+    """Atomic create-only publish with read-only reconciliation.
+
+    C-122 round-18 gate-2: the create-only ``update-ref`` (old value all-zero)
+    is the only action of the whole evidence commit that changes persistent
+    state.  If the update-ref itself raises or times out, the outcome is
+    ambiguous only until the ref is read back — the gate reconciles READ-ONLY so
+    a caller-side failure can never coexist with a published ``passed=true`` P:
+
+      * ref is a DIRECT ref == expected P  -> the publish landed; success.
+      * ref missing                        -> nothing was published; fail closed.
+      * ref holds any other value OR is a symbolic ref -> conflict (a
+        pre-seeded/hijacked ref or a concurrent/crashed run claimed the
+        run_id); fail closed.
+
+    C-122 P0 symbolic-ref hijack guard: a pre-seeded symref
+    ``gate_ref -> victim`` must never redirect the evidence write to the
+    victim, and must never be silently converted by the update itself.  The
+    probe BEFORE the update rejects any existing direct ref or symref as a
+    conflict, and the update uses ``--no-deref`` so even a symref appearing in
+    the probe-to-lock window cannot be dereferenced into a victim write.  The
+    read-only reconciliation then accepts ONLY a direct ref holding exactly
+    ``pointer_commit`` — a dereferenced read that happens to match P is not
+    success.
+
+    Repo hooks (``reference-transaction`` and friends) are disabled via
+    ``core.hooksPath`` pointing at an empty safe directory for the whole commit
+    phase, so a repository hook can never observe, veto or half-apply the
+    side-channel update.
+    """
+    # PRE-PUBLISH type check: create-only means the name must be completely
+    # free.  Any existing direct ref OR symref is a conflict.
+    preset = _probe_gate_ref_state(gate_ref, commit_env)
+    if preset != "absent":
+        raise GateStateChangedError(
+            f"gate ref {gate_ref} preset as {preset}; refusing to publish: "
+            "create-only requires an absent direct-ref name (symbolic-ref "
+            "hijack guard)"
+        )
+    try:
+        # ``--no-deref``: the update treats gate_ref itself as the target, so
+        # a symref racing in after the probe can never push P into the victim.
+        _git(
+            "update-ref", "--no-deref", gate_ref, pointer_commit, _ZERO_SHA,
+            check=True, env_extra=commit_env,
+        )
+        return
+    except GateStateChangedError as exc:
+        current = _probe_gate_ref_state(gate_ref, commit_env)
+        if current == f"direct:{pointer_commit}":
+            return  # publish landed before the failure surfaced
+        if current == "absent":
+            raise GateStateChangedError(
+                f"publish did not land and gate ref {gate_ref} does not exist: "
+                "no evidence was published"
+            ) from exc
+        raise GateStateChangedError(
+            f"gate ref conflict: {gate_ref} is {current}, not the expected "
+            f"direct:{pointer_commit}; a pre-seeded direct ref or symref "
+            "(hijack), repoint, or concurrent/crashed run already claimed this "
+            "run_id"
+        ) from exc
 
 
 def _commit_evidence(
@@ -2621,47 +5053,36 @@ def _commit_evidence(
     report: GateReport,
     *,
     start: GitSnapshot,
+    local_report_path: Path | None = None,
 ) -> str:
-    """Two-phase evidence commit, atomically.
+    """Side-channel evidence commit, atomically (C-122 P0 / 2026-08-10 11:00).
 
-    Phase 1: ``E`` — a commit whose tree contains only evidence paths (the
-    report at this point carries ``tested_commit_sha=S`` and ``evidence_commit``
-    unset).  Phase 2: a thin pointer commit that fills ``evidence_commit=E``
-    into the report so the authoritative record names both S and E, while never
-    claiming E was tested at S.
+    The authoritative repository — current branch, HEAD, real index and
+    worktree — is byte-for-byte read-only from entry to exit.  No real-index
+    copy/replace/read-tree/reset/sync and no ``update-ref`` against the current
+    branch ever run.  E and P are built entirely from a temporary
+    ``GIT_INDEX_FILE`` plus ``git commit-tree``:
 
-    Atomicity: neither phase moves the branch.  All staging happens against a
-    *temporary* ``GIT_INDEX_FILE`` (the real index is never dirtied by the
-    evidence adds), E and the pointer commit P are materialized with
-    ``git commit-tree`` off that temp tree, and the branch only advances through
-    a single compare-and-swap ``git update-ref HEAD <P> <S>`` at the very end.
-    A failure in either phase, the add, the write-tree, the commit-tree, the
-    final secret scan, or the update-ref therefore never leaves the final HEAD
-    on an intermediate E, never leaves a dirty index/worktree, and never leaves
-    a ``passed=true`` report without a committed evidence trail: on any failure
-    the working-tree writes are rolled back to their HEAD state, the real index
-    is re-synced to CURRENT HEAD (never moved back to the old tested revision —
-    C-118), and the gate exits 2.
+      E: tree = S's tree + evidence paths (report, manifest, committable
+         evidence), parent = S (the tested revision).
+      P: tree = E's tree with the report/manifest updated to bind
+         ``evidence_commit=E``, parent = E.
 
-    Tail-safety (C-114): every fallible validation — the final comprehensive
-    secret scan (after all report/manifest/compact evidence is written), the
-    real-index sync to the pointer tree, and the worktree-clean porcelain check
-    — happens BEFORE the CAS.  ``update-ref`` is the last state change, so no
-    operation after it can make the flow report failure while leaving ``P``
-    installed.  Rollback never uses silent ``check=False`` resets: a rollback
-    failure is surfaced alongside the original error.
+    Everything the contract requires — the manifest, the layer-5/6 compact
+    artifacts, the authoritative report, S / E / run_id / gate ref / hashes /
+    layer verdicts — is re-parsed from E's and P's COMMITTED blobs before
+    anything is published.
 
-    Requires a clean start tree: the gate already verified end==start, and this
-    phase must not sweep unrelated working-tree changes into E.
+    The ONLY action that affects persistent state is the final atomic
+    create-only ``git update-ref refs/tripchord/done-gate/<run_id> <P>`` with
+    old value all-zero: if the ref already exists the update fails and the gate
+    fails closed.  That update-ref is the last statement that can affect
+    persistent state — nothing fallible runs after it.
 
-    The commit-phase snapshot must also still name the repository and the exact
-    tested revision the report records (TOCTOU guard): if HEAD moved or the
-    evidence would land in a different repository between the run and this
-    phase, the audit trail cannot claim it certifies ``tested_commit_sha``.
-
-    Parentage is hard-verified *after* each materialized commit (``E^ == S``,
-    ``pointer^ == E``), closing the window between the entry snapshot and the
-    actual commit.
+    A crash before the publish leaves at most unreachable objects and changes
+    no visible repository state; after the publish, consumers verify ``P^=E``,
+    ``E^=S`` and the report/manifest bindings through the dedicated ref.  The
+    evidence commit is NEVER installed as the product branch HEAD.
     """
     if start.worktree_dirty:
         raise GateStateChangedError(
@@ -2678,50 +5099,59 @@ def _commit_evidence(
             f"refusing to commit evidence: commit-phase HEAD {start.commit_sha!r} "
             f"!= tested commit {report.tested_commit_sha!r}"
         )
-    tracked_report_path = ROOT / "benchmarks" / "results" / "product-v1-done-gate.json"
+    tested_commit_sha = report.tested_commit_sha
+    if not tested_commit_sha:
+        raise GateStateChangedError("no tested revision to certify")
+    if not report.run_id:
+        raise GateStateChangedError("no run_id to name the side-channel gate ref")
+    gate_ref = _gate_ref(report.run_id)
 
-    # Re-verify HEAD right before the first write: a concurrent writer could
-    # have moved HEAD after the entry snapshot.  This narrows the TOCTOU
-    # window; the post-commit parent checks close it definitively.
-    current = _git_snapshot()
-    if current.commit_sha != report.tested_commit_sha:
-        raise GateStateChangedError(
-            f"refusing to commit evidence: HEAD moved to {current.commit_sha!r} "
-            f"since the entry snapshot (tested commit {report.tested_commit_sha!r})"
-        )
+    # C-122 round-18 gate-6: the committed report must not carry the absolute
+    # host ``toplevel`` (it is committed evidence).  The binding was already
+    # validated against the live snapshot above; the staged/delivered copy is
+    # stripped of the host path while every repo-relative identifier stays.
+    report.toplevel = None
 
-    # Every file this phase may write, captured before any dump/copy so a
-    # failure can restore the working tree to its HEAD state (fail-closed on
-    # disk: no passed=true report without a committed evidence trail).
-    written: list[Path] = [tracked_report_path]
-    # Temp GIT_INDEX_FILE: the real index is only ever touched once, by the
-    # pre-CAS ``read-tree`` sync, so a failure during staging leaves the real
-    # index byte-for-byte at the tested revision.
+    # The authoritative report and manifest are staged OUTSIDE the tracked
+    # worktree, in the exclusive 0600 staging dir.  In main() the delivered
+    # ``--output`` report is this same file.
+    report_stage = local_report_path or staging_dir / _REPORT_STAGED_NAME
+    manifest_stage = staging_dir / _MANIFEST_STAGED_NAME
+
+    # Temp GIT_INDEX_FILE: ALL staging happens against this temp index — the
+    # real index is never read-tree'd, staged into or copied from (C-122 P0).
+    # The same env disables repository hooks (``core.hooksPath`` -> an empty
+    # safe dir) so a ``reference-transaction`` or any other repo hook can never
+    # observe, veto or half-apply the side-channel commit phase (C-122 round-18
+    # gate-2).  ``needles`` is captured ONCE so every scan in this phase uses
+    # the same secret set.
     index_tmp = tempfile.mkdtemp(prefix="gate-index-")
-    index_env = {"GIT_INDEX_FILE": str(Path(index_tmp) / "index")}
+    no_hooks = Path(index_tmp) / "no-hooks"
+    no_hooks.mkdir(parents=True, exist_ok=True)
+    index_env = {
+        "GIT_INDEX_FILE": str(Path(index_tmp) / "index"),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.hooksPath",
+        "GIT_CONFIG_VALUE_0": str(no_hooks),
+        # C-122 round-18 gate-4: every git child in the commit phase — most
+        # importantly the two ``commit-tree`` calls that create E and P — runs
+        # under the fixed non-personal evidence identity, so ambient repo/user
+        # git config can never author the trail.
+        **_EVIDENCE_COMMIT_IDENTITY,
+    }
+    needles = _evidence_scan_needles()
     try:
-        # The report goes into E with tested_commit_sha=S and evidence_commit unset.
-        _dump(report, tracked_report_path)
-        copied = _copy_staged_evidence(staging_dir)
-        written.extend(ROOT / rel for rel in copied)
-        # Evidence-contract manifest: records every staging original by SHA256
-        # (including the git-ignored live-* files E may not carry) plus the
-        # redacted layer-5/6 verdict fields and the committed compact
-        # artifacts.  The ignored raw evidence is thus never silently dropped
-        # from the audit trail even though E cannot commit its bytes.
-        manifest = _evidence_manifest(staging_dir, report)
-        manifest_target = _write_manifest(manifest)
-        written.append(manifest_target)
-        copied.append(_MANIFEST_REL)
-        if not copied:
-            raise GateStateChangedError("no staged evidence to commit")
-        # Phase 1: stage only evidence paths into the TEMP index and materialize
-        # E via commit-tree.  HEAD is NOT moved yet and the real index is NOT
-        # touched — a phase-1 failure can never leave an intermediate commit or
-        # a dirty real index.  Every git call hard-checks its exit code: a
-        # failed add/write-tree/commit-tree aborts the phase.
-        _git("read-tree", report.tested_commit_sha, check=True, env_extra=index_env)
-        _git("add", "--", *copied, check=True, env_extra=index_env)
+        # Phase 1: E — evidence_commit unset, parent = S.
+        _dump(report, report_stage)
+        _write_manifest(_evidence_manifest(staging_dir, report), manifest_stage)
+        _git("read-tree", tested_commit_sha, check=True, env_extra=index_env)
+        _stage_evidence_into_temp_index(
+            staging_dir,
+            index_env,
+            needles,
+            report_stage=report_stage,
+            manifest_stage=manifest_stage,
+        )
         e_tree = _git("write-tree", check=True, env_extra=index_env).stdout.strip()
         if not e_tree:
             raise GateStateChangedError("evidence tree unreadable after write-tree")
@@ -2729,33 +5159,39 @@ def _commit_evidence(
             "commit-tree",
             e_tree,
             "-p",
-            report.tested_commit_sha,
+            tested_commit_sha,
             "-m",
-            f"Done-Gate evidence for tested commit {report.tested_commit_sha} "
+            f"Done-Gate evidence for tested commit {tested_commit_sha} "
             f"({report.generated_at})",
             check=True,
+            env_extra=index_env,
         ).stdout.strip()
         if not evidence_commit:
             raise GateStateChangedError("evidence commit created but SHA unreadable")
-        # Atomic binding: E's first parent must be the tested revision S
-        # (post-commit hard verify), and E must carry the contract files.
-        _assert_parent_is(evidence_commit, report.tested_commit_sha, "evidence commit E")
-        _verify_evidence_contract(evidence_commit, staging_dir, manifest)
-        # Phase 2: record evidence_commit=E in the report, re-stamp the manifest
-        # with the evidence-commit SHA, and materialize the pointer commit P.
-        # Still no branch move and no real-index write: P is created but HEAD is
-        # untouched.
-        report.evidence_commit = evidence_commit
-        _dump(report, tracked_report_path)
-        _write_manifest(_evidence_manifest(staging_dir, report, evidence_commit=evidence_commit))
-        _git(
-            "add",
-            "--",
-            str(tracked_report_path.relative_to(ROOT)),
-            _MANIFEST_REL,
-            check=True,
-            env_extra=index_env,
+        # Atomic binding: E's first parent must be the tested revision S, and E
+        # must carry the contract files (re-parsed from E's committed blobs).
+        _assert_parent_is(evidence_commit, tested_commit_sha, "evidence commit E")
+        _verify_evidence_contract(
+            evidence_commit,
+            staging_dir,
+            tested_commit_sha=tested_commit_sha,
+            run_id=report.run_id,
         )
+        # Phase 2: P — record evidence_commit=E (and the side-channel gate ref)
+        # in the report, re-stamp the manifest, and materialize P.  Still no
+        # branch move and no real-index write.
+        report.evidence_commit = evidence_commit
+        report.gate_ref = gate_ref
+        _dump(report, report_stage)
+        if local_report_path is not None and local_report_path != report_stage:
+            _dump(report, local_report_path)
+        _write_manifest(
+            _evidence_manifest(staging_dir, report, evidence_commit=evidence_commit),
+            manifest_stage,
+        )
+        # Re-stage the two changed files (report + manifest) into the temp index.
+        _stage_blob_into_temp_index(_REPORT_REL, report_stage, index_env, needles)
+        _stage_blob_into_temp_index(_MANIFEST_REL, manifest_stage, index_env, needles)
         p_tree = _git("write-tree", check=True, env_extra=index_env).stdout.strip()
         if not p_tree:
             raise GateStateChangedError("pointer tree unreadable after write-tree")
@@ -2766,101 +5202,75 @@ def _commit_evidence(
             evidence_commit,
             "-m",
             f"Record Done-Gate evidence_commit={evidence_commit} for tested commit "
-            f"{report.tested_commit_sha}",
+            f"{tested_commit_sha}",
             check=True,
+            env_extra=index_env,
         ).stdout.strip()
         if not pointer_commit:
             raise GateStateChangedError("pointer commit created but SHA unreadable")
-        # Phase 2 parent must be E, and the pointer tree must carry the manifest
-        # with evidence_commit=E (field-completeness of the committed trail).
+        # Phase 2 parent must be E, and P's committed manifest must carry
+        # evidence_commit=E (field-completeness of the committed trail).
         _assert_parent_is(pointer_commit, evidence_commit, "phase 2 pointer commit")
-        committed_manifest_blob = _git(
-            "show", f"{pointer_commit}:{_MANIFEST_REL}", check=True
-        ).stdout
-        committed_manifest = json.loads(committed_manifest_blob)
-        if committed_manifest.get("evidence_commit") != evidence_commit:
-            raise GateStateChangedError(
-                "phase 2 manifest does not record evidence_commit "
-                f"{evidence_commit} in the pointer commit"
-            )
-        if committed_manifest.get("tested_commit_sha") != report.tested_commit_sha:
-            raise GateStateChangedError(
-                "phase 2 manifest tested_commit_sha does not match the tested revision"
-            )
-        # C-114 ordering fix: the final comprehensive secret scan runs AFTER every
-        # report / manifest / compact evidence file is written and BEFORE the
-        # CAS, so a leak in the last-written artifacts can never reach the
-        # branch.  Scan errors report only category + file name.
-        _final_evidence_secret_scan(staging_dir, written)
-        # All remaining fallible validations happen HERE, before the CAS:
-        # 1. Drop the temp index (no longer needed) and sync the REAL index to
-        #    the pointer tree, so once HEAD moves the index matches it.
-        shutil.rmtree(index_tmp, ignore_errors=True)
-        index_tmp = ""  # already cleaned; the finally block must not re-run it
-        _git("read-tree", pointer_commit, check=True)
-        # 2. Worktree-clean proof: every porcelain line must be a staged change
-        #    (first column set, second column a space) and nothing may be
-        #    untracked.  index==P and worktree==P by construction, so a clean
-        #    pre-CAS porcelain proves the post-CAS tree is clean too.
-        porcelain = _git("status", "--porcelain", check=True).stdout
-        for line in porcelain.splitlines():
-            if line.startswith("??"):
-                raise GateStateChangedError(
-                    "pre-CAS check failed: untracked file present before the "
-                    "atomic ref update"
-                )
-            if len(line) >= 2 and line[1] != " ":
-                raise GateStateChangedError(
-                    "pre-CAS check failed: unstaged change present before the "
-                    "atomic ref update"
-                )
-        # Atomic commit point: compare-and-swap HEAD from the tested revision S
-        # to P.  If a concurrent writer moved HEAD in the meantime, update-ref
-        # fails (non-zero exit, check=True) and the whole phase aborts — the
-        # branch never lands on an intermediate E and never loses the
-        # concurrent writer's commit.  This is the ONLY moment HEAD moves and
-        # the LAST state change: nothing fallible runs after it.
-        _git("update-ref", "HEAD", pointer_commit, report.tested_commit_sha, check=True)
+        # C-114 ordering fix: the final comprehensive secret scan runs AFTER
+        # every report / manifest / compact evidence file is written and BEFORE
+        # the publish, so a leak in the last-written artifacts can never reach
+        # the published ref.  Scan errors report only category + file name.
+        scan_paths = [report_stage, manifest_stage]
+        scan_paths.extend(
+            staging_dir / staged_name
+            for staged_name, _ in _EVIDENCE_TRACKED_PATHS
+            if (staging_dir / staged_name).is_file()
+        )
+        _final_evidence_secret_scan(staging_dir, scan_paths)
+        # C-122 round-18 gate-3: from the SAME final raw bytes, recompute the
+        # desensitized compacts and byte-compare against the to-be-committed
+        # artifacts — a raw change after compact generation fails closed here
+        # instead of publishing a stale compact.
+        _verify_compact_recomputed(staging_dir)
+        # Immediately before the publish: re-parse P's authoritative report +
+        # manifest from the COMMITTED blobs and re-verify every staged path's
+        # on-disk bytes still equal what the final scan just read.  A tampered E
+        # manifest, a non-JSON P report or a scanned-path byte change after the
+        # final check all fail closed here, never after the publish.
+        _verify_pointer_committed_blobs(
+            pointer_commit,
+            report,
+            evidence_commit,
+            _evidence_index_entries(
+                staging_dir,
+                report_stage=report_stage,
+                manifest_stage=manifest_stage,
+            ),
+            staging_dir,
+        )
+        # PUBLISH — the last action that can affect persistent state.  Atomic
+        # create-only update-ref of the namespaced gate ref with old value
+        # all-zero, reconciled read-only on any failure (a caller-side failure
+        # can never coexist with a published passed=true P — C-122 round-18
+        # gate-2).  Nothing fallible runs after this.
+        _publish_gate_ref(gate_ref, pointer_commit, index_env)
         return evidence_commit
     except (GateStateChangedError, OSError) as exc:
-        # Fail closed on disk too: never leave a report claiming passed=true
-        # with no evidence trail.  HEAD was never moved before the atomic
-        # update-ref, so restore every file this phase wrote and reset the real
-        # index to the tested revision, then propagate the failure.  Rollback
-        # uses only check=True git calls: a rollback failure is surfaced, never
-        # silently swallowed (C-114).
+        # Fail closed: nothing was published and the shared repo was never
+        # touched (HEAD/index/branch/worktree byte-for-byte at S), so there is
+        # nothing to restore in the tracked tree.  The staged files may stay in
+        # the exclusive staging dir; only the delivered local report copy is
+        # removed — it may carry evidence_commit or a leak, and the caller
+        # re-dumps the corrected (non-passing) verdict.  ``gate_ref`` is cleared
+        # too so a failure report never claims a side-channel ref that was never
+        # published.
         report.evidence_commit = None
-        restore_errors: list[str] = []
-        for target in written:
-            try:
-                rel = str(target.relative_to(ROOT))
-                _restore_tracked_file(rel)
-            except (GateStateChangedError, OSError) as restore_exc:
-                restore_errors.append(f"{target.name}: {restore_exc}")
-        # Restore the REAL index to CURRENT HEAD's tree — never to the tested
-        # revision (C-118).  A concurrent commit that landed after the entry
-        # snapshot is real work and must not be silently moved back to the old
-        # tested SHA; ``read-tree <current HEAD>`` re-syncs the index to
-        # whatever HEAD actually is now without moving the branch at all.
-        try:
-            current_head = _git("rev-parse", "HEAD", check=True).stdout.strip()
-            if current_head:
-                _git("read-tree", current_head, check=True)
-        except GateStateChangedError as reset_exc:
-            restore_errors.append(f"index restore: {reset_exc}")
-        if restore_errors:
-            raise GateStateChangedError(
-                f"{exc} (evidence rollback also failed: "
-                f"{'; '.join(restore_errors)})"
-            ) from exc
+        report.gate_ref = None
+        if local_report_path is not None:
+            with contextlib.suppress(OSError):
+                local_report_path.unlink(missing_ok=True)
         if isinstance(exc, OSError):
             raise GateStateChangedError(f"evidence commit I/O failure: {exc}") from exc
         raise
     finally:
         # Best-effort temp-index cleanup; ignore_errors=True keeps this
-        # non-fallible so it can never turn a committed gate into a failure.
-        if index_tmp:
-            shutil.rmtree(index_tmp, ignore_errors=True)
+        # non-fallible so it can never turn a published gate into a failure.
+        shutil.rmtree(index_tmp, ignore_errors=True)
 
 
 def _print_report(report: GateReport, output_path: Path, quiet: bool) -> None:
@@ -2899,10 +5309,284 @@ def _safe_print_report(report: GateReport, output_path: Path, quiet: bool) -> No
     print failure (e.g. ``BrokenPipeError`` on a closed stdout) is swallowed;
     the authoritative verdict already lives in the committed report.
     """
-    try:
+    with contextlib.suppress(BrokenPipeError, OSError):
         _print_report(report, output_path, quiet)
-    except (BrokenPipeError, OSError):
-        pass
+
+
+def _latest_gate_run_id() -> str:
+    """The run_id of the most recently published gate ref.
+
+    Lists ``refs/tripchord/done-gate/*`` sorted by committer date (newest first)
+    and returns the first run_id.  C-122 P0: a symbolic ref under the namespace
+    is a hijack, never a published run, and is skipped — ``--latest`` must not
+    resolve to a run whose evidence trail is not a direct ref.  The
+    authoritative binding is always the explicit
+    ``refs/tripchord/done-gate/<run_id>`` for the run being verified.
+    """
+    refs = _git(
+        "for-each-ref",
+        "--sort=-committerdate",
+        "--format=%(refname)%00%(symref)",
+        _DONE_GATE_REF_PREFIX,
+        check=True,
+    ).stdout.splitlines()
+    for line in refs:
+        line = line.strip()
+        if not line:
+            continue
+        ref, _sep, symref = line.partition("\0")
+        if symref:
+            continue  # symbolic ref under the gate namespace: hijack, skip
+        run_id = ref.rsplit("/", 1)[-1]
+        if run_id and _RUN_ID_RE.fullmatch(run_id):
+            return run_id
+    raise GateStateChangedError(
+        f"no published gate refs under {_DONE_GATE_REF_PREFIX} to resolve"
+    )
+
+
+def verify_gate_ref(run_id: str) -> dict[str, Any]:
+    """Machine-gate consumer entry: resolve and verify a published evidence trail.
+
+    C-122 round-18 gate-7: from ``refs/tripchord/done-gate/<run_id>`` resolve the
+    pointer commit P and verify the full chain P -> E -> S together with every
+    committed evidence blob:
+
+      1. P's first parent is E; E's first parent is S (the tested revision).
+      2. P's committed report (exact schema) binds S / E / run_id / gate_ref,
+         ``passed=true``, and exactly the six unique layer verdicts, each
+         passed=true / skipped=false.
+      3. P's committed manifest (exact schema) binds S / E / run_id.
+      4. E's committed manifest (exact schema) binds S / run_id and lists every
+         evidence file; each committed file's blob SHA256 matches the manifest
+         and every manifest-listed committed file exists in E's tree.
+
+    The tracked ``benchmarks/results/product-v1-done-gate.json`` convenience copy
+    is NEVER trusted here — the gate ref is the authoritative record.  Returns a
+    verdict dict ``{"verified": bool, ...}``; a non-verified result carries a
+    ``problems`` list naming each violation and never raises for a verification
+    failure (only git unavailability raises, fail-closed).
+    """
+    try:
+        gate_ref = _gate_ref(run_id)
+    except GateStateChangedError as exc:
+        return {
+            "verified": False,
+            "run_id": run_id,
+            "problems": [str(exc)],
+        }
+    verdict: dict[str, Any] = {
+        "verified": False,
+        "run_id": run_id,
+        "gate_ref": gate_ref,
+    }
+    # C-122 P0 symbolic-ref hijack guard: only a DIRECT ref is authoritative.
+    # A symref under the gate namespace (gate_ref -> victim) must fail closed —
+    # a dereferenced ``rev-parse`` would hand back the victim's OID and
+    # masquerade as a published trail.
+    state = _probe_gate_ref_state(gate_ref)
+    if state == "absent":
+        verdict["problems"] = [
+            f"gate ref {gate_ref} does not exist; nothing was published"
+        ]
+        return verdict
+    if state.startswith("symref"):
+        verdict["problems"] = [
+            f"gate ref {gate_ref} is a symbolic ref ({state}); the evidence "
+            "trail is hijacked — only a direct ref is authoritative"
+        ]
+        return verdict
+    pointer_commit = state[len("direct:"):]
+    verdict["pointer_commit"] = pointer_commit
+    problems: list[str] = []
+    try:
+        evidence_commit = _git_parent(pointer_commit)
+        verdict["evidence_commit"] = evidence_commit
+        tested_commit_sha = _git_parent(evidence_commit)
+        verdict["tested_commit_sha"] = tested_commit_sha
+        # 1. P's authoritative report binds S / E / run_id / gate_ref.
+        report_blob = _git(
+            "show", f"{pointer_commit}:{_REPORT_REL}", check=True, binary=True
+        ).stdout
+        try:
+            committed_report = json.loads(report_blob.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            problems.append(f"pointer commit P report {_REPORT_REL} is not valid JSON")
+            committed_report = None
+        if not isinstance(committed_report, dict):
+            problems.append("pointer commit P report is not an object")
+            committed_report = {}
+        if committed_report.get("schema_version") != EVIDENCE_SCHEMA:
+            problems.append(
+                f"pointer commit P report schema_version "
+                f"{committed_report.get('schema_version')!r} != {EVIDENCE_SCHEMA}"
+            )
+        if committed_report.get("passed") is not True:
+            problems.append("pointer commit P report does not record passed=true")
+        if committed_report.get("tested_commit_sha") != tested_commit_sha:
+            problems.append(
+                "pointer commit P report tested_commit_sha does not bind S"
+            )
+        if committed_report.get("evidence_commit") != evidence_commit:
+            problems.append("pointer commit P report evidence_commit does not bind E")
+        if committed_report.get("run_id") != run_id:
+            problems.append("pointer commit P report run_id does not bind the run")
+        if committed_report.get("gate_ref") != gate_ref:
+            problems.append(
+                "pointer commit P report gate_ref does not bind the side-channel ref"
+            )
+        committed_layers = committed_report.get("layers")
+        if not isinstance(committed_layers, list) or len(committed_layers) != 6:
+            problems.append(
+                "pointer commit P report layers must be exactly six unique layers"
+            )
+        else:
+            layer_names: set[str] = set()
+            for layer in committed_layers:
+                if not isinstance(layer, dict):
+                    problems.append("pointer commit P report has a non-object layer")
+                    continue
+                layer_name = layer.get("name")
+                if not isinstance(layer_name, str) or not layer_name:
+                    problems.append("pointer commit P report has a layer with no name")
+                    continue
+                if layer_name in layer_names:
+                    problems.append(
+                        f"pointer commit P report repeats layer {layer_name!r}"
+                    )
+                layer_names.add(layer_name)
+                if layer.get("passed") is not True:
+                    problems.append(
+                        f"pointer commit P report layer {layer_name!r} is not passed=true"
+                    )
+                if layer.get("skipped") is not False:
+                    problems.append(
+                        f"pointer commit P report layer {layer_name!r} is not skipped=false"
+                    )
+            # C-122 round-18 gate-3: the layer set must be EXACTLY the six fixed
+            # layer names — a renamed / replaced / foreign layer is not a
+            # done-gate pass even when the count and flags match.
+            if layer_names != set(_ALL_LAYER_NAMES):
+                problems.append(
+                    "pointer commit P report layer set != the six fixed layer names"
+                )
+        # 2. P's committed manifest binds S / E / run_id (exact schema).
+        p_manifest = _committed_json_blob(pointer_commit, _MANIFEST_REL, problems, "P manifest")
+        if isinstance(p_manifest, dict):
+            if p_manifest.get("schema_version") != _MANIFEST_SCHEMA:
+                problems.append(
+                    f"pointer commit P manifest schema_version "
+                    f"{p_manifest.get('schema_version')!r} != {_MANIFEST_SCHEMA}"
+                )
+            if p_manifest.get("tested_commit_sha") != tested_commit_sha:
+                problems.append("pointer commit P manifest tested_commit_sha does not bind S")
+            if p_manifest.get("evidence_commit") != evidence_commit:
+                problems.append("pointer commit P manifest evidence_commit does not bind E")
+            if p_manifest.get("run_id") != run_id:
+                problems.append("pointer commit P manifest run_id does not bind the run")
+        # 3. E's committed manifest binds S / run_id and every committed file.
+        e_manifest = _committed_json_blob(evidence_commit, _MANIFEST_REL, problems, "E manifest")
+        if isinstance(e_manifest, dict):
+            if e_manifest.get("schema_version") != _MANIFEST_SCHEMA:
+                problems.append(
+                    f"evidence commit E manifest schema_version "
+                    f"{e_manifest.get('schema_version')!r} != {_MANIFEST_SCHEMA}"
+                )
+            if e_manifest.get("tested_commit_sha") != tested_commit_sha:
+                problems.append("evidence commit E manifest tested_commit_sha does not bind S")
+            if e_manifest.get("run_id") != run_id:
+                problems.append("evidence commit E manifest run_id does not bind the run")
+            files = e_manifest.get("files")
+            if not isinstance(files, list):
+                problems.append("evidence commit E manifest files field is not a list")
+            else:
+                e_tree = _git(
+                    "ls-tree", "-r", "--name-only", evidence_commit, check=True
+                ).stdout.splitlines()
+                seen: set[str] = set()
+                for entry in files:
+                    if not isinstance(entry, dict):
+                        problems.append("evidence commit E manifest has a non-object file entry")
+                        continue
+                    entry_name = entry.get("name")
+                    entry_sha = entry.get("sha256")
+                    entry_committed = entry.get("committed")
+                    if not isinstance(entry_name, str) or not entry_name:
+                        problems.append("evidence commit E manifest has a file with no name")
+                        continue
+                    if entry_name in seen:
+                        problems.append(
+                            f"evidence commit E manifest repeats file name {entry_name!r}"
+                        )
+                    seen.add(entry_name)
+                    if entry_committed is not True:
+                        continue  # git-ignored raw evidence is listed, not committed
+                    rel = entry.get("tracked_path")
+                    if not isinstance(rel, str) or not rel:
+                        problems.append(
+                            f"evidence commit E manifest file {entry_name!r} has no tracked_path"
+                        )
+                        continue
+                    if rel not in e_tree:
+                        problems.append(
+                            f"evidence commit E {evidence_commit} missing committed file {rel}"
+                        )
+                        continue
+                    if (
+                        not isinstance(entry_sha, str)
+                        or _HEX_HASH_RE.fullmatch(entry_sha) is None
+                        or len(entry_sha) != 64
+                    ):
+                        problems.append(
+                            f"evidence commit E manifest file {entry_name!r} sha256 is not "
+                            "a valid 64-hex digest"
+                        )
+                        continue
+                    blob = _git(
+                        "show", f"{evidence_commit}:{rel}", check=True, binary=True
+                    )
+                    if hashlib.sha256(blob.stdout).hexdigest() != entry_sha:
+                        problems.append(
+                            f"evidence commit E file {rel} sha256 does not match the "
+                            "committed manifest"
+                        )
+    except GateStateChangedError as exc:
+        # Git became unavailable mid-verify (fail-closed, never a false pass).
+        problems.append(str(exc))
+    if problems:
+        verdict["problems"] = problems
+        return verdict
+    verdict["verified"] = True
+    verdict["report_passed"] = True
+    verdict["summary"] = (
+        f"verified: refs/tripchord/done-gate/{run_id} -> P {pointer_commit} -> "
+        f"E {evidence_commit} -> S {tested_commit_sha}; all committed evidence "
+        "blobs match the committed manifests"
+    )
+    return verdict
+
+
+def _committed_json_blob(
+    commit: str, rel: str, problems: list[str], label: str
+) -> dict[str, Any] | None:
+    """Read ``commit:rel`` and parse it as a JSON object, fail-closed.
+
+    Appends a problem for an unreadable/non-JSON blob and returns None — the
+    caller then skips field checks (each problem already names the violation).
+    """
+    try:
+        blob = _git("show", f"{commit}:{rel}", check=True, binary=True).stdout
+        parsed = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, GateStateChangedError) as exc:
+        problems.append(
+            f"commit {commit} {rel} {label} is not valid JSON "
+            f"({exc.__class__.__name__})"
+        )
+        return None
+    if not isinstance(parsed, dict):
+        problems.append(f"commit {commit} {rel} {label} is not an object")
+        return None
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2948,7 +5632,52 @@ def main(argv: list[str] | None = None) -> int:
             "tested_commit_sha=S, evidence_commit=E)"
         ),
     )
+    parser.add_argument(
+        "--verify-ref",
+        metavar="RUN_ID",
+        default=None,
+        help=(
+            "machine-gate consumer mode: verify the published evidence trail "
+            "for this run_id from refs/tripchord/done-gate/<run_id> and exit 0 "
+            "when verified, 2 otherwise.  No layers run."
+        ),
+    )
+    parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="with --verify-ref, resolve the most recently published gate ref instead of a run_id",
+    )
     args = parser.parse_args(argv)
+
+    # C-122 round-18 gate-3: ``--latest`` only makes sense WITH ``--verify-ref`` —
+    # a bare ``--latest`` is a parameter mistake and must fail closed instead of
+    # being silently ignored.
+    if args.latest and args.verify_ref is None:
+        print(
+            json.dumps(
+                {
+                    "verified": False,
+                    "problems": ["--latest requires --verify-ref"],
+                },
+                sort_keys=True,
+            )
+        )
+        return 2
+
+    # C-122 round-18 gate-7: the resolver entry — no layers run, no evidence is
+    # written.  The ref is the authoritative record; the tracked report copy is
+    # never trusted here.
+    if args.verify_ref is not None:
+        run_id = args.verify_ref
+        if args.latest:
+            try:
+                run_id = _latest_gate_run_id()
+            except GateStateChangedError as exc:
+                print(json.dumps({"verified": False, "problems": [str(exc)]}, sort_keys=True))
+                return 2
+        verdict = verify_gate_ref(run_id)
+        print(json.dumps(verdict, sort_keys=True))
+        return 0 if verdict.get("verified") else 2
 
     # One run_id per execution (C-114 R3): bound into the staging path (default
     # dir) and threaded into the report so the evidence trail identifies exactly
@@ -3016,12 +5745,10 @@ def main(argv: list[str] | None = None) -> int:
     # redaction does not cover — fail closed AND remove the report so nothing
     # sensitive stays on disk.
     try:
-        _secret_scan_paths([output_path], _evidence_secrets(), "report")
+        _secret_scan_paths([output_path], _evidence_scan_needles(), "report")
     except GateStateChangedError as exc:
-        try:
+        with contextlib.suppress(OSError):
             output_path.unlink(missing_ok=True)
-        except OSError:
-            pass
         print(f"gate aborted: {_redact_output(str(exc))}", file=sys.stderr)
         return 2
     try:
@@ -3055,7 +5782,15 @@ def main(argv: list[str] | None = None) -> int:
             # manifest.
             _verify_required_evidence_inputs(staging_dir)
             start = _git_snapshot()
-            _commit_evidence(staging_dir, report, start=start)
+            # C-122 Fix 7: the delivered report (carrying evidence_commit=E) is
+            # generated inside _commit_evidence BEFORE the CAS and covered by
+            # the pre-CAS secret scan.  Nothing is dumped after the CAS.
+            _commit_evidence(
+                staging_dir,
+                report,
+                start=start,
+                local_report_path=output_path,
+            )
         except GateStateChangedError as exc:
             # The run verdict is intact but the evidence commit is missing:
             # a committed report must never claim an evidence trail that does
@@ -3074,14 +5809,10 @@ def main(argv: list[str] | None = None) -> int:
             _dump(report, output_path)
             _safe_print_report(report, output_path, args.quiet)
             return 2
-        # Re-dump so the delivered report carries evidence_commit=E.  After the
-        # CAS the authoritative committed report already carries the verdict, so
-        # this local staging copy is best-effort ONLY: a failure here must never
-        # flip the exit once passed=true is installed (C-118 Gap 1).
-        try:
-            _dump(report, output_path)
-        except (GateStateChangedError, OSError):
-            pass
+        # C-122 Fix 7: no post-CAS output.  The delivered local report was
+        # generated and secret-scanned inside _commit_evidence BEFORE the CAS —
+        # the CAS is the last action, so the report on disk and the committed
+        # report agree and nothing fallible runs after the branch move.
 
     _safe_print_report(report, output_path, args.quiet)
     return 0 if report.passed else 2

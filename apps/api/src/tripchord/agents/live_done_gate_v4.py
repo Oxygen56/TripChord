@@ -388,6 +388,26 @@ def _check_v4_source_graph(
                 f"并从冻结合同生成 {len(expected_icom_tasks)} 路 iCom Source Agent"
             )
         ),
+        # C-122 Fix 3: the recomputable query/candidate/platform bindings this
+        # check actually verifies — query shapes, browser task count, Source id
+        # set and iCom contract ids — so the committed layer-6 compact can carry
+        # structured per-item evidence instead of a bare verdict.
+        evidence={
+            "expected_browser_tasks_per_pair": expected_browser_tasks,
+            "expected_browser_source_ids": sorted(expected_browser_source_ids),
+            "expected_query_shapes": sorted(
+                f"{getattr(platform, 'value', platform)}:"
+                f"{getattr(kind, 'value', kind)}"
+                for platform, kind in expected_query_shapes
+            ),
+            "expected_icom_task_ids": sorted(expected_icom_tasks),
+            "pair_ids": list(pair_ids),
+            "total_planned_task_count": (
+                run.query_plan.total_task_count
+                if run.query_plan is not None
+                else None
+            ),
+        },
     )
 
 
@@ -2228,6 +2248,24 @@ def _check_v4_strict_selected_coverage(
             if not errors
             else "；".join(errors)
         ),
+        # C-122 Fix 3: the strict platform-coverage bindings this check verifies —
+        # the selected stay-plan identity and the provider set with completed
+        # terminal outcomes — so the committed layer-6 compact carries structured
+        # per-item evidence instead of a bare verdict.
+        evidence={
+            "selected_stay_plan_id": (
+                initial.selected_stay_plan_id
+                if initial is not None and initial.selected_stay_plan_id is not None
+                else None
+            ),
+            "providers": sorted(providers) if initial is not None else [],
+            "coverage_mode": (
+                initial.mode.value if initial is not None else None
+            ),
+            "all_platforms_complete": (
+                initial.all_platforms_complete if initial is not None else None
+            ),
+        },
     )
 
 
