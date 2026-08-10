@@ -842,6 +842,41 @@ def test_v4_source_graph_rejects_duplicate_query_and_source_ids() -> None:
     ).passed
 
 
+def test_v4_source_graph_rejects_scenario_drift_from_canonical_frozen_graph() -> None:
+    """C-122 round-19 (supervision 17:03 Block 1): the producer must derive its
+    expected member sets from the SAME canonical frozen graph the layer-6
+    validator compares against.  A candidate set that drifts from the canonical
+    graph (here: an extra iCom-public-transfer contract) fails closed instead of
+    sealing a graph whose members the validator would reject as foreign."""
+    run, candidate_set = _v4_source_graph_fixture()
+    drifted_candidates: list[SimpleNamespace] = []
+    for index, plan in enumerate(candidate_set.candidates):
+        if index == 0:
+            extra_contract = SimpleNamespace(
+                contract_id="icom-evil-extra",
+                required_provider="icom-public-transfer",
+            )
+            plan = SimpleNamespace(
+                **{
+                    **vars(plan),
+                    "required_transfer_contracts": (
+                        *plan.required_transfer_contracts,
+                        extra_contract,
+                    ),
+                }
+            )
+        drifted_candidates.append(plan)
+    drifted_candidate_set = SimpleNamespace(
+        **{
+            **vars(candidate_set),
+            "candidates": tuple(drifted_candidates),
+        }
+    )
+    drifted_check = _check_v4_source_graph(run, drifted_candidate_set)
+    assert not drifted_check.passed
+    assert "与规范冻结图不一致" in drifted_check.summary
+
+
 _STAGE_AWARE_DECISION_DEPENDENCIES = {
     "plan-travel-package": ("normalize-browser-quotes",),
     "prepare-candidate-decision-frontier": ("plan-travel-package",),

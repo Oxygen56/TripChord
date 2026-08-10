@@ -43,6 +43,11 @@ from tripchord.planning.flexible_dates import (
     LIVE_V5_PLATFORMS,
     QueryTaskKind,
 )
+from tripchord.planning.frozen_graph import (
+    frozen_v4_browser_source_ids,
+    frozen_v4_icom_task_ids,
+    frozen_v4_query_shapes,
+)
 from tripchord.planning.package import (
     NormalizedFlightQuote,
     NormalizedLodgingQuote,
@@ -293,6 +298,25 @@ def _check_v4_source_graph(
             ),
         )
     }
+    # C-122 round-19 (supervision 17:03 Block 1): the expected member sets MUST
+    # equal the canonical frozen graph derived from the same inputs.  If the
+    # frozen scenario ever drifts (a segment renamed, an iCom contract added or
+    # dropped, a capability flipped), the producer fails closed here instead of
+    # silently sealing a graph whose members differ from what the layer-6
+    # validator accepts.
+    canonical_query_shapes = frozen_v4_query_shapes()
+    canonical_browser_source_ids = frozen_v4_browser_source_ids()
+    canonical_icom_task_ids = frozen_v4_icom_task_ids()
+    query_shape_strings = {
+        f"{getattr(platform, 'value', platform)}:{getattr(kind, 'value', kind)}"
+        for platform, kind in expected_query_shapes
+    }
+    if query_shape_strings != canonical_query_shapes:
+        errors.append("预期查询形状集与规范冻结图不一致（能力/平台漂移）")
+    if expected_browser_source_ids != canonical_browser_source_ids:
+        errors.append("预期浏览器 Source ID 集与规范冻结图不一致（候选集/分段漂移）")
+    if expected_icom_tasks != canonical_icom_task_ids:
+        errors.append("预期 iCom 任务集与规范冻结图不一致（接驳合同漂移）")
     pair_ids = tuple(execution.date_pair.id for execution in run.pair_runs)
     pair_dates = tuple(
         (
@@ -413,9 +437,22 @@ def _check_v4_source_graph(
             # fixed task plan).  The layer-6 compact validator recomputes
             # ``total_planned_task_count`` as the sum over these per-pair query
             # counts, so a forged graph with 1 pair / 1 task cannot be accepted.
+            # C-122 round-19 (supervision 17:03 Block 1): each entry also carries
+            # the exact per-pair MEMBER LISTS (``browser_source_task_ids`` /
+            # ``query_task_ids`` / ``icom_source_task_ids``) so the validator can
+            # compare member sets exactly per pair — a foreign member, a swapped
+            # pair or a missing/extra iCom task all fail closed even when the
+            # counts happen to line up.
             "per_pair": [
                 {
                     "pair_id": pair_id,
+                    "browser_source_task_ids": sorted(expected_browser_source_ids),
+                    "query_task_ids": sorted(
+                        f"{getattr(platform, 'value', platform)}:"
+                        f"{getattr(kind, 'value', kind)}"
+                        for platform, kind in expected_query_shapes
+                    ),
+                    "icom_source_task_ids": sorted(expected_icom_tasks),
                     "browser_source_task_count": expected_browser_tasks,
                     "query_task_count": expected_browser_tasks,
                     "icom_source_task_count": len(expected_icom_tasks),

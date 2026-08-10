@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import subprocess
+import sys
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -255,9 +257,10 @@ def _populate_required_evidence(staging_dir: Path) -> None:
 
     The layer-5/6 raw files carry REALISTIC passing verdicts (C-118): the
     desensitized compact artifacts derived from them must survive the strong
-    blob-read-back contract — the seven certified canary scopes (six browser
-    Companion OTA + iCom public-API) each fresh/authorized/read-only/passed for
-    layer 5, and the full fifteen done-gate checks all passed plus the
+    blob-read-back contract — the six registry-derived certified canary scopes
+    (five browser Companion OTA + iCom public-API) each fresh/authorized/
+    read-only/passed for layer 5, and the full fifteen done-gate checks all
+    passed plus the
     repo/runtime/Companion identity for layer 6.
     """
     staging_dir.mkdir(exist_ok=True)
@@ -502,71 +505,58 @@ def _per_check_evidence(name: str) -> dict[str, object]:
             "evidence_refs": [f"sha256:{candidate_sha}"],
         },
         "v4_source_graph": {
-            # The frozen maldives scenario schedules 13 browser queries per pair
-            # (6 enabled ctrip kinds + 6 enabled qunar kinds + tongcheng's single
-            # flight) with 4 iCom Source tasks per pair; the validator binds the
-            # Source-id / query-shape set lengths to this exact count (C-122
-            # HG-G2).
-            "expected_browser_tasks_per_pair": 13,
-            "expected_browser_source_ids": [
-                "source-ctrip-flight",
-                "source-ctrip-lodging-full-stay",
-                "source-ctrip-lodging-first-night",
-                "source-ctrip-lodging-middle-stay",
-                "source-ctrip-lodging-last-night",
-                "source-ctrip-lodging-hulhumale-full-stay",
-                "source-qunar-flight",
-                "source-qunar-lodging-full-stay",
-                "source-qunar-lodging-first-night",
-                "source-qunar-lodging-middle-stay",
-                "source-qunar-lodging-last-night",
-                "source-qunar-lodging-hulhumale-full-stay",
-                "source-tongcheng-flight",
-            ],
-            "expected_query_shapes": [
-                "ctrip:flight",
-                "ctrip:lodging_full_stay",
-                "ctrip:lodging_first_night",
-                "ctrip:lodging_middle_stay",
-                "ctrip:lodging_last_night",
-                "ctrip:lodging_hulhumale_full_stay",
-                "qunar:flight",
-                "qunar:lodging_full_stay",
-                "qunar:lodging_first_night",
-                "qunar:lodging_middle_stay",
-                "qunar:lodging_last_night",
-                "qunar:lodging_hulhumale_full_stay",
-                "tongcheng:flight",
-            ],
-            "expected_icom_task_ids": [
-                "public-transfer-icom-ctrip-1",
-                "public-transfer-icom-ctrip-2",
-                "public-transfer-icom-qunar-1",
-                "public-transfer-icom-qunar-2",
-            ],
+            # C-122 round-19 (supervision 17:03 Block 1): the fixture member sets
+            # are DERIVED from the canonical frozen graph the gate script imports
+            # (``_V4_FROZEN_*``), so the fixture always matches what the real
+            # producer derives for the frozen maldives scenario.  The frozen
+            # scenario schedules 13 browser queries per pair (6 enabled ctrip
+            # kinds + 6 enabled qunar kinds + tongcheng's single flight) with 4
+            # iCom Source tasks per pair.
+            "expected_browser_tasks_per_pair": gate._V4_FROZEN_TASKS_PER_PAIR,
+            "expected_browser_source_ids": sorted(
+                gate._V4_FROZEN_BROWSER_SOURCE_IDS
+            ),
+            "expected_query_shapes": sorted(gate._V4_FROZEN_QUERY_SHAPES),
+            "expected_icom_task_ids": sorted(gate._V4_FROZEN_ICOM_TASK_IDS),
             "pair_ids": ["pair-1", "pair-2", "pair-3"],
-            "total_planned_task_count": 39,
+            "total_planned_task_count": gate._V4_FROZEN_TASKS_PER_PAIR * 3,
             # C-122 HG-G: the frozen-scenario per-pair breakdown — 3 pairs x 13
             # browser/query tasks + 4 iCom tasks each, with the declared total
-            # recomputable as the per-pair query-task sum.
+            # recomputable as the per-pair query-task sum.  Block 1 adds the exact
+            # per-pair member lists so the validator can compare member sets.
             "per_pair": [
                 {
                     "pair_id": "pair-1",
-                    "browser_source_task_count": 13,
-                    "query_task_count": 13,
-                    "icom_source_task_count": 4,
+                    "browser_source_task_ids": sorted(
+                        gate._V4_FROZEN_BROWSER_SOURCE_IDS
+                    ),
+                    "query_task_ids": sorted(gate._V4_FROZEN_QUERY_SHAPES),
+                    "icom_source_task_ids": sorted(gate._V4_FROZEN_ICOM_TASK_IDS),
+                    "browser_source_task_count": gate._V4_FROZEN_TASKS_PER_PAIR,
+                    "query_task_count": gate._V4_FROZEN_TASKS_PER_PAIR,
+                    "icom_source_task_count": len(gate._V4_FROZEN_ICOM_TASK_IDS),
                 },
                 {
                     "pair_id": "pair-2",
-                    "browser_source_task_count": 13,
-                    "query_task_count": 13,
-                    "icom_source_task_count": 4,
+                    "browser_source_task_ids": sorted(
+                        gate._V4_FROZEN_BROWSER_SOURCE_IDS
+                    ),
+                    "query_task_ids": sorted(gate._V4_FROZEN_QUERY_SHAPES),
+                    "icom_source_task_ids": sorted(gate._V4_FROZEN_ICOM_TASK_IDS),
+                    "browser_source_task_count": gate._V4_FROZEN_TASKS_PER_PAIR,
+                    "query_task_count": gate._V4_FROZEN_TASKS_PER_PAIR,
+                    "icom_source_task_count": len(gate._V4_FROZEN_ICOM_TASK_IDS),
                 },
                 {
                     "pair_id": "pair-3",
-                    "browser_source_task_count": 13,
-                    "query_task_count": 13,
-                    "icom_source_task_count": 4,
+                    "browser_source_task_ids": sorted(
+                        gate._V4_FROZEN_BROWSER_SOURCE_IDS
+                    ),
+                    "query_task_ids": sorted(gate._V4_FROZEN_QUERY_SHAPES),
+                    "icom_source_task_ids": sorted(gate._V4_FROZEN_ICOM_TASK_IDS),
+                    "browser_source_task_count": gate._V4_FROZEN_TASKS_PER_PAIR,
+                    "query_task_count": gate._V4_FROZEN_TASKS_PER_PAIR,
+                    "icom_source_task_count": len(gate._V4_FROZEN_ICOM_TASK_IDS),
                 },
             ],
         },
@@ -759,19 +749,15 @@ def _per_scope_canary_evidence(scope: str) -> dict[str, object]:
 
 def _matching_canary() -> dict[str, object]:
     """A passing certified-OTA canary in the real schema: top-level ``passed``
-    plus the complete seven certified canary scopes (six browser Companion OTA
-    scopes including ``tongcheng:lodging`` plus the iCom public-API scope), each
-    fresh/authorized/read_only/passed.  The connected Companion authorizes
-    EXACTLY the six browser scopes — ``icom:transfer`` is a public-API scope and
-    never appears in ``authorized_scope_keys`` (C-122 HG-A)."""
-    browser_scopes = (
-        "ctrip:flight",
-        "ctrip:lodging",
-        "qunar:flight",
-        "qunar:lodging",
-        "tongcheng:flight",
-        "tongcheng:lodging",
-    )
+    plus the complete certified canary scope set derived from the authoritative
+    registry — the five certified browser Companion OTA scopes (ctrip:flight,
+    ctrip:lodging, qunar:flight, qunar:lodging, tongcheng:flight) plus the iCom
+    public-API scope, 6 total — each fresh/authorized/read_only/passed.  The
+    connected Companion authorizes EXACTLY the five certified browser scopes;
+    ``icom:transfer`` is a public-API scope and never appears in
+    ``authorized_scope_keys``, and the DISABLED ``tongcheng:lodging`` never
+    enters the canary (C-122 round-19 17:03 veto)."""
+    browser_scopes = tuple(sorted(gate._CERTIFIED_OTA_SCOPES))
     scopes = (
         *((scope, "companion_heartbeat") for scope in browser_scopes),
         ("icom:transfer", "icom_public_api"),
@@ -806,8 +792,8 @@ def _matching_canary() -> dict[str, object]:
                 {
                     "companion_id": "comp-1",
                     "providers": ["ctrip", "qunar", "tongcheng"],
-                    # C-122 HG-A: exactly the six browser scopes — no
-                    # ``icom:transfer``.
+                    # C-122 round-19: exactly the five certified browser scopes
+                    # — no ``icom:transfer``, no DISABLED ``tongcheng:lodging``.
                     "authorized_scope_keys": list(browser_scopes),
                     "is_fresh": True,
                     "age_seconds": 3,
@@ -1134,6 +1120,224 @@ def test_layer5_passes_only_complete_certified_set(
         json.dumps(_matching_canary()), encoding="utf-8"
     )
     assert gate.layer5_real_canary(staging_dir).passed is True
+
+
+def _seal_canary_failure_diagnostic(
+    output_path: Path,
+    *,
+    run_id: str,
+    tested_sha: str,
+    stage: str = "evaluate",
+    message: str = "upstream provider 401",
+) -> Path:
+    """Write a REAL 0600 canary failure diagnostic using the canary's OWN sealing
+    code (``_seal_failure_diagnostic``) — the exact function the canary's main()
+    calls on a crash.  The message embeds a token-shaped secret (40 chars) so the
+    tests prove the diagnostic and its consumption are desensitized."""
+    from benchmarks import live_canary_certified as canary
+
+    return canary._seal_failure_diagnostic(
+        stage,
+        RuntimeError(f"{message} {'S' * 40}"),
+        output_path,
+        run_id=run_id,
+        tested_sha=tested_sha,
+    )
+
+
+def test_layer5_consumes_canary_failure_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 round-19 (supervision 17:03 Block 2 counter-example): a crashed
+    canary (non-zero exit + no main JSON) writes a 0600 failure diagnostic; the
+    outer layer MUST read it, verify schema / run_id / tested_sha / runtime /
+    perms / freshness, and keep the desensitized classification + bindings in the
+    layer-5 detail — never discard the failure trail."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    diag_checks = [
+        c for c in result.sub_checks if c.get("name") == "canary_failure_diagnostic"
+    ]
+    assert diag_checks, "layer-5 must keep the canary failure classification+binding"
+    detail = diag_checks[0]["detail"]
+    assert "stage=evaluate" in detail
+    assert "exception=RuntimeError" in detail
+    assert f"run_id={run_id}" in detail
+    assert f"tested_sha={tested_sha[:12]}" in detail
+    assert "runtime=python" in detail
+    # The token-shaped secret in the crash message is redacted, never echoed.
+    assert "S" * 40 not in detail
+    assert "<redacted>" in detail
+
+
+def test_layer5_consumes_real_subprocess_sealed_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 round-19 (Block 2 counter-example, REAL subprocess): the canary's
+    diagnostic is sealed by an actual subprocess execution of its own sealing
+    code; the outer layer then reads it, verifies the 0600 perms + schema +
+    run_id + tested_sha + runtime, and keeps the desensitized classification in
+    the layer-5 detail."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    sealed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from pathlib import Path; "
+            "from benchmarks.live_canary_certified import _seal_failure_diagnostic; "
+            "_seal_failure_diagnostic('evaluate', RuntimeError('upstream provider 401'), "
+            "Path(sys.argv[1]), run_id=sys.argv[2], tested_sha=sys.argv[3])",
+            str(evidence_path),
+            run_id,
+            tested_sha,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=gate.ROOT,
+    )
+    assert sealed.returncode == 0, sealed.stderr
+    diag_path = evidence_path.with_suffix(evidence_path.suffix + ".failure.json")
+    assert diag_path.is_file()
+    assert stat.S_IMODE(diag_path.stat().st_mode) == 0o600
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    diag_checks = [
+        c for c in result.sub_checks if c.get("name") == "canary_failure_diagnostic"
+    ]
+    assert diag_checks, "layer-5 must keep the subprocess-sealed classification+binding"
+    detail = diag_checks[0]["detail"]
+    assert "stage=evaluate" in detail
+    assert "exception=RuntimeError" in detail
+    assert f"run_id={run_id}" in detail
+    assert f"tested_sha={tested_sha[:12]}" in detail
+    assert "runtime=python" in detail
+
+
+def test_layer5_rejects_mismatched_canary_failure_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 round-19 (Block 2 counter-example): a failure diagnostic that binds a
+    DIFFERENT run_id than this run must fail closed explicitly — a foreign or old
+    diagnostic is never silently consumed as evidence of THIS failure."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    # Diagnostic from a PRIOR / different run: different run_id and tested_sha.
+    _seal_canary_failure_diagnostic(
+        evidence_path, run_id="000000000000", tested_sha="b" * 40
+    )
+    result = gate.layer5_real_canary(
+        staging_dir, run_id="abc123def456", tested_commit_sha="a" * 40
+    )
+    assert result.passed is False
+    joined = " ; ".join(str(c.get("detail", "")) for c in result.sub_checks)
+    assert "canary failure diagnostic run_id" in joined
+    assert not any(
+        c.get("name") == "canary_failure_diagnostic" for c in result.sub_checks
+    )
+
+
+def test_layer5_rejects_stale_canary_failure_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 round-19 (Block 2 counter-example): a failure diagnostic that binds
+    THIS run but is STALE (generated long ago) must fail closed explicitly — old
+    failure evidence is never reused for a current run."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    diag_path = _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    diagnostic["generated_at"] = (
+        datetime.now(UTC) - timedelta(hours=2)
+    ).isoformat()
+    diag_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    joined = " ; ".join(str(c.get("detail", "")) for c in result.sub_checks)
+    assert "diagnostic is stale" in joined
+    assert not any(
+        c.get("name") == "canary_failure_diagnostic" for c in result.sub_checks
+    )
+
+
+def test_layer5_rejects_missing_canary_failure_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 round-19 (Block 2 counter-example): a crashed canary (non-zero exit,
+    no main JSON) with NO failure diagnostic must fail closed explicitly — a
+    missing diagnostic cannot be papered over."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    result = gate.layer5_real_canary(
+        staging_dir, run_id="abc123def456", tested_commit_sha="a" * 40
+    )
+    assert result.passed is False
+    joined = " ; ".join(str(c.get("detail", "")) for c in result.sub_checks)
+    assert "no failure diagnostic" in joined
+
+
+def test_layer5_recovery_success_does_not_reuse_old_failure_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 round-19 (Block 2 counter-example): a recovery-replay SUCCESS (exit 0
+    + valid passed=true report) must NOT reuse an old failure diagnostic sitting at
+    the output path — fresh success clears/replaces stale failure evidence, and the
+    layer only consumes a diagnostic when the CURRENT run failed."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (0, ""))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    # A PRIOR failed run left a stale diagnostic behind.
+    _seal_canary_failure_diagnostic(
+        evidence_path, run_id="000000000000", tested_sha="b" * 40
+    )
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(_matching_canary()), encoding="utf-8"
+    )
+    result = gate.layer5_real_canary(
+        staging_dir, run_id="abc123def456", tested_commit_sha="a" * 40
+    )
+    assert result.passed is True
+    assert not any(
+        c.get("name") == "canary_failure_diagnostic" for c in result.sub_checks
+    )
+    assert not any(
+        "failure diagnostic" in str(c.get("detail", "")) for c in result.sub_checks
+    )
 
 
 def test_layer3_browser_e2e_exit2_is_not_a_pass(
@@ -4100,7 +4304,7 @@ def test_compact_canary_carries_coverage_and_bindings(staging_dir: Path) -> None
     compact = gate._compact_canary(staging_dir)
     assert compact is not None
     coverage = compact["coverage"]
-    assert coverage["expected_scope_count"] == 7
+    assert coverage["expected_scope_count"] == len(gate._ALL_CERTIFIED_CANARY_SCOPES)
     assert set(coverage["expected_scopes"]) == set(gate._ALL_CERTIFIED_CANARY_SCOPES)
     assert coverage["passed_scope_count"] == 2
     assert "qunar:lodging" in coverage["missing"]
@@ -6118,8 +6322,8 @@ def test_layer5_rejects_extra_scopes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """C-118 Gap 2 counter-example: a canary that adds a non-certified extra
-    scope must fail the layer — coverage is the exact seven certified canary
-    scopes, and an ad-hoc scope inflates it."""
+    scope must fail the layer — coverage is the exact registry-derived
+    certified canary scopes, and an ad-hoc scope inflates it."""
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
     monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
@@ -6647,10 +6851,10 @@ def test_main_rejects_staging_symlink(
 
 def _layer5_compact_fixture() -> dict[str, object]:
     """A layer-5 compact that satisfies the strong C-118 blob contract: the
-    seven certified canary scopes (six browser Companion OTA + iCom public-API),
-    exact coverage thresholds, all passed/fresh/authorized/read-only, and the
-    connected Companion authorizing exactly the six browser scopes (C-122
-    HG-A)."""
+    registry-derived certified canary scopes (five browser Companion OTA + iCom
+    public-API, 6 total), exact coverage thresholds, all
+    passed/fresh/authorized/read-only, and the connected Companion authorizing
+    exactly the five certified browser scopes (C-122 round-19)."""
     canary = _matching_canary()
     cs = canary["companion_status"]
     companions = [
@@ -6692,19 +6896,19 @@ def _layer5_compact_fixture() -> dict[str, object]:
 
 
 def test_verify_layer5_compact_contract_accepts_full_set() -> None:
-    """C-118 Gap 7 positive: the complete seven-scope layer-5 compact passes the
-    blob read-back contract."""
+    """C-118 Gap 7 positive: the complete registry-derived six-scope layer-5
+    compact passes the blob read-back contract."""
     gate._verify_layer5_compact_contract(
         "done-gate-layer5-compact.json", _layer5_compact_fixture()
     )
 
 
 def test_verify_layer5_compact_contract_accepts_connected_browser_companion() -> None:
-    """C-122 HG-A counter-example: a connected ctrip/qunar/tongcheng Companion
-    authorizing EXACTLY the six browser OTA scopes (including ``tongcheng:lodging``,
-    excluding ``icom:transfer``) genuinely passes — the layer-5 compact contract
-    accepts the full certified canary scope set and the six-scope Companion
-    authorization together."""
+    """C-122 round-19 counter-example: a connected ctrip/qunar/tongcheng Companion
+    authorizing EXACTLY the certified browser OTA scopes (five scopes, excluding
+    ``icom:transfer`` and excluding the DISABLED ``tongcheng:lodging``) genuinely
+    passes — the layer-5 compact contract accepts the registry-derived certified
+    canary scope set and the five-scope Companion authorization together."""
     compact = _layer5_compact_fixture()
     companions = compact["companion_status"]["companions"]  # type: ignore[assignment]
     assert len(companions) == 1
@@ -6712,8 +6916,8 @@ def test_verify_layer5_compact_contract_accepts_connected_browser_companion() ->
         gate._CERTIFIED_OTA_SCOPES
     )
     assert "icom:transfer" not in companions[0]["authorized_scope_keys"]
-    assert "tongcheng:lodging" in companions[0]["authorized_scope_keys"]
-    # The full seven-scope canary + six-scope Companion contract passes.
+    assert "tongcheng:lodging" not in companions[0]["authorized_scope_keys"]
+    # The full registry-derived canary + Companion contract passes.
     gate._verify_layer5_compact_contract(
         "done-gate-layer5-compact.json", compact
     )
@@ -6730,25 +6934,65 @@ def test_verify_layer5_compact_contract_rejects_companion_with_icom_scope() -> N
     )
     with pytest.raises(
         gate.GateStateChangedError,
-        match="authorized_scope_keys != the six browser Companion OTA scopes",
+        match="authorized_scope_keys != the certified browser Companion OTA scopes",
     ):
         gate._verify_layer5_compact_contract(
             "done-gate-layer5-compact.json", compact
         )
 
 
-def test_verify_layer5_compact_contract_rejects_companion_missing_tongcheng_lodging() -> None:
-    """C-122 HG-A counter-example: a Companion that does not authorize
-    ``tongcheng:lodging`` must fail the compact contract — the six browser scope
-    set is mandatory and cannot silently shrink."""
+def test_verify_layer5_compact_contract_rejects_companion_missing_certified_scope() -> None:
+    """C-122 round-19 counter-example: a Companion that does not authorize a
+    CERTIFIED browser scope must fail the compact contract — the registry-derived
+    browser scope set is mandatory and cannot silently shrink."""
     compact = _layer5_compact_fixture()
+    removed = sorted(gate._CERTIFIED_OTA_SCOPES)[0]
     companions = compact["companion_status"]["companions"]  # type: ignore[assignment]
     companions[0]["authorized_scope_keys"] = sorted(
-        set(gate._CERTIFIED_OTA_SCOPES) - {"tongcheng:lodging"}
+        set(gate._CERTIFIED_OTA_SCOPES) - {removed}
     )
     with pytest.raises(
         gate.GateStateChangedError,
-        match="authorized_scope_keys != the six browser Companion OTA scopes",
+        match="authorized_scope_keys != the certified browser Companion OTA scopes",
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_disabled_scope() -> None:
+    """C-122 round-19 (2026-08-11 17:03 veto) counter-example: the DISABLED scope
+    ``tongcheng:lodging`` (host_permissions/allowed_actions empty, concurrency=0)
+    must NEVER enter the canary compact — a compact that swaps a certified scope
+    for the disabled scope, or a Companion that authorizes it, fails closed."""
+    # (a) the compact scope list may not include the disabled scope
+    compact = _layer5_compact_fixture()
+    scopes = compact["scopes"]  # type: ignore[assignment]
+    scopes[0] = {  # type: ignore[index]
+        "scope": "tongcheng:lodging",
+        "kind": "companion_heartbeat",
+        "provider": "tongcheng",
+        "passed": True,
+        "fresh": True,
+        "authorized": True,
+        "read_only": True,
+        "evidence": {"companion_id": "comp-1"},
+    }
+    with pytest.raises(
+        gate.GateStateChangedError, match="not one of the certified canary scopes"
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+    # (b) a Companion authorizing the disabled scope fails the exact browser set
+    compact = _layer5_compact_fixture()
+    companions = compact["companion_status"]["companions"]  # type: ignore[assignment]
+    companions[0]["authorized_scope_keys"] = sorted(
+        set(gate._CERTIFIED_OTA_SCOPES) | {"tongcheng:lodging"}
+    )
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="authorized_scope_keys != the certified browser Companion OTA scopes",
     ):
         gate._verify_layer5_compact_contract(
             "done-gate-layer5-compact.json", compact
@@ -6779,8 +7023,8 @@ def test_verify_layer5_compact_contract_rejects_incomplete_scope_set() -> None:
 
 def test_verify_layer5_compact_contract_rejects_non_certified_scope() -> None:
     """C-118 Gap 7 counter-example: a compact whose scope set is not exactly the
-    seven certified canary scopes (an ad-hoc scope swaps in for a certified one)
-    fails."""
+    registry-derived certified canary scopes (an ad-hoc scope swaps in for a
+    certified one) fails."""
     compact = _layer5_compact_fixture()
     scopes = compact["scopes"]  # type: ignore[assignment]
     scopes[0] = {  # type: ignore[index]
@@ -6831,9 +7075,11 @@ def _layer6_compact_fixture() -> dict[str, object]:
             "companions": [
                 {
                     "companion_id": "comp-1",
-                    # C-122 HG-A: exactly the six BROWSER Companion OTA scopes
-                    # (incl. tongcheng:lodging); ``icom:transfer`` is a public-API
-                    # scope and never appears in a Companion's authorization set.
+                    # C-122 round-19: exactly the CERTIFIED BROWSER Companion OTA
+                    # scopes (five scopes, registry-derived); ``icom:transfer`` is
+                    # a public-API scope and never appears in a Companion's
+                    # authorization set, and the DISABLED ``tongcheng:lodging``
+                    # never enters the compact.
                     "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
                 }
             ],
@@ -7237,7 +7483,7 @@ def test_verify_layer6_compact_contract_rejects_bad_companion_preflight() -> Non
 def test_verify_layer6_compact_contract_rejects_companion_with_icom_scope() -> None:
     """C-122 HG-A counter-example: the layer-6 Companion preflight whose
     ``authorized_scope_keys`` wrongly includes the iCom public-API scope fails
-    closed — a Companion authorizes exactly the six browser OTA scopes."""
+    closed — a Companion authorizes exactly the certified browser OTA scopes."""
     compact = _layer6_compact_fixture()
     companions = compact["companion_preflight"]["companions"]  # type: ignore[assignment]
     companions[0]["authorized_scope_keys"] = sorted(
@@ -7245,7 +7491,7 @@ def test_verify_layer6_compact_contract_rejects_companion_with_icom_scope() -> N
     )
     with pytest.raises(
         gate.GateStateChangedError,
-        match="authorized_scope_keys != the six browser Companion OTA scopes",
+        match="authorized_scope_keys != the certified browser Companion OTA scopes",
     ):
         gate._verify_layer6_compact_contract(
             "done-gate-layer6-compact.json",
@@ -7254,18 +7500,39 @@ def test_verify_layer6_compact_contract_rejects_companion_with_icom_scope() -> N
         )
 
 
-def test_verify_layer6_compact_contract_rejects_companion_missing_tongcheng_lodging() -> None:
-    """C-122 HG-A counter-example: the layer-6 Companion preflight that does not
-    authorize ``tongcheng:lodging`` fails closed — the six browser scope set is
-    mandatory."""
+def test_verify_layer6_compact_contract_rejects_companion_missing_certified_scope() -> None:
+    """C-122 round-19 counter-example: the layer-6 Companion preflight that does
+    not authorize a CERTIFIED browser scope fails closed — the registry-derived
+    browser scope set is mandatory and cannot silently shrink."""
     compact = _layer6_compact_fixture()
+    removed = sorted(gate._CERTIFIED_OTA_SCOPES)[0]
     companions = compact["companion_preflight"]["companions"]  # type: ignore[assignment]
     companions[0]["authorized_scope_keys"] = sorted(
-        set(gate._CERTIFIED_OTA_SCOPES) - {"tongcheng:lodging"}
+        set(gate._CERTIFIED_OTA_SCOPES) - {removed}
     )
     with pytest.raises(
         gate.GateStateChangedError,
-        match="authorized_scope_keys != the six browser Companion OTA scopes",
+        match="authorized_scope_keys != the certified browser Companion OTA scopes",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_disabled_scope() -> None:
+    """C-122 round-19 (2026-08-11 17:03 veto) counter-example: the DISABLED scope
+    ``tongcheng:lodging`` must never enter the layer-6 companion preflight — a
+    Companion that authorizes it fails closed."""
+    compact = _layer6_compact_fixture()
+    companions = compact["companion_preflight"]["companions"]  # type: ignore[assignment]
+    companions[0]["authorized_scope_keys"] = sorted(
+        set(gate._CERTIFIED_OTA_SCOPES) | {"tongcheng:lodging"}
+    )
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="authorized_scope_keys != the certified browser Companion OTA scopes",
     ):
         gate._verify_layer6_compact_contract(
             "done-gate-layer6-compact.json",
@@ -7703,6 +7970,115 @@ def test_verify_layer6_compact_contract_rejects_total_not_equal_pair_sum() -> No
         )
 
 
+def test_verify_layer6_compact_contract_rejects_foreign_browser_source_member() -> None:
+    """C-122 round-19 (supervision 17:03 Block 1 counter-example): a v4 source
+    graph with the RIGHT count (13 unique browser Source ids) but a FOREIGN member
+    (one canonical id replaced by an id outside the frozen graph) must REJECT —
+    the member SET must equal the canonical frozen graph exactly, never just have
+    the right length."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                source_ids = check["evidence"]["expected_browser_source_ids"]  # type: ignore[index]
+                assert "source-tongcheng-flight" in source_ids
+                source_ids[source_ids.index("source-tongcheng-flight")] = (  # type: ignore[index]
+                    "source-fliggy-flight"
+                )
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="member set != the canonical frozen graph browser Source-id set",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_wrong_pair_member_swap() -> None:
+    """C-122 round-19 (supervision 17:03 Block 1 counter-example): a v4 source
+    graph whose TOP-LEVEL sets are canonical but whose per-pair breakdown swaps
+    pair-2's query-shape members to a foreign set (13 unique shapes, but not the
+    canonical set) must REJECT — every pair's member sets must equal the frozen
+    graph exactly (wrong-pair-swap gate)."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                for entry in check["evidence"]["per_pair"]:  # type: ignore[index]
+                    if entry["pair_id"] == "pair-2":
+                        shapes = sorted(gate._V4_FROZEN_QUERY_SHAPES)
+                        assert "tongcheng:flight" in shapes
+                        shapes[shapes.index("tongcheng:flight")] = "fliggy:flight"
+                        entry["query_task_ids"] = shapes
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="pair 'pair-2' query shape member set != the canonical frozen graph set",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_missing_icom_task() -> None:
+    """C-122 round-19 (supervision 17:03 Block 1 counter-example): a v4 source
+    graph whose iCom task set DROPS a canonical member (4 -> 3, still unique and
+    positive) must REJECT — the iCom task set must equal the frozen graph exactly."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                icom_ids = check["evidence"]["expected_icom_task_ids"]  # type: ignore[index]
+                icom_ids.pop(0)
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="expected_icom_task_ids member set != the canonical frozen graph iCom task-id set",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_extra_icom_task_member() -> None:
+    """C-122 round-19 (supervision 17:03 Block 1 counter-example): a v4 source
+    graph whose per-pair iCom member list contains a FOREIGN extra member (size 5
+    where the frozen graph seals 4) must REJECT even though the top-level iCom set
+    and every count stays canonical — a pair carrying an extra iCom task is a
+    forged graph."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                for entry in check["evidence"]["per_pair"]:  # type: ignore[index]
+                    if entry["pair_id"] == "pair-1":
+                        entry["icom_source_task_ids"] = [
+                            *sorted(gate._V4_FROZEN_ICOM_TASK_IDS),
+                            "public-transfer-icom-evil-extra",
+                        ]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="pair 'pair-1' iCom task id member list is missing or has the wrong size",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
 def test_verify_layer6_compact_contract_rejects_coverage_mode_degraded() -> None:
     """C-122 HG-G counter-example (supervision real-run): a strict-coverage check
     that records coverage_mode=degraded must REJECT — the strict coverage receipt
@@ -7967,9 +8343,9 @@ def test_verify_layer5_compact_contract_rejects_empty_scope_evidence() -> None:
 
 
 def test_verify_layer5_compact_contract_rejects_valid_seven_plus_none() -> None:
-    """C-122 Fix 6 counter-example: the seven valid certified canary scopes plus
-    one extra ``None`` entry (input array length 8) must fail closed — the
-    array is exactly seven."""
+    """C-122 Fix 6 counter-example: the valid certified canary scopes plus one
+    extra ``None`` entry must fail closed — the array length must equal the
+    certified scope set size."""
     compact = _layer5_compact_fixture()
     expected = sorted(gate._ALL_CERTIFIED_CANARY_SCOPES)
     compact["coverage"] = {  # type: ignore[assignment]
@@ -8086,7 +8462,12 @@ def test_verify_layer5_compact_contract_rejects_icom_without_query_sample() -> N
     read-only query sample (per-item authentication) fails closed."""
     compact = _layer5_compact_fixture()
     scopes = compact["scopes"]  # type: ignore[assignment]
-    scopes[6] = {  # type: ignore[index]
+    icom_index = next(
+        i
+        for i, s in enumerate(scopes)
+        if isinstance(s, dict) and s.get("scope") == "icom:transfer"
+    )
+    scopes[icom_index] = {  # type: ignore[index]
         "scope": "icom:transfer",
         "kind": "icom_public_api",
         "provider": "icom",
@@ -8157,7 +8538,12 @@ def test_verify_layer5_compact_contract_rejects_icom_zero_options() -> None:
     carries no positive option count (0 / negative / non-int) fails closed."""
     compact = _layer5_compact_fixture()
     scopes = compact["scopes"]  # type: ignore[assignment]
-    scopes[6] = {  # type: ignore[index]
+    icom_index = next(
+        i
+        for i, s in enumerate(scopes)
+        if isinstance(s, dict) and s.get("scope") == "icom:transfer"
+    )
+    scopes[icom_index] = {  # type: ignore[index]
         "scope": "icom:transfer",
         "kind": "icom_public_api",
         "provider": "icom",
@@ -8181,7 +8567,12 @@ def test_verify_layer5_compact_contract_rejects_icom_sample_missing_quote() -> N
     quote and fails closed."""
     compact = _layer5_compact_fixture()
     scopes = compact["scopes"]  # type: ignore[assignment]
-    scopes[6] = {  # type: ignore[index]
+    icom_index = next(
+        i
+        for i, s in enumerate(scopes)
+        if isinstance(s, dict) and s.get("scope") == "icom:transfer"
+    )
+    scopes[icom_index] = {  # type: ignore[index]
         "scope": "icom:transfer",
         "kind": "icom_public_api",
         "provider": "icom",

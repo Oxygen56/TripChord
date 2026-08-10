@@ -155,6 +155,35 @@ def test_seal_failure_diagnostic_writes_0600_atomic(tmp_path: Path) -> None:
     assert not output.exists()
 
 
+def test_seal_failure_diagnostic_binds_run_id_tested_sha_runtime(tmp_path: Path) -> None:
+    """C-122 round-19 (Block 2): the failure diagnostic binds the run_id and
+    tested_sha the gate passed plus the runtime identity, so the outer layer can
+    verify the diagnostic belongs to THIS run at THIS revision and is not a stale
+    or foreign failure."""
+    output = tmp_path / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    diag = canary._seal_failure_diagnostic(
+        "evaluate",
+        RuntimeError("wrapped bridge"),
+        output,
+        run_id=run_id,
+        tested_sha=tested_sha,
+    )
+    payload = json.loads(diag.read_text(encoding="utf-8"))
+    assert payload["run_identity"]["run_id"] == run_id
+    assert payload["run_identity"]["tested_sha"] == tested_sha
+    runtime = payload["run_identity"]["runtime"]
+    assert isinstance(runtime, dict)
+    assert runtime.get("python") and runtime.get("platform")
+    # Default (gate passes no binding) stays present-but-empty for the consumer
+    # to detect as missing rather than guess.
+    bare = canary._seal_failure_diagnostic("evaluate", RuntimeError("x"), output)
+    bare_payload = json.loads(bare.read_text(encoding="utf-8"))
+    assert bare_payload["run_identity"]["run_id"] == ""
+    assert bare_payload["run_identity"]["tested_sha"] == ""
+
+
 def test_main_seals_diagnostic_when_evaluate_raises(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

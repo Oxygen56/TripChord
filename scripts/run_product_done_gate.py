@@ -48,6 +48,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
+from tripchord.planning.frozen_graph import (
+    FROZEN_V4_PAIR_COUNT,
+    frozen_v4_browser_source_ids,
+    frozen_v4_icom_task_ids,
+    frozen_v4_query_shapes,
+    frozen_v4_tasks_per_pair,
+)
+from tripchord.platform.registry import build_default_registry
 from tripchord.runtime_provenance import local_expected_provenance, provenance_mismatches
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1297,16 +1305,130 @@ def _final_evidence_secret_scan(
     )
 
 
-def layer5_real_canary(staging_dir: Path) -> LayerResult:
+_CANARY_DIAG_SCHEMA_VERSION = "tripchord-certified-ota-canary-v1"
+# A failure diagnostic older than this is a STALE failure (a prior run's crash),
+# never evidence of the current canary run (Block 2 freshness binding).
+_CANARY_DIAG_MAX_AGE_SECONDS = 1800
+
+
+def _consume_canary_failure_diagnostic(
+    evidence_path: Path,
+    *,
+    run_id: str = "",
+    tested_commit_sha: str = "",
+    now: datetime | None = None,
+) -> tuple[str | None, str | None]:
+    """Read and verify the 0600 canary failure diagnostic for a FAILED canary.
+
+    C-122 round-19 (supervision 17:03 Block 2): when the canary crashes without a
+    main JSON, the outer gate must consume the 0600 ``<output>.failure.json`` the
+    canary sealed and verify schema / diagnostic kind / run_id / tested_sha /
+    runtime / 0600 perms / freshness.  Returns ``(classification, error)`` —
+    exactly one is non-None.  ``classification`` is the desensitized
+    stage + exception class + summary plus the run_id / tested_sha / runtime
+    bindings, carried into the layer-5 detail.  Any missing / stale / mismatched /
+    unreadable diagnostic yields ``error`` so the layer fails closed explicitly
+    instead of silently consuming an old or foreign failure.
+    """
+    now = now or datetime.now(UTC)
+    diag_path = evidence_path.with_suffix(evidence_path.suffix + ".failure.json")
+    if not diag_path.is_file():
+        return None, (
+            "canary failed without a main JSON but no failure diagnostic "
+            "(expected 0600 <output>.failure.json)"
+        )
+    try:
+        mode = stat.S_IMODE(diag_path.stat().st_mode)
+    except OSError as exc:
+        return None, f"canary failure diagnostic stat failed: {exc}"
+    if mode != 0o600:
+        return None, f"canary failure diagnostic must be 0600, got {oct(mode)}"
+    try:
+        diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, f"canary failure diagnostic unreadable or invalid JSON: {exc}"
+    if not isinstance(diagnostic, dict):
+        return None, "canary failure diagnostic is not an object"
+    if diagnostic.get("schema_version") != _CANARY_DIAG_SCHEMA_VERSION:
+        return None, "canary failure diagnostic schema_version mismatch"
+    if diagnostic.get("diagnostic_kind") != "canary_failure":
+        return None, "canary failure diagnostic diagnostic_kind mismatch"
+    stage = diagnostic.get("stage")
+    exception_class = diagnostic.get("exception_class")
+    if not isinstance(stage, str) or not stage:
+        return None, "canary failure diagnostic missing stage"
+    if not isinstance(exception_class, str) or not exception_class:
+        return None, "canary failure diagnostic missing exception_class"
+    run_identity = diagnostic.get("run_identity")
+    if not isinstance(run_identity, dict):
+        return None, "canary failure diagnostic missing run_identity"
+    diag_run_id = run_identity.get("run_id")
+    if not isinstance(diag_run_id, str) or not diag_run_id:
+        return None, "canary failure diagnostic missing run_id"
+    if run_id and diag_run_id != run_id:
+        return None, (
+            f"canary failure diagnostic run_id {diag_run_id!r} != this run "
+            f"{run_id!r}"
+        )
+    diag_sha = run_identity.get("tested_sha")
+    if not isinstance(diag_sha, str) or not diag_sha:
+        return None, "canary failure diagnostic missing tested_sha"
+    if tested_commit_sha and diag_sha != tested_commit_sha:
+        return None, (
+            f"canary failure diagnostic tested_sha {diag_sha!r} != this run "
+            f"{tested_commit_sha!r}"
+        )
+    runtime = run_identity.get("runtime")
+    if not isinstance(runtime, dict):
+        return None, "canary failure diagnostic missing runtime identity"
+    if not runtime.get("python") or not runtime.get("platform"):
+        return None, "canary failure diagnostic runtime identity is incomplete"
+    generated_at = diagnostic.get("generated_at")
+    if not isinstance(generated_at, str) or not generated_at:
+        return None, "canary failure diagnostic missing generated_at"
+    try:
+        generated_dt = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None, "canary failure diagnostic generated_at is not a timestamp"
+    if generated_dt.tzinfo is None:
+        return None, "canary failure diagnostic generated_at is not timezone-aware"
+    age = (now - generated_dt).total_seconds()
+    if age < 0 or age > _CANARY_DIAG_MAX_AGE_SECONDS:
+        return None, (
+            f"canary failure diagnostic is stale (age {age:.0f}s > "
+            f"{_CANARY_DIAG_MAX_AGE_SECONDS}s)"
+        )
+    summary = diagnostic.get("summary")
+    if not isinstance(summary, str) or not summary:
+        summary = "no exception detail"
+    classification = (
+        f"canary failure diagnostic consumed: stage={stage} "
+        f"exception={exception_class} summary={summary} "
+        f"run_id={diag_run_id} tested_sha={diag_sha[:12]} "
+        f"runtime=python {runtime.get('python')}/{runtime.get('platform')} "
+        f"generated_at={generated_dt.isoformat()}"
+    )
+    return classification, None
+
+
+def layer5_real_canary(
+    staging_dir: Path,
+    *,
+    run_id: str = "",
+    tested_commit_sha: str = "",
+) -> LayerResult:
     """Every declared-certified real provider x vertical needs a live canary.
 
     The layer verdict is driven by a per-scope certified OTA canary
-    (``benchmarks/live_canary_certified.py``): each of the six certified scopes
+    (``benchmarks/live_canary_certified.py``): each certified scope
     must show a fresh, authorised, read-only canary — a fresh Companion
     heartbeat for the browser scopes and a real public API read for
     ``icom:transfer``.  The open-meteo / dpm.org.cn probes are kept as a
     separately-labelled public-page connectivity canary that never drives the
     layer verdict.
+
+    ``run_id`` / ``tested_commit_sha`` (when non-empty) are passed to the canary
+    so a crash seals a diagnostic that binds THIS run at THIS revision (Block 2).
     """
     sub_checks: list[dict[str, Any]] = []
 
@@ -1346,22 +1468,29 @@ def layer5_real_canary(staging_dir: Path) -> LayerResult:
     # The bridge token travels to the canary via the inherited environment, NEVER
     # via argv: argv is visible in the process list and can leak into logs.  The
     # child script reads TRIPCHORD_BROWSER_BRIDGE_TOKEN as its default token.
+    canary_argv = [
+        "uv",
+        "run",
+        "python",
+        "benchmarks/live_canary_certified.py",
+        "--output",
+        str(evidence_path),
+    ]
+    # C-122 round-19 (Block 2): bind this run + this tested revision into the
+    # canary so a crash seals a diagnostic the gate can verify as current-owned.
+    if run_id:
+        canary_argv += ["--run-id", run_id]
+    if tested_commit_sha:
+        canary_argv += ["--tested-sha", tested_commit_sha]
     code, _ = _run(
-        [
-            "uv",
-            "run",
-            "python",
-            "benchmarks/live_canary_certified.py",
-            "--output",
-            str(evidence_path),
-        ],
+        canary_argv,
         env=_bridge_env(bridge_token),
         timeout=900,
     )
     passed = False
     canary_failures: list[str] = []
     # C-118: the certified canary must BOTH exit 0 AND carry a passed=true JSON
-    # with the exact six certified scopes each fresh/authorized/read-only/passed.
+    # with the exact certified scope set each fresh/authorized/read-only/passed.
     # A non-zero exit cannot be papered over by a forged all-green JSON, and a
     # canary that exits 0 while reporting a failed/stale/unauthorized/incomplete
     # scope set must fail the layer (C-114 review R2).
@@ -1374,14 +1503,44 @@ def layer5_real_canary(staging_dir: Path) -> LayerResult:
     except (OSError, ValueError):
         report = None
         canary_failures.append("canary evidence JSON missing or unreadable")
+    # C-122 round-19 (supervision 17:03 Block 2): when the canary failed (non-zero
+    # exit OR the main JSON is missing/unreadable), the outer layer MUST consume
+    # the 0600 failure diagnostic the canary sealed — verify schema / run_id /
+    # tested_sha / runtime / 0600 perms / freshness and keep the desensitized
+    # classification + bindings in the layer-5 detail.  A missing diagnostic is
+    # only mandatory when the canary crashed without a report; a canary that
+    # exits 2 carrying a valid passed=false report legitimately has no diagnostic
+    # (its report IS the failure evidence).  Old / mismatched / missing
+    # diagnostics fail closed explicitly — never silently consumed.
+    if code != 0 or report is None:
+        diag_path = evidence_path.with_suffix(
+            evidence_path.suffix + ".failure.json"
+        )
+        if diag_path.is_file() or report is None:
+            classification, diag_error = _consume_canary_failure_diagnostic(
+                evidence_path,
+                run_id=run_id,
+                tested_commit_sha=tested_commit_sha,
+            )
+            if diag_error is not None:
+                canary_failures.append(diag_error)
+            elif classification is not None:
+                sub_checks.append(
+                    {
+                        "name": "canary_failure_diagnostic",
+                        "passed": False,
+                        "drives_pass": True,
+                        "detail": classification,
+                    }
+                )
     if report is not None:
         scopes = report.get("scopes")
         if not isinstance(scopes, list) or not scopes:
             canary_failures.append("canary carries no scopes")
         else:
             # C-122 round-18 item 4: the raw scope array must be EXACTLY the
-            # certified canary scope set (six browser Companion OTA scopes +
-            # the iCom public-API scope, 7 total), each a dict with a unique
+            # certified canary scope set (five browser Companion OTA scopes +
+            # the iCom public-API scope, 6 total), each a dict with a unique
             # non-empty name.  A canary that smuggles a string/None entry, a
             # duplicate or an extra scope past the green checks fails the layer
             # — nothing is silently skipped or deduped.
@@ -1428,7 +1587,7 @@ def layer5_real_canary(staging_dir: Path) -> LayerResult:
             if missing:
                 canary_failures.append("missing certified scopes: " + ", ".join(missing))
             # C-118: the certified canary must declare EXACTLY the certified
-            # scopes (six browser Companion + the iCom public-API scope) — an
+            # scopes (the certified browser Companion + the iCom public-API scope) — an
             # extra/ad-hoc scope is not certified and must fail the layer rather
             # than inflate coverage (C-122 HG-A).
             extra = sorted(present - _ALL_CERTIFIED_CANARY_SCOPES)
@@ -1463,7 +1622,7 @@ def layer5_real_canary(staging_dir: Path) -> LayerResult:
         name="5_real_canary",
         passed=passed,
         detail=(
-            "all 7 certified canary scopes (six browser Companion OTA + iCom "
+            "all 6 certified canary scopes (five browser Companion OTA + iCom "
             "public API) have fresh authorised read-only canaries"
             if passed
             else (
@@ -1500,42 +1659,45 @@ def _extract_build_fingerprint(status_payload: Any) -> str | None:
     return None
 
 
-# The declared-certified BROWSER Companion OTA scopes layer 5 requires (a fresh
-# Companion heartbeat for each browser provider).  A canary that omits, skips
-# or stales any of these must fail the layer (C-114 review R2): a certified
-# canary is complete or it is not a canary.
+# The certified canary scope contract is DERIVED from the authoritative
+# registry — never hardcoded.  ``build_default_registry().certified_scopes()``
+# returns exactly the CERTIFIED_ACTIVE set: five browser Companion OTA scopes
+# (ctrip:flight, ctrip:lodging, qunar:flight, qunar:lodging, tongcheng:flight)
+# plus the iCom public-API scope (icom:transfer) = 6 total.
 #
-# C-122 HG-A (2026-08-10 13:40 supervisor veto): this is the BROWSER Companion
-# authorization set — exactly the six browser OTA scopes (ctrip/qunar/tongcheng
-# x flight/lodging), including ``tongcheng:lodging``.  ``icom:transfer`` is an
-# independent public API read, NOT a browser Companion scope, and must never
-# appear in a Companion's ``authorized_scope_keys``.
+# C-122 round-19 (2026-08-11 17:03 supervision veto): ``tongcheng:lodging`` is
+# DISABLED in the authoritative registry (user skipped on 2026-08-05) — it must
+# NEVER enter the canary / compact / gate as a required member, and must never
+# be silently re-enabled by a hardcoded contract.  The layer-5 canary and the
+# layer-5/layer-6 compacts all bind to this registry-derived exact set.
+_CERTIFIED_CANARY_SCOPE_KEYS: frozenset[str] = frozenset(
+    scope.key for scope in build_default_registry().certified_scopes()
+)
+
+# The BROWSER Companion OTA scopes layer 5 requires (a fresh Companion heartbeat
+# for each browser provider).  ``icom:transfer`` is an independent public API
+# read, NOT a browser Companion scope, and must never appear in a Companion's
+# ``authorized_scope_keys``.
 _CERTIFIED_OTA_SCOPES = frozenset(
-    {
-        "ctrip:flight",
-        "ctrip:lodging",
-        "qunar:flight",
-        "qunar:lodging",
-        "tongcheng:flight",
-        "tongcheng:lodging",
-    }
+    key for key in _CERTIFIED_CANARY_SCOPE_KEYS if not key.startswith("icom:")
 )
 
 # The iCom public-API scope: a real read-only transfer-search query, separate
-# from the browser Companion authorization contract (C-122 HG-A).  It stays in
-# the certified canary scope set but is never part of a Companion's
-# ``authorized_scope_keys``.
-_ICOM_PUBLIC_API_SCOPES = frozenset({"icom:transfer"})
+# from the browser Companion authorization contract.  It stays in the certified
+# canary scope set but is never part of a Companion's ``authorized_scope_keys``.
+_ICOM_PUBLIC_API_SCOPES = frozenset(
+    key for key in _CERTIFIED_CANARY_SCOPE_KEYS if key.startswith("icom:")
+)
 
-# The full certified canary scope set = the six browser Companion OTA scopes
-# plus the iCom public-API scope (7 total).  The layer-5 canary's raw scope
-# array and the layer-5 compact's coverage/scope set must be exactly this set.
+# The full certified canary scope set = the certified browser Companion OTA
+# scopes plus the iCom public-API scope.  The layer-5 canary's raw scope array
+# and the layer-5 compact's coverage/scope set must be exactly this set.
 _ALL_CERTIFIED_CANARY_SCOPES = _CERTIFIED_OTA_SCOPES | _ICOM_PUBLIC_API_SCOPES
 
-# The fixed browser platform set the certified canary must complete: the three
-# OTA providers named by the browser Companion certified scopes (C-122 round-18
-# gate-2).  The strict-coverage evidence and the real browser source evidence
-# both bind to exactly this set — never a forged or partial provider list.
+# The fixed browser platform set the certified canary must complete: the OTA
+# providers named by the browser Companion certified scopes.  The
+# strict-coverage evidence and the real browser source evidence both bind to
+# exactly this set — never a forged or partial provider list.
 _BROWSER_OTA_PROVIDERS = frozenset(
     scope.split(":", 1)[0] for scope in _CERTIFIED_OTA_SCOPES
 )
@@ -1545,18 +1707,29 @@ _BROWSER_OTA_PROVIDERS = frozenset(
 # plan (mirror of the producer's ``len(run.pair_runs) != 3`` contract in
 # apps/api/src/tripchord/agents/live_done_gate_v4.py).  The layer-6 compact
 # validator uses this to reject a forged 1-pair / 1-task source graph.
-_V4_FROZEN_DATE_PAIR_COUNT = 3
+#
+# C-122 round-19 (supervision 17:03 Block 1): the frozen constants and the
+# canonical MEMBER SETS are DERIVED from the shared canonical frozen graph
+# (tripchord/planning/frozen_graph.py) — the exact same source the producer's
+# ``_check_v4_source_graph`` derives its expected sets from.  The validator
+# compares the compact's member sets against these EXACT sets (not just their
+# lengths), so a foreign member, a wrong-pair swap or a missing/extra iCom task
+# all fail closed.
+_V4_FROZEN_DATE_PAIR_COUNT = FROZEN_V4_PAIR_COUNT
 
-# C-122 round-18 HG-G2 (supervision 16:03): the frozen per-pair browser-source /
-# query-task count the layer-6 v4 source graph seals on EVERY frozen date pair.
-# The real frozen maldives scenario schedules 13 browser queries per pair (the 6
-# enabled ctrip kinds + the 6 enabled qunar kinds + tongcheng's single flight),
-# so a compact that shrinks the per-pair count to 1, or declares a per-pair task
-# count whose ID sets carry a different number of Source ids / query shapes, is a
-# forged graph and must fail closed even though every field is non-empty /
-# unique / positive.  Binding the ID-set lengths to this frozen count is the
-# HG-G2 counter-example fix.
-_V4_FROZEN_TASKS_PER_PAIR = 13
+# The frozen per-pair browser-source / query-task count the layer-6 v4 source
+# graph seals on EVERY frozen date pair.  The real frozen maldives scenario
+# schedules 13 browser queries per pair (the 6 enabled ctrip kinds + the 6
+# enabled qunar kinds + tongcheng's single flight), so a compact that shrinks the
+# per-pair count to 1, or declares a per-pair task count whose ID sets carry a
+# different number of Source ids / query shapes, is a forged graph and must fail
+# closed even though every field is non-empty / unique / positive.
+_V4_FROZEN_TASKS_PER_PAIR = frozen_v4_tasks_per_pair()
+
+# Canonical frozen member sets for exact per-pair comparison (Block 1).
+_V4_FROZEN_BROWSER_SOURCE_IDS = frozen_v4_browser_source_ids()
+_V4_FROZEN_QUERY_SHAPES = frozen_v4_query_shapes()
+_V4_FROZEN_ICOM_TASK_IDS = frozen_v4_icom_task_ids()
 
 
 def _resolve_live_state_db(explicit: Path | None = None) -> Path:
@@ -2460,12 +2633,20 @@ def run_gate(
             "cannot certify a revision that is not checked out"
         )
     tested_commit_sha = start.commit_sha
+    # C-122 round-19 (Block 2): the run_id is resolved BEFORE the layers run so
+    # the layer-5 canary can bind it into its failure diagnostic — a diagnostic
+    # that does not name this run is never consumed.
+    resolved_run_id = run_id or _new_run_id()
     layers = [
         layer1_reproducibility(),
         layer2_replay(staging_dir),
         layer3_clean_chrome_fixtures(staging_dir),
         layer4_model_smoke(),
-        layer5_real_canary(staging_dir),
+        layer5_real_canary(
+            staging_dir,
+            run_id=resolved_run_id,
+            tested_commit_sha=tested_commit_sha,
+        ),
         layer6_full_e2e(staging_dir, start, live_state_db=live_state_db),
     ]
     # B1 secret scan: bridge token + model API keys must never reach logs or
@@ -2504,7 +2685,7 @@ def run_gate(
         schema_version=EVIDENCE_SCHEMA,
         generated_at=_now(),
         tested_commit_sha=tested_commit_sha,
-        run_id=run_id or _new_run_id(),
+        run_id=resolved_run_id,
         toplevel=start.toplevel,
         branch=start.branch,
         worktree_dirty=start.worktree_dirty,
@@ -2827,7 +3008,7 @@ def _compact_canary(staging_dir: Path) -> dict[str, Any] | None:
     companions = companion_status.get("companions") or []
     scopes = payload.get("scopes") or []
     seen = {entry.get("scope") for entry in scopes if isinstance(entry, dict)}
-    # C-122 HG-A: coverage tracks the FULL certified canary scope set — the six
+    # C-122 HG-A: coverage tracks the FULL certified canary scope set — the
     # browser Companion OTA scopes plus the iCom public-API scope.
     expected = sorted(_ALL_CERTIFIED_CANARY_SCOPES)
     coverage = {
@@ -3065,9 +3246,15 @@ _LAYER6_EVIDENCE_SCHEMAS: dict[str, dict[str, Any]] = {
         # C-122 HG-G: the frozen-scenario per-pair breakdown — every nested field
         # is whitelisted so a forged 64-hex or an unknown nested binding cannot
         # ride into the committed compact.
+        # C-122 round-19 (Block 1): the per-pair MEMBER LISTS are whitelisted
+        # alongside the counts so the exact member-set comparison survives
+        # desensitization into the committed compact.
         "per_pair": {
             "_item": {
                 "pair_id": _EVIDENCE_SCALAR,
+                "browser_source_task_ids": {"_item": _EVIDENCE_SCALAR},
+                "query_task_ids": {"_item": _EVIDENCE_SCALAR},
+                "icom_source_task_ids": {"_item": _EVIDENCE_SCALAR},
                 "browser_source_task_count": _EVIDENCE_SCALAR,
                 "query_task_count": _EVIDENCE_SCALAR,
                 "icom_source_task_count": _EVIDENCE_SCALAR,
@@ -3456,7 +3643,7 @@ def _verify_required_evidence_inputs(staging_dir: Path) -> None:
 def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -> None:
     """C-118: hard-verify the committed layer-5 compact from E's blob.
 
-    Requires the exact six certified scopes — no fewer, no extra, each unique,
+    Requires the exact certified scope set — no fewer, no extra, each unique,
     each passed/fresh/authorized/read_only — plus the coverage thresholds naming
     the same six scopes with all observed/passed counts equal.  A compact that
     omits a scope, adds a non-certified scope, repeats a scope, carries a
@@ -3479,7 +3666,7 @@ def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
     # C-122 round-18 gate-5: semantic (not just non-empty) top-level validation
     # — a compact must itself declare passed=true with the bridge token present
     # (a real authenticated Companion session), backed by a connected/fresh
-    # Companion whose authorized scope set is EXACTLY the six certified scopes.
+    # Companion whose authorized scope set is EXACTLY the certified scope set.
     if compact.get("passed") is not True:
         raise GateStateChangedError(
             f"evidence commit E layer-5 compact {tracked_rel} top-level passed "
@@ -3537,14 +3724,14 @@ def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
             )
         companion_scopes = companion.get("authorized_scope_keys")
         # C-122 HG-A: a browser Companion's authorization set must be EXACTLY
-        # the six browser OTA scopes — ``icom:transfer`` is a public-API scope,
+        # the certified browser OTA scopes — ``icom:transfer`` is a public-API scope,
         # not a Companion scope, and must never appear here.
         if not isinstance(companion_scopes, list) or set(companion_scopes) != set(
             _CERTIFIED_OTA_SCOPES
         ):
             raise GateStateChangedError(
                 f"evidence commit E layer-5 compact {tracked_rel} companion "
-                "authorized_scope_keys != the six browser Companion OTA scopes"
+                "authorized_scope_keys != the certified browser Companion OTA scopes"
             )
         build_sha = companion.get("build_sha256")
         if (
@@ -3565,8 +3752,8 @@ def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
         if isinstance(companion, dict) and isinstance(companion.get("companion_id"), str)
     }
     # C-122 HG-A: the compact's coverage/scope set is the FULL certified canary
-    # scope set — the six browser Companion OTA scopes plus the iCom public-API
-    # scope (7 total).  The browser Companion ``authorized_scope_keys`` above
+    # scope set — the certified browser Companion OTA scopes plus the iCom
+    # public-API scope.  The browser Companion ``authorized_scope_keys`` above
     # stays the narrower six-browser set.
     expected = sorted(_ALL_CERTIFIED_CANARY_SCOPES)
     coverage = compact.get("coverage")
@@ -3756,7 +3943,7 @@ def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
     if present != set(expected):
         raise GateStateChangedError(
             f"evidence commit E layer-5 compact {tracked_rel} scope set != the "
-            "six certified scopes"
+            "certified scopes"
         )
 
 
@@ -3962,6 +4149,18 @@ def _verify_layer6_check_semantics(
                 f"{len(source_ids)} != the frozen per-pair browser task count "
                 f"{expected_tasks} — one Source id per task is required"
             )
+        # C-122 round-19 (supervision 17:03 Block 1 counter-example): the member
+        # SET must be EXACTLY the canonical frozen graph — a graph whose Source
+        # ids have the right length but contain a foreign member, or omit / swap
+        # a canonical member, is a forged graph and fails closed even though the
+        # count and uniqueness checks pass.
+        if set(source_ids) != _V4_FROZEN_BROWSER_SOURCE_IDS:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} expected_browser_source_ids member set != the "
+                "canonical frozen graph browser Source-id set (foreign, missing "
+                "or swapped member)"
+            )
         # C-122 round-18 HG-E: a passing v4 source graph must also carry the
         # query-shape contract, the iCom Source-task id set, the planned date
         # pairs and a positive total planned task count — the recomputable
@@ -3993,6 +4192,25 @@ def _verify_layer6_check_semantics(
                 f"{check_name!r} expected_query_shapes length "
                 f"{len(query_shapes)} != the frozen per-pair browser task count "
                 f"{expected_tasks} — one query shape per task is required"
+            )
+        # C-122 round-19 (supervision 17:03 Block 1 counter-example): the query
+        # shape and iCom task member SETS must be EXACTLY the canonical frozen
+        # graph.  A compact with the right counts but a foreign query shape /
+        # iCom task id, or a missing / extra iCom task, is a forged graph.
+        if set(query_shapes) != _V4_FROZEN_QUERY_SHAPES:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} expected_query_shapes member set != the "
+                "canonical frozen graph query-shape set (foreign or missing "
+                "member)"
+            )
+        icom_task_ids = evidence.get("expected_icom_task_ids")
+        if set(icom_task_ids) != _V4_FROZEN_ICOM_TASK_IDS:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} expected_icom_task_ids member set != the "
+                "canonical frozen graph iCom task-id set (foreign, missing or "
+                "extra iCom task)"
             )
         # C-122 HG-G: the frozen-scenario exact binding.  The producer seals the
         # v4 source graph for EXACTLY the three frozen date pairs, with the SAME
@@ -4073,6 +4291,43 @@ def _verify_layer6_check_semantics(
                     f"{check_name!r} pair {entry_pair_id!r} icom source task "
                     "count != the frozen per-pair iCom task set size"
                 )
+            # C-122 round-19 (supervision 17:03 Block 1 counter-example): each
+            # pair must also carry EXACT per-pair member LISTS that equal the
+            # canonical frozen graph member sets.  A pair whose browser Source
+            # ids / query shapes / iCom task ids contain a foreign member, omit a
+            # canonical member or swap in another pair's set fails closed even
+            # when every count lines up — this is the wrong-pair-swap gate.
+            for list_key, canonical, label in (
+                (
+                    "browser_source_task_ids",
+                    _V4_FROZEN_BROWSER_SOURCE_IDS,
+                    "browser Source id",
+                ),
+                ("query_task_ids", _V4_FROZEN_QUERY_SHAPES, "query shape"),
+                (
+                    "icom_source_task_ids",
+                    _V4_FROZEN_ICOM_TASK_IDS,
+                    "iCom task id",
+                ),
+            ):
+                member_ids = entry.get(list_key)
+                if not isinstance(member_ids, list) or len(member_ids) != len(
+                    canonical
+                ):
+                    raise GateStateChangedError(
+                        f"evidence commit E layer-6 compact {tracked_rel} check "
+                        f"{check_name!r} pair {entry_pair_id!r} {label} member "
+                        "list is missing or has the wrong size"
+                    )
+                if len(member_ids) != len(set(member_ids)) or set(
+                    member_ids
+                ) != canonical:
+                    raise GateStateChangedError(
+                        f"evidence commit E layer-6 compact {tracked_rel} check "
+                        f"{check_name!r} pair {entry_pair_id!r} {label} member "
+                        "set != the canonical frozen graph set (foreign, missing "
+                        "or swapped member)"
+                    )
         if per_pair_ids != set(pair_ids):
             raise GateStateChangedError(
                 f"evidence commit E layer-6 compact {tracked_rel} check "
@@ -4627,8 +4882,9 @@ def _verify_layer6_compact_contract(
         if not isinstance(scopes, list) or set(scopes) != set(_CERTIFIED_OTA_SCOPES):
             raise GateStateChangedError(
                 f"evidence commit E layer-6 compact {tracked_rel} companion "
-                "preflight authorized_scope_keys != the six browser Companion "
-                "OTA scopes (C-122 HG-A; icom:transfer is not a Companion scope)"
+                "preflight authorized_scope_keys != the certified browser "
+                "Companion OTA scopes (C-122 HG-A; icom:transfer is not a "
+                "Companion scope)"
             )
     event_injection = compact.get("event_injection_contract")
     if not isinstance(event_injection, dict) or not isinstance(
@@ -5765,12 +6021,12 @@ def _verify_p_manifest_binds_e(
                 "entry in E's canonical manifest"
             )
             continue
-        for field in ("tracked_path", "committed", "sha256", "size_bytes"):
-            p_val = p_entry.get(field)
-            e_val = e_entry.get(field)
+        for key in ("tracked_path", "committed", "sha256", "size_bytes"):
+            p_val = p_entry.get(key)
+            e_val = e_entry.get(key)
             if p_val != e_val:
                 problems.append(
-                    f"pointer commit P manifest file {p_name!r} {field} "
+                    f"pointer commit P manifest file {p_name!r} {key} "
                     f"{p_val!r} != E canonical manifest {e_val!r}"
                 )
         # Bind committed entries to the real blob: recompute from E's tree.

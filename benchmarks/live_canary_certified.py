@@ -60,27 +60,31 @@ _ICOM_REPLAY_DELAY_SECONDS = 0.5
 # stderr or the committed evidence — a canary failure must never echo a secret.
 _TOKEN_SHAPE_RE = re.compile(r"[A-Za-z0-9_\-=]{32,}")
 
-# C-122 HG-A (2026-08-10 13:40 supervisor veto): the certified canary scope
-# contract = the six BROWSER Companion OTA scopes (incl. ``tongcheng:lodging``)
-# plus the iCom public-API scope.  This deliberately iterates the done-gate's
-# contract set rather than ``registry.certified_scopes()`` so a connected
-# Companion that authorizes all six browser scopes is genuinely exercised, and
-# ``tongcheng:lodging`` is never silently dropped from the canary because its
-# capability is individually DISABLED.  ``icom:transfer`` is a public-API read
-# and never appears in a Companion's ``authorized_scope_keys``.
-_CERTIFIED_CANARY_SCOPE_KEYS: tuple[str, ...] = (
-    "ctrip:flight",
-    "ctrip:lodging",
-    "qunar:flight",
-    "qunar:lodging",
-    "tongcheng:flight",
-    "tongcheng:lodging",
-    "icom:transfer",
+# C-122 round-19 (2026-08-11 17:03 supervisor veto): the certified canary scope
+# contract is DERIVED from the authoritative registry — never hardcoded.
+# ``registry.certified_scopes()`` returns exactly the CERTIFIED_ACTIVE set: five
+# browser Companion OTA scopes (ctrip:flight, ctrip:lodging, qunar:flight,
+# qunar:lodging, tongcheng:flight) plus the iCom public-API scope
+# (icom:transfer) = 6 total.  ``tongcheng:lodging`` is DISABLED in the registry
+# (user skipped on 2026-08-05) and must never enter the canary — a disabled
+# scope is never a required canary member and is never silently re-enabled by a
+# hardcoded contract.  ``icom:transfer`` is a public-API read and never appears
+# in a Companion's ``authorized_scope_keys``.
+_CERTIFIED_CANARY_SCOPE_KEYS: tuple[str, ...] = tuple(
+    scope.key for scope in build_default_registry().certified_scopes()
 )
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _runtime_identity() -> dict[str, str]:
+    """The interpreter that ran the canary — binds a diagnostic to the runtime."""
+    return {
+        "python": ".".join(str(part) for part in sys.version_info[:3]),
+        "platform": sys.platform,
+    }
 
 
 async def _query_companion_status(
@@ -325,8 +329,9 @@ async def evaluate(
             except Exception as exc:  # network / HTTP / auth
                 status = {"error": str(exc)}
 
-    # C-122 HG-A: iterate the certified canary scope CONTRACT (six browser
-    # scopes + iCom public-API), not the registry's individually-certified set.
+    # C-122 round-19: iterate the certified canary scope CONTRACT derived from
+    # the authoritative registry (five certified browser scopes + the iCom
+    # public-API scope).
     for scope_key in _CERTIFIED_CANARY_SCOPE_KEYS:
         cap = caps[scope_key]
         # HG-I regression (round-18 gate, 08:40 UTC): ``ProviderCapability`` has
@@ -422,9 +427,13 @@ def _seal_failure_diagnostic(
     stage: str,
     exc: BaseException,
     output: Path,
+    *,
+    run_id: str = "",
+    tested_sha: str = "",
 ) -> Path:
     """Atomically write a 0600 failure diagnostic (stage, exception class,
-    desensitized summary, run identity) and NEVER echo a secret.
+    desensitized summary, run identity + run_id / tested_sha / runtime bindings)
+    and NEVER echo a secret.
 
     C-122 round-18 HG-I (supervision 16:03): a canary failure must be AUDITABLE.
     When anything escapes ``evaluate`` / ``_dump``, ``main`` captures it at the
@@ -432,6 +441,12 @@ def _seal_failure_diagnostic(
     redacted summary, and seals it next to the output as ``<output>.failure.json``
     with the same 0600 atomic dump used for the report itself.  The raw exception
     text never reaches stderr or the committed trail unfiltered.
+
+    C-122 round-19 (supervision 17:03 Block 2): the diagnostic binds the run_id
+    and tested_sha the gate passed (``--run-id`` / ``--tested-sha``) plus the
+    runtime identity, so the outer gate can verify the diagnostic belongs to THIS
+    run at THIS revision and is fresh — a stale or mismatched diagnostic is never
+    silently consumed.
     """
     diagnostic: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -442,11 +457,29 @@ def _seal_failure_diagnostic(
         "run_identity": {
             "script": Path(__file__).name,
             "output": str(output),
+            "run_id": run_id,
+            "tested_sha": tested_sha,
+            "runtime": _runtime_identity(),
         },
         "generated_at": _now(),
     }
     diag_path = output.with_suffix(output.suffix + ".failure.json")
     return _dump(diagnostic, diag_path)
+
+
+def _clear_stale_failure_diagnostic(output: Path) -> None:
+    """Best-effort removal of a PRIOR run's failure diagnostic after THIS run
+    succeeded.
+
+    C-122 round-19 (supervision 17:03 Block 2 counter-example): a recovery-replay
+    success must never leave an old ``<output>.failure.json`` on disk that a
+    later consumer could mistake for evidence of a current failure.  A fresh
+    successful report clears the stale diagnostic.
+    """
+    stale = output.with_suffix(output.suffix + ".failure.json")
+    with contextlib.suppress(OSError):
+        if stale.exists():
+            stale.unlink()
 
 
 def main() -> int:
@@ -457,6 +490,11 @@ def main() -> int:
         default=os.environ.get("TRIPCHORD_BROWSER_BRIDGE_TOKEN", ""),
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    # C-122 round-19 (supervision 17:03 Block 2): the gate binds THIS run and THIS
+    # tested revision into the canary diagnostic so a failure can be verified as
+    # current-and-owned before the outer layer consumes it.
+    parser.add_argument("--run-id", default="")
+    parser.add_argument("--tested-sha", default="")
     args = parser.parse_args()
 
     try:
@@ -469,7 +507,13 @@ def main() -> int:
         # fail the process so layer 5 cannot be papered over.  The seal itself is
         # best-effort — a disk that can no longer write must still fail loudly.
         with contextlib.suppress(BaseException):
-            _seal_failure_diagnostic("evaluate", exc, args.output)
+            _seal_failure_diagnostic(
+                "evaluate",
+                exc,
+                args.output,
+                run_id=args.run_id,
+                tested_sha=args.tested_sha,
+            )
         print(
             f"canary failed during evaluate ({type(exc).__name__}): "
             f"{_desensitize(str(exc)) if str(exc) else 'no detail'}",
@@ -480,13 +524,22 @@ def main() -> int:
         output = _dump(report, args.output)
     except BaseException as exc:
         with contextlib.suppress(BaseException):
-            _seal_failure_diagnostic("dump", exc, args.output)
+            _seal_failure_diagnostic(
+                "dump",
+                exc,
+                args.output,
+                run_id=args.run_id,
+                tested_sha=args.tested_sha,
+            )
         print(
             f"canary failed writing evidence ({type(exc).__name__}): "
             f"{_desensitize(str(exc)) if str(exc) else 'no detail'}",
             file=sys.stderr,
         )
         return 1
+    # A fresh success clears a PRIOR failed run's diagnostic so recovery-replay
+    # success can never leave stale failure evidence behind (Block 2).
+    _clear_stale_failure_diagnostic(args.output)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     print(f"evidence: {output}", file=sys.stderr)
     return 0 if report["passed"] else 2
