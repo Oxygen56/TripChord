@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -328,7 +329,11 @@ async def evaluate(
     # scopes + iCom public-API), not the registry's individually-certified set.
     for scope_key in _CERTIFIED_CANARY_SCOPE_KEYS:
         cap = caps[scope_key]
-        provider = cap.provider
+        # HG-I regression (round-18 gate, 08:40 UTC): ``ProviderCapability`` has
+        # no ``.provider`` attribute — the provider lives on its scope key
+        # (``cap.key.provider``).  The old ``cap.provider`` crashed ``evaluate``
+        # mid-flight, and before the top-level seal a crashed canary was silent.
+        provider = cap.key.provider
         if provider == "icom":
             entry = await _icom_scope_canary()
             entry["scope"] = scope_key
@@ -407,10 +412,8 @@ def _dump(report: dict[str, Any], output: Path) -> Path:
         os.replace(tmp, output)
     except BaseException:
         # Never leave a partial 0600 temp file behind on a failed dump.
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(tmp)
-        except OSError:
-            pass
         raise
     return output
 
@@ -465,10 +468,8 @@ def main() -> int:
         # exception (it may contain a token); write the audit diagnostic and
         # fail the process so layer 5 cannot be papered over.  The seal itself is
         # best-effort — a disk that can no longer write must still fail loudly.
-        try:
+        with contextlib.suppress(BaseException):
             _seal_failure_diagnostic("evaluate", exc, args.output)
-        except BaseException:
-            pass
         print(
             f"canary failed during evaluate ({type(exc).__name__}): "
             f"{_desensitize(str(exc)) if str(exc) else 'no detail'}",
@@ -478,10 +479,8 @@ def main() -> int:
     try:
         output = _dump(report, args.output)
     except BaseException as exc:
-        try:
+        with contextlib.suppress(BaseException):
             _seal_failure_diagnostic("dump", exc, args.output)
-        except BaseException:
-            pass
         print(
             f"canary failed writing evidence ({type(exc).__name__}): "
             f"{_desensitize(str(exc)) if str(exc) else 'no detail'}",

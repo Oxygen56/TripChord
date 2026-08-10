@@ -10,7 +10,6 @@ These tests exercise the failure paths WITHOUT network access.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,7 +18,7 @@ from unittest import mock
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from benchmarks import live_canary_certified as canary  # noqa: E402
+from benchmarks import live_canary_certified as canary
 
 
 def test_desensitize_redacts_token_shaped_substrings() -> None:
@@ -30,6 +29,43 @@ def test_desensitize_redacts_token_shaped_substrings() -> None:
     assert "<redacted>" in redacted
     assert "search failed with" in redacted
     assert "url ok" in redacted
+
+
+@pytest.mark.asyncio
+async def test_evaluate_resolves_contract_providers_from_real_registry() -> None:
+    """HG-I regression (round-18 gate 08:40 UTC): ``evaluate`` must resolve each
+    certified scope's provider from the REAL capability map (via
+    ``ProviderCapability.key.provider``).  The pre-fix ``cap.provider`` crashed
+    ``evaluate`` on every gate run after HG-A; before the top-level seal that
+    crash was silent.  With no bridge token the browser scopes fail closed as
+    pending authorization and the iCom scope is stubbed, so no network is hit."""
+    caps = canary.build_default_registry().capability_map()
+    for scope_key in canary._CERTIFIED_CANARY_SCOPE_KEYS:
+        assert scope_key in caps, f"contract scope {scope_key} missing from registry"
+        assert caps[scope_key].key.provider, f"no provider resolved for {scope_key}"
+
+    async def fake_icom() -> dict[str, Any]:
+        return {
+            "passed": True,
+            "kind": "icom_public_api",
+            "fresh": True,
+            "authorized": True,
+            "read_only": True,
+            "evidence": {"options": 1},
+            "detail": "stubbed icom",
+        }
+
+    with mock.patch.object(canary, "_icom_scope_canary", new=fake_icom):
+        report = await canary.evaluate(api_base="http://127.0.0.1:9", bridge_token="")
+
+    assert report["bridge_token_present"] is False
+    scopes = {entry["scope"]: entry for entry in report["scopes"]}
+    assert set(scopes) == set(canary._CERTIFIED_CANARY_SCOPE_KEYS)
+    assert scopes["icom:transfer"]["passed"] is True
+    for scope_key in canary._CERTIFIED_CANARY_SCOPE_KEYS:
+        if scope_key != "icom:transfer":
+            assert scopes[scope_key]["passed"] is False
+            assert scopes[scope_key]["kind"] == "companion_heartbeat"
 
 
 def _fake_icom_provider(
