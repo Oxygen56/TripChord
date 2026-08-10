@@ -44,6 +44,24 @@ RESULTS_DIR = Path(__file__).resolve().parent / "results"
 DEFAULT_OUTPUT = RESULTS_DIR / "live-canary-certified.json"
 SCHEMA_VERSION = "tripchord-certified-ota-canary-v1"
 
+# C-122 HG-A (2026-08-10 13:40 supervisor veto): the certified canary scope
+# contract = the six BROWSER Companion OTA scopes (incl. ``tongcheng:lodging``)
+# plus the iCom public-API scope.  This deliberately iterates the done-gate's
+# contract set rather than ``registry.certified_scopes()`` so a connected
+# Companion that authorizes all six browser scopes is genuinely exercised, and
+# ``tongcheng:lodging`` is never silently dropped from the canary because its
+# capability is individually DISABLED.  ``icom:transfer`` is a public-API read
+# and never appears in a Companion's ``authorized_scope_keys``.
+_CERTIFIED_CANARY_SCOPE_KEYS: tuple[str, ...] = (
+    "ctrip:flight",
+    "ctrip:lodging",
+    "qunar:flight",
+    "qunar:lodging",
+    "tongcheng:flight",
+    "tongcheng:lodging",
+    "icom:transfer",
+)
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -242,7 +260,7 @@ async def evaluate(
     bridge_token: str,
 ) -> dict[str, Any]:
     registry = build_default_registry()
-    certified = registry.certified_scopes()
+    caps = registry.capability_map()
 
     scopes: list[dict[str, Any]] = []
     status: dict[str, Any] | None = None
@@ -254,8 +272,10 @@ async def evaluate(
             except Exception as exc:  # network / HTTP / auth
                 status = {"error": str(exc)}
 
-    for cap in certified:
-        scope_key = cap.key
+    # C-122 HG-A: iterate the certified canary scope CONTRACT (six browser
+    # scopes + iCom public-API), not the registry's individually-certified set.
+    for scope_key in _CERTIFIED_CANARY_SCOPE_KEYS:
+        cap = caps[scope_key]
         provider = cap.provider
         if provider == "icom":
             entry = await _icom_scope_canary()
