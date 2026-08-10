@@ -64,8 +64,8 @@
 | `.venv/bin/python -m pytest scripts/tests/test_run_product_done_gate.py` | 138 passed——含八项硬缺口反例：CAS 后 post-CAS re-dump 失败 rc=0、层 5 非零退出+伪全绿 JSON 必败、额外 scope 必败、失败门报告脱敏、bridge-state queued/claimed/重排预检、层 6 bridge 残留阻断、staging symlink 拒绝、compact 层5/6 blob 合同接受与拒绝 |
 | `uv run pytest apps/api/tests/ scripts/tests/ --ignore scripts/tests/test_browser_e2e.py` | 1016 passed，退出码 0（不跑 `test_browser_e2e.py`，避免污染 tracked 结果树） |
 | `launchctl kickstart -k gui/<uid>/com.tripchord.live-api` | API 受控重启成功；`/api/v1/agents/runtime` provenance `commit_sha`/`dependency_lock_sha256`/`live_system_source_sha256` 与本地树三哈希匹配、pid 存活（机器证据见第十七轮评审 §5） |
-| Companion 自动重配 | 结果如实记录（见第十七轮评审 §6） |
-| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence` | 从头六层门结果如实记录（见第十七轮评审 §7）；passed 如实记 PASS/FAIL |
+| Companion 自动重配 | supervisor_running=true、outcome=`waiting_for_control_capable_companion`、attempt_count=0；companion status 0 companions/disconnected；bridge-state `tasks=[]`/`reload_requests=[]` 无残留；未配对任何 Companion（用户侧动作，本轮不伪造；详见第十七轮评审 §6） |
+| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence` | run_id=`ff7492050865`、tested_commit_sha=`048ba57`：层 1/2/3/4 PASS、层 5 FAIL（5 浏览器 scope 无 Companion 心跳，`icom:transfer` 真实公共 API 7 选项 PASS）、层 6 FAIL（pending user authorization、runner `failed_before_done_gate`）；`passed=false` 退出码 2、evidence_commit=None、工作树干净；15 项 done_gate checks 未运行；详见第十七轮评审 §7 |
 
 ## 当前可对外声明
 
