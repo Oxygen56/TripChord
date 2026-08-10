@@ -1363,7 +1363,7 @@ def test_layer5_consumes_canary_failure_diagnostic(
     assert "runtime=python" in detail
     # The token-shaped secret in the crash message is redacted, never echoed.
     assert "S" * 40 not in detail
-    assert "<redacted>" in detail
+    assert "[REDACTED]" in detail
 
 
 def test_layer5_consumes_real_subprocess_sealed_diagnostic(
@@ -1546,7 +1546,7 @@ def test_layer5_sanitizes_credential_bearing_canary_failure_summary(
     assert "https://evil.example/token" not in detail
     assert "abcdef0123456789abcdef0123456789abcdef01" not in detail
     assert "13812345678" not in detail
-    assert "<url>" in detail and "<redacted>" in detail
+    assert "<url>" in detail and "[REDACTED]" in detail
 
 
 def test_layer5_redacts_short_and_structured_secret_shapes(
@@ -1592,7 +1592,7 @@ def test_layer5_redacts_short_and_structured_secret_shapes(
     assert akia_key not in detail
     assert dotted not in detail
     assert "xJ3kQm9pR2sW" not in detail
-    assert "<redacted>" in detail
+    assert "[REDACTED]" in detail
 
 
 def test_layer5_redacts_shortest_and_prefixed_secret_shapes(
@@ -1636,7 +1636,7 @@ def test_layer5_redacts_shortest_and_prefixed_secret_shapes(
     assert "abcd1234" not in detail
     assert short_jwt not in detail
     assert short_kv not in detail
-    assert "<redacted>" in detail
+    assert "[REDACTED]" in detail
 
 
 def test_canary_producer_seal_desensitizes_short_credential_shapes(
@@ -1677,7 +1677,7 @@ def test_canary_producer_seal_desensitizes_short_credential_shapes(
     assert short_jwt not in summary
     assert short_kv not in summary
     assert "evil.example" not in summary
-    assert "<redacted>" in summary
+    assert "[REDACTED]" in summary
 
 
 def test_canary_producer_desensitize_catches_short_credential_shapes() -> None:
@@ -1698,7 +1698,7 @@ def test_canary_producer_desensitize_catches_short_credential_shapes() -> None:
     ):
         out = canary._desensitize(raw)
         assert forbidden not in out, f"{forbidden!r} leaked in {out!r}"
-        assert "<redacted>" in out or "<url>" in out
+        assert "[REDACTED]" in out or "<url>" in out
 
 
 def test_canary_producer_desensitize_catches_whole_header_forms() -> None:
@@ -1759,7 +1759,7 @@ def test_canary_producer_desensitize_catches_whole_header_forms() -> None:
     ):
         out = canary._desensitize(raw)
         assert forbidden not in out, f"{forbidden!r} leaked in {out!r}"
-        assert "<redacted>" in out
+        assert "[REDACTED]" in out
 
 
 def test_canary_producer_seal_desensitizes_whole_header_forms(
@@ -1801,7 +1801,7 @@ def test_canary_producer_seal_desensitizes_whole_header_forms(
     assert "YWJjZA==" not in summary
     assert "a=b" not in summary
     assert "abc123" not in summary
-    assert "<redacted>" in summary
+    assert "[REDACTED]" in summary
 
 
 def test_layer5_redacts_whole_header_forms_from_final_report(
@@ -1851,7 +1851,7 @@ def test_layer5_redacts_whole_header_forms_from_final_report(
     assert "YWJjZA==" not in detail
     assert "a=b" not in detail
     assert "abc123" not in detail
-    assert "REDACTED" in detail
+    assert "[REDACTED]" in detail
 
 
 def test_secret_scan_rejects_whole_header_forms_in_failure_diagnostic(
@@ -5831,6 +5831,248 @@ def test_secret_scan_flags_account_identifier(
     )
     with pytest.raises(gate.GateStateChangedError, match="account identifier"):
         gate.run_gate(staging_dir)
+
+
+def test_secret_scan_allows_canary_pending_authorization_prose(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 supervision 04:14 regression counter-example: ``authorization`` /
+    ``cookie`` are also English words, so the canary's legitimate scope detail
+    ``pending user authorization: no connected Companion declares provider
+    'ctrip'; pair the Companion and keep the official OTA domains logged in,
+    then re-run`` is PROSE, not a header leak — the structured-JSON scan must
+    not abort the gate on it.  (A real leak is a header FIELD — line start /
+    JSON value position — which ``test_secret_scan_flags_authorization_header``
+    and ``test_secret_scan_rejects_short_whole_header_forms_in_structured_json``
+    still catch.)"""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(
+            {
+                "scopes": [
+                    {
+                        "scope": "ctrip:flight",
+                        "authorized": False,
+                        "detail": (
+                            "pending user authorization: no connected Companion "
+                            "declares provider 'ctrip'; pair the Companion and "
+                            "keep the official OTA domains logged in, then re-run"
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    gate.run_gate(staging_dir)  # must not raise
+
+
+def test_secret_scan_rejects_short_whole_header_forms_in_structured_json(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
+) -> None:
+    """C-122 supervision 04:14 counter-example for the structured-JSON scan:
+    the generic (non-``.failure.json``) evidence scan must still fail the gate
+    closed on a whole Authorization/Cookie/X-API-Key header FIELD with a short
+    (3-char) or quoted value — ``Cookie:a=b`` / ``X-API-Key:abc`` /
+    ``Authorization: "Basic YWJjZA=="`` / ``Set-Cookie: "sid=abc; HttpOnly"`` /
+    ``X-API-Key: "abc123"`` — when the header sits at a field position (line
+    start / JSON value start), even though the prose in
+    ``test_secret_scan_allows_canary_pending_authorization_prose`` passes."""
+    _patch_root(monkeypatch, clean_repo)
+    _passing_layers(monkeypatch)
+    _staging_evidence(staging_dir)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        '{"request": {"headers": "Cookie:a=b X-API-Key:abc '
+        'Authorization: \\"Basic YWJjZA==\\" Set-Cookie: \\"sid=abc; HttpOnly\\" '
+        'X-API-Key: \\"abc123\\""}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.GateStateChangedError, match="Authorization/Cookie"):
+        gate.run_gate(staging_dir)
+
+
+def test_secret_scan_rejects_quoted_key_json_dict_forms_in_failure_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """C-122 supervision 04:44 counter-example (final scan layer): even if a
+    producer bypass were to write a JSON/dict QUOTED-KEY credential into a
+    free-form diagnostic — double-quoted JSON keys (``failure={"Authorization":
+    "Basic YWJjZA=="}``), single-quoted dict keys (``failure={'Set-Cookie':
+    'sid=abc'}``), and quoted ``X-API-Key`` / ``Proxy-Authorization`` — the
+    staging secret scan must fail the gate closed before the file is certified.
+    ``json.dumps`` escapes the inner quotes, so the raw bytes also exercise the
+    escaped-quote form (``{\\"Authorization\\":\\"Basic YWJjZA==\\"}``)."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    diag = staging_dir / "live-canary-certified.json.failure.json"
+    diag.write_text(
+        json.dumps(
+            {
+                "schema_version": "x",
+                "summary": (
+                    'failure={"Authorization":"Basic YWJjZA=="} '
+                    "failure={'Set-Cookie': 'sid=abc'} "
+                    'failure={"X-API-Key":"abc"} '
+                    'failure={"Proxy-Authorization":"Bearer abcd"}'
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.GateStateChangedError, match="secret leak"):
+        gate._secret_scan_staging(staging_dir, gate._SecretNeedles(()))
+
+
+def test_secret_scan_rejects_quoted_key_forms_in_structured_json(
+    tmp_path: Path,
+) -> None:
+    """C-122 supervision 04:44 counter-example (final scan layer, structured
+    evidence): a committed-adjacent JSON artifact whose headers string carries
+    QUOTED-KEY embedded JSON (``{\\"Authorization\\":\\"Basic a\\"}``) must fail
+    the gate closed — the quoted field name is recognised at the escaped-quote
+    field position, not only a bare ``Cookie:a=b`` form."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        '{"request": {"headers": "{\\"Authorization\\":\\"Basic a\\"}"}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.GateStateChangedError, match="Authorization/Cookie"):
+        gate._secret_scan_staging(staging_dir, gate._SecretNeedles(()))
+
+
+def test_canary_producer_desensitize_catches_quoted_key_json_dict_forms() -> None:
+    """C-122 supervision 04:44 counter-example (stderr layer): the producer's
+    ``_desensitize`` masks whole header fields even when the field name sits in
+    a JSON/dict QUOTED-KEY position — double-quoted JSON keys
+    (``{"Authorization": "Basic a"}``) and single-quoted dict keys
+    (``{'Set-Cookie': 'sid=abc'}``) — while the legitimate business prose
+    ``pending user authorization: ...`` is not a credential VALUE leak (only the
+    keyword span is shape-masked)."""
+    from benchmarks import live_canary_certified as canary
+
+    for raw, forbidden in (
+        ('failure={"Authorization":"Basic a"}', "Basic a"),
+        ('failure={"Set-Cookie":"sid=abc"}', "sid=abc"),
+        ('failure={"X-API-Key":"abc"}', "abc"),
+        ("failure={'Authorization': 'Basic a'}", "Basic a"),
+        ("failure={'Set-Cookie': 'sid=abc'}", "sid=abc"),
+        ("failure={'X-API-Key': 'abc'}", "abc"),
+        ('failure={"Proxy-Authorization":"Bearer abcd"}', "abcd"),
+    ):
+        out = canary._desensitize(raw)
+        assert forbidden not in out, f"{forbidden!r} leaked in {out!r}"
+        assert "[REDACTED]" in out, f"{raw!r} not masked in {out!r}"
+    # Positive business prose is not a credential VALUE leak.
+    prose = (
+        "pending user authorization: no connected Companion declares "
+        "provider 'ctrip'; pair the Companion and keep the official OTA "
+        "domains logged in, then re-run"
+    )
+    out = canary._desensitize(prose)
+    assert "pending user" in out
+
+
+def test_canary_producer_seal_desensitizes_quoted_key_json_dict_forms(
+    tmp_path: Path,
+) -> None:
+    """C-122 supervision 04:44 counter-example (producer artifact layer): the
+    PRODUCER's own ``_seal_failure_diagnostic`` must not write a JSON/dict
+    QUOTED-KEY credential into the ``<output>.failure.json`` ``summary`` — a
+    double-quoted JSON ``Authorization``, a single-quoted dict ``Set-Cookie``
+    and a quoted ``X-API-Key`` must NEVER appear raw in the committed
+    diagnostic."""
+    from benchmarks import live_canary_certified as canary
+
+    output = tmp_path / "live-canary-certified.json"
+    message = (
+        'failure={"Authorization":"Basic YWJjZA=="} '
+        "failure={'Set-Cookie': 'sid=abc; HttpOnly'} "
+        'failure={"X-API-Key":"abc123"}'
+    )
+    diag_path = canary._seal_failure_diagnostic(
+        "evaluate",
+        RuntimeError(message),
+        output,
+        run_id="abc123def456",
+        tested_sha="a" * 40,
+    )
+    assert diag_path.is_file()
+    summary = json.loads(diag_path.read_text(encoding="utf-8"))["summary"]
+    assert "YWJjZA==" not in summary
+    assert "sid=abc" not in summary
+    assert "abc123" not in summary
+    assert "[REDACTED]" in summary
+
+
+def test_canary_producer_seal_allows_pending_authorization_prose(
+    tmp_path: Path,
+) -> None:
+    """C-122 supervision 04:44 positive counter-example (producer artifact
+    layer): the business prose ``pending user authorization: ...`` is NOT a
+    credential — the operational guidance that precedes the keyword survives the
+    seal (only the ``authorization`` keyword span is conservatively masked,
+    fail-closed direction), and the summary carries no credential VALUE."""
+    from benchmarks import live_canary_certified as canary
+
+    output = tmp_path / "live-canary-certified.json"
+    message = (
+        "pending user authorization: no connected Companion declares "
+        "provider 'ctrip'; pair the Companion and keep the official OTA "
+        "domains logged in, then re-run"
+    )
+    diag_path = canary._seal_failure_diagnostic(
+        "evaluate",
+        RuntimeError(message),
+        output,
+        run_id="abc123def456",
+        tested_sha="a" * 40,
+    )
+    summary = json.loads(diag_path.read_text(encoding="utf-8"))["summary"]
+    assert "pending user" in summary
+
+
+def test_layer5_redacts_quoted_key_json_dict_forms_from_final_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """C-122 supervision 04:44 counter-example (consumer / final report layer):
+    the CONSUMER's sanitizer masks whole Authorization / Cookie / X-API-Key
+    header fields even in a JSON/dict QUOTED-KEY position inside the failure
+    summary — ``failure={"Authorization":"Basic YWJjZA=="}`` / ``failure=
+    {'Set-Cookie': 'sid=abc'}`` / ``failure={"X-API-Key":"abc123"}`` — so the
+    credentials never reach the committed layer-5 detail."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "x9y8z7w6v5u4"
+    tested_sha = "a" * 40
+    diag_path = _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    diagnostic["summary"] = (
+        'failure={"Authorization":"Basic YWJjZA=="} '
+        "failure={'Set-Cookie': 'sid=abc; HttpOnly'} "
+        'failure={"X-API-Key":"abc123"}'
+    )
+    diag_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    diag_checks = [
+        c for c in result.sub_checks if c.get("name") == "canary_failure_diagnostic"
+    ]
+    assert diag_checks, "a valid (this-run, fresh) diagnostic still keeps its classification"
+    detail = diag_checks[0]["detail"]
+    assert "YWJjZA==" not in detail
+    assert "sid=abc" not in detail
+    assert "abc123" not in detail
+    assert "[REDACTED]" in detail
 
 
 def test_secret_scan_flags_model_api_key_from_env(

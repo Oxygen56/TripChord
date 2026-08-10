@@ -79,7 +79,7 @@ _CANARY_DIAG_DOTTED_TOKEN_RE = re.compile(
 _CANARY_DIAG_OPAQUE_KV_RE = re.compile(
     r"(?i)\b(?:token|password|passwd|secret|apikey|api_key|access_key|"
     r"secret_key|client_secret|authorization|bearer|private_key|session_key)\b"
-    r"\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
+    r"\s*(?:\\[\"']?|[\"'])?\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
 )
 # C-122 supervision 03:46 (Block 1): whole-header/field redaction.  The shape
 # patterns above still let a credential BODY slip through when the value is
@@ -95,10 +95,17 @@ _CANARY_DIAG_OPAQUE_KV_RE = re.compile(
 # C-122 supervision 04:14: any non-empty value is masked whole — no {4,}
 # character floor (``Cookie:a=b`` / ``X-API-Key:abc``) and no quote stops the
 # span (``Authorization: "Basic YWJjZA=="`` / ``Set-Cookie: "sid=abc;
-# HttpOnly"`` / ``X-API-Key: "abc123"`` must all collapse to ``<redacted>``).
+# HttpOnly"`` / ``X-API-Key: "abc123"`` must all collapse to ``[REDACTED]``).
+# C-122 supervision 04:44: a JSON/dict QUOTED-KEY form (``{"Authorization":
+# "Basic a"}`` / ``{'Set-Cookie': 'sid=abc'}``) is recognised too — an optional
+# quote may sit between the field name and the ``:``/``=`` and between the
+# ``:``/``=`` and the value, so a double-quoted JSON key or a single-quoted
+# dict key is masked WHOLE, never split at the quote.  Mirrors the consumer's
+# ``_CANARY_DIAG_WHOLE_HEADER_RE`` (keep both in sync).
 _CANARY_DIAG_WHOLE_HEADER_RE = re.compile(
     r"(?i)\b(?:proxy[-_ ]authorization|set[-_ ]cookie|x-api-key|api[-_ ]key|"
-    r"authorization|cookie)\b\s*[:=]\s*[^\r\n]+"
+    r"authorization|cookie)\b\s*(?:\\[\"']?|[\"'])?\s*[:=]\s*"
+    r"(?:\\[\"']?|[\"'])?[^\r\n]+"
 )
 
 # C-122 round-19 (2026-08-11 17:03 supervisor veto): the certified canary scope
@@ -275,7 +282,10 @@ def _desensitize(text: str) -> str:
     collapsed to ``<url>``, and AKIA-style AWS keys, well-known token prefixes
     (``ghp_`` / ``github_pat_`` / ``glpat-`` / ``xoxb-`` / ``sk-``), short
     ``Bearer <token>`` forms, dotted JWTs and short opaque ``token=`` /
-    ``bearer=`` / ``password=`` assignments are all collapsed to ``<redacted>``.
+    ``bearer=`` / ``password=`` assignments are all collapsed to ``[REDACTED]``
+    (C-122 supervision 04:44: the redaction marker contract is unified with the
+    consumer's ``_sanitize_canary_diag_field`` and the gate's ``_redact_output``
+    — one fixed ``[REDACTED]`` marker).
     Whole header fields — ``Authorization`` / ``Proxy-Authorization`` /
     ``Cookie`` / ``Set-Cookie`` / ``X-API-Key`` — are masked name-and-value
     together, so a ``Basic`` base64 body or a ``;``-joined cookie pair can never
@@ -283,14 +293,14 @@ def _desensitize(text: str) -> str:
     Mirrors the consumer's ``_sanitize_canary_diag_field`` so the producer
     artifact is already sanitized on disk and on stderr before the gate re-checks
     it."""
-    text = _CANARY_DIAG_WHOLE_HEADER_RE.sub("<redacted>", text)
+    text = _CANARY_DIAG_WHOLE_HEADER_RE.sub("[REDACTED]", text)
     text = _CANARY_DIAG_URL_RE.sub("<url>", text)
-    text = _TOKEN_SHAPE_RE.sub("<redacted>", text)
-    text = _CANARY_DIAG_AKIA_RE.sub("<redacted>", text)
-    text = _CANARY_DIAG_PREFIX_TOKEN_RE.sub("<redacted>", text)
-    text = _CANARY_DIAG_BEARER_RE.sub("<redacted>", text)
-    text = _CANARY_DIAG_DOTTED_TOKEN_RE.sub("<redacted>", text)
-    text = _CANARY_DIAG_OPAQUE_KV_RE.sub("<redacted>", text)
+    text = _TOKEN_SHAPE_RE.sub("[REDACTED]", text)
+    text = _CANARY_DIAG_AKIA_RE.sub("[REDACTED]", text)
+    text = _CANARY_DIAG_PREFIX_TOKEN_RE.sub("[REDACTED]", text)
+    text = _CANARY_DIAG_BEARER_RE.sub("[REDACTED]", text)
+    text = _CANARY_DIAG_DOTTED_TOKEN_RE.sub("[REDACTED]", text)
+    text = _CANARY_DIAG_OPAQUE_KV_RE.sub("[REDACTED]", text)
     return text
 
 

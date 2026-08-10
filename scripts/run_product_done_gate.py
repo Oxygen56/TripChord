@@ -813,9 +813,26 @@ def _evidence_secrets() -> tuple[str, ...]:
 # character floor (``Cookie:a=b`` / ``X-API-Key:abc``) and no quote stops the
 # span (``Authorization: "Basic YWJjZA=="`` / ``Set-Cookie: "sid=abc;
 # HttpOnly"`` / ``X-API-Key: "abc123"`` must all collapse to the marker).
+# C-122 supervision 04:14 regression fix: ``authorization`` / ``cookie`` are
+# also English words, so a free-form prose sentence like ``pending user
+# authorization: no connected Companion declares provider 'ctrip'`` must NOT be
+# treated as a header leak.  The name is required to sit at a FIELD position —
+# line start, a JSON value/key opening quote, a structural delimiter, or an
+# escaped quote (``\``) in a JSON string — where a real header block / JSON
+# string value carries it, never mid-prose after a word.  C-122 supervision
+# 04:44: a JSON/dict QUOTED-KEY form (``{"Authorization": "Basic a"}`` /
+# ``{'Set-Cookie': 'sid=abc'}`` / ``\"Authorization\":\"Basic a\"`` in raw JSON
+# bytes) is recognised too — an optional quote may sit between the field name
+# and the ``:``/``=`` and between the ``:``/``=`` and the value, so a
+# double-quoted JSON key or a single-quoted dict key is masked WHOLE, never
+# split at the quote (``[REDACTED]`` replaces name+quotes+value together).
+# (A ``"Authorization": "Bearer …"`` JSON KEY is caught separately by
+# ``_reject_credential_field_names``; the free-form ``.failure.json`` shape
+# scan keeps the broad ``_CANARY_DIAG_WHOLE_HEADER_RE`` for mid-line masking.)
 _AUTH_COOKIE_PATTERN = re.compile(
-    r"(?i)(?:proxy-authorization|set-cookie|x-api-key|authorization|cookie)"
-    r"\s*[:=]\s*[^\r\n]+",
+    r"(?i)(?:^[ \t]*|[\"'{[(,:\\])(?:proxy-authorization|set-cookie|x-api-key|"
+    r"authorization|cookie)\s*(?:\\[\"']?|[\"'])?\s*[:=]\s*"
+    r"(?:\\[\"']?|[\"'])?[^\r\n]+",
     re.MULTILINE,
 )
 
@@ -1412,10 +1429,13 @@ _CANARY_DIAG_DOTTED_TOKEN_RE = re.compile(
 # C-122 supervision 02:56 (Block 2): a SHORT opaque ``token=abc`` /
 # ``password=abc`` / ``bearer=xyz`` assignment (value as short as 3 chars) is a
 # credential too — the previous ``{6,}`` value floor let ``token=abc`` through.
+# C-122 supervision 04:44: an optional quote may sit between the key and the
+# ``:``/``=``, so a JSON/dict QUOTED-KEY form (``{"token": "abc"}`` /
+# ``{'password': 'xyz'}``) is recognised too.
 _CANARY_DIAG_OPAQUE_KV_RE = re.compile(
     r"(?i)\b(?:token|password|passwd|secret|apikey|api_key|access_key|"
     r"secret_key|client_secret|authorization|bearer|private_key|session_key)\b"
-    r"\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
+    r"\s*(?:\\[\"']?|[\"'])?\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
 )
 # C-122 supervision 03:46 (Block 1): whole-header/field masking — Authorization /
 # Proxy-Authorization / Cookie / Set-Cookie / X-API-Key are masked name-and-value
@@ -1424,10 +1444,15 @@ _CANARY_DIAG_OPAQUE_KV_RE = re.compile(
 # body) and never names ``set-cookie`` / ``x-api-key`` / ``proxy-authorization``;
 # a ``;``-joined cookie pair likewise survives it.  Mirrors the producer's
 # ``_desensitize`` (``benchmarks/live_canary_certified.py``) and
-# ``_AUTH_COOKIE_PATTERN`` — keep all three in sync.
+# ``_AUTH_COOKIE_PATTERN`` — keep all three in sync.  C-122 supervision 04:44:
+# an optional quote may sit between the field name and the ``:``/``=`` and
+# between the ``:``/``=`` and the value, so a JSON/dict QUOTED-KEY form
+# (``{"Authorization": "Basic a"}`` / ``{'Set-Cookie': 'sid=abc'}``) is masked
+# WHOLE — never split at the quote.
 _CANARY_DIAG_WHOLE_HEADER_RE = re.compile(
     r"(?i)\b(?:proxy[-_ ]authorization|set[-_ ]cookie|x-api-key|api[-_ ]key|"
-    r"authorization|cookie)\b\s*[:=]\s*[^\r\n]+"
+    r"authorization|cookie)\b\s*(?:\\[\"']?|[\"'])?\s*[:=]\s*"
+    r"(?:\\[\"']?|[\"'])?[^\r\n]+"
 )
 # The diagnostic's STRUCTURED schema — a fail-closed whitelist: any unknown
 # top-level / run_identity / runtime field makes the diagnostic foreign and is
@@ -1457,23 +1482,26 @@ def _sanitize_canary_diag_field(value: str, fallback: str) -> str:
     report, so the consumer re-sanitizes every free-form diagnostic string
     before it lands: env-secret / URL / phone / account / tracking patterns are
     redacted (``_redact_output``), any remaining URL is collapsed to ``<url>``,
-    any 32+ token-shaped run is collapsed to ``<redacted>``, AKIA-style access
+    any 32+ token-shaped run is collapsed to ``[REDACTED]``, AKIA-style access
     keys / dotted bearer tokens / short opaque ``token=`` assignments are
     collapsed too, whole header fields are masked name-and-value together
     (C-122 supervision 03:46 Block 1), control characters are stripped, and the
-    result is bounded in length.  A credential-bearing summary — forged or
-    otherwise — can never reach the committed trail as-is (C-122 supervision
-    01:10 Block 3 + 18:13).
+    result is bounded in length.  C-122 supervision 04:44: the redaction marker
+    contract is unified — this sanitizer and the producer's ``_desensitize``
+    emit the SAME ``[REDACTED]`` marker the gate's ``_redact_output`` uses, so a
+    three-layer regression can assert a single fixed marker.  A
+    credential-bearing summary — forged or otherwise — can never reach the
+    committed trail as-is (C-122 supervision 01:10 Block 3 + 18:13).
     """
     value = _redact_output(value)
-    value = _CANARY_DIAG_WHOLE_HEADER_RE.sub("<redacted>", value)
+    value = _CANARY_DIAG_WHOLE_HEADER_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_URL_RE.sub("<url>", value)
-    value = _CANARY_DIAG_TOKEN_RUN_RE.sub("<redacted>", value)
-    value = _CANARY_DIAG_AKIA_RE.sub("<redacted>", value)
-    value = _CANARY_DIAG_PREFIX_TOKEN_RE.sub("<redacted>", value)
-    value = _CANARY_DIAG_BEARER_RE.sub("<redacted>", value)
-    value = _CANARY_DIAG_DOTTED_TOKEN_RE.sub("<redacted>", value)
-    value = _CANARY_DIAG_OPAQUE_KV_RE.sub("<redacted>", value)
+    value = _CANARY_DIAG_TOKEN_RUN_RE.sub("[REDACTED]", value)
+    value = _CANARY_DIAG_AKIA_RE.sub("[REDACTED]", value)
+    value = _CANARY_DIAG_PREFIX_TOKEN_RE.sub("[REDACTED]", value)
+    value = _CANARY_DIAG_BEARER_RE.sub("[REDACTED]", value)
+    value = _CANARY_DIAG_DOTTED_TOKEN_RE.sub("[REDACTED]", value)
+    value = _CANARY_DIAG_OPAQUE_KV_RE.sub("[REDACTED]", value)
     value = re.sub(r"[\x00-\x1f\x7f]", " ", value).strip()
     if not value:
         return fallback

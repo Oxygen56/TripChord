@@ -26,7 +26,7 @@ def test_desensitize_redacts_token_shaped_substrings() -> None:
     message = "search failed with token abcDEF0123456789_abcdefghijklmnopqrstuvwxyz and url ok"
     redacted = canary._desensitize(message)
     assert "abcDEF0123456789" not in redacted
-    assert "<redacted>" in redacted
+    assert "[REDACTED]" in redacted
     assert "search failed with" in redacted
     assert "url ok" in redacted
 
@@ -127,7 +127,7 @@ async def test_icom_scope_canary_failure_records_replay_and_no_secret() -> None:
     assert result["replay_attempts"] == canary._ICOM_REPLAY_ATTEMPTS
     assert result["exception_class"] == "RuntimeError"
     assert secret not in json.dumps(result)
-    assert "<redacted>" in result["detail"]
+    assert "[REDACTED]" in result["detail"]
 
 
 def test_seal_failure_diagnostic_writes_0600_atomic(tmp_path: Path) -> None:
@@ -149,7 +149,7 @@ def test_seal_failure_diagnostic_writes_0600_atomic(tmp_path: Path) -> None:
     assert payload["stage"] == "evaluate"
     assert payload["exception_class"] == "RuntimeError"
     assert secret not in json.dumps(payload)
-    assert "<redacted>" in payload["summary"]
+    assert "[REDACTED]" in payload["summary"]
     assert payload["run_identity"]["script"] == "live_canary_certified.py"
     # The primary evidence file is NOT produced on a sealed failure.
     assert not output.exists()
