@@ -14671,3 +14671,237 @@ def test_r28_full_chain_producer_seal_consumer_block47_48_both_finals(
             "ev.json",
             credential_field_check=True,
         )
+
+
+def test_r29_block50_case_variant_index_bases_fail_closed_both_paths() -> None:
+    """C-122 round-29 Block 50 counter-examples (architect independent review of
+    7f2ce95): ``_REGISTERED_LOWER_BASE_RE`` must match ALL NINE registered bases
+    case-insensitively, not only the five lowercase marker bases.  A
+    PascalCase / all-uppercase / all-lowercase / mixed-case variant of an index
+    base (``FlightOption7`` / ``FLIGHTOPTION1`` / ``flightoption7`` /
+    ``Flightoption7`` / ``HotelAmenity1`` / ``BookingReference2`` /
+    ``RefreshTokenCount2``) alone AND wrapped in ``{"summary": …}`` fails BOTH
+    finals closed — the bare value must not be re-allowlisted through a case
+    variant.  The version-marker exemption stays limited to the EXACT documented
+    lowercase ``baseV<digits>`` form (``plannerV2`` / ``providerV4`` /
+    ``tokenizationV1`` / ``secretariatV1`` accepted), so a case variant of a
+    version base (``PlannerV2`` / ``PLANNERV2`` / …) also fails closed."""
+    for tok in (
+        "FlightOption7",
+        "FLIGHTOPTION1",
+        "flightoption7",
+        "Flightoption7",
+        "HotelAmenity1",
+        "BookingReference2",
+        "RefreshTokenCount2",
+    ):
+        for raw in (tok, f'{{"summary": "{tok}"}}'):
+            with pytest.raises(gate.GateStateChangedError):
+                gate._secret_scan_bytes(
+                    raw.encode(),
+                    gate._SecretNeedles(()),
+                    "evidence",
+                    "ev.json",
+                    credential_field_check=True,
+                )
+            with pytest.raises(gate.GateStateChangedError):
+                gate._secret_scan_bytes(
+                    raw.encode(),
+                    gate._SecretNeedles(()),
+                    "evidence",
+                    "live-canary-certified.json.failure.json",
+                    credential_field_check=False,
+                )
+    # Exact documented lowercase version form stays accepted on BOTH finals.
+    for tok in ("plannerV2", "providerV4", "tokenizationV1", "secretariatV1"):
+        gate._secret_scan_bytes(
+            tok.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            tok.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    # Case variants of version bases are NOT the documented form → fail closed.
+    for tok in (
+        "PlannerV2",
+        "PLANNERV2",
+        "ProviderV4",
+        "PROVIDERV4",
+        "TokenizationV1",
+        "SecretariatV1",
+    ):
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                tok.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                tok.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+
+
+def test_r29_block51_non_nfkc_arrow_narration_binding_fail_closed_both_paths() -> None:
+    """C-122 round-29 Block 51 counter-examples (architect independent review of
+    7f2ce95): the credential-narration operator set must cover the Unicode
+    arrows that NFKC normalization leaves INVARIANT (``⇒`` U+21D2 / ``⟶`` U+27F6 /
+    ``⤳`` U+2933 / ``➔`` U+2794), or narration binding is bypassed through an
+    arrow variant.  ``passphrase {⇒,⟶,⤳,➔} plannerV2`` fails BOTH finals closed,
+    exactly like the already-covered ``→`` / ``=>`` / ``:`` forms.  A designation
+    word that does NOT bind a registered base stays accepted."""
+    for arrow in ("⇒", "⟶", "⤳", "➔"):
+        raw = f"passphrase {arrow} plannerV2"
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # Covered operators stay rejected (regression).
+    for op in ("→", "=>", ":"):
+        raw = f"passphrase {op} plannerV2"
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+    # A designation word that does not designate a registered base is prose.
+    for raw in (
+        "the passcode was not stored anywhere",
+        "login page loads today",
+        "key: a plain discussion of the itinerary",
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r29_full_chain_producer_seal_consumer_block50_51_both_finals(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-29 full chain (Blocks 50 + 51): the producer masks a
+    case-variant index base (``FlightOption7`` / ``FLIGHTOPTION1`` /
+    ``flightoption7`` / ``Flightoption7`` / ``HotelAmenity1`` /
+    ``BookingReference2`` / ``RefreshTokenCount2``) and a narration assignment
+    using a non-NFKC arrow (``passphrase ⇒ plannerV2``) BEFORE the 0600 seal, so
+    the sealed diagnostic is clean and BOTH finals pass; the RAW value still
+    fails BOTH finals (defense in depth).  The exact-lowercase version markers
+    (``plannerV2`` / …) survive producer + seal + BOTH finals accepted."""
+    from benchmarks import live_canary_certified as canary
+
+    def seal(message: str) -> Path:
+        output = tmp_path / "live-canary-certified.json"
+        return canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(message),
+            output,
+            run_id="r29chain",
+            tested_sha="13d76ae" + "0" * 33,
+        )
+
+    for raw in (
+        "FlightOption7",
+        "FLIGHTOPTION1",
+        "flightoption7",
+        "Flightoption7",
+        "HotelAmenity1",
+        "BookingReference2",
+        "RefreshTokenCount2",
+        "passphrase ⇒ plannerV2",
+        "passphrase ⟶ plannerV2",
+        "passphrase ⤳ plannerV2",
+        "passphrase ➔ plannerV2",
+    ):
+        masked = canary._desensitize(raw)
+        assert masked != raw, "producer must mask the case-variant base / arrow narration"
+        assert "[REDACTED]" in masked
+        diag = seal(masked)
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                f'{{"summary": "{masked}"}}', "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for business in ("plannerV2", "providerV4", "tokenizationV1", "secretariatV1"):
+        assert business == canary._desensitize(business)
+        diag = seal(business)
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )

@@ -979,17 +979,24 @@ _VERSION_MARKER_BUSINESS_BASES = frozenset(
 # registered bases (``day`` / ``planner`` / ``provider`` / ``tokenization`` /
 # ``secretariat`` — the base itself has no uppercase letter), so a free-text
 # run like ``day1 planner1 provider9`` was invisible to the bare-credential
-# scan and slipped through.  This recognizer matches ONLY those registered
-# all-lowercase bases followed by a ``<digits>`` or ``V<digits>`` suffix, so
-# the form validation in :func:`_is_bare_credential_token` can see them.  It
-# is the SAME closed auditable registry — no word list, no threshold.  R28
-# Block 47: the recognizer is CASE-INSENSITIVE (``Day1`` / ``X-Day1`` /
-# ``PLANNERV2`` are the same base forms the gate's key/header recognizers
-# already treat case-insensitively) — a capitalized index base is still an
-# index base and fails closed; a capitalized version form (``PlannerV2``) is
-# not the documented lowercase ``baseV<digits>`` form and fails closed too.
+# scan and slipped through.  This recognizer surfaces EVERY registered
+# business-identifier base followed by a ``<digits>`` or ``V<digits>`` suffix
+# to the form validation in :func:`_is_bare_credential_token`.  It is the
+# SAME closed auditable registry — no word list, no threshold.  R28 Block 47
+# / R29 Block 50: the recognizer is CASE-INSENSITIVE and covers ALL NINE
+# registered bases (``day`` / ``flightOption`` / ``hotelAmenity`` /
+# ``bookingReference`` / ``refreshTokenCount`` / ``planner`` / ``provider`` /
+# ``tokenization`` / ``secretariat``) — a PascalCase / all-uppercase /
+# all-lowercase variant of an index base (``FlightOption7`` /
+# ``FLIGHTOPTION1`` / ``flightoption7`` / ``Flightoption7`` /
+# ``HotelAmenity1`` / ``BookingReference2`` / ``RefreshTokenCount2``) is the
+# same credential-shaped base and fails closed; a capitalized version form
+# (``PlannerV2`` / ``PLANNERV2``) is not the documented lowercase
+# ``baseV<digits>`` form and fails closed too.
 _REGISTERED_LOWER_BASE_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])(?:day|planner|provider|tokenization|secretariat)"
+    r"(?i)(?<![A-Za-z0-9_])"
+    r"(?:refreshTokenCount|bookingReference|hotelAmenity|tokenization"
+    r"|secretariat|flightOption|provider|planner|day)"
     r"(?:V[0-9]+|[0-9]+)(?![A-Za-z0-9_])"
 )
 
@@ -1018,12 +1025,24 @@ _CREDENTIAL_DESIGNATION_ALT = (
     r"|auth[_-]?token|session[_-]?token|client[_-]?secret|secret[_-]?key"
     r"|authorization|proxy[_-]?authorization|bearer|auth)"
 )
+# R29 Block 51: the binding-operator arrow class must carry the NFKC-invariant
+# arrow variants a bypass can substitute for ``→`` (``⇒`` U+21D2 / ``⟶`` U+27F6
+# / ``⤳`` U+2933 / ``➔`` U+2794 — NFKC leaves every one of them unchanged, so
+# normalizing the scanned text cannot collapse them; the operator set itself has
+# to include the full right-arrow family, or ``passphrase ⇒ plannerV2`` escapes
+# the narration binding).  Over-inclusion here only ever binds (fail-closed) —
+# a designation word + arrow + registered-base value is credential narration
+# regardless of which arrow glyph the author typed.
+_CREDENTIAL_NARRATION_BIND_OP = (
+    r"(?:is|was|were|are|equals?|becomes)\b[ \t]*"
+    r"|[:=→⇒⟶⤳➔⟹⇨➜➡↦]|->|=>"
+)
 # A designation word in FIELD-NAME position immediately followed by a binding
 # operator and the bound value.  ``value`` is bounded and stops at a structural
 # delimiter (``,;{}`` / line end) — the registered-base token must sit inside it.
 _CREDENTIAL_NARRATION_ASSIGN_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(" + _CREDENTIAL_DESIGNATION_ALT + r")"
-    r"[ \t]*(?:(?:is|was|were|are|equals?|becomes)\b[ \t]*|[:=→]|->|=>)[ \t]*"
+    r"[ \t]*(?:" + _CREDENTIAL_NARRATION_BIND_OP + r")[ \t]*"
     r"(?P<value>[^\r\n,;{}]{0,120})"
 )
 
