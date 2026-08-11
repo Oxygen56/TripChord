@@ -1025,20 +1025,25 @@ _CREDENTIAL_DESIGNATION_ALT = (
     r"|auth[_-]?token|session[_-]?token|client[_-]?secret|secret[_-]?key"
     r"|authorization|proxy[_-]?authorization|bearer|auth)"
 )
-# R29 Block 51 / R30 Block 52: the binding-operator arrow class is CLOSED BY
-# UNICODE ARROW BLOCK RANGE, not by glyph enumeration.  NFKC leaves every arrow
-# codepoint unchanged (⇒ U+21D2 / ⟶ U+27F6 / ⤳ U+2933 / ➔ U+2794 / ⇛ U+21DB /
-# ⭢ U+2B62 / ⮕ U+2B95 …), so normalizing the scanned text can never collapse
-# them — the operator set itself must accept ANY rightward arrow.  R29 listed 10
-# glyphs and the review found 19 more unlisted ones (``⇛``/``⇉``/``⇶``/``➙``/
-# ``➝``/``⟿``/``⇢``/``⭢``/``⮕``) that escaped both finals; the fix matches the
-# prescribed arrow BLOCK ranges instead: Arrows U+2190-U+21FF, Supplemental
-# Arrows-A U+27F0-U+27FF, Supplemental Arrows-B U+2900-U+297F, Dingbats rightward
-# arrows U+2794-U+27BF, Misc Symbols & Arrows U+2B00-U+2BFF.  Over-inclusion here
-# only ever binds (fail-closed) — a designation word + arrow + registered-base
-# value is credential narration regardless of which arrow glyph the author typed.
+# R29 Block 51 / R30 Block 52 / R31 Block 53: the binding-operator arrow class
+# is CLOSED BY UNICODE ARROW BLOCK RANGE, not by glyph enumeration.  NFKC leaves
+# every arrow codepoint unchanged (⇒ U+21D2 / ⟶ U+27F6 / ⤳ U+2933 / ➔ U+2794 /
+# ⇛ U+21DB / ⭢ U+2B62 / 🡂 U+1F802 …), so normalizing the scanned text can never
+# collapse them — the operator set itself must accept ANY rightward arrow.  R29
+# listed 10 glyphs, R30 added the remaining four BMP arrow blocks + Dingbats, and
+# R31 review found the SIXTH arrow block (Supplemental Arrows-C U+1F800-U+1F8FF,
+# 33 rightward arrows) plus 8 scattered rightward codepoints (U+0362 / U+2348 /
+# U+1F4F2 / U+1F500-U+1F502 / U+1F51C / U+1FBB6) all escaping both finals.  The
+# class now closes ALL SIX arrow blocks (Arrows U+2190-U+21FF, Supplemental
+# Arrows-A U+27F0-U+27FF, Supplemental Arrows-B U+2900-U+297F, Dingbats U+2794-
+# U+27BF, Misc Symbols & Arrows U+2B00-U+2BFF, Supplemental Arrows-C U+1F800-
+# U+1F8FF) plus the 8 scattered codepoints.  Over-inclusion here only ever binds
+# (fail-closed) — a designation word + arrow + registered-base value is
+# credential narration regardless of which arrow glyph the author typed.
 _UNICODE_ARROW_BLOCK_CLASS = (
-    r"[\u2190-\u21FF\u27F0-\u27FF\u2900-\u297F\u2794-\u27BF\u2B00-\u2BFF]"
+    r"[\u2190-\u21FF\u27F0-\u27FF\u2900-\u297F\u2794-\u27BF"
+    r"\u2B00-\u2BFF\U0001F800-\U0001F8FF"
+    r"\u0362\u2348\U0001F4F2\U0001F500-\U0001F502\U0001F51C\U0001FBB6]"
 )
 _CREDENTIAL_NARRATION_BIND_OP = (
     r"(?:is|was|were|are|equals?|becomes)\b[ \t]*"
