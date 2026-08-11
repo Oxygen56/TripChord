@@ -2000,12 +2000,16 @@ _FINAL_TEXT_SHAPE_PAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
 # _\uff54\uff4f\uff4b\uff45\uff4e=abc`` that does
 # NOT sit inside a decoded JSON string value (a bare non-JSON ``.json`` free-text
 # file, a raw provider dump) is still a leak and must be rejected on BOTH final
-# paths (C-122 supervision 09:00 gap 2).  Only this one shape scans the raw top
+# paths (C-122 supervision 09:00 gap 2).  Only this small set scans the raw top
 # level of committed evidence; the rest of the FINAL_VALUE set runs on DECODED
 # string values where legitimate dotted domains / whole headers / 32+ test names
-# are excluded.
+# are excluded.  R18 Block 1 adds ``basic_auth`` — the final-scan independent
+# fallback: a complete ``Authorization``/``Proxy-Authorization`` ``Basic`` field
+# that survives producer/consumer must fail closed on the committed RAW path too,
+# not just on the free-form whole-header path.
 _CREDENTIAL_FIELD_SHAPE_PAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
     (registry_pattern("credential_field"), "credential field name assignment"),
+    (registry_pattern("basic_auth"), "Basic Authorization field"),
 )
 # The diagnostic's STRUCTURED schema — a fail-closed whitelist: any unknown
 # top-level / run_identity / runtime field makes the diagnostic foreign and is

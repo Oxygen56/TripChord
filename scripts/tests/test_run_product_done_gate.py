@@ -7234,6 +7234,197 @@ def test_producer_consumer_mask_fullwidth_zero_width_credential_spans() -> None:
         assert "[REDACTED]" in consumer_out
 
 
+def test_r18_final_scan_rejects_complete_basic_auth_field_both_paths() -> None:
+    """C-122 round-18 supervision re-review Block 1 counter-example: a complete
+    ``Authorization``/``Proxy-Authorization`` ``Basic <base64>`` field that the
+    producer/consumer already desensitize must ALSO fail the final scan's
+    independent backstop on BOTH the committed-evidence and free-form failure
+    paths — raw free text and JSON-wrapped decoded string values — while the
+    three real ``pending user authorization:`` prose positives stay accepted by
+    the committed structured scan."""
+    from benchmarks import live_canary_certified as canary
+
+    for raw in (
+        "upstream Authorization: Basic YWJjZA==",
+        "upstream proxy-authorization: Basic YWJjZA==",
+        json.dumps({"summary": "upstream Authorization: Basic YWJjZA=="}),
+        json.dumps({"detail": "upstream proxy-authorization: Basic YWJjZA=="}),
+    ):
+        # Committed evidence path (credential_field_check=True) and the
+        # decoded-value scanner both reject the complete field.
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+        # The producer masks the field whole; no base64 payload survives.
+        assert "YWJjZA" not in canary._desensitize(raw)
+
+    # The three real prose positives carry no ``Basic`` scheme and must stay
+    # accepted by the committed structured scan (they sit inside JSON string
+    # values in the real report, never at a header field position).
+    for prose in (
+        "pending user authorization: no connected Companion declares provider "
+        "'ctrip'; pair the Companion and re-run",
+        "pending user authorization: not all certified canary scopes have a "
+        "fresh authorised read-only canary",
+        "pending user authorization: full real E2E runs the configured mode",
+    ):
+        gate._secret_scan_bytes(
+            json.dumps(
+                {
+                    "scopes": [
+                        {"scope": "ctrip:flight", "authorized": False, "detail": prose}
+                    ]
+                }
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json",
+            credential_field_check=True,
+        )
+
+
+def test_r18_safe_marker_exact_exemption_rejects_trailing_chars() -> None:
+    """C-122 round-18 supervision re-review Block 2 counter-example: the safe
+    marker exemption is EXACT — only a field value that, after removing
+    surrounding quotes, is precisely ``[REDACTED]`` AND immediately followed by a
+    real field boundary / end is preserved.  Any trailing character
+    (``[REDACTED]actual``, ``[REDACTED] actual``, the ``[REDACTED];def"`` residue
+    of a quote-split value) fails the exemption and re-masks / re-rejects the
+    WHOLE segment on all three layers."""
+    from benchmarks import live_canary_certified as canary
+
+    # Trailing characters must be masked whole by producer/consumer and rejected
+    # by both final scans — never accepted as a "safe marker + junk".
+    for raw in (
+        "secret=[REDACTED]actual",
+        "secret=[REDACTED] actual",
+        'secret="[REDACTED]"actual',
+        'secret=[REDACTED];def"',
+        "token=[REDACTED]extra",
+    ):
+        assert canary._desensitize(raw) == "[REDACTED]", (
+            f"producer left trailing residue for {raw!r}"
+        )
+        assert gate._sanitize_canary_diag_field(raw, "fallback") == "[REDACTED]", (
+            f"consumer left trailing residue for {raw!r}"
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+
+    # The EXACT marker (quoted or bare) followed by a clean boundary stays
+    # untouched by producer/consumer and accepted by the committed final scan —
+    # the gate's own redacted report detail must never trip its own scan.
+    for raw in ("secret=[REDACTED]", 'secret="[REDACTED]"'):
+        assert canary._desensitize(raw) == raw, f"producer masked exact marker {raw!r}"
+        assert gate._sanitize_canary_diag_field(raw, "fallback") == raw, (
+            f"consumer masked exact marker {raw!r}"
+        )
+    report_fragment = json.dumps({"detail": "secret=[REDACTED]", "name": "x"})
+    gate._secret_scan_bytes(
+        report_fragment.encode(),
+        gate._SecretNeedles(()),
+        "evidence",
+        "product-v1-done-gate.json",
+        credential_field_check=True,
+    )
+
+
+def test_r18_quote_aware_credential_value_no_seal_residue(tmp_path: Path) -> None:
+    """C-122 round-18 supervision re-review Block 3 counter-example: the shared
+    quote-aware credential-value parser masks a quoted / comma / backslash /
+    bracket value WHOLE (``Session_token="abc;def"`` never leaves a ``;def"``
+    residue, ``token=[1,2]`` never leaves ``,2]``), and a REAL 0600 seal written
+    from a failure carrying such values is clean on disk — the consumer then
+    masks the summary whole and the final scan rejects the raw forms on both
+    paths."""
+    from benchmarks import live_canary_certified as canary
+
+    for raw in (
+        'Session_token="abc;def"',
+        "Session_token=abc,def",
+        "Session_token=abc\\def",
+        "token=[1,2]",
+        "Session_token=abc@def",
+        "Session_token=!/@/秘密/🔑",
+        "Session_token: abc def",
+    ):
+        assert canary._desensitize(raw) == "[REDACTED]", (
+            f"producer left residue for {raw!r}"
+        )
+        assert gate._sanitize_canary_diag_field(raw, "fallback") == "[REDACTED]", (
+            f"consumer left residue for {raw!r}"
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+
+    # A REAL 0600 seal written from a failure whose text carries the quote-split
+    # values must be clean on disk — no ``;def"`` / ``,def`` / ``[1,2]`` residue
+    # and no credential field name surviving in the summary.
+    output = tmp_path / "live-canary-certified.json"
+    diag_path = canary._seal_failure_diagnostic(
+        "evaluate",
+        RuntimeError(
+            'upstream 401 Session_token="abc;def" Session_token=abc,def token=[1,2]'
+        ),
+        output,
+        run_id="r18block3",
+        tested_sha="a" * 40,
+    )
+    assert diag_path.is_file()
+    summary = json.loads(diag_path.read_text(encoding="utf-8"))["summary"]
+    assert "session_token" not in summary.lower()
+    assert ";def\"" not in summary
+    assert ",def" not in summary
+    assert "[1,2]" not in summary
+    assert "abc" not in summary
+    # The consumer masks the sealed summary whole too — no residue survives.
+    consumer_out = gate._sanitize_canary_diag_field(summary, "fallback")
+    assert "session_token" not in consumer_out.lower()
+    assert ";def\"" not in consumer_out
+    assert "[1,2]" not in consumer_out
+
+
 def test_secret_scan_rejects_double_encoded_authorization_in_structured_json(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:

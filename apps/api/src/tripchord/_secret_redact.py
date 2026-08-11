@@ -215,12 +215,17 @@ CREDENTIAL_FIELD_NAME_PATTERN = re.compile(
 #   (``session_token``, ``api_key``, ``client_secret``, bare ``token`` /
 #   ``secret``, and — 09:59 Block 3 — ``password`` / ``passwd`` / ``access_key``
 #   / ``session_key``, which no longer share a branch with ``authorization``).
-#   Their VALUE is every NON-EMPTY character from the first value character to a
-#   clear field boundary (a quote, ``;`` / ``,``, a newline / the end of the
-#   diagnostic, or a space that BEGINS another field assignment) or the whole
-#   diagnostic — so ``Session_token=a`` (1 char), ``Password=a/ab/!`` and
-#   ``Session_token=abc@def`` are all masked WHOLE, never relying on a 3-char
-#   token-run minimum and never limited to an ASCII charset.
+#   Their VALUE is QUOTE- AND BRACKET-AWARE and CHARSET-UNRESTRICTED (R18
+#   Block 3): the first value character may be ANY character except a newline;
+#   a quoted value runs to the matching UNESCAPED closing quote, a bracket
+#   value (``token=[1,2]``) to the matching closing bracket, and an unquoted
+#   value to a real field boundary (a newline / the end of the diagnostic, or a
+#   space that BEGINS another field assignment).  So ``Session_token=a`` (1
+#   char), ``Password=a/ab/!``, ``Session_token=abc@def``,
+#   ``Session_token="abc;def"``, ``Session_token=abc,def``,
+#   ``Session_token=abc\def`` and ``token=[1,2]`` are all masked WHOLE — never
+#   relying on a 3-char token-run minimum, never limited to an ASCII charset,
+#   and never leaving a ``;def"`` / ``,2]`` residue.
 # * ``_CREDENTIAL_FIELD_WEAK_NAME_ALT`` — names that are ALSO ordinary English
 #   words (``authorization``, ``cookie``, ``bearer``).  Their value must be an
 #   actual token-character payload: a SINGLE token run of ``{3,}`` token
@@ -236,8 +241,13 @@ CREDENTIAL_FIELD_NAME_PATTERN = re.compile(
 # ``session[_-]?token`` first; the bare ``token`` never matches the ``token``
 # inside ``bridge_token_present`` because a preceding ``_`` is not a
 # field-position guard).  The gate's own redaction marker ``secret=[REDACTED]``
-# is the ONE exact exemption (Block 3): its ``[``-value fails the value start,
-# so an already-redacted assignment is left untouched.
+# is the ONE EXACT exemption (R18 Block 2): only a field value that — after
+# removing surrounding quotes — is precisely ``[REDACTED]`` and is immediately
+# followed by a real field boundary / end (``secret=[REDACTED]``,
+# ``secret="[REDACTED]"``, ``secret=[REDACTED] next=1``) is left untouched.
+# Any trailing character — ``[REDACTED]actual``, ``[REDACTED] actual``, the
+# ``[REDACTED];def"`` residue of a quote-split value — fails the exemption and
+# re-masks / re-rejects the WHOLE segment.
 _CREDENTIAL_FIELD_STRONG_NAME_ALT = (
     r"access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|"
     r"session[_-]?token|api[_-]?key|apikey|client[_-]?secret|"
@@ -246,36 +256,67 @@ _CREDENTIAL_FIELD_STRONG_NAME_ALT = (
     r"access[_-]?key|session[_-]?key|passw(?:ord|d)"
 )
 _CREDENTIAL_FIELD_WEAK_NAME_ALT = r"authorization|cookie|bearer"
+_CREDENTIAL_FIELD_VALUE_END = (
+    # A real end of a credential value.  The value ``[REDACTED]`` inside a JSON
+    # string (``\"detail\":\"secret=[REDACTED]\",...``) is parsed with the
+    # value's opening quote as the field-position guard and the value ending at
+    # the CLOSING quote, so a string-closing quote followed by JSON structure
+    # (``\"`` then ``,`` / ``}`` / ``]`` / end) is a boundary.  The other
+    # boundary forms: end-of-text / a newline, a JSON structural punctuation
+    # (``}`` / ``]`` / ``,``) or a ``;`` / ``,`` field separator — optionally
+    # followed by the next (possibly quoted) field assignment — or a space that
+    # BEGINS another field assignment.  A bare quote is NOT a boundary on its
+    # own: ``secret=\"[REDACTED]\"actual`` and ``secret=[REDACTED]actual`` must
+    # not be treated as the marker followed by a clean boundary (R18 Block 2).
+    r"(?:$|[\r\n]"
+    r"|[\"'][ \t]*(?:$|[\r\n]|[}\],;][ \t]*(?:$|[\r\n]|[\"']?[A-Za-z0-9_.-]+[\"']*[ \t]*[:=]))"
+    r"|[}\],;][ \t]*(?:$|[\r\n]|[\"']?[A-Za-z0-9_.-]+[\"']*[ \t]*[:=])"
+    r"|[ \t](?=[A-Za-z0-9_-]+[ \t]*[\"']*[ \t]*[:=]))"
+)
 _CREDENTIAL_FIELD_STRONG_VALUE = (
-    # C-122 supervision 09:59 Block 3: the value is CHARSET-UNRESTRICTED — the
-    # first value character may be ANY character except whitespace, a quote,
-    # ``;`` / ``,`` (field separators), a backslash (JSON escape / Windows-path
-    # boundary) or the ``[`` of the exact safe marker ``[REDACTED]``.  ``@``,
-    # ``!``, ``/``, CJK and emoji are all real value characters
-    # (``Session_token=!/@/\u79d8\u5bc6/\U0001f511``, ``Password=a/ab/!`` and
-    # ``Session_token=abc@def`` must mask WHOLE, never leave ``@def`` residue).
-    # The leading ``(?!\[REDACTED\])`` is the ONE marker exemption: when the
-    # value position starts with the exact safe marker the whole match fails,
-    # so ``secret=[REDACTED]`` is left untouched while any OTHER ``[``-shaped
-    # value (``token=[1,2]``) is still a real value.  The value then runs to a
-    # clear field boundary: a quote, ``;`` / ``,``, a newline / the end of the
-    # diagnostic, or a space that BEGINS another field assignment (``name``
-    # followed by ``:`` / ``=``) — a space-separated value (``Session_token: abc
-    # def``) is covered WHOLE from the first non-empty char, while
-    # ``token=a Session_token: b`` stops the first value at the next field
-    # instead of swallowing its name (C-122 supervision 09:28 gap B).
-    r"(?!\[REDACTED\])(?:[^\s;,\"'\\]|\[)"
-    r"(?:"
-    r"[^\s;,\"'\\]"
-    r"|[ \t](?![A-Za-z0-9_-]+[ \t]*[\"']*[ \t]*[:=])"
-    r")*"
+    # C-122 supervision 09:59 (R18 Block 3): the value is CHARSET-UNRESTRICTED
+    # AND quote/bracket-AWARE.  ``@``, ``!``, ``/``, CJK and emoji are real
+    # value characters (``Session_token=!/@/秘密/\U0001f511``,
+    # ``Password=a/ab/!`` and ``Session_token=abc@def`` must mask WHOLE, never
+    # leave ``@def`` residue); a quoted value runs to the matching UNESCAPED
+    # closing quote (``Session_token="abc;def"`` — never a ``;def"`` residue),
+    # a comma / backslash value (``Session_token=abc,def``,
+    # ``Session_token=abc\def``) and a bracket list (``token=[1,2]``) mask
+    # whole, and an unquoted value runs to a real field boundary — a newline /
+    # the end of the diagnostic, or a space that BEGINS another field
+    # assignment (``name`` followed by ``:`` / ``=``), so ``token=a
+    # Session_token: b`` still stops the first value at the next field instead
+    # of swallowing its name (C-122 supervision 09:28 gap B) while a
+    # space-separated value (``Session_token: abc def``) is covered WHOLE.
+    #
+    # The leading lookahead is the EXACT safe-marker exemption (R18 Block 2):
+    # only a field value that — after removing surrounding quotes — is
+    # precisely ``[REDACTED]`` and is immediately followed by a real field
+    # boundary / end (``secret=[REDACTED]``, ``secret="[REDACTED]"``,
+    # ``secret=[REDACTED] next=1``) is left untouched.  Any trailing character
+    # (``secret=[REDACTED]actual``, ``secret=[REDACTED] actual``) fails the
+    # exemption and the WHOLE value is masked again.
+    r"(?!"
+    r"(?:[\"']\[REDACTED\][\"']|\[REDACTED\])"
+    + _CREDENTIAL_FIELD_VALUE_END
+    + r")"
+    + r"(?:"
+    + r"[\"'](?:\\[\s\S]|[^\\\"'])*[\"']"
+    + _CREDENTIAL_FIELD_VALUE_END
+    + r"|\[(?:[^\[\]\"']|\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')*\]"
+    + _CREDENTIAL_FIELD_VALUE_END
+    + r"|[^\r\n](?:[^\r\n]|[ \t](?![A-Za-z0-9_-]+[ \t]*[\"']*[ \t]*[:=]))*"
+    + r")"
 )
 _SHAPE_PATTERN_CREDENTIAL_FIELD_RE = re.compile(
     r"(?i)(?:"
     r"(?:^|[^A-Za-z0-9_])("
     + _CREDENTIAL_FIELD_STRONG_NAME_ALT
     + r")(?:[_-]?|$)\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
-    r"(?:\\*[\"']?|[\"'])?"
+    # R18 Block 3: NO value pre-pattern quote-consumption on the STRONG branch —
+    # the value regex itself is quote-aware (a quoted value runs to the closing
+    # quote, a bracket value to the closing bracket), so an opening quote must
+    # reach the value so the closing quote is never left as residue.
     + _CREDENTIAL_FIELD_STRONG_VALUE
     + r"|"
     r"(?:^|[^A-Za-z0-9_])("
@@ -283,6 +324,29 @@ _SHAPE_PATTERN_CREDENTIAL_FIELD_RE = re.compile(
     + r")(?:[_-]?|$)\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
     r"(?:\\*[\"']?|[\"'])?(?>[A-Za-z0-9+/=_\-.]{3,})(?![ \t])"
     r")"
+)
+# C-122 supervision 09:59 (R18 Block 1): the ``Authorization`` /
+# ``Proxy-Authorization`` Basic-SCHEME field.  The weak credential-field branch
+# requires a SINGLE token payload (``authorization: YWJjZA==``), so the
+# space-separated Basic scheme (``Authorization: Basic YWJjZA==``,
+# ``proxy-authorization: Basic YWJjZA==``) was invisible to the FINAL_VALUE
+# decoded-value scan even though the whole-header shape masks it in the
+# producer/consumer and failure-diagnostic text.  This shape is the FINAL-scan
+# independent backstop: the committed-evidence decoded-value scan recognizes
+# the COMPLETE Basic field (scheme + base64 payload) as a leak while the three
+# real ``pending user authorization: …`` prose positives (no ``Basic`` scheme)
+# stay allowed.  Scoped to the FINAL scans only — the whole-header shape
+# already owns producer/consumer masking.
+_SHAPE_PATTERN_BASIC_AUTH_RE = re.compile(
+    r"(?i)\b(?:proxy[-_ ]authorization|authorization)\b\s*"
+    r"(?:\\*[\"']?|[\"'])?\s*[:=]\s*(?:\\*[\"']?|[\"'])?"
+    # The payload is a MAXIMAL token run — it must end at a non-token char or
+    # end-of-value, never stop mid-word: ``Basic YWJjZA==`` is a leak but
+    # ``authorization: Basic is required`` (prose, ``is`` followed by a space)
+    # and ``Basic YWJjZA== extra`` (non-canonical, payload not at the end) are
+    # NOT matched — the ``(?![A-Za-z0-9+/=_\-.]|[ \t])`` guard rejects a run
+    # that is continued by a token character OR a space.
+    r"Basic[ \t]+[A-Za-z0-9+/=_\-.]{1,}(?![A-Za-z0-9+/=_\-.]|[ \t])"
 )
 
 _S = PatternScope
@@ -294,7 +358,11 @@ _S = PatternScope
 #   ``api.icomtours.com/...``) and the field-position auth/cookie value scan
 #   already covers header forms.  The full set — including dotted JWTs — still
 #   applies to FREE-FORM failure diagnostics via ``FINAL_TEXT``, where such
-#   text is a real credential signal.
+#   text is a real credential signal.  The ONE exception is the
+#   ``basic_auth`` shape (R18 Block 1): the complete ``Authorization`` /
+#   ``Proxy-Authorization`` Basic field (scheme + base64 payload) is exactly
+#   what the weak credential-field branch can NOT see, so the committed
+#   decoded-value scan needs its own recognizer for it.
 # * token-run — a committed evidence artifact legitimately carries 32+ ASCII
 #   runs that are NOT credentials (test names like ``test_booking_planning_
 #   integration``, Chrome extension ids like ``chrome-mv3-<40-hex>``).  A 32+
@@ -382,6 +450,22 @@ SHAPE_PATTERN_REGISTRY: tuple[SensitiveShapePattern, ...] = (
         pattern=_SHAPE_PATTERN_CREDENTIAL_FIELD_RE,
         kind="credential field name assignment",
         scopes=_FINAL_VALUE_SHAPES,
+    ),
+    # R18 Block 1: the ONE Basic-scheme header exception to the
+    # FINAL_VALUE-excludes-whole-header rule.  The weak credential-field branch
+    # needs a single token payload, so ``Authorization: Basic YWJjZA==`` /
+    # ``proxy-authorization: Basic YWJjZA==`` pass the committed decoded-value
+    # scan untouched.  This is the FINAL-scan independent backstop for the
+    # complete Basic field — the whole-header shape (which masks it in the
+    # producer / consumer / failure diagnostics) is deliberately not in
+    # FINAL_VALUE, so the committed path needed its own recognizer.  The three
+    # real ``pending user authorization: …`` prose positives carry no ``Basic``
+    # scheme and stay allowed.  Scoped to the FINAL scans only.
+    SensitiveShapePattern(
+        name="basic_auth",
+        pattern=_SHAPE_PATTERN_BASIC_AUTH_RE,
+        kind="Basic Authorization field",
+        scopes=_S.FINAL_TEXT | _S.FINAL_VALUE,
     ),
 )
 
