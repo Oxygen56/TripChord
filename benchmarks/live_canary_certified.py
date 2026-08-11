@@ -33,8 +33,10 @@ from typing import Any
 
 import httpx
 from tripchord._secret_redact import (
+    _BARE_CREDENTIAL_TOKEN_RE,
     CREDENTIAL_FIELD_NAME_PATTERN,
     PatternScope,
+    _is_bare_credential_token,
     bounded_json_mask,
     mask_normalized_spans,
     registry_pattern,
@@ -373,6 +375,24 @@ def _desensitize_level(text: str) -> str:
     # the shared strong/weak boundary semantics (the credential_field line below
     # does the work).
     text = _CANARY_DIAG_CREDENTIAL_FIELD_RE.sub("[REDACTED]", text)
+    # C-122 round-26 Block 41: free-text UNKNOWN bare camelCase-and-digit
+    # values are masked BEFORE the 0600 seal lands on disk.  The SAME closed
+    # registered business-identifier bases the final scan accepts survive here
+    # (``flightOption1`` / ``refreshTokenCount1`` / ``hotelAmenity3`` …); every
+    # other bare value (``qwerTy1`` / ``myFlightHotel1`` / ``mySuperSecretV1``
+    # / ``purpleMonkeyDishwasher1`` …) fails closed to ``[REDACTED]`` in the
+    # producer, so an unknown bare credential can never reach the sealed
+    # diagnostic unmasked.  This is the ``落盘前脱敏`` half of supervision
+    # Block 41; the final scans still reject a raw unknown bare value if one
+    # ever appears (defense in depth).
+    text = _BARE_CREDENTIAL_TOKEN_RE.sub(
+        lambda m: (
+            "[REDACTED]"
+            if _is_bare_credential_token(m.group(0))
+            else m.group(0)
+        ),
+        text,
+    )
     return text
 
 

@@ -432,21 +432,17 @@ _BASIC_VALUE_TOKEN_RE = re.compile(r"(?i)\bBasic[ \t]+(?P<payload>[A-Za-z0-9+/]{
 # (The span used is :func:`_BASIC_VALUE_TOKEN_RE`'s ``payload`` group.)
 
 
-# Trip business-identifier vocabulary used by the STRUCTURED recognizers
-# (R23 Block 33/34, restored for the business check by R25 Block 39): a bare
-# camelCase-and-digit token is non-credential business English ONLY when EVERY
-# word segment is in this controlled Trip vocabulary.  R24 Block 37 shipped a
-# 207k-word English dictionary in this position, which contained
-# ``secret``/``password``/``credential``/``signature`` AND ``access``/
-# ``purple``/``monkey``/``dishwasher`` — every one of the nine R25 regression
-# tokens was "all real English words" and passed, re-opening the R23
-# fail-closed defense.  The vocabulary deliberately keeps credential-keyword
-# segments out (``secret``/``password``/``token``/… fail closed in ANY
-# position via the symmetric keyword check, R25 Block 39) and keeps non-Trip
-# English words out (``purple``/``monkey``/``dishwasher`` are real English but
-# are not a verifiable Trip business identifier).  ``amenity`` / ``booking`` /
-# ``reference`` complete the R23 set with the exact words the R24 Block 37
-# contract requires (``hotelAmenity3`` / ``bookingReference1`` stay positive).
+# Basic-prose phrase vocabulary used ONLY by the Basic-header prose-exemption
+# (``_is_english_prose_phrase``): a non-base64 ``Basic`` payload plus any
+# trailing text is non-credential prose ONLY when every word is in this
+# controlled vocabulary — ``is required`` / ``authentication is required`` are
+# prose, ``ab extra`` / ``abc extra`` are not.  R26 Block 41 removed this
+# vocabulary from the BARE-IDENTIFIER determination — business identifiers are
+# now bound to the closed, auditable ``_BUSINESS_IDENTIFIER_BASES``
+# schema/field-path registry below, never to a word list — so this set exists
+# solely to classify Basic-header prose.  ``authentication`` is added (R26
+# Block 42) so ``Basic authentication is required`` is recognised as the normal
+# English sentence the supervision contract mandates stay accepted.
 _CREDENTIAL_VALUE_WORDS = frozenset(
     {
         # function words
@@ -491,7 +487,8 @@ _CREDENTIAL_VALUE_WORDS = frozenset(
         "number", "quantity", "option", "options",
         "choice", "select",
         "selected", "choose", "pick", "prefer", "preference", "setting",
-        "settings", "config", "configuration", "auth", "mode", "model", "type",
+        "settings", "config", "configuration", "auth", "authentication",
+        "mode", "model", "type",
         "version", "status", "state", "level", "rank", "order", "sort",
         "group", "class", "kind", "list", "array", "map",
         "object", "field", "fields", "label", "title", "header", "body",
@@ -535,20 +532,6 @@ _CREDENTIAL_VALUE_WORDS = frozenset(
         "iteration", "runs", "execution", "execute",
     }
 )
-
-
-def _split_camel_case(prefix: str) -> list[str]:
-    """Split a camelCase word prefix into its word segments at each
-    lower→upper boundary: ``flightOption`` -> [``flight``, ``Option``],
-    ``refreshTokenCount`` -> [``refresh``, ``Token``, ``Count``]."""
-    segments: list[str] = []
-    start = 0
-    for i in range(1, len(prefix)):
-        if prefix[i].isupper() and prefix[i - 1].islower():
-            segments.append(prefix[start:i])
-            start = i
-    segments.append(prefix[start:])
-    return segments
 
 
 def _is_english_prose_phrase(text: str) -> bool:
@@ -634,11 +617,15 @@ def _is_basic_payload_prose(bm: re.Match[str], value: str) -> bool:
       decodes to TEXT-LIKE bytes — a printable-ASCII ratio >= 0.5, e.g.
       ``Basic dXNlcv8=`` -> ``user\xff`` — is a real username/password
       fragment (R23 Block 34);
+    * a decodable payload whose bytes contain ZERO printable ASCII (``Basic
+      //8=`` decodes to ``\xff\xff``) is PURE BINARY — a real credential body,
+      never prose (R26 Block 42: base64 validity is not a pass);
     * an invalid-base64 payload is prose only when the payload plus any
       trailing text is a proven 2+ word English phrase (``is required``);
       ``ab``/``abc``/``ab extra``/``abc extra`` fail closed;
     * anything else — a binary junk body (``Basic auth/setting`` decodes to
-      non-UTF-8 bytes, no ``:``, low printable ratio) — is prose.
+      non-UTF-8 bytes, no ``:``, low printable ratio, at least one printable
+      byte) — is prose.
     """
     payload = bm.group("payload")
     if _is_valid_basic_payload(payload):
@@ -651,6 +638,13 @@ def _is_basic_payload_prose(bm: re.Match[str], value: str) -> bool:
         if b":" in decoded:
             return False
         printable = sum(1 for byte in decoded if 32 <= byte < 127)
+        # R26 Block 42: a body with ZERO printable ASCII bytes is PURE BINARY —
+        # never English prose, always a real credential payload.  ``Basic //8=``
+        # decodes to ``\xff\xff`` and fails closed (base64 validity != pass),
+        # while ``Basic auth/setting`` keeps >= 1 printable byte and stays a
+        # binary-junk prose body.
+        if decoded and printable == 0:
+            return False
         if decoded and printable / len(decoded) >= 0.5:
             return False
         rest = value[bm.end():].strip()
@@ -736,8 +730,19 @@ _SHAPE_PATTERN_DIGEST_AUTH_RE = re.compile(
     # or a STANDALONE structural position (line/value start or after a
     # ``,;{}[]"'\\`` delimiter) — a descriptor-word prefix means the text is a
     # model/business narrative, never a credential header.
+    #
+    # R26 Block 42: the descriptor guard is RESTORED but narrowed to REAL
+    # header-context descriptors — network-entity words that sit in front of an
+    # actual upstream/origin HTTP header block in a server log (``upstream
+    # Digest username="user", response=<64hex>``).  These are bound to a real
+    # credential-header context and REJECT, while the business-narration
+    # descriptors (``model`` / ``notice`` / ``the`` / ``result``) stay out and
+    # remain accepted.  The hex length is ANY 16-128 run, so ``response=<16/32/
+    # 64hex>`` all fail closed the same way.
     r"(?i)(?:^|[\r\n,;{}\[\]\"'\\]|"
-    r"(?:authorization|proxy-authorization)[ \t]*:[ \t]*)digest\b(?:"
+    r"(?:authorization|proxy-authorization)[ \t]*:[ \t]*|"
+    r"(?<![A-Za-z0-9_-])(?:upstream|origin|backend|gateway|proxy|remote|peer|"
+    r"server|client)[ \t]+)digest\b(?:"
     r"[ \t]+response\s*=\s*[\"']?[0-9a-f]{16,128}"
     r"|[ \t]+(?:username|realm|nonce|uri|qop|nc|cnonce|opaque|algorithm|"
     r"stale|domain)\s*=\s*(?:[\"'][^\"']{0,80}[\"']|[^,\r\n]{1,80})"
@@ -783,65 +788,76 @@ _BARE_CREDENTIAL_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])[a-z]+[A-Z][A-Za-z0-9_]*[0-9]+[A-Za-z0-9_]*(?![A-Za-z0-9_])"
 )
 
-# Credential keyword FULL SEGMENTS (camelCase boundaries, case-insensitive) —
-# NOT substrings: ``tokenization`` / ``secretariat`` contain ``token`` /
-# ``secret`` as substrings but are ordinary English words and never match.
-_BARE_CREDENTIAL_KEYWORD_SEGMENTS = frozenset(
+# R26 Block 41: business-identifier determination is a CLOSED, AUDITABLE
+# registry of TripChord business-identifier BASES bound to parsed
+# schema/field-path sources — NOT a dictionary, NOT a word list, NOT a
+# threshold.  Each base is the EXACT camelCase prefix of a known TripChord
+# business identifier and is documented with the schema/field path it comes
+# from.  A bare camelCase-and-digit token is a business identifier ONLY when
+# its base (after stripping a trailing ``V<digits>`` version marker) EXACTLY
+# equals a registered base; anything else — ``qwerTy`` / ``myFlightHotel`` /
+# ``flightHotelTrip`` / ``userHotelPlan`` / ``openTripPlan`` /
+# ``myHotelPlan`` / ``accessLogCount`` / ``purpleMonkeyDishwasher`` / any
+# unknown chain — fails closed BY CONSTRUCTION (an unregistered base is a bare
+# credential value, never a business identifier).
+#
+# This replaces the R23 controlled-vocabulary / R24 207k-dictionary / R25
+# Trip-word-list determinations (supervision Block 41: 禁止对任意 free-text 用
+# 词典/Trip 词表/阈值做身份猜测).  ``refreshTokenCount`` is a REGISTERED business
+# base even though a camelCase segment split would expose a ``Token`` segment —
+# the contract fixes it as a business positive (R23 Block 33, restored by R26
+# Block 40), and the closed exact-base match is what grants that exemption, so
+# fixing Block 39 can never silently flip it back.
+_BUSINESS_IDENTIFIER_BASES = frozenset(
     {
-        "secret", "password", "passwd", "pwd", "pass", "credential",
-        "credentials", "token", "key", "apikey", "accesskey", "authkey",
-        "sessionkey", "privatekey", "clientsecret", "secretkey",
-        "accesstoken", "refreshtoken", "authtoken", "idtoken", "tokenid",
-        "signature", "signingkey", "bearer", "nonce", "authorization",
-        "auth", "cookie", "session", "sid",
+        # plan.flight_option[].option — flight option selector (R24 Block 37)
+        "flightOption",
+        # plan.hotel_amenity[].amenity — hotel amenity selector (R24 Block 37)
+        "hotelAmenity",
+        # plan.booking_reference — booking reference (R24 Block 37)
+        "bookingReference",
+        # oauth.refresh_token_count — token-refresh counter (R23 Block 33)
+        "refreshTokenCount",
+        # plan.planner_version — planner version marker (R24 Block 36)
+        "planner",
+        # plan.provider_version — provider version marker (R24 Block 36)
+        "provider",
+        # plan.tokenization_version — tokenization version (R23 Block 33)
+        "tokenization",
+        # plan.secretariat_version — secretariat version (R23 Block 33)
+        "secretariat",
+        # plan.day — itinerary day index (R21 Block 25 ``day2``)
+        "day",
     }
 )
 
 
-# R25 Block 39: the R24 207k-word English dictionary is REMOVED from the
-# business-identifier determination.  A complete English dictionary cannot
-# separate a Trip business identifier from an arbitrary English word chain —
-# ``hotelAmenity3`` and ``purpleMonkeyDishwasher1`` are structurally identical
-# (every segment a real English word), and the dictionary also contains the
-# sensitive words themselves (``secret`` / ``password`` / ``credential`` /
-# ``signature``), so R24 silently accepted all nine regression tokens.  The
-# business determination is the controlled Trip vocabulary
-# ``_CREDENTIAL_VALUE_WORDS`` (fail-closed by construction: credential-keyword
-# segments and non-Trip English words alike fail closed), completed with the
-# three words the R24 Block 37 contract requires.
 def _is_bare_credential_token(token: str) -> bool:
-    """True when a camelCase-and-digit token is a BARE credential value —
-    the STRUCTURED recognizer (R23 Block 33 / R24 Block 36 / R25 Block 39),
-    NOT a keyword/threshold heuristic.  ``qwerTy1`` (a short keyboard mash +
-    digit) and ``mySuperSecret1`` structurally share the shape of
+    """True when a camelCase-and-digit token is a BARE credential value — the
+    STRUCTURED recognizer (R23 Block 33 / R24 Block 36 / R26 Block 41), NOT a
+    keyword/threshold/heuristic recognizer.  ``qwerTy1`` (a short keyboard
+    mash + digit) and ``mySuperSecret1`` structurally share the shape of
     ``flightOption12`` (lower+Upper+lower+digits), so no
-    length/digit-position/punctuation rule can separate them: the decision is
-    identifier STRUCTURE:
+    length/digit-position/punctuation rule can separate them.  The decision is
+    identifier STRUCTURE + a CLOSED business-identifier registry:
 
     * a digit run followed by a letter INSIDE the token (``1xyz`` in
       ``abcD1xyz9``) — the digit is embedded, not a trailing number — is a
       credential (fail-closed);
     * a trailing ``V<digits>`` version marker (``plannerV2`` /
       ``tokenizationV1`` / ``secretariatV1``) is a versioned business
-      identifier ONLY AFTER the credential-keyword segments are excluded —
-      ``mySuperSecretV1`` / ``refreshTokenV1`` end in credential keywords and
-      stay credentials (R24 Block 36);
-    * a trailing-digit token ANY of whose camelCase segments is a credential
-      keyword fails closed — SYMMETRIC with the version branch, ANY segment
-      position, not just the last (R25 Block 39: ``clientSecretTree1`` /
-      ``passwordCheck1`` / ``secretSauce1`` / ``signaturePad1`` put the
-      keyword in a non-final segment; the R24 last-segment check let them
-      through);
-    * a trailing-digit token whose camelCase segments are ALL in the Trip
-      business vocabulary (``flightOption`` = ``flight`` + ``Option``,
-      ``hotelAmenity`` = ``hotel`` + ``Amenity``,
-      ``bookingReference`` = ``booking`` + ``Reference``) is a business
-      identifier — R25 Block 39 restores the R23 controlled-vocabulary
-      fail-closed (the R24 dictionary accepted ``accessLogCount1`` and
-      ``purpleMonkeyDishwasher1`` because every segment was "a real English
-      word");
-    * ANY other digit-bearing camelCase token (``qwerTy1`` — a short
-      keyboard-mash prefix with a digit) fails closed as a credential shape.
+      identifier ONLY when the version-stripped base is a registered business
+      base — ``mySuperSecretV1`` / ``refreshTokenV1`` / ``qwerTyV1`` are NOT
+      registered and stay credentials.  The version branch is SYMMETRIC with
+      the non-version branch (R26 Block 41: ``qwerTyV1`` and ``qwerTy1`` judge
+      identically, both fail-closed);
+    * a trailing-digit token whose base is EXACTLY a registered
+      ``_BUSINESS_IDENTIFIER_BASES`` entry (``flightOption1`` /
+      ``hotelAmenity3`` / ``bookingReference1`` / ``refreshTokenCount1`` /
+      ``day2``) is a business identifier;
+    * ANY other digit-bearing camelCase token (``qwerTy1`` /
+      ``myFlightHotel1`` / ``purpleMonkeyDishwasher1``) fails closed as a
+      bare credential shape.
     """
     if re.search(r"[0-9]+[A-Za-z]", token):
         return True
@@ -849,36 +865,13 @@ def _is_bare_credential_token(token: str) -> bool:
     if m is None:
         return False
     prefix, _digits = m.group(1), m.group(2)
-    if prefix[-1] in "Vv":
-        # R24 Block 36: the version-marker exemption is granted ONLY after the
-        # credential-keyword segments are excluded.  ``mySuperSecretV1`` /
-        # ``authTokenV1`` / ``sessionCookieV2`` / ``refreshTokenV1`` all carry a
-        # credential keyword in the word prefix and stay credentials, while
-        # ``tokenizationV1`` / ``secretariatV1`` / ``plannerV2`` (no keyword
-        # segment) remain versioned business identifiers.
-        segments = _split_camel_case(prefix[:-1])
-        return any(
-            segment.lower() in _BARE_CREDENTIAL_KEYWORD_SEGMENTS
-            for segment in segments
-        )
-    segments = _split_camel_case(prefix)
-    if not segments:
-        return False
-    # R25 Block 39: symmetric with the version branch — ANY segment that is a
-    # credential keyword fails closed, not just the last segment.
-    if any(
-        segment.lower() in _BARE_CREDENTIAL_KEYWORD_SEGMENTS
-        for segment in segments
-    ):
-        return True
-    # R25 Block 39: business determination is the controlled Trip vocabulary
-    # (fail-closed), not the 207k English dictionary (fail-open).  A single
-    # non-Trip segment — ``access`` in ``accessLogCount1``, ``purple`` /
-    # ``monkey`` / ``dishwasher`` in ``purpleMonkeyDishwasher1`` — rejects the
-    # identifier in ANY position.
-    return not all(
-        segment.lower() in _CREDENTIAL_VALUE_WORDS for segment in segments
-    )
+    base = prefix[:-1] if prefix[-1] in "Vv" else prefix
+    # R26 Block 41: exact closed-registry match.  ``refreshTokenCount1`` is a
+    # registered business base; ``refreshTokenV1`` (base ``refreshToken``) and
+    # ``qwerTyV1`` / ``qwerTy1`` (base ``qwerTy``) are not registered and fail
+    # closed — the version branch judges by the SAME registry, so there is no
+    # asymmetric version exemption to exploit.
+    return base not in _BUSINESS_IDENTIFIER_BASES
 
 
 class _BareCredentialScan:

@@ -49,6 +49,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from tripchord._secret_redact import (
+    _BARE_CREDENTIAL_TOKEN_RE,
     _CREDENTIAL_FIELD_STRONG_NAME_ALT,
     _SHAPE_PATTERN_DIGEST_AUTH_RE,
     BARE_CREDENTIAL_FIELD_NAMES,
@@ -56,6 +57,7 @@ from tripchord._secret_redact import (
     DuplicateJsonKeyError,
     PatternScope,
     RecursiveJsonBudgetError,
+    _is_bare_credential_token,
     _is_whole_header_prose,
     _normalize_for_scan,
     bounded_json_mask,
@@ -2398,6 +2400,20 @@ def _canary_diag_mask_level(value: str) -> str:
     # the shared strong/weak boundary semantics (the credential_field line
     # below does the work).
     value = _CANARY_DIAG_CREDENTIAL_FIELD_RE.sub("[REDACTED]", value)
+    # C-122 round-26 Block 41: free-text UNKNOWN bare camelCase-and-digit
+    # values are masked by the CONSUMER too, mirroring the producer — the
+    # closed registered business-identifier bases survive
+    # (``flightOption1`` / ``refreshTokenCount1`` …), every other bare value
+    # (``qwerTy1`` / ``myFlightHotel1`` …) fails closed to ``[REDACTED]``
+    # before it can reach the committed report.
+    value = _BARE_CREDENTIAL_TOKEN_RE.sub(
+        lambda m: (
+            "[REDACTED]"
+            if _is_bare_credential_token(m.group(0))
+            else m.group(0)
+        ),
+        value,
+    )
     return value
 
 
