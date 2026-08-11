@@ -844,14 +844,24 @@ class _DigestAuthScan:
                 continue
             if not _HEX_FULL_RE.fullmatch(response.strip()):
                 continue
-            # A descriptor-prefixed digest is a credential ONLY when it carries
-            # a request-identity parameter: ``service Digest username=…`` /
-            # ``upstream … userhash=true`` fail closed, ``client digest
-            # algorithm=md5, response=…`` (no identity) stays accepted.
-            if binding == "descriptor" and not (
-                "username" in params or "userhash" in params
-            ):
-                continue
+            # R28 Block 49: a descriptor-prefixed digest is a credential EXCEPT
+            # when it is a pure algorithm description — ``client digest
+            # algorithm=md5, response=…`` narrates the ALGORITHM (no request
+            # identity, no bare hex-secret position) and stays accepted.  A
+            # descriptor digest carrying a request-identity parameter (``service
+            # Digest username=…`` / ``upstream … userhash=true``) fails closed
+            # (R27 Block 45), and so does a descriptor digest with NO identity
+            # and NO algorithm — ``origin Digest response=<hex>`` /
+            # ``upstream Digest response=<hex>`` are not descriptions of
+            # anything, they are the credential form the R27 fix over-relaxed
+            # and must fail closed (恢复描述符上下文 Digest 任意 hex 拒绝, 含仅
+            # response= 无身份参数形态).
+            if binding == "descriptor":
+                if "username" in params or "userhash" in params:
+                    return m
+                if "algorithm" in params:
+                    continue
+                return m
             return m
         return None
 
@@ -972,37 +982,71 @@ _VERSION_MARKER_BUSINESS_BASES = frozenset(
 # scan and slipped through.  This recognizer matches ONLY those registered
 # all-lowercase bases followed by a ``<digits>`` or ``V<digits>`` suffix, so
 # the form validation in :func:`_is_bare_credential_token` can see them.  It
-# is the SAME closed auditable registry — no word list, no threshold.
+# is the SAME closed auditable registry — no word list, no threshold.  R28
+# Block 47: the recognizer is CASE-INSENSITIVE (``Day1`` / ``X-Day1`` /
+# ``PLANNERV2`` are the same base forms the gate's key/header recognizers
+# already treat case-insensitively) — a capitalized index base is still an
+# index base and fails closed; a capitalized version form (``PlannerV2``) is
+# not the documented lowercase ``baseV<digits>`` form and fails closed too.
 _REGISTERED_LOWER_BASE_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:day|planner|provider|tokenization|secretariat)"
+    r"(?i)(?<![A-Za-z0-9_])(?:day|planner|provider|tokenization|secretariat)"
     r"(?:V[0-9]+|[0-9]+)(?![A-Za-z0-9_])"
 )
 
-# R27 Block 43: credential-NARRATION words — a closed, auditable set of the
-# credential FIELD-NAME words (the STRONG names, mirroring
-# ``_CREDENTIAL_FIELD_STRONG_NAME_ALT``) whose whole-word presence in a
-# scanned value binds every registered business-identifier token in that value
-# to a credential-narration context (``password is flightOption1`` /
-# ``the password was plannerV2``) → fail closed.  Word-bounded, so a bare
-# ``token`` never matches inside ``refreshTokenCount1`` / ``tokenizationV1``.
-_CREDENTIAL_NARRATION_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])(?:password|passwd|secret|token|credentials?"
-    r"|api[_-]?key|access[_-]?key|session[_-]?key|private[_-]?key"
-    r"|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token"
-    r"|session[_-]?token|client[_-]?secret|secret[_-]?key"
-    r"|authorization|proxy[_-]?authorization|bearer|auth)(?![A-Za-z0-9_])"
+# R28 Block 48: credential-NARRATION binding — NOT a flat wordlist.  The R27
+# ``_CREDENTIAL_NARRATION_RE`` was a closed set of STRONG words whose mere
+# presence anywhere in a scanned value bound every registered token in it; the
+# review found it bypassable (``passphrase is flightOption1`` / ``login is
+# flightOption1`` / ``pwd is flightOption1`` / ``the passcode was plannerV2`` /
+# ``key: day2`` / ``userpass is day1`` — none of the narration words was in the
+# list, so ``narration=False`` and the registered base stayed accepted).
+#
+# The replacement is SYNTACTIC: a credential-designation word (the STRONG
+# field-name words PLUS the common designation words the review names —
+# key/login/pwd/passphrase/passcode/userpass) binds a registered base ONLY when
+# it is in a FIELD-NAME position, immediately followed by a binding operator
+# (copula ``is/was/...`` or ``:``/``=``/arrow) and a value that carries a
+# registered-base token (``passphrase is flightOption1`` / ``key: day2`` / ``the
+# passcode was plannerV2``).  A designation word alone in prose never binds — the
+# word has to actually designate a value, so a synonym can never silently unbind
+# a registered base (Block 48: 叙述/凭据上下文绑定不得用可绕过的固定词表, 须基于
+# 真实字段名/句法解析).
+_CREDENTIAL_DESIGNATION_ALT = (
+    r"(?:password|passwd|passphrase|passcode|pwd|userpass|login|key|secret"
+    r"|token|credentials?|api[_-]?key|access[_-]?key|session[_-]?key"
+    r"|private[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token"
+    r"|auth[_-]?token|session[_-]?token|client[_-]?secret|secret[_-]?key"
+    r"|authorization|proxy[_-]?authorization|bearer|auth)"
+)
+# A designation word in FIELD-NAME position immediately followed by a binding
+# operator and the bound value.  ``value`` is bounded and stops at a structural
+# delimiter (``,;{}`` / line end) — the registered-base token must sit inside it.
+_CREDENTIAL_NARRATION_ASSIGN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(" + _CREDENTIAL_DESIGNATION_ALT + r")"
+    r"[ \t]*(?:(?:is|was|were|are|equals?|becomes)\b[ \t]*|[:=→]|->|=>)[ \t]*"
+    r"(?P<value>[^\r\n,;{}]{0,120})"
 )
 
 
 def _is_business_identifier_token(token: str) -> bool:
     """True when ``token`` is a REGISTERED TripChord business identifier in its
-    DOCUMENTED schema form (R27 Block 43): a version-marker base must carry its
-    ``V<digits>`` marker (``plannerV2`` / ``tokenizationV1``), an
-    index/selector/counter base must carry a plain ``<digits>``
-    (``flightOption1`` / ``day2`` / ``refreshTokenCount1``).  A token that is
-    not a registered base at all (``qwerTy1`` / ``myFlightHotel1``), or a
-    registered base in the wrong form (``planner1`` / ``provider9`` /
-    ``flightOptionV1``), is NOT a business identifier."""
+    DOCUMENTED schema form.  R28 Block 47: ONLY the version-marker bases
+    (``planner`` / ``provider`` / ``tokenization`` / ``secretariat``) keep the
+    business-identifier exemption, and only as ``baseV<digits>`` (``plannerV2``
+    / ``tokenizationV1``) — the ``V<digits>`` marker is a real, auditable
+    structural feature.  The index/selector/counter bases (``day`` /
+    ``flightOption`` / ``hotelAmenity`` / ``bookingReference`` /
+    ``refreshTokenCount``) are NOT exempted in ANY free-text context: ``day1``
+    / ``flightOption7`` / ``hotelAmenity1`` / ``bookingReference2`` /
+    ``refreshTokenCount2`` alone or wrapped in ``{"summary": …}`` fail closed.
+    The claimed field paths (``plan.day`` / ``plan.flight_option[].option`` /
+    ``plan.hotel_amenity[].amenity`` / ``plan.booking_reference`` /
+    ``oauth.refresh_token_count``) appear 0 times in the actual codebase, so the
+    "documented schema form" exemption has no auditable provenance and every
+    such bare token is treated as a credential-shaped value.  A token that is
+    not a registered base (``qwerTy1`` / ``myFlightHotel1``), or a version base
+    in the wrong form (``planner1`` / ``provider9`` / ``flightOptionV1``), is
+    NOT a business identifier."""
     if re.search(r"[0-9]+[A-Za-z]", token):
         return False
     m = re.match(r"^([A-Za-z]+)([0-9]+)$", token)
@@ -1010,13 +1054,13 @@ def _is_business_identifier_token(token: str) -> bool:
         return False
     prefix, _digits = m.group(1), m.group(2)
     base = prefix[:-1] if prefix[-1] in "Vv" else prefix
-    if base not in _BUSINESS_IDENTIFIER_BASES:
+    if base not in _VERSION_MARKER_BUSINESS_BASES:
+        # R28 Block 47: index/selector/counter bases and unknown bases fail
+        # closed in every free-text context — the exemption is only ever the
+        # version-marker ``baseV<digits>`` form.
         return False
-    if base in _VERSION_MARKER_BUSINESS_BASES:
-        # version-marker base: valid only as ``baseV<digits>``
-        return prefix[-1] in "Vv" and prefix[:-1] == base
-    # index/selector/counter base: valid only as ``base<digits>``
-    return prefix[-1] not in "Vv"
+    # version-marker base: valid only as ``baseV<digits>``
+    return prefix[-1] in "Vv" and prefix[:-1] == base
 
 
 def _is_bare_credential_token(token: str) -> bool:
@@ -1038,13 +1082,15 @@ def _is_bare_credential_token(token: str) -> bool:
       registered and stay credentials.  The version branch is SYMMETRIC with
       the non-version branch (R26 Block 41: ``qwerTyV1`` and ``qwerTy1`` judge
       identically, both fail-closed);
-    * a trailing-digit token whose base is EXACTLY a registered
-      ``_BUSINESS_IDENTIFIER_BASES`` entry (``flightOption1`` /
-      ``hotelAmenity3`` / ``bookingReference1`` / ``refreshTokenCount1`` /
-      ``day2``) is a business identifier — IN ITS DOCUMENTED SCHEMA FORM (R27
-      Block 43): a version-marker base must carry its ``V`` (``plannerV2``),
-      an index/selector/counter base must not (``planner1`` / ``provider9`` /
-      ``flightOptionV1`` fail closed);
+    * a trailing-digit token whose base is EXACTLY a registered version-marker
+      ``_VERSION_MARKER_BUSINESS_BASES`` entry in its documented ``baseV<digits>``
+      form (``plannerV2`` / ``tokenizationV1`` / ``secretariatV1``) is a
+      business identifier (R28 Block 47: ONLY the version-marker bases keep the
+      exemption — the ``V<digits>`` marker is auditable structure).  The
+      index/selector/counter bases (``flightOption1`` / ``hotelAmenity3`` /
+      ``bookingReference1`` / ``refreshTokenCount1`` / ``day2``) fail closed in
+      every free-text context, as do ``planner1`` / ``provider9`` /
+      ``flightOptionV1`` (wrong form);
     * ANY other digit-bearing camelCase token (``qwerTy1`` /
       ``myFlightHotel1`` / ``purpleMonkeyDishwasher1``) fails closed as a
       bare credential shape.
@@ -1059,14 +1105,14 @@ class _BareCredentialScan:
     object: iterates EVERY word-bounded camelCase-and-digit token AND every
     registered all-lowercase base token (``day2`` / ``planner1``) and rejects
     it via :func:`_is_bare_credential_token` (R22 Block 28/32 restore the
-    any-digit contract while keeping business values positive).  R27 Block 43:
-    a registered business identifier is exempted ONLY outside a
-    credential-NARRATION context — any credential-narration word in the same
-    scanned value (``password is flightOption1``) fails the registered token
-    closed."""
+    any-digit contract while keeping business values positive).  R27 Block 43 /
+    R28 Block 48: a registered business identifier is exempted ONLY outside a
+    credential-NARRATION context — a SYNTACTIC designation assignment binding a
+    registered base (``password is flightOption1`` / ``key: day2`` / ``the
+    passcode was plannerV2``) fails the registered token closed."""
 
     def search(self, text: str) -> re.Match[str] | None:
-        narration = _CREDENTIAL_NARRATION_RE.search(text) is not None
+        narration = _credential_narration_binds(text)
         for m in _BARE_CREDENTIAL_TOKEN_RE.finditer(text):
             if _is_bare_credential_token(m.group(0)):
                 return m
@@ -1089,11 +1135,14 @@ def _mask_bare_credential_text(text: str) -> str:
     base token that is (a) NOT a registered business identifier in its
     documented schema form (``qwerTy1`` / ``myFlightHotel1`` / ``planner1`` /
     ``provider9``), or (b) a registered business identifier sitting in a
-    credential-NARRATION context (``password is flightOption1``).  Business
-    identifiers in their documented schema form with no narration
-    (``flightOption1 day2 plannerV2 providerV4`` / ``refreshTokenCount1`` /
-    ``day2``) are left untouched."""
-    narration = _CREDENTIAL_NARRATION_RE.search(text) is not None
+    credential-NARRATION context (``password is flightOption1`` / ``key: day2``
+    / ``the passcode was plannerV2``).  R28 Block 47: the index/selector/counter
+    bases are NOT business identifiers in free text anymore — ``day2`` /
+    ``flightOption1`` / ``refreshTokenCount1`` are masked here too — so only the
+    version-marker business identifiers in their documented schema form with no
+    narration (``plannerV2 providerV4`` / ``tokenizationV1``) are left
+    untouched."""
+    narration = _credential_narration_binds(text)
 
     def repl(m: re.Match[str]) -> str:
         if _is_bare_credential_token(m.group(0)):
@@ -1139,6 +1188,33 @@ _REGISTERED_BASE_HEADER_FIELD_RE = re.compile(
     r"(?im)(?:^|[ \t\r\n,;{}])[ \t]*(?:[A-Za-z0-9_-]+[ \t]*[-_][ \t]*)?"
     r"(?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+)[ \t]*[:=]"
 )
+
+
+# R28 Block 48: the value a credential-designation word must bind — a registered
+# business-identifier base token in ANY digit form (``day2`` / ``flightOption1``
+# / ``plannerV2`` / ``planner1``), word-bounded.  Used by
+# :func:`_credential_narration_binds` to decide whether a designation assignment
+# is a credential-narration context.
+_REGISTERED_BASE_TOKEN_IN_VALUE_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?:" + _REGISTERED_BASE_ALT + r")"
+    r"(?:V[0-9]+|[0-9]+)(?![A-Za-z0-9_])"
+)
+
+
+def _credential_narration_binds(text: str) -> bool:
+    """True when ``text`` puts a registered business-identifier base in a
+    credential-narration context (R28 Block 48): a credential-designation word
+    (``passphrase`` / ``login`` / ``pwd`` / ``passcode`` / ``key`` / ``userpass``
+    / ``password`` / ``token`` …) in FIELD-NAME position, immediately followed by
+    a binding operator (``is`` / ``was`` / ``:`` / ``=`` / arrow), with the
+    bound value carrying a registered-base token (``passphrase is
+    flightOption1`` / ``key: day2`` / ``the passcode was plannerV2``).  The
+    binding is SYNTACTIC — a designation word alone in prose never binds a
+    token, so the R27 flat wordlist cannot be bypassed with a synonym."""
+    for m in _CREDENTIAL_NARRATION_ASSIGN_RE.finditer(text):
+        if _REGISTERED_BASE_TOKEN_IN_VALUE_RE.search(m.group("value")):
+            return True
+    return False
 
 
 def _is_registered_base_key_token(key: str) -> bool:
