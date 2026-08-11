@@ -15819,3 +15819,295 @@ def test_r34_full_chain_producer_seal_consumer_block57_58_both_finals(
                 "live-canary-certified.json.failure.json",
                 credential_field_check=False,
             )
+
+
+def test_r35_block59_credential_designation_structural_closure_fail_closed_both_paths() -> None:
+    """C-122 round-35 Block 59 counter-examples (architect independent review of
+    ab5d918): ``OTP code is plannerV2`` / ``verification code is plannerV2`` /
+    ``验证码是plannerV2`` / ``口令内容是plannerV2`` ACCEPTED both finals and the
+    producer left them unmasked — the designation SEMANTIC CLASS could not name
+    ``OTP`` / ``verification`` / ``验证码`` / ``口令内容`` (they are not
+    credential-designation words), and adding them would be a word-list patch
+    (supervision Block 59: 禁止继续补 head/modifier/CJK 词表或语言样例).  The
+    closure is now STRUCTURAL, not lexical: the free-text business-identifier
+    exemption is bound to the documented structured schema/field paths
+    (``plan.planner_version`` = ``plannerV2`` …), so an ARBITRARY free-text field
+    name binding an EXACT registered base (``<any field name> is plannerV2`` /
+    ``验证码: plannerV2`` / full-width variants) is credential-style assignment
+    narration at an UNBOUND path and fails closed with NO new designation word.
+    The only exempted assignment is the documented version-marker field path
+    (``planner_version = plannerV2`` / ``plan.planner_version = plannerV2`` /
+    ``{"planner_version": "plannerV2"}``) — the auditable schema value position.
+    A base embedded in a phrase (``access is granted to plannerV2 users``) or a
+    bare run with no bind operator (``plannerV2 providerV4``) stays accepted."""
+    b59_reject = (
+        "OTP code is plannerV2",
+        "verification code is plannerV2",
+        "验证码是plannerV2",  # 验证码 verification code
+        "口令内容是plannerV2",  # 口令内容 passphrase-content
+        # same family: other version-marker bases
+        "OTP code is tokenizationV1",
+        "verification code is providerV4",
+        "验证码是 secretariatV1",
+        "口令内容是 tokenizationV1",
+        # bind-op variants (colon / full-width colon / full-width equals)
+        "OTP: plannerV2",
+        "验证码：plannerV2",  # full-width colon
+        "验证码＝plannerV2",  # full-width equals
+        "OTP code = plannerV2",
+        # case variants
+        "otp code is plannerV2",
+        "Verification Code is plannerV2",
+        "OTP CODE = plannerV2",
+        # synonyms of the verification-code designation
+        "verify code is plannerV2",
+        "verification code equals plannerV2",
+        "two factor code is plannerV2",
+        "2fa code is plannerV2",
+        "6 digit code is plannerV2",
+        # JSON-wrapped
+        '{"summary": "OTP code is plannerV2"}',
+        '{"summary": "验证码是plannerV2"}',
+    )
+    for raw in b59_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # Documented structured schema/field-path positives — the auditable value
+    # position the free-text exemption is bound to — plus free-text prose that
+    # is NOT an exact-value assignment stays accepted.
+    for raw in (
+        # documented version-marker field paths (structured positives)
+        '{"planner_version": "plannerV2"}',
+        "plan.planner_version = plannerV2",
+        "planner_version = plannerV2",
+        '{"provider_version": "providerV4"}',
+        # no bind operator, or a base embedded in a phrase, or no base in value
+        "plannerV2 providerV4",
+        "access is granted to plannerV2 users",
+        "pass is required for entry",
+        "the pass was provided yesterday",
+        "the access code is printed on the boarding pass",
+        "口令值是普通业务文本",
+        "pin code is 1234",
+        "access code printed below",
+        "pass phrase value is used here",
+        '{"summary": "tokenizationV1"}',
+        '{"summary": "secretariatV1"}',
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r35_block60_digest_rfc7616_identity_list_empty_members_fail_closed_both_paths() -> None:
+    """C-122 round-35 Block 60 counter-examples (architect independent review of
+    ab5d918): ``service Digest username*=UTF-8''user, algorithm=MD5,
+    response=<32hex>`` ACCEPTED both finals because ``_DIGEST_TOKEN_RE``
+    tokenizes ``username*`` as the parameter NAME (``*`` is an RFC 7230 tchar)
+    and the exact ``"username" in params`` check missed it — the descriptor fell
+    into the algorithm-description exception.  A Digest header with an RFC 7230
+    ``#list`` EMPTY member (``response=<hex>, , foo=bar``) or a trailing comma
+    (``response=<hex>,``) made ``_parse_digest_auth_params`` ``return None``,
+    dropping a REAL response hex parsed before it and ACCEPTING.  RFC 7616
+    extended identity params (``username*`` / ``userhash*``) are now identity
+    params; empty members / trailing commas are skipped while EVERY parsed pair
+    is preserved — any identity param (including ``username*``) with any
+    16/32/64-hex response fails closed order-independently, and quoted-pair /
+    empty-member / trailing-comma never change the result."""
+    h16 = "ab" * 8
+    h32 = "ab" * 16
+    h64 = "ab" * 32
+    b60_reject = (
+        # RFC 7616 extended identity param ``username*`` — the required case
+        f"service Digest username*=UTF-8''user, algorithm=MD5, response={h32}",
+        f"upstream Digest username*=UTF-8''user, algorithm=SHA-256, response={h32}",
+        f"service Digest username*=UTF-8''user, response={h16}",
+        f"service Digest username*=UTF-8''user, response={h64}",
+        # quoted extended value
+        f'service Digest username*="UTF-8\'\'user", algorithm=MD5, response={h32}',
+        # order-independent: identity after the response
+        f"service Digest response={h32}, username*=UTF-8''user, algorithm=MD5",
+        # RFC 7230 #list empty member / trailing comma must not drop the hex
+        f'service Digest username="user", response={h32}, , foo=bar',
+        f'service Digest username="user", response={h32},',
+        f'service Digest username="user", response={h16}, ,',
+        f'origin Digest response={h32}, , foo=bar',
+        f'origin Digest response={h64},',
+        # JSON-escaped raw
+        '{"summary": "service Digest username*=\\"UTF-8\'\'user\\", '
+        f'algorithm=MD5, response={h32}"}}',
+    )
+    for raw in b60_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # No real response hex, or an algorithm-description digest with no request
+    # identity, stays accepted even with an empty member / trailing comma.
+    for raw in (
+        'service Digest username="user", response=xyz, response=xyz',
+        f"client digest algorithm=md5, response={h32}, response=xyz",
+        f"model digest algorithm=md5 response={h32}",
+        "WWW-Authenticate: Digest realm=\"test\", nonce=abc123",
+        "service Digest username*=UTF-8''user, algorithm=MD5, response=xyz",
+        'service Digest username="user", response=xyz,',
+        'origin Digest response=xyz, , foo=bar',
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r35_full_chain_producer_seal_consumer_block59_60_both_finals(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-35 full chain (Block 59 + Block 60): the producer masks a
+    free-text credential-style assignment of an exact registered base (``OTP code
+    is plannerV2`` / ``验证码是plannerV2`` …) and a real Digest credential
+    descriptor with an RFC 7616 ``username*`` identity or a ``#list`` empty
+    member / trailing comma BEFORE the 0600 seal, so the sealed diagnostic is
+    clean and BOTH finals pass; the RAW value still fails BOTH finals (defense
+    in depth).  The documented structured field positives (``planner_version =
+    plannerV2`` / ``plannerV2 providerV4``) survive the seal untouched."""
+    from benchmarks import live_canary_certified as canary
+
+    h16 = "ab" * 8
+    h32 = "ab" * 16
+    h64 = "ab" * 32
+    raw_cases = (
+        "OTP code is plannerV2",
+        "verification code is plannerV2",
+        "验证码是plannerV2",
+        "口令内容是plannerV2",
+        "OTP: plannerV2",
+        f"service Digest username*=UTF-8''user, algorithm=MD5, response={h32}",
+        f'service Digest username="user", response={h16}, ,',
+        f'origin Digest response={h32}, , foo=bar',
+        f'service Digest username="user", response={h64},',
+    )
+    for raw in raw_cases:
+        masked = canary._desensitize(raw)
+        assert masked != raw, "producer must mask the credential"
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r35chain",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # The documented structured positives survive the 0600 seal unchanged and
+    # both finals accept them.
+    for raw in (
+        "planner_version = plannerV2",
+        "plannerV2 providerV4",
+        "access is granted to plannerV2 users",
+    ):
+        masked = canary._desensitize(raw)
+        assert masked == raw, "producer must leave the business field untouched"
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r35chain",
+            tested_sha="9" * 40,
+        )
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )

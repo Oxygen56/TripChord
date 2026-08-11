@@ -758,6 +758,22 @@ _DIGEST_AUTH_KEYWORD_RE = re.compile(r"(?i)digest\b")
 _DIGEST_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _HEX_FULL_RE = re.compile(r"(?i)[0-9a-f]+")
 
+# R35 Block 60: the Digest request-IDENTITY parameter class — ``username`` /
+# ``userhash`` and their RFC 7616 extended-parameter forms (``username*`` /
+# ``userhash*``).  RFC 7616 ``username*=UTF-8''user`` is the extended username;
+# the ``*`` suffix is RFC 5987 parameter-name syntax, so ``_DIGEST_TOKEN_RE``
+# tokenizes ``username*`` as the NAME (``*`` is an RFC 7230 tchar).  The old
+# exact ``"username" in params`` check missed ``username*``, so a descriptor
+# digest carrying ``username*=UTF-8''user`` fell into the algorithm-description
+# exception and ACCEPTED both finals; any identity parameter (including
+# ``username*``) combined with any real 16/32/64-hex ``response`` now fails
+# closed order-independently.
+_DIGEST_IDENTITY_PARAM_RE = re.compile(r"(?i)^(?:username|userhash)\*?$")
+
+
+def _is_digest_identity_params(params: dict[str, list[str]]) -> bool:
+    return any(_DIGEST_IDENTITY_PARAM_RE.match(name) for name in params)
+
 
 class _DigestAuthScan:
     """Structural Digest-auth recognizer (R27 Block 45).  Exposes the same
@@ -812,20 +828,48 @@ class _DigestAuthScan:
         while True:
             while i < n and text[i] in " \t":
                 i += 1
+            # RFC 7230 ``#rule`` (R35 Block 60): an EMPTY element — a trailing
+            # comma (``response=<hex>,``) or a ``response=<hex>, , foo=bar``
+            # empty member between commas — contributes nothing and must NOT
+            # invalidate an already-parsed list.  It used to ``return None``
+            # here, which DROPPED a real response hex parsed before the empty
+            # member and ACCEPTED the header both finals.
+            if i >= n:
+                break
+            if text[i] == ",":
+                i += 1
+                continue
             m = _DIGEST_TOKEN_RE.match(text, i)
             if m is None:
-                return None
+                # Non-token boundary: the list ends here — a space-squashed
+                # narration (``algorithm=md5 response=<hex>``) parses only the
+                # first pair and stays accepted.  Without a real pair this is
+                # not a Digest parameter list at all.
+                if not params:
+                    return None
+                break
             name = m.group(0).lower()
             i = m.end()
             while i < n and text[i] in " \t":
                 i += 1
             if i >= n or text[i] != "=":
-                return None
+                # RFC ``#rule``: a non-empty element that is not ``name=value``
+                # is a malformed member and contributes nothing.  Skip to the
+                # next comma so a real response hex parsed BEFORE it is
+                # preserved rather than the whole list being dropped.
+                while i < n and text[i] != ",":
+                    i += 1
+                if i >= n:
+                    break
+                i += 1
+                continue
             i += 1
             while i < n and text[i] in " \t":
                 i += 1
             if i >= n:
-                return None
+                # A trailing ``name=`` with no value — malformed member,
+                # preserve what was parsed before it.
+                break
             if text[i] == '"' or (
                 text[i] == "\\" and i + 1 < n and text[i + 1] == '"'
             ):
@@ -914,7 +958,7 @@ class _DigestAuthScan:
             if not any(_HEX_FULL_RE.fullmatch(r.strip()) for r in responses):
                 continue
             if binding == "descriptor":
-                if "username" in params or "userhash" in params:
+                if _is_digest_identity_params(params):
                     spans.append((m.start(), end))
                     continue
                 if "algorithm" in params:
@@ -951,7 +995,7 @@ class _DigestAuthScan:
             # and must fail closed (恢复描述符上下文 Digest 任意 hex 拒绝, 含仅
             # response= 无身份参数形态).
             if binding == "descriptor":
-                if "username" in params or "userhash" in params:
+                if _is_digest_identity_params(params):
                     return m
                 if "algorithm" in params:
                     continue
@@ -1496,6 +1540,51 @@ _REGISTERED_BASE_TOKEN_IN_VALUE_RE = re.compile(
     r"(?:V[0-9]+|[0-9]+)(?![A-Za-z0-9_])"
 )
 
+# R35 Block 59: the free-text business-identifier exemption (a registered base
+# like ``plannerV2`` in a VALUE position) is bound to the DOCUMENTED structured
+# schema/field paths — the version-marker fields ``plan.planner_version`` /
+# ``plan.provider_version`` / ``plan.tokenization_version`` /
+# ``plan.secretariat_version`` (R24 Block 36).  A credential-STYLE assignment of
+# an EXACT registered base to an ARBITRARY free-text field name (``OTP code is
+# plannerV2`` / ``verification code is plannerV2`` / ``验证码是plannerV2`` /
+# ``口令内容是plannerV2``) is an assignment narration at an UNBOUND path and
+# fails closed REGARDLESS of the designation word — NO head/modifier/CJK word
+# list is involved (supervision Block 59: 禁止继续补 head/modifier/CJK 词表或语言
+# 样例).  The designation semantic class cannot name a new synonym, so the
+# closure is STRUCTURAL: a bind operator + an EXACT registered-base value, with
+# the surrounding ``"`` quotes a JSON field (``{"planner_version":
+# "plannerV2"}``) tolerated.  ``access is granted to plannerV2 users`` (value is
+# a phrase, not the exact base) and a bare ``plannerV2 providerV4`` run (no bind
+# operator) stay exempt — only the exact-value assignment is a credential.
+_EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_\u4e00-\u9fff])"
+    r"(?:[\w\u4e00-\u9fff][\w\u4e00-\u9fff.-]*?)"
+    r"[ \t]*(?:" + _CREDENTIAL_NARRATION_BIND_OP + r")[ \t]*"
+    r"\"?((?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+))\"?"
+    r"(?![A-Za-z0-9_\u4e00-\u9fff])"
+)
+# R35 Block 59: the DOCUMENTED structured version-marker field assignment — the
+# auditable value position the free-text exemption is bound to.  The field name
+# is DERIVED from the closed ``_VERSION_MARKER_BUSINESS_BASES`` registry
+# (``<base>_version`` = ``planner_version`` / ``provider_version`` /
+# ``tokenization_version`` / ``secretariat_version``), optionally under a dotted
+# path prefix (``plan.planner_version``); the value is the matching
+# version-marker base.  A match here is NOT a credential-narration assignment —
+# it is the documented schema field whose VALUE position the exemption grants.
+_DOCUMENTED_VERSION_FIELD_ASSIGN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_\u4e00-\u9fff])"
+    r"(?:[\w\u4e00-\u9fff.-]*[ \t]*)?"
+    r"(?:"
+    + "|".join(
+        re.escape(base) + r"_version"
+        for base in sorted(_VERSION_MARKER_BUSINESS_BASES, key=len, reverse=True)
+    )
+    + r")"
+    r"[ \t]*(?:" + _CREDENTIAL_NARRATION_BIND_OP + r")[ \t]*"
+    r"\"?((?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+))\"?"
+    r"(?![A-Za-z0-9_\u4e00-\u9fff])"
+)
+
 
 def _credential_narration_binds(text: str) -> bool:
     """True when ``text`` puts a registered business-identifier base in a
@@ -1506,10 +1595,21 @@ def _credential_narration_binds(text: str) -> bool:
     bound value carrying a registered-base token (``passphrase is
     flightOption1`` / ``key: day2`` / ``the passcode was plannerV2``).  The
     binding is SYNTACTIC — a designation word alone in prose never binds a
-    token, so the R27 flat wordlist cannot be bypassed with a synonym."""
+    token, so the R27 flat wordlist cannot be bypassed with a synonym.  R35
+    Block 59: the closure is now STRUCTURAL too — an ARBITRARY free-text field
+    name binding an EXACT registered base (``OTP code is plannerV2`` /
+    ``验证码是plannerV2`` / ``口令内容是plannerV2``) is credential-style narration
+    at an unbound path and fails closed with NO new designation word; the only
+    exempted assignment is the documented version-marker field path
+    (``planner_version = plannerV2`` / ``plan.planner_version = plannerV2``), the
+    auditable schema path the business-identifier exemption is bound to."""
     for m in _CREDENTIAL_NARRATION_ASSIGN_RE.finditer(text):
         if _REGISTERED_BASE_TOKEN_IN_VALUE_RE.search(m.group("value")):
             return True
+    for m in _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE.finditer(text):
+        if _DOCUMENTED_VERSION_FIELD_ASSIGN_RE.search(m.group(0)):
+            continue
+        return True
     return False
 
 
