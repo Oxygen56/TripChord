@@ -8,29 +8,47 @@ regex stops seeing after one level.  This module provides:
 * :func:`iter_json_levels` — a BOUNDED recursive ``json.loads`` walker that
   yields the text at every decoded level (hard depth / node / size caps,
   parse failures surfaced so callers fail closed, never unbounded recursion
-  or waiting);
+  or waiting).  Every dict/list/scalar node AND every object member key counts
+  toward the node cap and is scanned one-by-one (C-122 supervision 00:06
+  要求 A).
 * :func:`bounded_json_mask` — a BOUNDED recursive masker that rebuilds a
   whole-JSON document with every nested JSON-string value masked, and applies
-  a caller-supplied ``mask_level`` to every free-form level.
+  a caller-supplied ``mask_level`` to every free-form level, with an optional
+  ``normalize_patterns`` re-check on a NFKC + casefold + Cf/U+200B-stripped
+  copy (:func:`mask_normalized_spans`, C-122 supervision 00:06 要求 B).
+* :func:`mask_normalized_spans` / :func:`_normalize_for_scan` — the shared
+  Unicode normalization helpers the sensitive key/value detection runs on.
 
-Both are shared by the canary producer
-(``benchmarks/live_canary_certified.py``), the gate consumer and the final
-secret scan (``scripts/run_product_done_gate.py``) so the whole chain has ONE
-consistent redaction semantic.  This module is the single source of truth —
-do NOT re-implement the walker in callers.
+All are shared by the canary producer (``benchmarks/live_canary_certified.py``),
+the gate consumer and the final secret scan
+(``scripts/run_product_done_gate.py``) so the whole chain has ONE consistent
+redaction semantic.  This module is the single source of truth — do NOT
+re-implement the walker in callers.
 """
 
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from enum import Flag, auto
 from typing import Any
 
 # Hard budgets for the recursive JSON walk.  ``_MAX_JSON_SCAN_DEPTH`` covers
 # the mandated level 0-3 double/triple-encoding counter-examples plus structural
 # margin; the node / size caps stop a maliciously huge or fan-out document from
-# forcing unbounded work.  Budget overflow raises ``RecursiveJsonBudgetError``
-# and every caller fails closed.
+# forcing unbounded work.  C-122 supervision 07:29 (gap 1): the SAME budgets
+# also cover the JSON STRUCTURE itself — every dict/list/scalar node counts
+# toward the node cap and the container nesting depth is capped, so a deep /
+# fan-out / 20000-primitive object inside one decoded level fails closed too,
+# never relying on Python's recursion limit.  C-122 supervision 00:06
+# (要求 A): an object MEMBER KEY counts as a node as well (a 20000-member object
+# fails on its keys alone), so a normal/decoded string value AND every
+# object member/key both count toward the budget and are scanned one-by-one.
+# Budget overflow raises ``RecursiveJsonBudgetError`` and every caller fails
+# closed.
 _MAX_JSON_SCAN_DEPTH = 8
 _MAX_JSON_SCAN_NODES = 10_000
 _MAX_JSON_SCAN_CHARS = 2_000_000
@@ -51,9 +69,409 @@ def looks_like_json(text: str) -> bool:
     return bool(stripped) and stripped[0] in "{[\""
 
 
-def iter_json_levels(text: str) -> Iterator[tuple[str, int, bool]]:
+# ============================================================================
+# Typed sensitive-shape pattern registry (C-122 supervision 08:30+08:31 补充 C)
+#
+# ONE registry of every credential SHAPE the redaction chain knows about.  The
+# producer (``benchmarks/live_canary_certified.py``), the gate consumer and the
+# final secret scan (``scripts/run_product_done_gate.py``) all derive their
+# pattern sets from :data:`SHAPE_PATTERN_REGISTRY` — the single source of
+# truth, so a flag change (e.g. AKIA case-insensitivity) lands in all three
+# layers at once and a shape is never defined twice with drift.
+# ============================================================================
+
+
+class PatternScope(Flag):
+    """Where a shape pattern applies.  Flags compose.
+
+    - ``PRODUCER_MASK`` — the canary producer's ``_desensitize`` level mask.
+    - ``CONSUMER_MASK`` — the gate consumer's ``_canary_diag_mask_level``.
+    - ``NORMALIZED`` — ALSO re-searched on the NFKC + casefold + Cf/U+200B-
+      dropped copy (00:06 要求 B), so a full-width / zero-width-obfuscated
+      span is caught even though the ASCII regex stops seeing it on raw text.
+    - ``FINAL_TEXT`` — the final secret scan on a WHOLE free-form diagnostic
+      text level (``.failure.json``), raw and normalized.
+    - ``FINAL_VALUE`` — the final secret scan on an individual DECODED string
+      value (every string value in the shared bounded walker, on BOTH the
+      committed-evidence and the failure-artifact path — 补充 A).
+    """
+
+    PRODUCER_MASK = auto()
+    CONSUMER_MASK = auto()
+    NORMALIZED = auto()
+    FINAL_TEXT = auto()
+    FINAL_VALUE = auto()
+
+
+@dataclass(frozen=True)
+class SensitiveShapePattern:
+    """One credential shape in the single registry.
+
+    ``pattern`` is the compiled regex (flags baked in — e.g. AKIA is
+    case-insensitive so the casefolded normalized copy still matches),
+    ``kind`` is the human error label, and ``scopes`` pins exactly where the
+    shape is applied (producer / consumer mask, normalized re-check, final
+    whole-text scan, final decoded-value scan).
+    """
+
+    name: str
+    pattern: re.Pattern[str]
+    kind: str
+    scopes: PatternScope
+
+
+_SHAPE_PATTERN_WHOLE_HEADER_RE = re.compile(
+    r"(?i)\b(?:proxy[-_ ]authorization|set[-_ ]cookie|x-api-key|api[-_ ]key|"
+    r"authorization|cookie)\b\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
+    r"(?:\\*[\"']?|[\"'])?[^\r\n]+"
+)
+_SHAPE_PATTERN_CANARY_URL_RE = re.compile(
+    r"(?i)https?://[^\s\"'<>)\[\]{}]+"
+)
+_SHAPE_PATTERN_TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9_\-=]{32,}")
+# ``(?i)`` (C-122 supervision 08:30+08:31 缺口②): the NORMALIZED copy is
+# casefolded, so a full-width ``\uff21\uff4b\uff29\uff21`` composes to lowercase
+# ``akia`` — the pattern must be case-insensitive to match it.  This one flag
+# change makes the full-width AKIA counter-example fail closed in all three
+# layers at once.
+_SHAPE_PATTERN_AKIA_RE = re.compile(r"(?i)\bAKIA[0-9A-Z]{16}\b")
+_SHAPE_PATTERN_PREFIX_TOKEN_RE = re.compile(
+    r"(?i)\b(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-|xoxa-|"
+    r"sk-|rk-)[A-Za-z0-9_\-]{6,}"
+)
+_SHAPE_PATTERN_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-.]{4,}")
+_SHAPE_PATTERN_DOTTED_TOKEN_RE = re.compile(
+    r"\b[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]{3,}\b"
+)
+_SHAPE_PATTERN_OPAQUE_KV_RE = re.compile(
+    r"(?i)\b(?:token|password|passwd|secret|apikey|api_key|access_key|"
+    r"secret_key|client_secret|authorization|bearer|private_key|session_key)\b"
+    r"\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
+)
+# Credential FIELD NAMES — the full set a diagnostic / committed artifact must
+# never carry.  Two shapes derive from this single alternation:
+#
+# * ``credential_field`` — the KEY-VALUE form (``session_token=abc``,
+#   ``"Session_token":"abc"``, ``Session_token: abc``), masked WHOLE (name +
+#   value together) by the producer/consumer diagnostic sanitizers and rejected
+#   by the final scan on BOTH the committed-evidence and failure-artifact paths
+#   (C-122 supervision 09:00: an ASCII / full-width ``Session_token=abc`` was
+#   passing all three layers because ``session_token`` was never in the shape
+#   set and the free-text ``=``-form had no field-position guard).
+# * ``CREDENTIAL_FIELD_NAME_PATTERN`` — the KEY-NAME form used by the gate's
+#   committed-evidence key rejector and the structured-JSON key mask.
+#
+# ``bridge_token_present`` / ``candidate_set_sha256`` / ``build_sha256`` are
+# deliberately NOT matched: the token flags and digest fields are legitimate
+# committed contract fields, so a name is only flagged when it is the FULL key
+# or a ``_``/``-``-bounded final component — never a substring of a flag/digest
+# name.  Bare ``token`` / ``cookie`` / ``secret`` / ``browser_token`` are
+# separate (``BARE_CREDENTIAL_FIELD_NAMES`` owns the exact-name key check; the
+# key-VALUE shape includes them as whole keys only, never as a name substring,
+# so ``bridge_token_present`` stays a legitimate flag).
+_CREDENTIAL_FIELD_NAME_ALT = (
+    r"access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|"
+    r"session[_-]?token|api[_-]?key|apikey|client[_-]?secret|"
+    r"secret[_-]?key|private[_-]?key|authorization|set[_-]?cookie|"
+    r"passw(?:ord|d)|session[_-]?id|account[_-]?secret|credentials?"
+)
+BARE_CREDENTIAL_FIELD_NAMES = frozenset(
+    {"token", "cookie", "secret", "browser_token"}
+)
+# Key-NAME form: the credential word must be the full key or a ``_``/``-``-
+# bounded component — ``bridge_token_present`` / ``candidate_set_sha256`` /
+# ``build_sha256`` (token flags and digest fields) never match.
+CREDENTIAL_FIELD_NAME_PATTERN = re.compile(
+    r"(?i)(?:^|[_-])(" + _CREDENTIAL_FIELD_NAME_ALT + r")(?:[_-]?|$)"
+)
+# The credential-field KEY-VALUE shape splits the field names by how strongly
+# they signal a credential (C-122 supervision 09:28 gap 2):
+#
+# * ``_CREDENTIAL_FIELD_STRONG_NAME_ALT`` — names that are NEVER English prose
+#   (``session_token``, ``api_key``, ``client_secret``, bare ``token`` /
+#   ``secret`` …).  Their VALUE is every non-empty character from the first
+#   token character to a clear field boundary (end of line, ``;`` / ``,`` /
+#   ``]`` / ``}``) or the whole diagnostic — so ``Session_token=a`` (1 char),
+#   ``Session_token=ab`` and ``Session_token: abc def`` are all masked WHOLE,
+#   never relying on a 3-char token-run minimum.
+# * ``_CREDENTIAL_FIELD_WEAK_NAME_ALT`` — names that are ALSO ordinary English
+#   words (``authorization``, ``password``, bare ``cookie``).  Their value must
+#   be an actual token-character payload (``{3,}``) so the canary's legitimate
+#   scope-detail PROSE (``pending user authorization: no connected Companion
+#   declares…``) is never flagged as a credential assignment.
+#
+# Both branches keep the ``(?:^|[^A-Za-z0-9_])`` leading guard (a field
+# position — line start / quote / comma / bracket — separate from ordinary
+# prose) and the bare names are only whole keys (``session_token`` matches
+# ``session[_-]?token`` first; the bare ``token`` never matches the ``token``
+# inside ``bridge_token_present`` because a preceding ``_`` is not a
+# field-position guard).  The gate's own redaction marker ``secret=[REDACTED]``
+# starts its value with ``[`` — never a token character — so neither branch
+# flags an already-redacted assignment.
+_CREDENTIAL_FIELD_STRONG_NAME_ALT = (
+    r"access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|"
+    r"session[_-]?token|api[_-]?key|apikey|client[_-]?secret|"
+    r"secret[_-]?key|private[_-]?key|set[_-]?cookie|session[_-]?id|"
+    r"account[_-]?secret|credentials?|browser_token|token|secret"
+)
+_CREDENTIAL_FIELD_WEAK_NAME_ALT = r"authorization|passw(?:ord|d)|cookie"
+_CREDENTIAL_FIELD_STRONG_VALUE = (
+    # The first value character must be a real token character — never a space,
+    # the ``[`` of ``[REDACTED]`` or the ``<`` of ``<url>`` — then the value
+    # runs to a clear field boundary: ``;`` / ``,`` / ``]`` / ``}`` / line end,
+    # or a space that BEGINS another field assignment (``name`` followed by
+    # ``:`` / ``=``).  A space-separated credential value (``Session_token:
+    # abc def``) is covered WHOLE from the first non-empty char, while
+    # ``token=a Session_token: b`` stops the first value at the next field
+    # instead of swallowing its name and leaving ``: b`` residue
+    # (C-122 supervision 09:28 gap B).
+    r"[A-Za-z0-9+/=_\-.]"
+    r"(?:"
+    r"[A-Za-z0-9+/=_\-.]"
+    r"|[ \t](?![A-Za-z0-9_-]+[ \t]*[\"']*[ \t]*[:=])"
+    r")*"
+)
+_SHAPE_PATTERN_CREDENTIAL_FIELD_RE = re.compile(
+    r"(?i)(?:"
+    r"(?:^|[^A-Za-z0-9_])("
+    + _CREDENTIAL_FIELD_STRONG_NAME_ALT
+    + r")(?:[_-]?|$)\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
+    r"(?:\\*[\"']?|[\"'])?"
+    + _CREDENTIAL_FIELD_STRONG_VALUE
+    + r"|"
+    r"(?:^|[^A-Za-z0-9_])("
+    + _CREDENTIAL_FIELD_WEAK_NAME_ALT
+    + r")(?:[_-]?|$)\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
+    r"(?:\\*[\"']?|[\"'])?[A-Za-z0-9+/=_\-.]{3,}"
+    r")"
+)
+
+_S = PatternScope
+# ``FINAL_VALUE`` deliberately EXCLUDES the dotted-token, whole-header and
+# token-run shapes:
+#
+# * dotted-token + whole-header — a committed evidence artifact legitimately
+#   carries dotted domains (``https://flights.ctrip.com/...``,
+#   ``api.icomtours.com/...``) and the field-position auth/cookie value scan
+#   already covers header forms.  The full set — including dotted JWTs — still
+#   applies to FREE-FORM failure diagnostics via ``FINAL_TEXT``, where such
+#   text is a real credential signal.
+# * token-run — a committed evidence artifact legitimately carries 32+ ASCII
+#   runs that are NOT credentials (test names like ``test_booking_planning_
+#   integration``, Chrome extension ids like ``chrome-mv3-<40-hex>``).  A 32+
+#   run in a decoded VALUE is already redacted by the compact desensitizer
+#   (``_desensitize_check_scalar``), the unknown-64-hex rejector owns bare
+#   digests, and the FREE-FORM failure-diagnostic level scan rejects a
+#   token-run via ``FINAL_TEXT`` — so the decoded-value scan is the one place a
+#   token run must NOT be trusted as a leak signal.
+_FINAL_VALUE_SHAPES = (
+    _S.PRODUCER_MASK
+    | _S.CONSUMER_MASK
+    | _S.NORMALIZED
+    | _S.FINAL_TEXT
+    | _S.FINAL_VALUE
+)
+SHAPE_PATTERN_REGISTRY: tuple[SensitiveShapePattern, ...] = (
+    SensitiveShapePattern(
+        name="whole_header",
+        pattern=_SHAPE_PATTERN_WHOLE_HEADER_RE,
+        kind="whole Authorization/Cookie header",
+        scopes=_S.PRODUCER_MASK | _S.CONSUMER_MASK | _S.NORMALIZED | _S.FINAL_TEXT,
+    ),
+    SensitiveShapePattern(
+        name="url",
+        pattern=_SHAPE_PATTERN_CANARY_URL_RE,
+        kind="tracking URL",
+        scopes=_S.PRODUCER_MASK | _S.CONSUMER_MASK | _S.NORMALIZED,
+    ),
+    SensitiveShapePattern(
+        name="token_run",
+        pattern=_SHAPE_PATTERN_TOKEN_RUN_RE,
+        kind="token-shaped run",
+        # Deliberately NOT ``FINAL_VALUE``: committed evidence legitimately
+        # carries 32+ ASCII runs (test names, Chrome extension ids), so a
+        # token run is a leak signal on the FREE-FORM failure-diagnostic level
+        # scan (``FINAL_TEXT``) and in the mask layers, never in a decoded
+        # value of a committed artifact.  See ``_FINAL_VALUE_SHAPES`` above.
+        scopes=(
+            _S.PRODUCER_MASK
+            | _S.CONSUMER_MASK
+            | _S.NORMALIZED
+            | _S.FINAL_TEXT
+        ),
+    ),
+    SensitiveShapePattern(
+        name="akia",
+        pattern=_SHAPE_PATTERN_AKIA_RE,
+        kind="AKIA-style access key",
+        scopes=_FINAL_VALUE_SHAPES,
+    ),
+    SensitiveShapePattern(
+        name="prefix_token",
+        pattern=_SHAPE_PATTERN_PREFIX_TOKEN_RE,
+        kind="prefixed token",
+        scopes=_FINAL_VALUE_SHAPES,
+    ),
+    SensitiveShapePattern(
+        name="bearer",
+        pattern=_SHAPE_PATTERN_BEARER_RE,
+        kind="short Bearer token",
+        scopes=_FINAL_VALUE_SHAPES,
+    ),
+    SensitiveShapePattern(
+        name="dotted_token",
+        pattern=_SHAPE_PATTERN_DOTTED_TOKEN_RE,
+        kind="dotted bearer token",
+        scopes=(
+            _S.PRODUCER_MASK
+            | _S.CONSUMER_MASK
+            | _S.NORMALIZED
+            | _S.FINAL_TEXT
+        ),
+    ),
+    SensitiveShapePattern(
+        name="opaque_kv",
+        pattern=_SHAPE_PATTERN_OPAQUE_KV_RE,
+        kind="short opaque token assignment",
+        scopes=_FINAL_VALUE_SHAPES,
+    ),
+    SensitiveShapePattern(
+        name="credential_field",
+        pattern=_SHAPE_PATTERN_CREDENTIAL_FIELD_RE,
+        kind="credential field name assignment",
+        scopes=_FINAL_VALUE_SHAPES,
+    ),
+)
+
+
+def registry_patterns(*scopes: PatternScope) -> tuple[re.Pattern[str], ...]:
+    """Patterns from the registry whose scope includes ANY of ``scopes``."""
+    wanted = PatternScope(0)
+    for scope in scopes:
+        wanted |= scope
+    return tuple(
+        entry.pattern for entry in SHAPE_PATTERN_REGISTRY if entry.scopes & wanted
+    )
+
+
+def registry_pattern(name: str) -> re.Pattern[str]:
+    """The single registry pattern for ``name`` — what a caller keeps as a
+    named module-level variable so a mask layer can apply per-pattern
+    replacements while still deriving from the ONE registry (补充 C)."""
+    for entry in SHAPE_PATTERN_REGISTRY:
+        if entry.name == name:
+            return entry.pattern
+    raise KeyError(f"no sensitive-shape registry pattern named {name!r}")
+
+
+def registry_shape_pairs(
+    *scopes: PatternScope,
+) -> tuple[tuple[re.Pattern[str], str], ...]:
+    """``(pattern, kind)`` pairs from the registry whose scope includes ANY of
+    ``scopes`` — what the final secret scan iterates to reject a shape."""
+    wanted = PatternScope(0)
+    for scope in scopes:
+        wanted |= scope
+    return tuple(
+        (entry.pattern, entry.kind)
+        for entry in SHAPE_PATTERN_REGISTRY
+        if entry.scopes & wanted
+    )
+
+
+def _normalize_with_offsets(text: str) -> tuple[str, list[int]]:
+    """NFKC + casefold + drop Cf/U+200B, with an offset map for span mapping.
+
+    C-122 supervision 00:06 (要求 B): sensitive key/value DETECTION runs on a
+    NORMALIZED COPY of the text — Unicode NFKC composes full-width forms
+    (``\uff21uthorization`` -> ``Authorization``) and canonical equivalents to their
+    ASCII core, ``casefold`` is the stronger Unicode case fold (so whatever
+    casing is smuggled in compares equal), and Cf (format) category chars plus
+    the zero-width space U+200B are DROPPED so a credential can never hide
+    between its own letters.  Returns ``(normalized, offsets)`` where
+    ``offsets[i]`` is the ORIGINAL character index of normalized char ``i``
+    (dropped Cf chars map to no output char) — a caller that masks can map a
+    span found on the copy back onto the original text.
+    """
+    out: list[str] = []
+    offsets: list[int] = []
+    for i, ch in enumerate(text):
+        if unicodedata.category(ch) == "Cf" or ch == "\u200b":
+            continue
+        for nc in unicodedata.normalize("NFKC", ch).casefold():
+            out.append(nc)
+            offsets.append(i)
+    return "".join(out), offsets
+
+
+def _normalize_for_scan(text: str) -> str:
+    """Normalize ``text`` for sensitive-pattern detection (no offset map)."""
+    return _normalize_with_offsets(text)[0]
+
+
+def mask_normalized_spans(
+    text: str,
+    patterns: tuple[re.Pattern[str], ...],
+    marker: str = "[REDACTED]",
+) -> str:
+    """Mask every span of ``text`` that ``patterns`` match on the NORMALIZED
+    copy (NFKC + casefold, Cf/U+200B dropped), mapping the span back onto the
+    ORIGINAL characters.
+
+    Only the credential-carrying span is masked — the surrounding prose
+    survives — and only a COPY is normalized for detection; the original text
+    is returned with those spans masked.  Used by the producer / consumer mask
+    layers so a full-width / zero-width-obfuscated credential is collapsed even
+    though the ASCII shape regexes stopped seeing it on the raw text.
+    """
+    if not patterns:
+        return text
+    normalized, offsets = _normalize_with_offsets(text)
+    if not normalized:
+        return text
+    spans: list[tuple[int, int]] = []
+    for pattern in patterns:
+        spans.extend(match.span() for match in pattern.finditer(normalized))
+    if not spans:
+        return text
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    result: list[str] = []
+    last = 0
+    for start, end in merged:
+        orig_start = offsets[start]
+        # ``end`` is exclusive on the NORMALIZED copy; the last normalized char
+        # of the span is ``end - 1`` and its original char extends one further.
+        orig_end = offsets[end - 1] + 1
+        result.append(text[last:orig_start])
+        result.append(marker)
+        last = orig_end
+    result.append(text[last:])
+    return "".join(result)
+
+
+def iter_json_levels(
+    text: str,
+    *,
+    on_string_value: Callable[[str], None] | None = None,
+) -> Iterator[tuple[str, int, bool]]:
     """Yield ``(level_text, depth, malformed)`` for ``text`` and every nested
     JSON-string value found by bounded recursive ``json.loads``.
+
+    ``on_string_value`` (C-122 supervision 08:30+08:31 缺口③ / 补充 A): when
+    given, the SAME budget-counting walk calls it for every decoded string
+    value (including the decoded value of a bare JSON string literal at any
+    depth) as it visits that node — AFTER the node budget check for that value,
+    so a document that overflows the budget is rejected at the first over-budget
+    node and the callback never runs past the cap.  The caller's per-value scan
+    (known-needle + shapes) therefore runs INSIDE the one bounded walker; there
+    is no separate unbounded re-parse that could traverse a 20k-string document
+    before the budget fires.  The callback may raise to abort the walk.
 
     * ``level_text`` — the text at one decoding level (the outer document
       first, then each JSON-string value found inside a parsed level, then each
@@ -104,29 +522,85 @@ def iter_json_levels(text: str) -> Iterator[tuple[str, int, bool]]:
             continue
         if isinstance(parsed, str):
             # A bare JSON string literal whose decoded value is itself JSON
-            # text — the next encoding level down.
+            # text — the next encoding level down.  The DECODED value is a
+            # string value too (补充 A: 顶层/嵌套 bare JSON string literal).
+            if on_string_value is not None:
+                on_string_value(parsed)
             if looks_like_json(parsed):
                 stack.append((parsed, depth + 1))
             continue
         # Collect every JSON-string value in the parsed structure so each is
-        # scanned at the next depth down.
-        pending: list[Any] = [parsed]
+        # scanned at the next depth down.  The SAME hard budgets cover the JSON
+        # STRUCTURE itself (C-122 supervision 07:29 gap 1): every dict/list/
+        # scalar node counts toward the node cap and the container nesting depth
+        # is capped, so a fan-out empty-dict, a 20000-primitive list or a
+        # pathologically deep object inside one decoded level fails closed
+        # instead of being traversed without bound.  The walk is an explicit
+        # stack — never Python recursion.
+        pending: list[tuple[Any, int]] = [(parsed, 0)]
         while pending:
-            node = pending.pop()
+            node, struct_depth = pending.pop()
+            if struct_depth > _MAX_JSON_SCAN_DEPTH:
+                raise RecursiveJsonBudgetError(
+                    "JSON structural depth budget exceeded"
+                )
+            budget_nodes += 1
+            if budget_nodes > _MAX_JSON_SCAN_NODES:
+                raise RecursiveJsonBudgetError("JSON scan node budget exceeded")
             if isinstance(node, dict):
-                for value in node.values():
+                for _key, value in node.items():
+                    # The object MEMBER KEY counts as a node and is scanned
+                    # individually (C-122 supervision 00:06 要求 A) — a 20000-
+                    # member object fails closed on its keys alone, and every
+                    # key is subject to the caller's normalized key scan.
+                    budget_nodes += 1
+                    if budget_nodes > _MAX_JSON_SCAN_NODES:
+                        raise RecursiveJsonBudgetError(
+                            "JSON scan node budget exceeded"
+                        )
                     if isinstance(value, str):
+                        # A normal/decoded STRING VALUE counts as a node too
+                        # (00:06 要求 A) — a 20000-string document fails closed
+                        # whether the strings are JSON text (scanned at the next
+                        # decoded level) or plain text.
+                        budget_nodes += 1
+                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                            raise RecursiveJsonBudgetError(
+                                "JSON scan node budget exceeded"
+                            )
+                        if on_string_value is not None:
+                            on_string_value(value)
                         if looks_like_json(value):
                             stack.append((value, depth + 1))
                     elif isinstance(value, (dict, list)):
-                        pending.append(value)
+                        pending.append((value, struct_depth + 1))
+                    else:
+                        budget_nodes += 1
+                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                            raise RecursiveJsonBudgetError(
+                                "JSON scan node budget exceeded"
+                            )
             elif isinstance(node, list):
                 for item in node:
                     if isinstance(item, str):
+                        # Same string-VALUE node accounting as the dict branch.
+                        budget_nodes += 1
+                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                            raise RecursiveJsonBudgetError(
+                                "JSON scan node budget exceeded"
+                            )
+                        if on_string_value is not None:
+                            on_string_value(item)
                         if looks_like_json(item):
                             stack.append((item, depth + 1))
                     elif isinstance(item, (dict, list)):
-                        pending.append(item)
+                        pending.append((item, struct_depth + 1))
+                    else:
+                        budget_nodes += 1
+                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                            raise RecursiveJsonBudgetError(
+                                "JSON scan node budget exceeded"
+                            )
 
 
 def bounded_json_mask(
@@ -134,6 +608,8 @@ def bounded_json_mask(
     *,
     mask_level: Callable[[str], str],
     marker: str = "[REDACTED]",
+    normalize_patterns: tuple[re.Pattern[str], ...] = (),
+    key_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> str:
     """Bounded recursive JSON / JSON-string masking.
 
@@ -145,27 +621,44 @@ def bounded_json_mask(
     parse (a truncated / obfuscated JSON attempt) is masked whole to
     ``marker`` — parse failures fail closed.  Budget overflow also fails closed
     to ``marker``.
+
+    ``normalize_patterns`` (C-122 supervision 00:06 要求 B): when given, every
+    ``mask_level`` result is ALSO re-checked on a NORMALIZED copy (NFKC +
+    casefold, Cf/U+200B dropped) via :func:`mask_normalized_spans`, so a
+    full-width / zero-width-obfuscated credential span the ASCII shape regexes
+    stop seeing is still masked — only a copy is normalized, the artifact text
+    is returned with those spans masked.
+
+    ``key_patterns`` (C-122 supervision 09:00): when given, every STRUCTURED
+    JSON dict KEY is also checked (on the raw key and its NORMALIZED copy, plus
+    the exact ``BARE_CREDENTIAL_FIELD_NAMES`` names) and a credential field
+    NAME is masked WHOLE with the value — the key becomes ``marker`` and the
+    value still runs the normal mask, so ``{"Session_token":"abc"}`` is
+    rebuilt as ``{"[REDACTED]":"[REDACTED]"}`` (valid JSON, field name gone)
+    instead of leaking the key that the free-form ``mask_level`` never sees.
+    The rebuild stays valid JSON so the gate's own malformed-nested-JSON scan
+    never flags the sanitized artifact.
     """
     budget_nodes = 0
     budget_chars = 0
 
-    def mask_value(node: Any, depth: int) -> Any:
-        nonlocal budget_nodes, budget_chars
-        if isinstance(node, dict):
-            budget_nodes += 1
-            if budget_nodes > _MAX_JSON_SCAN_NODES:
-                raise RecursiveJsonBudgetError("JSON mask node budget exceeded")
-            return {
-                key: mask_value(value, depth + 1) for key, value in node.items()
-            }
-        if isinstance(node, list):
-            budget_nodes += 1
-            if budget_nodes > _MAX_JSON_SCAN_NODES:
-                raise RecursiveJsonBudgetError("JSON mask node budget exceeded")
-            return [mask_value(item, depth + 1) for item in node]
-        if isinstance(node, str):
-            return mask_text(node, depth + 1)
-        return node
+    def apply_mask_level(level_text: str) -> str:
+        masked = mask_level(level_text)
+        if normalize_patterns:
+            return mask_normalized_spans(masked, normalize_patterns, marker=marker)
+        return masked
+
+    def is_credential_key(key: object) -> bool:
+        if not isinstance(key, str):
+            return False
+        if key.strip().lower() in BARE_CREDENTIAL_FIELD_NAMES:
+            return True
+        if any(p.search(key) for p in key_patterns):
+            return True
+        norm = _normalize_for_scan(key)
+        if norm.strip().lower() in BARE_CREDENTIAL_FIELD_NAMES:
+            return True
+        return norm != key and any(p.search(norm) for p in key_patterns)
 
     def mask_text(current: str, depth: int) -> str:
         nonlocal budget_nodes, budget_chars
@@ -178,7 +671,7 @@ def bounded_json_mask(
         if budget_chars > _MAX_JSON_SCAN_CHARS:
             raise RecursiveJsonBudgetError("JSON mask size budget exceeded")
         if not looks_like_json(current):
-            return mask_level(current)
+            return apply_mask_level(current)
         try:
             parsed = json.loads(current)
         except (json.JSONDecodeError, ValueError, RecursionError):
@@ -188,13 +681,107 @@ def bounded_json_mask(
         if isinstance(parsed, str):
             return json.dumps(mask_text(parsed, depth + 1), ensure_ascii=False)
         if isinstance(parsed, (dict, list)):
-            return json.dumps(mask_value(parsed, depth), ensure_ascii=False)
-        return mask_level(current)
+            return json.dumps(
+                mask_structure(parsed, depth), ensure_ascii=False
+            )
+        return apply_mask_level(current)
+
+    def mask_structure(parsed: Any, level_depth: int) -> Any:
+        """Iteratively rebuild ``parsed`` with every nested JSON-string value
+        masked.  The SAME hard budgets cover the JSON STRUCTURE itself
+        (C-122 supervision 07:29 gap 1): every dict/list/scalar node counts
+        toward the node cap and the container nesting depth is capped, so a
+        fan-out empty-dict, a 20000-primitive list or a pathologically deep
+        object fails closed instead of relying on Python's recursion limit.
+        The rebuild is an explicit stack with ``finalize`` markers — never
+        Python recursion."""
+        nonlocal budget_nodes, budget_chars
+        root_slot: dict[str, Any] = {"__out__": None}
+        # Work item: ("value", node, container, key, struct_depth) masks
+        # ``node`` into ``container[key]``; ("finalize", built, container,
+        # key, struct_depth) commits an already-built container.
+        stack: list[tuple[str, Any, Any, Any, int]] = [
+            ("value", parsed, root_slot, "__out__", 0)
+        ]
+        while stack:
+            kind, node, container, key, struct_depth = stack.pop()
+            if kind == "finalize":
+                container[key] = node
+                continue
+            if struct_depth > _MAX_JSON_SCAN_DEPTH:
+                raise RecursiveJsonBudgetError(
+                    "JSON mask structural depth budget exceeded"
+                )
+            budget_nodes += 1
+            if budget_nodes > _MAX_JSON_SCAN_NODES:
+                raise RecursiveJsonBudgetError("JSON mask node budget exceeded")
+            if isinstance(node, dict):
+                out: dict[str, Any] = {}
+                stack.append(("finalize", out, container, key, struct_depth))
+                for k, v in node.items():
+                    # The object MEMBER KEY counts as a node (C-122 supervision
+                    # 00:06 要求 A) — a 20000-member object fails closed on its
+                    # keys alone, matching the scan-layer counting.
+                    budget_nodes += 1
+                    if budget_nodes > _MAX_JSON_SCAN_NODES:
+                        raise RecursiveJsonBudgetError(
+                            "JSON mask node budget exceeded"
+                        )
+                    if key_patterns and is_credential_key(k):
+                        # A credential FIELD NAME in a structured JSON key is
+                        # masked WHOLE (name + value): the key AND the value
+                        # both collapse to the marker, so a ``Session_token`` /
+                        # full-width ``\uff33\uff45\uff53\uff53\uff49\uff4f\uff4e
+# \uff3f\uff54\uff4f\uff4b\uff45\uff4e`` key and its
+                        # payload can never survive into the rebuilt artifact
+                        # while the JSON stays valid (C-122 supervision 09:00
+                        # gap 2: a cookie value ``a=b`` is not itself a
+                        # credential SHAPE, so the value is masked by policy,
+                        # not by shape — ``{"[REDACTED]": "[REDACTED]"}``).
+                        out[marker] = marker
+                    elif isinstance(v, str):
+                        out[k] = mask_text(v, level_depth + 1)
+                    elif isinstance(v, (dict, list)):
+                        stack.append(
+                            ("value", v, out, k, struct_depth + 1)
+                        )
+                    else:
+                        budget_nodes += 1
+                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                            raise RecursiveJsonBudgetError(
+                                "JSON mask node budget exceeded"
+                            )
+                        out[k] = v
+            elif isinstance(node, list):
+                out_list: list[Any] = [None] * len(node)
+                stack.append(
+                    ("finalize", out_list, container, key, struct_depth)
+                )
+                for i, item in enumerate(node):
+                    if isinstance(item, str):
+                        out_list[i] = mask_text(item, level_depth + 1)
+                    elif isinstance(item, (dict, list)):
+                        stack.append(
+                            ("value", item, out_list, i, struct_depth + 1)
+                        )
+                    else:
+                        budget_nodes += 1
+                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                            raise RecursiveJsonBudgetError(
+                                "JSON mask node budget exceeded"
+                            )
+                        out_list[i] = item
+            else:
+                # A scalar work item is never pushed (scalars are handled
+                # inline above); keep the branch for structural completeness.
+                container[key] = node
+        return root_slot["__out__"]
 
     try:
         rebuilt = mask_text(text, 0)
     except RecursiveJsonBudgetError:
         return marker
     # Final sweep: a JSON key/value pair reconstructed by the walker is
-    # collapsed name-and-value together exactly like the raw scan does.
-    return mask_level(rebuilt)
+    # collapsed name-and-value together exactly like the raw scan does (and,
+    # with ``normalize_patterns``, re-checked on the normalized copy).
+    return apply_mask_level(rebuilt)

@@ -41,7 +41,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -49,9 +49,18 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from tripchord._secret_redact import (
+    BARE_CREDENTIAL_FIELD_NAMES,
+    CREDENTIAL_FIELD_NAME_PATTERN,
+    PatternScope,
     RecursiveJsonBudgetError,
+    _normalize_for_scan,
     bounded_json_mask,
     iter_json_levels,
+    looks_like_json,
+    mask_normalized_spans,
+    registry_pattern,
+    registry_patterns,
+    registry_shape_pairs,
 )
 from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
 from tripchord.planning.frozen_graph import (
@@ -858,47 +867,57 @@ _PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 # / ``build_sha256`` are NOT matched: the token flags and digest fields are
 # legitimate committed contract fields, so the regex requires the credential
 # word to be a full key (or a ``_``/``-``-bounded final component), never a
-# substring of a digest/flag name.
-_CREDENTIAL_FIELD_RE = re.compile(
-    r"(?i)(?:^|[_-])("
-    r"access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|"
-    r"session[_-]?token|api[_-]?key|apikey|client[_-]?secret|"
-    r"secret[_-]?key|private[_-]?key|authorization|set[_-]?cookie|"
-    r"passw(?:ord|d)|session[_-]?id|account[_-]?secret|credentials?)"
-    r"(?:[_-]?|$)"
-)
+# substring of a digest/flag name.  Derived from the SHARED registry
+# (``tripchord._secret_redact.CREDENTIAL_FIELD_NAME_PATTERN``) so the key-name
+# rejector, the producer/consumer structured-key mask and the ``credential_field``
+# key-VALUE shape all speak the same field-name contract (C-122 supervision
+# 09:00).
+_CREDENTIAL_FIELD_RE = CREDENTIAL_FIELD_NAME_PATTERN
+_BARE_CREDENTIAL_FIELD_NAMES = BARE_CREDENTIAL_FIELD_NAMES
 
-# BARE credential field names that must never appear in a committed evidence
-# artifact, checked by EXACT match (C-122 round-18 gate-4): ``token`` /
-# ``cookie`` / ``secret`` / ``browser_token`` are leak-shaped even when their
-# value is hash-shaped.  The regex above deliberately avoids these bare words so
-# legitimate flag/binding names (``bridge_token_present``,
-# ``candidate_set_sha256``) are not false-positives; the exact-name check below
-# closes that gap without reopening it.
-_BARE_CREDENTIAL_FIELD_NAMES = frozenset(
-    {"token", "cookie", "secret", "browser_token"}
-)
-
-# The positive field-path whitelist of 64-hex content-addressable bindings this
-# gate itself produces in COMMITTED artifacts.  C-122 round-18 HG-F: a key merely
-# NAMED ``*_sha256`` / ``*_hash`` / ``*_digest`` / ``*_fingerprint`` is no longer
-# enough — the walker trusts a 64-hex VALUE only at one of these EXACT normalized
-# JSON paths (array indices normalize to ``[]``).  Every path below is produced by
-# this gate's own manifest / layer-5 compact / layer-6 compact builders; a 64-hex
-# under any other path — including a well-named digest key inside an artifact this
-# gate does not produce — is an opaque token-shaped secret (C-122 round-18 gate-4).
-_DIGEST_BINDING_PATHS: frozenset[str] = frozenset(
+# A 64-hex VALUE is trusted only at one of these EXACT committed JSON paths.
+# C-122 round-18 HG-F: a key merely NAMED ``*_sha256`` / ``*_hash`` /
+# ``*_digest`` / ``*_fingerprint`` is no longer enough.  C-122 supervision
+# 09:28 (gap 1): each path is a TYPED tuple — dict-key segments and array
+# markers (``None``) are SEPARATE, matched by exact type sequence, never a
+# string concatenation.  A malicious key that literally contains the path
+# delimiter text (``{"files[].sha256": "<64hex>"}``, ``{"files[]": {...}}``,
+# ``{"done_gate.checks[].evidence.candidate_set_sha256": "<64hex>"}``) becomes a
+# DIFFERENT typed path — a single ``("files[].sha256",)`` key segment or a
+# literal ``"files[]"`` key — and can never hit the whitelist.  Every tuple
+# below is produced by this gate's own manifest / layer-5 compact / layer-6
+# compact builders; a 64-hex under any other path — including a well-named
+# digest key inside an artifact this gate does not produce — is an opaque
+# token-shaped secret (C-122 round-18 gate-4).
+_ARRAY_MARKER: str | None = None  # a list-index position in a typed digest path
+_DIGEST_BINDING_PATHS: frozenset[tuple[str | None, ...]] = frozenset(
     {
         # Evidence manifest: the per-file content hash and the layer-5 canary
         # Companion build fingerprint.
-        "files[].sha256",
-        "layer_verdicts.5_real_canary.companion.build_sha256",
+        ("files", _ARRAY_MARKER, "sha256"),
+        (
+            "layer_verdicts",
+            "5_real_canary",
+            "companion",
+            "build_sha256",
+        ),
         # Layer-5 compact: the Companion build fingerprint in companion_status.
-        "companion_status.companions[].build_sha256",
+        (
+            "companion_status",
+            "companions",
+            _ARRAY_MARKER,
+            "build_sha256",
+        ),
         # Raw layer-5 canary (a committable live-* artifact in a repo without the
         # production ignore rule): the Companion's build fingerprint as carried by
         # the browser-bridge payload.
-        "companion_status.companions[].build_identity.build_sha256",
+        (
+            "companion_status",
+            "companions",
+            _ARRAY_MARKER,
+            "build_identity",
+            "build_sha256",
+        ),
         # Layer-6 compact: candidate-set / scenario bindings, runtime-provenance
         # digests, the bridge-state lease hashes, the raw-original hash and the
         # raw request payload's own SHA (``api_payload_sha256`` — the checkpoint
@@ -906,31 +925,118 @@ _DIGEST_BINDING_PATHS: frozenset[str] = frozenset(
         # Block 3).  A real compact carries it at this exact committed path, so
         # an unlisted path would make the secret scan reject every genuine
         # publish.
-        "api_payload_candidate_set_sha256",
-        "api_payload_sha256",
-        "scenario_sha256",
-        "runtime_before_run.runtime_provenance.dependency_lock_sha256",
-        "runtime_before_run.runtime_provenance.live_system_source_sha256",
-        "bridge_state_lease_preflight.sha256",
-        "bridge_state_lease_postcheck.sha256",
-        "raw_evidence.sha256",
-        "done_gate.checks[].evidence.candidate_set_sha256",
+        ("api_payload_candidate_set_sha256",),
+        ("api_payload_sha256",),
+        ("scenario_sha256",),
+        (
+            "runtime_before_run",
+            "runtime_provenance",
+            "dependency_lock_sha256",
+        ),
+        (
+            "runtime_before_run",
+            "runtime_provenance",
+            "live_system_source_sha256",
+        ),
+        ("bridge_state_lease_preflight", "sha256"),
+        ("bridge_state_lease_postcheck", "sha256"),
+        ("raw_evidence", "sha256"),
+        (
+            "done_gate",
+            "checks",
+            _ARRAY_MARKER,
+            "evidence",
+            "candidate_set_sha256",
+        ),
         # C-122 Fix 4: the desensitized checkpoint binding the compact carries —
         # the ordered per-checkpoint digest chain, the chain digest, the request
         # identity and each binding's content hashes.  Every value here is a
         # recomputable content-addressable binding the layer-6 validator
         # re-verifies from the carried fields (chain recompute / date window /
         # request identity / per-checkpoint content), so each is trusted at its
-        # exact committed path.
-        "done_gate.checks[].evidence.checkpoint_binding.ordered_checkpoint_sha256[]",
-        "done_gate.checks[].evidence.checkpoint_binding.checkpoint_chain_sha256",
-        "done_gate.checks[].evidence.checkpoint_binding.request_sha256",
-        "done_gate.checks[].evidence.checkpoint_binding.bindings[].checkpoint_sha256",
-        "done_gate.checks[].evidence.checkpoint_binding.bindings[].request_sha256",
-        "done_gate.checks[].evidence.checkpoint_binding.bindings[].run_summary_sha256",
-        "done_gate.checks[].evidence.checkpoint_binding.bindings[].query_task_ids_sha256",
+        # exact committed path.  ``ordered_checkpoint_sha256`` is a list of
+        # plain 64-hex strings, hence its trailing ``_ARRAY_MARKER``.
+        (
+            "done_gate",
+            "checks",
+            _ARRAY_MARKER,
+            "evidence",
+            "checkpoint_binding",
+            "ordered_checkpoint_sha256",
+            _ARRAY_MARKER,
+        ),
+        (
+            "done_gate",
+            "checks",
+            _ARRAY_MARKER,
+            "evidence",
+            "checkpoint_binding",
+            "checkpoint_chain_sha256",
+        ),
+        (
+            "done_gate",
+            "checks",
+            _ARRAY_MARKER,
+            "evidence",
+            "checkpoint_binding",
+            "request_sha256",
+        ),
+        (
+            "done_gate",
+            "checks",
+            _ARRAY_MARKER,
+            "evidence",
+            "checkpoint_binding",
+            "bindings",
+            _ARRAY_MARKER,
+            "checkpoint_sha256",
+        ),
+        (
+            "done_gate",
+            "checks",
+            _ARRAY_MARKER,
+            "evidence",
+            "checkpoint_binding",
+            "bindings",
+            _ARRAY_MARKER,
+            "request_sha256",
+        ),
+        (
+            "done_gate",
+            "checks",
+            _ARRAY_MARKER,
+            "evidence",
+            "checkpoint_binding",
+            "bindings",
+            _ARRAY_MARKER,
+            "run_summary_sha256",
+        ),
+        (
+            "done_gate",
+            "checks",
+            _ARRAY_MARKER,
+            "evidence",
+            "checkpoint_binding",
+            "bindings",
+            _ARRAY_MARKER,
+            "query_task_ids_sha256",
+        ),
     }
 )
+
+
+def _format_typed_path(path: tuple[str | None, ...]) -> str:
+    """Render a typed digest path back to the dotted string form
+    (``("files", None, "sha256")`` -> ``files[].sha256``) for error messages."""
+    out: list[str] = []
+    for i, seg in enumerate(path):
+        if seg is None:
+            out.append("[]")
+        else:
+            if i > 0:
+                out.append(".")
+            out.append(seg)
+    return "".join(out)
 
 # A 32-128 char pure-hex span is a recomputable digest (git SHA, sha256), never
 # a phone number or a numeric account identifier.  The pattern scan masks these
@@ -943,10 +1049,46 @@ _HEX_HASH_SPAN_RE = re.compile(r"[0-9a-fA-F]{32,128}")
 def _mask_hex_hash_spans(text: str) -> str:
     """Return ``text`` with every 32-128 char pure-hex span replaced by a
     non-digit placeholder, so no computed digest can read as a phone number or
-    account identifier to the pattern scan."""
+    account identifier to the pattern scan.
+
+    C-122 supervision 08:30+08:31 缺口①: the placeholder is ``~`` — NOT in the
+    token-run charset (``[A-Za-z0-9_\\-=]``) — so a masked digest can never be
+    re-flagged as a 32+ token-shaped run by the failure-diagnostic shape scan.
+    """
     return _HEX_HASH_SPAN_RE.sub(
-        lambda match: "h" * (match.end() - match.start()), text
+        lambda match: "~" * (match.end() - match.start()), text
     )
+
+
+def _reject_malformed_top_level_json(data: bytes, label: str, name: str) -> None:
+    """C-122 supervision 07:29 (gap 2): a ``.json`` evidence artifact — or any
+    artifact scanned with ``credential_field_check=True`` — whose TOP-LEVEL text
+    is UTF-8, LOOKS like JSON and yet does NOT parse as JSON must fail closed.
+
+    A truncated / unicode-escape-obfuscated JSON attempt at the TOP level
+    (``{"Authorization": "Basic a` or a cut ``{"\\u12`` key) could hide a
+    credential the byte scan no longer sees as one document: the per-level
+    walker only flags malformed NESTED levels (``depth >= 1``) and the top-level
+    schema check runs on a DIFFERENT parse.  Rejecting the top-level parse
+    failure here closes that hole.  Non-JSON content keeps the original contract
+    — binary (not UTF-8 decodable), empty artifacts and plain non-JSON text
+    (a PNG placeholder, a prose note) are NOT malformed-JSON attempts and pass
+    through to the byte + pattern scan, exactly like any non-JSON file.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return  # binary, not a JSON artifact; original contract
+    if not text.strip():
+        return  # empty artifact — no JSON parse to fail
+    if not looks_like_json(text):
+        return  # plain non-JSON text; byte + pattern scan still applies
+    try:
+        json.loads(text)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        raise GateStateChangedError(
+            f"secret leak: malformed top-level JSON in {label} file {name}"
+        ) from None
 
 
 def _reject_credential_field_names(data: bytes, label: str, name: str) -> None:
@@ -994,12 +1136,22 @@ def _reject_credential_field_names(data: bytes, label: str, name: str) -> None:
                 node = stack.pop()
                 if isinstance(node, dict):
                     for key, value in node.items():
+                        # C-122 supervision 00:06 (要求 B): the key is matched on
+                        # BOTH the raw name and the NORMALIZED copy (NFKC +
+                        # casefold, Cf/U+200B dropped) — a full-width
+                        # ``Session_token`` (NFKC-composed) or a zero-width
+                        # ``Author\u200bization`` is the same credential field
+                        # name as its ASCII form and fails closed too.  Only a
+                        # COPY is normalized; the committed key text is
+                        # untouched.
+                        if not isinstance(key, str):
+                            continue
+                        norm_key = _normalize_for_scan(key)
                         if (
-                            isinstance(key, str)
-                            and (
-                                _CREDENTIAL_FIELD_RE.search(key)
-                                or key.strip().lower() in _BARE_CREDENTIAL_FIELD_NAMES
-                            )
+                            _CREDENTIAL_FIELD_RE.search(key)
+                            or key.strip().lower() in _BARE_CREDENTIAL_FIELD_NAMES
+                            or _CREDENTIAL_FIELD_RE.search(norm_key)
+                            or norm_key.strip() in _BARE_CREDENTIAL_FIELD_NAMES
                         ):
                             raise GateStateChangedError(
                                 f"secret leak: credential field name {key!r} in "
@@ -1017,6 +1169,53 @@ def _reject_credential_field_names(data: bytes, label: str, name: str) -> None:
         ) from None
 
 
+def _check_unknown_64hex(
+    value: str,
+    path: tuple[str | None, ...],
+    depth: int,
+    label: str,
+    name: str,
+) -> None:
+    """Fail closed when ``value`` is a 64-hex outside the typed digest whitelist.
+
+    C-122 supervision 08:30+08:31 缺口①: the value is also checked on its
+    NORMALIZED copy (NFKC + casefold, Cf/U+200B dropped) — an uppercase /
+    full-width / zero-width-obfuscated 64-hex composes to lowercase hex and is
+    the same unknown digest.
+
+    C-122 supervision 09:00 (gap 1): a decoded NESTED level's path resets to
+    ``()`` inside this walk, so a 64-hex smuggled through a JSON-string value
+    (``{"summary": "{\"files\":[{\"sha256\": \"aHEX64\"}]}"}``) would land at
+    the top-level whitelisted path ``("files", None, "sha256")`` and be
+    accepted -- but its REAL path is the parent context
+    (``summary::<decoded>.files[].sha256``), which the whitelist does NOT
+    cover.  A nested decoded string can never be a committed digest binding, so
+    EVERY 64-hex there is an opaque token-shaped secret.
+
+    At the TOP level the whitelist pass requires RAW canonical lowercase ASCII
+    AND an exact typed committed path -- an obfuscated (uppercase / full-width
+    / zero-width) 64-hex is never trusted, even under a whitelisted key.  The
+    typed-path comparison is EXACT (C-122 supervision 09:28 gap 1): a key that
+    merely CONTAINS the delimiter text (``{"files[].sha256": ...}``,
+    ``{"files[]": {"sha256": ...}}``) is a DIFFERENT typed path and can never
+    hit the whitelist.
+    """
+    raw_hex = _SHA256_HEX_RE.fullmatch(value) is not None
+    norm_hex = _SHA256_HEX_RE.fullmatch(_normalize_for_scan(value)) is not None
+    if not (raw_hex or norm_hex):
+        return
+    if depth >= 1:
+        raise GateStateChangedError(
+            f"secret leak: unknown 64-hex value in decoded "
+            f"nested level of {label} file {name}"
+        )
+    if not raw_hex or path not in _DIGEST_BINDING_PATHS:
+        raise GateStateChangedError(
+            f"secret leak: unknown 64-hex value under field "
+            f"path {_format_typed_path(path)!r} in {label} file {name}"
+        )
+
+
 def _reject_unknown_64hex_values(data: bytes, label: str, name: str) -> None:
     """Fail closed when a committed JSON artifact carries an unknown 64-hex
     value — a string of exactly 64 lowercase hex OUTSIDE the positive
@@ -1031,6 +1230,13 @@ def _reject_unknown_64hex_values(data: bytes, label: str, name: str) -> None:
     is a leak too.  Only committed JSON artifacts are walked; the compact
     desensitizer already redacts 64-hex outside hash positions, so this is the
     second line of defence for the verbatim-copied evidence files.
+
+    C-122 supervision 09:28 (gap 1): the whitelist paths are TYPED tuples —
+    dict-key segments and array markers are separate, matched by EXACT type
+    sequence, never a string concatenation.  A key that merely contains the
+    delimiter text (``{"files[].sha256": ...}``, ``{"files[]": {"sha256": ...}}``,
+    ``{"done_gate.checks[].evidence.candidate_set_sha256": ...}``) forms a
+    DIFFERENT typed path and is rejected.
 
     C-122 supervision 06:58: the walk is BOUNDED-RECURSIVE over JSON-string
     values too, and a structural-start string that does not parse (a truncated /
@@ -1053,27 +1259,48 @@ def _reject_unknown_64hex_values(data: bytes, label: str, name: str) -> None:
                 parsed = json.loads(level_text)
             except ValueError:
                 continue  # not JSON text at this level; the pattern scan applies
-            stack: list[tuple[Any, str]] = [(parsed, "")]
+            stack: list[tuple[Any, tuple[str | None, ...]]] = [(parsed, ())]
             while stack:
                 node, path = stack.pop()
                 if isinstance(node, dict):
                     for key, value in node.items():
                         seg = str(key).strip().lower().replace("-", "_")
-                        child_path = f"{path}.{seg}" if path else seg
-                        if isinstance(value, str) and _SHA256_HEX_RE.fullmatch(value):
-                            if child_path not in _DIGEST_BINDING_PATHS:
-                                raise GateStateChangedError(
-                                    f"secret leak: unknown 64-hex value under field "
-                                    f"path {child_path!r} in {label} file {name}"
-                                )
-                        elif isinstance(value, (dict, list)):
+                        child_path = (*path, seg)
+                        if isinstance(value, str):
+                            _check_unknown_64hex(
+                                value, child_path, depth, label, name
+                            )
+                        elif isinstance(value, list):
+                            # A list under a whitelisted key — e.g.
+                            # ``ordered_checkpoint_sha256`` carries a list of
+                            # plain 64-hex strings, so each string item is
+                            # checked at ``path + <array>`` (the trailing
+                            # ``_ARRAY_MARKER`` whitelist entries).  Non-string
+                            # items are walked normally.
+                            for item in value:
+                                if isinstance(item, str):
+                                    _check_unknown_64hex(
+                                        item,
+                                        (*child_path, _ARRAY_MARKER),
+                                        depth,
+                                        label,
+                                        name,
+                                    )
+                                elif isinstance(item, (dict, list)):
+                                    stack.append(
+                                        (item, (*child_path, _ARRAY_MARKER))
+                                    )
+                        elif isinstance(value, dict):
                             stack.append((value, child_path))
                 elif isinstance(node, list):
-                    stack.extend(
-                        (item, f"{path}[]")
-                        for item in node
-                        if isinstance(item, (dict, list))
-                    )
+                    for item in node:
+                        if isinstance(item, str):
+                            _check_unknown_64hex(
+                                item, (*path, _ARRAY_MARKER), depth, label, name
+                            )
+                        elif isinstance(item, (dict, list)):
+                            stack.append((item, (*path, _ARRAY_MARKER)))
+
     except RecursiveJsonBudgetError:
         raise GateStateChangedError(
             f"secret leak: nested JSON budget exceeded in {label} file {name}"
@@ -1238,7 +1465,10 @@ def _is_tracking_url_leak(url: str) -> bool:
     return False
 
 
-_TRACKING_URL_PATTERN = re.compile(r"https?://[^\s\"'<>)\[\]{}]+")
+# ``(?i)`` (C-122 supervision 08:30+08:31 补充 B): an uppercase ``HTTPS://`` URL
+# is the same tracking URL as lowercase — the pattern must match it so the
+# ``_is_tracking_url_leak`` semantics decide (a plain URL is never rejected).
+_TRACKING_URL_PATTERN = re.compile(r"(?i)https?://[^\s\"'<>)\[\]{}]+")
 
 
 class _SecretNeedles:
@@ -1276,6 +1506,96 @@ def _evidence_scan_needles() -> _SecretNeedles:
     return _SecretNeedles(_evidence_secrets())
 
 
+def _scan_decoded_string_value(
+    value: str,
+    needles: _SecretNeedles,
+    label: str,
+    name: str,
+) -> None:
+    """Scan ONE decoded string value with the full value-pattern set.
+
+    C-122 supervision 00:06 (要求 A: 普通/解码后 string value ... 逐一扫描):
+    a credential smuggled as unicode escapes (``B\u0065...`` spelling
+    ``Bearer abcd``) or full-width / zero-width characters is invisible to the
+    level-TEXT scan (which sees the escaped form) but is the plain credential
+    once the level is decoded — so every decoded string VALUE is scanned
+    individually, on the raw and on the NORMALIZED copy (要求 B).
+
+    C-122 supervision 08:30+08:31 (补充 A): this is the callback the shared
+    bounded walker (``iter_json_levels(..., on_string_value=…)``) fires for
+    every decoded string value — top level, nested levels, bare JSON string
+    literals, ``\\uXXXX``-encoded forms — AFTER that value's node budget check,
+    so a budget-busting document fails closed at the first over-budget node and
+    the callback never runs past the cap (缺口③).  Every value gets the exact-
+    secret needle scan, the auth/cookie/account/phone value patterns and the
+    tracking-URL leak check on BOTH the committed-evidence and failure-artifact
+    paths.  The credential-shape set differs by path: committed evidence runs
+    the FINAL_VALUE shapes (akia / prefixed tokens / short Bearer / opaque token
+    assignments — dotted JWTs, whole headers and 32+ token runs are legitimate
+    there), while a FREE-FORM ``.failure.json`` diagnostic runs the full
+    FINAL_TEXT set — including the 32+ token run, dotted bearer tokens and whole
+    headers — because such a value is a real credential signal in a diagnostic
+    and the level-TEXT scan only sees the ``\\uff53``-escaped form of a
+    full-width run, never the run itself (the decoded value is where the real
+    characters surface).
+    """
+    value_masked = _mask_hex_hash_spans(value)
+    value_norm = _normalize_for_scan(value_masked)
+    for needle in tuple(needles):
+        if needle in value.encode("utf-8"):
+            raise GateStateChangedError(
+                f"secret leak: secret value found in decoded value in "
+                f"{label} file {name}"
+            )
+    for pattern, kind in (
+        (_AUTH_COOKIE_PATTERN, "Authorization/Cookie"),
+        (_ACCOUNT_ID_PATTERN, "account identifier"),
+        (_PHONE_PATTERN, "phone number"),
+    ):
+        if pattern.search(value_masked) or pattern.search(value_norm):
+            raise GateStateChangedError(
+                f"secret leak: {kind} in decoded value in {label} file {name}"
+            )
+    shape_pairs = (
+        _FINAL_TEXT_SHAPE_PAIRS
+        if name.endswith(".failure.json")
+        else registry_shape_pairs(PatternScope.FINAL_VALUE)
+    )
+    for pattern, kind in shape_pairs:
+        if pattern.search(value_masked) or pattern.search(value_norm):
+            raise GateStateChangedError(
+                f"secret leak: {kind} in decoded value in {label} file {name}"
+            )
+    for match in _TRACKING_URL_PATTERN.finditer(value_masked):
+        if _is_tracking_url_leak(match.group(0)):
+            raise GateStateChangedError(
+                f"secret leak: tracking URL in decoded value in {label} file {name}"
+            )
+    # 补充 B: the same tracking-URL semantics on the normalized copy — an
+    # uppercase ``HTTPS://`` / full-width / Cf-obfuscated URL is the same leak
+    # once NFKC + casefold + Cf-drop runs, decided by ``_is_tracking_url_leak``
+    # (never a blanket URL rejection).
+    for match in _TRACKING_URL_PATTERN.finditer(value_norm):
+        if _is_tracking_url_leak(match.group(0)):
+            raise GateStateChangedError(
+                f"secret leak: tracking URL in decoded value in {label} file {name}"
+            )
+
+
+def _make_decoded_value_scanner(
+    needles: _SecretNeedles,
+    label: str,
+    name: str,
+) -> Callable[[str], None]:
+    """The ``on_string_value`` callback for :func:`_secret_scan_bytes`'s shared
+    bounded walker — scans every decoded string value (补充 A) and aborts the
+    walk by raising."""
+    def scan(value: str) -> None:
+        _scan_decoded_string_value(value, needles, label, name)
+
+    return scan
+
+
 def _secret_scan_bytes(
     data: bytes,
     needles: _SecretNeedles,
@@ -1308,6 +1628,12 @@ def _secret_scan_bytes(
             raise GateStateChangedError(
                 f"secret leak: secret value found in {label} file {name}"
             )
+    # C-122 supervision 07:29 (gap 2): a ``.json`` evidence artifact or a
+    # committed JSON artifact whose TOP-LEVEL text is UTF-8 but fails to parse
+    # must fail closed before any per-level walk — a truncated /
+    # unicode-escape-obfuscated top-level JSON attempt could hide a credential.
+    if credential_field_check or name.endswith(".json"):
+        _reject_malformed_top_level_json(data, label, name)
     if credential_field_check:
         _reject_credential_field_names(data, label, name)
         _reject_unknown_64hex_values(data, label, name)
@@ -1325,31 +1651,70 @@ def _secret_scan_bytes(
             raise GateStateChangedError(
                 f"secret leak: {kind} in {label} file {name}"
             )
+    # C-122 supervision 00:06 (要求 B): the SAME value patterns run on the
+    # NORMALIZED copy (NFKC + casefold, Cf/U+200B dropped) — a full-width /
+    # zero-width-obfuscated value the ASCII regexes stop seeing is still a leak.
+    # Only a COPY is normalized; the artifact bytes are never rewritten.
+    norm_masked = _normalize_for_scan(masked_text)
+    for pattern, kind in (
+        (_AUTH_COOKIE_PATTERN, "Authorization/Cookie"),
+        (_ACCOUNT_ID_PATTERN, "account identifier"),
+        (_PHONE_PATTERN, "phone number"),
+    ):
+        if pattern.search(norm_masked):
+            raise GateStateChangedError(
+                f"secret leak: {kind} in {label} file {name}"
+            )
     # C-122 supervision 02:56 (Block 2): short / structured credential SHAPES
     # are leaks even when no KNOWN secret value is present and the value is
     # under the 32-char run threshold — AKIA-style AWS keys, well-known token
     # prefixes (``ghp_`` / ``github_pat_`` / ``glpat-`` / ``xoxb-`` / ``sk-``),
     # dotted three-segment JWTs, short ``Bearer <token>`` forms and short opaque
-    # ``token=abc`` assignments.  These shape scans are applied ONLY to free-form
+    # ``token=abc`` assignments.  08:30+08:31 (补充 B): the 32+ TOKEN RUN is a
+    # rejection signal here too.  These shape scans are applied ONLY to free-form
     # diagnostic files (``<output>.failure.json``) where such text is a real
     # credential signal — a structured evidence file legitimately carries URLs /
-    # query strings / dotted domains, so a global shape scan would false-positive
-    # the gate.  A producer that fails to sanitize its diagnostic still fails the
-    # gate closed before certification.
+    # query strings / dotted domains / 32+ test names, so a global shape scan
+    # would false-positive the gate.  A producer that fails to sanitize its
+    # diagnostic still fails the gate closed before certification.
     if name.endswith(".failure.json"):
-        for pattern, kind in (
-            (_CANARY_DIAG_WHOLE_HEADER_RE, "whole Authorization/Cookie header"),
-            (_CANARY_DIAG_AKIA_RE, "AKIA-style access key"),
-            (_CANARY_DIAG_PREFIX_TOKEN_RE, "prefixed token"),
-            (_CANARY_DIAG_DOTTED_TOKEN_RE, "dotted bearer token"),
-            (_CANARY_DIAG_BEARER_RE, "short Bearer token"),
-            (_CANARY_DIAG_OPAQUE_KV_RE, "short opaque token assignment"),
-        ):
+        for pattern, kind in _FINAL_TEXT_SHAPE_PAIRS:
             if pattern.search(masked_text):
                 raise GateStateChangedError(
                     f"secret leak: {kind} in {label} file {name}"
                 )
+        # 00:06 (要求 B): the same failure-diagnostic shape set re-searched on
+        # the normalized copy, so a full-width / zero-width credential in the
+        # free-form diagnostic is caught even when the ASCII shapes stop seeing
+        # it on the raw bytes.
+        for pattern, kind in _FINAL_TEXT_SHAPE_PAIRS:
+            if pattern.search(norm_masked):
+                raise GateStateChangedError(
+                    f"secret leak: {kind} in {label} file {name}"
+                )
+    # C-122 supervision 09:00 (gap 2): a FREE-FORM credential field assignment
+    # (``Session_token=abc``, full-width ``\uff33\uff45\uff53\uff53\uff49\uff4f\uff4e
+    # _\uff54\uff4f\uff4b\uff45\uff4e=abc``) is a
+    # leak even when the artifact is NOT a ``.failure.json`` and the text does
+    # NOT sit inside a decoded JSON string value — the committed-evidence path
+    # scans its raw top-level text for the credential-FIELD shape on the raw AND
+    # NORMALIZED copies (mirroring the free-form diagnostic scan above).  A
+    # committed JSON artifact's field KEYS are already rejected structurally
+    # (``_reject_credential_field_names``); this closes the free-text form.
+    for pattern, kind in _CREDENTIAL_FIELD_SHAPE_PAIRS:
+        if pattern.search(masked_text) or pattern.search(norm_masked):
+            raise GateStateChangedError(
+                f"secret leak: {kind} in {label} file {name}"
+            )
     for match in _TRACKING_URL_PATTERN.finditer(text):
+        if _is_tracking_url_leak(match.group(0)):
+            raise GateStateChangedError(
+                f"secret leak: tracking URL in {label} file {name}"
+            )
+    # 补充 B: the same tracking-URL semantics on the NORMALIZED copy — an
+    # uppercase ``HTTPS://`` / full-width / Cf-obfuscated URL is the same leak
+    # once NFKC + casefold + Cf-drop runs, decided by ``_is_tracking_url_leak``.
+    for match in _TRACKING_URL_PATTERN.finditer(norm_masked):
         if _is_tracking_url_leak(match.group(0)):
             raise GateStateChangedError(
                 f"secret leak: tracking URL in {label} file {name}"
@@ -1361,10 +1726,21 @@ def _secret_scan_bytes(
     # walker has hard depth/node/size budgets (never unbounded recursion or
     # waiting); a structural-start string that does not parse (a truncated /
     # obfuscated JSON attempt) and a budget overflow both fail closed.
+    # The shared bounded walker also fires ``on_string_value`` for every
+    # decoded string value AFTER that value's node budget check (缺口③) — the
+    # per-value scan (known-needle + shapes + tracking URL, both paths) runs
+    # INSIDE the one walker, so a 20k-string document fails closed at node
+    # 10001 before any separate traversal could scan all 20k.
+    decoded_value_scanner = _make_decoded_value_scanner(needles, label, name)
     try:
-        for level_text, depth, malformed in iter_json_levels(text):
+        for level_text, depth, malformed in iter_json_levels(
+            text, on_string_value=decoded_value_scanner
+        ):
             if depth == 0:
-                continue  # the raw top-level scan above already covered this
+                # The raw + normalized TOP-LEVEL text scans above covered the raw
+                # form; the DECODED top-level string values are scanned one-by-one
+                # by the ``on_string_value`` callback (00:06 要求 A + 补充 A).
+                continue
             if malformed:
                 raise GateStateChangedError(
                     f"secret leak: malformed nested JSON in {label} file {name}"
@@ -1379,16 +1755,29 @@ def _secret_scan_bytes(
                     raise GateStateChangedError(
                         f"secret leak: {kind} in nested JSON in {label} file {name}"
                     )
+            # 00:06 (要求 B): the same nested-level value scan on the NORMALIZED
+            # copy — a full-width / zero-width credential inside a decoded level
+            # is still a leak.
+            level_norm = _normalize_for_scan(level_masked)
+            for pattern, kind in (
+                (_AUTH_COOKIE_PATTERN, "Authorization/Cookie"),
+                (_ACCOUNT_ID_PATTERN, "account identifier"),
+                (_PHONE_PATTERN, "phone number"),
+            ):
+                if pattern.search(level_norm):
+                    raise GateStateChangedError(
+                        f"secret leak: {kind} in nested JSON in {label} file {name}"
+                    )
             if name.endswith(".failure.json"):
-                for pattern, kind in (
-                    (_CANARY_DIAG_WHOLE_HEADER_RE, "whole Authorization/Cookie header"),
-                    (_CANARY_DIAG_AKIA_RE, "AKIA-style access key"),
-                    (_CANARY_DIAG_PREFIX_TOKEN_RE, "prefixed token"),
-                    (_CANARY_DIAG_DOTTED_TOKEN_RE, "dotted bearer token"),
-                    (_CANARY_DIAG_BEARER_RE, "short Bearer token"),
-                    (_CANARY_DIAG_OPAQUE_KV_RE, "short opaque token assignment"),
-                ):
+                for pattern, kind in _FINAL_TEXT_SHAPE_PAIRS:
                     if pattern.search(level_masked):
+                        raise GateStateChangedError(
+                            f"secret leak: {kind} in nested JSON in {label} file {name}"
+                        )
+                # 00:06 (要求 B): the failure-diagnostic shape set on the
+                # normalized nested copy too.
+                for pattern, kind in _FINAL_TEXT_SHAPE_PAIRS:
+                    if pattern.search(level_norm):
                         raise GateStateChangedError(
                             f"secret leak: {kind} in nested JSON in {label} file {name}"
                         )
@@ -1397,10 +1786,29 @@ def _secret_scan_bytes(
                     raise GateStateChangedError(
                         f"secret leak: tracking URL in nested JSON in {label} file {name}"
                     )
+            # 补充 B: the same tracking-URL semantics on the normalized nested
+            # copy — an uppercase / full-width / Cf-obfuscated URL is caught
+            # once NFKC + casefold + Cf-drop runs.
+            for match in _TRACKING_URL_PATTERN.finditer(level_norm):
+                if _is_tracking_url_leak(match.group(0)):
+                    raise GateStateChangedError(
+                        f"secret leak: tracking URL in nested JSON in {label} file {name}"
+                    )
     except RecursiveJsonBudgetError:
         raise GateStateChangedError(
             f"secret leak: nested JSON budget exceeded in {label} file {name}"
         ) from None
+    # C-122 supervision 07:29 (gap 3): the NORMALIZED key scan — every key at
+    # every decoded level — must ALSO run on free-form ``.failure.json`` staging
+    # diagnostics, even though ``credential_field_check=False`` there.  A
+    # failure artifact must never carry a credential-looking field name
+    # (``session_token`` / ``authorization_status`` / ``token``) in its
+    # structured summary, and the shape scans above do NOT see such a key
+    # (``session_token`` has no word boundary before ``token``).  This runs
+    # AFTER the per-level pattern scan so the existing double/triple-encoded
+    # ``Authorization``-value rejection (``Authorization/Cookie``) fires first.
+    if name.endswith(".failure.json"):
+        _reject_credential_field_names(data, label, name)
 
 
 def _secret_scan_paths(
@@ -1506,56 +1914,60 @@ _CANARY_DIAG_FIELD_MAX_CHARS = 512
 # (20 chars), dotted bearer tokens (``header.payload.signature`` JWTs whose first
 # two segments are each under 32 chars and survive the run pattern), and short
 # opaque ``token=value`` / ``password=value`` assignments.
-_CANARY_DIAG_URL_RE = re.compile(r"https?://[^\s\"'<>)\[\]{}]+")
-_CANARY_DIAG_TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9_\-=]{32,}")
-_CANARY_DIAG_AKIA_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
-# C-122 supervision 02:56 (Block 2): well-known short token PREFIXES — GitHub
-# personal/oauth/install tokens (``ghp_`` / ``gho_`` / ``ghu_`` / ``ghs_`` /
-# ``ghr_`` / ``github_pat_``), GitLab ``glpat-``, Slack ``xoxb-`` / ``xoxp-`` /
-# ``xoxa-``, OpenAI ``sk-`` — each is UNDER the 32-char run threshold and is
-# missed by the token-run / dotted patterns.  Same shape the producer's
-# ``_desensitize`` (``benchmarks/live_canary_certified.py``) collapses.
-_CANARY_DIAG_PREFIX_TOKEN_RE = re.compile(
-    r"(?i)\b(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-|xoxa-|"
-    r"sk-|rk-)[A-Za-z0-9_\-]{6,}"
+# Every credential-shape regex the consumer mask and final scan use is DERIVED
+# from the single typed registry in ``tripchord._secret_redact`` (C-122
+# supervision 08:30+08:31 补充 C) — a shape / flag change lands in producer,
+# consumer and final scan at once instead of three hand-synced copies.  The
+# named variables stay so ``_canary_diag_mask_level`` can apply each pattern
+# with its own replacement (``<url>`` vs ``[REDACTED]``).
+_CANARY_DIAG_URL_RE = registry_pattern("url")
+_CANARY_DIAG_TOKEN_RUN_RE = registry_pattern("token_run")
+_CANARY_DIAG_AKIA_RE = registry_pattern("akia")
+_CANARY_DIAG_PREFIX_TOKEN_RE = registry_pattern("prefix_token")
+_CANARY_DIAG_BEARER_RE = registry_pattern("bearer")
+_CANARY_DIAG_DOTTED_TOKEN_RE = registry_pattern("dotted_token")
+_CANARY_DIAG_OPAQUE_KV_RE = registry_pattern("opaque_kv")
+_CANARY_DIAG_WHOLE_HEADER_RE = registry_pattern("whole_header")
+# C-122 supervision 09:00: the credential FIELD NAME key-VALUE shape — an ASCII /
+# full-width ``Session_token=abc`` / ``"Session_token":"abc"`` assignment (the
+# ``session_token`` family plus bare ``token=`` / ``cookie=`` / ``secret=``) is
+# masked WHOLE (name + value) by the consumer before a free-form diagnostic field
+# reaches the committed report, and rejected by the final scan on BOTH paths.
+_CANARY_DIAG_CREDENTIAL_FIELD_RE = registry_pattern("credential_field")
+# C-122 supervision 00:06 (要求 B) + 08:30+08:31 补充 B: the value/shape set —
+# including the 32+ token run and the tracking URL — re-applied to a NORMALIZED
+# copy (NFKC + casefold, Cf/U+200B dropped).  A full-width / zero-width-
+# obfuscated credential (``\uff21uthorization: Basic``,
+# ``Author\u200bization: ...``, ``\uff22\uff45\uff41\uff52\uff45\uff52
+# abcd``, full-width ``\uff54\uff4f\uff4b\uff45\uff4e\uff1d\uff41\uff42
+# \uff43``) and a full-width / Cf-obfuscated ``HTTPS://`` URL stop matching the
+# ASCII regexes above once the ASCII letters are hidden, so the SAME patterns
+# are searched again on the normalized detection copy (only a copy is
+# normalized; the artifact bytes are untouched).
+_NORMALIZED_DIAG_SHAPE_PATTERNS: tuple[re.Pattern[str], ...] = registry_patterns(
+    PatternScope.NORMALIZED
 )
-# A short ``Bearer <token>`` form — ``Bearer abcd1234`` has no ``=``/``:`` so the
-# opaque-KV pattern cannot catch it, and a <32-char token evades the run pattern.
-_CANARY_DIAG_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-.]{4,}")
-# C-122 supervision 02:56 (Block 2): a dotted three-segment bearer token / JWT
-# whose last segment is as short as 3 chars is a credential too — the 32-char run
-# pattern misses it and the previous ``{6,}`` last-segment floor let short JWTs
-# through.
-_CANARY_DIAG_DOTTED_TOKEN_RE = re.compile(
-    r"\b[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]{3,}\b"
+# The FINAL-TEXT shape pairs the free-form failure-diagnostic level scan
+# iterates (raw + normalized) — whole headers, token runs, AKIA keys, prefixed
+# tokens, dotted JWTs, short Bearer forms and opaque token assignments
+# (补充 B: the 32+ token run is now a rejection signal here too).  Excludes the
+# URL shape — a tracking URL is decided by ``_is_tracking_url_leak`` semantics,
+# never by rejecting every URL.
+_FINAL_TEXT_SHAPE_PAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
+    registry_shape_pairs(PatternScope.FINAL_TEXT)
 )
-# C-122 supervision 02:56 (Block 2): a SHORT opaque ``token=abc`` /
-# ``password=abc`` / ``bearer=xyz`` assignment (value as short as 3 chars) is a
-# credential too — the previous ``{6,}`` value floor let ``token=abc`` through.
-# C-122 supervision 04:44: an optional quote may sit between the key and the
-# ``:``/``=``, so a JSON/dict QUOTED-KEY form (``{"token": "abc"}`` /
-# ``{'password': 'xyz'}``) is recognised too.
-_CANARY_DIAG_OPAQUE_KV_RE = re.compile(
-    r"(?i)\b(?:token|password|passwd|secret|apikey|api_key|access_key|"
-    r"secret_key|client_secret|authorization|bearer|private_key|session_key)\b"
-    r"\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
-)
-# C-122 supervision 03:46 (Block 1): whole-header/field masking — Authorization /
-# Proxy-Authorization / Cookie / Set-Cookie / X-API-Key are masked name-and-value
-# together (value runs to the next newline / quote).  The opaque-KV pattern above
-# stops at the first space (``authorization: Basic <base64>`` keeps the base64
-# body) and never names ``set-cookie`` / ``x-api-key`` / ``proxy-authorization``;
-# a ``;``-joined cookie pair likewise survives it.  Mirrors the producer's
-# ``_desensitize`` (``benchmarks/live_canary_certified.py``) and
-# ``_AUTH_COOKIE_PATTERN`` — keep all three in sync.  C-122 supervision 04:44:
-# an optional quote may sit between the field name and the ``:``/``=`` and
-# between the ``:``/``=`` and the value, so a JSON/dict QUOTED-KEY form
-# (``{"Authorization": "Basic a"}`` / ``{'Set-Cookie': 'sid=abc'}``) is masked
-# WHOLE — never split at the quote.
-_CANARY_DIAG_WHOLE_HEADER_RE = re.compile(
-    r"(?i)\b(?:proxy[-_ ]authorization|set[-_ ]cookie|x-api-key|api[-_ ]key|"
-    r"authorization|cookie)\b\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
-    r"(?:\\*[\"']?|[\"'])?[^\r\n]+"
+# The single credential-FIELD-NAME shape applied to the RAW TOP-LEVEL text of
+# EVERY artifact — committed evidence AND free-form diagnostics.  A free-form
+# ``Session_token=abc`` / full-width ``\uff33\uff45\uff53\uff53\uff49\uff4f\uff4e
+# _\uff54\uff4f\uff4b\uff45\uff4e=abc`` that does
+# NOT sit inside a decoded JSON string value (a bare non-JSON ``.json`` free-text
+# file, a raw provider dump) is still a leak and must be rejected on BOTH final
+# paths (C-122 supervision 09:00 gap 2).  Only this one shape scans the raw top
+# level of committed evidence; the rest of the FINAL_VALUE set runs on DECODED
+# string values where legitimate dotted domains / whole headers / 32+ test names
+# are excluded.
+_CREDENTIAL_FIELD_SHAPE_PAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (registry_pattern("credential_field"), "credential field name assignment"),
 )
 # The diagnostic's STRUCTURED schema — a fail-closed whitelist: any unknown
 # top-level / run_identity / runtime field makes the diagnostic foreign and is
@@ -1596,7 +2008,19 @@ def _sanitize_canary_diag_field(value: str, fallback: str) -> str:
     credential-bearing summary — forged or otherwise — can never reach the
     committed trail as-is (C-122 supervision 01:10 Block 3 + 18:13).
     """
-    value = bounded_json_mask(value, mask_level=_canary_diag_mask_level)
+    value = bounded_json_mask(
+        value,
+        mask_level=_canary_diag_mask_level,
+        # C-122 supervision 00:06 (要求 B): re-check every masked level on the
+        # NORMALIZED copy (NFKC + casefold, Cf/U+200B dropped) so a full-width /
+        # zero-width-obfuscated credential span is collapsed even though the
+        # ASCII shape regexes stopped seeing it on the raw text.
+        normalize_patterns=_NORMALIZED_DIAG_SHAPE_PATTERNS,
+        # C-122 supervision 09:00: a STRUCTURED JSON credential field NAME
+        # (``{"Session_token":"abc"}``) is masked whole too — the key would
+        # otherwise survive the free-form value-only walk.
+        key_patterns=(CREDENTIAL_FIELD_NAME_PATTERN,),
+    )
     value = re.sub(r"[\x00-\x1f\x7f]", " ", value).strip()
     if not value:
         return fallback
@@ -1615,15 +2039,35 @@ def _canary_diag_mask_level(value: str) -> str:
     (``tripchord._secret_redact.bounded_json_mask``, C-122 supervision 06:58)
     can apply it at every decoded level of a multi-``json.dumps`` summary.
     """
+    # C-122 supervision 09:00 (gap 2): same zero-width-split pre-pass as the
+    # producer — a Cf / full-width credential-FIELD assignment (``Session​token:…``)
+    # is masked WHOLE on the normalized copy BEFORE the ASCII chain runs, so the
+    # opaque-KV shape below cannot collapse ``token:…`` and leave the name half.
+    # The WHOLE-HEADER shape runs here too so a full-width ``\uff21uthorization:
+    # Basic YWJjZA==`` masks name-and-base64 together (the tightened
+    # credential-FIELD value pattern stops at the space after ``Basic``).
+    # C-122 supervision 09:28 (gap 2 regression): collapse URLs on the RAW text
+    # BEFORE the normalized credential-field pre-pass.  The credential-field
+    # value now runs from the first value char to a clear field boundary (spaces
+    # included), so without this a trailing ``https://…`` scheme would be
+    # swallowed into the value (``token=abc https``) and the URL host would
+    # survive once the scheme half was redacted.  Masking the URL first turns
+    # ``token=abc <url>`` into a clean ``[REDACTED] <url>``.
+    value = _CANARY_DIAG_URL_RE.sub("<url>", value)
+    value = mask_normalized_spans(
+        value,
+        (_CANARY_DIAG_WHOLE_HEADER_RE, _CANARY_DIAG_CREDENTIAL_FIELD_RE),
+        marker="[REDACTED]",
+    )
     value = _redact_output(value)
     value = _CANARY_DIAG_WHOLE_HEADER_RE.sub("[REDACTED]", value)
-    value = _CANARY_DIAG_URL_RE.sub("<url>", value)
     value = _CANARY_DIAG_TOKEN_RUN_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_AKIA_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_PREFIX_TOKEN_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_BEARER_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_DOTTED_TOKEN_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_OPAQUE_KV_RE.sub("[REDACTED]", value)
+    value = _CANARY_DIAG_CREDENTIAL_FIELD_RE.sub("[REDACTED]", value)
     return value
 
 

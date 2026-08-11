@@ -6188,6 +6188,220 @@ def test_secret_scan_rejects_depth_budget_overflow_fail_closed() -> None:
         gate._reject_credential_field_names(raw.encode(), b"x", "deep.json")
 
 
+def test_secret_scan_rejects_structural_node_budget_overflow() -> None:
+    """C-122 supervision 07:29 (gap 1) counter-example: the depth/node budgets
+    must cover the JSON STRUCTURE itself — a 20000-primitive list inside one
+    decoded level must fail closed (``budget exceeded``), never traverse without
+    bound.  The same list as a mask input fails closed to ``[REDACTED]``."""
+    from benchmarks import live_canary_certified as canary
+
+    raw = json.dumps(list(range(20000)))
+    with pytest.raises(gate.GateStateChangedError, match="budget exceeded"):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "big.json",
+            credential_field_check=True,
+        )
+    # Producer + consumer mask layers fail closed to the marker.
+    assert canary._desensitize(raw) == "[REDACTED]"
+    assert gate._sanitize_canary_diag_field(raw, "fallback") == "[REDACTED]"
+
+
+def test_secret_scan_rejects_structural_depth_budget_overflow() -> None:
+    """C-122 supervision 07:29 (gap 1) counter-example: a pathologically DEEP
+    object (10 nested containers — beyond the depth=8 structural cap) must fail
+    closed in scan AND mask, never rely on Python's recursion limit."""
+    from benchmarks import live_canary_certified as canary
+
+    node: Any = 1
+    for _ in range(10):  # struct_depth 9 > 8
+        node = {"k": node}
+    raw = json.dumps(node)
+    with pytest.raises(gate.GateStateChangedError, match="budget exceeded"):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "deep.json",
+            credential_field_check=True,
+        )
+    assert canary._desensitize(raw) == "[REDACTED]"
+    assert gate._sanitize_canary_diag_field(raw, "fallback") == "[REDACTED]"
+
+
+def test_secret_scan_rejects_fanout_empty_dict_budget_overflow() -> None:
+    """C-122 supervision 07:29 (gap 1) counter-example: a FAN-OUT document
+    (20000 empty-dict values) inside one decoded level must fail closed — the
+    structural node cap counts every dict/list/scalar node, not just JSON-string
+    levels."""
+    raw = json.dumps({f"k{i}": {} for i in range(20000)})
+    with pytest.raises(gate.GateStateChangedError, match="budget exceeded"):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "fanout.json",
+            credential_field_check=True,
+        )
+
+
+def test_secret_scan_allows_legit_structure_at_budget() -> None:
+    """C-122 supervision 07:29 (gap 1) positive counter-example: a document that
+    nests EXACTLY to the depth budget (9 containers -> struct_depth 8) and a
+    normal small document both pass — the structural budget is a real cap, not a
+    false positive on legitimate evidence."""
+    node: Any = 1
+    for _ in range(9):  # struct_depth 0..8 — at budget
+        node = {"k": node}
+    gate._secret_scan_bytes(
+        json.dumps(node).encode(),
+        gate._SecretNeedles(()),
+        "evidence",
+        "at-budget.json",
+        credential_field_check=True,
+    )  # must not raise
+    gate._secret_scan_bytes(
+        json.dumps({"a": 1, "b": [1, 2], "c": {"d": "text"}}).encode(),
+        gate._SecretNeedles(()),
+        "evidence",
+        "normal.json",
+        credential_field_check=True,
+    )  # must not raise
+
+
+def test_secret_scan_rejects_malformed_top_level_json() -> None:
+    """C-122 supervision 07:29 (gap 2) counter-example: a ``.json`` evidence
+    artifact (or any ``credential_field_check=True`` artifact) whose TOP-LEVEL
+    text is UTF-8, looks like JSON and yet does NOT parse must fail closed —
+    covering an ordinary truncation AND a unicode-escape + truncation attempt
+    (``{"\\u12`` cut mid-escape).  Non-JSON text/binary and a valid non-sensitive
+    JSON artifact pass through per the original contract."""
+    for bad, name in (
+        ('{"Authorization": "Basic', "live-done-gate-v4.json"),
+        ('{"\\u12', "live-done-gate-v4.json"),
+    ):
+        with pytest.raises(gate.GateStateChangedError, match="malformed top-level JSON"):
+            gate._secret_scan_bytes(
+                bad.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                name,
+                credential_field_check=False,
+            )
+        with pytest.raises(gate.GateStateChangedError, match="malformed top-level JSON"):
+            gate._secret_scan_bytes(
+                bad.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "evidence.json",
+                credential_field_check=True,
+            )
+    # A plain non-JSON text / binary placeholder is NOT a malformed-JSON attempt
+    # (original contract: byte + pattern scan only).
+    gate._secret_scan_bytes(
+        b"PNG",
+        gate._SecretNeedles(()),
+        "committed evidence",
+        "browser-e2e-screenshot.png",
+        credential_field_check=True,
+    )  # must not raise
+    gate._secret_scan_bytes(
+        json.dumps({"ok": 1, "note": "public"}).encode(),
+        gate._SecretNeedles(()),
+        "evidence",
+        "evidence.json",
+        credential_field_check=True,
+    )  # must not raise
+
+
+def test_secret_scan_rejects_credential_keys_in_failure_artifact() -> None:
+    """C-122 supervision 07:29 (gap 3) counter-example: the NORMALIZED key scan
+    must run on free-form ``.failure.json`` diagnostics even when
+    ``credential_field_check=False`` — a structured summary carrying a
+    credential-looking KEY (``session_token`` / ``authorization_status`` /
+    ``token``) is a leak the shape scans do NOT see (no word boundary before
+    ``token``), so the key rejector is the only line that catches it."""
+    for key in ("session_token", "authorization_status", "token"):
+        raw = json.dumps({"summary": json.dumps({key: "abc"})})
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "committed evidence",
+                "evidence.json",
+                credential_field_check=True,
+            )
+
+
+def test_secret_scan_normalized_keys_unicode_and_both_check_paths() -> None:
+    """C-122 supervision 07:29 (gap 3) positive + negative counter-examples: a
+    legit outer document with a UNICODE key passes, a UNICODE credential key is
+    still caught, and a TRUNCATED unicode key fails closed as malformed nested
+    JSON — on BOTH the committed (True) and failure-artifact (False) paths."""
+    # Legit outer + unicode key: passes on both paths.
+    legit = json.dumps({"外层": {"note": "public", "count": 3}})
+    gate._secret_scan_bytes(
+        legit.encode(),
+        gate._SecretNeedles(()),
+        "committed evidence",
+        "evidence.json",
+        credential_field_check=True,
+    )  # must not raise
+    gate._secret_scan_bytes(
+        legit.encode(),
+        gate._SecretNeedles(()),
+        "evidence",
+        "live-canary-certified.json.failure.json",
+        credential_field_check=False,
+    )  # must not raise
+    # Unicode credential key: still caught on both paths.
+    bad = json.dumps({"外层": {"Authorization": "Basic YWJjZA=="}})
+    with pytest.raises(gate.GateStateChangedError):
+        gate._secret_scan_bytes(
+            bad.encode(),
+            gate._SecretNeedles(()),
+            "committed evidence",
+            "evidence.json",
+            credential_field_check=True,
+        )
+    with pytest.raises(gate.GateStateChangedError):
+        gate._secret_scan_bytes(
+            bad.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    # Truncated unicode key at a NESTED level: malformed nested fail-closed.
+    truncated = json.dumps({"summary": '{"\\u12'})
+    with pytest.raises(gate.GateStateChangedError, match="malformed nested JSON"):
+        gate._secret_scan_bytes(
+            truncated.encode(),
+            gate._SecretNeedles(()),
+            "committed evidence",
+            "evidence.json",
+            credential_field_check=True,
+        )
+    with pytest.raises(gate.GateStateChangedError, match="malformed nested JSON"):
+        gate._secret_scan_bytes(
+            truncated.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
 def test_secret_scan_keeps_pending_authorization_and_cookie_prose() -> None:
     """C-122 supervision 06:58 positive counter-example: ``authorization`` /
     ``cookie`` are also English words, so the legitimate scope detail prose
@@ -6222,6 +6436,605 @@ def test_secret_scan_keeps_pending_authorization_and_cookie_prose() -> None:
     assert "pending user" in sanitized
     cookie_sanitized = gate._sanitize_canary_diag_field(cookie_prose, "fallback")
     assert cookie_sanitized == cookie_prose
+
+
+def test_secret_scan_rejects_20000_string_values_budget_overflow() -> None:
+    """C-122 supervision 00:06 (要求 A) counter-example: a document whose string
+    VALUES alone exceed the node budget (20000 plain string values) must fail
+    closed in scan AND mask — an ordinary/decoded string value counts toward the
+    node budget, not just the JSON-string levels and containers."""
+    from benchmarks import live_canary_certified as canary
+
+    raw = json.dumps(["x"] * 20000)
+    with pytest.raises(gate.GateStateChangedError, match="budget exceeded"):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "many-strings.json",
+            credential_field_check=True,
+        )
+    assert canary._desensitize(raw) == "[REDACTED]"
+    assert gate._sanitize_canary_diag_field(raw, "fallback") == "[REDACTED]"
+
+
+def test_secret_scan_rejects_20000_object_member_keys_budget_overflow() -> None:
+    """C-122 supervision 00:06 (要求 A) counter-example: a 20000-member OBJECT
+    fails closed — the object MEMBER KEY counts as a node (the member key AND
+    the value both count), so a fan-out object cannot smuggle past the budget by
+    hiding under a handful of JSON-string levels."""
+    from benchmarks import live_canary_certified as canary
+
+    raw = json.dumps({f"k{i}": i for i in range(20000)})
+    with pytest.raises(gate.GateStateChangedError, match="budget exceeded"):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "many-keys.json",
+            credential_field_check=True,
+        )
+    assert canary._desensitize(raw) == "[REDACTED]"
+    assert gate._sanitize_canary_diag_field(raw, "fallback") == "[REDACTED]"
+
+
+def test_secret_scan_allows_exactly_at_node_budget_boundary() -> None:
+    """C-122 supervision 00:06 (要求 A) positive counter-example: a document at
+    EXACTLY the node budget (10000 nodes) passes the scan AND the mask layers —
+    a 9998-item list of ints, a 9998-item list of plain strings and a 4999-member
+    object each count exactly 10000 nodes; one more node (9999 ints / 5000
+    members) fails closed.  The cap is a real ceiling, not a false positive on
+    legal boundaries."""
+    from benchmarks import live_canary_certified as canary
+
+    for raw in (
+        json.dumps(list(range(9998))),
+        json.dumps(["x"] * 9998),
+        json.dumps({f"k{i}": i for i in range(4999)}),
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "at-budget.json",
+            credential_field_check=True,
+        )  # must not raise
+        assert canary._desensitize(raw) != "[REDACTED]"
+        assert gate._sanitize_canary_diag_field(raw, "fallback") != "[REDACTED]"
+    for raw in (
+        json.dumps(list(range(9999))),
+        json.dumps({f"k{i}": i for i in range(5000)}),
+    ):
+        with pytest.raises(gate.GateStateChangedError, match="budget exceeded"):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "over-budget.json",
+                credential_field_check=True,
+            )
+        assert canary._desensitize(raw) == "[REDACTED]"
+
+
+def test_secret_scan_rejects_unicode_escaped_bearer_in_failure_diagnostic() -> None:
+    """C-122 supervision 00:06 (要求 A) counter-example: a ``Bearer abcd``
+    smuggled as unicode escapes (``\\u0042\\u0065...``) in a decoded
+    ``.failure.json`` summary — the level TEXT never spells ``bearer`` (it sees
+    the escaped form), but the DECODED string value is scanned one-by-one and is
+    the plain credential, so the gate fails closed with the short-Bearer shape.
+    """
+    inner = '{"detail": "x \\u0042\\u0065\\u0061\\u0072\\u0065\\u0072 abcd"}'
+    raw = json.dumps({"summary": inner})
+    with pytest.raises(gate.GateStateChangedError, match="Bearer"):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_secret_scan_rejects_short_opaque_token_assignment_in_failure() -> None:
+    """C-122 supervision 00:06 (要求 A) counter-example: a short opaque
+    ``token=abc`` assignment in a decoded ``.failure.json`` summary is a
+    credential even though the value is only 3 chars — the short-opaque shape
+    scan rejects it on the raw AND on the decoded-value scan."""
+    raw = json.dumps({"summary": "token=abc"})
+    with pytest.raises(gate.GateStateChangedError, match="token assignment"):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_secret_scan_rejects_fullwidth_zero_width_value_obfuscation() -> None:
+    """C-122 supervision 00:06 (要求 B) counter-example: a credential VALUE
+    obfuscated with full-width letters (``\uff21uthorization``) or a zero-width
+    space (``Author\\u200bization``) is the same header as its ASCII form once
+    the scan copy is NFKC + casefold + Cf/U+200B-dropped — rejected on BOTH the
+    committed (credential_field_check=True) and failure-artifact (False) paths,
+    in the raw value scan and at every decoded level."""
+    full_width = json.dumps({"summary": "Ａuthorization: Basic YWJjZA=="})
+    zero_width = json.dumps({"summary": "Author​ization: Basic YWJjZA=="})
+    for raw in (full_width, zero_width):
+        with pytest.raises(gate.GateStateChangedError, match="Authorization/Cookie"):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "committed evidence",
+                "evidence.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError, match="Authorization/Cookie"):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+
+
+def test_secret_scan_rejects_fullwidth_zero_width_credential_keys() -> None:
+    """C-122 supervision 00:06 (要求 B) counter-example: a credential FIELD NAME
+    obfuscated with full-width letters
+    (``\uff33\uff45\uff53\uff53\uff49\uff4f\uff4e\uff3f\uff54\uff4f\uff4b\uff45\uff4e``)
+    or a
+    zero-width space (``Author\\u200bization``) is rejected by the NORMALIZED key
+    scan on BOTH the committed and failure-artifact paths, while a legit outer
+    document with a plain CJK key still passes."""
+    full_width_key = json.dumps(
+        {
+            "summary": json.dumps(
+                {
+                    "Ｓｅｓｓｉｏｎ＿"
+                    "ｔｏｋｅｎ": "abc"
+                }
+            )
+        }
+    )
+    zero_width_key = json.dumps(
+        {"summary": json.dumps({"Author​ization": "Basic YWJjZA=="})}
+    )
+    for raw in (full_width_key, zero_width_key):
+        with pytest.raises(gate.GateStateChangedError, match="credential field name"):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "committed evidence",
+                "evidence.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError, match="credential field name"):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # A legit outer document with a plain CJK key still passes both paths.
+    legit = json.dumps({"外层": {"note": "public", "count": 3}})
+    gate._secret_scan_bytes(
+        legit.encode(),
+        gate._SecretNeedles(()),
+        "committed evidence",
+        "evidence.json",
+        credential_field_check=True,
+    )  # must not raise
+    gate._secret_scan_bytes(
+        legit.encode(),
+        gate._SecretNeedles(()),
+        "evidence",
+        "live-canary-certified.json.failure.json",
+        credential_field_check=False,
+    )  # must not raise
+
+
+def test_secret_scan_rejects_fullwidth_token_run_in_failure_decoded_value() -> None:
+    """C-122 supervision 00:06 (要求 A/B) counter-example: a 32+ token run
+    obfuscated as FULL-WIDTH letters (``\uff53\uff45\uff43\uff52\uff45\uff54`` =
+    ``secret`` * 6 after NFKC) hidden in a decoded ``.failure.json`` value.  The
+    level-TEXT scan only sees the ``\\uff53``-escaped form (invisible to
+    ``token_run`` even on the normalized copy), so the DECODED value — where the
+    real full-width characters surface — must apply the free-form FINAL_TEXT
+    shape set, including the 32+ token run, and fail closed.  The same full-width
+    run in a COMMITTED evidence
+    value still PASSES: ``token_run`` is deliberately excluded from FINAL_VALUE
+    there (committed artifacts legitimately carry 32+ ASCII runs) and the compact
+    desensitizer masks the run instead of rejecting it."""
+    fw_run = "ｓｅｃｒｅｔ" * 6  # 36 ASCII chars once NFKC-composed
+    raw = json.dumps({"summary": fw_run})
+    with pytest.raises(gate.GateStateChangedError, match="token-shaped run"):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    gate._secret_scan_bytes(
+        raw.encode(),
+        gate._SecretNeedles(()),
+        "committed evidence",
+        "evidence.json",
+        credential_field_check=True,
+    )  # must not raise — committed-artifact token runs are masked, not rejected
+
+
+def _credential_field_cases() -> list[tuple[str, str]]:
+    """(label, raw) matrix of credential-FIELD-NAME assignment counter-examples.
+
+    C-122 supervision 09:00 gap 2: structured (JSON key-value) AND free-text
+    (``=`` / ``:``) forms, ASCII / full-width (NFKC) / zero-width (Cf) name
+    spellings, short values (``abc`` — under the 32-char run threshold) and
+    ``json.dumps`` nesting 1-3 levels.  Every row must be masked by the
+    producer / consumer BEFORE disk and rejected by the final scan on BOTH the
+    committed-evidence and free-form failure paths.
+    """
+    return [
+        ("ascii quoted kv", 'Session_token:"abc"'),
+        ("ascii free-text =", "Session_token=abc"),
+        ("ascii colon space", "Session_token: abc"),
+        ("fullwidth quoted kv", 'Ｓｅｓｓｉｏｎ_ｔｏｋｅｎ:"abc"'),
+        ("fullwidth free-text =", "Ｓｅｓｓｉｏｎ_ｔｏｋｅｎ＝abc"),
+        ("zero-width quoted kv", "Session​token:\"abc\""),
+        ("zero-width free-text =", "Session​_token=abc"),
+        ("zero-width colon space", "Session​token : abc"),
+        ("structured ascii", json.dumps({"Session_token": "abc"})),
+        ("structured zero-width", json.dumps({"Session​_token": "abc"})),
+        ("nested 1-layer", json.dumps({"summary": json.dumps({"Session_token": "abc"})})),
+        (
+            "nested 2-layer",
+            json.dumps(
+                {"summary": json.dumps({"note": json.dumps({"Session_token": "abc"})})}
+            ),
+        ),
+        (
+            "nested 3-layer",
+            json.dumps(
+                {
+                    "summary": json.dumps(
+                        {"note": json.dumps({"detail": json.dumps({"Session_token": "abc"})})}
+                    )
+                }
+            ),
+        ),
+        # C-122 supervision 09:28 (gap B): the credential-field parse/mask covers
+        # from the FIRST non-empty value char to a clear field boundary or the
+        # whole diagnostic — a 1-char / 2-char / space-separated / quoted /
+        # full-width / zero-width value is masked WHOLE, never relying on a
+        # 3-char token-run minimum.
+        ("ascii 1-char", "Session_token=a"),
+        ("ascii 2-char", "Session_token=ab"),
+        ("ascii space-separated", "Session_token: abc def"),
+        ("ascii quoted 1-char", 'session_token="a"'),
+        ("ascii quoted 2-char", 'session_token="ab"'),
+        ("fullwidth 1-char value", "Session_token=ａ"),
+        ("zero-width 1-char value", "Session​token=a"),
+        ("structured 1-char", json.dumps({"Session_token": "a"})),
+        ("structured 2-char", json.dumps({"Session_token": "ab"})),
+    ]
+
+
+def test_gap2_producer_consumer_mask_credential_field_name_forms() -> None:
+    """C-122 supervision 09:00 (gap 2) counter-example: the producer
+    ``_desensitize`` and the consumer ``_sanitize_canary_diag_field`` mask a
+    credential-FIELD-NAME assignment (``Session_token=abc``, ``Session_token:"abc"``,
+    full-width / zero-width spellings, structured JSON key, 1-3 ``json.dumps``
+    layers) WHOLE — the field name can never survive to stderr or the sealed
+    failure diagnostic."""
+    from benchmarks import live_canary_certified as canary
+
+    for label, raw in _credential_field_cases():
+        producer_out = canary._desensitize(raw)
+        assert "session_token" not in producer_out.lower(), (
+            f"producer leaked field name for {label}: {producer_out!r}"
+        )
+        consumer_out = gate._sanitize_canary_diag_field(raw, "fallback")
+        assert "session_token" not in consumer_out.lower(), (
+            f"consumer leaked field name for {label}: {consumer_out!r}"
+        )
+
+
+def test_gap2_final_scan_rejects_credential_field_name_both_paths() -> None:
+    """C-122 supervision 09:00 (gap 2) counter-example: the final scan rejects a
+    credential-FIELD-NAME assignment on BOTH final paths — the committed
+    evidence artifact (``credential_field_check=True``, raw top-level + decoded
+    JSON-string values + the field-name rejector) and the free-form
+    ``.failure.json`` diagnostic (FINAL_TEXT shape set)."""
+    for label, raw in _credential_field_cases():
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "committed evidence",
+                f"evidence-{label}.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+
+
+def test_gap2_final_scan_rejects_bare_free_text_credential_field() -> None:
+    """C-122 supervision 09:00 (gap 2) counter-example: a BARE free-text
+    ``Session_token=abc`` (not valid JSON, does not sit inside a decoded string
+    value) must still fail the COMMITTED path closed — the credential-FIELD
+    shape runs on the raw top-level text, not only inside decoded JSON
+    values."""
+    for raw in ("Session_token=abc", "Ｓｅｓｓｉｏｎ_ｔｏｋｅｎ=abc", "Session​_token=abc"):
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "committed evidence",
+                "evidence-1.json",
+                credential_field_check=True,
+            )
+
+
+def test_gap1_unknown64_nested_decoded_json_path_reset() -> None:
+    """C-122 supervision 09:00 (gap 1) counter-example: a 64-hex smuggled through
+    a decoded JSON-string value (``{"summary": "{\\"files\\":[{\\"sha256\\":
+    \\"<64hex>\\"}]}"}``, 1-3 ``json.dumps`` layers) must be REJECTED — the walk's
+    decoded-level path resets to ``""``, so the nested ``files[].sha256`` must
+    NOT hit the top-level digest whitelist.  A real top-level committed
+    ``files[].sha256`` stays accepted; an UPPERCASE / full-width 64-hex is never
+    trusted even under a whitelisted key."""
+    hex64 = "a" * 64
+    fw_hex = "ｆ" * 64
+
+    def layered(value: str, levels: int) -> str:
+        text = value
+        for _ in range(levels):
+            text = json.dumps({"outer": text})
+        return text
+
+    # Nested decoded JSON-string 64-hex — 1 / 2 / 3 layers — must fail closed.
+    for level in (1, 2, 3):
+        inner = json.dumps({"files": [{"sha256": hex64}]})
+        with pytest.raises(gate.GateStateChangedError, match="64-hex"):
+            gate._reject_unknown_64hex_values(
+                layered(inner, level).encode(), b"x", f"nested-{level}.json"
+            )
+    # Full-width nested 64-hex fails closed too.
+    with pytest.raises(gate.GateStateChangedError):
+        gate._reject_unknown_64hex_values(
+            json.dumps({"summary": json.dumps({"files": [{"sha256": fw_hex}]})}).encode(),
+            b"x",
+            "nested-fw.json",
+        )
+    # Top-level whitelisted path stays accepted.
+    gate._reject_unknown_64hex_values(
+        json.dumps({"files": [{"sha256": hex64}]}).encode(), b"x", "manifest.json"
+    )
+    # Uppercase / full-width 64-hex at a whitelisted path is never trusted.
+    with pytest.raises(gate.GateStateChangedError):
+        gate._reject_unknown_64hex_values(
+            json.dumps({"files": [{"sha256": "A" * 64}]}).encode(),
+            b"x",
+            "upper.json",
+        )
+    with pytest.raises(gate.GateStateChangedError):
+        gate._reject_unknown_64hex_values(
+            json.dumps({"files": [{"sha256": fw_hex}]}).encode(),
+            b"x",
+            "fw.json",
+        )
+
+
+def test_gap1_gap2_positive_business_evidence_passes() -> None:
+    """C-122 supervision 09:00 positive example: legitimate business state — a
+    committed evidence manifest carrying real digest bindings at EXACT
+    whitelisted paths and the ``bridge_token_present`` flag — passes the final
+    scan unchanged, and a normal producer/consumer canary diagnostic passes
+    through the mask layers without a false positive."""
+    from benchmarks import live_canary_certified as canary
+
+    hex64 = "a" * 64
+    legit = {
+        "files": [{"sha256": hex64}],
+        "layer_verdicts": {
+            "5_real_canary": {"companion": {"build_sha256": hex64}}
+        },
+        "done_gate": {
+            "checks": [{"evidence": {"candidate_set_sha256": hex64}}]
+        },
+        "bridge_token_present": True,
+    }
+    raw = json.dumps(legit)
+    # The full committed scan passes: no credential field name, no unknown 64-hex.
+    gate._secret_scan_bytes(
+        raw.encode(),
+        gate._SecretNeedles(()),
+        "committed evidence",
+        "evidence-manifest.json",
+        credential_field_check=True,
+    )
+    # Producer / consumer pass a normal business diagnostic unchanged — the
+    # bounded walker may reorder JSON keys during its stack rebuild, so the
+    # masked document must be JSON-equal to the input, never false-positive.
+    business = json.dumps(
+        {
+            "summary": "flight search done",
+            "query": {"origin": "ICOM_AIRPORT", "date": "2026-08-14"},
+            "results": 2,
+        }
+    )
+    assert json.loads(canary._desensitize(business)) == json.loads(business)
+    assert json.loads(gate._sanitize_canary_diag_field(business, "fallback")) == (
+        json.loads(business)
+    )
+
+
+def test_gap1_delimiter_in_key_never_whitelisted() -> None:
+    """C-122 supervision 09:28 (gap A) counter-example: a 64-hex smuggled under a
+    KEY that embeds path delimiters / array markers (``files[].sha256`` as a
+    single key, ``files[]`` wrapping the ``sha256`` member, a dotted
+    ``done_gate.checks[].evidence.candidate_set_sha256`` key) must be REJECTED —
+    the digest whitelist matches TYPED key paths (string segments and array
+    markers separated), never a dotted key segment.  A real committed path — a
+    top-level ``api_payload_candidate_set_sha256`` / ``scenario_sha256`` scalar,
+    the real ``files[].sha256`` nesting and the real ``done_gate.checks[].evidence.
+    candidate_set_sha256`` nesting — stays accepted."""
+    hex64 = "a" * 64
+    for raw in (
+        json.dumps({"files[].sha256": hex64}),
+        json.dumps({"files[]": {"sha256": hex64}}),
+        json.dumps({"done_gate.checks[].evidence.candidate_set_sha256": hex64}),
+    ):
+        with pytest.raises(gate.GateStateChangedError, match="64-hex"):
+            gate._reject_unknown_64hex_values(raw.encode(), b"x", "delim.json")
+    for raw in (
+        json.dumps({"api_payload_candidate_set_sha256": hex64}),
+        json.dumps({"scenario_sha256": hex64}),
+        json.dumps({"files": [{"sha256": hex64}]}),
+        json.dumps(
+            {
+                "done_gate": {
+                    "checks": [{"evidence": {"candidate_set_sha256": hex64}}]
+                }
+            }
+        ),
+    ):
+        gate._reject_unknown_64hex_values(raw.encode(), b"x", "real.json")
+
+
+def test_gap2_short_credential_values_to_field_boundary(tmp_path: Path) -> None:
+    """C-122 supervision 09:28 (gap B) counter-example: the SHARED credential-field
+    parse/mask covers from the FIRST non-empty value character to a clear field
+    boundary or the whole diagnostic — a 1-char (``Session_token=a``), 2-char
+    (``Session_token=ab``), space-separated (``Session_token: abc def`` — no
+    ``def`` residue), quoted (``session_token=\"a\"``) or semicolon-bounded
+    (``token=a; next=1``) value is masked WHOLE by the producer / consumer and
+    rejected by both final scans; a real seal-on-disk diagnostic never leaks any
+    of the short forms; and normal business prose (``we use a cookie jar``,
+    ``secret=[REDACTED]``, ``pending user authorization: no connected
+    Companion``) stays untouched."""
+    from benchmarks import live_canary_certified as canary
+
+    leak_free: list[tuple[str, str, str]] = [
+        ("1-char", "Session_token=a", "session_token"),
+        ("2-char", "Session_token=ab", "session_token"),
+        ("space-separated", "Session_token: abc def", "def"),
+        ("quoted 1-char", 'session_token="a"', "session_token"),
+        ("quoted 2-char", 'session_token="ab"', "session_token"),
+        ("semicolon 1-char", "token=a; next=1", "token=a"),
+        ("semicolon 2-char", "token=ab; next=1", "token=ab"),
+        ("fullwidth value", "Session_token=ａ", "session_token"),
+        ("zero-width value", "Session​token=a", "session_token"),
+        ("structured 1-char", json.dumps({"Session_token": "a"}), "session_token"),
+        ("structured 2-char", json.dumps({"Session_token": "ab"}), "session_token"),
+    ]
+    for label, raw, gone in leak_free:
+        producer_out = canary._desensitize(raw)
+        assert gone not in producer_out.lower(), (
+            f"producer leaked {gone!r} for {label}: {producer_out!r}"
+        )
+        consumer_out = gate._sanitize_canary_diag_field(raw, "fallback")
+        assert gone not in consumer_out.lower(), (
+            f"consumer leaked {gone!r} for {label}: {consumer_out!r}"
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+
+    # A real seal-on-disk diagnostic never leaks any of the short forms.
+    output = tmp_path / "live-canary-certified.json"
+    diag_path = canary._seal_failure_diagnostic(
+        "evaluate",
+        RuntimeError(
+            "upstream 401 Session_token=a Session_token: abc def token=ab; next=1"
+        ),
+        output,
+        run_id="abc123def456",
+        tested_sha="a" * 40,
+    )
+    assert diag_path.is_file()
+    summary = json.loads(diag_path.read_text(encoding="utf-8"))["summary"]
+    assert "session_token" not in summary.lower()
+    assert "def" not in summary
+    assert "token=ab" not in summary
+
+    # Normal business text passes through both mask layers unchanged — the
+    # credential-FIELD shape must never flag an ordinary English sentence
+    # (``cookie`` is a word, ``[REDACTED]`` is already a marker, ``token`` as a
+    # plain word has no assignment).
+    for prose in ("we use a cookie jar", "secret=[REDACTED]", "flight search done"):
+        assert canary._desensitize(prose) == prose, f"producer masked prose {prose!r}"
+        assert gate._sanitize_canary_diag_field(prose, "fallback") == prose, (
+            f"consumer masked prose {prose!r}"
+        )
+    # The canary's own scope-detail PROSE (``authorization`` as an English word,
+    # no token payload) stays allowed by the COMMITTED structured scan — it sits
+    # inside a JSON string value, not at a header field position (the same
+    # regression ``test_secret_scan_allows_canary_pending_authorization_prose``
+    # covers).  The free-form producer / failure-path masks still collapse it
+    # as a whole header by design — a cosmetic loss, never a leak.
+    prose = (
+        "pending user authorization: no connected Companion declares provider "
+        "'ctrip'; pair the Companion and re-run"
+    )
+    gate._secret_scan_bytes(
+        json.dumps(
+            {"scopes": [{"scope": "ctrip:flight", "authorized": False, "detail": prose}]}
+        ).encode(),
+        gate._SecretNeedles(()),
+        "evidence",
+        "live-canary-certified.json",
+        credential_field_check=True,
+    )
+
+
+def test_producer_consumer_mask_fullwidth_zero_width_credential_spans() -> None:
+    """C-122 supervision 00:06 (要求 B) counter-example: the producer
+    ``_desensitize`` and consumer ``_sanitize_canary_diag_field`` mask a
+    full-width / zero-width-obfuscated credential span to ``[REDACTED]``, while
+    the prose PREFIX survives — only the credential-carrying span is collapsed,
+    never the whole message."""
+    from benchmarks import live_canary_certified as canary
+
+    for raw in (
+        "Ａuthorization: Basic YWJjZA==",
+        "Author​ization: Basic YWJjZA==",
+        "Ｂｅａｒｅｒ abcd",
+        "ｔｏｋｅｎ＝abc",
+    ):
+        producer_out = canary._desensitize(raw)
+        assert producer_out == "[REDACTED]"
+        consumer_out = gate._sanitize_canary_diag_field(raw, "fallback")
+        assert consumer_out == "[REDACTED]"
+    # Prose prefix survives; only the credential span is masked.
+    for raw in (
+        "pending user Ａuthorization: Basic YWJjZA== end",
+        "pending user Author​ization: Basic end",
+    ):
+        consumer_out = gate._sanitize_canary_diag_field(raw, "fallback")
+        assert "pending user" in consumer_out
+        assert "[REDACTED]" in consumer_out
 
 
 def test_secret_scan_rejects_double_encoded_authorization_in_structured_json(
@@ -7540,9 +8353,12 @@ def test_commit_evidence_rejects_non_json_pointer_report(
 
     monkeypatch.setattr(gate, "_dump", tampered_p_dump)
 
-    with pytest.raises(
-        gate.GateStateChangedError, match="authoritative report is not valid JSON"
-    ):
+    # C-122 supervision 07:29 (gap 2): the malformed top-level JSON check now
+    # fires FIRST in the final secret scan (the poisoned ``{not valid json``
+    # staged report is a ``.json`` evidence artifact), so the message names the
+    # malformed top-level JSON rather than the later committed-blob parse.  The
+    # fail-closed outcome is identical: the branch never moves.
+    with pytest.raises(gate.GateStateChangedError, match="malformed top-level JSON"):
         gate._commit_evidence(staging_dir, report, start=start)
 
     # Fail closed: the branch never moved, the tree is clean.

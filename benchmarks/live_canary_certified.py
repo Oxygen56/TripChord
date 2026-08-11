@@ -32,7 +32,14 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from tripchord._secret_redact import bounded_json_mask
+from tripchord._secret_redact import (
+    CREDENTIAL_FIELD_NAME_PATTERN,
+    PatternScope,
+    bounded_json_mask,
+    mask_normalized_spans,
+    registry_pattern,
+    registry_patterns,
+)
 from tripchord.platform.registry import build_default_registry
 from tripchord.providers.browser_bridge import BRIDGE_TOKEN_HEADER
 from tripchord.providers.icom_transfer import (
@@ -59,29 +66,33 @@ _ICOM_REPLAY_DELAY_SECONDS = 0.5
 # Any value that LOOKS like a bearer token / key (>=32 chars of letters, digits,
 # ``_``, ``-``, ``=``) is redacted from a diagnostic summary before it can reach
 # stderr or the committed evidence — a canary failure must never echo a secret.
-_TOKEN_SHAPE_RE = re.compile(r"[A-Za-z0-9_\-=]{32,}")
+# Every credential-shape regex this producer masks with is DERIVED from the
+# single typed registry in ``tripchord._secret_redact`` (C-122 supervision
+# 08:30+08:31 补充 C) — a shape / flag change lands in producer, consumer and
+# final scan at once instead of three hand-synced copies.  The named variables
+# stay so the mask chain below can apply each pattern with its own replacement
+# (``<url>`` vs ``[REDACTED]``).
+_TOKEN_SHAPE_RE = registry_pattern("token_run")
 
 # C-122 supervision 02:56 (Block 2): the 32+ run alone misses short Bearer/JWT,
 # AKIA/GitHub-style and ``token=``-short-opaque credentials that can otherwise
 # hit disk (``<output>.failure.json``) or stderr.  These structured shape
 # patterns mirror the consumer's ``_sanitize_canary_diag_field``
-# (``scripts/run_product_done_gate.py``) — keep both sets in sync so the
-# producer artifact is already sanitized BEFORE the consumer re-checks it.
-_CANARY_DIAG_URL_RE = re.compile(r"https?://[^\s\"'<>)\[\]{}]+")
-_CANARY_DIAG_AKIA_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
-_CANARY_DIAG_PREFIX_TOKEN_RE = re.compile(
-    r"(?i)\b(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-|xoxa-|"
-    r"sk-|rk-)[A-Za-z0-9_\-]{6,}"
-)
-_CANARY_DIAG_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-.]{4,}")
-_CANARY_DIAG_DOTTED_TOKEN_RE = re.compile(
-    r"\b[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]{3,}\b"
-)
-_CANARY_DIAG_OPAQUE_KV_RE = re.compile(
-    r"(?i)\b(?:token|password|passwd|secret|apikey|api_key|access_key|"
-    r"secret_key|client_secret|authorization|bearer|private_key|session_key)\b"
-    r"\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
-)
+# (``scripts/run_product_done_gate.py``) — both derive from the same registry so
+# the producer artifact is already sanitized BEFORE the consumer re-checks it.
+_CANARY_DIAG_URL_RE = registry_pattern("url")
+_CANARY_DIAG_AKIA_RE = registry_pattern("akia")
+_CANARY_DIAG_PREFIX_TOKEN_RE = registry_pattern("prefix_token")
+_CANARY_DIAG_BEARER_RE = registry_pattern("bearer")
+_CANARY_DIAG_DOTTED_TOKEN_RE = registry_pattern("dotted_token")
+_CANARY_DIAG_OPAQUE_KV_RE = registry_pattern("opaque_kv")
+# C-122 supervision 09:00: the credential FIELD NAME shape — an ASCII / full-width
+# ``Session_token=abc`` / ``"Session_token":"abc"`` key-value assignment (the
+# ``session_token`` family and bare ``token=`` / ``cookie=`` / ``secret=``) must be
+# masked WHOLE (name + value) before the diagnostic ever reaches stderr or the
+# ``<output>.failure.json`` summary — the short value would otherwise survive
+# every existing shape scan (``opaque_kv``'s key list stops at ``session_key``).
+_CANARY_DIAG_CREDENTIAL_FIELD_RE = registry_pattern("credential_field")
 # C-122 supervision 03:46 (Block 1): whole-header/field redaction.  The shape
 # patterns above still let a credential BODY slip through when the value is
 # short or carries ``;`` / spaces — ``Cookie: session=abc; csrftoken=xyz`` keeps
@@ -91,8 +102,8 @@ _CANARY_DIAG_OPAQUE_KV_RE = re.compile(
 # at all.  This pattern masks the WHOLE header field (name + ``:``/``=`` +
 # value, up to the next newline) so the credential and its body are
 # removed together — mirrors the consumer's ``_AUTH_COOKIE_PATTERN`` in
-# ``scripts/run_product_done_gate.py`` (keep both in sync).  Over-redaction is
-# the fail-closed direction.
+# ``scripts/run_product_done_gate.py``.  Over-redaction is the fail-closed
+# direction.
 # C-122 supervision 04:14: any non-empty value is masked whole — no {4,}
 # character floor (``Cookie:a=b`` / ``X-API-Key:abc``) and no quote stops the
 # span (``Authorization: "Basic YWJjZA=="`` / ``Set-Cookie: "sid=abc;
@@ -101,12 +112,20 @@ _CANARY_DIAG_OPAQUE_KV_RE = re.compile(
 # "Basic a"}`` / ``{'Set-Cookie': 'sid=abc'}``) is recognised too — an optional
 # quote may sit between the field name and the ``:``/``=`` and between the
 # ``:``/``=`` and the value, so a double-quoted JSON key or a single-quoted
-# dict key is masked WHOLE, never split at the quote.  Mirrors the consumer's
-# ``_CANARY_DIAG_WHOLE_HEADER_RE`` (keep both in sync).
-_CANARY_DIAG_WHOLE_HEADER_RE = re.compile(
-    r"(?i)\b(?:proxy[-_ ]authorization|set[-_ ]cookie|x-api-key|api[-_ ]key|"
-    r"authorization|cookie)\b\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
-    r"(?:\\*[\"']?|[\"'])?[^\r\n]+"
+# dict key is masked WHOLE, never split at the quote.
+_CANARY_DIAG_WHOLE_HEADER_RE = registry_pattern("whole_header")
+# C-122 supervision 00:06 (要求 B) + 08:30+08:31 补充 B: the SAME shape set —
+# including the 32+ token run and the tracking URL — is re-checked on a
+# NORMALIZED copy (NFKC + casefold, Cf/U+200B dropped) by
+# ``bounded_json_mask(..., normalize_patterns=...)``: a full-width /
+# zero-width-obfuscated credential (``\uff21uthorization: Basic``,
+# ``Author\u200bization: ...``, full-width
+# ``\uff54\uff4f\uff4b\uff45\uff4e\uff1d\uff41\uff42\uff43``) and a
+# full-width / Cf-obfuscated ``HTTPS://`` URL are collapsed even though the
+# ASCII regexes above stop seeing them on the raw text.  Only a COPY is
+# normalized; the producer artifact text is returned with those spans masked.
+_NORMALIZED_DETECTION_PATTERNS: tuple[re.Pattern[str], ...] = registry_patterns(
+    PatternScope.NORMALIZED
 )
 
 # C-122 round-19 (2026-08-11 17:03 supervisor veto): the certified canary scope
@@ -301,19 +320,54 @@ def _desensitize(text: str) -> str:
     structural-start string that does not parse and a depth/node/size budget
     overflow both fail closed to ``[REDACTED]``.
     """
-    return bounded_json_mask(text, mask_level=_desensitize_level)
+    return bounded_json_mask(
+        text,
+        mask_level=_desensitize_level,
+        # C-122 supervision 00:06 (要求 B): re-check every masked level on the
+        # NORMALIZED copy (NFKC + casefold, Cf/U+200B dropped) so a full-width /
+        # zero-width-obfuscated credential span is collapsed even though the
+        # ASCII shape regexes stopped seeing it on the raw text.
+        normalize_patterns=_NORMALIZED_DETECTION_PATTERNS,
+        # C-122 supervision 09:00: a STRUCTURED JSON credential field NAME
+        # (``{"Session_token":"abc"}``) is masked whole too — the key would
+        # otherwise survive the free-form value-only walk.
+        key_patterns=(CREDENTIAL_FIELD_NAME_PATTERN,),
+    )
 
 
 def _desensitize_level(text: str) -> str:
     """Mask ONE free-form text level with the credential-shape regex chain."""
-    text = _CANARY_DIAG_WHOLE_HEADER_RE.sub("[REDACTED]", text)
+    # C-122 supervision 09:00 (gap 2): mask the credential-FIELD assignment on
+    # the NORMALIZED copy of the RAW text FIRST.  A zero-width-split field name
+    # (``Session​token:"abc"``) would otherwise be PARTIALLY masked by the
+    # opaque-KV shape below — the Cf char is a word boundary, so ``token:…`` is
+    # collapsed and the ``Session`` name half survives.  The WHOLE-HEADER shape
+    # runs here too so a full-width ``\uff21uthorization: Basic YWJjZA==`` masks
+    # name-and-base64 together (the tightened credential-FIELD value pattern
+    # stops at the space after ``Basic``).  Normalizing first folds the Cf /
+    # full-width split back into ASCII and masks the whole assignment before
+    # the ASCII chain can tear it apart.
+    # C-122 supervision 09:28 (gap 2 regression): collapse URLs on the RAW text
+    # BEFORE the normalized credential-field pre-pass.  The credential-field
+    # value now runs from the first value char to a clear field boundary (spaces
+    # included), so without this a trailing ``https://…`` scheme would be
+    # swallowed into the value (``token=abc https``) and the URL host would
+    # survive once the scheme half was redacted.  Masking the URL first turns
+    # ``token=abc <url>`` into a clean ``[REDACTED] <url>``.
     text = _CANARY_DIAG_URL_RE.sub("<url>", text)
+    text = mask_normalized_spans(
+        text,
+        (_CANARY_DIAG_WHOLE_HEADER_RE, _CANARY_DIAG_CREDENTIAL_FIELD_RE),
+        marker="[REDACTED]",
+    )
+    text = _CANARY_DIAG_WHOLE_HEADER_RE.sub("[REDACTED]", text)
     text = _TOKEN_SHAPE_RE.sub("[REDACTED]", text)
     text = _CANARY_DIAG_AKIA_RE.sub("[REDACTED]", text)
     text = _CANARY_DIAG_PREFIX_TOKEN_RE.sub("[REDACTED]", text)
     text = _CANARY_DIAG_BEARER_RE.sub("[REDACTED]", text)
     text = _CANARY_DIAG_DOTTED_TOKEN_RE.sub("[REDACTED]", text)
     text = _CANARY_DIAG_OPAQUE_KV_RE.sub("[REDACTED]", text)
+    text = _CANARY_DIAG_CREDENTIAL_FIELD_RE.sub("[REDACTED]", text)
     return text
 
 
