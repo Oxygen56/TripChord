@@ -462,7 +462,17 @@ def _is_whole_header_prose(value: str) -> bool:
     * a real base64 payload (``Basic YWJjZA==``) — never prose;
     * a SHORT non-empty Basic payload (``Basic a``) — a placeholder credential,
       never prose (R21 Block 27 restores the non-empty-short-value rejection);
-    * otherwise every Basic payload is non-credential prose -> prose.
+    * a payload whose decoded bytes contain ``:`` — a real ``user:pass``
+      credential even when the bytes are not UTF-8 (``Basic dXNlcjr/`` decodes
+      to ``user:\xff``), never prose (R22 Block 29 closes the Latin-1/base64
+      variant);
+    * a payload that is NOT a decodable base64 body and is the LAST content of
+      the header value — a lone short placeholder (``Basic ab`` / ``Basic abc``),
+      never proven prose (R22 Block 29);
+    * otherwise every Basic payload is non-credential prose -> prose
+      (``authorization: Basic is required`` — trailing text after a
+      non-decodable ``is``; ``authorization: Basic auth/setting`` — a decodable
+      body whose bytes carry no ``:``, so prose even at the value end).
     """
     if len(list(_HEADER_FIELD_NAME_RE.finditer(value))) != 1:
         return False
@@ -470,9 +480,18 @@ def _is_whole_header_prose(value: str) -> bool:
     if bm is None:
         return False
     for bm in _BASIC_VALUE_TOKEN_RE.finditer(value):
-        if _is_valid_basic_payload(bm.group("payload")):
+        payload = bm.group("payload")
+        if _is_valid_basic_payload(payload):
             return False
-        if len(bm.group("payload")) < 2:
+        if len(payload) < 2:
+            return False
+        try:
+            decoded = base64.b64decode(payload, validate=True)
+        except (ValueError, binascii.Error):
+            decoded = b""
+        if b":" in decoded:
+            return False
+        if not decoded and not value[bm.end():].strip():
             return False
     return True
 
@@ -529,7 +548,15 @@ _SHAPE_PATTERN_DIGEST_AUTH_RE = re.compile(
     # ``digest`` with a plain word between it and ``response=`` — no longer
     # matches (business positive preserved), while a real Digest header /
     # decoded value still fails closed on both FINAL scans.
-    r"(?i)(?:^|[^A-Za-z0-9_])digest\b(?:"
+    #
+    # R22 Block 32: the leading guard is a FIELD-POSITION guard, not any
+    # non-alphanumeric — ``digest`` must sit at a line/value start, after a
+    # structural delimiter (``,;{}[]"'\\`` or ``:``), never mid-prose after a
+    # plain word.  So a business sentence ``model digest algorithm=md5
+    # response=<hex>`` (``algorithm`` is also a generic English word) no longer
+    # matches, while a real ``Digest username="user", response=<hex>`` at a
+    # field position still fails closed on both FINAL scans.
+    r"(?i)(?:^|[\r\n,;{}\[\]\"'\\]|:[ \t]*)digest\b(?:"
     r"[^\r\n]{0,200}?(?:username|realm|nonce|uri|qop|nc|cnonce|opaque|"
     r"algorithm|stale|domain)\s*=\s*(?:[\"'][^\"']{0,80}[\"']|[^,\r\n]{1,80})"
     r"[^\r\n]{0,120}?response\s*=\s*[\"']?[0-9a-f]{16,128}"
@@ -542,25 +569,68 @@ _SHAPE_PATTERN_DIGEST_AUTH_RE = re.compile(
 # committed summary, or a ``[REDACTED]<alnum>`` splice after a split value).
 # The exact marker followed by a JSON delimiter / space / end is the gate's own
 # clean report and never matches this shape.
+#
+# R22 Block 31: the residue recognizer is case-insensitive and covers the
+# normalized (NFKC + casefold) copy — a MIXED-case residue
+# (``[Redacted]mySecret1``), a full-width marker
+# (``[\\uff32\\uff25\\uff24\\uff21\\uff23\\uff34\\uff25\\uff24]mySecret1``)
+# or a zero-width/Cf-obfuscated marker (``[RE\\u200dDACTED]mySecret1``) is the
+# same marker-splice leak in an ordinary summary and fails closed on both
+# finals, while the gate's OWN clean exact ``[REDACTED]`` marker is blanked
+# before this scan (R21 Block 26) and is never followed by a credential char.
 _SHAPE_PATTERN_REDACTION_RESIDUE_RE = re.compile(
-    r"\[REDACTED\](?=[A-Za-z0-9+/=])"
+    r"(?i)\[REDACTED\](?=[A-Za-z0-9+/=])"
 )
 
 # R20 Block 17: a BARE credential-shaped value with NO field name — a
-# camelCase token ending in a digit run (``mySuperSecret123``), the classic
+# camelCase token with a digit run (``mySuperSecret123``), the classic
 # generated-password shape.  A committed artifact must fail closed on the value
 # class even when no credential-field name or known secret value is present.
 # Word-bounded so prose / snake_case keys never match.
-_SHAPE_PATTERN_BARE_CREDENTIAL_VALUE_RE = re.compile(
-    # R21 Block 25: the BARE value must end in a MULTI-DIGIT run (``{2,}``) so a
-    # single trailing version digit — ``flightOption1`` / ``day2`` /
-    # ``plannerV2`` / ``providerV4`` — is a business value, not a credential,
-    # while a generated-password shape (``mySuperSecret123`` /
-    # ``anotherSecret99``) still fails closed.  The R20 contract (block 17)
-    # kept the same camelCase+digit class; the digit-run floor separates the
-    # two without weakening the bare-value backstop.
-    r"(?<![A-Za-z0-9_])[a-z]+[A-Z][A-Za-z0-9_]*[0-9]{2,}[A-Za-z0-9_]*(?![A-Za-z0-9_])"
+#
+# R22 Block 28 + Block 32: the R21 MULTI-DIGIT floor (``{2,}``) is REPLACED by a
+# real discriminator so ANY-digit fail-closed returns (``mySuperSecret1`` /
+# ``abcD1xyz9`` reject) while business camelCase (``flightOption1`` /
+# ``flightOption12`` / ``day2`` / ``plannerV2`` / ``providerV4``) stays
+# accepted.  A token is a bare credential when it either contains a
+# credential KEYWORD component (``secret`` / ``token`` / ``password`` / … —
+# ``mySuperSecret1``) or has a MID-TOKEN digit run followed by letters
+# (``abcD1xyz9`` — the digit is not a trailing version number).
+_BARE_CREDENTIAL_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[a-z]+[A-Z][A-Za-z0-9_]*[0-9]+[A-Za-z0-9_]*(?![A-Za-z0-9_])"
 )
+_BARE_CREDENTIAL_KEYWORD_RE = re.compile(
+    r"(?i)(?:secret|password|passwd|pwd|credential|creds?|apikey|token|"
+    r"access[_ -]?key|session[_ -]?key|private[_ -]?key|client[_ -]?secret|"
+    r"auth[_ -]?token|session[_ -]?token|access[_ -]?token|refresh[_ -]?token)"
+)
+
+
+def _is_bare_credential_token(token: str) -> bool:
+    """True when a camelCase-and-digit token is a BARE credential value: it
+    contains a credential keyword component (``Secret`` in ``mySuperSecret1``)
+    OR its digit run is followed by a letter inside the token (``1xyz`` in
+    ``abcD1xyz9``), so a trailing version digit (``flightOption12``) is not a
+    credential."""
+    if _BARE_CREDENTIAL_KEYWORD_RE.search(token):
+        return True
+    return bool(re.search(r"[0-9]+[A-Za-z]", token))
+
+
+class _BareCredentialScan:
+    """Final-scan ``bare_credential_value`` backstop as a drop-in ``.search``-able
+    object: iterates EVERY word-bounded camelCase-and-digit token and rejects it
+    via :func:`_is_bare_credential_token` (R22 Block 28/32 restore the any-digit
+    contract while keeping business values positive)."""
+
+    def search(self, text: str) -> re.Match[str] | None:
+        for m in _BARE_CREDENTIAL_TOKEN_RE.finditer(text):
+            if _is_bare_credential_token(m.group(0)):
+                return m
+        return None
+
+
+_SHAPE_PATTERN_BARE_CREDENTIAL_VALUE_RE = _BareCredentialScan()
 
 _S = PatternScope
 # ``FINAL_VALUE`` deliberately EXCLUDES the dotted-token, whole-header and

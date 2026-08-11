@@ -855,6 +855,57 @@ _AUTH_COOKIE_PATTERN = re.compile(
     re.MULTILINE,
 )
 
+# R22 Block 30: the FINAL-scan ONLY mid-word (descriptor-prefixed) header form —
+# ``upstream Cookie: sid=abc trailing``.  The anchored ``_AUTH_COOKIE_PATTERN``
+# needs the field name at a header position, so a real Cookie/Auth header that
+# follows a descriptor word (a provider log line) escapes the committed
+# decoded-value scan.  This broader pattern matches the name after ANY word
+# boundary; :func:`_is_midword_header_prose` then separates a real credential
+# VALUE (cookie ``key=value``, Basic/Bearer token) from plain English prose
+# (``pending user authorization: no connected Companion…``).  The value is
+# quote/newline-bounded so a single-line JSON evidence file cannot let one
+# prose match swallow the JSON tail and misread a later ``?date=…`` / ``a=b``
+# query string as a credential value.
+_AUTH_COOKIE_BROAD_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9_-])(?:proxy-authorization|set-cookie|x-api-key|"
+    r"authorization|cookie)\b\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
+    r"(?:\\*[\"']?|[\"'])?[^\r\n\"']{1,200}",
+    re.MULTILINE,
+)
+_AUTH_COOKIE_BODY_RE = re.compile(r"(?i)^[^:=\r\n]*[:=]\s*(.*)$", re.DOTALL)
+# A Basic / Bearer scheme token is a credential ANYWHERE in the value, while a
+# cookie ``key=value`` is only a credential at the START of the value (see
+# :func:`_is_midword_header_prose`) — an env-var assignment far into prose
+# (``set TRIPCHORD_ACK_MODEL_COST=1 to authorise…``) is not a cookie.
+_HEADER_VALUE_BASIC_BEARER_RE = re.compile(
+    r"(?i)\b(?:basic|bearer)\b[ \t]+[A-Za-z0-9+/=_\-.]{2,}"
+)
+_HEADER_VALUE_KV_RE = re.compile(
+    r"(?i)[A-Za-z0-9_.-]{1,32}\s*=\s*[^\s,;\"']{1,}"
+)
+# A real cookie ``key=value`` sits immediately after the header colon
+# (``upstream Cookie: sid=abc trailing`` -> ``sid=abc`` at position 0).
+_HEADER_VALUE_KV_START_MAX = 16
+
+
+def _is_midword_header_prose(value: str) -> bool:
+    """True when a MID-WORD (descriptor-prefixed) auth/cookie header match
+    carries plain English prose rather than a credential payload.  A Basic /
+    Bearer scheme token is a credential anywhere in the value; a cookie
+    ``key=value`` is a credential only when it starts the value (``upstream
+    Cookie: sid=abc trailing``), never when it is an env-var assignment far into
+    prose (the gate's own ``pending user authorization: … set
+    TRIPCHORD_ACK_MODEL_COST=1 …`` report line)."""
+    body = _AUTH_COOKIE_BODY_RE.match(value)
+    if body is None:
+        return True
+    body_text = body.group(1)
+    if _HEADER_VALUE_BASIC_BEARER_RE.search(body_text):
+        return False
+    kv = _HEADER_VALUE_KV_RE.search(body_text)
+    return kv is None or kv.start() > _HEADER_VALUE_KV_START_MAX
+
+
 class _AuthCookieLeakScan:
     """FINAL-scan ``Authorization``/``Cookie`` value backstop with the round-20
     Block 20c Basic-prose exception.
@@ -874,12 +925,25 @@ class _AuthCookieLeakScan:
     :func:`_is_whole_header_prose` (shared module) decides per VALUE whether
     the prose exemption may apply (a second sensitive field name, a real
     payload, or a short non-empty ``Basic a`` placeholder is never prose).
+
+    R22 Block 29/30: a short / Latin-1 Basic payload that ENDS the value
+    (``Basic ab`` / ``Basic abc`` / ``Basic dXNlcjr/``) is no longer prose
+    (Block 29), and the scan ALSO iterates mid-word (descriptor-prefixed)
+    headers — ``upstream Cookie: sid=abc trailing`` — whose credential-shaped
+    VALUE fails the committed decoded-value scan closed (Block 30) while the
+    ``pending user authorization: …`` prose positives stay allowed.
     """
 
     def search(self, text: str) -> re.Match[str] | None:
         for m in _AUTH_COOKIE_PATTERN.finditer(text):
             if not _is_whole_header_prose(m.group(0)):
                 return m
+        for m in _AUTH_COOKIE_BROAD_PATTERN.finditer(text):
+            if _is_whole_header_prose(m.group(0)):
+                continue
+            if _is_midword_header_prose(m.group(0)):
+                continue
+            return m
         return None
 
 
