@@ -49,14 +49,14 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from tripchord._secret_redact import (
-    _BASIC_VALUE_TOKEN_RE,
+    _CREDENTIAL_FIELD_STRONG_NAME_ALT,
     _SHAPE_PATTERN_DIGEST_AUTH_RE,
     BARE_CREDENTIAL_FIELD_NAMES,
     CREDENTIAL_FIELD_NAME_PATTERN,
     DuplicateJsonKeyError,
     PatternScope,
     RecursiveJsonBudgetError,
-    _is_valid_basic_payload,
+    _is_whole_header_prose,
     _normalize_for_scan,
     bounded_json_mask,
     iter_json_levels,
@@ -867,16 +867,20 @@ class _AuthCookieLeakScan:
     scans.  ``_is_valid_basic_payload`` (shared module) applies the length-4
     alignment + padding + decodes-to-UTF-8 validity check so the exemption can
     never mask a real credential.
+
+    R21 Block 22/23: ``.search`` iterates EVERY header match — a leading prose
+    Basic value must never hide a real ``Authorization: Basic YWJjZA==`` or a
+    ``Cookie: sid=abc trailing`` later in the same text — and
+    :func:`_is_whole_header_prose` (shared module) decides per VALUE whether
+    the prose exemption may apply (a second sensitive field name, a real
+    payload, or a short non-empty ``Basic a`` placeholder is never prose).
     """
 
     def search(self, text: str) -> re.Match[str] | None:
-        m = _AUTH_COOKIE_PATTERN.search(text)
-        if m is None:
-            return None
-        bm = _BASIC_VALUE_TOKEN_RE.search(m.group(0))
-        if bm is not None and not _is_valid_basic_payload(bm.group("payload")):
-            return None
-        return m
+        for m in _AUTH_COOKIE_PATTERN.finditer(text):
+            if not _is_whole_header_prose(m.group(0)):
+                return m
+        return None
 
 
 _AUTH_COOKIE_LEAK_SCAN = _AuthCookieLeakScan()
@@ -1196,6 +1200,19 @@ def _reject_credential_field_names(data: bytes, label: str, name: str) -> None:
                             or _CREDENTIAL_FIELD_RE.search(norm_key)
                             or norm_key.strip() in _BARE_CREDENTIAL_FIELD_NAMES
                         ):
+                            # R21 Block 26: a credential field whose value is
+                            # EXACTLY the gate's own case-exact redaction marker
+                            # (``{"secret": "[REDACTED]"}``, at a top-level or a
+                            # DECODED nested JSON-string level) is the gate's
+                            # clean redacted report, not a leak.  Only the
+                            # complete, case-exact ``[REDACTED]`` is exempt —
+                            # ``[Redacted]`` / ``[REDACTED]x`` /
+                            # ``[RE​DACTED]`` are impersonations and still
+                            # fail closed (the shared credential-field shape's
+                            # case-exact exemption already guards the free-text
+                            # form).
+                            if isinstance(value, str) and value == "[REDACTED]":
+                                continue
                             raise GateStateChangedError(
                                 f"secret leak: credential field name {key!r} in "
                                 f"{label} file {name}"
@@ -1637,8 +1654,17 @@ def _scan_decoded_string_value(
         if name.endswith(".failure.json")
         else registry_shape_pairs(PatternScope.FINAL_VALUE)
     )
+    # R21 Block 26: the SAME exact-marker blanking applies to a decoded
+    # JSON-string level — a clean redacted report smuggled through json.dumps
+    # (``{"summary": "{\"secret\": \"[REDACTED]\"}"}``) decodes to an exact
+    # marker assignment here and must not be a shape false positive.  Only the
+    # RAW case-exact complete marker is blanked; an impersonation stays a leak.
+    value_shapes = _blank_diagnostic_schema_version(
+        _blank_exact_marker_assignments(value_masked)
+    )
+    value_shapes_norm = _normalize_for_scan(value_shapes)
     for pattern, kind in shape_pairs:
-        if pattern.search(value_masked) or pattern.search(value_norm):
+        if pattern.search(value_shapes) or pattern.search(value_shapes_norm):
             raise GateStateChangedError(
                 f"secret leak: {kind} in decoded value in {label} file {name}"
             )
@@ -1763,8 +1789,15 @@ def _secret_scan_bytes(
     # would false-positive the gate.  A producer that fails to sanitize its
     # diagnostic still fails the gate closed before certification.
     if name.endswith(".failure.json"):
+        # R21 Block 26: blank the gate's own exact-marker assignments on the
+        # free-form diagnostic path too, so a clean redacted report (or its
+        # decoded nested JSON-string level) is not a shape false positive.
+        failure_text = _blank_diagnostic_schema_version(
+            _blank_exact_marker_assignments(masked_text)
+        )
+        failure_norm = _normalize_for_scan(failure_text)
         for pattern, kind in _FINAL_TEXT_SHAPE_PAIRS:
-            if pattern.search(masked_text):
+            if pattern.search(failure_text):
                 raise GateStateChangedError(
                     f"secret leak: {kind} in {label} file {name}"
                 )
@@ -1773,7 +1806,7 @@ def _secret_scan_bytes(
         # free-form diagnostic is caught even when the ASCII shapes stop seeing
         # it on the raw bytes.
         for pattern, kind in _FINAL_TEXT_SHAPE_PAIRS:
-            if pattern.search(norm_masked):
+            if pattern.search(failure_norm):
                 raise GateStateChangedError(
                     f"secret leak: {kind} in {label} file {name}"
                 )
@@ -1787,21 +1820,38 @@ def _secret_scan_bytes(
     # committed JSON artifact's field KEYS are already rejected structurally
     # (``_reject_credential_field_names``); this closes the free-text form.
     #
-    # R20 Block 17: the bare-value / residue shapes are TEXT credential forms —
-    # they are skipped on a BINARY artifact (a screenshot PNG, an opaque blob)
-    # whose bytes do not even decode as strict UTF-8, so a ``utf-8``
-    # ``errors="ignore"`` decode of binary noise cannot false-positive the
-    # camelCase-and-digit shape.  The byte-exact needle scan above and the
+    # R20 Block 17 + R21 Block 21: the binary (non-strict-UTF-8) guard is now
+    # NARROWED to the BARE camelCase-and-digit shape only — that shape is the
+    # one that false-positives on a ``utf-8`` ``errors="ignore"`` decode of
+    # binary noise (a screenshot PNG's pixels).  The FIELD-NAME-ANCHORED shapes
+    # (``credential_field`` / ``basic_auth`` / ``redaction_residue``) are
+    # literal field-name / marker signals and run on EVERY artifact, binary
+    # included — a PNG whose metadata embeds ``secret=mySuperSecret123`` /
+    # ``Session_token=Abc123!`` must fail closed even though the bytes are not
+    # strict UTF-8.  The byte-exact needle scan above and the
     # Authorization/Cookie / phone / tracking-URL pattern scans still apply to
-    # binary files, so a credential literally embedded in a binary stays caught.
+    # binary files too.
     try:
         data.decode("utf-8")
     except UnicodeDecodeError:
         is_utf8_text = False
     else:
         is_utf8_text = True
+    # R21 Block 26: blank the gate's OWN clean redacted reports
+    # (``secret="[REDACTED]"`` / ``\"secret\": \"[REDACTED]\"`` at a decoded
+    # nested JSON-string level) BEFORE the anchored shapes scan, so an exact
+    # complete marker is not a false positive.  The blanking is RAW, case-exact
+    # and same-length (positions preserved); an obfuscated / residue marker is
+    # not blanked and still fails closed on the raw AND normalized copies.
+    anchored_text = _blank_exact_marker_assignments(masked_text)
+    anchored_norm = _normalize_for_scan(anchored_text)
+    for pattern, kind in _CREDENTIAL_FIELD_ANCHORED_PAIRS:
+        if pattern.search(anchored_text) or pattern.search(anchored_norm):
+            raise GateStateChangedError(
+                f"secret leak: {kind} in {label} file {name}"
+            )
     if is_utf8_text:
-        for pattern, kind in _CREDENTIAL_FIELD_SHAPE_PAIRS:
+        for pattern, kind in _BARE_CREDENTIAL_PAIRS:
             if pattern.search(masked_text) or pattern.search(norm_masked):
                 raise GateStateChangedError(
                     f"secret leak: {kind} in {label} file {name}"
@@ -1869,15 +1919,22 @@ def _secret_scan_bytes(
                         f"secret leak: {kind} in nested JSON in {label} file {name}"
                     )
             if name.endswith(".failure.json"):
+                # R21 Block 26: blank exact-marker assignments at the nested
+                # level too — a decoded ``{"secret": "[REDACTED]"}`` level is the
+                # gate's clean redacted report, not a leak.
+                level_shapes = _blank_diagnostic_schema_version(
+                    _blank_exact_marker_assignments(level_masked)
+                )
+                level_shapes_norm = _normalize_for_scan(level_shapes)
                 for pattern, kind in _FINAL_TEXT_SHAPE_PAIRS:
-                    if pattern.search(level_masked):
+                    if pattern.search(level_shapes):
                         raise GateStateChangedError(
                             f"secret leak: {kind} in nested JSON in {label} file {name}"
                         )
                 # 00:06 (要求 B): the failure-diagnostic shape set on the
                 # normalized nested copy too.
                 for pattern, kind in _FINAL_TEXT_SHAPE_PAIRS:
-                    if pattern.search(level_norm):
+                    if pattern.search(level_shapes_norm):
                         raise GateStateChangedError(
                             f"secret leak: {kind} in nested JSON in {label} file {name}"
                         )
@@ -2068,14 +2125,110 @@ _FINAL_TEXT_SHAPE_PAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
 # fallback: a complete ``Authorization``/``Proxy-Authorization`` ``Basic`` field
 # that survives producer/consumer must fail closed on the committed RAW path too,
 # not just on the free-form whole-header path.
-_CREDENTIAL_FIELD_SHAPE_PAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
+# R21 Block 21: the anchored set runs on EVERY artifact, binary included — the
+# shapes are literal field-name / marker signals (``secret=…``,
+# ``Authorization: Basic <payload>``, ``[REDACTED]<alnum>``) whose presence in
+# a binary's metadata is exactly the leak.  ``bare_credential_value`` is
+# split out (``_BARE_CREDENTIAL_PAIRS``) because the camelCase-and-digit shape
+# is the one that false-positives on utf-8-ignore-decoded binary noise and
+# stays gated on strict-UTF-8 text.
+_CREDENTIAL_FIELD_ANCHORED_PAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
     (registry_pattern("credential_field"), "credential field name assignment"),
     (registry_pattern("basic_auth"), "Basic Authorization field"),
-    # R20 Block 17: the bare-value committed/failure final backstop — a
-    # redaction-marker RESIDUE (``[REDACTED]mySuperSecret123``) and a BARE
-    # camelCase-and-digit credential-shaped value (``mySuperSecret123``) with no
-    # field name are leaks on the RAW top-level text of every artifact.
+    # R20 Block 17: the redaction-marker RESIDUE (``[REDACTED]mySuperSecret123``)
+    # is a literal-marker leak on the RAW top-level text of every artifact.
     (registry_pattern("redaction_residue"), "redaction-marker residue"),
+)
+
+
+# R21 Block 26: the gate's own clean redacted report is ``{"secret": "[REDACTED]"}``
+# — a credential field whose value is EXACTLY the case-exact ``[REDACTED]`` marker
+# (complete field value, quoted or bare, at a top-level or a decoded nested
+# JSON-string level) is exempt from the free-text credential-field scan.  The
+# shared ``credential_field`` shape's own exemption is bypassed in JSON-quoted
+# text because the value branch can start at the KEY's closing quote, so the scan
+# blanks every exact-marker assignment FIRST and runs the anchored shapes on the
+# blanked copy.  Only the RAW case-exact marker is blanked — any impersonation
+# (``[Redacted]``, ``[REDACTED]x``, full-width / zero-width / Cf variant, a
+# marker followed by residue) is NOT blanked and still fails closed.
+_EXACT_MARKER_AFTER = (
+    # after the marker's closing quote / bracket: either JSON structure to end
+    # or newline (``}`` / ``]`` / ``,`` / ``;`` and JSON-string close quotes /
+    # backslash escapes: ``\"}\"`` of a nested JSON-string level), or a space
+    # that BEGINS the next field assignment.
+    r"(?=(?:[ \t]*[\}\],;\\\\\"])*[ \t]*(?:$|[\r\n])"
+    r"|[ \t]+[A-Za-z0-9_-]+[ \t]*[\"']?[ \t]*[:=])"
+)
+_EXACT_MARKER_FIELD_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9_])((?i:"
+    + _CREDENTIAL_FIELD_STRONG_NAME_ALT
+    + r"))(?:[_-]?|$)"
+    r"\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
+    r"(?:(?:\\*[\"'])\[REDACTED\](?:\\*[\"'])|\[REDACTED\])"
+    + _EXACT_MARKER_AFTER
+)
+
+
+def _blank_exact_marker_assignments(text: str) -> str:
+    """Replace every exact-marker credential-field assignment with same-length
+    spaces (positions preserved), so the anchored free-text scan no longer sees
+    the gate's own clean redacted report as a leak (R21 Block 26).  Only the
+    RAW, case-exact, complete ``[REDACTED]`` value is blanked; an obfuscated /
+    residue marker stays intact and fails the scan closed."""
+    if not text:
+        return text
+    spans = [m.span() for m in _EXACT_MARKER_FIELD_RE.finditer(text)]
+    if not spans:
+        return text
+    chars = list(text)
+    for start, end in spans:
+        for i in range(start, end):
+            if chars[i] not in "\r\n":
+                chars[i] = " "
+    return "".join(chars)
+
+
+# R21 full-chain: a REAL sealed canary failure diagnostic carries the canary's own
+# fixed ``schema_version`` constant (``tripchord-certified-ota-canary-v1``) — a
+# 33-char ``[A-Za-z0-9_\\-=]`` run the free-form token-run shape would flag as a
+# "token-shaped run", making the gate reject its OWN clean diagnostic on the
+# failure final.  The value is a FIXED constant written by the gate's seal code
+# (never user-controlled), so blanking the assignment before the free-form shape
+# scan cannot mask a real leak — the ``summary`` (the actual free-form carrier)
+# is scanned unchanged.  Matches BOTH the ``"schema_version": …`` assignment AND
+# the bare constant in a decoded string-value callback (the bounded walker fires
+# on the VALUE, not the assignment).
+_DIAGNOSTIC_SCHEMA_VERSION_RE = re.compile(
+    r'((?i:"schema_version")[ \t]*:[ \t]*)(?:"(?:\\.|[^"\\])*"|[A-Za-z0-9_.\-:/]+)'
+    r'|(?:"'
+    + re.escape(_CANARY_DIAG_SCHEMA_VERSION)
+    + r'"|'
+    + re.escape(_CANARY_DIAG_SCHEMA_VERSION)
+    + r")"
+)
+
+
+def _blank_diagnostic_schema_version(text: str) -> str:
+    """Same-length-space the diagnostic's own fixed ``schema_version`` assignment
+    / constant, so the canary's sealed failure diagnostic does not trip its own
+    failure-final token-run scan."""
+    if not text:
+        return text
+    spans = [m.span() for m in _DIAGNOSTIC_SCHEMA_VERSION_RE.finditer(text)]
+    if not spans:
+        return text
+    chars = list(text)
+    for start, end in spans:
+        for i in range(start, end):
+            if chars[i] not in "\r\n":
+                chars[i] = " "
+    return "".join(chars)
+
+
+_BARE_CREDENTIAL_PAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # R20 Block 17: the BARE camelCase-and-digit credential-shaped value
+    # (``mySuperSecret123``) with no field name is a leak on the RAW top-level
+    # text of a strict-UTF-8 artifact (R21 Block 21: skipped on binary).
     (registry_pattern("bare_credential_value"), "bare credential-shaped value"),
 )
 # The diagnostic's STRUCTURED schema — a fail-closed whitelist: any unknown

@@ -396,15 +396,19 @@ class _BasicAuthScan:
     ``Proxy-Authorization`` ``Basic`` field and captures the payload token, and
     :func:`_is_valid_basic_payload` decides whether it is a real base64
     credential (R20 Block 20c) — the scan loops stay ``pattern.search(text)``
-    unchanged."""
+    unchanged.
+
+    R21 Block 22: ``.search`` now iterates EVERY candidate — a leading prose
+    ``Basic auth/setting`` (4-aligned but non-UTF-8, so the regex's ``{4,}``
+    floor matches it but the validity check rejects it) must never hide a real
+    ``Basic YWJjZA==`` later in the same text.
+    """
 
     def search(self, text: str) -> re.Match[str] | None:
-        match = _SHAPE_PATTERN_BASIC_AUTH_RE.search(text)
-        if match is None:
-            return None
-        if not _is_valid_basic_payload(match.group("payload")):
-            return None
-        return match
+        for match in _SHAPE_PATTERN_BASIC_AUTH_RE.finditer(text):
+            if _is_valid_basic_payload(match.group("payload")):
+                return match
+        return None
 
 
 _BASIC_AUTH_SCAN = _BasicAuthScan()
@@ -428,6 +432,51 @@ _BASIC_VALUE_TOKEN_RE = re.compile(r"(?i)\bBasic[ \t]+(?P<payload>[A-Za-z0-9+/]{
 # (The span used is :func:`_BASIC_VALUE_TOKEN_RE`'s ``payload`` group.)
 
 
+# Field-name occurrences used by the header-prose check (R21 Block 22/23/27):
+# a prose-Basic exemption applies ONLY when the matched value is a SINGLE
+# header field whose Basic payload is non-credential prose — a second sensitive
+# field name inside the same value (``authorization: Basic is required; Cookie:
+# sid=abc``) is a real credential the prose exemption must never swallow.
+_HEADER_FIELD_NAME_RE = re.compile(
+    r"(?i)\b(?:proxy-authorization|set-cookie|x-api-key|api[-_ ]?key|"
+    r"authorization|cookie)\b"
+)
+
+
+def _is_whole_header_prose(value: str) -> bool:
+    """True when ``value`` is ONE header field whose complete value is Basic
+    prose (``authorization: Basic is required``) rather than a real credential.
+
+    R21 Block 22: the FINAL-scan Authorization/Cookie backstops used
+    ``.search`` and returned only the FIRST header match — a leading prose
+    Basic value (``authorization: Basic auth/setting``) made the whole region
+    prose and masked a REAL ``Authorization: Basic YWJjZA==`` / ``Cookie: …``
+    later in the same text.  R21 Block 23: a ``Cookie: sid=abc trailing`` line
+    masked by a preceding prose-Basic on the same line escaped whole.  This
+    helper decides per matched VALUE whether the exemption may apply at all:
+
+    * more than one sensitive field name in the value (``…; Cookie: …``) — a
+      real field beyond the prose-Basic one, never prose;
+    * no Basic scheme token — a real credential header (``Cookie: sid=abc``,
+      ``Authorization: Bearer …``), never prose;
+    * a real base64 payload (``Basic YWJjZA==``) — never prose;
+    * a SHORT non-empty Basic payload (``Basic a``) — a placeholder credential,
+      never prose (R21 Block 27 restores the non-empty-short-value rejection);
+    * otherwise every Basic payload is non-credential prose -> prose.
+    """
+    if len(list(_HEADER_FIELD_NAME_RE.finditer(value))) != 1:
+        return False
+    bm = _BASIC_VALUE_TOKEN_RE.search(value)
+    if bm is None:
+        return False
+    for bm in _BASIC_VALUE_TOKEN_RE.finditer(value):
+        if _is_valid_basic_payload(bm.group("payload")):
+            return False
+        if len(bm.group("payload")) < 2:
+            return False
+    return True
+
+
 class _WholeHeaderScan:
     """The ``whole_header`` shape as a drop-in ``re.Pattern``-like object with
     the round-20 Block 20c Basic-prose exception.
@@ -442,16 +491,16 @@ class _WholeHeaderScan:
     (``Basic YWJjZA==``) and every non-Basic authorization/cookie value are
     still leaks.  ``.sub`` / ``.finditer`` delegate to the raw regex — the
     producer/consumer mask layers stay conservative (masking prose is harmless).
+
+    R21 Block 22: ``.search`` iterates EVERY header match, so a prose-Basic
+    field never hides a later real ``Authorization``/``Cookie`` field.
     """
 
     def search(self, text: str) -> re.Match[str] | None:
-        match = _SHAPE_PATTERN_WHOLE_HEADER_RE.search(text)
-        if match is None:
-            return None
-        bm = _BASIC_VALUE_TOKEN_RE.search(match.group(0))
-        if bm is not None and not _is_valid_basic_payload(bm.group("payload")):
-            return None
-        return match
+        for match in _SHAPE_PATTERN_WHOLE_HEADER_RE.finditer(text):
+            if not _is_whole_header_prose(match.group(0)):
+                return match
+        return None
 
     def sub(self, repl: str, text: str, count: int = 0) -> str:
         return _SHAPE_PATTERN_WHOLE_HEADER_RE.sub(repl, text, count=count)
@@ -472,7 +521,20 @@ _WHOLE_HEADER_SCAN = _WholeHeaderScan()
 # server challenge (``WWW-Authenticate: Digest realm=…, nonce=…``) carries no
 # ``response=`` and stays allowed.
 _SHAPE_PATTERN_DIGEST_AUTH_RE = re.compile(
-    r"(?i)\bdigest\b[^\r\n]{0,200}?response\s*=\s*[\"']?[0-9a-f]{16,128}"
+    # R21 Block 25: the ``Digest`` auth ``response`` hex credential is bound to
+    # the REAL Digest-auth field context — the keyword must either be followed
+    # by at least one auth parameter (``Digest username="user", response=…``)
+    # or immediately by ``response=`` (a bare ``Digest response=<hex>`` value).
+    # Prose like ``model digest calculation response=<32hex>`` — a noun
+    # ``digest`` with a plain word between it and ``response=`` — no longer
+    # matches (business positive preserved), while a real Digest header /
+    # decoded value still fails closed on both FINAL scans.
+    r"(?i)(?:^|[^A-Za-z0-9_])digest\b(?:"
+    r"[^\r\n]{0,200}?(?:username|realm|nonce|uri|qop|nc|cnonce|opaque|"
+    r"algorithm|stale|domain)\s*=\s*(?:[\"'][^\"']{0,80}[\"']|[^,\r\n]{1,80})"
+    r"[^\r\n]{0,120}?response\s*=\s*[\"']?[0-9a-f]{16,128}"
+    r"|[ \t]+response\s*=\s*[\"']?[0-9a-f]{16,128}"
+    r")"
 )
 
 # R20 Block 17: the redaction-marker RESIDUE — ``[REDACTED]`` immediately
@@ -490,7 +552,14 @@ _SHAPE_PATTERN_REDACTION_RESIDUE_RE = re.compile(
 # class even when no credential-field name or known secret value is present.
 # Word-bounded so prose / snake_case keys never match.
 _SHAPE_PATTERN_BARE_CREDENTIAL_VALUE_RE = re.compile(
-    r"(?<![A-Za-z0-9_])[a-z]+[A-Z][A-Za-z0-9_]*[0-9]+[A-Za-z0-9_]*(?![A-Za-z0-9_])"
+    # R21 Block 25: the BARE value must end in a MULTI-DIGIT run (``{2,}``) so a
+    # single trailing version digit — ``flightOption1`` / ``day2`` /
+    # ``plannerV2`` / ``providerV4`` — is a business value, not a credential,
+    # while a generated-password shape (``mySuperSecret123`` /
+    # ``anotherSecret99``) still fails closed.  The R20 contract (block 17)
+    # kept the same camelCase+digit class; the digit-run floor separates the
+    # two without weakening the bare-value backstop.
+    r"(?<![A-Za-z0-9_])[a-z]+[A-Z][A-Za-z0-9_]*[0-9]{2,}[A-Za-z0-9_]*(?![A-Za-z0-9_])"
 )
 
 _S = PatternScope
@@ -680,6 +749,38 @@ def registry_shape_pairs(
     )
 
 
+def _basic_payload_preserve_spans(text: str) -> list[tuple[int, int]]:
+    """Original-text spans of ``Basic``-scheme payload tokens to keep VERBATIM
+    through normalization.
+
+    R21 Block 24: a full-width (``\uff22\uff41\uff53\uff49\uff43``) or
+    zero-width / Cf-obfuscated (``Basic``) scheme is invisible to
+    ``_BASIC_VALUE_TOKEN_RE`` on the RAW text, so its payload would otherwise be
+    casefolded and the normalized copy's base64-validity prose-exemption would
+    misclassify the real credential as prose (``Basic YWJjZA==`` ->
+    ``basic ywjjza==``).  The scheme is NFKC-composed and Cf-dropped on a
+    DETECTION copy (NEVER casefolded — base64 payloads are case-sensitive), the
+    ASCII scheme+payload is matched there, and the payload span is mapped back
+    to the ORIGINAL text.  Only the payload TOKEN is preserved; an unrelated
+    uppercase 64-hex digest (``{"sha256": "AAAA..."}``) is not a Basic payload
+    and still casefolds.
+    """
+    pre_chars: list[str] = []
+    pre_to_orig: list[int] = []
+    for i, ch in enumerate(text):
+        if unicodedata.category(ch) == "Cf" or ch == "​":
+            continue
+        for nc in unicodedata.normalize("NFKC", ch):
+            pre_chars.append(nc)
+            pre_to_orig.append(i)
+    pre = "".join(pre_chars)
+    spans: list[tuple[int, int]] = []
+    for m in _BASIC_VALUE_TOKEN_RE.finditer(pre):
+        ps, pe = m.span("payload")
+        spans.append((pre_to_orig[ps], pre_to_orig[pe - 1] + 1))
+    return spans
+
+
 def _normalize_with_offsets(text: str) -> tuple[str, list[int]]:
     """NFKC + casefold + drop Cf/U+200B, with an offset map for span mapping.
 
@@ -698,14 +799,15 @@ def _normalize_with_offsets(text: str) -> tuple[str, list[int]]:
     offsets: list[int] = []
     i = 0
     n = len(text)
-    # R20 Block 20c: ``Basic`` payload tokens are preserved in their ORIGINAL
-    # case (see ``_BASIC_VALUE_TOKEN_RE`` above) so the casefolded copy keeps a
-    # real ``Basic YWJjZA==`` payload valid for the prose-exemption.  Only the
-    # payload TOKEN is preserved — an unrelated uppercase 64-hex digest
-    # (``{"sha256": "AAAA..."}``) is not a ``Basic`` payload and still casefolds.
-    preserved_spans = [
-        m.span("payload") for m in _BASIC_VALUE_TOKEN_RE.finditer(text)
-    ]
+    # R20 Block 20c + R21 Block 24: ``Basic`` payload tokens are preserved in
+    # their ORIGINAL case (see ``_BASIC_VALUE_TOKEN_RE`` above) so the
+    # casefolded copy keeps a real ``Basic YWJjZA==`` payload valid for the
+    # prose-exemption — including a full-width / Cf-obfuscated SCHEME spelling
+    # (``\uff22\uff41\uff53\uff49\uff43 YWJjZA==``), whose payload the detection copy
+    # (:func:`_basic_payload_preserve_spans`) still finds.  Only the payload
+    # TOKEN is preserved — an unrelated uppercase 64-hex digest (``{"sha256":
+    # "AAAA..."}``) is not a Basic payload and still casefolds.
+    preserved_spans = _basic_payload_preserve_spans(text)
     ps_idx = 0
     while i < n:
         while (
@@ -715,7 +817,16 @@ def _normalize_with_offsets(text: str) -> tuple[str, list[int]]:
         if ps_idx < len(preserved_spans):
             ps_start, ps_end = preserved_spans[ps_idx]
             if ps_start <= i < ps_end:
-                out.append(text[i])
+                ch = text[i]
+                # R21 Block 24: even INSIDE a preserved payload span, a Cf /
+                # zero-width char is dropped (a ``Basic YW​JjZA==``
+                # obfuscation must not keep its zero-width and re-break the
+                # base64 validity of the normalized copy).  The payload CASE is
+                # preserved; format chars never are.
+                if unicodedata.category(ch) == "Cf" or ch == "​":
+                    i += 1
+                    continue
+                out.append(ch)
                 offsets.append(i)
                 i += 1
                 continue
