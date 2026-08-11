@@ -49,11 +49,14 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from tripchord._secret_redact import (
+    _BASIC_VALUE_TOKEN_RE,
+    _SHAPE_PATTERN_DIGEST_AUTH_RE,
     BARE_CREDENTIAL_FIELD_NAMES,
     CREDENTIAL_FIELD_NAME_PATTERN,
     DuplicateJsonKeyError,
     PatternScope,
     RecursiveJsonBudgetError,
+    _is_valid_basic_payload,
     _normalize_for_scan,
     bounded_json_mask,
     iter_json_levels,
@@ -852,6 +855,32 @@ _AUTH_COOKIE_PATTERN = re.compile(
     re.MULTILINE,
 )
 
+class _AuthCookieLeakScan:
+    """FINAL-scan ``Authorization``/``Cookie`` value backstop with the round-20
+    Block 20c Basic-prose exception.
+
+    The broad ``_AUTH_COOKIE_PATTERN`` must keep matching every
+    authorization/cookie value for the CONSUMER mask (``.sub`` at line 306) and
+    for real Basic credentials (``Basic YWJjZA==``), but a value whose Basic
+    payload is NOT valid base64 is prose (``authorization: Basic auth/setting``,
+    ``authorization: Basic is required``) and must stay ALLOWED in the FINAL
+    scans.  ``_is_valid_basic_payload`` (shared module) applies the length-4
+    alignment + padding + decodes-to-UTF-8 validity check so the exemption can
+    never mask a real credential.
+    """
+
+    def search(self, text: str) -> re.Match[str] | None:
+        m = _AUTH_COOKIE_PATTERN.search(text)
+        if m is None:
+            return None
+        bm = _BASIC_VALUE_TOKEN_RE.search(m.group(0))
+        if bm is not None and not _is_valid_basic_payload(bm.group("payload")):
+            return None
+        return m
+
+
+_AUTH_COOKIE_LEAK_SCAN = _AuthCookieLeakScan()
+
 # Account / member / passenger identifiers with a numeric value (>= 6 digits).
 # Tolerates the JSON key-quote between the name and the colon.
 _ACCOUNT_ID_PATTERN = re.compile(
@@ -1578,6 +1607,14 @@ def _scan_decoded_string_value(
     full-width run, never the run itself (the decoded value is where the real
     characters surface).
     """
+    # R20 Block 20a: the ``Digest`` auth ``response`` hex credential is scanned
+    # on the RAW decoded value BEFORE ``_mask_hex_hash_spans`` (the 32-128 hex
+    # run is otherwise replaced by the recomputable-digest placeholder).
+    if _SHAPE_PATTERN_DIGEST_AUTH_RE.search(value):
+        raise GateStateChangedError(
+            f"secret leak: Digest-auth response in decoded value in "
+            f"{label} file {name}"
+        )
     value_masked = _mask_hex_hash_spans(value)
     value_norm = _normalize_for_scan(value_masked)
     for needle in tuple(needles):
@@ -1587,7 +1624,7 @@ def _scan_decoded_string_value(
                 f"{label} file {name}"
             )
     for pattern, kind in (
-        (_AUTH_COOKIE_PATTERN, "Authorization/Cookie"),
+        (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
         (_ACCOUNT_ID_PATTERN, "account identifier"),
         (_PHONE_PATTERN, "phone number"),
     ):
@@ -1677,12 +1714,21 @@ def _secret_scan_bytes(
         _reject_credential_field_names(data, label, name)
         _reject_unknown_64hex_values(data, label, name)
     text = data.decode("utf-8", errors="ignore")
+    # R20 Block 20a: the ``Digest`` auth ``response`` hex credential is scanned
+    # on the RAW text BEFORE ``_mask_hex_hash_spans`` — a 32-128 pure-hex run
+    # is otherwise replaced by the recomputable-digest placeholder and the
+    # token-run shape never sees it.  A server challenge (``WWW-Authenticate:
+    # Digest realm=…, nonce=…``) carries no ``response=`` and stays allowed.
+    if _SHAPE_PATTERN_DIGEST_AUTH_RE.search(text):
+        raise GateStateChangedError(
+            f"secret leak: Digest-auth response in {label} file {name}"
+        )
     # Mask recomputable hex digests (git SHAs, sha256) before the pattern
     # scan: a hash that happens to contain a phone-shaped run of digits is
     # not a leak, and a bare phone number is always decimal (never hex).
     masked_text = _mask_hex_hash_spans(text)
     for pattern, kind in (
-        (_AUTH_COOKIE_PATTERN, "Authorization/Cookie"),
+        (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
         (_ACCOUNT_ID_PATTERN, "account identifier"),
         (_PHONE_PATTERN, "phone number"),
     ):
@@ -1696,7 +1742,7 @@ def _secret_scan_bytes(
     # Only a COPY is normalized; the artifact bytes are never rewritten.
     norm_masked = _normalize_for_scan(masked_text)
     for pattern, kind in (
-        (_AUTH_COOKIE_PATTERN, "Authorization/Cookie"),
+        (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
         (_ACCOUNT_ID_PATTERN, "account identifier"),
         (_PHONE_PATTERN, "phone number"),
     ):
@@ -1740,11 +1786,26 @@ def _secret_scan_bytes(
     # NORMALIZED copies (mirroring the free-form diagnostic scan above).  A
     # committed JSON artifact's field KEYS are already rejected structurally
     # (``_reject_credential_field_names``); this closes the free-text form.
-    for pattern, kind in _CREDENTIAL_FIELD_SHAPE_PAIRS:
-        if pattern.search(masked_text) or pattern.search(norm_masked):
-            raise GateStateChangedError(
-                f"secret leak: {kind} in {label} file {name}"
-            )
+    #
+    # R20 Block 17: the bare-value / residue shapes are TEXT credential forms —
+    # they are skipped on a BINARY artifact (a screenshot PNG, an opaque blob)
+    # whose bytes do not even decode as strict UTF-8, so a ``utf-8``
+    # ``errors="ignore"`` decode of binary noise cannot false-positive the
+    # camelCase-and-digit shape.  The byte-exact needle scan above and the
+    # Authorization/Cookie / phone / tracking-URL pattern scans still apply to
+    # binary files, so a credential literally embedded in a binary stays caught.
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        is_utf8_text = False
+    else:
+        is_utf8_text = True
+    if is_utf8_text:
+        for pattern, kind in _CREDENTIAL_FIELD_SHAPE_PAIRS:
+            if pattern.search(masked_text) or pattern.search(norm_masked):
+                raise GateStateChangedError(
+                    f"secret leak: {kind} in {label} file {name}"
+                )
     for match in _TRACKING_URL_PATTERN.finditer(text):
         if _is_tracking_url_leak(match.group(0)):
             raise GateStateChangedError(
@@ -1786,7 +1847,7 @@ def _secret_scan_bytes(
                 )
             level_masked = _mask_hex_hash_spans(level_text)
             for pattern, kind in (
-                (_AUTH_COOKIE_PATTERN, "Authorization/Cookie"),
+                (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
                 (_ACCOUNT_ID_PATTERN, "account identifier"),
                 (_PHONE_PATTERN, "phone number"),
             ):
@@ -1799,7 +1860,7 @@ def _secret_scan_bytes(
             # is still a leak.
             level_norm = _normalize_for_scan(level_masked)
             for pattern, kind in (
-                (_AUTH_COOKIE_PATTERN, "Authorization/Cookie"),
+                (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
                 (_ACCOUNT_ID_PATTERN, "account identifier"),
                 (_PHONE_PATTERN, "phone number"),
             ):
@@ -2010,6 +2071,12 @@ _FINAL_TEXT_SHAPE_PAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
 _CREDENTIAL_FIELD_SHAPE_PAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
     (registry_pattern("credential_field"), "credential field name assignment"),
     (registry_pattern("basic_auth"), "Basic Authorization field"),
+    # R20 Block 17: the bare-value committed/failure final backstop — a
+    # redaction-marker RESIDUE (``[REDACTED]mySuperSecret123``) and a BARE
+    # camelCase-and-digit credential-shaped value (``mySuperSecret123``) with no
+    # field name are leaks on the RAW top-level text of every artifact.
+    (registry_pattern("redaction_residue"), "redaction-marker residue"),
+    (registry_pattern("bare_credential_value"), "bare credential-shaped value"),
 )
 # The diagnostic's STRUCTURED schema — a fail-closed whitelist: any unknown
 # top-level / run_identity / runtime field makes the diagnostic foreign and is

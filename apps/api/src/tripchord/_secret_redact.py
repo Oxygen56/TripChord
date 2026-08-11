@@ -28,6 +28,8 @@ re-implement the walker in callers.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 import unicodedata
@@ -295,15 +297,22 @@ _CREDENTIAL_FIELD_STRONG_VALUE = (
     # of swallowing its name (C-122 supervision 09:28 gap B) while a
     # space-separated value (``Session_token: abc def``) is covered WHOLE.
     #
-    # The leading lookahead is the EXACT safe-marker exemption (R18 Block 2):
-    # only a field value that — after removing surrounding quotes — is
+    # The leading lookahead is the EXACT safe-marker exemption (R18 Block 2,
+    # tightened in R20 Block 18/19): only a field value that — after removing
+    # surrounding quotes AND the JSON backslash-escaping of those quotes — is
     # precisely ``[REDACTED]`` and is immediately followed by a real field
     # boundary / end (``secret=[REDACTED]``, ``secret="[REDACTED]"``,
-    # ``secret=[REDACTED] next=1``) is left untouched.  Any trailing character
-    # (``secret=[REDACTED]actual``, ``secret=[REDACTED] actual``) fails the
-    # exemption and the WHOLE value is masked again.
+    # ``secret=\"[REDACTED]\"`` inside a JSON string, ``secret=[REDACTED]
+    # next=1``) is left untouched.  The exemption is CASE-SENSITIVE — the
+    # credential-field pattern is compiled without ``(?i)`` (names keep their
+    # own ``(?i:...)`` scope), so ``[Redacted]`` / ``[redacted]`` /
+    # ``\"[Redacted]\"`` are impersonations that FAIL the exemption and are
+    # masked / rejected whole.  Any trailing character
+    # (``secret=[REDACTED]actual``, ``secret=[REDACTED] actual``,
+    # ``secret=\"[REDACTED]\" actual``) fails the exemption and the WHOLE value
+    # is masked again.
     r"(?!"
-    r"(?:[\"']\[REDACTED\][\"']|\[REDACTED\])"
+    r"(?:(?:\\*[\"'])\[REDACTED\](?:\\*[\"'])|\[REDACTED\])"
     + _CREDENTIAL_FIELD_VALUE_END
     + r")"
     + r"(?:"
@@ -315,19 +324,26 @@ _CREDENTIAL_FIELD_STRONG_VALUE = (
     + r")"
 )
 _SHAPE_PATTERN_CREDENTIAL_FIELD_RE = re.compile(
-    r"(?i)(?:"
-    r"(?:^|[^A-Za-z0-9_])("
+    # R20 Block 18: the field-NAME alternations keep their own ``(?i:...)``
+    # scope (``Session_token`` / ``passworD`` still match), but the compile is
+    # NO LONGER globally case-insensitive — the marker exemption and the value
+    # branches are case-sensitive, so a mixed/lowercase ``[Redacted]`` /
+    # ``[redacted]`` value fails the exact ``[REDACTED]`` exemption and is
+    # masked / rejected whole (the root cause of the Block-18 leak was the
+    # ``(?i)`` flag making the exemption case-blind).
+    r"(?:"
+    r"(?:^|[^A-Za-z0-9_])((?i:"
     + _CREDENTIAL_FIELD_STRONG_NAME_ALT
-    + r")(?:[_-]?|$)\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
+    + r"))(?:[_-]?|$)\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
     # R18 Block 3: NO value pre-pattern quote-consumption on the STRONG branch —
     # the value regex itself is quote-aware (a quoted value runs to the closing
     # quote, a bracket value to the closing bracket), so an opening quote must
     # reach the value so the closing quote is never left as residue.
     + _CREDENTIAL_FIELD_STRONG_VALUE
     + r"|"
-    r"(?:^|[^A-Za-z0-9_])("
+    r"(?:^|[^A-Za-z0-9_])((?i:"
     + _CREDENTIAL_FIELD_WEAK_NAME_ALT
-    + r")(?:[_-]?|$)\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
+    + r"))(?:[_-]?|$)\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
     r"(?:\\*[\"']?|[\"'])?(?>[A-Za-z0-9+/=_\-.]{3,})(?![ \t])"
     r")"
 )
@@ -343,16 +359,138 @@ _SHAPE_PATTERN_CREDENTIAL_FIELD_RE = re.compile(
 # real ``pending user authorization: …`` prose positives (no ``Basic`` scheme)
 # stay allowed.  Scoped to the FINAL scans only — the whole-header shape
 # already owns producer/consumer masking.
+#
+# R20 Block 20b/c: the payload is a base64 token validated by
+# :func:`_is_valid_basic_payload` — length 4-aligned + correct padding (the
+# regex's ``{4,}={0,2}`` shape) AND the decoded bytes must be valid UTF-8, the
+# real ``base64(user:pass)`` form.  This separates a genuine payload from prose:
+# ``Basic YWJjZA==`` / ``Basic b3BlbiBzZXNhbWU=`` / ``Basic YQ==`` are leaks,
+# ``upstream Authorization: Basic YWJjZA== extra`` (mid-text Basic header, R20
+# Block 20b) is a leak because the payload token ends at the space and the
+# trailing prose is outside the match, while ``authorization: Basic is
+# required`` (``is`` is under the 4-char floor) and ``authorization: Basic
+# auth/setting`` (4-aligned but decodes to non-UTF-8 bytes) stay positive.
 _SHAPE_PATTERN_BASIC_AUTH_RE = re.compile(
     r"(?i)\b(?:proxy[-_ ]authorization|authorization)\b\s*"
     r"(?:\\*[\"']?|[\"'])?\s*[:=]\s*(?:\\*[\"']?|[\"'])?"
-    # The payload is a MAXIMAL token run — it must end at a non-token char or
-    # end-of-value, never stop mid-word: ``Basic YWJjZA==`` is a leak but
-    # ``authorization: Basic is required`` (prose, ``is`` followed by a space)
-    # and ``Basic YWJjZA== extra`` (non-canonical, payload not at the end) are
-    # NOT matched — the ``(?![A-Za-z0-9+/=_\-.]|[ \t])`` guard rejects a run
-    # that is continued by a token character OR a space.
-    r"Basic[ \t]+[A-Za-z0-9+/=_\-.]{1,}(?![A-Za-z0-9+/=_\-.]|[ \t])"
+    r"Basic[ \t]+(?P<payload>[A-Za-z0-9+/]{4,}={0,2})"
+)
+
+
+def _is_valid_basic_payload(payload: str) -> bool:
+    """True when ``payload`` is a REAL Basic-auth base64 body: standard base64
+    alphabet, length 4-aligned with correct padding (``b64decode(validate=True)``
+    enforces both), and the decoded bytes are valid UTF-8 — a real
+    ``base64(user:pass)``.  Prose like ``auth/setting`` (4-aligned but decodes
+    to binary) or ``is required`` (not 4-aligned) fails the check."""
+    try:
+        base64.b64decode(payload, validate=True).decode("utf-8")
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return False
+    return True
+
+
+class _BasicAuthScan:
+    """The FINAL-scan ``basic_auth`` backstop as a drop-in ``.search``-able
+    object: the regex bounds the complete ``Authorization`` /
+    ``Proxy-Authorization`` ``Basic`` field and captures the payload token, and
+    :func:`_is_valid_basic_payload` decides whether it is a real base64
+    credential (R20 Block 20c) — the scan loops stay ``pattern.search(text)``
+    unchanged."""
+
+    def search(self, text: str) -> re.Match[str] | None:
+        match = _SHAPE_PATTERN_BASIC_AUTH_RE.search(text)
+        if match is None:
+            return None
+        if not _is_valid_basic_payload(match.group("payload")):
+            return None
+        return match
+
+
+_BASIC_AUTH_SCAN = _BasicAuthScan()
+
+# A ``Basic`` scheme token used to decide whether a whole-header value is a REAL
+# credential or prose.  The token charset+padding mirrors the ``basic_auth``
+# shape so the whole-header backstop and the ``basic_auth`` shape agree
+# (C-122 round-20 Block 20c).
+_BASIC_VALUE_TOKEN_RE = re.compile(r"(?i)\bBasic[ \t]+(?P<payload>[A-Za-z0-9+/]{1,}={0,2})")
+
+# ``Basic`` scheme payload spans preserved VERBATIM through normalization (R20
+# Block 20c): base64 is case-sensitive, so a casefolded copy would turn a real
+# ``Basic YWJjZA==`` payload into ``ywjjza==`` and the whole-header /
+# Authorization prose-exemption — which separates real payloads from prose by
+# base64 validity — would then misclassify the real credential as prose and let
+# it through.  The payload TOKEN of every ``Basic`` value is preserved in its
+# original case; prose (``Basic auth/setting``) is preserved too and the
+# prose-exemption still decides by validity, while an unrelated uppercase 64-hex
+# digest (``{"sha256": "AAAA..."}``) is NOT a Basic payload and stays casefolded
+# so the 64-hex trust check keeps rejecting it.
+# (The span used is :func:`_BASIC_VALUE_TOKEN_RE`'s ``payload`` group.)
+
+
+class _WholeHeaderScan:
+    """The ``whole_header`` shape as a drop-in ``re.Pattern``-like object with
+    the round-20 Block 20c Basic-prose exception.
+
+    The whole-header shape matches a COMPLETE ``Authorization`` /
+    ``Proxy-Authorization`` / ``Set-Cookie`` / ``Cookie`` field (name + value
+    together) for producer/consumer masking and free-form diagnostic rejection.
+    The R20 exception only applies to the FINAL-scan ``.search`` role: a value
+    that is ``Basic <payload>`` where the payload is NOT valid base64
+    (``authorization: Basic auth/setting``, ``authorization: Basic is
+    required``) is prose and must stay allowed, while a real Basic payload
+    (``Basic YWJjZA==``) and every non-Basic authorization/cookie value are
+    still leaks.  ``.sub`` / ``.finditer`` delegate to the raw regex — the
+    producer/consumer mask layers stay conservative (masking prose is harmless).
+    """
+
+    def search(self, text: str) -> re.Match[str] | None:
+        match = _SHAPE_PATTERN_WHOLE_HEADER_RE.search(text)
+        if match is None:
+            return None
+        bm = _BASIC_VALUE_TOKEN_RE.search(match.group(0))
+        if bm is not None and not _is_valid_basic_payload(bm.group("payload")):
+            return None
+        return match
+
+    def sub(self, repl: str, text: str, count: int = 0) -> str:
+        return _SHAPE_PATTERN_WHOLE_HEADER_RE.sub(repl, text, count=count)
+
+    def finditer(self, text: str) -> re.Iterator[re.Match[str]]:
+        return _SHAPE_PATTERN_WHOLE_HEADER_RE.finditer(text)
+
+
+_WHOLE_HEADER_SCAN = _WholeHeaderScan()
+
+# R20 Block 20a: the ``Digest`` auth scheme's ``response`` parameter is a
+# per-request hex credential (``Digest username="user", response="<64hex>"``,
+# ``Digest response=<64hex>;``).  The committed/failure FINAL scans must reject
+# the Digest field independently — the 64-hex is otherwise masked by the gate's
+# ``_mask_hex_hash_spans`` (a recomputable digest) before the token-run shape
+# sees it, so this recognizer is wired as a RAW-TEXT scan BEFORE hex masking in
+# ``_secret_scan_bytes`` / ``_scan_decoded_string_value`` (R20 Block 20a).  A
+# server challenge (``WWW-Authenticate: Digest realm=…, nonce=…``) carries no
+# ``response=`` and stays allowed.
+_SHAPE_PATTERN_DIGEST_AUTH_RE = re.compile(
+    r"(?i)\bdigest\b[^\r\n]{0,200}?response\s*=\s*[\"']?[0-9a-f]{16,128}"
+)
+
+# R20 Block 17: the redaction-marker RESIDUE — ``[REDACTED]`` immediately
+# followed by a credential character (``[REDACTED]mySuperSecret123`` in a
+# committed summary, or a ``[REDACTED]<alnum>`` splice after a split value).
+# The exact marker followed by a JSON delimiter / space / end is the gate's own
+# clean report and never matches this shape.
+_SHAPE_PATTERN_REDACTION_RESIDUE_RE = re.compile(
+    r"\[REDACTED\](?=[A-Za-z0-9+/=])"
+)
+
+# R20 Block 17: a BARE credential-shaped value with NO field name — a
+# camelCase token ending in a digit run (``mySuperSecret123``), the classic
+# generated-password shape.  A committed artifact must fail closed on the value
+# class even when no credential-field name or known secret value is present.
+# Word-bounded so prose / snake_case keys never match.
+_SHAPE_PATTERN_BARE_CREDENTIAL_VALUE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[a-z]+[A-Z][A-Za-z0-9_]*[0-9]+[A-Za-z0-9_]*(?![A-Za-z0-9_])"
 )
 
 _S = PatternScope
@@ -387,7 +525,7 @@ _FINAL_VALUE_SHAPES = (
 SHAPE_PATTERN_REGISTRY: tuple[SensitiveShapePattern, ...] = (
     SensitiveShapePattern(
         name="whole_header",
-        pattern=_SHAPE_PATTERN_WHOLE_HEADER_RE,
+        pattern=_WHOLE_HEADER_SCAN,
         kind="whole Authorization/Cookie header",
         scopes=_S.PRODUCER_MASK | _S.CONSUMER_MASK | _S.NORMALIZED | _S.FINAL_TEXT,
     ),
@@ -469,8 +607,39 @@ SHAPE_PATTERN_REGISTRY: tuple[SensitiveShapePattern, ...] = (
     # scheme and stay allowed.  Scoped to the FINAL scans only.
     SensitiveShapePattern(
         name="basic_auth",
-        pattern=_SHAPE_PATTERN_BASIC_AUTH_RE,
+        # The drop-in validated scan object: regex bounding + base64 payload
+        # validity (R20 Block 20c) — its ``.search`` has the same contract as a
+        # compiled pattern, so every ``pattern.search`` scan loop is unchanged.
+        pattern=_BASIC_AUTH_SCAN,
         kind="Basic Authorization field",
+        scopes=_S.FINAL_TEXT | _S.FINAL_VALUE,
+    ),
+    # R20 Block 17: the redaction-marker RESIDUE (``[REDACTED]`` immediately
+    # followed by a credential character) and the BARE credential-shaped value
+    # (a camelCase token ending in a digit run) — the committed / failure final
+    # scans' independent backstop for the bare-value leak class.  Scoped to the
+    # FINAL scans only; the producer / consumer already mask the marker-splice
+    # form whole via the credential-field trailing-chars rule.
+    SensitiveShapePattern(
+        name="redaction_residue",
+        pattern=_SHAPE_PATTERN_REDACTION_RESIDUE_RE,
+        kind="redaction-marker residue",
+        scopes=_S.FINAL_TEXT | _S.FINAL_VALUE,
+    ),
+    SensitiveShapePattern(
+        name="bare_credential_value",
+        pattern=_SHAPE_PATTERN_BARE_CREDENTIAL_VALUE_RE,
+        kind="bare credential-shaped value",
+        scopes=_S.FINAL_TEXT | _S.FINAL_VALUE,
+    ),
+    # R20 Block 20a: the ``Digest`` auth ``response`` hex credential.  Scoped to
+    # the FINAL scans; the gate additionally runs it on the RAW (pre-hex-mask)
+    # text because ``_mask_hex_hash_spans`` would otherwise hide the response
+    # digest before the registry scan sees it.
+    SensitiveShapePattern(
+        name="digest_auth",
+        pattern=_SHAPE_PATTERN_DIGEST_AUTH_RE,
+        kind="Digest-auth response",
         scopes=_S.FINAL_TEXT | _S.FINAL_VALUE,
     ),
 )
@@ -527,12 +696,54 @@ def _normalize_with_offsets(text: str) -> tuple[str, list[int]]:
     """
     out: list[str] = []
     offsets: list[int] = []
-    for i, ch in enumerate(text):
+    i = 0
+    n = len(text)
+    # R20 Block 20c: ``Basic`` payload tokens are preserved in their ORIGINAL
+    # case (see ``_BASIC_VALUE_TOKEN_RE`` above) so the casefolded copy keeps a
+    # real ``Basic YWJjZA==`` payload valid for the prose-exemption.  Only the
+    # payload TOKEN is preserved — an unrelated uppercase 64-hex digest
+    # (``{"sha256": "AAAA..."}``) is not a ``Basic`` payload and still casefolds.
+    preserved_spans = [
+        m.span("payload") for m in _BASIC_VALUE_TOKEN_RE.finditer(text)
+    ]
+    ps_idx = 0
+    while i < n:
+        while (
+            ps_idx < len(preserved_spans) and preserved_spans[ps_idx][1] <= i
+        ):
+            ps_idx += 1
+        if ps_idx < len(preserved_spans):
+            ps_start, ps_end = preserved_spans[ps_idx]
+            if ps_start <= i < ps_end:
+                out.append(text[i])
+                offsets.append(i)
+                i += 1
+                continue
+        ch = text[i]
+        # R20 Block 18: the gate's fixed redaction marker ``[REDACTED]`` is
+        # preserved VERBATIM through normalization.  The marker exemption in the
+        # credential-field shape is CASE-SENSITIVE (only exact ``[REDACTED]`` is
+        # the marker; ``[Redacted]`` / ``[redacted]`` are impersonations to be
+        # masked/rejected), and the normalized copy is what the producer /
+        # consumer mask layer and the gate scan run the SHARED pattern on \u2014 a
+        # casefolded ``[redacted]`` would trip the case-sensitive exemption and
+        # re-mask / re-reject the gate's own redacted reports.  Only the exact
+        # ASCII span is preserved; a full-width ``\uff3bREDACTED\uff3d`` or a
+        # Cf-obfuscated ``[R\u200bEDACTED]`` still normalizes to ``[redacted]`` and
+        # stays a masked impersonation.
+        if ch == "[" and text.startswith("[REDACTED]", i):
+            for j, mc in enumerate("[REDACTED]"):
+                out.append(mc)
+                offsets.append(i + j)
+            i += len("[REDACTED]")
+            continue
         if unicodedata.category(ch) == "Cf" or ch == "\u200b":
+            i += 1
             continue
         for nc in unicodedata.normalize("NFKC", ch).casefold():
             out.append(nc)
             offsets.append(i)
+        i += 1
     return "".join(out), offsets
 
 

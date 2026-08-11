@@ -5930,13 +5930,15 @@ def test_secret_scan_rejects_quoted_key_forms_in_structured_json(
 ) -> None:
     """C-122 supervision 04:44 counter-example (final scan layer, structured
     evidence): a committed-adjacent JSON artifact whose headers string carries
-    QUOTED-KEY embedded JSON (``{\\"Authorization\\":\\"Basic a\\"}``) must fail
-    the gate closed — the quoted field name is recognised at the escaped-quote
-    field position, not only a bare ``Cookie:a=b`` form."""
+    QUOTED-KEY embedded JSON (``{\\"Authorization\\":\\"Basic YWJjZA==\\"}``)
+    must fail the gate closed — the quoted field name is recognised at the
+    escaped-quote field position, not only a bare ``Cookie:a=b`` form.  (R20
+    Block 20c: the value must be a REAL base64 payload — a sub-4-char ``Basic
+    a`` is prose under the base64-validity rule and stays allowed.)"""
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
     (staging_dir / "live-done-gate-v4.json").write_text(
-        '{"request": {"headers": "{\\"Authorization\\":\\"Basic a\\"}"}}',
+        '{"request": {"headers": "{\\"Authorization\\":\\"Basic YWJjZA==\\"}"}}',
         encoding="utf-8",
     )
     with pytest.raises(gate.GateStateChangedError, match="Authorization/Cookie"):
@@ -7502,6 +7504,245 @@ def test_r19_block16_semicolon_connected_credential_fields_no_plaintext(
     consumer_out = gate._sanitize_canary_diag_field(summary, "fallback")
     assert "mySuperSecret123" not in consumer_out
     assert ";password=" not in consumer_out
+
+
+def test_r20_block17_bare_credential_value_and_residue_rejected_both_paths() -> None:
+    """C-122 round-20 architect re-review Block 17 counter-examples: a BARE
+    camelCase-and-digit credential-shaped value (``mySuperSecret123``) with no
+    field name, and a redaction-marker RESIDUE (``[REDACTED]mySuperSecret123``)
+    — the ``[REDACTED]``-marker with credential-shaped junk glued to its tail —
+    must fail the committed/failure dual FINAL scans' independent backstop even
+    though the bare value alone is not a credential-field assignment."""
+    for raw in (
+        "mySuperSecret123",
+        '{"summary":"[REDACTED]mySuperSecret123"}',
+        "left mySuperSecret123 right",
+        '{"summary": "ok [REDACTED]anotherSecret99"}',
+    ):
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # A clean committed digest at its TRUSTED path stays positive on the
+    # committed path — the bare backstop must never flag a legitimate
+    # ``done_gate.checks[].evidence.candidate_set_sha256`` value.
+    gate._secret_scan_bytes(
+        json.dumps(
+            {
+                "done_gate": {
+                    "checks": [
+                        {"evidence": {"candidate_set_sha256": "a" * 64}}
+                    ]
+                }
+            }
+        ).encode(),
+        gate._SecretNeedles(()),
+        "evidence",
+        "product-v1-done-gate.json",
+        credential_field_check=True,
+    )
+
+
+def test_r20_block18_marker_exemption_case_sensitive_both_paths() -> None:
+    """C-122 round-20 architect re-review Block 18 counter-examples: the safe
+    marker exemption is CASE-EXACT ``[REDACTED]``.  Mixed / lowercase
+    impersonations (``[Redacted]`` / ``[redacted]``) — bare or quoted — must be
+    masked whole by producer/consumer and rejected by both final scans, while the
+    exact marker (bare or quoted) stays preserved (the gate's own redacted
+    reports must never trip its own scan)."""
+    from benchmarks import live_canary_certified as canary
+
+    for raw in (
+        "secret=[Redacted]",
+        "secret=[redacted]",
+        'secret="[Redacted]"',
+        "token=[redacted]",
+        "secret=[rEdAcTeD]",
+    ):
+        assert canary._desensitize(raw) == "[REDACTED]", (
+            f"producer left impersonation for {raw!r}"
+        )
+        assert gate._sanitize_canary_diag_field(raw, "fallback") == "[REDACTED]", (
+            f"consumer left impersonation for {raw!r}"
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # The exact marker survives producer/consumer and both final scans.
+    for raw in ("secret=[REDACTED]", 'secret="[REDACTED]"'):
+        assert canary._desensitize(raw) == raw, f"producer masked exact marker {raw!r}"
+        assert gate._sanitize_canary_diag_field(raw, "fallback") == raw, (
+            f"consumer masked exact marker {raw!r}"
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r20_block19_json_escaped_quote_marker_preserved_both_paths() -> None:
+    """C-122 round-20 architect re-review Block 19 counter-example: a
+    JSON-escaped-quote marker value (``{"detail": "secret=\\"[REDACTED]\\""}``)
+    — the decoded form ``secret="[REDACTED]"`` and the raw escaped form — is a
+    POSITIVE that both final scans must accept, and the producer must emit
+    VALID JSON (the old exemption failed on the escaped-quote form and the
+    producer mangled the document)."""
+    from benchmarks import live_canary_certified as canary
+
+    raw = '{"detail": "secret=\\"[REDACTED]\\""}'
+    # Producer keeps the escaped-quote marker intact and the JSON valid.
+    producer_out = canary._desensitize(raw)
+    assert "secret" in producer_out
+    assert json.loads(producer_out)["detail"] == 'secret="[REDACTED]"', (
+        f"producer mangled JSON: {producer_out!r}"
+    )
+    # Both final scans accept the escaped form AND the decoded form.
+    for text in (raw, 'secret="[REDACTED]"', '{"detail": "secret=\\"[REDACTED]\\""}'):
+        gate._secret_scan_bytes(
+            text.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            text.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r20_block20_digest_basic_prose_boundaries() -> None:
+    """C-122 round-20 architect re-review Block 20 counter-examples.
+
+    a) A ``Digest`` auth ``response`` hex credential (quoted or bare, with
+    trailing ``;``) fails the committed/failure dual finals independently —
+    before hex-span masking hides the 64-hex from the token-run shape.
+    b) A mid-text ``upstream Authorization: Basic <base64>`` (raw and
+    JSON-wrapped) fails the committed final independently.
+    c) ``authorization: Basic auth/setting`` / ``authorization: Basic is
+    required`` — Basic prose whose payload is NOT valid base64 — stay POSITIVE
+    on both finals, while a real base64 payload stays a leak.
+    """
+    digest_q = 'Digest username="user", response="' + "a" * 64 + '"'
+    digest_sc = "Digest response=" + "b" * 64 + ";"
+    for raw in (digest_q, digest_sc):
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in (
+        "upstream Authorization: Basic YWJjZA== extra",
+        json.dumps({"summary": "upstream Authorization: Basic YWJjZA== extra"}),
+    ):
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+    # Prose positives accepted by both finals.
+    for raw in (
+        "authorization: Basic auth/setting",
+        "authorization: Basic is required",
+        '{"summary": "authorization: Basic is required"}',
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r20_block17_bare_value_skipped_on_binary_artifact() -> None:
+    """R20 Block 17 binary guard: the bare camelCase-and-digit / residue shapes
+    are TEXT credential forms — a BINARY artifact (a screenshot PNG whose bytes
+    are not strict UTF-8) whose ``utf-8`` ignore-decode happens to contain a
+    ``abcD1xyz9``-shaped run must NOT false-positive the shape scan, while the
+    same shape in a real UTF-8 artifact still rejects."""
+    binary = b"\x89PNG\r\n\x1a\n\x00\x00abcD1xyz9\x00\x00\xff"
+    with pytest.raises(UnicodeDecodeError):
+        binary.decode("utf-8")
+    # A binary screenshot with a bare-credential-shaped run passes the shape scan
+    # (the needle / Authorization / phone / tracking scans still apply).
+    gate._secret_scan_bytes(
+        binary,
+        gate._SecretNeedles(()),
+        "committed evidence",
+        "browser-e2e-screenshot.png",
+        credential_field_check=True,
+    )
+    # The same run inside a real UTF-8 artifact still rejects.
+    with pytest.raises(
+        gate.GateStateChangedError, match="bare credential-shaped value"
+    ):
+        gate._secret_scan_bytes(
+            b'{"summary": "abcD1xyz9"}',
+            gate._SecretNeedles(()),
+            "committed evidence",
+            "evidence.json",
+            credential_field_check=True,
+        )
 
 
 def test_secret_scan_rejects_double_encoded_authorization_in_structured_json(
