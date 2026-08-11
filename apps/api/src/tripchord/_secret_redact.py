@@ -69,6 +69,34 @@ def looks_like_json(text: str) -> bool:
     return bool(stripped) and stripped[0] in "{[\""
 
 
+class DuplicateJsonKeyError(ValueError):
+    """A JSON object repeated a member key — every parser fails closed on it.
+
+    Standard ``json.loads`` keeps the LAST occurrence of a duplicate key and
+    silently discards the earlier value, so a published artifact could smuggle a
+    FOREIGN 64-hex under a whitelisted field name and have the first (candidate)
+    value discarded while the second (normal) value is kept — both currently
+    pass the gate (C-122 supervision 09:59 Block 2).  Every object parsed by the
+    redaction chain must fail BEFORE any member enters an object the gate
+    trusts, so the whole chain loads through :func:`json_loads_no_dupes`.
+    """
+
+
+def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``object_pairs_hook`` that raises on a duplicated member key."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKeyError(f"duplicate JSON object member: {key!r}")
+        result[key] = value
+    return result
+
+
+def json_loads_no_dupes(text: str) -> Any:
+    """``json.loads`` that fails closed on duplicate object member keys."""
+    return json.loads(text, object_pairs_hook=_reject_duplicate_object_keys)
+
+
 # ============================================================================
 # Typed sensitive-shape pattern registry (C-122 supervision 08:30+08:31 补充 C)
 #
@@ -143,11 +171,6 @@ _SHAPE_PATTERN_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-.]{4,}")
 _SHAPE_PATTERN_DOTTED_TOKEN_RE = re.compile(
     r"\b[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]{3,}\b"
 )
-_SHAPE_PATTERN_OPAQUE_KV_RE = re.compile(
-    r"(?i)\b(?:token|password|passwd|secret|apikey|api_key|access_key|"
-    r"secret_key|client_secret|authorization|bearer|private_key|session_key)\b"
-    r"\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*[\"']?[A-Za-z0-9+/=_\-.]{3,}"
-)
 # Credential FIELD NAMES — the full set a diagnostic / committed artifact must
 # never carry.  Two shapes derive from this single alternation:
 #
@@ -173,7 +196,8 @@ _CREDENTIAL_FIELD_NAME_ALT = (
     r"access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|"
     r"session[_-]?token|api[_-]?key|apikey|client[_-]?secret|"
     r"secret[_-]?key|private[_-]?key|authorization|set[_-]?cookie|"
-    r"passw(?:ord|d)|session[_-]?id|account[_-]?secret|credentials?"
+    r"passw(?:ord|d)|session[_-]?id|account[_-]?secret|credentials?|"
+    r"access[_-]?key|session[_-]?key|bearer"
 )
 BARE_CREDENTIAL_FIELD_NAMES = frozenset(
     {"token", "cookie", "secret", "browser_token"}
@@ -185,20 +209,26 @@ CREDENTIAL_FIELD_NAME_PATTERN = re.compile(
     r"(?i)(?:^|[_-])(" + _CREDENTIAL_FIELD_NAME_ALT + r")(?:[_-]?|$)"
 )
 # The credential-field KEY-VALUE shape splits the field names by how strongly
-# they signal a credential (C-122 supervision 09:28 gap 2):
+# they signal a credential (C-122 supervision 09:28 gap 2 + 09:59 Block 3/4):
 #
 # * ``_CREDENTIAL_FIELD_STRONG_NAME_ALT`` — names that are NEVER English prose
 #   (``session_token``, ``api_key``, ``client_secret``, bare ``token`` /
-#   ``secret`` …).  Their VALUE is every non-empty character from the first
-#   token character to a clear field boundary (end of line, ``;`` / ``,`` /
-#   ``]`` / ``}``) or the whole diagnostic — so ``Session_token=a`` (1 char),
-#   ``Session_token=ab`` and ``Session_token: abc def`` are all masked WHOLE,
-#   never relying on a 3-char token-run minimum.
+#   ``secret``, and — 09:59 Block 3 — ``password`` / ``passwd`` / ``access_key``
+#   / ``session_key``, which no longer share a branch with ``authorization``).
+#   Their VALUE is every NON-EMPTY character from the first value character to a
+#   clear field boundary (a quote, ``;`` / ``,``, a newline / the end of the
+#   diagnostic, or a space that BEGINS another field assignment) or the whole
+#   diagnostic — so ``Session_token=a`` (1 char), ``Password=a/ab/!`` and
+#   ``Session_token=abc@def`` are all masked WHOLE, never relying on a 3-char
+#   token-run minimum and never limited to an ASCII charset.
 # * ``_CREDENTIAL_FIELD_WEAK_NAME_ALT`` — names that are ALSO ordinary English
-#   words (``authorization``, ``password``, bare ``cookie``).  Their value must
-#   be an actual token-character payload (``{3,}``) so the canary's legitimate
-#   scope-detail PROSE (``pending user authorization: no connected Companion
-#   declares…``) is never flagged as a credential assignment.
+#   words (``authorization``, ``cookie``, ``bearer``).  Their value must be an
+#   actual token-character payload: a SINGLE token run of ``{3,}`` token
+#   characters NOT followed by more text (``(?![ \\t])``), so the canary's own
+#   scope-detail PROSE — ``pending user authorization: not all certified…``,
+#   ``authorization: full real E2E…``, ``authorization: no connected
+#   Companion…`` — is never flagged as a credential assignment, while a real
+#   token payload (``authorization: abc``, ``Cookie:a=b``) still is.
 #
 # Both branches keep the ``(?:^|[^A-Za-z0-9_])`` leading guard (a field
 # position — line start / quote / comma / bracket — separate from ordinary
@@ -206,28 +236,37 @@ CREDENTIAL_FIELD_NAME_PATTERN = re.compile(
 # ``session[_-]?token`` first; the bare ``token`` never matches the ``token``
 # inside ``bridge_token_present`` because a preceding ``_`` is not a
 # field-position guard).  The gate's own redaction marker ``secret=[REDACTED]``
-# starts its value with ``[`` — never a token character — so neither branch
-# flags an already-redacted assignment.
+# is the ONE exact exemption (Block 3): its ``[``-value fails the value start,
+# so an already-redacted assignment is left untouched.
 _CREDENTIAL_FIELD_STRONG_NAME_ALT = (
     r"access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|"
     r"session[_-]?token|api[_-]?key|apikey|client[_-]?secret|"
     r"secret[_-]?key|private[_-]?key|set[_-]?cookie|session[_-]?id|"
-    r"account[_-]?secret|credentials?|browser_token|token|secret"
+    r"account[_-]?secret|credentials?|browser_token|token|secret|"
+    r"access[_-]?key|session[_-]?key|passw(?:ord|d)"
 )
-_CREDENTIAL_FIELD_WEAK_NAME_ALT = r"authorization|passw(?:ord|d)|cookie"
+_CREDENTIAL_FIELD_WEAK_NAME_ALT = r"authorization|cookie|bearer"
 _CREDENTIAL_FIELD_STRONG_VALUE = (
-    # The first value character must be a real token character — never a space,
-    # the ``[`` of ``[REDACTED]`` or the ``<`` of ``<url>`` — then the value
-    # runs to a clear field boundary: ``;`` / ``,`` / ``]`` / ``}`` / line end,
-    # or a space that BEGINS another field assignment (``name`` followed by
-    # ``:`` / ``=``).  A space-separated credential value (``Session_token:
-    # abc def``) is covered WHOLE from the first non-empty char, while
+    # C-122 supervision 09:59 Block 3: the value is CHARSET-UNRESTRICTED — the
+    # first value character may be ANY character except whitespace, a quote,
+    # ``;`` / ``,`` (field separators), a backslash (JSON escape / Windows-path
+    # boundary) or the ``[`` of the exact safe marker ``[REDACTED]``.  ``@``,
+    # ``!``, ``/``, CJK and emoji are all real value characters
+    # (``Session_token=!/@/\u79d8\u5bc6/\U0001f511``, ``Password=a/ab/!`` and
+    # ``Session_token=abc@def`` must mask WHOLE, never leave ``@def`` residue).
+    # The leading ``(?!\[REDACTED\])`` is the ONE marker exemption: when the
+    # value position starts with the exact safe marker the whole match fails,
+    # so ``secret=[REDACTED]`` is left untouched while any OTHER ``[``-shaped
+    # value (``token=[1,2]``) is still a real value.  The value then runs to a
+    # clear field boundary: a quote, ``;`` / ``,``, a newline / the end of the
+    # diagnostic, or a space that BEGINS another field assignment (``name``
+    # followed by ``:`` / ``=``) — a space-separated value (``Session_token: abc
+    # def``) is covered WHOLE from the first non-empty char, while
     # ``token=a Session_token: b`` stops the first value at the next field
-    # instead of swallowing its name and leaving ``: b`` residue
-    # (C-122 supervision 09:28 gap B).
-    r"[A-Za-z0-9+/=_\-.]"
+    # instead of swallowing its name (C-122 supervision 09:28 gap B).
+    r"(?!\[REDACTED\])(?:[^\s;,\"'\\]|\[)"
     r"(?:"
-    r"[A-Za-z0-9+/=_\-.]"
+    r"[^\s;,\"'\\]"
     r"|[ \t](?![A-Za-z0-9_-]+[ \t]*[\"']*[ \t]*[:=])"
     r")*"
 )
@@ -242,7 +281,7 @@ _SHAPE_PATTERN_CREDENTIAL_FIELD_RE = re.compile(
     r"(?:^|[^A-Za-z0-9_])("
     + _CREDENTIAL_FIELD_WEAK_NAME_ALT
     + r")(?:[_-]?|$)\s*(?:\\*[\"']?|[\"'])?\s*[:=]\s*"
-    r"(?:\\*[\"']?|[\"'])?[A-Za-z0-9+/=_\-.]{3,}"
+    r"(?:\\*[\"']?|[\"'])?(?>[A-Za-z0-9+/=_\-.]{3,})(?![ \t])"
     r")"
 )
 
@@ -329,12 +368,15 @@ SHAPE_PATTERN_REGISTRY: tuple[SensitiveShapePattern, ...] = (
             | _S.FINAL_TEXT
         ),
     ),
-    SensitiveShapePattern(
-        name="opaque_kv",
-        pattern=_SHAPE_PATTERN_OPAQUE_KV_RE,
-        kind="short opaque token assignment",
-        scopes=_FINAL_VALUE_SHAPES,
-    ),
+    # C-122 supervision 09:59 Block 4: the legacy ``opaque_kv`` shape (a
+    # ``{3,}`` token-run value under a fixed key list with NO field boundary)
+    # falsely rejected real report prose (``pending user authorization: not all
+    # certified…``) while missing the stronger credential-FIELD shapes.  It is
+    # REMOVED — every name it carried (``token`` / ``password`` / ``passwd`` /
+    # ``secret`` / ``apikey`` / ``api_key`` / ``access_key`` / ``secret_key`` /
+    # ``client_secret`` / ``authorization`` / ``bearer`` / ``private_key`` /
+    # ``session_key``) is now folded into the strong/weak credential_field
+    # branches with the shared boundary semantics.
     SensitiveShapePattern(
         name="credential_field",
         pattern=_SHAPE_PATTERN_CREDENTIAL_FIELD_RE,
@@ -510,7 +552,14 @@ def iter_json_levels(
         malformed = False
         if looks_like_json(current):
             try:
-                parsed = json.loads(current)
+                # C-122 supervision 09:59 Block 2: load through the canonical
+                # parser — a duplicate object member key fails closed (a
+                # published artifact could otherwise smuggle a foreign digest
+                # under a whitelisted key, then ``json.loads`` keep only the
+                # second value).  The exception is a ``ValueError`` so the
+                # OBJECT-shaped start becomes malformed and every caller fails
+                # closed at ``depth >= 1``.
+                parsed = json_loads_no_dupes(current)
             except (json.JSONDecodeError, ValueError, RecursionError):
                 # Only an OBJECT-shaped start can hide a credential field
                 # name/value pair; the ``[REDACTED]`` marker and bare arrays /
@@ -673,7 +722,11 @@ def bounded_json_mask(
         if not looks_like_json(current):
             return apply_mask_level(current)
         try:
-            parsed = json.loads(current)
+            # C-122 supervision 09:59 Block 2: canonical parser — a duplicate
+            # object member key (a foreign digest smuggled under a whitelisted
+            # key) is a parse failure and the whole level is masked (fail
+            # closed), never silently keeping the last value.
+            parsed = json_loads_no_dupes(current)
         except (json.JSONDecodeError, ValueError, RecursionError):
             # Structural-start but not valid JSON: a truncated / obfuscated
             # JSON attempt — mask the whole level (fail closed).

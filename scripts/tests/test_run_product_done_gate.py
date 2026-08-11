@@ -6538,10 +6538,14 @@ def test_secret_scan_rejects_unicode_escaped_bearer_in_failure_diagnostic() -> N
 def test_secret_scan_rejects_short_opaque_token_assignment_in_failure() -> None:
     """C-122 supervision 00:06 (要求 A) counter-example: a short opaque
     ``token=abc`` assignment in a decoded ``.failure.json`` summary is a
-    credential even though the value is only 3 chars — the short-opaque shape
-    scan rejects it on the raw AND on the decoded-value scan."""
+    credential even though the value is only 3 chars.  C-122 supervision 09:59
+    (Block 4): the legacy ``opaque_kv`` shape was removed and ``token`` is now a
+    STRONG credential-FIELD name — the credential-field shape rejects it on the
+    raw AND on the decoded-value scan."""
     raw = json.dumps({"summary": "token=abc"})
-    with pytest.raises(gate.GateStateChangedError, match="token assignment"):
+    with pytest.raises(
+        gate.GateStateChangedError, match="credential field name assignment"
+    ):
         gate._secret_scan_bytes(
             raw.encode(),
             gate._SecretNeedles(()),
@@ -6910,6 +6914,189 @@ def test_gap1_delimiter_in_key_never_whitelisted() -> None:
         gate._reject_unknown_64hex_values(raw.encode(), b"x", "real.json")
 
 
+def test_gap1_digest_typed_path_never_aliased() -> None:
+    """C-122 supervision 09:59 (Block 1) counter-example: the digest whitelist
+    matches the ORIGINAL canonical spec key EXACTLY — a non-canonical alias of a
+    whitelisted 64-hex field (uppercase ``API_PAYLOAD_CANDIDATE_SET_SHA256``,
+    dash ``api-payload-candidate-set-sha256``, a trailing-space spelling) is a
+    DIFFERENT typed path and is rejected, because a non-canonical alias is
+    exactly where a foreign digest is smuggled in.  The compact validators
+    reject an unknown top-level field for the same reason."""
+    hex64 = "a" * 64
+    for raw in (
+        json.dumps({"API_PAYLOAD_CANDIDATE_SET_SHA256": hex64}),
+        json.dumps({"api-payload-candidate-set-sha256": hex64}),
+        json.dumps({"api_payload_candidate_set_sha256 ": hex64}),
+        json.dumps({"Api_Payload_Candidate_Set_Sha256": hex64}),
+    ):
+        with pytest.raises(gate.GateStateChangedError, match="64-hex"):
+            gate._reject_unknown_64hex_values(raw.encode(), b"x", "alias.json")
+    # The ORIGINAL canonical key stays accepted.
+    gate._reject_unknown_64hex_values(
+        json.dumps({"api_payload_candidate_set_sha256": hex64}).encode(),
+        b"x",
+        "canonical.json",
+    )
+    # Compact validators: an ALIAS top-level field (uppercase / dash spelling of
+    # a digest key) fails closed; the canonical top-level field set is allowed
+    # by the unknown-field check (the full semantic validator still runs).
+    l5 = {
+        "schema_version": gate._LAYER5_COMPACT_SCHEMA,
+        "generated_at": "x",
+        "passed": True,
+        "bridge_token_present": True,
+        "coverage": {},
+        "scopes": [],
+        "companion_status": {},
+        "raw_evidence": {},
+    }
+    l5_alias = dict(l5, **{"API_PAYLOAD_CANDIDATE_SET_SHA256": hex64})
+    with pytest.raises(gate.GateStateChangedError, match="unknown top-level"):
+        gate._verify_layer5_compact_contract("tracked", l5_alias)
+    l6 = {
+        "schema_version": gate._LAYER6_COMPACT_SCHEMA,
+        "captured_at": "x",
+        "run_status": "completed",
+        "done_gate": {
+            "passed": True,
+            "check_count": 15,
+            "passed_check_count": 15,
+            "checks": [],
+        },
+        "repo_revision": "x",
+        "start_revision": "x",
+        "failure": None,
+        "timeout_contract": {},
+        "runner_contract": {},
+        "event_injection_contract": {},
+        "api_payload_candidate_set_sha256": hex64,
+        "api_payload_sha256": hex64,
+        "scenario_sha256": hex64,
+        "runtime_before_run": {},
+        "companion_preflight": {},
+        "bridge_state_lease_preflight": {},
+        "bridge_state_lease_postcheck": {},
+        "raw_evidence": {},
+    }
+    l6_alias = dict(l6, **{"API_PAYLOAD_CANDIDATE_SET_SHA256": hex64})
+    with pytest.raises(gate.GateStateChangedError, match="unknown top-level"):
+        gate._verify_layer6_compact_contract("tracked", l6_alias)
+
+
+def test_block2_duplicate_json_keys_fail_closed() -> None:
+    """C-122 supervision 09:59 (Block 2) counter-example: a published JSON that
+    repeats a whitelisted field name — a FOREIGN 64-hex first, then a normal
+    value — must fail closed BEFORE any value is trusted.  ``json.loads`` keeps
+    only the LAST value and discards the first, so both were previously
+    accepted; every parser in the chain now loads through a canonical
+    ``object_pairs_hook`` and rejects the duplicate key.  Top-level and nested
+    1-3 layer JSON-string dupes all fail the committed scan, and the
+    producer/consumer maskers collapse the document whole (fail closed)."""
+    from benchmarks import live_canary_certified as canary
+
+    foreign = "b" * 64
+    normal = "c" * 64
+    dup_top = (
+        '{"api_payload_candidate_set_sha256": "' + foreign + '", '
+        '"api_payload_candidate_set_sha256": "' + normal + '"}'
+    )
+
+    def layered(value: str, levels: int) -> str:
+        text = value
+        for _ in range(levels):
+            text = json.dumps({"outer": text})
+        return text
+
+    for level in (0, 1, 2, 3):
+        raw = dup_top if level == 0 else layered(dup_top, level)
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                f"dup-{level}.json",
+                credential_field_check=True,
+            )
+        # The maskers fail closed — a duplicate key is a parse failure, never
+        # keeping the last value: the whole top-level document (level 0) or the
+        # dup JSON-string level collapses to the marker, so neither the foreign
+        # nor the normal digest survives into the output.
+        producer_out = canary._desensitize(raw)
+        consumer_out = gate._sanitize_canary_diag_field(raw, "fallback")
+        assert foreign not in producer_out and normal not in producer_out
+        assert foreign not in consumer_out and normal not in consumer_out
+        assert "[REDACTED]" in producer_out
+        assert "[REDACTED]" in consumer_out
+
+
+def test_block3_charset_unrestricted_credential_field_values(tmp_path: Path) -> None:
+    """C-122 supervision 09:59 (Block 3) counter-example: a non-empty credential
+    field VALUE is masked from the FIRST non-empty character to a clear field
+    boundary or the whole diagnostic, with NO ASCII charset limit — ``!`` / ``@``
+    / ``/`` / CJK / emoji (``Session_token=\uff01/@/\u79d8\u5bc6/\U0001f511``),
+    a ``Password=`` / ``passwd=`` value (``Password=a/ab/!``) and an
+    ``@``-containing token (``Session_token=abc@def``) are masked WHOLE by the
+    producer/consumer and rejected by both final scans; only the EXACT safe
+    marker (``[REDACTED]``) is exempt; and a real 0600 seal-on-disk never leaks
+    any of the forms."""
+    from benchmarks import live_canary_certified as canary
+
+    leak_free = [
+        ("emoji-cjk", "Session_token=!/@/秘密/🔑", "session_token"),
+        ("password-slash", "Password=a/ab/!", "password"),
+        ("passwd-1char", "passwd=!", "passwd"),
+        ("at-char", "Session_token=abc@def", "abc@def"),
+        ("password-2char", "Password=ab", "password"),
+    ]
+    for label, raw, gone in leak_free:
+        producer_out = canary._desensitize(raw)
+        assert gone not in producer_out.lower(), (
+            f"producer leaked {gone!r} for {label}: {producer_out!r}"
+        )
+        consumer_out = gate._sanitize_canary_diag_field(raw, "fallback")
+        assert gone not in consumer_out.lower(), (
+            f"consumer leaked {gone!r} for {label}: {consumer_out!r}"
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # A real seal-on-disk diagnostic never leaks any of the forms.
+    output = tmp_path / "live-canary-certified.json"
+    diag_path = canary._seal_failure_diagnostic(
+        "evaluate",
+        RuntimeError(
+            "upstream 401 Session_token=!/@/秘密/🔑 Password=a/ab/! "
+            "Session_token=abc@def"
+        ),
+        output,
+        run_id="abc123def456",
+        tested_sha="a" * 40,
+    )
+    assert diag_path.is_file()
+    summary = json.loads(diag_path.read_text(encoding="utf-8"))["summary"]
+    assert "session_token" not in summary.lower()
+    assert "abc@def" not in summary
+    assert "秘密" not in summary
+    # The exact safe marker is the ONE exemption.
+    assert canary._desensitize("secret=[REDACTED]") == "secret=[REDACTED]"
+    assert gate._sanitize_canary_diag_field("secret=[REDACTED]", "fallback") == (
+        "secret=[REDACTED]"
+    )
+
+
 def test_gap2_short_credential_values_to_field_boundary(tmp_path: Path) -> None:
     """C-122 supervision 09:28 (gap B) counter-example: the SHARED credential-field
     parse/mask covers from the FIRST non-empty value character to a clear field
@@ -6992,21 +7179,31 @@ def test_gap2_short_credential_values_to_field_boundary(tmp_path: Path) -> None:
     # no token payload) stays allowed by the COMMITTED structured scan — it sits
     # inside a JSON string value, not at a header field position (the same
     # regression ``test_secret_scan_allows_canary_pending_authorization_prose``
-    # covers).  The free-form producer / failure-path masks still collapse it
-    # as a whole header by design — a cosmetic loss, never a leak.
-    prose = (
+    # covers).  The variants below are the exact detail strings the gate's own
+    # ``product-v1-done-gate.json`` report carries — a real report must never
+    # trip its own final scan.  The free-form producer / failure-path masks
+    # still collapse them as a whole header by design — a cosmetic loss, never
+    # a leak.
+    for prose in (
         "pending user authorization: no connected Companion declares provider "
-        "'ctrip'; pair the Companion and re-run"
-    )
-    gate._secret_scan_bytes(
-        json.dumps(
-            {"scopes": [{"scope": "ctrip:flight", "authorized": False, "detail": prose}]}
-        ).encode(),
-        gate._SecretNeedles(()),
-        "evidence",
-        "live-canary-certified.json",
-        credential_field_check=True,
-    )
+        "'ctrip'; pair the Companion and re-run",
+        "pending user authorization: not all certified canary scopes have a "
+        "fresh authorised read-only canary",
+        "pending user authorization: full real E2E runs the configured mode",
+    ):
+        gate._secret_scan_bytes(
+            json.dumps(
+                {
+                    "scopes": [
+                        {"scope": "ctrip:flight", "authorized": False, "detail": prose}
+                    ]
+                }
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json",
+            credential_field_check=True,
+        )
 
 
 def test_producer_consumer_mask_fullwidth_zero_width_credential_spans() -> None:

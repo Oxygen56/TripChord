@@ -85,13 +85,15 @@ _CANARY_DIAG_AKIA_RE = registry_pattern("akia")
 _CANARY_DIAG_PREFIX_TOKEN_RE = registry_pattern("prefix_token")
 _CANARY_DIAG_BEARER_RE = registry_pattern("bearer")
 _CANARY_DIAG_DOTTED_TOKEN_RE = registry_pattern("dotted_token")
-_CANARY_DIAG_OPAQUE_KV_RE = registry_pattern("opaque_kv")
 # C-122 supervision 09:00: the credential FIELD NAME shape — an ASCII / full-width
 # ``Session_token=abc`` / ``"Session_token":"abc"`` key-value assignment (the
-# ``session_token`` family and bare ``token=`` / ``cookie=`` / ``secret=``) must be
+# ``session_token`` family plus bare ``token=`` / ``cookie=`` / ``secret=`` /
+# ``password=`` / ``passwd=`` / ``access_key=`` / ``session_key=``) must be
 # masked WHOLE (name + value) before the diagnostic ever reaches stderr or the
 # ``<output>.failure.json`` summary — the short value would otherwise survive
-# every existing shape scan (``opaque_kv``'s key list stops at ``session_key``).
+# every existing shape scan.  C-122 supervision 09:59 (Block 4): the legacy
+# ``opaque_kv`` shape was REMOVED and its keys folded into this shape with the
+# shared strong/weak boundary semantics.
 _CANARY_DIAG_CREDENTIAL_FIELD_RE = registry_pattern("credential_field")
 # C-122 supervision 03:46 (Block 1): whole-header/field redaction.  The shape
 # patterns above still let a credential BODY slip through when the value is
@@ -339,8 +341,8 @@ def _desensitize_level(text: str) -> str:
     """Mask ONE free-form text level with the credential-shape regex chain."""
     # C-122 supervision 09:00 (gap 2): mask the credential-FIELD assignment on
     # the NORMALIZED copy of the RAW text FIRST.  A zero-width-split field name
-    # (``Session​token:"abc"``) would otherwise be PARTIALLY masked by the
-    # opaque-KV shape below — the Cf char is a word boundary, so ``token:…`` is
+    # (``Session​token:"abc"``) would otherwise be PARTIALLY masked by the ASCII
+    # credential-field shape — the Cf char is a word boundary, so ``token:…`` is
     # collapsed and the ``Session`` name half survives.  The WHOLE-HEADER shape
     # runs here too so a full-width ``\uff21uthorization: Basic YWJjZA==`` masks
     # name-and-base64 together (the tightened credential-FIELD value pattern
@@ -366,7 +368,10 @@ def _desensitize_level(text: str) -> str:
     text = _CANARY_DIAG_PREFIX_TOKEN_RE.sub("[REDACTED]", text)
     text = _CANARY_DIAG_BEARER_RE.sub("[REDACTED]", text)
     text = _CANARY_DIAG_DOTTED_TOKEN_RE.sub("[REDACTED]", text)
-    text = _CANARY_DIAG_OPAQUE_KV_RE.sub("[REDACTED]", text)
+    # C-122 supervision 09:59 (Block 4): the legacy ``opaque_kv`` mask is gone —
+    # every key it carried is now folded into the credential-FIELD shape with
+    # the shared strong/weak boundary semantics (the credential_field line below
+    # does the work).
     text = _CANARY_DIAG_CREDENTIAL_FIELD_RE.sub("[REDACTED]", text)
     return text
 

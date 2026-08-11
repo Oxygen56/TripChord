@@ -51,11 +51,13 @@ from urllib.parse import parse_qsl, urlsplit
 from tripchord._secret_redact import (
     BARE_CREDENTIAL_FIELD_NAMES,
     CREDENTIAL_FIELD_NAME_PATTERN,
+    DuplicateJsonKeyError,
     PatternScope,
     RecursiveJsonBudgetError,
     _normalize_for_scan,
     bounded_json_mask,
     iter_json_levels,
+    json_loads_no_dupes,
     looks_like_json,
     mask_normalized_spans,
     registry_pattern,
@@ -457,7 +459,7 @@ def layer2_replay(staging_dir: Path) -> LayerResult:
     passed_accept = code_accept == 0
     if passed_accept and acceptance_out.is_file():
         try:
-            payload = json.loads(acceptance_out.read_text(encoding="utf-8"))
+            payload = json_loads_no_dupes(acceptance_out.read_text(encoding="utf-8"))
             accept_detail = (
                 f"all {len(payload.get('surfaces', []))} anti-surface surfaces passed"
             )
@@ -1084,7 +1086,11 @@ def _reject_malformed_top_level_json(data: bytes, label: str, name: str) -> None
     if not looks_like_json(text):
         return  # plain non-JSON text; byte + pattern scan still applies
     try:
-        json.loads(text)
+        # C-122 supervision 09:59 Block 2: the canonical parser — a duplicate
+        # object member key (a foreign digest smuggled under a whitelisted key)
+        # is a top-level parse failure and fails closed, never keeping only the
+        # LAST value as ``json.loads`` would.
+        json_loads_no_dupes(text)
     except (json.JSONDecodeError, ValueError, RecursionError):
         raise GateStateChangedError(
             f"secret leak: malformed top-level JSON in {label} file {name}"
@@ -1126,7 +1132,15 @@ def _reject_credential_field_names(data: bytes, label: str, name: str) -> None:
                     f"secret leak: malformed nested JSON in {label} file {name}"
                 )
             try:
-                parsed = json.loads(level_text)
+                parsed = json_loads_no_dupes(level_text)
+            except DuplicateJsonKeyError:
+                # C-122 supervision 09:59 Block 2: a duplicate object member key
+                # anywhere in a committed artifact is a parse failure — a foreign
+                # digest smuggled under a whitelisted field name must fail closed
+                # before any value is kept.
+                raise GateStateChangedError(
+                    f"secret leak: duplicate JSON object key in {label} file {name}"
+                ) from None
             except ValueError:
                 continue  # not JSON text at this level; the pattern scan applies
             if not isinstance(parsed, (dict, list)):
@@ -1238,6 +1252,16 @@ def _reject_unknown_64hex_values(data: bytes, label: str, name: str) -> None:
     ``{"done_gate.checks[].evidence.candidate_set_sha256": ...}``) forms a
     DIFFERENT typed path and is rejected.
 
+    C-122 supervision 09:59 (Block 1): the typed-path segment is the RAW
+    canonical key — the walker does NOT strip / lowercase / dash-fold a key
+    before matching.  ``API_PAYLOAD_CANDIDATE_SET_SHA256`` (uppercase),
+    ``api-payload-candidate-set-sha256`` (dash) and a trailing-space spelling of
+    a whitelisted 64-hex field are all DIFFERENT typed paths and are rejected;
+    only the ORIGINAL spec key (``api_payload_candidate_set_sha256`` etc.) is
+    trusted, because a non-canonical alias is exactly where a foreign digest is
+    smuggled in.  The compact validators reject unknown top-level fields for the
+    same reason.
+
     C-122 supervision 06:58: the walk is BOUNDED-RECURSIVE over JSON-string
     values too, and a structural-start string that does not parse (a truncated /
     obfuscated JSON attempt) or a walk that overflows the depth/node/size
@@ -1256,7 +1280,15 @@ def _reject_unknown_64hex_values(data: bytes, label: str, name: str) -> None:
                     f"secret leak: malformed nested JSON in {label} file {name}"
                 )
             try:
-                parsed = json.loads(level_text)
+                parsed = json_loads_no_dupes(level_text)
+            except DuplicateJsonKeyError:
+                # C-122 supervision 09:59 Block 2: a duplicate object member key
+                # is a parse failure — a foreign digest smuggled under a
+                # whitelisted field name must fail closed before any value is
+                # kept (``json.loads`` would silently keep the LAST value).
+                raise GateStateChangedError(
+                    f"secret leak: duplicate JSON object key in {label} file {name}"
+                ) from None
             except ValueError:
                 continue  # not JSON text at this level; the pattern scan applies
             stack: list[tuple[Any, tuple[str | None, ...]]] = [(parsed, ())]
@@ -1264,7 +1296,14 @@ def _reject_unknown_64hex_values(data: bytes, label: str, name: str) -> None:
                 node, path = stack.pop()
                 if isinstance(node, dict):
                     for key, value in node.items():
-                        seg = str(key).strip().lower().replace("-", "_")
+                        # C-122 supervision 09:59 Block 1: the typed-path segment
+                        # is the RAW canonical key — never ``strip``ped /
+                        # ``lower``ed / dash-folded.  An alias of the original
+                        # spec key (``API_PAYLOAD_CANDIDATE_SET_SHA256``,
+                        # ``api-payload-candidate-set-sha256``, a trailing-space
+                        # spelling) is a DIFFERENT typed path and can never hit
+                        # the whitelist.
+                        seg = str(key)
                         child_path = (*path, seg)
                         if isinstance(value, str):
                             _check_unknown_64hex(
@@ -1926,7 +1965,6 @@ _CANARY_DIAG_AKIA_RE = registry_pattern("akia")
 _CANARY_DIAG_PREFIX_TOKEN_RE = registry_pattern("prefix_token")
 _CANARY_DIAG_BEARER_RE = registry_pattern("bearer")
 _CANARY_DIAG_DOTTED_TOKEN_RE = registry_pattern("dotted_token")
-_CANARY_DIAG_OPAQUE_KV_RE = registry_pattern("opaque_kv")
 _CANARY_DIAG_WHOLE_HEADER_RE = registry_pattern("whole_header")
 # C-122 supervision 09:00: the credential FIELD NAME key-VALUE shape — an ASCII /
 # full-width ``Session_token=abc`` / ``"Session_token":"abc"`` assignment (the
@@ -2042,7 +2080,8 @@ def _canary_diag_mask_level(value: str) -> str:
     # C-122 supervision 09:00 (gap 2): same zero-width-split pre-pass as the
     # producer — a Cf / full-width credential-FIELD assignment (``Session​token:…``)
     # is masked WHOLE on the normalized copy BEFORE the ASCII chain runs, so the
-    # opaque-KV shape below cannot collapse ``token:…`` and leave the name half.
+    # ASCII credential-field shape cannot collapse ``token:…`` and leave the
+    # name half.
     # The WHOLE-HEADER shape runs here too so a full-width ``\uff21uthorization:
     # Basic YWJjZA==`` masks name-and-base64 together (the tightened
     # credential-FIELD value pattern stops at the space after ``Basic``).
@@ -2066,7 +2105,10 @@ def _canary_diag_mask_level(value: str) -> str:
     value = _CANARY_DIAG_PREFIX_TOKEN_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_BEARER_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_DOTTED_TOKEN_RE.sub("[REDACTED]", value)
-    value = _CANARY_DIAG_OPAQUE_KV_RE.sub("[REDACTED]", value)
+    # C-122 supervision 09:59 Block 4: the legacy ``opaque_kv`` mask is gone —
+    # every key it carried is now folded into the credential-FIELD shape with
+    # the shared strong/weak boundary semantics (the credential_field line
+    # below does the work).
     value = _CANARY_DIAG_CREDENTIAL_FIELD_RE.sub("[REDACTED]", value)
     return value
 
@@ -2104,7 +2146,7 @@ def _consume_canary_failure_diagnostic(
     if mode != 0o600:
         return None, f"canary failure diagnostic must be 0600, got {oct(mode)}"
     try:
-        diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+        diagnostic = json_loads_no_dupes(diag_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return None, f"canary failure diagnostic unreadable or invalid JSON: {exc}"
     if not isinstance(diagnostic, dict):
@@ -2306,7 +2348,7 @@ def layer5_real_canary(
             f"canary process exited {code} (must exit 0 with certified JSON)"
         )
     try:
-        report = json.loads(evidence_path.read_text(encoding="utf-8"))
+        report = json_loads_no_dupes(evidence_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         report = None
         canary_failures.append("canary evidence JSON missing or unreadable")
@@ -2866,7 +2908,7 @@ def _bridge_state_validate(state_path: Path | None, *, after: bool) -> list[str]
         # (C-122 round-18 item 3).
         payload_bytes = state_path.read_bytes()
         payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
-        payload = json.loads(payload_bytes.decode("utf-8"))
+        payload = json_loads_no_dupes(payload_bytes.decode("utf-8"))
     except (OSError, ValueError) as exc:
         return [
             f"bridge-state file {state_path} unreadable "
@@ -3253,7 +3295,7 @@ def layer6_full_e2e(
         )
     runner_evidence: dict[str, Any] = {}
     try:
-        runner_evidence = json.loads(output_path.read_text(encoding="utf-8"))
+        runner_evidence = json_loads_no_dupes(output_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         mismatches.append("runner evidence JSON missing or unreadable")
     if not mismatches:
@@ -3264,7 +3306,7 @@ def layer6_full_e2e(
         canary_path = staging_dir / "live-canary-certified.json"
         canary_fingerprint = None
         try:
-            canary = json.loads(canary_path.read_text(encoding="utf-8"))
+            canary = json_loads_no_dupes(canary_path.read_text(encoding="utf-8"))
             canary_fingerprint = _extract_build_fingerprint(canary.get("companion_status"))
         except (OSError, ValueError):
             pass
@@ -3601,6 +3643,46 @@ _COMPACT_E2E_STAGED_NAME = "done-gate-layer6-compact.json"
 # rejected (C-122 acceptance).
 _LAYER5_COMPACT_SCHEMA = "tripchord-done-gate-layer5-compact-v2"
 _LAYER6_COMPACT_SCHEMA = "tripchord-done-gate-layer6-compact-v2"
+# C-122 supervision 09:59 (Block 1): a compact is a PUBLIC contract — its
+# top-level field set is fixed.  A non-canonical ALIAS of a whitelisted digest
+# key (``API_PAYLOAD_CANDIDATE_SET_SHA256``, ``api-payload-candidate-set-
+# sha256``) or any other foreign top-level field makes the compact foreign and
+# fails the validator closed, mirroring the raw-key exact match the digest
+# whitelist walker enforces.
+_LAYER5_COMPACT_ALLOWED_TOP_LEVEL = frozenset(
+    {
+        "schema_version",
+        "generated_at",
+        "passed",
+        "bridge_token_present",
+        "coverage",
+        "scopes",
+        "companion_status",
+        "raw_evidence",
+    }
+)
+_LAYER6_COMPACT_ALLOWED_TOP_LEVEL = frozenset(
+    {
+        "schema_version",
+        "captured_at",
+        "run_status",
+        "done_gate",
+        "repo_revision",
+        "start_revision",
+        "failure",
+        "timeout_contract",
+        "runner_contract",
+        "event_injection_contract",
+        "api_payload_candidate_set_sha256",
+        "api_payload_sha256",
+        "scenario_sha256",
+        "runtime_before_run",
+        "companion_preflight",
+        "bridge_state_lease_preflight",
+        "bridge_state_lease_postcheck",
+        "raw_evidence",
+    }
+)
 
 _EVIDENCE_TRACKED_PATHS: tuple[tuple[str, str], ...] = (
     ("product-acceptance.json", "benchmarks/results/product-acceptance.json"),
@@ -3741,7 +3823,7 @@ def _canary_manifest(staging_dir: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_loads_no_dupes(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     companions = ((payload.get("companion_status") or {}).get("companions")) or []
@@ -3772,7 +3854,7 @@ def _live_e2e_manifest(staging_dir: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_loads_no_dupes(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     rb = payload.get("runtime_before_run") or {}
@@ -3861,7 +3943,7 @@ def _compact_canary(staging_dir: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_loads_no_dupes(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     companion_status = payload.get("companion_status") or {}
@@ -4323,7 +4405,7 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_loads_no_dupes(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     rb = payload.get("runtime_before_run") or {}
@@ -4774,6 +4856,16 @@ def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
             f"evidence commit E layer-5 compact {tracked_rel} schema_version "
             f"{compact.get('schema_version')!r} != {_LAYER5_COMPACT_SCHEMA} "
             "(producer and validator must share the same schema version)"
+        )
+    # C-122 supervision 09:59 (Block 1): the top-level field set is a fixed
+    # contract — an ALIAS of a whitelisted digest key or any other foreign field
+    # makes the compact foreign and fails closed (a non-canonical alias is
+    # exactly where a foreign digest is smuggled in).
+    unknown = set(compact) - _LAYER5_COMPACT_ALLOWED_TOP_LEVEL
+    if unknown:
+        raise GateStateChangedError(
+            f"evidence commit E layer-5 compact {tracked_rel} unknown top-level "
+            f"field(s): {sorted(unknown)!r}"
         )
     # C-122 round-18 gate-5: semantic (not just non-empty) top-level validation
     # — a compact must itself declare passed=true with the bridge token present
@@ -6130,6 +6222,17 @@ def _verify_layer6_compact_contract(
             f"{compact.get('schema_version')!r} != {_LAYER6_COMPACT_SCHEMA} "
             "(producer and validator must share the same schema version)"
         )
+    # C-122 supervision 09:59 (Block 1): the top-level field set is a fixed
+    # contract — an ALIAS of a whitelisted digest key (``API_PAYLOAD_CANDIDATE_
+    # SET_SHA256`` / ``api-payload-candidate-set-sha256``) or any other foreign
+    # field makes the compact foreign and fails closed, mirroring the digest
+    # whitelist walker's raw-key exact match.
+    unknown = set(compact) - _LAYER6_COMPACT_ALLOWED_TOP_LEVEL
+    if unknown:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} unknown top-level "
+            f"field(s): {sorted(unknown)!r}"
+        )
     done_gate = compact.get("done_gate")
     if not isinstance(done_gate, dict):
         raise GateStateChangedError(
@@ -6575,7 +6678,7 @@ def _verify_evidence_contract(
         "show", f"{evidence_commit}:{_MANIFEST_REL}", check=True, binary=True
     ).stdout
     try:
-        manifest = json.loads(manifest_blob.decode("utf-8"))
+        manifest = json_loads_no_dupes(manifest_blob.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise GateStateChangedError(
             f"evidence commit E manifest {_MANIFEST_REL} is not valid JSON"
@@ -6655,7 +6758,7 @@ def _verify_evidence_contract(
         # done-gate check set).
         blob = _git("show", f"{evidence_commit}:{tracked_rel}", check=True, binary=True)
         try:
-            compact = json.loads(blob.stdout.decode("utf-8"))
+            compact = json_loads_no_dupes(blob.stdout.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
             raise GateStateChangedError(
                 f"evidence commit E compact artifact {tracked_rel} is not valid JSON"
@@ -6707,7 +6810,7 @@ def _verify_pointer_committed_blobs(
         check=True, binary=True,
     ).stdout
     try:
-        committed_report = json.loads(report_blob.decode("utf-8"))
+        committed_report = json_loads_no_dupes(report_blob.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise GateStateChangedError(
             "pointer commit P authoritative report is not valid JSON"
@@ -6789,7 +6892,7 @@ def _verify_pointer_committed_blobs(
         "show", f"{pointer_commit}:{_MANIFEST_REL}", check=True, binary=True
     ).stdout
     try:
-        committed_manifest = json.loads(manifest_blob.decode("utf-8"))
+        committed_manifest = json_loads_no_dupes(manifest_blob.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise GateStateChangedError(
             f"pointer commit P manifest {_MANIFEST_REL} is not valid JSON"
@@ -7632,7 +7735,7 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
             "show", f"{pointer_commit}:{_REPORT_REL}", check=True, binary=True
         ).stdout
         try:
-            committed_report = json.loads(report_blob.decode("utf-8"))
+            committed_report = json_loads_no_dupes(report_blob.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
             problems.append(f"pointer commit P report {_REPORT_REL} is not valid JSON")
             committed_report = None
@@ -7879,7 +7982,7 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
                         binary=True,
                     )
                     try:
-                        compact = json.loads(compact_blob.stdout.decode("utf-8"))
+                        compact = json_loads_no_dupes(compact_blob.stdout.decode("utf-8"))
                     except (UnicodeDecodeError, ValueError):
                         problems.append(
                             f"evidence commit E compact artifact {tracked_rel} is not "
@@ -8019,7 +8122,7 @@ def _committed_json_blob(
     """
     try:
         blob = _git("show", f"{commit}:{rel}", check=True, binary=True).stdout
-        parsed = json.loads(blob.decode("utf-8"))
+        parsed = json_loads_no_dupes(blob.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, GateStateChangedError) as exc:
         problems.append(
             f"commit {commit} {rel} {label} is not valid JSON "
