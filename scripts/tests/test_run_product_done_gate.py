@@ -14905,3 +14905,127 @@ def test_r29_full_chain_producer_seal_consumer_block50_51_both_finals(
             "ev.json",
             credential_field_check=True,
         )
+
+
+def test_r30_block52_unlisted_arrow_glyphs_narration_fail_closed_both_paths() -> None:
+    """C-122 round-30 Block 52 counter-examples (architect independent review of
+    429c861): the credential-narration operator set must be CLOSED BY UNICODE
+    ARROW BLOCK RANGE, not glyph enumeration.  R29 listed 10 arrow glyphs and
+    the review found unlisted rightward-arrow codepoints that escaped BOTH
+    finals (``⇛`` U+21DB / ``⇉`` U+21C9 / ``⇶`` U+21F6 / ``➙`` U+2799 /
+    ``➝`` U+279D / ``⟿`` U+27FF / ``⇢`` U+21E2 / ``⭢`` U+2B62 / ``⮕`` U+2B95 —
+    every one NFKC-invariant).  ``passphrase {glyph} plannerV2`` fails BOTH
+    finals closed, exactly like the covered ``⇒``/``→``/``=>``/``:``/``=`` and
+    the NFKC-folded full-width colon (U+FF1A) / equals (U+FF1D) forms.  A designation word that does
+    NOT bind a registered base stays accepted."""
+    for glyph in ("⇛", "⇉", "⇶", "➙", "➝", "⟿", "⇢", "⭢", "⮕"):
+        raw = f"passphrase {glyph} plannerV2"
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # Covered operators stay rejected (regression): arrow + ASCII + full-width.
+    for op in ("⇒", "→", "=>", ":", "=", "：", "＝"):
+        raw = f"passphrase {op} plannerV2"
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+    # A designation word that does not designate a registered base is prose.
+    for raw in (
+        "the passcode was not stored anywhere",
+        "login page loads today",
+        "key: a plain discussion of the itinerary",
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r30_full_chain_producer_seal_consumer_block52_arrow_glyphs_both_finals(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-30 full chain (Block 52): the producer masks a narration
+    assignment whose binding operator is an unlisted arrow glyph
+    (``passphrase ⇛ plannerV2`` and the ``⇉``/``⇶``/``➙``/``➝``/``⟿``/``⇢``/
+    ``⭢``/``⮕`` siblings) BEFORE the 0600 seal, so the sealed diagnostic is
+    clean and BOTH finals pass; the RAW value still fails BOTH finals (defense
+    in depth)."""
+    from benchmarks import live_canary_certified as canary
+
+    def seal(message: str) -> Path:
+        output = tmp_path / "live-canary-certified.json"
+        return canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(message),
+            output,
+            run_id="r30chain",
+            tested_sha="13d76ae" + "0" * 33,
+        )
+
+    for glyph in ("⇛", "⇉", "⇶", "➙", "➝", "⟿", "⇢", "⭢", "⮕"):
+        raw = f"passphrase {glyph} plannerV2"
+        masked = canary._desensitize(raw)
+        assert masked != raw, "producer must mask the arrow-narration value"
+        assert "[REDACTED]" in masked
+        diag = seal(masked)
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                f'{{"summary": "{masked}"}}', "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )

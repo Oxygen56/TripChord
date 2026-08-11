@@ -1025,17 +1025,24 @@ _CREDENTIAL_DESIGNATION_ALT = (
     r"|auth[_-]?token|session[_-]?token|client[_-]?secret|secret[_-]?key"
     r"|authorization|proxy[_-]?authorization|bearer|auth)"
 )
-# R29 Block 51: the binding-operator arrow class must carry the NFKC-invariant
-# arrow variants a bypass can substitute for ``→`` (``⇒`` U+21D2 / ``⟶`` U+27F6
-# / ``⤳`` U+2933 / ``➔`` U+2794 — NFKC leaves every one of them unchanged, so
-# normalizing the scanned text cannot collapse them; the operator set itself has
-# to include the full right-arrow family, or ``passphrase ⇒ plannerV2`` escapes
-# the narration binding).  Over-inclusion here only ever binds (fail-closed) —
-# a designation word + arrow + registered-base value is credential narration
-# regardless of which arrow glyph the author typed.
+# R29 Block 51 / R30 Block 52: the binding-operator arrow class is CLOSED BY
+# UNICODE ARROW BLOCK RANGE, not by glyph enumeration.  NFKC leaves every arrow
+# codepoint unchanged (⇒ U+21D2 / ⟶ U+27F6 / ⤳ U+2933 / ➔ U+2794 / ⇛ U+21DB /
+# ⭢ U+2B62 / ⮕ U+2B95 …), so normalizing the scanned text can never collapse
+# them — the operator set itself must accept ANY rightward arrow.  R29 listed 10
+# glyphs and the review found 19 more unlisted ones (``⇛``/``⇉``/``⇶``/``➙``/
+# ``➝``/``⟿``/``⇢``/``⭢``/``⮕``) that escaped both finals; the fix matches the
+# prescribed arrow BLOCK ranges instead: Arrows U+2190-U+21FF, Supplemental
+# Arrows-A U+27F0-U+27FF, Supplemental Arrows-B U+2900-U+297F, Dingbats rightward
+# arrows U+2794-U+27BF, Misc Symbols & Arrows U+2B00-U+2BFF.  Over-inclusion here
+# only ever binds (fail-closed) — a designation word + arrow + registered-base
+# value is credential narration regardless of which arrow glyph the author typed.
+_UNICODE_ARROW_BLOCK_CLASS = (
+    r"[\u2190-\u21FF\u27F0-\u27FF\u2900-\u297F\u2794-\u27BF\u2B00-\u2BFF]"
+)
 _CREDENTIAL_NARRATION_BIND_OP = (
     r"(?:is|was|were|are|equals?|becomes)\b[ \t]*"
-    r"|[:=→⇒⟶⤳➔⟹⇨➜➡↦]|->|=>"
+    r"|[:=]|" + _UNICODE_ARROW_BLOCK_CLASS + r"|->|=>"
 )
 # A designation word in FIELD-NAME position immediately followed by a binding
 # operator and the bound value.  ``value`` is bounded and stops at a structural
