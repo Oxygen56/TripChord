@@ -36,6 +36,7 @@ import unicodedata
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Flag, auto
+from pathlib import Path
 from typing import Any
 
 # Hard budgets for the recursive JSON walk.  ``_MAX_JSON_SCAN_DEPTH`` covers
@@ -710,21 +711,26 @@ _SHAPE_PATTERN_DIGEST_AUTH_RE = re.compile(
     # R22 Block 32: the leading guard is a FIELD-POSITION guard, not any
     # non-alphanumeric — ``digest`` must sit at a line/value start, after a
     # structural delimiter (``,;{}[]"'\\`` or a real authorization-field
-    # colon), or after a DESCRIPTOR noun (``upstream``/``model`` + space).
-    # ``result:`` is a plain colon, not an authorization field, so a business
-    # sentence ``model result: digest algorithm=md5 response=<hex>`` no longer
-    # matches (business positive preserved).
+    # colon).  ``result:`` is a plain colon, not an authorization field, so a
+    # business sentence ``model result: digest algorithm=md5 response=<hex>``
+    # no longer matches (business positive preserved).
     #
     # R23 Block 35: the auth-parameter list is a COMMA-SEPARATED grammar — an
     # optional ``username``/``realm``/… parameter list followed by a final
     # comma then ``response=<hex>`` — never a space-squashed ``algorithm=md5
-    # response=``.  A real Digest header / decoded value (``upstream Digest
-    # username="user", response=<64hex>`` at a field position) still fails
-    # closed on both FINAL scans, while ``digest algorithm=md5 response=…``
-    # (space-separated prose narration) is preserved.
+    # response=``.  ``digest algorithm=md5 response=…`` (space-separated prose
+    # narration) is preserved.
+    #
+    # R24 Block 38: the R23 DESCRIPTOR-NOUN guard (``(?<![A-Za-z0-9_-])
+    # [a-z][a-z0-9-]*[ \t]+``) is REMOVED — it fired on ANY preceding noun, so
+    # business narration ``model Digest username="user", response=<64hex>`` /
+    # ``notice Digest …`` was misrejected as a credential header.  ``Digest``
+    # now binds ONLY to the real Authorization/Proxy-Authorization field colon
+    # or a STANDALONE structural position (line/value start or after a
+    # ``,;{}[]"'\\`` delimiter) — a descriptor-word prefix means the text is a
+    # model/business narrative, never a credential header.
     r"(?i)(?:^|[\r\n,;{}\[\]\"'\\]|"
-    r"(?:authorization|proxy-authorization)[ \t]*:[ \t]*|"
-    r"(?<![A-Za-z0-9_-])[a-z][a-z0-9-]*[ \t]+)digest\b(?:"
+    r"(?:authorization|proxy-authorization)[ \t]*:[ \t]*)digest\b(?:"
     r"[ \t]+response\s*=\s*[\"']?[0-9a-f]{16,128}"
     r"|[ \t]+(?:username|realm|nonce|uri|qop|nc|cnonce|opaque|algorithm|"
     r"stale|domain)\s*=\s*(?:[\"'][^\"']{0,80}[\"']|[^,\r\n]{1,80})"
@@ -785,11 +791,33 @@ _BARE_CREDENTIAL_KEYWORD_SEGMENTS = frozenset(
 )
 
 
+# R24 Block 37: business-identifier determination is a VERIFIABLE English
+# check — every camelCase segment of a bare trailing-digit token must be a real
+# English word, looked up in a complete bundled dictionary (an objective,
+# external resource), NOT a hand-curated word list.  The R23
+# ``_CREDENTIAL_VALUE_WORDS`` misrejected ``hotelAmenity3`` / ``bookingReference1``
+# because ``amenity`` / ``booking`` / ``reference`` were simply missing from the
+# curated set; a full dictionary is complete by construction and verifiable.
+# ``_CREDENTIAL_VALUE_WORDS`` remains ONLY for the R21/R23 prose-phrase check
+# (``Basic is required``), which needs a small controlled function-word set.
+_ENGLISH_WORDS_PATH = Path(__file__).with_name("_english_words.txt")
+_ENGLISH_WORDS_CACHE: frozenset[str] | None = None
+
+
+def _english_words() -> frozenset[str]:
+    """The bundled English dictionary, loaded once (207k lowercase words)."""
+    global _ENGLISH_WORDS_CACHE
+    if _ENGLISH_WORDS_CACHE is None:
+        with _ENGLISH_WORDS_PATH.open(encoding="utf-8") as _fh:
+            _ENGLISH_WORDS_CACHE = frozenset(_fh.read().splitlines())
+    return _ENGLISH_WORDS_CACHE
+
+
 def _is_bare_credential_token(token: str) -> bool:
     """True when a camelCase-and-digit token is a BARE credential value —
-    the STRUCTURED recognizer (R23 Block 33), NOT a keyword/threshold
-    heuristic.  ``qwerTy1`` (a short keyboard mash + digit) and
-    ``mySuperSecret1`` structurally share the shape of ``flightOption12``
+    the STRUCTURED recognizer (R23 Block 33 / R24 Block 36-37), NOT a
+    keyword/threshold heuristic.  ``qwerTy1`` (a short keyboard mash + digit)
+    and ``mySuperSecret1`` structurally share the shape of ``flightOption12``
     (lower+Upper+lower+digits), so no length/digit-position/punctuation rule
     can separate them: the decision is identifier STRUCTURE:
 
@@ -798,12 +826,16 @@ def _is_bare_credential_token(token: str) -> bool:
       credential (fail-closed);
     * a trailing ``V<digits>`` version marker (``plannerV2`` /
       ``tokenizationV1`` / ``secretariatV1``) is a versioned business
-      identifier, not a credential;
+      identifier ONLY AFTER the credential-keyword segments are excluded —
+      ``mySuperSecretV1`` / ``refreshTokenV1`` end in credential keywords and
+      stay credentials (R24 Block 36);
     * a trailing-digit token whose FINAL camelCase segment is a credential
       keyword (``Secret`` in ``mySuperSecret1``) is a credential;
-    * a trailing-digit token whose camelCase segments are ALL common English
-      words (``flightOption`` = ``flight`` + ``Option``, ``refreshTokenCount``
-      = ``refresh`` + ``Token`` + ``Count``) is a business identifier;
+    * a trailing-digit token whose camelCase segments are ALL verifiable
+      English words (``flightOption`` = ``flight`` + ``Option``,
+      ``refreshTokenCount`` = ``refresh`` + ``Token`` + ``Count``,
+      ``hotelAmenity`` = ``hotel`` + ``Amenity``) is a business identifier
+      (R24 Block 37 — dictionary-verified, no curated word list);
     * ANY other digit-bearing camelCase token (``qwerTy1`` — a short
       keyboard-mash prefix with a digit) fails closed as a credential shape.
     """
@@ -814,14 +846,24 @@ def _is_bare_credential_token(token: str) -> bool:
         return False
     prefix, _digits = m.group(1), m.group(2)
     if prefix[-1] in "Vv":
-        return False
+        # R24 Block 36: the version-marker exemption is granted ONLY after the
+        # credential-keyword segments are excluded.  ``mySuperSecretV1`` /
+        # ``authTokenV1`` / ``sessionCookieV2`` / ``refreshTokenV1`` all carry a
+        # credential keyword in the word prefix and stay credentials, while
+        # ``tokenizationV1`` / ``secretariatV1`` / ``plannerV2`` (no keyword
+        # segment) remain versioned business identifiers.
+        segments = _split_camel_case(prefix[:-1])
+        return any(
+            segment.lower() in _BARE_CREDENTIAL_KEYWORD_SEGMENTS
+            for segment in segments
+        )
     segments = _split_camel_case(prefix)
     if not segments:
         return False
     if segments[-1].lower() in _BARE_CREDENTIAL_KEYWORD_SEGMENTS:
         return True
     return not all(
-        segment.lower() in _CREDENTIAL_VALUE_WORDS for segment in segments
+        segment.lower() in _english_words() for segment in segments
     )
 
 

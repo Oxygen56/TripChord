@@ -13341,17 +13341,25 @@ def test_r23_block34_sensitive_header_any_nonempty_value_both_paths() -> None:
 
 
 def test_r23_block35_digest_real_header_structural_both_paths() -> None:
-    """C-122 round-23 Block 35: the Digest recognizer STRUCTURALLY parses the
-    real Digest header — a DESCRIPTOR field position plus a COMMA-SEPARATED
-    auth-parameter list ending in ``response=<hex>``.  ``upstream Digest
-    username="user", response=<64hex>`` and a bare ``Digest response=<64hex>``
-    REJECT on BOTH finals, while the space-separated narration ``model result:
-    digest algorithm=md5 response=<32hex>`` (a plain colon, not an
-    authorization field) stays accepted."""
+    """C-122 round-23 Block 35 (as amended by round-24 Block 38): the Digest
+    recognizer STRUCTURALLY parses the real Digest header — the keyword must
+    bind to a REAL Authorization/Proxy-Authorization field colon or a
+    STANDALONE structural position (line/value start, ``,;{}[]"'\\``
+    delimiter), and the auth-parameter list is a COMMA-SEPARATED grammar
+    ending in ``response=<hex>``.  ``Authorization: Digest username="user",
+    response=<64hex>`` / ``Proxy-Authorization: …`` and a bare ``Digest
+    response=<64hex>`` REJECT on BOTH finals, while the space-separated
+    narration ``model result: digest algorithm=md5 response=<32hex>`` (a plain
+    colon, not an authorization field) and a DESCRIPTOR-noun-prefixed
+    ``upstream Digest username="user", response=<64hex>`` (business narration
+    — superseded by R24 Block 38, which removed the descriptor-word trigger)
+    stay accepted."""
     h64 = "ab" * 32
     for raw in (
-        "upstream Digest username=\"user\", response=" + h64,
-        '{"summary": "upstream Digest username=\\"user\\", response=' + h64 + '"}',
+        "Authorization: Digest username=\"user\", response=" + h64,
+        '{"summary": "Authorization: Digest username=\\"user\\", response=' + h64 + '"}',
+        "Proxy-Authorization: Digest username=\"user\", response=" + h64,
+        '{"summary": "Proxy-Authorization: Digest username=\\"user\\", response=' + h64 + '"}',
         "Digest response=" + h64,
         '{"summary": "Digest response=' + h64 + '"}',
     ):
@@ -13380,6 +13388,10 @@ def test_r23_block35_digest_real_header_structural_both_paths() -> None:
         "the model digest algorithm=md5 response=" + "a" * 32,
         "digest algorithm=md5 response=" + "a" * 32,
         "model digest calculation response=" + "a" * 32,
+        # R24 Block 38: descriptor-noun-prefixed ``Digest`` is business
+        # narration, never a credential header — ``upstream`` included.
+        "upstream Digest username=\"user\", response=" + h64,
+        '{"summary": "upstream Digest username=\\"user\\", response=' + h64 + '"}',
     ):
         gate._secret_scan_bytes(
             raw.encode(),
@@ -13466,8 +13478,10 @@ def test_r23_full_chain_producer_seal_consumer_final_structured_both_paths(
             credential_field_check=True,
         )
     # A real Digest credential is masked by the producer BEFORE the seal, so
-    # the sealed artifact is clean end-to-end.
-    digest = "upstream Digest username=\"user\", response=" + "ab" * 32
+    # the sealed artifact is clean end-to-end.  (R24 Block 38: the masked form
+    # must be the REAL Authorization-field Digest header — a descriptor-word
+    # ``upstream Digest …`` is business narration, not a credential header.)
+    digest = "Authorization: Digest username=\"user\", response=" + "ab" * 32
     masked = canary._desensitize(digest)
     assert "ab" * 32 not in masked
     diag = seal(masked)
@@ -13486,3 +13500,197 @@ def test_r23_full_chain_producer_seal_consumer_final_structured_both_paths(
         "ev.json",
         credential_field_check=True,
     )
+
+
+def test_r24_block36_version_exemption_after_keyword_segments_both_paths() -> None:
+    """C-122 round-24 Block 36: the ``V<digits>`` version-marker exemption is
+    granted ONLY AFTER the credential-keyword segments are excluded.  A
+    versioned token whose word prefix carries a credential keyword
+    (``mySuperSecretV1`` / ``passwordV1`` / ``authTokenV1`` /
+    ``clientSecretV3`` / ``sessionCookieV2`` / ``mySecretV1`` /
+    ``refreshTokenV1``) is a BARE CREDENTIAL and REJECTS on BOTH finals (raw
+    and JSON-wrapped), while versioned business identifiers with no keyword
+    segment (``tokenizationV1`` / ``secretariatV1`` / ``plannerV2`` /
+    ``providerV4``) stay accepted."""
+    for t in (
+        "mySuperSecretV1",
+        "passwordV1",
+        "authTokenV1",
+        "clientSecretV3",
+        "sessionCookieV2",
+        "mySecretV1",
+        "refreshTokenV1",
+    ):
+        for raw in (t, f'{{"summary": "{t}"}}'):
+            with pytest.raises(gate.GateStateChangedError):
+                gate._secret_scan_bytes(
+                    raw.encode(),
+                    gate._SecretNeedles(()),
+                    "evidence",
+                    "ev.json",
+                    credential_field_check=True,
+                )
+            with pytest.raises(gate.GateStateChangedError):
+                gate._secret_scan_bytes(
+                    raw.encode(),
+                    gate._SecretNeedles(()),
+                    "evidence",
+                    "live-canary-certified.json.failure.json",
+                    credential_field_check=False,
+                )
+    for t in ("tokenizationV1", "secretariatV1", "plannerV2", "providerV4"):
+        gate._secret_scan_bytes(
+            t.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            t.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r24_block37_dictionary_verified_business_identifiers_both_paths() -> None:
+    """C-122 round-24 Block 37: business-identifier determination is a
+    VERIFIABLE English check — every camelCase segment must be a real English
+    word (complete bundled dictionary), NOT a hand-curated word list.  The R23
+    curated list misrejected ``hotelAmenity3`` / ``bookingReference1``; both
+    are business identifiers and are ACCEPTED on BOTH finals, while the
+    keyboard-mash ``qwerTy1`` (non-word segments) still fails closed."""
+    for t in ("hotelAmenity3", "bookingReference1"):
+        for raw in (t, f'{{"summary": "{t}"}}'):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+
+
+def test_r24_block38_digest_binds_auth_field_or_standalone_both_paths() -> None:
+    """C-122 round-24 Block 38: the Digest recognizer no longer fires on a
+    DESCRIPTOR-noun prefix — ``model Digest username="user", response=<64hex>``
+    and ``notice Digest …`` are business narration and ACCEPT on BOTH finals,
+    while the REAL ``Authorization`` / ``Proxy-Authorization`` Digest header
+    and a standalone ``Digest response=<64hex>`` still REJECT."""
+    h64 = "ab" * 32
+    for raw in (
+        "model Digest username=\"user\", response=" + h64,
+        '{"summary": "model Digest username=\\"user\\", response=' + h64 + '"}',
+        "notice Digest username=\"user\", response=" + h64,
+        '{"summary": "notice Digest username=\\"user\\", response=' + h64 + '"}',
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    for raw in (
+        "Authorization: Digest username=\"user\", response=" + h64,
+        '{"summary": "Authorization: Digest username=\\"user\\", response=' + h64 + '"}',
+        "Proxy-Authorization: Digest username=\"user\", response=" + h64,
+        '{"summary": "Proxy-Authorization: Digest username=\\"user\\", response=' + h64 + '"}',
+        "Digest response=" + h64,
+        '{"summary": "Digest response=' + h64 + '"}',
+    ):
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+
+
+def test_r24_full_chain_producer_seal_consumer_final_block36_37_both_paths(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-24 full chain: the Block 36 versioned bare credentials
+    (``mySuperSecretV1`` / ``authTokenV1`` / ``refreshTokenV1``) are left
+    unmasked by the producer, reach the 0600 seal, and fail BOTH finals
+    closed; the Block 37 business identifiers (``hotelAmenity3`` /
+    ``bookingReference1``) survive producer + seal + BOTH finals accepted."""
+    from benchmarks import live_canary_certified as canary
+
+    def seal(message: str) -> Path:
+        output = tmp_path / "live-canary-certified.json"
+        return canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(message),
+            output,
+            run_id="r24fullchain",
+            tested_sha="13d76ae" + "0" * 33,
+        )
+
+    for leak in ("mySuperSecretV1", "authTokenV1", "refreshTokenV1"):
+        assert leak == canary._desensitize(leak), "producer must not mask bare token"
+        diag = seal(leak)
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        assert leak in diag.read_text(encoding="utf-8"), "leak must reach the seal"
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                diag.read_bytes(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                gate._sanitize_canary_diag_field(
+                    canary._desensitize(leak), "fallback"
+                ).encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+    for business in ("hotelAmenity3", "bookingReference1"):
+        assert business == canary._desensitize(business)
+        diag = seal(business)
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
