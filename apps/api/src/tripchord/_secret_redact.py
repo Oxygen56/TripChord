@@ -257,21 +257,27 @@ _CREDENTIAL_FIELD_STRONG_NAME_ALT = (
 )
 _CREDENTIAL_FIELD_WEAK_NAME_ALT = r"authorization|cookie|bearer"
 _CREDENTIAL_FIELD_VALUE_END = (
-    # A real end of a credential value.  The value ``[REDACTED]`` inside a JSON
-    # string (``\"detail\":\"secret=[REDACTED]\",...``) is parsed with the
-    # value's opening quote as the field-position guard and the value ending at
-    # the CLOSING quote, so a string-closing quote followed by JSON structure
-    # (``\"`` then ``,`` / ``}`` / ``]`` / end) is a boundary.  The other
-    # boundary forms: end-of-text / a newline, a JSON structural punctuation
-    # (``}`` / ``]`` / ``,``) or a ``;`` / ``,`` field separator — optionally
-    # followed by the next (possibly quoted) field assignment — or a space that
-    # BEGINS another field assignment.  A bare quote is NOT a boundary on its
-    # own: ``secret=\"[REDACTED]\"actual`` and ``secret=[REDACTED]actual`` must
-    # not be treated as the marker followed by a clean boundary (R18 Block 2).
-    r"(?:$|[\r\n]"
+    # A real end of a credential value, matched as a NON-CONSUMING lookahead so
+    # the boundary text stays in the diagnostic and the NEXT field assignment
+    # can be masked on its own (R19 Block 16: ``token=[1,2];password=…`` must
+    # NOT swallow ``;password=`` into the bracket value — the second field's
+    # VALUE would otherwise be orphaned as plaintext).  The value ``[REDACTED]``
+    # inside a JSON string (``\"detail\":\"secret=[REDACTED]\",...``) is parsed
+    # with the value's opening quote as the field-position guard and the value
+    # ending at the CLOSING quote, so a string-closing quote followed by JSON
+    # structure (``\"`` then ``,`` / ``}`` / ``]`` / end) is a boundary.  The
+    # other boundary forms: end-of-text / a newline, a JSON structural
+    # punctuation (``}`` / ``]`` / ``,``) or a ``;`` / ``,`` field separator —
+    # optionally followed by the next (possibly quoted) field assignment — or a
+    # space that BEGINS another field assignment.  A bare quote is NOT a
+    # boundary on its own: ``secret=\"[REDACTED]\"actual`` and
+    # ``secret=[REDACTED]actual`` must not be treated as the marker followed by
+    # a clean boundary (R18 Block 2).
+    r"(?=(?:$|[\r\n]"
     r"|[\"'][ \t]*(?:$|[\r\n]|[}\],;][ \t]*(?:$|[\r\n]|[\"']?[A-Za-z0-9_.-]+[\"']*[ \t]*[:=]))"
     r"|[}\],;][ \t]*(?:$|[\r\n]|[\"']?[A-Za-z0-9_.-]+[\"']*[ \t]*[:=])"
     r"|[ \t](?=[A-Za-z0-9_-]+[ \t]*[\"']*[ \t]*[:=]))"
+    r")"
 )
 _CREDENTIAL_FIELD_STRONG_VALUE = (
     # C-122 supervision 09:59 (R18 Block 3): the value is CHARSET-UNRESTRICTED

@@ -7425,6 +7425,85 @@ def test_r18_quote_aware_credential_value_no_seal_residue(tmp_path: Path) -> Non
     assert "[1,2]" not in consumer_out
 
 
+def test_r19_block16_semicolon_connected_credential_fields_no_plaintext(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-19 supervision re-review Block 16 counter-example: the
+    credential-field VALUE-END boundary is NON-CONSUMING — a ``;``-connected
+    second strong field (``token=[1,2];password=mySuperSecret123``,
+    ``Session_token="abc;def";password=mySuperSecret123``,
+    ``token=[1,2];secret='xyz123'``, ``token=[ab,cd];password=pw``) is masked
+    SEPARATELY instead of the bracket/quoted value swallowing the ``;password=``
+    and orphaning the second field's VALUE as plaintext.  Producer and consumer
+    collapse the whole assignment, both final scans reject the raw leak form, and
+    a REAL 0600 seal-on-disk never carries the plaintext."""
+    from benchmarks import live_canary_certified as canary
+
+    leak_inputs = [
+        ("bracket-int", "token=[1,2];password=mySuperSecret123", "mySuperSecret123"),
+        (
+            "quoted-semicolon",
+            'Session_token="abc;def";password=mySuperSecret123',
+            "mySuperSecret123",
+        ),
+        ("bracket-secret", "token=[1,2];secret='xyz123'", "xyz123"),
+        ("bracket-name", "token=[ab,cd];password=pw", "pw"),
+    ]
+    for label, raw, gone in leak_inputs:
+        producer_out = canary._desensitize(raw)
+        assert gone not in producer_out.lower(), (
+            f"producer leaked {gone!r} for {label}: {producer_out!r}"
+        )
+        consumer_out = gate._sanitize_canary_diag_field(raw, "fallback")
+        assert gone not in consumer_out.lower(), (
+            f"consumer leaked {gone!r} for {label}: {consumer_out!r}"
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+
+    # A REAL 0600 seal written from a failure carrying the ;-connected strong
+    # fields must be clean on disk — no second-field VALUE plaintext survives.
+    output = tmp_path / "live-canary-certified.json"
+    diag_path = canary._seal_failure_diagnostic(
+        "evaluate",
+        RuntimeError(
+            "upstream 401 token=[1,2];password=mySuperSecret123 "
+            'Session_token="abc;def";password=mySuperSecret123 '
+            "token=[ab,cd];password=pw"
+        ),
+        output,
+        run_id="r19block16",
+        tested_sha="a" * 40,
+    )
+    assert diag_path.is_file()
+    content = diag_path.read_text(encoding="utf-8")
+    summary = json.loads(content)["summary"]
+    assert "mySuperSecret123" not in content
+    assert "xyz123" not in content
+    assert ";password=" not in summary
+    assert "[1,2]" not in summary
+    assert "[ab,cd]" not in summary
+    assert "abc;def" not in summary
+    # The consumer re-masks the sealed summary whole too — no value residue.
+    consumer_out = gate._sanitize_canary_diag_field(summary, "fallback")
+    assert "mySuperSecret123" not in consumer_out
+    assert ";password=" not in consumer_out
+
+
 def test_secret_scan_rejects_double_encoded_authorization_in_structured_json(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
