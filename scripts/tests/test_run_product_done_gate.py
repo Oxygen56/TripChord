@@ -15361,3 +15361,244 @@ def test_r32_full_chain_producer_seal_consumer_block54_family_both_finals(
                 "live-canary-certified.json.failure.json",
                 credential_field_check=False,
             )
+
+
+def test_r33_block55_credential_narration_semantic_class_fail_closed_both_paths() -> None:
+    """C-122 round-33 Block 55 counter-examples (architect independent review of
+    5ebd9be): ``_CREDENTIAL_DESIGNATION_ALT`` was still a FIXED designation word
+    list — ``pin is plannerV2``, ``password value is plannerV2`` and ``口令是
+    plannerV2`` (Chinese copula) all ACCEPTED both finals in committed / failure.
+    The narration/credential context binding is now closed by the credential-
+    designation SEMANTIC CLASS (every word that names a credential in field-name
+    position — pin/password/passphrase/pwd/passcode/login/key/userpass plus the
+    Chinese designations 口令/密码/密钥/通行码/登录/账号/凭证/秘密 and a composite
+    ``<designation> value`` qualifier) rather than a reviewed-points enumeration
+    (禁止逐词补表式打补丁), and the Chinese copulas ``是/为/等于/成为`` bind exactly
+    like ``is``/``:``/``=``.  Every named counter-example and same-family variant
+    (full-width colon / equals bind operators, no-space forms, mixed English-Chinese
+    composites) fails BOTH finals closed; designation words alone in ordinary
+    prose stay accepted."""
+    b55_reject = (
+        "pin is plannerV2",
+        "PIN is plannerV2",
+        "password value is plannerV2",
+        "passphrase value is plannerV2",
+        "login password is plannerV2",
+        "token value is plannerV2",
+        "secret value is plannerV2",
+        "pin = plannerV2",
+        "pin is providerV4",
+        "password is flightOption1",
+        "口令是 plannerV2",  # 口令是 plannerV2
+        "口令是 providerV4",  # 口令是 providerV4
+        "口令是 tokenizationV1",  # 口令是 tokenizationV1
+        "密码是 plannerV2",  # 密码是 plannerV2
+        "密钥是 plannerV2",  # 密钥是 plannerV2
+        "通行码是 plannerV2",  # 通行码是 plannerV2
+        "登录是 plannerV2",  # 登录是 plannerV2
+        "账号是 plannerV2",  # 账号是 plannerV2
+        "口令为 plannerV2",  # 口令为 plannerV2
+        "口令等于 plannerV2",  # 口令等于 plannerV2
+        "口令成为 plannerV2",  # 口令成为 plannerV2
+        "口令是plannerV2",  # 口令是plannerV2 (no space)
+        "口令：plannerV2",  # 口令 + full-width colon
+        "口令＝plannerV2",  # 口令 + full-width equals
+    )
+    for raw in b55_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # A designation word alone in prose — or one whose value carries NO
+    # registered-base token — stays accepted.
+    for raw in (
+        "login page loads today",
+        "key: a plain discussion of the itinerary",
+        "the passcode was not stored anywhere",
+        "the model digest calculation response value is here",
+        "plannerV2 providerV4",
+        "口令 是这里的一个普通词语",  # 口令 is here an ordinary word
+        "密码: 普通业务文本",  # 密码: ordinary business text
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r33_block56_digest_rfc_tokenize_fail_closed_both_paths() -> None:
+    """C-122 round-33 Block 56 counter-examples (architect independent review of
+    5ebd9be): ``_parse_digest_auth_params`` sliced the Digest parameter list with
+    the R27 regex ``[A-Za-z][A-Za-z0-9_-]*`` pair matcher, so the list silently
+    truncated at a param whose name used an RFC 7230 ``tchar`` outside the regex
+    (``foo*``) or began with a digit (``1st``), or whose quoted value contained
+    an RFC quoted-pair (``username="use\\"r"``) — a real ``response=<hex>`` AFTER
+    that param was dropped and the header ACCEPTED both finals.  The parser is
+    now a strict RFC 7235/7230 token + quoted-pair tokenizer, so any real
+    response credential hex (16/32/64) in the header fails BOTH finals closed.
+    The Block 45 positives (algorithm descriptions with no request identity) and
+    the Block 49 descriptor digest (``service Digest algorithm=md5``) stay
+    accepted."""
+    h16 = "ab" * 8
+    h32 = "ab" * 16
+    h64 = "ab" * 32
+    b56_reject = (
+        f'service Digest username="user", foo*=bar, response={h32}',
+        f'service Digest 1st=abc, username="user", response={h32}',
+        f'service Digest username="use\\"r", response={h32}',
+        f'service Digest username="use\\"r", foo*=bar, response={h32}',
+        f'service Digest userhash=true, foo*=bar, response={h32}',
+        f'service Digest response={h16}',
+        f'upstream Digest username="user", foo*=bar, response={h16}',
+        f'origin Digest 1st=abc, response={h64}',
+        f'{{"summary": "service Digest username=\\"user\\", foo*=bar, '
+        f'response={h32}"}}',
+        f'{{"summary": "service Digest username=\\"use\\\\\\"r\\", '
+        f'response={h32}"}}',
+    )
+    for raw in b56_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # Block 45 / Block 49 positives — an algorithm-description digest (no request
+    # identity) or a server challenge (no response) is narration, not a
+    # credential.
+    for raw in (
+        f"client digest algorithm=md5, response={h32}",
+        f"model digest algorithm=md5, response={h32}",
+        f"model digest algorithm=md5 response={h32}",
+        "WWW-Authenticate: Digest realm=\"test\", nonce=abc123",
+        "the model digest calculation response value is here",
+        f'service Digest algorithm=md5, response={h32}',
+        'service Digest username="user", foo*=bar',
+        f'{{"summary": "client digest algorithm=md5, response={h32}"}}',
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r33_full_chain_producer_seal_consumer_block55_56_both_finals(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-33 full chain (Block 55 + Block 56): the producer masks a
+    credential-narration assignment (Chinese / composite designation, full-width
+    full-width colon / equals bind operators) and a real Digest credential
+    descriptor (the
+    16/32/64-hex ``response`` AND its identity params) BEFORE the 0600 seal, so
+    the sealed diagnostic is clean and BOTH finals pass; the RAW value still
+    fails BOTH finals (defense in depth).  The committed summary is JSON-encoded
+    with ``json.dumps`` so a masked value that keeps a quoted Digest username is
+    a VALID committed artifact (the R32 naive ``{{"summary": "{masked}"}}``
+    f-string would produce unterminated JSON when the masked value contains a
+    ``"``)."""
+    from benchmarks import live_canary_certified as canary
+
+    h16 = "ab" * 8
+    h32 = "ab" * 16
+    h64 = "ab" * 32
+    raw_cases = (
+        "pin is plannerV2",
+        "password value is plannerV2",
+        "口令是 plannerV2",  # 口令是 plannerV2
+        "密码是 plannerV2",  # 密码是 plannerV2
+        "口令：plannerV2",  # 口令 + full-width colon
+        "口令＝plannerV2",  # 口令 + full-width equals
+        "pin = plannerV2",
+        "密钥是 providerV4",  # 密钥是 providerV4
+        f'service Digest username="user", foo*=bar, response={h16}',
+        f'service Digest username="user", foo*=bar, response={h32}',
+        f'origin Digest 1st=abc, response={h64}',
+        f'service Digest username="use\\"r", response={h32}',
+    )
+    for raw in raw_cases:
+        masked = canary._desensitize(raw)
+        assert masked != raw, "producer must mask the credential"
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r33chain",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )

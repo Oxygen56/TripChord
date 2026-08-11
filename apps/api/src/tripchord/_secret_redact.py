@@ -741,54 +741,22 @@ _WHOLE_HEADER_SCAN = _WholeHeaderScan()
 # ``upstream``; the surviving business positives are the ones WITHOUT a real
 # ``username=…, response=<hex>`` structure.
 _DIGEST_AUTH_KEYWORD_RE = re.compile(r"(?i)digest\b")
-# A ``name=value`` pair value: a quoted run (with the optional backslash-escape
-# a Digest header inside JSON string text uses — ``username=\"user\"``) or an
-# unquoted run that stops at a comma / ``;`` (a bare ``response=<hex>;``) / a
-# quote char (the closing ``"`` of a JSON-wrapped header).  No length bounds:
-# a 256+ hex response is still a credential.
-_DIGEST_AUTH_QUOTED_VALUE = r"\\*[\"'][^\"']*\\*[\"']"
-_DIGEST_AUTH_UNQUOTED_VALUE = r"[^,\r\n;\"']+"
-_DIGEST_AUTH_PAIR_BODY = (
-    r"[A-Za-z][A-Za-z0-9_-]*[ \t]*=[ \t]*(?:"
-    + _DIGEST_AUTH_QUOTED_VALUE
-    + r"|"
-    + _DIGEST_AUTH_UNQUOTED_VALUE
-    + r")"
-)
-_DIGEST_AUTH_BLOCK_RE = re.compile(
-    r"[ \t]+(?P<params>"
-    + _DIGEST_AUTH_PAIR_BODY
-    + r"(?:[ \t]*,[ \t]*"
-    + _DIGEST_AUTH_PAIR_BODY
-    + r")*)"
-)
-_DIGEST_AUTH_PARAM_PAIR_RE = re.compile(
-    r"(?i)(?P<name>[A-Za-z][A-Za-z0-9_-]*)[ \t]*=[ \t]*(?P<value>"
-    + _DIGEST_AUTH_QUOTED_VALUE
-    + r"|"
-    + _DIGEST_AUTH_UNQUOTED_VALUE
-    + r")"
-)
+# R33 Block 56: the auth-parameter list is tokenized by RFC 7235 / RFC 7230
+# grammar, NOT by the R27 regex ``[A-Za-z][A-Za-z0-9_-]*`` pair matcher — the
+# regex silently truncated the parameter list at the first param whose name
+# used an RFC ``tchar`` outside ``[A-Za-z0-9_-]`` (``foo*``), began with a
+# digit (``1st``), or whose quoted value contained an RFC quoted-pair
+# (``username=\"use\\\"r\"``), so a real ``response=<hex>`` credential AFTER
+# that param was dropped and the header ACCEPTED both finals.  A param name is
+# any RFC 7230 ``token`` run (``tchar`` = ``!#$%&'*+-.^_`|~`` + alnum); a value
+# is a token or a quoted-string whose backslash-quoted-pair / JSON-escape
+# (``\"``) is consumed literally.  The tokenizer is strict about the grammar
+# (a ``name`` must be followed by ``=`` and a value) but tolerant of a trailing
+# non-comma boundary, so a space-squashed algorithm narration
+# (``model digest algorithm=md5 response=<hex>``) still parses only the first
+# pair and stays accepted.
+_DIGEST_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _HEX_FULL_RE = re.compile(r"(?i)[0-9a-f]+")
-
-
-def _strip_digest_value_quotes(value: str) -> str:
-    """Strip one layer of surrounding quotes — and the backslash-escape a
-    Digest header inside JSON string text uses (``\"user\"`` -> ``user``).
-    A bare token passes through unchanged."""
-    for _ in range(2):
-        if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
-            value = value[1:-1]
-        elif (
-            len(value) >= 3
-            and value[0] == "\\"
-            and value[1] in "\"'"
-            and value[-1] == value[1]
-        ):
-            value = value[2:-1]
-        else:
-            break
-    return value
 
 
 class _DigestAuthScan:
@@ -817,28 +785,139 @@ class _DigestAuthScan:
             return "descriptor"
         return "none"
 
-    def _parse_digest_auth_params(self, text: str, end: int) -> dict[str, str] | None:
+    def _parse_digest_auth_params(
+        self, text: str, end: int
+    ) -> tuple[dict[str, str], int] | None:
         """Parse the comma-separated ``name=value`` list that must directly
-        follow the keyword (at ``end``).  ``None`` when the text is not a
-        syntactic Digest parameter list."""
-        blk = _DIGEST_AUTH_BLOCK_RE.match(text, end)
-        if blk is None:
+        follow the keyword (at ``end``) by RFC 7235 / RFC 7230 token and
+        quoted-string grammar (R33 Block 56).  ``None`` when the text is not a
+        syntactic Digest parameter list.  The parameter list ends at the first
+        non-comma boundary after a value — so a space-squashed algorithm
+        narration (``algorithm=md5 response=<hex>``) parses only the first pair
+        and stays accepted, while ``username="use\\"r", foo*=bar, response=<hex>``
+        parses every pair including the real ``response`` credential.  Returns
+        ``(params, index_after_last_pair)`` — the caller masks the whole
+        descriptor span (R33 Block 56 producer side)."""
+        i = end
+        n = len(text)
+        # A real Digest header has OWS after the scheme; require at least one
+        # SP / HTAB so a bare ``digest`` keyword never parses as a header.
+        if i >= n or text[i] not in " \t":
             return None
         params: dict[str, str] = {}
-        for pair in _DIGEST_AUTH_PARAM_PAIR_RE.finditer(blk.group("params")):
-            params[pair.group("name").lower()] = _strip_digest_value_quotes(
-                pair.group("value")
-            )
-        return params
+        while True:
+            while i < n and text[i] in " \t":
+                i += 1
+            m = _DIGEST_TOKEN_RE.match(text, i)
+            if m is None:
+                return None
+            name = m.group(0).lower()
+            i = m.end()
+            while i < n and text[i] in " \t":
+                i += 1
+            if i >= n or text[i] != "=":
+                return None
+            i += 1
+            while i < n and text[i] in " \t":
+                i += 1
+            if i >= n:
+                return None
+            if text[i] == '"' or (
+                text[i] == "\\" and i + 1 < n and text[i + 1] == '"'
+            ):
+                # quoted-string — plain RFC quotes, or the ``\"`` a Digest
+                # header inside a committed JSON artifact uses.  Quoted-pair /
+                # JSON ``\X`` escapes are consumed as literal characters, so a
+                # real response AFTER a quoted value that itself contains an
+                # escaped quote is still parsed (``username="use\\"r", response=…``).
+                parsed = self._parse_digest_quoted_value(text, i)
+                if parsed is None:
+                    return None
+                val, i = parsed
+            else:
+                m = _DIGEST_TOKEN_RE.match(text, i)
+                if m is None:
+                    return None
+                val = m.group(0)
+                i = m.end()
+            params[name] = val
+            # OWS then either a comma (more pairs) or the end of the list.
+            while i < n and text[i] in " \t":
+                i += 1
+            if i < n and text[i] == ",":
+                i += 1
+                continue
+            break
+        return params, i
+
+    @staticmethod
+    def _parse_digest_quoted_value(text: str, i: int) -> tuple[str, int] | None:
+        """RFC 7230 quoted-string, tolerant of the ``\"`` form a Digest header
+        inside a committed JSON artifact uses.  ``text[i]`` is the opening ``"``
+        (or ``\"`` when JSON-escaped).  Returns ``(unescaped_value, index_after
+        _closing_quote)`` or ``None`` when the value is unterminated."""
+        n = len(text)
+        json_escaped = text[i] == "\\"
+        i += 2 if json_escaped else 1
+        out: list[str] = []
+        while i < n:
+            ch = text[i]
+            if json_escaped:
+                if ch == "\\" and i + 1 < n and text[i + 1] == '"':
+                    return "".join(out), i + 2
+            elif ch == '"':
+                return "".join(out), i + 1
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+        return None
+
+    def _digest_credential_spans(self, text: str) -> list[tuple[int, int]]:
+        """``(start, end)`` spans of every REAL Digest credential descriptor in
+        ``text`` — the keyword through the END of its RFC tokenized parameter
+        list (R33 Block 56 producer half).  A credential is exactly what
+        ``search()`` accepts (field / standalone / non-algorithm descriptor
+        binding + a hex ``response``), so the producer can mask the WHOLE
+        descriptor — identity params and a 16/32/64-hex response together —
+        before the 0600 seal, never leaving a ``username=`` residue for the
+        consumer sanitizer to trip on.  An algorithm-description narration
+        (``client digest algorithm=md5, response=<hex>``, Block 45) is NOT a
+        credential and is left for the narration masker."""
+        spans: list[tuple[int, int]] = []
+        for m in _DIGEST_AUTH_KEYWORD_RE.finditer(text):
+            binding = self._classify_digest_binding(text, m.start())
+            if binding == "none":
+                continue
+            parsed = self._parse_digest_auth_params(text, m.end())
+            if parsed is None:
+                continue
+            params, end = parsed
+            response = params.get("response")
+            if response is None:
+                continue
+            if not _HEX_FULL_RE.fullmatch(response.strip()):
+                continue
+            if binding == "descriptor":
+                if "username" in params or "userhash" in params:
+                    spans.append((m.start(), end))
+                    continue
+                if "algorithm" in params:
+                    continue
+            spans.append((m.start(), end))
+        return spans
 
     def search(self, text: str) -> re.Match[str] | None:
         for m in _DIGEST_AUTH_KEYWORD_RE.finditer(text):
             binding = self._classify_digest_binding(text, m.start())
             if binding == "none":
                 continue
-            params = self._parse_digest_auth_params(text, m.end())
-            if params is None:
+            parsed = self._parse_digest_auth_params(text, m.end())
+            if parsed is None:
                 continue
+            params, _end = parsed
             response = params.get("response")
             if response is None:
                 continue
@@ -1000,30 +1079,46 @@ _REGISTERED_LOWER_BASE_RE = re.compile(
     r"(?:V[0-9]+|[0-9]+)(?![A-Za-z0-9_])"
 )
 
-# R28 Block 48: credential-NARRATION binding — NOT a flat wordlist.  The R27
-# ``_CREDENTIAL_NARRATION_RE`` was a closed set of STRONG words whose mere
-# presence anywhere in a scanned value bound every registered token in it; the
-# review found it bypassable (``passphrase is flightOption1`` / ``login is
-# flightOption1`` / ``pwd is flightOption1`` / ``the passcode was plannerV2`` /
-# ``key: day2`` / ``userpass is day1`` — none of the narration words was in the
-# list, so ``narration=False`` and the registered base stayed accepted).
+# R28 Block 48 / R33 Block 55: credential-NARRATION binding — NOT a flat
+# wordlist.  The R27 ``_CREDENTIAL_NARRATION_RE`` was a closed set of STRONG
+# words whose mere presence anywhere in a scanned value bound every registered
+# token in it; the review found it bypassable (``passphrase is flightOption1`` /
+# ``login is flightOption1`` / ``pwd is flightOption1`` / ``the passcode was
+# plannerV2`` / ``key: day2`` / ``userpass is day1`` — none of the narration
+# words was in the list, so ``narration=False`` and the registered base stayed
+# accepted).
 #
-# The replacement is SYNTACTIC: a credential-designation word (the STRONG
-# field-name words PLUS the common designation words the review names —
-# key/login/pwd/passphrase/passcode/userpass) binds a registered base ONLY when
-# it is in a FIELD-NAME position, immediately followed by a binding operator
-# (copula ``is/was/...`` or ``:``/``=``/arrow) and a value that carries a
-# registered-base token (``passphrase is flightOption1`` / ``key: day2`` / ``the
-# passcode was plannerV2``).  A designation word alone in prose never binds — the
-# word has to actually designate a value, so a synonym can never silently unbind
-# a registered base (Block 48: 叙述/凭据上下文绑定不得用可绕过的固定词表, 须基于
-# 真实字段名/句法解析).
+# The replacement is SYNTACTIC + a closed SEMANTIC CLASS: a credential-
+# designation word binds a registered base ONLY when it is in a FIELD-NAME
+# position, immediately followed by a binding operator (copula
+# ``is/was/...``/``:``/``=``/arrow — or the Chinese copula ``是``/``为``/``等于``/
+# ``成为``) and a value that carries a registered-base token (``passphrase is
+# flightOption1`` / ``key: day2`` / ``the passcode was plannerV2`` /
+# ``pin is plannerV2`` / ``口令是 plannerV2``).  A designation word alone in
+# prose never binds — the word has to actually designate a value, so a synonym
+# can never silently unbind a registered base (Block 48: 叙述/凭据上下文绑定不得用
+# 可绕过的固定词表, 须基于真实字段名/句法解析).  The designation set is closed by
+# meaning: every word that NAMES a credential in a field-name position — the
+# STRONG field-name words plus ``key``/``login``/``pwd``/``passphrase``/
+# ``passcode``/``userpass``/``pin`` and the Chinese credential-designation
+# words (``口令`` password / ``密码``/``密碼`` password / ``密钥``/``密鑰`` secret
+# key / ``通行码``/``通行碼`` passcode / ``登录``/``登入`` login / ``账号``/``帳號``/
+# ``账户``/``帳戶`` account / ``凭证``/``憑證`` credential / ``秘密`` secret) —
+# NOT a reviewed-points enumeration.  A composite narration (``password value``
+# / ``login password``) is the same designation word followed by a plain
+# field-noun modifier and is covered by the optional qualifier suffix
+# (``value``/``word``/``name``/``string``/``text``/``number``), so
+# ``password value is plannerV2`` fails closed too (R33 Block 55: 禁止逐词补表式
+# 打补丁 — 按凭据指称语义类闭合, 含中文与组合叙述).
 _CREDENTIAL_DESIGNATION_ALT = (
     r"(?:password|passwd|passphrase|passcode|pwd|userpass|login|key|secret"
-    r"|token|credentials?|api[_-]?key|access[_-]?key|session[_-]?key"
+    r"|pin|token|credentials?|api[_-]?key|access[_-]?key|session[_-]?key"
     r"|private[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token"
     r"|auth[_-]?token|session[_-]?token|client[_-]?secret|secret[_-]?key"
-    r"|authorization|proxy[_-]?authorization|bearer|auth)"
+    r"|authorization|proxy[_-]?authorization|bearer|auth"
+    r"|口令|密码|密碼|密钥|密鑰|通行码|通行碼|登录|登入|账号|帳號|账户|帳戶"
+    r"|凭证|憑證|秘密"
+    r")(?:\s+(?:value|word|name|string|text|number))?"
 )
 # R29 Block 51 / R30 Block 52 / R31 Block 53 / R32 Block 54: the binding-operator
 # arrow class is CLOSED BY UNICODE ARROW BLOCK RANGE plus a principled
@@ -1116,6 +1211,10 @@ _UNICODE_ARROW_BLOCK_CLASS = (
 _CREDENTIAL_NARRATION_BIND_OP = (
     r"(?:is|was|were|are|equals?|becomes)\b[ \t]*"
     r"|[:=]|" + _UNICODE_ARROW_BLOCK_CLASS + r"|->|=>"
+    # Chinese copula / equality (R33 Block 55): 是 (is), 为 (is/equals), 等于
+    # (equals), 成为 (becomes).  No ``\b`` — CJK has no ASCII word boundary, so
+    # ``口令是plannerV2`` binds exactly like ``口令是 plannerV2``.
+    r"|(?:是|为|等于|成为)[ \t]*"
 )
 # A designation word in FIELD-NAME position immediately followed by a binding
 # operator and the bound value.  ``value`` is bounded and stops at a structural
@@ -1228,6 +1327,36 @@ class _BareCredentialScan:
 _SHAPE_PATTERN_BARE_CREDENTIAL_VALUE_RE = _BareCredentialScan()
 
 
+def _mask_digest_credential_text(text: str) -> str:
+    """Mask every REAL Digest credential descriptor (the keyword through the end
+    of its RFC-tokenized parameter list) to ``[REDACTED]`` — the producer half of
+    R33 Block 56.  The token-run masker only collapses a 32+ response, so a
+    16-hex ``response`` and the identity params beside it (``username="user"``)
+    could otherwise reach the sealed diagnostic, where the consumer sanitizer
+    sees ``username`` as a credential field name and trips.  Masking the WHOLE
+    descriptor fails the credential closed on the producer side too; the
+    algorithm-description narrations (``client digest algorithm=md5,
+    response=…``) are not credentials and stay untouched (Block 45)."""
+    spans = _SHAPE_PATTERN_DIGEST_AUTH_RE._digest_credential_spans(text)
+    if not spans:
+        return text
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    result: list[str] = []
+    last = 0
+    for start, end in merged:
+        result.append(text[last:start])
+        result.append("[REDACTED]")
+        last = end
+    result.append(text[last:])
+    return "".join(result)
+
+
 def _mask_bare_credential_text(text: str) -> str:
     """R27 Block 43: the producer/consumer free-text bare-credential masker —
     masks every camelCase-and-digit token and every registered all-lowercase
@@ -1240,8 +1369,14 @@ def _mask_bare_credential_text(text: str) -> str:
     ``flightOption1`` / ``refreshTokenCount1`` are masked here too — so only the
     version-marker business identifiers in their documented schema form with no
     narration (``plannerV2 providerV4`` / ``tokenizationV1``) are left
-    untouched."""
-    narration = _credential_narration_binds(text)
+    untouched.  R33 Block 55: the narration test runs on the NORMALIZED copy
+    (NFKC folds a full-width colon / equals to ``:``/``=``) so a full-width
+    Chinese copula or colon binds a registered base the same way the final scan
+    sees it (``口令 + full-width-colon + plannerV2`` -> ``口令 +
+    [REDACTED]``); R33 Block 56: a real Digest credential descriptor is masked
+    WHOLE first (16/32/64-hex response and its identity params)."""
+    text = _mask_digest_credential_text(text)
+    narration = _credential_narration_binds(_normalize_for_scan(text))
 
     def repl(m: re.Match[str]) -> str:
         if _is_bare_credential_token(m.group(0)):
