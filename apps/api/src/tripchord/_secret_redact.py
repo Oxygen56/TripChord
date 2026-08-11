@@ -432,6 +432,129 @@ _BASIC_VALUE_TOKEN_RE = re.compile(r"(?i)\bBasic[ \t]+(?P<payload>[A-Za-z0-9+/]{
 # (The span used is :func:`_BASIC_VALUE_TOKEN_RE`'s ``payload`` group.)
 
 
+# Common-English identifier vocabulary used by the STRUCTURED recognizers
+# (R23 Block 33/34): a bare camelCase-and-digit token or an invalid-base64
+# Basic payload is non-credential business English ONLY when every word segment
+# is in this set.  The vocabulary is an English-word set, NOT a
+# credential-keyword blacklist — credential keywords are deliberately absent
+# so ``secret``/``password``/``token`` in final-segment position still fail
+# closed, while ``token`` as a MIDDLE segment (``refreshTokenCount``) is
+# ordinary business English.
+_CREDENTIAL_VALUE_WORDS = frozenset(
+    {
+        # function words
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+        "am", "of", "for", "to", "in", "on", "at", "by", "with", "from",
+        "up", "down", "off", "over", "under", "into", "onto", "about",
+        "and", "or", "but", "nor", "so", "yet", "as", "than", "if", "then",
+        "else", "when", "while", "not", "no", "yes", "also", "only",
+        "this", "that", "these", "those", "it", "its", "there", "here",
+        "we", "you", "they", "he", "she", "them", "us", "our", "your",
+        "their", "his", "her", "my", "me", "do", "does", "did", "done",
+        "have", "has", "had", "will", "would", "shall", "should", "can",
+        "could", "may", "might", "must", "please", "need", "needs",
+        # common adjectives / adverbs / verbs / nouns
+        "all", "any", "some", "many", "much", "few", "more", "most", "less",
+        "least", "very", "really", "quite", "too", "just", "even",
+        "still", "already", "always", "never", "often", "sometimes",
+        "required", "optional", "default", "empty", "full",
+        "valid", "invalid", "new", "old", "first", "last", "next",
+        "left", "right", "top", "bottom", "high", "low", "big", "small",
+        "large", "long", "short", "fast", "slow", "early", "late",
+        "good", "bad", "true", "false", "ok", "okay", "none",
+        "null", "zero", "one", "two", "three", "four", "five", "six",
+        "seven", "eight", "nine", "ten", "key", "value", "pair", "name",
+        "user", "email", "phone", "date", "time", "day",
+        "month", "year", "hour", "minute", "second", "week", "start", "end",
+        "begin", "finish", "open", "close", "create", "update", "delete",
+        "insert", "remove", "add", "set", "get", "make", "take", "put",
+        "send", "receive", "give", "show", "hide", "read", "write", "run",
+        "stop", "check", "verify", "test", "build", "deploy",
+        "plan", "planner", "trip", "flight", "hotel",
+        "hotels", "route", "itinerary", "destination", "city", "country",
+        "rating", "score", "review", "reviews", "availability", "capacity",
+        "currency",
+        "duration", "distance", "discount", "tax", "fee", "deposit",
+        "cancellation", "refund", "fare", "seat", "cabin",
+        "breakfast", "luggage", "baggage", "transfer", "rental", "car",
+        "attraction", "ticket", "visa", "insurance", "weather",
+        "id", "ids", "num",
+        "budget", "price", "cost", "amount", "total", "sum", "count",
+        "number", "quantity", "option", "options",
+        "choice", "select",
+        "selected", "choose", "pick", "prefer", "preference", "setting",
+        "settings", "config", "configuration", "auth", "mode", "model", "type",
+        "version", "status", "state", "level", "rank", "order", "sort",
+        "group", "class", "kind", "list", "array", "map",
+        "object", "field", "fields", "label", "title", "header", "body",
+        "text", "line", "row", "column", "cell", "page", "screen", "view",
+        "panel", "window", "menu", "button", "input", "output", "result",
+        "results", "error", "message", "info", "note", "notice",
+        "warning", "danger", "success", "fail", "failure", "pass", "passes",
+        "attempt", "retry", "try", "action", "task", "job", "work", "item",
+        "items", "entry", "entries", "record", "records", "file", "folder",
+        "path", "dir", "root", "node", "branch", "leaf", "tree",
+        "graph", "edge", "vertex", "layer", "engine", "module", "component",
+        "service", "api", "app", "application", "client", "server", "host",
+        "port", "address", "url", "link", "uri", "endpoint",
+        "request", "response", "query", "session", "context", "scope",
+        "region", "zone", "area", "part", "parts", "piece", "whole", "half",
+        "quarter", "section",
+        "segment", "block", "chunk", "unit", "package", "bundle",
+        "release", "tag", "commit", "push", "pull",
+        "merge", "rebase", "clone", "fetch", "sync", "upload", "download",
+        "install", "upgrade", "downgrade", "patch",
+        "fix", "bug", "issue", "story", "epic",
+        "feature", "spec", "docs", "document", "doc", "guide",
+        "manual", "readme", "help", "faq", "tutorial", "example",
+        "sample", "demo", "preview", "draft", "final", "ready", "pending",
+        "blocked", "cancel", "cancelled", "abort",
+        "pause", "resume", "continue", "halt", "exit", "quit",
+        "back", "forward", "previous", "prev", "current", "live",
+        "prod", "production", "dev", "development", "stage", "staging",
+        "testing", "integration", "e2e", "regression",
+        "smoke", "sanity", "health", "metric", "metrics",
+        "log", "logs", "trace", "span", "samples", "refresh", "reload",
+        "renew", "token", "tokens", "exchange",
+        "grant", "audience", "issuer", "subject",
+        "provider", "providers", "vendor", "supplier", "partner", "tenant",
+        "users", "member", "admin", "owner", "guest", "viewer",
+        "editor", "agent", "agents", "bot", "worker", "runner",
+        "scheduler", "queue", "topic", "subscription", "channel",
+        "stream", "event", "events", "pub", "sub", "callback",
+        "webhook", "hook", "listener", "handler", "processor",
+        "pipeline", "step", "phase", "wave", "round", "cycle",
+        "iteration", "runs", "execution", "execute",
+    }
+)
+
+
+def _split_camel_case(prefix: str) -> list[str]:
+    """Split a camelCase word prefix into its word segments at each
+    lower→upper boundary: ``flightOption`` -> [``flight``, ``Option``],
+    ``refreshTokenCount`` -> [``refresh``, ``Token``, ``Count``]."""
+    segments: list[str] = []
+    start = 0
+    for i in range(1, len(prefix)):
+        if prefix[i].isupper() and prefix[i - 1].islower():
+            segments.append(prefix[start:i])
+            start = i
+    segments.append(prefix[start:])
+    return segments
+
+
+def _is_english_prose_phrase(text: str) -> bool:
+    """True when ``text`` is 2+ words and every word is common English — the
+    structure that separates ``is required`` (prose) from ``ab extra`` /
+    ``abc extra`` (credential-shaped) and ``ab`` / ``abc`` (lone
+    placeholder).  A one-word text is never prose, so a bare ``Basic is``
+    fails closed."""
+    words = re.findall(r"[A-Za-z]+", text)
+    return len(words) >= 2 and all(
+        w.lower() in _CREDENTIAL_VALUE_WORDS for w in words
+    )
+
+
 # Field-name occurrences used by the header-prose check (R21 Block 22/23/27):
 # a prose-Basic exemption applies ONLY when the matched value is a SINGLE
 # header field whose Basic payload is non-credential prose — a second sensitive
@@ -466,34 +589,69 @@ def _is_whole_header_prose(value: str) -> bool:
       credential even when the bytes are not UTF-8 (``Basic dXNlcjr/`` decodes
       to ``user:\xff``), never prose (R22 Block 29 closes the Latin-1/base64
       variant);
-    * a payload that is NOT a decodable base64 body and is the LAST content of
-      the header value — a lone short placeholder (``Basic ab`` / ``Basic abc``),
-      never proven prose (R22 Block 29);
+    * a canonical payload whose decoded bytes are TEXT-LIKE (mostly printable
+      ASCII, ``Basic dXNlcv8=`` decodes to ``user\xff``) — a real
+      username/password fragment, never prose (R23 Block 34);
+    * an invalid-base64 payload that is NOT a proven multi-word English phrase
+      (``Basic ab extra`` / ``Basic abc extra`` / lone ``ab`` / ``abc``) —
+      never prose (R23 Block 34);
     * otherwise every Basic payload is non-credential prose -> prose
       (``authorization: Basic is required`` — trailing text after a
-      non-decodable ``is``; ``authorization: Basic auth/setting`` — a decodable
-      body whose bytes carry no ``:``, so prose even at the value end).
+      non-decodable ``is`` forms the phrase ``is required``;
+      ``authorization: Basic auth/setting`` — a decodable body whose bytes are
+      binary junk with no ``:`` and a low printable-byte ratio, so prose even
+      at the value end).
     """
     if len(list(_HEADER_FIELD_NAME_RE.finditer(value))) != 1:
         return False
-    bm = _BASIC_VALUE_TOKEN_RE.search(value)
-    if bm is None:
+    return (
+        _BASIC_VALUE_TOKEN_RE.search(value) is not None
+        and all(
+            _is_basic_payload_prose(bm, value)
+            for bm in _BASIC_VALUE_TOKEN_RE.finditer(value)
+        )
+    )
+
+
+def _is_basic_payload_prose(bm: re.Match[str], value: str) -> bool:
+    """True when ONE Basic payload inside a sensitive-header value is
+    non-credential prose (R23 Block 34).  The exemption is a STRUCTURED
+    payload-classification, not a length/decode-result/punctuation shortcut:
+
+    * a valid base64 payload is a real credential (``Basic YWJjZA==``);
+    * a valid-base64 payload that decodes to bytes containing ``:`` is a real
+      ``user:pass`` credential even in Latin-1 (``Basic dXNlcjr/`` ->
+      ``user:\xff``);
+    * a CANONICAL payload (base64 alphabet only, no ``/`` or ``+``) that
+      decodes to TEXT-LIKE bytes — a printable-ASCII ratio >= 0.5, e.g.
+      ``Basic dXNlcv8=`` -> ``user\xff`` — is a real username/password
+      fragment (R23 Block 34);
+    * an invalid-base64 payload is prose only when the payload plus any
+      trailing text is a proven 2+ word English phrase (``is required``);
+      ``ab``/``abc``/``ab extra``/``abc extra`` fail closed;
+    * anything else — a binary junk body (``Basic auth/setting`` decodes to
+      non-UTF-8 bytes, no ``:``, low printable ratio) — is prose.
+    """
+    payload = bm.group("payload")
+    if _is_valid_basic_payload(payload):
         return False
-    for bm in _BASIC_VALUE_TOKEN_RE.finditer(value):
-        payload = bm.group("payload")
-        if _is_valid_basic_payload(payload):
-            return False
-        if len(payload) < 2:
-            return False
-        try:
-            decoded = base64.b64decode(payload, validate=True)
-        except (ValueError, binascii.Error):
-            decoded = b""
+    try:
+        decoded = base64.b64decode(payload, validate=True)
+    except (ValueError, binascii.Error):
+        decoded = None
+    if decoded is not None:
         if b":" in decoded:
             return False
-        if not decoded and not value[bm.end():].strip():
+        printable = sum(1 for byte in decoded if 32 <= byte < 127)
+        if decoded and printable / len(decoded) >= 0.5:
             return False
-    return True
+        rest = value[bm.end():].strip()
+        return rest == "" or _is_english_prose_phrase(payload + " " + rest)
+    # Invalid base64: the payload (plus trailing text) must be a proven English
+    # phrase; a lone short token is a placeholder credential.
+    if len(payload) < 2 and not value[bm.end():].strip():
+        return False
+    return _is_english_prose_phrase(payload + " " + value[bm.end():].strip())
 
 
 class _WholeHeaderScan:
@@ -551,16 +709,28 @@ _SHAPE_PATTERN_DIGEST_AUTH_RE = re.compile(
     #
     # R22 Block 32: the leading guard is a FIELD-POSITION guard, not any
     # non-alphanumeric — ``digest`` must sit at a line/value start, after a
-    # structural delimiter (``,;{}[]"'\\`` or ``:``), never mid-prose after a
-    # plain word.  So a business sentence ``model digest algorithm=md5
-    # response=<hex>`` (``algorithm`` is also a generic English word) no longer
-    # matches, while a real ``Digest username="user", response=<hex>`` at a
-    # field position still fails closed on both FINAL scans.
-    r"(?i)(?:^|[\r\n,;{}\[\]\"'\\]|:[ \t]*)digest\b(?:"
-    r"[^\r\n]{0,200}?(?:username|realm|nonce|uri|qop|nc|cnonce|opaque|"
-    r"algorithm|stale|domain)\s*=\s*(?:[\"'][^\"']{0,80}[\"']|[^,\r\n]{1,80})"
-    r"[^\r\n]{0,120}?response\s*=\s*[\"']?[0-9a-f]{16,128}"
-    r"|[ \t]+response\s*=\s*[\"']?[0-9a-f]{16,128}"
+    # structural delimiter (``,;{}[]"'\\`` or a real authorization-field
+    # colon), or after a DESCRIPTOR noun (``upstream``/``model`` + space).
+    # ``result:`` is a plain colon, not an authorization field, so a business
+    # sentence ``model result: digest algorithm=md5 response=<hex>`` no longer
+    # matches (business positive preserved).
+    #
+    # R23 Block 35: the auth-parameter list is a COMMA-SEPARATED grammar — an
+    # optional ``username``/``realm``/… parameter list followed by a final
+    # comma then ``response=<hex>`` — never a space-squashed ``algorithm=md5
+    # response=``.  A real Digest header / decoded value (``upstream Digest
+    # username="user", response=<64hex>`` at a field position) still fails
+    # closed on both FINAL scans, while ``digest algorithm=md5 response=…``
+    # (space-separated prose narration) is preserved.
+    r"(?i)(?:^|[\r\n,;{}\[\]\"'\\]|"
+    r"(?:authorization|proxy-authorization)[ \t]*:[ \t]*|"
+    r"(?<![A-Za-z0-9_-])[a-z][a-z0-9-]*[ \t]+)digest\b(?:"
+    r"[ \t]+response\s*=\s*[\"']?[0-9a-f]{16,128}"
+    r"|[ \t]+(?:username|realm|nonce|uri|qop|nc|cnonce|opaque|algorithm|"
+    r"stale|domain)\s*=\s*(?:[\"'][^\"']{0,80}[\"']|[^,\r\n]{1,80})"
+    r"(?:[ \t]*,[ \t]*(?:username|realm|nonce|uri|qop|nc|cnonce|opaque|"
+    r"algorithm|stale|domain)\s*=\s*(?:[\"'][^\"']{0,80}[\"']|[^,\r\n]{1,80}))*"
+    r"[ \t]*,[ \t]*response\s*=\s*[\"']?[0-9a-f]{16,128}"
     r")"
 )
 
@@ -599,22 +769,60 @@ _SHAPE_PATTERN_REDACTION_RESIDUE_RE = re.compile(
 _BARE_CREDENTIAL_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])[a-z]+[A-Z][A-Za-z0-9_]*[0-9]+[A-Za-z0-9_]*(?![A-Za-z0-9_])"
 )
-_BARE_CREDENTIAL_KEYWORD_RE = re.compile(
-    r"(?i)(?:secret|password|passwd|pwd|credential|creds?|apikey|token|"
-    r"access[_ -]?key|session[_ -]?key|private[_ -]?key|client[_ -]?secret|"
-    r"auth[_ -]?token|session[_ -]?token|access[_ -]?token|refresh[_ -]?token)"
+
+# Credential keyword FULL SEGMENTS (camelCase boundaries, case-insensitive) —
+# NOT substrings: ``tokenization`` / ``secretariat`` contain ``token`` /
+# ``secret`` as substrings but are ordinary English words and never match.
+_BARE_CREDENTIAL_KEYWORD_SEGMENTS = frozenset(
+    {
+        "secret", "password", "passwd", "pwd", "pass", "credential",
+        "credentials", "token", "key", "apikey", "accesskey", "authkey",
+        "sessionkey", "privatekey", "clientsecret", "secretkey",
+        "accesstoken", "refreshtoken", "authtoken", "idtoken", "tokenid",
+        "signature", "signingkey", "bearer", "nonce", "authorization",
+        "auth", "cookie", "session", "sid",
+    }
 )
 
 
 def _is_bare_credential_token(token: str) -> bool:
-    """True when a camelCase-and-digit token is a BARE credential value: it
-    contains a credential keyword component (``Secret`` in ``mySuperSecret1``)
-    OR its digit run is followed by a letter inside the token (``1xyz`` in
-    ``abcD1xyz9``), so a trailing version digit (``flightOption12``) is not a
-    credential."""
-    if _BARE_CREDENTIAL_KEYWORD_RE.search(token):
+    """True when a camelCase-and-digit token is a BARE credential value —
+    the STRUCTURED recognizer (R23 Block 33), NOT a keyword/threshold
+    heuristic.  ``qwerTy1`` (a short keyboard mash + digit) and
+    ``mySuperSecret1`` structurally share the shape of ``flightOption12``
+    (lower+Upper+lower+digits), so no length/digit-position/punctuation rule
+    can separate them: the decision is identifier STRUCTURE:
+
+    * a digit run followed by a letter INSIDE the token (``1xyz`` in
+      ``abcD1xyz9``) — the digit is embedded, not a trailing number — is a
+      credential (fail-closed);
+    * a trailing ``V<digits>`` version marker (``plannerV2`` /
+      ``tokenizationV1`` / ``secretariatV1``) is a versioned business
+      identifier, not a credential;
+    * a trailing-digit token whose FINAL camelCase segment is a credential
+      keyword (``Secret`` in ``mySuperSecret1``) is a credential;
+    * a trailing-digit token whose camelCase segments are ALL common English
+      words (``flightOption`` = ``flight`` + ``Option``, ``refreshTokenCount``
+      = ``refresh`` + ``Token`` + ``Count``) is a business identifier;
+    * ANY other digit-bearing camelCase token (``qwerTy1`` — a short
+      keyboard-mash prefix with a digit) fails closed as a credential shape.
+    """
+    if re.search(r"[0-9]+[A-Za-z]", token):
         return True
-    return bool(re.search(r"[0-9]+[A-Za-z]", token))
+    m = re.match(r"^([A-Za-z]+)([0-9]+)$", token)
+    if m is None:
+        return False
+    prefix, _digits = m.group(1), m.group(2)
+    if prefix[-1] in "Vv":
+        return False
+    segments = _split_camel_case(prefix)
+    if not segments:
+        return False
+    if segments[-1].lower() in _BARE_CREDENTIAL_KEYWORD_SEGMENTS:
+        return True
+    return not all(
+        segment.lower() in _CREDENTIAL_VALUE_WORDS for segment in segments
+    )
 
 
 class _BareCredentialScan:

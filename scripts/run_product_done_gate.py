@@ -878,7 +878,7 @@ _AUTH_COOKIE_BODY_RE = re.compile(r"(?i)^[^:=\r\n]*[:=]\s*(.*)$", re.DOTALL)
 # :func:`_is_midword_header_prose`) — an env-var assignment far into prose
 # (``set TRIPCHORD_ACK_MODEL_COST=1 to authorise…``) is not a cookie.
 _HEADER_VALUE_BASIC_BEARER_RE = re.compile(
-    r"(?i)\b(?:basic|bearer)\b[ \t]+[A-Za-z0-9+/=_\-.]{2,}"
+    r"(?i)\b(?:basic|bearer)\b[ \t]+[A-Za-z0-9+/=_\-.]{1,}"
 )
 _HEADER_VALUE_KV_RE = re.compile(
     r"(?i)[A-Za-z0-9_.-]{1,32}\s*=\s*[^\s,;\"']{1,}"
