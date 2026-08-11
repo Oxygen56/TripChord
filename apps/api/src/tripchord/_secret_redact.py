@@ -787,7 +787,7 @@ class _DigestAuthScan:
 
     def _parse_digest_auth_params(
         self, text: str, end: int
-    ) -> tuple[dict[str, str], int] | None:
+    ) -> tuple[dict[str, list[str]], int] | None:
         """Parse the comma-separated ``name=value`` list that must directly
         follow the keyword (at ``end``) by RFC 7235 / RFC 7230 token and
         quoted-string grammar (R33 Block 56).  ``None`` when the text is not a
@@ -797,14 +797,18 @@ class _DigestAuthScan:
         and stays accepted, while ``username="use\\"r", foo*=bar, response=<hex>``
         parses every pair including the real ``response`` credential.  Returns
         ``(params, index_after_last_pair)`` — the caller masks the whole
-        descriptor span (R33 Block 56 producer side)."""
+        descriptor span (R33 Block 56 producer side).  R34 Block 58: EVERY
+        occurrence of a duplicated parameter name is preserved in insertion
+        order (``dict[str, list[str]]``), never overwritten — the caller checks
+        ALL ``response`` values, so ``response=<32hex>, response=xyz`` and its
+        reverse fail closed identically."""
         i = end
         n = len(text)
         # A real Digest header has OWS after the scheme; require at least one
         # SP / HTAB so a bare ``digest`` keyword never parses as a header.
         if i >= n or text[i] not in " \t":
             return None
-        params: dict[str, str] = {}
+        params: dict[str, list[str]] = {}
         while True:
             while i < n and text[i] in " \t":
                 i += 1
@@ -840,7 +844,12 @@ class _DigestAuthScan:
                     return None
                 val = m.group(0)
                 i = m.end()
-            params[name] = val
+            # R34 Block 58: keep EVERY duplicate — the old ``params[name] = val``
+            # let the last occurrence win, so ``response=<32hex>, response=xyz``
+            # (real credential first) ACCEPTED because the overwrite left ``xyz``
+            # behind; the reversed order rejected.  Any real response hex must
+            # fail closed regardless of order, so no value is dropped.
+            params.setdefault(name, []).append(val)
             # OWS then either a comma (more pairs) or the end of the list.
             while i < n and text[i] in " \t":
                 i += 1
@@ -895,10 +904,14 @@ class _DigestAuthScan:
             if parsed is None:
                 continue
             params, end = parsed
-            response = params.get("response")
-            if response is None:
+            responses = params.get("response")
+            if not responses:
                 continue
-            if not _HEX_FULL_RE.fullmatch(response.strip()):
+            # R34 Block 58: ANY real response credential hex (16/32/64) in ANY
+            # position fails closed — the dict preserves every duplicate, so a
+            # hex credential is never hidden behind a later ``response=xyz``
+            # overwrite.
+            if not any(_HEX_FULL_RE.fullmatch(r.strip()) for r in responses):
                 continue
             if binding == "descriptor":
                 if "username" in params or "userhash" in params:
@@ -918,10 +931,12 @@ class _DigestAuthScan:
             if parsed is None:
                 continue
             params, _end = parsed
-            response = params.get("response")
-            if response is None:
+            responses = params.get("response")
+            if not responses:
                 continue
-            if not _HEX_FULL_RE.fullmatch(response.strip()):
+            # R34 Block 58: same any-hex-any-position rule as the span builder —
+            # a real response credential in ANY duplicate position fails closed.
+            if not any(_HEX_FULL_RE.fullmatch(r.strip()) for r in responses):
                 continue
             # R28 Block 49: a descriptor-prefixed digest is a credential EXCEPT
             # when it is a pure algorithm description — ``client digest
@@ -1110,7 +1125,11 @@ _REGISTERED_LOWER_BASE_RE = re.compile(
 # (``value``/``word``/``name``/``string``/``text``/``number``), so
 # ``password value is plannerV2`` fails closed too (R33 Block 55: 禁止逐词补表式
 # 打补丁 — 按凭据指称语义类闭合, 含中文与组合叙述).
-_CREDENTIAL_DESIGNATION_ALT = (
+# R34 Block 57: the designation HEAD class — every word that NAMES a credential
+# in a field-name position (R33 Block 55), including the compound key/token/
+# secret/authorization forms and the Chinese designations.  ``pass`` /
+# ``access`` are deliberately NOT here — see ``_CREDENTIAL_DESIGNATION_PREFIX_ALT``.
+_CREDENTIAL_DESIGNATION_STANDALONE_ALT = (
     r"(?:password|passwd|passphrase|passcode|pwd|userpass|login|key|secret"
     r"|pin|token|credentials?|api[_-]?key|access[_-]?key|session[_-]?key"
     r"|private[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token"
@@ -1118,7 +1137,50 @@ _CREDENTIAL_DESIGNATION_ALT = (
     r"|authorization|proxy[_-]?authorization|bearer|auth"
     r"|口令|密码|密碼|密钥|密鑰|通行码|通行碼|登录|登入|账号|帳號|账户|帳戶"
     r"|凭证|憑證|秘密"
-    r")(?:\s+(?:value|word|name|string|text|number))?"
+    r")"
+)
+# R34 Block 57: ``pass`` / ``access`` are the English ROOT / access-grant words
+# of the designation class (pass = the root of password/passphrase/passcode;
+# access = the access-grant credential) but are ambiguous ALONE, so they bind
+# only inside a composite noun phrase (``pass phrase`` / ``access code``).
+_CREDENTIAL_DESIGNATION_PREFIX_ALT = r"pass|access"
+# R34 Block 57: the composite MODIFIER class — a noun that denotes the content
+# or value of a field (value/word/name/string/text/number/code/phrase) plus the
+# designation words themselves (``login password`` / ``password passcode``).
+_CREDENTIAL_DESIGNATION_MODIFIER_ALT = (
+    r"(?:value|word|name|string|text|number|code|phrase"
+    r"|" + _CREDENTIAL_DESIGNATION_STANDALONE_ALT + r")"
+)
+# R34 Block 57: the Chinese content-noun class — concatenated, no space, onto a
+# Chinese designation head (``口令值`` / ``口令密码``).  Same semantic closure as
+# the English modifier class; ``是/为/等于/成为`` are copulas, not content nouns.
+_CREDENTIAL_DESIGNATION_CJK_NOUN_ALT = (
+    r"(?:值|词|詞|名|号|號|码|碼|短语|短語|文本|数字|數字"
+    r"|口令|密码|密碼|密钥|密鑰|通行码|通行碼|登录|登入|账号|帳號|账户|帳戶"
+    r"|凭证|憑證|秘密"
+    r")"
+)
+# R34 Block 57: the composite designation is a noun PHRASE — a designation head
+# optionally followed by 0-2 spaced value/field nouns (``password value`` /
+# ``login password`` / ``pin code`` / ``access code`` / ``pass phrase``), plus
+# the Chinese content nouns that concatenate onto a Chinese head with no space
+# (``口令值`` / ``口令密码``).  The modifier classes are closed BY MEANING (a noun
+# that denotes the CONTENT of a field), so ``code`` / ``phrase`` / ``值`` bind
+# exactly like the old fixed qualifier list and the reviewer's composites are
+# instances of the class — not words added one-by-one (R33 Block 55: 禁止逐词补表
+# 式打补丁 — 按凭据指称语义类闭合, 含中文与组合叙述).  ``pass`` / ``access`` bind
+# ONLY when compounded with a content noun (``pass phrase`` / ``access code`` /
+# ``access key``); bare ``pass is …`` / ``access is …`` are ordinary business
+# prose and never bind, so the added words cannot flip narration onto a plain
+# sentence.
+_CREDENTIAL_DESIGNATION_ALT = (
+    r"(?:" + _CREDENTIAL_DESIGNATION_STANDALONE_ALT + r")"
+    r"(?:[ \t]+(?:" + _CREDENTIAL_DESIGNATION_MODIFIER_ALT + r")){0,2}"
+    r"(?:" + _CREDENTIAL_DESIGNATION_CJK_NOUN_ALT + r"){0,2}"
+    r"|"
+    r"(?:" + _CREDENTIAL_DESIGNATION_PREFIX_ALT + r")"
+    r"[ \t]+(?:" + _CREDENTIAL_DESIGNATION_MODIFIER_ALT + r")"
+    r"(?:[ \t]+(?:" + _CREDENTIAL_DESIGNATION_MODIFIER_ALT + r"))?"
 )
 # R29 Block 51 / R30 Block 52 / R31 Block 53 / R32 Block 54: the binding-operator
 # arrow class is CLOSED BY UNICODE ARROW BLOCK RANGE plus a principled

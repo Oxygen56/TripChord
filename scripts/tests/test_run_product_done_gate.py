@@ -15602,3 +15602,220 @@ def test_r33_full_chain_producer_seal_consumer_block55_56_both_finals(
                 "live-canary-certified.json.failure.json",
                 credential_field_check=False,
             )
+def test_r34_block57_composite_designation_semantic_class_fail_closed_both_paths() -> None:
+    """C-122 round-34 Block 57 counter-examples (architect independent review of
+    bf190dd): a composite credential designation is a noun PHRASE — a designation
+    head optionally followed by value/field content nouns (``pin code`` /
+    ``access code`` / ``pass phrase``) or a Chinese head with a concatenated
+    content noun (``口令值``).  ``_CREDENTIAL_DESIGNATION_ALT`` was still a fixed
+    designation word + fixed qualifier enumeration, so ``code`` / ``phrase`` /
+    ``值`` were invisible and the real credential ACCEPTED both finals.  The
+    composite is now closed by the SEMANTIC class (designation head + content-
+    noun modifier), NOT a reviewed-points enumeration — the reviewer's strings
+    are instances of the class (禁止逐词补表式打补丁).  ``pass`` / ``access`` bind
+    only when compounded (``pass phrase`` / ``access code``), so bare ``access
+    is …`` / ``pass is …`` business prose stays accepted.  Every counter-example
+    and same-family variant fails BOTH finals closed; designation words alone in
+    ordinary prose stay accepted."""
+    b57_reject = (
+        "pin code is plannerV2",
+        "access code is plannerV2",
+        "pass phrase is plannerV2",
+        "口令值是plannerV2",  # 口令值 passphrase-value
+        "PIN CODE is plannerV2",
+        "access code = plannerV2",
+        "pass phrase is tokenizationV1",
+        "access key is plannerV2",
+        "access token is plannerV2",
+        "pass code is plannerV2",
+        "口令密码是 plannerV2",  # 口令密码 passphrase-password
+        "登录密码是 providerV4",  # 登录密码 login-password
+        "账号密码是 providerV4",  # 账号密码 account-password
+        "pin code值是plannerV2",  # mixed English-CJK composite
+    )
+    for raw in b57_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # A designation word alone in prose — or one whose value carries NO
+    # registered-base token — stays accepted.  ``access`` / ``pass`` alone are
+    # ordinary business nouns and never bind.
+    for raw in (
+        "access is granted to plannerV2 users",
+        "pass is required for entry",
+        "the pass was provided yesterday",
+        "the access code is printed on the boarding pass",
+        "pass phrase 是这里的一个普通词语",  # 口令 is here an ordinary word
+        "口令值是普通业务文本",  # 口令值 is ordinary business text
+        "pin code is 1234",
+        "access code printed below",
+        "pass phrase value is used here",
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r34_block58_digest_duplicate_params_order_independent_fail_closed_both_paths() -> None:
+    """C-122 round-34 Block 58 counter-examples (architect independent review of
+    bf190dd): ``_parse_digest_auth_params`` returned a ``dict[str, str]`` and
+    ``params[name] = val`` let the LAST duplicate win, so ``response=<32hex>,
+    response=xyz`` ended with ``response=xyz`` and the real credential ACCEPTED
+    both finals — only the reversed order rejected.  Every duplicate parameter
+    value is now PRESERVED in insertion order and ANY real response credential
+    hex (16/32/64) fails closed, so the result is order-independent.  The Block
+    45 / Block 49 algorithm-description positives (no request identity) and a
+    digest with NO real response hex stay accepted."""
+    h16 = "ab" * 8
+    h32 = "ab" * 16
+    h64 = "ab" * 32
+    b58_reject = (
+        f'service Digest username="user", response={h32}, response=xyz',
+        f'service Digest username="user", response=xyz, response={h32}',
+        f'service Digest username="user", response={h16}, response=xyz',
+        f'service Digest username="user", response=xyz, response={h64}',
+        f'service Digest username="user", response={h32}, response=xyz, '
+        f'response={h64}',
+        f'service Digest username="user", response="xyz", response={h32}',
+        f'service Digest userhash=true, response=xyz, response={h16}',
+        f'origin Digest response={h32}, response=xyz',
+        f'upstream Digest response=xyz, response={h16}',
+        f'{{"summary": "service Digest username=\\"user\\", response={h32}, '
+        f'response=xyz"}}',
+    )
+    for raw in b58_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # A digest with NO real response hex — an algorithm-description narration or
+    # a non-hex response in every position — stays accepted.
+    for raw in (
+        'service Digest username="user", response=xyz, response=xyz',
+        'service Digest response=xyz',
+        f"client digest algorithm=md5, response={h32}, response=xyz",
+        f"model digest algorithm=md5 response={h32}",
+        'WWW-Authenticate: Digest realm="test", nonce=abc123',
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r34_full_chain_producer_seal_consumer_block57_58_both_finals(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-34 full chain (Block 57 + Block 58): the producer masks a
+    composite credential-designation narration (``pin code is plannerV2`` /
+    ``access code is plannerV2`` / ``pass phrase is plannerV2`` /
+    ``口令值是plannerV2``) and a real Digest credential descriptor with DUPLICATE
+    response params (``response=<32hex>, response=xyz`` in either order) BEFORE
+    the 0600 seal, so the sealed diagnostic is clean and BOTH finals pass; the
+    RAW value still fails BOTH finals (defense in depth)."""
+    from benchmarks import live_canary_certified as canary
+
+    h16 = "ab" * 8
+    h32 = "ab" * 16
+    h64 = "ab" * 32
+    raw_cases = (
+        "pin code is plannerV2",
+        "access code is plannerV2",
+        "pass phrase is plannerV2",
+        "口令值是plannerV2",  # 口令值 passphrase-value
+        f'service Digest username="user", response={h32}, response=xyz',
+        f'service Digest username="user", response=xyz, response={h32}',
+        f'service Digest username="user", response={h16}, response=xyz',
+        f'origin Digest response={h64}, response=xyz',
+    )
+    for raw in raw_cases:
+        masked = canary._desensitize(raw)
+        assert masked != raw, "producer must mask the credential"
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r34chain",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
