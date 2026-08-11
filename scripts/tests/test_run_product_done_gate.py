@@ -16111,3 +16111,577 @@ def test_r35_full_chain_producer_seal_consumer_block59_60_both_finals(
             "ev.json",
             credential_field_check=True,
         )
+
+
+def test_r36_block61_structural_field_path_fail_closed_both_paths() -> None:
+    """C-122 round-36 Block 61 counter-examples (architect independent review of
+    5d34bb0a): a registered business-identifier base (``plannerV2`` /
+    ``providerV4`` / ``tokenizationV1``) is a credential-shaped VALUE unless it
+    sits at an exact DOCUMENTED member path with the matching base.  The R35
+    exemption keyed ONLY on the ``_version``-suffixed field name, so ``{"otp":
+    "plannerV2"}`` — a version-marker base at an unbound field — and
+    ``planner_version = providerV4`` — a cross-field value — ACCEPTED both
+    finals, and a PSEUDO-suffix key (``evilplanner_version = plannerV2``)
+    matched the ``.*_version`` prefix test and was wrongly exempted.  The path
+    grant is now exact: ``_DOCUMENTED_BUSINESS_VALUE_PATHS`` lists the precise
+    member-key paths (``planner_version`` / ``plan.planner_version`` /
+    ``summary`` / ``detail`` / ``reason`` …) and the exact base each grants, the
+    value must be the exact registered ``base`` + ``V[0-9]+|[0-9]+`` form, and
+    the key boundary is COMPLETE-word — single/double-quote and parenthesised
+    values (``'plannerV2'`` / ``(plannerV2)``) and JSON-escaped decoded levels
+    never bypass.  Every counter-example fails BOTH finals closed; the exact
+    documented paths and non-base values stay accepted."""
+    b61_reject = (
+        # version-marker base at an UNBOUND field path
+        '{"otp":"plannerV2"}',
+        '{"day": "plannerV2"}',
+        '{"otp": "plannerV2 "}',
+        '{"planner_versions": "plannerV2"}',
+        '{"planner-version": "plannerV2"}',
+        # cross-field: the WRONG base at a documented path
+        "planner_version = providerV4",
+        "plan.planner_version = tokenizationV1",
+        '{"plan": {"planner_version": "providerV4"}}',
+        # pseudo-suffix key — the key boundary is complete-word
+        "evilplanner_version = plannerV2",
+        'evilplanner_version = "plannerV2"',
+        # wrapped values never bypass
+        'verification code is "plannerV2"',
+        "verification code is 'plannerV2'",
+        "verification code is (plannerV2)",
+        # JSON-escaped decoded level: the decoded path (``otp`` / ``day``) is
+        # unbound even though the wrapping field is ``summary``
+        '{"summary": "{\\"otp\\": \\"plannerV2\\"}"}',
+        '{"summary": "{\\"day\\": \\"plannerV2\\"}"}',
+        '{"summary": "{\\"plan\\": {\\"planner_version\\": \\"providerV4\\"}}"}',
+    )
+    for raw in b61_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # The EXACT documented paths with the matching base, non-base values at
+    # unbound paths, and bases in ordinary prose stay accepted on BOTH finals.
+    for raw in (
+        '{"planner_version":"plannerV2"}',
+        '{"plan": {"planner_version": "plannerV2"}}',
+        "plan.planner_version = plannerV2",
+        "planner_version = 'plannerV2'",
+        'plan.planner_version = "plannerV2"',
+        "planner_version = (plannerV2)",
+        '{"summary":"tokenizationV1"}',
+        '{"detail": "tokenizationV1"}',
+        '{"summary": "{\\"planner_version\\": \\"plannerV2\\"}"}',
+        '{"summary": "{\\"plan\\": {\\"planner_version\\": \\"plannerV2\\"}}"}',
+        '{"day":"2"}',
+        '{"otp":"abc123"}',
+        "plannerV2 providerV4",
+        "access is granted to plannerV2 users",
+        "the OTP is single-use for this trip",
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r36_block62_digest_incremental_fail_closed_both_paths() -> None:
+    """C-122 round-36 Block 62 counter-examples (architect independent review of
+    5d34bb0a): ``_parse_digest_auth_params`` returned ``None`` for the WHOLE
+    header when any member after the response was malformed, so
+    ``service Digest username="user", response=<32hex>, bad="unterminated`` and
+    ``..., bad=@`` dropped the ALREADY-PARSED real response and ACCEPTED both
+    finals.  The parse is now INCREMENTAL and fail-closed: every real 16/32/64-
+    hex response already seen is preserved, an unknown / illegal / unclosed
+    quoted-string member (or a corrupt list member) never clears parsed
+    credentials, and ANY syntax error whose region contains a REAL response hex
+    (``bad="unterminated, response=<hex>``) is a credential signal too — both
+    finals reject and the producer/consumer mask the WHOLE descriptor.  The
+    algorithm-description narrations (no request identity) and a digest whose
+    response is NOT real hex stay accepted."""
+    h16 = "ab" * 8
+    h32 = "ab" * 16
+    h64 = "ab" * 32
+    b62_reject = (
+        # malformed member AFTER a real response — the parsed credential survives
+        f'service Digest username="user", response={h32}, bad="unterminated',
+        f'service Digest username="user", response={h32}, bad=@',
+        f'service Digest username="user", response={h16}, bad="unterminated',
+        f'service Digest username="user", response={h64}, bad=@',
+        # malformed member BEFORE the response — the response still parses
+        f'service Digest username="user", bad=@, response={h32}',
+        # unclosed quote whose region CONTAINS the real response — a credential
+        f'service Digest username="user", bad="unterminated, response={h32}',
+        # real response with NO identity param + malformed member
+        f'service Digest response={h16}, bad="unterminated',
+        f'service Digest response={h64}, bad=@',
+        # quoted-pair inside a value (regression guard)
+        f'service Digest username="user", response={h32}, bad="a\\"b"',
+        # JSON-escaped raw on both finals
+        '{"summary": "service Digest username=\\"user\\", response=\\"'
+        + h32
+        + '\\", bad=\\"unterminated"}',
+        '{"summary": "service Digest username=\\"user\\", response=\\"'
+        + h16
+        + '\\", bad=\\"unterminated"}',
+    )
+    for raw in b62_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # A malformed member with NO real response hex, or an algorithm description,
+    # stays accepted — the syntax error alone is not a credential.
+    for raw in (
+        'service Digest username="user", response=xyz, bad="unterminated',
+        'service Digest username="user", response=xyz, bad=@',
+        'service Digest username="user", bad="unterminated, response=xyz',
+        'service Digest username="user", bad=@, response=xyz',
+        f"client digest algorithm=md5, response={h32}",
+        f"model digest algorithm=md5 response={h32}",
+        "WWW-Authenticate: Digest realm=\"test\", nonce=abc123",
+        "the model digest calculation response value is here",
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r36_full_chain_producer_seal_consumer_block61_62_both_finals(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-36 full chain (Block 61 + Block 62): the producer masks an
+    unbound-path registered business base (``{"otp":"plannerV2"}`` /
+    ``planner_version = providerV4`` …) and a real Digest credential descriptor
+    with an unclosed quoted-string / illegal-value member BEFORE the 0600 seal,
+    so the sealed diagnostic is clean and BOTH finals pass; the RAW value still
+    fails BOTH finals (defense in depth).  The exact documented structural
+    positives (``{"planner_version":"plannerV2"}`` / ``plan.planner_version =
+    plannerV2`` / ``{"summary":"tokenizationV1"}``) survive the seal — the JSON
+    positives are re-serialized (space after the colon) but their values are
+    untouched."""
+    from benchmarks import live_canary_certified as canary
+
+    h16 = "ab" * 8
+    h32 = "ab" * 16
+    h64 = "ab" * 32
+    raw_cases = (
+        '{"otp":"plannerV2"}',
+        '{"day": "plannerV2"}',
+        '{"planner_versions": "plannerV2"}',
+        "planner_version = providerV4",
+        "plan.planner_version = tokenizationV1",
+        '{"plan": {"planner_version": "providerV4"}}',
+        "evilplanner_version = plannerV2",
+        "verification code is 'plannerV2'",
+        "verification code is (plannerV2)",
+        f'service Digest username="user", response={h32}, bad="unterminated',
+        f'service Digest username="user", response={h16}, bad=@',
+        f'service Digest response={h64}, bad="unterminated',
+    )
+    for raw in raw_cases:
+        masked = canary._desensitize(raw)
+        assert masked != raw, "producer must mask the credential"
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r36chain",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # The documented structured positives survive the seal untouched (the JSON
+    # positives re-serialize with a space after the colon; the value is never
+    # replaced) and both finals accept them.
+    for raw in (
+        '{"planner_version":"plannerV2"}',
+        '{"plan": {"planner_version": "plannerV2"}}',
+        "plan.planner_version = plannerV2",
+        '{"summary":"tokenizationV1"}',
+        "plannerV2 providerV4",
+        "access is granted to plannerV2 users",
+    ):
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked
+        assert "plannerV2" in masked or "tokenizationV1" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r36chain",
+            tested_sha="9" * 40,
+        )
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+
+
+def test_r36_block63_pseudo_path_wrapped_value_fail_closed_both_paths() -> None:
+    """C-122 round-36 Block 63 counter-examples (supervision WIP merge):
+    structural-appearance pseudo-paths and WRAPPED registered-base values are
+    still credentials unless they sit at an exact DOCUMENTED member path with
+    the matching base.  ``evil/planner_version = plannerV2`` (slash path) and
+    ``evil[planner_version] = plannerV2`` (bracket path) reached the R36 Block
+    61 raw-text backstop as fields that stopped at the FIRST word segment, so
+    the bind was never seen; the field class now includes ``/`` ``[`` ``]`` and
+    the pseudo-path matches as ONE whole field, fails the documented-path check,
+    and rejects.  ``{"otp":"(plannerV2)"}`` — a JSON string value whose parens
+    wrap an EXACT base at an unbound path — read as a non-base phrase and was
+    exempted; ``_registered_base_value_info`` now unwraps a balanced
+    ``(...)``/``'...'``/``"..."`` pair so the base resolves and the unbound path
+    fails closed.  Every counter-example fails BOTH finals closed; the exact
+    documented paths (with or without a wrapper) and non-base values stay
+    accepted."""
+    b63_reject = (
+        # pseudo-paths — slash / bracket / dotted
+        "evil/planner_version = plannerV2",
+        "evil[planner_version] = plannerV2",
+        "evil.planner_version = plannerV2",
+        "evil/planner_version = (plannerV2)",
+        "evil[planner_version] = 'plannerV2'",
+        "evil/planner_version = providerV4",
+        # wrapped exact bases at UNBOUND paths
+        '{"otp":"(plannerV2)"}',
+        '{"otp": "(plannerV2)"}',
+        '{"day": "(plannerV2)"}',
+        '{"plan": {"otp": "(plannerV2)"}}',
+        '{"plan": {"day": "(plannerV2)"}}',
+        "{'otp':'(plannerV2)'}",
+        # JSON-escaped decoded level: the unbound decoded path still fails
+        '{"summary": "{\\"otp\\": \\"(plannerV2)\\"}"}',
+        '{"summary": "{\\"day\\": \\"(plannerV2)\\"}"}',
+    )
+    for raw in b63_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # The exact DOCUMENTED paths survive a wrapper (the base matches), phrases
+    # that merely mention a base stay accepted, and non-base values at unbound
+    # paths are untouched — on BOTH finals.
+    for raw in (
+        '{"planner_version":"plannerV2"}',
+        '{"planner_version": "(plannerV2)"}',
+        '{"plan": {"planner_version": "plannerV2"}}',
+        '{"plan": {"planner_version": "(plannerV2)"}}',
+        '{"summary":"tokenizationV1"}',
+        '{"summary": "(tokenizationV1)"}',
+        '{"summary": "see (tokenizationV1)"}',
+        '{"detail": "(tokenizationV1)"}',
+        "plan.planner_version = plannerV2",
+        '{"otp":"abc123"}',
+        "plannerV2 providerV4",
+        "access is granted to plannerV2 users",
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r36_block64_digest_any_hex_quoted_tail_fail_closed_both_paths() -> None:
+    """C-122 round-36 Block 64 counter-examples (supervision WIP merge): the
+    malformed-member recovery branch must apply the SAME any-non-empty-hex
+    response determination as the normal parse.  The R36 Block 62 recovery used
+    ``[0-9a-f]{16,}`` — a gate-lowering that let ``response=deadbeef`` (8 hex,
+    rejected in normal parse) pass once an unterminated member swallowed it, and
+    ignored a QUOTED response (``response="<32hex>"``) entirely.  The recovery
+    now captures the value token, strips a leading/trailing quote (torn by the
+    member boundary / JSON escaping), and fullmatches ANY non-empty hex run; an
+    unterminated quoted member, an illegal-value member, and a TERMINATED quoted
+    member whose value tears a ``response=`` binding all fail closed on BOTH
+    finals and the producer masks the whole descriptor.  Non-hex responses and
+    algorithm-description narrations (no request identity) stay accepted."""
+    h16 = "ab" * 8
+    h32 = "ab" * 16
+    h64 = "ab" * 32
+    b64_reject = (
+        # any non-empty hex — 8/16/32/64 — swallowed by an unterminated member
+        'service Digest username="user", bad="unterminated, response=deadbeef',
+        f'service Digest username="user", bad="unterminated, response={h16}',
+        f'service Digest username="user", bad="unterminated, response={h32}',
+        f'service Digest username="user", bad="unterminated, response={h64}',
+        # QUOTED response swallowed by a TERMINATED quoted member that tears
+        # the binding (the early closing quote cuts ``bad`` short)
+        f'service Digest username="user", bad="unterminated, response="{h32}"',
+        f'service Digest username="user", bad="unterminated, response="{h64}"',
+        'service Digest username="user", bad="unterminated, response="deadbeef"',
+        # illegal-value member + real hex (the response itself parses normally)
+        'service Digest username="user", bad=@, response=deadbeef',
+        # JSON-escaped decoded level with a torn quote / real 8-hex
+        '{"summary": "service Digest username=\\"user\\", bad=\\"unterminated,'
+        ' response=\\"deadbeef"}',
+        '{"summary": "service Digest username=\\"user\\", bad=\\"unterminated,'
+        ' response=\\"' + h32 + '"}',
+    )
+    for raw in b64_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # Non-hex responses (with or without a malformed member), algorithm
+    # descriptions (no request identity), and non-descriptor prose stay
+    # accepted on BOTH finals.
+    for raw in (
+        'service Digest username="user", response=xyz',
+        'service Digest username="user", response=xyz, bad="unterminated',
+        'service Digest username="user", bad="unterminated, response=xyz',
+        'service Digest username="user", bad=@, response=xyz',
+        f'client digest algorithm=md5, response={h32}',
+        f'client digest algorithm="md5", response={h32}',
+        f'model digest algorithm=md5 response={h32}',
+        "WWW-Authenticate: Digest realm=\"test\", nonce=abc123",
+        "the model digest calculation response value is here",
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r36_full_chain_producer_seal_consumer_block63_64_both_finals(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-36 full chain (Block 63 + Block 64): the producer masks a
+    pseudo-path / wrapped-value registered business base and a real Digest
+    credential descriptor with an unterminated / illegal / quoted-torn member
+    BEFORE the 0600 seal, so the sealed diagnostic is clean and BOTH finals
+    pass; the RAW value still fails BOTH finals (defense in depth).  The exact
+    documented structural positives survive the seal untouched."""
+    from benchmarks import live_canary_certified as canary
+
+    h32 = "ab" * 16
+    raw_cases = (
+        "evil/planner_version = plannerV2",
+        "evil[planner_version] = plannerV2",
+        "evil.planner_version = plannerV2",
+        '{"otp":"(plannerV2)"}',
+        '{"day": "(plannerV2)"}',
+        '{"plan": {"otp": "(plannerV2)"}}',
+        '{"summary": "{\\"otp\\": \\"(plannerV2)\\"}"}',
+        'service Digest username="user", bad="unterminated, response=deadbeef',
+        f'service Digest username="user", bad="unterminated, response={h32}',
+        f'service Digest username="user", bad="unterminated, response="{h32}"',
+        'service Digest username="user", bad=@, response=deadbeef',
+    )
+    for raw in raw_cases:
+        masked = canary._desensitize(raw)
+        assert masked != raw, "producer must mask the credential"
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r36b63",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # The documented structural positives survive the seal untouched and both
+    # finals accept them.
+    for raw in (
+        '{"planner_version":"plannerV2"}',
+        '{"planner_version": "(plannerV2)"}',
+        '{"plan": {"planner_version": "plannerV2"}}',
+        "plan.planner_version = plannerV2",
+        '{"summary":"tokenizationV1"}',
+        '{"summary": "see (tokenizationV1)"}',
+        "plannerV2 providerV4",
+        "access is granted to plannerV2 users",
+    ):
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked
+        assert "plannerV2" in masked or "tokenizationV1" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r36b63",
+            tested_sha="9" * 40,
+        )
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )

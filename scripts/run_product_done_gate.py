@@ -60,7 +60,9 @@ from tripchord._secret_redact import (
     _is_registered_base_key_token,
     _is_whole_header_prose,
     _mask_bare_credential_text,
+    _mask_digest_credential_text,
     _normalize_for_scan,
+    _registered_base_value_exempt_at_path,
     bounded_json_mask,
     iter_json_levels,
     json_loads_no_dupes,
@@ -1312,6 +1314,76 @@ def _reject_credential_field_names(data: bytes, label: str, name: str) -> None:
         ) from None
 
 
+def _reject_unbound_registered_base_values(
+    data: bytes, label: str, name: str
+) -> None:
+    """Fail closed when a JSON evidence artifact carries an EXACT registered
+    business-identifier base as a string VALUE at a member path the documented
+    business-value registry does not grant (R36 Block 61).
+
+    ``{"otp": "plannerV2"}`` — a version-marker base at an unbound field — and
+    ``{"planner_version": "providerV4"}`` — a cross-field value — are
+    credential-shaped regardless of the field NAME; only the exact
+    ``_DOCUMENTED_BUSINESS_VALUE_PATHS`` paths (``planner_version`` /
+    ``plan.planner_version`` / ``summary`` …) with the matching base grant the
+    exemption.  The walk is the same BOUNDED-RECURSIVE one used for credential
+    field names, over EVERY DECODED JSON level — a base smuggled through a
+    ``json.dumps`` value fails closed at the decoded path, not the wrapping
+    ``summary`` field.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return  # not UTF-8 text; the byte/pattern scan still applies
+    try:
+        for level_text, depth, malformed in iter_json_levels(text):
+            # A malformed NESTED level (a truncated / obfuscated JSON-string
+            # attempt hiding a credential) fails closed; a non-JSON TOP-LEVEL is
+            # not a JSON artifact and passes through to the byte/pattern scan
+            # and the schema check, exactly like a non-JSON file.
+            if malformed and depth >= 1:
+                raise GateStateChangedError(
+                    f"secret leak: malformed nested JSON in {label} file {name}"
+                )
+            try:
+                parsed = json_loads_no_dupes(level_text)
+            except DuplicateJsonKeyError:
+                raise GateStateChangedError(
+                    f"secret leak: duplicate JSON object key in {label} file {name}"
+                ) from None
+            except ValueError:
+                continue  # not JSON text at this level; the pattern scan applies
+            if not isinstance(parsed, (dict, list)):
+                continue
+            stack: list[tuple[Any, tuple[str, ...]]] = [(parsed, ())]
+            while stack:
+                node, path = stack.pop()
+                if isinstance(node, dict):
+                    for key, value in node.items():
+                        if not isinstance(key, str):
+                            continue
+                        child_path = (*path, key)
+                        if isinstance(value, str):
+                            if not _registered_base_value_exempt_at_path(
+                                child_path, value
+                            ):
+                                raise GateStateChangedError(
+                                    f"secret leak: registered business base "
+                                    f"value at unbound field path {child_path!r} "
+                                    f"in {label} file {name}"
+                                )
+                        elif isinstance(value, (dict, list)):
+                            stack.append((value, child_path))
+                elif isinstance(node, list):
+                    for item in node:
+                        if isinstance(item, (dict, list)):
+                            stack.append((item, (*path, "[]")))
+    except RecursiveJsonBudgetError:
+        raise GateStateChangedError(
+            f"secret leak: nested JSON budget exceeded in {label} file {name}"
+        ) from None
+
+
 def _check_unknown_64hex(
     value: str,
     path: tuple[str | None, ...],
@@ -1831,6 +1903,11 @@ def _secret_scan_bytes(
     # unicode-escape-obfuscated top-level JSON attempt could hide a credential.
     if credential_field_check or name.endswith(".json"):
         _reject_malformed_top_level_json(data, label, name)
+        # R36 Block 61: an exact registered business-identifier base at a
+        # non-documented JSON member path fails closed on BOTH finals — the
+        # ``.failure.json`` (cfc=False) producer artifact and the structured
+        # evidence file (cfc=True) alike.
+        _reject_unbound_registered_base_values(data, label, name)
     if credential_field_check:
         _reject_credential_field_names(data, label, name)
         _reject_unknown_64hex_values(data, label, name)
@@ -2433,6 +2510,12 @@ def _canary_diag_mask_level(value: str) -> str:
     )
     value = _redact_output(value)
     value = _CANARY_DIAG_WHOLE_HEADER_RE.sub("[REDACTED]", value)
+    # R36 Block 62 consumer half: mirror the producer — mask the WHOLE real
+    # Digest credential descriptor BEFORE the token-run shape, so the 32+ hex
+    # response is not pre-collapsed and the span builder can still see it.  The
+    # ``username=`` identity params and the ``bad=…`` malformed tail then fail
+    # closed together with the response instead of surviving the sanitizer.
+    value = _mask_digest_credential_text(value)
     value = _CANARY_DIAG_TOKEN_RUN_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_AKIA_RE.sub("[REDACTED]", value)
     value = _CANARY_DIAG_PREFIX_TOKEN_RE.sub("[REDACTED]", value)

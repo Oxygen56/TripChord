@@ -36,6 +36,7 @@ from tripchord._secret_redact import (
     CREDENTIAL_FIELD_NAME_PATTERN,
     PatternScope,
     _mask_bare_credential_text,
+    _mask_digest_credential_text,
     bounded_json_mask,
     mask_normalized_spans,
     registry_pattern,
@@ -364,6 +365,16 @@ def _desensitize_level(text: str) -> str:
         marker="[REDACTED]",
     )
     text = _CANARY_DIAG_WHOLE_HEADER_RE.sub("[REDACTED]", text)
+    # R36 Block 62 producer half: mask the WHOLE real Digest credential
+    # descriptor BEFORE the token-shape chain — the 32+ hex response would
+    # otherwise be collapsed to ``[REDACTED]`` here first, and the span builder
+    # (which only accepts a real 16/32/64-hex response) would no longer see it,
+    # leaving the ``username=`` identity params and the ``bad=…`` malformed tail
+    # to survive the seal.  Masking the descriptor whole while the hex is still
+    # visible fails the credential closed on the producer side too (R33 Block 56 /
+    # R36 Block 62); the call inside ``_mask_bare_credential_text`` below is then
+    # a no-op on the already-masked marker.
+    text = _mask_digest_credential_text(text)
     text = _TOKEN_SHAPE_RE.sub("[REDACTED]", text)
     text = _CANARY_DIAG_AKIA_RE.sub("[REDACTED]", text)
     text = _CANARY_DIAG_PREFIX_TOKEN_RE.sub("[REDACTED]", text)

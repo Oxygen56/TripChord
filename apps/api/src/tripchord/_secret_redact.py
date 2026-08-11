@@ -775,6 +775,45 @@ def _is_digest_identity_params(params: dict[str, list[str]]) -> bool:
     return any(_DIGEST_IDENTITY_PARAM_RE.match(name) for name in params)
 
 
+# R36 Block 62: a REAL Digest response credential inside a MALFORMED member —
+# an unterminated quoted-string swallowed the ``response=<hex>`` that followed
+# it (``service Digest username="user", bad="unterminated, response=<32hex>``),
+# so the raw member body must be re-checked for the credential before the
+# syntax error can hide it.  The value is a genuine 16+ hex run — the same
+# lengths the response credential accepts — with complete boundaries, so
+# ``response=abc`` prose or a hex run inside a longer token never matches.
+_DIGEST_RESPONSE_HEX_RE = re.compile(
+    r"(?i)(?:^|[^\w])response[ \t]*=[ \t]*(?P<token>[^\s,]+)"
+)
+
+
+def _digest_malformed_response_hex(text: str, start: int, end: int) -> bool:
+    """R36 Block 64: a ``response=<value>`` buried in a malformed Digest member
+    — after an unterminated quoted-string or a non-token value — is a credential
+    iff the value, once a surrounding quote pair is stripped, is a NON-EMPTY
+    hex run: the SAME determination the normal parse makes on a parsed response
+    value (``_HEX_FULL_RE.fullmatch``).  The old ``{16,}`` threshold lowered the
+    gate (an 8-hex response hidden behind an unclosed quote ACCEPTED) and
+    ignored a quoted response (``response="<32hex>"``) entirely; both are now
+    detected and fail closed.  ``response=abc`` prose, an empty value, or a hex
+    prefix of a longer non-hex token (``response=deadbeefxyz``) are not
+    credentials — matching the normal parse exactly."""
+    for m in _DIGEST_RESPONSE_HEX_RE.finditer(text, start, end):
+        tok = m.group("token")
+        # R36 Block 64: the quote pair is often torn by the member boundary
+        # (``response="deadbeef`` — the closing quote was swallowed / never
+        # written) or JSON-escaped; strip a leading and/or trailing quote
+        # independently so tail damage never erases the hex, then apply the
+        # SAME any-non-empty-hex determination as the normal parse.
+        if tok.startswith(("\"", "'")):
+            tok = tok[1:]
+        if tok.endswith(("\"", "'")):
+            tok = tok[:-1]
+        if _HEX_FULL_RE.fullmatch(tok.strip()):
+            return True
+    return False
+
+
 class _DigestAuthScan:
     """Structural Digest-auth recognizer (R27 Block 45).  Exposes the same
     ``.search(text)`` surface as a compiled pattern so the registry and the
@@ -803,7 +842,7 @@ class _DigestAuthScan:
 
     def _parse_digest_auth_params(
         self, text: str, end: int
-    ) -> tuple[dict[str, list[str]], int] | None:
+    ) -> tuple[dict[str, list[str]], int, bool] | None:
         """Parse the comma-separated ``name=value`` list that must directly
         follow the keyword (at ``end``) by RFC 7235 / RFC 7230 token and
         quoted-string grammar (R33 Block 56).  ``None`` when the text is not a
@@ -812,12 +851,25 @@ class _DigestAuthScan:
         narration (``algorithm=md5 response=<hex>``) parses only the first pair
         and stays accepted, while ``username="use\\"r", foo*=bar, response=<hex>``
         parses every pair including the real ``response`` credential.  Returns
-        ``(params, index_after_last_pair)`` — the caller masks the whole
-        descriptor span (R33 Block 56 producer side).  R34 Block 58: EVERY
+        ``(params, span_end, malformed_response_hex)`` — ``span_end`` is the
+        index the producer masks through (R33 Block 56 producer side), and the
+        third element is True when a MALFORMED member's body carried a real
+        ``response=<hex>`` credential (an unterminated quoted-string swallowed
+        it), so the caller can still fail closed.  R34 Block 58: EVERY
         occurrence of a duplicated parameter name is preserved in insertion
         order (``dict[str, list[str]]``), never overwritten — the caller checks
         ALL ``response`` values, so ``response=<32hex>, response=xyz`` and its
-        reverse fail closed identically."""
+        reverse fail closed identically.
+
+        R36 Block 62 (incremental fail-closed): a malformed member — an
+        unterminated quoted-string or a non-token value (``bad=@``) — is a
+        syntax ERROR, not a list terminator.  It contributes nothing but
+        preserves every already-parsed pair, so a real response hex parsed
+        BEFORE it is never dropped (``response=<hex>, bad="unterminated``
+        rejects); a real response inside the malformed member itself
+        (``bad="unterminated, response=<hex>``) is flagged via
+        ``malformed_response_hex`` and the span extends to cover the swallowed
+        body, so the producer masks it whole."""
         i = end
         n = len(text)
         # A real Digest header has OWS after the scheme; require at least one
@@ -825,6 +877,7 @@ class _DigestAuthScan:
         if i >= n or text[i] not in " \t":
             return None
         params: dict[str, list[str]] = {}
+        malformed_response_hex = False
         while True:
             while i < n and text[i] in " \t":
                 i += 1
@@ -845,7 +898,7 @@ class _DigestAuthScan:
                 # narration (``algorithm=md5 response=<hex>``) parses only the
                 # first pair and stays accepted.  Without a real pair this is
                 # not a Digest parameter list at all.
-                if not params:
+                if not params and not malformed_response_hex:
                     return None
                 break
             name = m.group(0).lower()
@@ -878,14 +931,59 @@ class _DigestAuthScan:
                 # JSON ``\X`` escapes are consumed as literal characters, so a
                 # real response AFTER a quoted value that itself contains an
                 # escaped quote is still parsed (``username="use\\"r", response=…``).
+                value_start = i
                 parsed = self._parse_digest_quoted_value(text, i)
                 if parsed is None:
-                    return None
+                    # R36 Block 62: an UNTERMINATED quoted-string swallows
+                    # everything to the end of the line — including a real
+                    # ``response=<hex>`` that followed it.  Record the
+                    # credential in the malformed member body, extend the span
+                    # to cover the swallowed body, and stop: nothing after the
+                    # unclosed quote can be parsed as a new pair.
+                    region_end = text.find("\n", i)
+                    if region_end == -1:
+                        region_end = n
+                    if _digest_malformed_response_hex(text, i, region_end):
+                        malformed_response_hex = True
+                    i = region_end
+                    break
                 val, i = parsed
+                # R36 Block 64: a TERMINATED quoted value can still tear a
+                # ``response=<hex>`` binding — ``bad="unterminated, response="
+                # <32hex>"`` — the closing quote cuts the member short and the
+                # quoted hex dangles after it.  When the value text itself
+                # contains a ``response=`` binding (a normal member value never
+                # does), re-scan the line from the opening quote with the SAME
+                # any-non-empty-hex determination and extend the span to cover
+                # the swallowed tail, so the credential is not erased by the
+                # early closing quote.  A value without ``response=`` (e.g.
+                # ``algorithm="md5", response=<hex>``) stays untouched and the
+                # algorithm-description positive is preserved.
+                if re.search(r"(?i)response[ \t]*=", val):
+                    line_end = text.find("\n", value_start)
+                    if line_end == -1:
+                        line_end = n
+                    if _digest_malformed_response_hex(text, value_start, line_end):
+                        malformed_response_hex = True
+                        i = line_end
             else:
                 m = _DIGEST_TOKEN_RE.match(text, i)
                 if m is None:
-                    return None
+                    # R36 Block 62: a non-token value (``bad=@``) is a
+                    # malformed member, not a list terminator — preserve every
+                    # already-parsed pair and continue after the comma.  The
+                    # member body (to the next comma) is re-checked for a real
+                    # ``response=<hex>`` credential.
+                    region_end = text.find(",", i)
+                    if region_end == -1:
+                        region_end = n
+                    if _digest_malformed_response_hex(text, i, region_end):
+                        malformed_response_hex = True
+                    i = region_end
+                    if i >= n:
+                        break
+                    i += 1  # consume the comma
+                    continue
                 val = m.group(0)
                 i = m.end()
             # R34 Block 58: keep EVERY duplicate — the old ``params[name] = val``
@@ -901,7 +999,7 @@ class _DigestAuthScan:
                 i += 1
                 continue
             break
-        return params, i
+        return params, i, malformed_response_hex
 
     @staticmethod
     def _parse_digest_quoted_value(text: str, i: int) -> tuple[str, int] | None:
@@ -947,18 +1045,21 @@ class _DigestAuthScan:
             parsed = self._parse_digest_auth_params(text, m.end())
             if parsed is None:
                 continue
-            params, end = parsed
-            responses = params.get("response")
-            if not responses:
-                continue
-            # R34 Block 58: ANY real response credential hex (16/32/64) in ANY
-            # position fails closed — the dict preserves every duplicate, so a
-            # hex credential is never hidden behind a later ``response=xyz``
-            # overwrite.
-            if not any(_HEX_FULL_RE.fullmatch(r.strip()) for r in responses):
+            params, end, malformed_response_hex = parsed
+            responses = params.get("response") or []
+            # R34 Block 58 / R36 Block 62: ANY real response credential hex
+            # (16/32/64) in ANY position fails closed — the dict preserves every
+            # duplicate, so a hex credential is never hidden behind a later
+            # ``response=xyz`` overwrite — and a real response swallowed by a
+            # malformed member (``bad="unterminated, response=<hex>``) is a
+            # credential too.
+            if not (
+                malformed_response_hex
+                or any(_HEX_FULL_RE.fullmatch(r.strip()) for r in responses)
+            ):
                 continue
             if binding == "descriptor":
-                if _is_digest_identity_params(params):
+                if _is_digest_identity_params(params) or malformed_response_hex:
                     spans.append((m.start(), end))
                     continue
                 if "algorithm" in params:
@@ -974,13 +1075,16 @@ class _DigestAuthScan:
             parsed = self._parse_digest_auth_params(text, m.end())
             if parsed is None:
                 continue
-            params, _end = parsed
-            responses = params.get("response")
-            if not responses:
-                continue
+            params, _end, malformed_response_hex = parsed
+            responses = params.get("response") or []
             # R34 Block 58: same any-hex-any-position rule as the span builder —
             # a real response credential in ANY duplicate position fails closed.
-            if not any(_HEX_FULL_RE.fullmatch(r.strip()) for r in responses):
+            # R36 Block 62: a real response swallowed by a malformed member is
+            # the same credential signal.
+            if not (
+                malformed_response_hex
+                or any(_HEX_FULL_RE.fullmatch(r.strip()) for r in responses)
+            ):
                 continue
             # R28 Block 49: a descriptor-prefixed digest is a credential EXCEPT
             # when it is a pure algorithm description — ``client digest
@@ -995,7 +1099,11 @@ class _DigestAuthScan:
             # and must fail closed (恢复描述符上下文 Digest 任意 hex 拒绝, 含仅
             # response= 无身份参数形态).
             if binding == "descriptor":
-                if _is_digest_identity_params(params):
+                # R36 Block 62: a real response swallowed by a malformed member
+                # is a credential even without an identity param — the syntax
+                # error cannot hide it behind the algorithm-description
+                # exception.
+                if _is_digest_identity_params(params) or malformed_response_hex:
                     return m
                 if "algorithm" in params:
                     continue
@@ -1540,6 +1648,96 @@ _REGISTERED_BASE_TOKEN_IN_VALUE_RE = re.compile(
     r"(?:V[0-9]+|[0-9]+)(?![A-Za-z0-9_])"
 )
 
+# R36 Block 61: the exact registered-base VALUE form parser — a business
+# identifier value is ``<base><V<digits>|<digits>>`` (``plannerV2`` /
+# ``flightOption1``), matched on the WHOLE value with complete boundaries so a
+# phrase (``plannerV2 providerV4``) or a non-base token (``qwerTy1``) is not an
+# exact base value.  Returns ``(base_lower, is_version_form)`` or ``None``.
+_REGISTERED_BASE_VALUE_RE = re.compile(
+    r"(?i)^(?P<base>(?:" + _REGISTERED_BASE_ALT + r"))"
+    r"(?P<suffix>V[0-9]+|[0-9]+)$"
+)
+
+
+def _registered_base_value_info(value: str) -> tuple[str, bool] | None:
+    """Resolve ``value`` to ``(base_lower, is_version_form)`` when it is an
+    EXACT registered base value.  R36 Block 63: a balanced ``(...)`` /
+    ``'...'`` / ``"..."`` wrapper around the exact base (``{"otp":
+    "(plannerV2)"}`` — a JSON string or prose parenthetical wrapping the
+    value) is unwrapped before the match, so an UNBOUND path carrying a
+    wrapped exact base still fails closed instead of reading as a non-base
+    phrase.  Mismatched wrappers (``(plannerV2"``) and phrases that merely
+    mention a base (``"see (tokenizationV1)"``) are unchanged and stay
+    non-credentials."""
+    v = value.strip()
+    while len(v) >= 2 and v[0] in "\"'(":
+        opener, closer = v[0], v[-1]
+        pair = {"\"": "\"", "'": "'", "(": ")"}[opener]
+        if closer != pair:
+            break
+        v = v[1:-1].strip()
+    m = _REGISTERED_BASE_VALUE_RE.match(v)
+    if m is None:
+        return None
+    return m.group("base").lower(), m.group("suffix").startswith("V")
+
+
+# R36 Block 61: the exact JSON member-key PATHS where a registered business
+# identifier is the DOCUMENTED value position.  Path keys are the exact
+# member-key path tuple (a list index collapses to the ``[]`` placeholder); the
+# value is the closed set of base names allowed at that path.  The
+# version-marker schema fields (``planner_version`` = ``plannerV2`` …,
+# optionally under the documented ``plan.`` prefix) and the free-form
+# diagnostic fields (``summary`` / ``detail`` / ``reason``) are documented; the
+# index/selector/counter fields (``plan.day`` / ``plan.flight_option`` /
+# ``plan.hotel_amenity`` / ``plan.booking_reference`` /
+# ``oauth.refresh_token_count``) are NOT — R27 Block 43 fail-closes them even
+# at the VALUE position of their own declared schema field (``{"day":
+# "day2"}``).  The R35 prefix regex (``[\w\u4e00-\u9fff.-]*``) that let
+# ``evilplanner_version`` / ``foo.planner_version`` reach the exemption is gone
+# — a member key is matched COMPLETE, so only the exact documented paths grant
+# the exemption (``evilplanner_version`` is the full field name, never a
+# prefix-stripped ``planner_version``).
+_DOCUMENTED_BUSINESS_VALUE_PATHS: dict[tuple[str, ...], frozenset[str]] = {
+    # Free-form diagnostic fields carry version-marker business identifiers
+    # (R21 Block 25 / R27 Block 43 positives ``{"summary":
+    # "tokenizationV1"}``); an index/selector base inside them
+    # (``{"summary": "flightOption1 day2 plannerV2 providerV4"}``) still fails
+    # closed because the base is not in the allowed set.
+    ("summary",): frozenset(_VERSION_MARKER_BUSINESS_BASES),
+    ("detail",): frozenset(_VERSION_MARKER_BUSINESS_BASES),
+    ("reason",): frozenset(_VERSION_MARKER_BUSINESS_BASES),
+}
+for _base in sorted(_VERSION_MARKER_BUSINESS_BASES):
+    _version_field = _base + "_version"
+    _DOCUMENTED_BUSINESS_VALUE_PATHS[(_version_field,)] = frozenset((_base,))
+    _DOCUMENTED_BUSINESS_VALUE_PATHS[("plan", _version_field)] = frozenset(
+        (_base,)
+    )
+del _base, _version_field
+
+
+def _registered_base_value_exempt_at_path(
+    path: tuple[str, ...], value: str
+) -> bool:
+    """True when the exact registered-base ``value`` may sit at the JSON
+    member-key ``path`` without being a credential (R36 Block 61): either it is
+    not an exact registered-base value at all (a phrase / non-base token —
+    nothing to exempt), or the path is DOCUMENTED and its allowed base set
+    contains the value's base.  A base at any other path (``("otp",)`` +
+    ``plannerV2``), a cross-field value (``("planner_version",)`` +
+    ``providerV4``) and a fake-suffix field (``("evilplanner_version",)`` +
+    ``plannerV2``) all return False and fail closed."""
+    info = _registered_base_value_info(value)
+    if info is None:
+        return True
+    base, _is_version = info
+    allowed = _DOCUMENTED_BUSINESS_VALUE_PATHS.get(path)
+    if allowed is None:
+        return False
+    return base in allowed
+
+
 # R35 Block 59: the free-text business-identifier exemption (a registered base
 # like ``plannerV2`` in a VALUE position) is bound to the DOCUMENTED structured
 # schema/field paths — the version-marker fields ``plan.planner_version`` /
@@ -1552,38 +1750,37 @@ _REGISTERED_BASE_TOKEN_IN_VALUE_RE = re.compile(
 # list is involved (supervision Block 59: 禁止继续补 head/modifier/CJK 词表或语言
 # 样例).  The designation semantic class cannot name a new synonym, so the
 # closure is STRUCTURAL: a bind operator + an EXACT registered-base value, with
-# the surrounding ``"`` quotes a JSON field (``{"planner_version":
-# "plannerV2"}``) tolerated.  ``access is granted to plannerV2 users`` (value is
-# a phrase, not the exact base) and a bare ``plannerV2 providerV4`` run (no bind
-# operator) stay exempt — only the exact-value assignment is a credential.
+# the surrounding ``"`` / ``'`` / ``(`` wrappers a JSON field or prose
+# parenthetical uses (``{"planner_version": "plannerV2"}`` /
+# ``verification code is 'plannerV2'`` / ``verification code is (plannerV2)``)
+# tolerated — R36 Block 61 extends the wrapper class from ``\"?`` to all three.
+# ``access is granted to plannerV2 users`` (value is a phrase, not the exact
+# base) and a bare ``plannerV2 providerV4`` run (no bind operator) stay exempt
+# — only the exact-value assignment is a credential.
 _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_\u4e00-\u9fff])"
-    r"(?:[\w\u4e00-\u9fff][\w\u4e00-\u9fff.-]*?)"
+    r"(?P<field>[\w\u4e00-\u9fff/\[\]][\w\u4e00-\u9fff./\[\]-]*)"
     r"[ \t]*(?:" + _CREDENTIAL_NARRATION_BIND_OP + r")[ \t]*"
-    r"\"?((?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+))\"?"
+    r"(?:[\"'(])?"
+    r"(?P<value>(?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+))"
+    r"(?:[\"')])?"
     r"(?![A-Za-z0-9_\u4e00-\u9fff])"
 )
-# R35 Block 59: the DOCUMENTED structured version-marker field assignment — the
-# auditable value position the free-text exemption is bound to.  The field name
-# is DERIVED from the closed ``_VERSION_MARKER_BUSINESS_BASES`` registry
-# (``<base>_version`` = ``planner_version`` / ``provider_version`` /
-# ``tokenization_version`` / ``secretariat_version``), optionally under a dotted
-# path prefix (``plan.planner_version``); the value is the matching
-# version-marker base.  A match here is NOT a credential-narration assignment —
-# it is the documented schema field whose VALUE position the exemption grants.
-_DOCUMENTED_VERSION_FIELD_ASSIGN_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_\u4e00-\u9fff])"
-    r"(?:[\w\u4e00-\u9fff.-]*[ \t]*)?"
-    r"(?:"
-    + "|".join(
-        re.escape(base) + r"_version"
-        for base in sorted(_VERSION_MARKER_BUSINESS_BASES, key=len, reverse=True)
-    )
-    + r")"
-    r"[ \t]*(?:" + _CREDENTIAL_NARRATION_BIND_OP + r")[ \t]*"
-    r"\"?((?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+))\"?"
-    r"(?![A-Za-z0-9_\u4e00-\u9fff])"
-)
+
+
+def _documented_version_field_exempt(m: re.Match[str]) -> bool:
+    """True when the exact-registered-base assignment ``m`` (R35 Block 59 / R36
+    Block 61) binds at a DOCUMENTED business-value field path.  The field name
+    is the exact member-key path derived from the closed
+    ``_DOCUMENTED_BUSINESS_VALUE_PATHS`` registry (``planner_version`` /
+    ``plan.planner_version`` / ``summary`` …) with COMPLETE member-key boundary
+    matching — ``evilplanner_version`` is the field ``evilplanner_version``,
+    never a prefix-stripped ``planner_version`` (R36 fake-suffix), and the
+    value base must be in the path's allowed set (``planner_version =
+    providerV4`` is a cross-field value, not exempt)."""
+    field = m.group("field").strip()
+    path = tuple(part.strip().lower() for part in field.split("."))
+    return _registered_base_value_exempt_at_path(path, m.group("value"))
 
 
 def _credential_narration_binds(text: str) -> bool:
@@ -1600,14 +1797,19 @@ def _credential_narration_binds(text: str) -> bool:
     name binding an EXACT registered base (``OTP code is plannerV2`` /
     ``验证码是plannerV2`` / ``口令内容是plannerV2``) is credential-style narration
     at an unbound path and fails closed with NO new designation word; the only
-    exempted assignment is the documented version-marker field path
+    exempted assignment is the documented business-value field path
     (``planner_version = plannerV2`` / ``plan.planner_version = plannerV2``), the
-    auditable schema path the business-identifier exemption is bound to."""
+    auditable schema path the business-identifier exemption is bound to.  R36
+    Block 61: the exemption is a FUNCTIONAL member-key + base-set check against
+    ``_DOCUMENTED_BUSINESS_VALUE_PATHS`` (the R35 ``<base>_version`` prefix regex
+    is gone) — the wrapper forms ``'plannerV2'`` / ``(plannerV2)`` bind too, and
+    a fake-suffix field (``evilplanner_version = plannerV2``) or a cross-field
+    value (``planner_version = providerV4``) is NOT exempt."""
     for m in _CREDENTIAL_NARRATION_ASSIGN_RE.finditer(text):
         if _REGISTERED_BASE_TOKEN_IN_VALUE_RE.search(m.group("value")):
             return True
     for m in _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE.finditer(text):
-        if _DOCUMENTED_VERSION_FIELD_ASSIGN_RE.search(m.group(0)):
+        if _documented_version_field_exempt(m):
             continue
         return True
     return False
@@ -2214,24 +2416,18 @@ def bounded_json_mask(
         return apply_mask_level(current)
 
     def mask_structure(parsed: Any, level_depth: int) -> Any:
-        """Iteratively rebuild ``parsed`` with every nested JSON-string value
-        masked.  The SAME hard budgets cover the JSON STRUCTURE itself
-        (C-122 supervision 07:29 gap 1): every dict/list/scalar node counts
-        toward the node cap and the container nesting depth is capped, so a
-        fan-out empty-dict, a 20000-primitive list or a pathologically deep
-        object fails closed instead of relying on Python's recursion limit.
-        The rebuild is an explicit stack with ``finalize`` markers — never
-        Python recursion."""
         nonlocal budget_nodes, budget_chars
         root_slot: dict[str, Any] = {"__out__": None}
-        # Work item: ("value", node, container, key, struct_depth) masks
+        # Work item: ("value", node, container, key, struct_depth, path) masks
         # ``node`` into ``container[key]``; ("finalize", built, container,
-        # key, struct_depth) commits an already-built container.
-        stack: list[tuple[str, Any, Any, Any, int]] = [
-            ("value", parsed, root_slot, "__out__", 0)
+        # key, struct_depth, path) commits an already-built container.  ``path``
+        # is the exact member-key path of ``node`` (a list index collapses to
+        # the ``[]`` placeholder).
+        stack: list[tuple[str, Any, Any, Any, int, tuple[str, ...]]] = [
+            ("value", parsed, root_slot, "__out__", 0, ())
         ]
         while stack:
-            kind, node, container, key, struct_depth = stack.pop()
+            kind, node, container, key, struct_depth, path = stack.pop()
             if kind == "finalize":
                 container[key] = node
                 continue
@@ -2244,7 +2440,9 @@ def bounded_json_mask(
                 raise RecursiveJsonBudgetError("JSON mask node budget exceeded")
             if isinstance(node, dict):
                 out: dict[str, Any] = {}
-                stack.append(("finalize", out, container, key, struct_depth))
+                stack.append(
+                    ("finalize", out, container, key, struct_depth, path)
+                )
                 for k, v in node.items():
                     # The object MEMBER KEY counts as a node (C-122 supervision
                     # 00:06 要求 A) — a 20000-member object fails closed on its
@@ -2258,38 +2456,57 @@ def bounded_json_mask(
                         # A credential FIELD NAME in a structured JSON key is
                         # masked WHOLE (name + value): the key AND the value
                         # both collapse to the marker, so a ``Session_token`` /
-                        # full-width ``\uff33\uff45\uff53\uff53\uff49\uff4f\uff4e
-# \uff3f\uff54\uff4f\uff4b\uff45\uff4e`` key and its
+                        # full-width ``Session_token`` key and its
                         # payload can never survive into the rebuilt artifact
                         # while the JSON stays valid (C-122 supervision 09:00
                         # gap 2: a cookie value ``a=b`` is not itself a
                         # credential SHAPE, so the value is masked by policy,
                         # not by shape — ``{"[REDACTED]": "[REDACTED]"}``).
                         out[marker] = marker
-                    elif isinstance(v, str):
-                        out[k] = mask_text(v, level_depth + 1)
-                    elif isinstance(v, (dict, list)):
-                        stack.append(
-                            ("value", v, out, k, struct_depth + 1)
-                        )
                     else:
-                        budget_nodes += 1
-                        if budget_nodes > _MAX_JSON_SCAN_NODES:
-                            raise RecursiveJsonBudgetError(
-                                "JSON mask node budget exceeded"
+                        child_path = path + ((k,) if isinstance(k, str) else ("",))
+                        if isinstance(v, str):
+                            # R36 Block 61: an EXACT registered business base
+                            # in a string VALUE at a member path the documented
+                            # business-value registry does not grant
+                            # (``{"otp": "plannerV2"}``) is masked WHOLE — the
+                            # producer / consumer must not seal an unbound
+                            # business value the finals reject.  A documented
+                            # path (``{"planner_version": "plannerV2"}`` /
+                            # ``{"summary": "tokenizationV1"}``) is left to the
+                            # normal level masker and survives.
+                            if _registered_base_value_exempt_at_path(
+                                child_path, v
+                            ):
+                                out[k] = mask_text(v, level_depth + 1)
+                            else:
+                                out[k] = marker
+                        elif isinstance(v, (dict, list)):
+                            stack.append(
+                                ("value", v, out, k, struct_depth + 1, child_path)
                             )
-                        out[k] = v
+                        else:
+                            budget_nodes += 1
+                            if budget_nodes > _MAX_JSON_SCAN_NODES:
+                                raise RecursiveJsonBudgetError(
+                                    "JSON mask node budget exceeded"
+                                )
+                            out[k] = v
             elif isinstance(node, list):
                 out_list: list[Any] = [None] * len(node)
                 stack.append(
-                    ("finalize", out_list, container, key, struct_depth)
+                    ("finalize", out_list, container, key, struct_depth, path)
                 )
                 for i, item in enumerate(node):
                     if isinstance(item, str):
-                        out_list[i] = mask_text(item, level_depth + 1)
+                        child_path = (*path, "[]")
+                        if _registered_base_value_exempt_at_path(child_path, item):
+                            out_list[i] = mask_text(item, level_depth + 1)
+                        else:
+                            out_list[i] = marker
                     elif isinstance(item, (dict, list)):
                         stack.append(
-                            ("value", item, out_list, i, struct_depth + 1)
+                            ("value", item, out_list, i, struct_depth + 1, (*path, "[]"))
                         )
                     else:
                         budget_nodes += 1
