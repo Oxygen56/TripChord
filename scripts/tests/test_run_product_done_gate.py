@@ -5003,6 +5003,76 @@ def test_layer6_lease_preflight_passes_on_clean_live_state(
     assert result.passed is True
 
 
+def test_clean_env_run_defaults_durable_runtime_to_temp_and_leaves_live_files_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-122 round-27 Block 46 counter-example: a clean-env pytest run must
+    default the durable DB and bridge-state to a TEMP path so the LIVE
+    ``ROOT/tripchord.db`` and ``ROOT/.runtime/browser-bridge-state.json`` are
+    never opened or written.
+
+    The session-scoped conftest fixture (``_isolate_runtime_persistence``)
+    redirects ``TRIPCHORD_DATABASE_URL`` and
+    ``TRIPCHORD_BROWSER_BRIDGE_STATE_PATH`` to a session temp dir for the WHOLE
+    run — this test asserts that redirection is active, then snapshots the live
+    files (bytes + mtime), builds a clean temp DB + bridge-state exactly as a
+    clean-env entry point does, and runs the exact preflight operations against
+    those temp paths.  Both live files must be byte/mtime invariant, and the
+    preflights must bind to (and succeed against) the temp paths, never the
+    live ones.
+    """
+    live_db = gate.ROOT / "tripchord.db"
+    live_bridge = gate.ROOT / ".runtime" / "browser-bridge-state.json"
+
+    def snapshot(path: Path) -> tuple[bytes, int] | None:
+        if not path.is_file():
+            return None
+        return path.read_bytes(), path.stat().st_mtime_ns
+
+    before_db = snapshot(live_db)
+    before_bridge = snapshot(live_bridge)
+
+    # The session isolation fixture is active: the durable paths resolve to a
+    # TEMP location, never ROOT (the live files a real gate run would touch).
+    assert gate._resolve_live_state_db() != live_db
+    assert gate._resolve_bridge_state_path() != live_bridge
+
+    # A clean-env run creates its OWN clean temp DB + bridge-state and runs the
+    # preflights against those temp paths.  Prove the preflights SUCCEED on the
+    # clean temp state (so the isolation evidence is not vacuous).
+    probe_db = tmp_path / "clean-run.db"
+    probe_bridge = tmp_path / "clean-run-bridge-state.json"
+    _make_jobs_db(probe_db, [])
+    probe_bridge.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-11T00:00:00+00:00",
+                "tasks": [],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # The clean-env entry (run_tests_clean_env._isolate_runtime_persistence)
+    # points TRIPCHORD_DATABASE_URL / TRIPCHORD_BROWSER_BRIDGE_STATE_PATH at the
+    # temp paths; the gate's resolvers bind to them and the preflights succeed.
+    monkeypatch.setenv("TRIPCHORD_DATABASE_URL", f"sqlite+aiosqlite:///{probe_db}")
+    monkeypatch.setenv("TRIPCHORD_BROWSER_BRIDGE_STATE_PATH", str(probe_bridge))
+    assert gate._resolve_live_state_db() == probe_db
+    assert gate._resolve_bridge_state_path() == probe_bridge
+    assert gate._live_state_lease_preflight(probe_db) == []
+    assert gate._bridge_state_lease_preflight(probe_bridge) == []
+
+    # After the run, the live files are byte/mtime invariant.
+    assert snapshot(live_db) == before_db, "live tripchord.db was modified"
+    assert snapshot(live_bridge) == before_bridge, (
+        "live .runtime/browser-bridge-state.json was modified"
+    )
+
+
 def test_secret_scan_fails_closed_on_token_in_evidence(
     monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path
 ) -> None:
@@ -13402,22 +13472,23 @@ def test_r23_block34_sensitive_header_any_nonempty_value_both_paths() -> None:
 
 
 def test_r23_block35_digest_real_header_structural_both_paths() -> None:
-    """C-122 round-23 Block 35 (as amended by round-24 Block 38 and round-26
-    Block 42): the Digest recognizer STRUCTURALLY parses the real Digest header
-    — the keyword must bind to a REAL Authorization/Proxy-Authorization field
-    colon, a STANDALONE structural position (line/value start, ``,;{}[]"'\\``
-    delimiter), or a REAL reverse-proxy descriptor noun (``upstream``/``origin``
-    /``backend``/``gateway``/``proxy``/``remote``/``peer``/``server``/``client``)
-    followed by whitespace, and the auth-parameter list is a COMMA-SEPARATED
-    grammar ending in ``response=<hex>``.  ``Authorization: Digest
+    """C-122 round-23 Block 35 (as amended by rounds 24/26 and REWRITTEN by
+    round-27 Block 45): the Digest recognizer STRUCTURALLY parses the real
+    Digest header — the R26 descriptor/parameter word lists (``upstream|
+    origin|…`` / ``username|realm|…``) and the R24 descriptor-NOUN rule are
+    deleted.  The keyword binds to a REAL Authorization/Proxy-Authorization
+    field colon, a STANDALONE structural position (line/value start,
+    ``,;{}[]"'\\`` delimiter), or a DESCRIPTOR context that ALSO carries the
+    request-identity parameter ``username``/``userhash``; the auth-parameter
+    list is a COMMA-SEPARATED ``name=value`` grammar (ANY legal param name,
+    ending in a pure-hex ``response=``).  ``Authorization: Digest
     username="user", response=<64hex>`` / ``Proxy-Authorization: …``, a bare
-    ``Digest response=<64hex>``, and a proxy-descriptor ``upstream Digest
-    username="user", response=<16|32|64hex>`` REJECT on BOTH finals — ANY hex
-    length (16/32/64) is a credential, base64 validity is irrelevant.  The
-    space-separated narration ``model result: digest algorithm=md5
-    response=<32hex>`` (a plain colon, not an authorization field) and the
-    narration ``model digest algorithm=md5 response=<32hex>`` / ``model digest
-    calculation response=<32hex>`` (a non-descriptor noun, not a proxy) stay
+    ``Digest response=<64hex>``, and ``upstream``/``origin``/…/``service``/
+    ``notice``/``model`` ``Digest username="user", response=<16|32|64hex>``
+    (identity + request-digest) REJECT on BOTH finals; ``client digest
+    algorithm=md5, response=<32hex>`` (an algorithm description without an
+    identity param) and the space-squashed narrations (``model digest
+    algorithm=md5 response=…`` / ``model digest calculation response=…``) stay
     accepted."""
     h64 = "ab" * 32
     for raw in (
@@ -13437,6 +13508,20 @@ def test_r23_block35_digest_real_header_structural_both_paths() -> None:
         "gateway Digest username=\"user\", response=" + "c" * 64,
         "backend Digest username=\"user\", response=" + "d" * 16,
         '{"summary": "upstream Digest username=\\"user\\", response=' + "e" * 32 + '"}',
+        # R27 Block 45: the request-IDENTITY parameter (username/userhash) makes
+        # ANY descriptor context a credential — ``service`` (never in the old
+        # descriptor word list) and ``userhash=true`` (never in the old param
+        # word list) fail closed, and the R24 business-narration ``notice`` case
+        # is corrected: it carries the identity params + request-digest, so it
+        # is real credential structure, not prose.
+        "service Digest username=\"user\", response=" + "a" * 16,
+        '{"summary": "service Digest username=\\"user\\", response=' + "a" * 16 + '"}',
+        "upstream Digest username=\"user\", userhash=true, response=" + h64,
+        '{"summary": "upstream Digest username=\\"user\\", userhash=true, response='
+        + h64
+        + '"}',
+        "notice Digest username=\"user\", response=" + "a" * 32,
+        '{"summary": "notice Digest username=\\"user\\", response=' + "a" * 32 + '"}',
     ):
         with pytest.raises(gate.GateStateChangedError):
             gate._secret_scan_bytes(
@@ -13463,11 +13548,15 @@ def test_r23_block35_digest_real_header_structural_both_paths() -> None:
         "the model digest algorithm=md5 response=" + "a" * 32,
         "digest algorithm=md5 response=" + "a" * 32,
         "model digest calculation response=" + "a" * 32,
-        # R26 Block 42: non-descriptor nouns (model/notice/the/…) are business
-        # narration, never a credential header — only the real reverse-proxy
-        # descriptor set is a credential context (see the REJECT loop above).
         "the model digest algorithm=md5 response=" + "a" * 32,
-        "notice Digest username=\"user\", response=" + "a" * 32,
+        # R27 Block 45: a comma-separated Digest parameter list that carries NO
+        # request-identity param (username/userhash) is an ALGORITHM description
+        # (``client digest algorithm=md5, response=…`` / ``model digest
+        # algorithm=md5, response=…``), not a credential — accepted on both
+        # finals, matching the review's exact positive.
+        "client digest algorithm=md5, response=" + "a" * 32,
+        '{"summary": "client digest algorithm=md5, response=' + "a" * 32 + '"}',
+        "model digest algorithm=md5, response=" + "a" * 32,
     ):
         gate._secret_scan_bytes(
             raw.encode(),
@@ -13691,11 +13780,15 @@ def test_r24_block37_dictionary_verified_business_identifiers_both_paths() -> No
 
 
 def test_r24_block38_digest_binds_auth_field_or_standalone_both_paths() -> None:
-    """C-122 round-24 Block 38: the Digest recognizer no longer fires on a
-    DESCRIPTOR-noun prefix — ``model Digest username="user", response=<64hex>``
-    and ``notice Digest …`` are business narration and ACCEPT on BOTH finals,
-    while the REAL ``Authorization`` / ``Proxy-Authorization`` Digest header
-    and a standalone ``Digest response=<64hex>`` still REJECT."""
+    """C-122 round-24 Block 38 (REVISED by round-27 Block 45): the R24 rule that
+    a DESCRIPTOR-noun prefix means business narration is deleted — it was a word
+    list and failed open on real credential structure.  A descriptor-prefixed
+    ``model Digest username="user", response=<64hex>`` / ``notice Digest …``
+    carries the request-identity params + request-digest and REJECTS on BOTH
+    finals, exactly like the real ``Authorization`` / ``Proxy-Authorization``
+    header and a standalone ``Digest response=<64hex>``.  Business narration
+    WITHOUT an identity param (``model digest algorithm=md5, response=<32hex>``)
+    stays accepted."""
     h64 = "ab" * 32
     for raw in (
         "model Digest username=\"user\", response=" + h64,
@@ -13703,20 +13796,22 @@ def test_r24_block38_digest_binds_auth_field_or_standalone_both_paths() -> None:
         "notice Digest username=\"user\", response=" + h64,
         '{"summary": "notice Digest username=\\"user\\", response=' + h64 + '"}',
     ):
-        gate._secret_scan_bytes(
-            raw.encode(),
-            gate._SecretNeedles(()),
-            "evidence",
-            "ev.json",
-            credential_field_check=True,
-        )
-        gate._secret_scan_bytes(
-            raw.encode(),
-            gate._SecretNeedles(()),
-            "evidence",
-            "live-canary-certified.json.failure.json",
-            credential_field_check=False,
-        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
     for raw in (
         "Authorization: Digest username=\"user\", response=" + h64,
         '{"summary": "Authorization: Digest username=\\"user\\", response=' + h64 + '"}',
@@ -13741,6 +13836,186 @@ def test_r24_block38_digest_binds_auth_field_or_standalone_both_paths() -> None:
                 "live-canary-certified.json.failure.json",
                 credential_field_check=False,
             )
+    # R27 Block 45: an algorithm description without a request-identity param is
+    # business narration and stays accepted on both finals.
+    for raw in (
+        "client digest algorithm=md5, response=" + "a" * 32,
+        '{"summary": "client digest algorithm=md5, response=' + "a" * 32 + '"}',
+        "model digest algorithm=md5, response=" + "a" * 32,
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r27_block43_registered_base_context_binding_both_paths() -> None:
+    """C-122 round-27 Block 43: the registered business-identifier BASE list is
+    an exemption bound to the DOCUMENTED schema/field-path VALUE position — never
+    a global allowlist.  A registered base in a credential-NARRATION context
+    (``password is flightOption1`` / ``the password was plannerV2``), a bare
+    free-text run of registered bases in the WRONG schema form (``day1 planner1
+    provider9`` — version bases without their ``V``), a registered base used as a
+    JSON object KEY (``{"day1": …}`` / ``{"plannerV2": …}`` /
+    ``{"flightOption1": …}``) and a registered base used as a HEADER / free-form
+    field NAME (``day1: …`` / ``X-Day1: …`` / ``plannerV2: …`` / ``my_day1: …``)
+    all fail closed on BOTH finals.  The documented business identifiers
+    (``flightOption1 day2 plannerV2 providerV4`` / ``refreshTokenCount1`` /
+    ``tokenizationV1`` / ``secretariatV1``) and the plain documented schema field
+    names (``day`` / ``flight_option`` / ``planner_version``) stay accepted."""
+    for raw in (
+        # credential-NARRATION context
+        "password is flightOption1",
+        '{"summary": "password is flightOption1"}',
+        "the password was plannerV2",
+        '{"summary": "the password was plannerV2"}',
+        # bare free-text run of registered bases — version bases missing their V
+        "day1 planner1 provider9",
+        '{"summary": "day1 planner1 provider9"}',
+        # registered base as a JSON object KEY
+        '{"day1": "x"}',
+        '{"plannerV2": "x"}',
+        '{"flightOption1": "x"}',
+        '{"refreshTokenCount1": "x"}',
+        '{"tokenizationV1": "x"}',
+        # registered base as a HEADER / free-form field NAME
+        "day1: foo",
+        "X-Day1: foo",
+        "plannerV2: foo",
+        "my_day1: foo",
+        '{"summary": "day1: foo"}',
+    ):
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in (
+        # documented business identifiers in their schema VALUE form
+        '{"summary": "flightOption1 day2 plannerV2 providerV4"}',
+        '{"summary": "flightOption12"}',
+        '{"summary": "tokenizationV1"}',
+        '{"summary": "secretariatV1"}',
+        "refreshTokenCount1",
+        '{"summary": "refreshTokenCount1"}',
+        # documented schema field NAMES are not registered-base tokens
+        '{"day": "2"}',
+        '{"day": "day2"}',
+        '{"planner_version": "plannerV2"}',
+        '{"flight_option": "flightOption1"}',
+        '{"hotel_amenity": "hotelAmenity3"}',
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r27_block43_full_chain_producer_seal_consumer_both_finals(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-27 Block 43 full chain: the registered-business-base
+    exemption is VALUE-position-bound, so a context leak is NOT producible away.
+    The narration forms (``password is flightOption1`` / ``the password was
+    plannerV2``) and the wrong-form bare run (``day1 planner1 provider9``) are
+    masked by the producer's ``_desensitize`` before the 0600 seal — the sealed
+    diagnostic is clean and BOTH finals accept it, while the RAW value still
+    fails BOTH finals (defense in depth).  The JSON-key and header forms
+    (``{"day1": "x"}`` / ``day1: foo`` / ``X-Day1: foo``) are INVISIBLE to the
+    value masker (a registered base is a business token wherever it appears), so
+    the sealed diagnostic still carries the context form and the final-scan
+    backstop REJECTS it on BOTH finals — a producer cannot exempt a base from
+    its schema/field-path binding by hiding it in a summary.  The documented
+    business identifiers survive the 0600 seal and BOTH finals accepted."""
+    from benchmarks import live_canary_certified as canary
+
+    def seal(message: str) -> Path:
+        output = tmp_path / "live-canary-certified.json"
+        return canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(message),
+            output,
+            run_id="r27block43",
+            tested_sha="13d76ae" + "0" * 33,
+        )
+
+    def scan(data: bytes, name: str, cfc: bool) -> None:
+        gate._secret_scan_bytes(
+            data,
+            gate._SecretNeedles(()),
+            "evidence",
+            name,
+            credential_field_check=cfc,
+        )
+
+    # Narration / wrong-form bare run: the producer MASKS them, so the sealed
+    # diagnostic is clean and BOTH finals pass; the RAW value still fails BOTH
+    # finals (defense in depth — a producer that skips sanitizing is caught).
+    for raw in ("password is flightOption1", "the password was plannerV2",
+                "day1 planner1 provider9"):
+        masked = canary._desensitize(raw)
+        assert masked != raw, "producer must mask the narration / wrong-form run"
+        diag = seal(masked)
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        scan(diag.read_bytes(), "live-canary-certified.json.failure.json", False)
+        scan(diag.read_bytes(), "ev.json", True)
+        with pytest.raises(gate.GateStateChangedError):
+            scan(raw.encode(), "ev.json", True)
+        with pytest.raises(gate.GateStateChangedError):
+            scan(raw.encode(), "live-canary-certified.json.failure.json", False)
+    # JSON-key / header forms: the value masker leaves a registered base in a
+    # non-value position untouched, so the sealed diagnostic still carries the
+    # context leak and the final-scan backstop REJECTS it on BOTH finals.
+    for raw in ('{"day1": "x"}', "day1: foo", "X-Day1: foo"):
+        assert raw == canary._desensitize(raw)
+        diag = seal(raw)
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        with pytest.raises(gate.GateStateChangedError):
+            scan(diag.read_bytes(), "live-canary-certified.json.failure.json", False)
+        with pytest.raises(gate.GateStateChangedError):
+            scan(diag.read_bytes(), "ev.json", True)
+    # Documented business identifiers survive producer + 0600 seal + BOTH finals.
+    for business in (
+        "flightOption1 day2 plannerV2 providerV4",
+        "refreshTokenCount1",
+        "tokenizationV1",
+    ):
+        assert business == canary._desensitize(business)
+        diag = seal(business)
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        scan(diag.read_bytes(), "live-canary-certified.json.failure.json", False)
+        scan(diag.read_bytes(), "ev.json", True)
 
 
 def test_r24_full_chain_producer_seal_consumer_final_block36_37_both_paths(

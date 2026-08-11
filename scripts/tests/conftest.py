@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterator
 
 import pytest
 
@@ -55,3 +56,30 @@ def _clear_secret_env() -> None:
             os.environ.pop(name, None)
         else:
             os.environ[name] = value
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_runtime_persistence(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
+    """R27 Block 46: a test session never touches the LIVE durable runtime
+    files.  The gate's live-state SQLite preflight defaults to
+    ``ROOT/tripchord.db`` and the bridge-state lease preflight defaults to
+    ``ROOT/.runtime/browser-bridge-state.json``; a clean-env pytest run must
+    default BOTH to a temporary path instead, so the live files are never
+    opened or written (their bytes + mtime stay invariant across the run).  A
+    session-scoped temp dir is created once and shared by every test; an
+    explicit caller override (a test that sets ``TRIPCHORD_DATABASE_URL`` /
+    ``TRIPCHORD_BROWSER_BRIDGE_STATE_PATH`` via monkeypatch) still wins for the
+    duration of that test.
+    """
+    tmp = tmp_path_factory.mktemp("tripchord-runtime-isolation")
+    os.environ[
+        "TRIPCHORD_DATABASE_URL"
+    ] = f"sqlite+aiosqlite:///{tmp / 'tripchord-test.db'}"
+    os.environ[
+        "TRIPCHORD_BROWSER_BRIDGE_STATE_PATH"
+    ] = str(tmp / "browser-bridge-state.json")
+    yield
+    os.environ.pop("TRIPCHORD_DATABASE_URL", None)
+    os.environ.pop("TRIPCHORD_BROWSER_BRIDGE_STATE_PATH", None)

@@ -586,12 +586,15 @@ def _is_whole_header_prose(value: str) -> bool:
     * an invalid-base64 payload that is NOT a proven multi-word English phrase
       (``Basic ab extra`` / ``Basic abc extra`` / lone ``ab`` / ``abc``) —
       never prose (R23 Block 34);
-    * otherwise every Basic payload is non-credential prose -> prose
+    * otherwise a Basic payload is non-credential prose ONLY when the payload
+      plus any trailing text is a proven 2+ word English phrase
       (``authorization: Basic is required`` — trailing text after a
       non-decodable ``is`` forms the phrase ``is required``;
       ``authorization: Basic auth/setting`` — a decodable body whose bytes are
-      binary junk with no ``:`` and a low printable-byte ratio, so prose even
-      at the value end).
+      binary junk yet the payload itself is the two-word phrase
+      ``auth/setting``).  A non-prose body — including a bare non-UTF-8
+      payload at the value end (``Basic AP9h`` / ``Basic /0H//w==``) — fails
+      closed (R27 Block 44).
     """
     if len(list(_HEADER_FIELD_NAME_RE.finditer(value))) != 1:
         return False
@@ -623,9 +626,13 @@ def _is_basic_payload_prose(bm: re.Match[str], value: str) -> bool:
     * an invalid-base64 payload is prose only when the payload plus any
       trailing text is a proven 2+ word English phrase (``is required``);
       ``ab``/``abc``/``ab extra``/``abc extra`` fail closed;
-    * anything else — a binary junk body (``Basic auth/setting`` decodes to
-      non-UTF-8 bytes, no ``:``, low printable ratio, at least one printable
-      byte) — is prose.
+    * a decodable binary-junk body (``Basic auth/setting`` — non-UTF-8 bytes,
+      no ``:``, not pure binary, low printable ratio) is prose ONLY when the
+      payload plus any trailing text is a proven 2+ word English phrase
+      (``auth/setting``); a non-prose binary body (``Basic AP9h`` ->
+      ``\x00\xffa``, ``Basic /0H//w==`` -> ``\xffA\xff\x0d``) fails closed (R27
+      Block 44 — a base64-valid but non-UTF-8 payload is never prose by
+      itself).
     """
     payload = bm.group("payload")
     if _is_valid_basic_payload(payload):
@@ -647,8 +654,14 @@ def _is_basic_payload_prose(bm: re.Match[str], value: str) -> bool:
             return False
         if decoded and printable / len(decoded) >= 0.5:
             return False
+        # R27 Block 44: a decodable binary body is prose ONLY when the payload
+        # plus any trailing text is a proven 2+ word English phrase.  The old
+        # ``rest == ""`` shortcut let a bare non-UTF-8 body (``Basic AP9h`` ->
+        # ``\x00\xffa``, ``Basic /0H//w==`` -> ``\xffA\xff\x0d``) pass as prose
+        # at the value end — a non-UTF-8 sensitive header value must fail
+        # closed on BOTH finals.
         rest = value[bm.end():].strip()
-        return rest == "" or _is_english_prose_phrase(payload + " " + rest)
+        return _is_english_prose_phrase(payload + " " + rest)
     # Invalid base64: the payload (plus trailing text) must be a proven English
     # phrase; a lone short token is a placeholder credential.
     if len(payload) < 2 and not value[bm.end():].strip():
@@ -699,58 +712,153 @@ _WHOLE_HEADER_SCAN = _WholeHeaderScan()
 # ``_secret_scan_bytes`` / ``_scan_decoded_string_value`` (R20 Block 20a).  A
 # server challenge (``WWW-Authenticate: Digest realm=…, nonce=…``) carries no
 # ``response=`` and stays allowed.
-_SHAPE_PATTERN_DIGEST_AUTH_RE = re.compile(
-    # R21 Block 25: the ``Digest`` auth ``response`` hex credential is bound to
-    # the REAL Digest-auth field context — the keyword must either be followed
-    # by at least one auth parameter (``Digest username="user", response=…``)
-    # or immediately by ``response=`` (a bare ``Digest response=<hex>`` value).
-    # Prose like ``model digest calculation response=<32hex>`` — a noun
-    # ``digest`` with a plain word between it and ``response=`` — no longer
-    # matches (business positive preserved), while a real Digest header /
-    # decoded value still fails closed on both FINAL scans.
-    #
-    # R22 Block 32: the leading guard is a FIELD-POSITION guard, not any
-    # non-alphanumeric — ``digest`` must sit at a line/value start, after a
-    # structural delimiter (``,;{}[]"'\\`` or a real authorization-field
-    # colon).  ``result:`` is a plain colon, not an authorization field, so a
-    # business sentence ``model result: digest algorithm=md5 response=<hex>``
-    # no longer matches (business positive preserved).
-    #
-    # R23 Block 35: the auth-parameter list is a COMMA-SEPARATED grammar — an
-    # optional ``username``/``realm``/… parameter list followed by a final
-    # comma then ``response=<hex>`` — never a space-squashed ``algorithm=md5
-    # response=``.  ``digest algorithm=md5 response=…`` (space-separated prose
-    # narration) is preserved.
-    #
-    # R24 Block 38: the R23 DESCRIPTOR-NOUN guard (``(?<![A-Za-z0-9_-])
-    # [a-z][a-z0-9-]*[ \t]+``) is REMOVED — it fired on ANY preceding noun, so
-    # business narration ``model Digest username="user", response=<64hex>`` /
-    # ``notice Digest …`` was misrejected as a credential header.  ``Digest``
-    # now binds ONLY to the real Authorization/Proxy-Authorization field colon
-    # or a STANDALONE structural position (line/value start or after a
-    # ``,;{}[]"'\\`` delimiter) — a descriptor-word prefix means the text is a
-    # model/business narrative, never a credential header.
-    #
-    # R26 Block 42: the descriptor guard is RESTORED but narrowed to REAL
-    # header-context descriptors — network-entity words that sit in front of an
-    # actual upstream/origin HTTP header block in a server log (``upstream
-    # Digest username="user", response=<64hex>``).  These are bound to a real
-    # credential-header context and REJECT, while the business-narration
-    # descriptors (``model`` / ``notice`` / ``the`` / ``result``) stay out and
-    # remain accepted.  The hex length is ANY 16-128 run, so ``response=<16/32/
-    # 64hex>`` all fail closed the same way.
-    r"(?i)(?:^|[\r\n,;{}\[\]\"'\\]|"
-    r"(?:authorization|proxy-authorization)[ \t]*:[ \t]*|"
-    r"(?<![A-Za-z0-9_-])(?:upstream|origin|backend|gateway|proxy|remote|peer|"
-    r"server|client)[ \t]+)digest\b(?:"
-    r"[ \t]+response\s*=\s*[\"']?[0-9a-f]{16,128}"
-    r"|[ \t]+(?:username|realm|nonce|uri|qop|nc|cnonce|opaque|algorithm|"
-    r"stale|domain)\s*=\s*(?:[\"'][^\"']{0,80}[\"']|[^,\r\n]{1,80})"
-    r"(?:[ \t]*,[ \t]*(?:username|realm|nonce|uri|qop|nc|cnonce|opaque|"
-    r"algorithm|stale|domain)\s*=\s*(?:[\"'][^\"']{0,80}[\"']|[^,\r\n]{1,80}))*"
-    r"[ \t]*,[ \t]*response\s*=\s*[\"']?[0-9a-f]{16,128}"
-    r")"
+#
+# R27 Block 45: the recognizer is rewritten from the R26 descriptor/parameter
+# FIXED WORD LISTS to REAL RFC 7616 structure parsing — the review forbids
+# descriptor word lists, parameter word lists, punctuation or length special
+# cases.  A Digest credential now requires
+#   * a syntactically real comma-separated ``name=value`` parameter list whose
+#     names are ANY legal RFC 7230 token identifier (never a fixed set —
+#     ``userhash``/``nc``/``uri``/… all parse), with the keyword DIRECTLY
+#     followed by ``name=value`` (never a space-squashed narration);
+#   * a ``response`` parameter whose (quote-stripped) value is a pure hex run —
+#     the per-request request-digest (ANY hex length, no ``{16,128}`` bound);
+#   * a binding that is a REAL Authorization/Proxy-Authorization field colon, a
+#     STANDALONE structural position, or a DESCRIPTOR context that also carries
+#     the request-IDENTITY parameters ``username`` / ``userhash``.  The identity
+#     params are the only structural signal that names the credential HOLDER
+#     rather than describing a digest algorithm, so ``service Digest
+#     username="user", response=<16hex>`` and ``upstream Digest username="user",
+#     userhash=true, response=<64hex>`` fail closed while ``client digest
+#     algorithm=md5, response=<32hex>`` (an algorithm description, no identity)
+#     stays accepted — the review's exact trilemma.
+#
+# R27 semantic correction to R24 Block 38: the R24 rule that ANY descriptor-noun
+# prefix (``model``/``notice``/``the``…) is business narration is DELETED — it
+# was a word list and it failed open on real credential structure.  A
+# descriptor-prefixed ``Digest username="user", response=<hex>`` carries the
+# identity + request-digest and fails closed, exactly like ``service``/
+# ``upstream``; the surviving business positives are the ones WITHOUT a real
+# ``username=…, response=<hex>`` structure.
+_DIGEST_AUTH_KEYWORD_RE = re.compile(r"(?i)digest\b")
+# A ``name=value`` pair value: a quoted run (with the optional backslash-escape
+# a Digest header inside JSON string text uses — ``username=\"user\"``) or an
+# unquoted run that stops at a comma / ``;`` (a bare ``response=<hex>;``) / a
+# quote char (the closing ``"`` of a JSON-wrapped header).  No length bounds:
+# a 256+ hex response is still a credential.
+_DIGEST_AUTH_QUOTED_VALUE = r"\\*[\"'][^\"']*\\*[\"']"
+_DIGEST_AUTH_UNQUOTED_VALUE = r"[^,\r\n;\"']+"
+_DIGEST_AUTH_PAIR_BODY = (
+    r"[A-Za-z][A-Za-z0-9_-]*[ \t]*=[ \t]*(?:"
+    + _DIGEST_AUTH_QUOTED_VALUE
+    + r"|"
+    + _DIGEST_AUTH_UNQUOTED_VALUE
+    + r")"
 )
+_DIGEST_AUTH_BLOCK_RE = re.compile(
+    r"[ \t]+(?P<params>"
+    + _DIGEST_AUTH_PAIR_BODY
+    + r"(?:[ \t]*,[ \t]*"
+    + _DIGEST_AUTH_PAIR_BODY
+    + r")*)"
+)
+_DIGEST_AUTH_PARAM_PAIR_RE = re.compile(
+    r"(?i)(?P<name>[A-Za-z][A-Za-z0-9_-]*)[ \t]*=[ \t]*(?P<value>"
+    + _DIGEST_AUTH_QUOTED_VALUE
+    + r"|"
+    + _DIGEST_AUTH_UNQUOTED_VALUE
+    + r")"
+)
+_HEX_FULL_RE = re.compile(r"(?i)[0-9a-f]+")
+
+
+def _strip_digest_value_quotes(value: str) -> str:
+    """Strip one layer of surrounding quotes — and the backslash-escape a
+    Digest header inside JSON string text uses (``\"user\"`` -> ``user``).
+    A bare token passes through unchanged."""
+    for _ in range(2):
+        if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+            value = value[1:-1]
+        elif (
+            len(value) >= 3
+            and value[0] == "\\"
+            and value[1] in "\"'"
+            and value[-1] == value[1]
+        ):
+            value = value[2:-1]
+        else:
+            break
+    return value
+
+
+class _DigestAuthScan:
+    """Structural Digest-auth recognizer (R27 Block 45).  Exposes the same
+    ``.search(text)`` surface as a compiled pattern so the registry and the
+    gate's RAW-text scan (``run_product_done_gate.py``) work unchanged; the
+    gate only truth-tests the result."""
+
+    _FIELD_RE = re.compile(r"(?i)(?:authorization|proxy-authorization)[ \t]*:[ \t]*$")
+    _STANDALONE_RE = re.compile(r"(?:^|[\r\n,;{}\[\]\"'\\])[ \t]*$")
+
+    def _classify_digest_binding(self, text: str, start: int) -> str:
+        """The context immediately before the ``digest`` keyword: ``field`` (a
+        real Authorization/Proxy-Authorization field colon), ``standalone``
+        (line/value start or a structural delimiter ``,;{}[]"'\\``), ``descriptor``
+        (a word character — the previous token is a noun), or ``none`` (a plain
+        colon/dot — business prose, never a header)."""
+        prefix = text[:start].rstrip()
+        if not prefix:
+            return "standalone"
+        if self._FIELD_RE.search(prefix):
+            return "field"
+        if self._STANDALONE_RE.search(prefix):
+            return "standalone"
+        if prefix[-1].isalnum() or prefix[-1] in "-_":
+            return "descriptor"
+        return "none"
+
+    def _parse_digest_auth_params(self, text: str, end: int) -> dict[str, str] | None:
+        """Parse the comma-separated ``name=value`` list that must directly
+        follow the keyword (at ``end``).  ``None`` when the text is not a
+        syntactic Digest parameter list."""
+        blk = _DIGEST_AUTH_BLOCK_RE.match(text, end)
+        if blk is None:
+            return None
+        params: dict[str, str] = {}
+        for pair in _DIGEST_AUTH_PARAM_PAIR_RE.finditer(blk.group("params")):
+            params[pair.group("name").lower()] = _strip_digest_value_quotes(
+                pair.group("value")
+            )
+        return params
+
+    def search(self, text: str) -> re.Match[str] | None:
+        for m in _DIGEST_AUTH_KEYWORD_RE.finditer(text):
+            binding = self._classify_digest_binding(text, m.start())
+            if binding == "none":
+                continue
+            params = self._parse_digest_auth_params(text, m.end())
+            if params is None:
+                continue
+            response = params.get("response")
+            if response is None:
+                continue
+            if not _HEX_FULL_RE.fullmatch(response.strip()):
+                continue
+            # A descriptor-prefixed digest is a credential ONLY when it carries
+            # a request-identity parameter: ``service Digest username=…`` /
+            # ``upstream … userhash=true`` fail closed, ``client digest
+            # algorithm=md5, response=…`` (no identity) stays accepted.
+            if binding == "descriptor" and not (
+                "username" in params or "userhash" in params
+            ):
+                continue
+            return m
+        return None
+
+
+# R27 Block 45: a scan object, not a compiled pattern — the registry entry and
+# the gate's ``.search()`` callers are unchanged.
+_SHAPE_PATTERN_DIGEST_AUTH_RE = _DigestAuthScan()
 
 # R20 Block 17: the redaction-marker RESIDUE — ``[REDACTED]`` immediately
 # followed by a credential character (``[REDACTED]mySuperSecret123`` in a
@@ -831,6 +939,85 @@ _BUSINESS_IDENTIFIER_BASES = frozenset(
     }
 )
 
+# R27 Block 43: a registered business base is exempted ONLY in the FORM its
+# schema field documents.  The version-marker fields (``plan.planner_version``
+# / ``plan.provider_version`` / ``plan.tokenization_version`` /
+# ``plan.secretariat_version``) carry a ``V<digits>`` version marker
+# (``plannerV2`` / ``providerV4`` / ``tokenizationV1`` / ``secretariatV1``);
+# the index/selector/counter fields (``plan.flight_option`` /
+# ``plan.hotel_amenity`` / ``plan.booking_reference`` /
+# ``oauth.refresh_token_count`` / ``plan.day``) carry a plain ``<digits>``
+# (``flightOption1`` / ``hotelAmenity3`` / ``bookingReference1`` /
+# ``refreshTokenCount1`` / ``day2``).  A registered base in the WRONG form — a
+# version base without its ``V`` (``planner1`` / ``provider9``) or an index
+# base with a ``V`` (``flightOptionV1``) — is NOT the documented schema value
+# and fails closed as a bare credential.
+_VERSION_MARKER_BUSINESS_BASES = frozenset(
+    {
+        # plan.planner_version — version marker (R24 Block 36)
+        "planner",
+        # plan.provider_version — version marker (R24 Block 36)
+        "provider",
+        # plan.tokenization_version — version marker (R23 Block 33)
+        "tokenization",
+        # plan.secretariat_version — version marker (R23 Block 33)
+        "secretariat",
+    }
+)
+
+# R27 Block 43: the camelCase shape regex above cannot see the ALL-LOWERCASE
+# registered bases (``day`` / ``planner`` / ``provider`` / ``tokenization`` /
+# ``secretariat`` — the base itself has no uppercase letter), so a free-text
+# run like ``day1 planner1 provider9`` was invisible to the bare-credential
+# scan and slipped through.  This recognizer matches ONLY those registered
+# all-lowercase bases followed by a ``<digits>`` or ``V<digits>`` suffix, so
+# the form validation in :func:`_is_bare_credential_token` can see them.  It
+# is the SAME closed auditable registry — no word list, no threshold.
+_REGISTERED_LOWER_BASE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:day|planner|provider|tokenization|secretariat)"
+    r"(?:V[0-9]+|[0-9]+)(?![A-Za-z0-9_])"
+)
+
+# R27 Block 43: credential-NARRATION words — a closed, auditable set of the
+# credential FIELD-NAME words (the STRONG names, mirroring
+# ``_CREDENTIAL_FIELD_STRONG_NAME_ALT``) whose whole-word presence in a
+# scanned value binds every registered business-identifier token in that value
+# to a credential-narration context (``password is flightOption1`` /
+# ``the password was plannerV2``) → fail closed.  Word-bounded, so a bare
+# ``token`` never matches inside ``refreshTokenCount1`` / ``tokenizationV1``.
+_CREDENTIAL_NARRATION_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?:password|passwd|secret|token|credentials?"
+    r"|api[_-]?key|access[_-]?key|session[_-]?key|private[_-]?key"
+    r"|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token"
+    r"|session[_-]?token|client[_-]?secret|secret[_-]?key"
+    r"|authorization|proxy[_-]?authorization|bearer|auth)(?![A-Za-z0-9_])"
+)
+
+
+def _is_business_identifier_token(token: str) -> bool:
+    """True when ``token`` is a REGISTERED TripChord business identifier in its
+    DOCUMENTED schema form (R27 Block 43): a version-marker base must carry its
+    ``V<digits>`` marker (``plannerV2`` / ``tokenizationV1``), an
+    index/selector/counter base must carry a plain ``<digits>``
+    (``flightOption1`` / ``day2`` / ``refreshTokenCount1``).  A token that is
+    not a registered base at all (``qwerTy1`` / ``myFlightHotel1``), or a
+    registered base in the wrong form (``planner1`` / ``provider9`` /
+    ``flightOptionV1``), is NOT a business identifier."""
+    if re.search(r"[0-9]+[A-Za-z]", token):
+        return False
+    m = re.match(r"^([A-Za-z]+)([0-9]+)$", token)
+    if m is None:
+        return False
+    prefix, _digits = m.group(1), m.group(2)
+    base = prefix[:-1] if prefix[-1] in "Vv" else prefix
+    if base not in _BUSINESS_IDENTIFIER_BASES:
+        return False
+    if base in _VERSION_MARKER_BUSINESS_BASES:
+        # version-marker base: valid only as ``baseV<digits>``
+        return prefix[-1] in "Vv" and prefix[:-1] == base
+    # index/selector/counter base: valid only as ``base<digits>``
+    return prefix[-1] not in "Vv"
+
 
 def _is_bare_credential_token(token: str) -> bool:
     """True when a camelCase-and-digit token is a BARE credential value — the
@@ -854,40 +1041,116 @@ def _is_bare_credential_token(token: str) -> bool:
     * a trailing-digit token whose base is EXACTLY a registered
       ``_BUSINESS_IDENTIFIER_BASES`` entry (``flightOption1`` /
       ``hotelAmenity3`` / ``bookingReference1`` / ``refreshTokenCount1`` /
-      ``day2``) is a business identifier;
+      ``day2``) is a business identifier — IN ITS DOCUMENTED SCHEMA FORM (R27
+      Block 43): a version-marker base must carry its ``V`` (``plannerV2``),
+      an index/selector/counter base must not (``planner1`` / ``provider9`` /
+      ``flightOptionV1`` fail closed);
     * ANY other digit-bearing camelCase token (``qwerTy1`` /
       ``myFlightHotel1`` / ``purpleMonkeyDishwasher1``) fails closed as a
       bare credential shape.
     """
     if re.search(r"[0-9]+[A-Za-z]", token):
         return True
-    m = re.match(r"^([A-Za-z]+)([0-9]+)$", token)
-    if m is None:
-        return False
-    prefix, _digits = m.group(1), m.group(2)
-    base = prefix[:-1] if prefix[-1] in "Vv" else prefix
-    # R26 Block 41: exact closed-registry match.  ``refreshTokenCount1`` is a
-    # registered business base; ``refreshTokenV1`` (base ``refreshToken``) and
-    # ``qwerTyV1`` / ``qwerTy1`` (base ``qwerTy``) are not registered and fail
-    # closed — the version branch judges by the SAME registry, so there is no
-    # asymmetric version exemption to exploit.
-    return base not in _BUSINESS_IDENTIFIER_BASES
+    return not _is_business_identifier_token(token)
 
 
 class _BareCredentialScan:
     """Final-scan ``bare_credential_value`` backstop as a drop-in ``.search``-able
-    object: iterates EVERY word-bounded camelCase-and-digit token and rejects it
-    via :func:`_is_bare_credential_token` (R22 Block 28/32 restore the any-digit
-    contract while keeping business values positive)."""
+    object: iterates EVERY word-bounded camelCase-and-digit token AND every
+    registered all-lowercase base token (``day2`` / ``planner1``) and rejects
+    it via :func:`_is_bare_credential_token` (R22 Block 28/32 restore the
+    any-digit contract while keeping business values positive).  R27 Block 43:
+    a registered business identifier is exempted ONLY outside a
+    credential-NARRATION context — any credential-narration word in the same
+    scanned value (``password is flightOption1``) fails the registered token
+    closed."""
 
     def search(self, text: str) -> re.Match[str] | None:
+        narration = _CREDENTIAL_NARRATION_RE.search(text) is not None
         for m in _BARE_CREDENTIAL_TOKEN_RE.finditer(text):
             if _is_bare_credential_token(m.group(0)):
+                return m
+            if narration:
+                return m
+        for m in _REGISTERED_LOWER_BASE_RE.finditer(text):
+            if _is_bare_credential_token(m.group(0)):
+                return m
+            if narration:
                 return m
         return None
 
 
 _SHAPE_PATTERN_BARE_CREDENTIAL_VALUE_RE = _BareCredentialScan()
+
+
+def _mask_bare_credential_text(text: str) -> str:
+    """R27 Block 43: the producer/consumer free-text bare-credential masker —
+    masks every camelCase-and-digit token and every registered all-lowercase
+    base token that is (a) NOT a registered business identifier in its
+    documented schema form (``qwerTy1`` / ``myFlightHotel1`` / ``planner1`` /
+    ``provider9``), or (b) a registered business identifier sitting in a
+    credential-NARRATION context (``password is flightOption1``).  Business
+    identifiers in their documented schema form with no narration
+    (``flightOption1 day2 plannerV2 providerV4`` / ``refreshTokenCount1`` /
+    ``day2``) are left untouched."""
+    narration = _CREDENTIAL_NARRATION_RE.search(text) is not None
+
+    def repl(m: re.Match[str]) -> str:
+        if _is_bare_credential_token(m.group(0)):
+            return "[REDACTED]"
+        if narration:
+            return "[REDACTED]"
+        return m.group(0)
+
+    masked = _BARE_CREDENTIAL_TOKEN_RE.sub(repl, text)
+    return _REGISTERED_LOWER_BASE_RE.sub(repl, masked)
+
+
+# R27 Block 43: a registered business-identifier BASE is a VALUE at a
+# documented schema/field-path (``plan.day`` = ``day2``,
+# ``plan.flight_option`` = ``flightOption1``), never a field NAME.  A
+# registered base used as a JSON object KEY or an HTTP/header field name
+# (``{"day1": …}`` / ``X-Day1: …`` / ``plannerV2: …``) is a credential-shaped
+# field with NO schema/field-path binding and must fail closed — the closed
+# registry grants the exemption only to the documented VALUE position
+# (supervision Block 43).  ``_REGISTERED_BASE_ALT`` is the same closed auditable
+# base set, longest-first so ``refreshTokenCount1`` never leaves a ``Token`` /
+# ``Count`` residue for a shorter base to steal.
+_REGISTERED_BASE_ALT = "|".join(
+    re.escape(base)
+    for base in sorted(_BUSINESS_IDENTIFIER_BASES, key=len, reverse=True)
+)
+# A registered base followed by its ``<digits>`` / ``V<digits>`` suffix, in ANY
+# digit form (``planner1`` is as credential-shaped a key as ``plannerV2``), at
+# a word boundary on both sides — case-insensitive so ``Day1`` / ``DAY1`` keys
+# are the same field name once NFKC + casefold runs.
+_REGISTERED_BASE_KEY_TOKEN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?:" + _REGISTERED_BASE_ALT + r")"
+    r"(?:V[0-9]+|[0-9]+)(?![A-Za-z0-9_])"
+)
+# A registered base used as a HEADER / free-form field NAME: the base is the
+# first name segment (optionally after an ``X-`` / ``Foo-`` / ``my_`` name
+# prefix), carries the ``<digits>``/``V<digits>`` suffix, then a ``:``/``=``
+# field separator.  ``day1: …`` / ``X-Day1: …`` / ``plannerV2: …`` are all
+# credential-shaped field names and fail closed on BOTH final paths; a plain
+# prose value (``day2`` / ``flightOption1 day2 plannerV2 providerV4``) has no
+# ``:``/``=`` after the base and stays positive.
+_REGISTERED_BASE_HEADER_FIELD_RE = re.compile(
+    r"(?im)(?:^|[ \t\r\n,;{}])[ \t]*(?:[A-Za-z0-9_-]+[ \t]*[-_][ \t]*)?"
+    r"(?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+)[ \t]*[:=]"
+)
+
+
+def _is_registered_base_key_token(key: str) -> bool:
+    """True when ``key`` is a REGISTERED business-identifier BASE token used as
+    a JSON object KEY (``day1`` / ``plannerV2`` / ``planner1`` /
+    ``flightOption1`` / ``refreshTokenCount1`` …), in ANY digit form — a base
+    in a key position is a credential-shaped field regardless of the schema
+    form its VALUE would need (R27 Block 43).  A plain documented schema field
+    name (``day`` / ``planner`` / ``flight_option`` / ``planner_version``) has
+    no registered suffix and returns False."""
+    return _REGISTERED_BASE_KEY_TOKEN_RE.search(key) is not None
+
 
 _S = PatternScope
 # ``FINAL_VALUE`` deliberately EXCLUDES the dotted-token, whole-header and

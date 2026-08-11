@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 _SECRET_ENV_RE = re.compile(
@@ -64,10 +65,29 @@ def _scrub_secrets(environ: dict[str, str]) -> dict[str, str]:
     return scrubbed
 
 
+def _isolate_runtime_persistence(environ: dict[str, str]) -> dict[str, str]:
+    """R27 Block 46: the clean-env test child must default the durable DB and
+    bridge-state to a TEMP path, never the live ``ROOT/tripchord.db`` or
+    ``ROOT/.runtime/browser-bridge-state.json``.  Returns a copy of ``environ``
+    with both re-pointed at a fresh temp dir.  An explicit caller override is
+    preserved (the env vars are only set when absent)."""
+    result = dict(environ)
+    tmp = tempfile.mkdtemp(prefix="tripchord-test-runtime-")
+    if "TRIPCHORD_DATABASE_URL" not in result:
+        result["TRIPCHORD_DATABASE_URL"] = (
+            f"sqlite+aiosqlite:///{tmp}/tripchord-test.db"
+        )
+    if "TRIPCHORD_BROWSER_BRIDGE_STATE_PATH" not in result:
+        result["TRIPCHORD_BROWSER_BRIDGE_STATE_PATH"] = os.path.join(
+            tmp, "browser-bridge-state.json"
+        )
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     scripts_tests = Path(__file__).resolve().parent
-    env = _scrub_secrets(dict(os.environ))
+    env = _isolate_runtime_persistence(_scrub_secrets(dict(os.environ)))
     cmd = [sys.executable, "-m", "pytest", str(scripts_tests), *args]
     result = subprocess.run(cmd, env=env)
     return result.returncode

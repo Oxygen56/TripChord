@@ -49,16 +49,17 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from tripchord._secret_redact import (
-    _BARE_CREDENTIAL_TOKEN_RE,
     _CREDENTIAL_FIELD_STRONG_NAME_ALT,
+    _REGISTERED_BASE_HEADER_FIELD_RE,
     _SHAPE_PATTERN_DIGEST_AUTH_RE,
     BARE_CREDENTIAL_FIELD_NAMES,
     CREDENTIAL_FIELD_NAME_PATTERN,
     DuplicateJsonKeyError,
     PatternScope,
     RecursiveJsonBudgetError,
-    _is_bare_credential_token,
+    _is_registered_base_key_token,
     _is_whole_header_prose,
+    _mask_bare_credential_text,
     _normalize_for_scan,
     bounded_json_mask,
     iter_json_levels,
@@ -1283,6 +1284,22 @@ def _reject_credential_field_names(data: bytes, label: str, name: str) -> None:
                                 f"secret leak: credential field name {key!r} in "
                                 f"{label} file {name}"
                             )
+                        # R27 Block 43: a REGISTERED business-identifier BASE
+                        # used as a JSON object KEY (``{"day1": …}`` /
+                        # ``{"plannerV2": …}`` / ``{"flightOption1": …}``) is a
+                        # credential-shaped field with NO schema/field-path
+                        # binding — the closed registry grants the exemption
+                        # only to the documented VALUE position, so the base as
+                        # a KEY fails closed on the raw AND normalized key
+                        # copies, whatever its value (a base-as-key has no
+                        # ``[REDACTED]`` clean-report form to exempt).
+                        if _is_registered_base_key_token(key) or (
+                            _is_registered_base_key_token(norm_key)
+                        ):
+                            raise GateStateChangedError(
+                                f"secret leak: registered business base as JSON "
+                                f"key {key!r} in {label} file {name}"
+                            )
                         if isinstance(value, (dict, list)):
                             stack.append(value)
                 elif isinstance(node, list):
@@ -1734,6 +1751,18 @@ def _scan_decoded_string_value(
             raise GateStateChangedError(
                 f"secret leak: {kind} in decoded value in {label} file {name}"
             )
+    # R27 Block 43: the same registered-base-as-header/field-name rule on a
+    # DECODED string value — a ``day1: …`` / ``X-Day1: …`` label inside a
+    # decoded JSON-string level is still a credential-shaped field name with no
+    # schema/field-path binding and fails closed on the raw AND normalized
+    # value copies.
+    if _REGISTERED_BASE_HEADER_FIELD_RE.search(
+        value_masked
+    ) or _REGISTERED_BASE_HEADER_FIELD_RE.search(value_norm):
+        raise GateStateChangedError(
+            f"secret leak: registered business base as header/field name in "
+            f"decoded value in {label} file {name}"
+        )
     for match in _TRACKING_URL_PATTERN.finditer(value_masked):
         if _is_tracking_url_leak(match.group(0)):
             raise GateStateChangedError(
@@ -1916,6 +1945,20 @@ def _secret_scan_bytes(
             raise GateStateChangedError(
                 f"secret leak: {kind} in {label} file {name}"
             )
+    # R27 Block 43: a REGISTERED business-identifier BASE used as a HEADER /
+    # free-form field NAME (``day1: …`` / ``X-Day1: …`` / ``plannerV2: …`` /
+    # ``my_day1: …``) is a credential-shaped field with no schema/field-path
+    # binding and fails closed on the raw AND normalized copies, on every
+    # artifact — the same field-name-signal class as the anchored shapes above.
+    # A plain prose value (``day2`` / ``flightOption1 day2 plannerV2
+    # providerV4``) has no ``:``/``=`` after the base and stays positive.
+    if _REGISTERED_BASE_HEADER_FIELD_RE.search(
+        anchored_text
+    ) or _REGISTERED_BASE_HEADER_FIELD_RE.search(anchored_norm):
+        raise GateStateChangedError(
+            f"secret leak: registered business base as header/field name "
+            f"in {label} file {name}"
+        )
     if is_utf8_text:
         for pattern, kind in _BARE_CREDENTIAL_PAIRS:
             if pattern.search(masked_text) or pattern.search(norm_masked):
@@ -2400,20 +2443,15 @@ def _canary_diag_mask_level(value: str) -> str:
     # the shared strong/weak boundary semantics (the credential_field line
     # below does the work).
     value = _CANARY_DIAG_CREDENTIAL_FIELD_RE.sub("[REDACTED]", value)
-    # C-122 round-26 Block 41: free-text UNKNOWN bare camelCase-and-digit
-    # values are masked by the CONSUMER too, mirroring the producer — the
-    # closed registered business-identifier bases survive
-    # (``flightOption1`` / ``refreshTokenCount1`` …), every other bare value
-    # (``qwerTy1`` / ``myFlightHotel1`` …) fails closed to ``[REDACTED]``
-    # before it can reach the committed report.
-    value = _BARE_CREDENTIAL_TOKEN_RE.sub(
-        lambda m: (
-            "[REDACTED]"
-            if _is_bare_credential_token(m.group(0))
-            else m.group(0)
-        ),
-        value,
-    )
+    # C-122 round-26 Block 41 + round-27 Block 43: free-text bare values are
+    # masked by the CONSUMER too, mirroring the producer — the closed
+    # registered business-identifier bases survive IN THEIR DOCUMENTED SCHEMA
+    # FORM (``flightOption1`` / ``refreshTokenCount1`` / ``plannerV2`` …),
+    # every other bare value (``qwerTy1`` / ``myFlightHotel1`` …) AND a
+    # registered base in the wrong schema form (``planner1`` / ``provider9``)
+    # or inside a credential-NARRATION context (``password is flightOption1``)
+    # fails closed to ``[REDACTED]`` before it can reach the committed report.
+    value = _mask_bare_credential_text(value)
     return value
 
 
