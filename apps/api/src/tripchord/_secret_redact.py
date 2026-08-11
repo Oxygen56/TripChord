@@ -1025,26 +1025,94 @@ _CREDENTIAL_DESIGNATION_ALT = (
     r"|auth[_-]?token|session[_-]?token|client[_-]?secret|secret[_-]?key"
     r"|authorization|proxy[_-]?authorization|bearer|auth)"
 )
-# R29 Block 51 / R30 Block 52 / R31 Block 53: the binding-operator arrow class
-# is CLOSED BY UNICODE ARROW BLOCK RANGE, not by glyph enumeration.  NFKC leaves
-# every arrow codepoint unchanged (⇒ U+21D2 / ⟶ U+27F6 / ⤳ U+2933 / ➔ U+2794 /
-# ⇛ U+21DB / ⭢ U+2B62 / 🡂 U+1F802 …), so normalizing the scanned text can never
-# collapse them — the operator set itself must accept ANY rightward arrow.  R29
-# listed 10 glyphs, R30 added the remaining four BMP arrow blocks + Dingbats, and
-# R31 review found the SIXTH arrow block (Supplemental Arrows-C U+1F800-U+1F8FF,
-# 33 rightward arrows) plus 8 scattered rightward codepoints (U+0362 / U+2348 /
-# U+1F4F2 / U+1F500-U+1F502 / U+1F51C / U+1FBB6) all escaping both finals.  The
-# class now closes ALL SIX arrow blocks (Arrows U+2190-U+21FF, Supplemental
-# Arrows-A U+27F0-U+27FF, Supplemental Arrows-B U+2900-U+297F, Dingbats U+2794-
-# U+27BF, Misc Symbols & Arrows U+2B00-U+2BFF, Supplemental Arrows-C U+1F800-
-# U+1F8FF) plus the 8 scattered codepoints.  Over-inclusion here only ever binds
-# (fail-closed) — a designation word + arrow + registered-base value is
-# credential narration regardless of which arrow glyph the author typed.
+# R29 Block 51 / R30 Block 52 / R31 Block 53 / R32 Block 54: the binding-operator
+# arrow class is CLOSED BY UNICODE ARROW BLOCK RANGE plus a principled
+# rightward-arrow FAMILY closure, not by glyph enumeration.  NFKC leaves every
+# arrow codepoint unchanged (=> U+21D2 / ⟶ U+27F6 / ⤳ U+2933 / ➔ U+2794 /
+# ⇛ U+21DB / ⭢ U+2B62 / 🡂 U+1F802 ...), so normalizing the scanned text can never
+# collapse them - the operator set itself must accept the whole family.  R29-R31
+# closed all SIX Unicode arrow blocks (Arrows U+2190-U+21FF, Supplemental Arrows-A
+# U+27F0-U+27FF, Supplemental Arrows-B U+2900-U+297F, Dingbats U+2794-U+27BF,
+# Misc Symbols & Arrows U+2B00-U+2BFF, Supplemental Arrows-C U+1F800-U+1F8FF) and
+# 8 scattered rightward codepoints (U+0362 / U+2348 / U+1F4F2 / U+1F500-U+1F502 /
+# U+1F51C / U+1FBB6), but Block 54 review found the closure was STILL a
+# reviewed-points enumeration: 17 same-family rightward/bidirectional
+# arrow/arrowhead codepoints OUTSIDE those blocks (U+02C3 / U+02F2 / U+034D /
+# U+0350 / U+0355 / U+0356 / U+08F8-U+08FD / U+1DFF / U+20D7 / U+20E1 / U+20EF /
+# U+29B3 / U+1F51B - combining marks, modifier letters, Arabic variants and an
+# enclosed bidirectional arrow) escaped both finals, e.g. U+0362 was closed while
+# same-block same-family U+034D / U+0350 stayed open.  The class now ALSO closes
+# the whole out-of-block rightward / bidirectional ARROW / ARROWHEAD family by
+# name semantics (:func:`_rightward_arrow_family_ranges`): any codepoint whose
+# Unicode name marks a RIGHT / RIGHTWARDS / LEFT-RIGHT arrow or arrowhead binds,
+# plus the Arabic arrowhead sub-family (U+08F7-U+08FD).  Over-inclusion here only
+# ever binds (fail-closed) - a designation word + arrow + registered-base value is
+# credential narration regardless of which arrow glyph the author typed; ordinary
+# RIGHT-POINTING symbols (triangles / quotes / brackets / magnifier: U+25B6-25BB,
+# U+23E9-23F5, U+00BB, U+203A, U+232A, U+1F50E, U+10878) are NOT arrow glyphs and
+# stay non-binding.
+def _rightward_arrow_family_ranges() -> str:
+    """Regex-range escapes for every out-of-block rightward / bidirectional arrow
+    or arrowhead in the Unicode database (Block 54: close the FAMILY, not the
+    codepoints a review happens to name).  A codepoint is in the family when its
+    name marks an ARROW/ARROWHEAD glyph with a rightward or bidirectional
+    direction (``RIGHT`` / ``RIGHTWARDS`` / ``LEFT RIGHT``), or is an Arabic
+    arrowhead (U+08F7-U+08FD sub-family).  Codepoints already inside the six
+    closed arrow blocks or the 8 scattered codepoints are skipped (the static
+    ranges below already cover them)."""
+    blocks = (
+        (0x2190, 0x21FF), (0x27F0, 0x27FF), (0x2900, 0x297F), (0x2794, 0x27BF),
+        (0x2B00, 0x2BFF), (0x1F800, 0x1F8FF),
+    )
+    scattered = frozenset(
+        (0x0362, 0x2348, 0x1F4F2, 0x1F500, 0x1F501, 0x1F502, 0x1F51C, 0x1FBB6)
+    )
+
+    def closed(cp: int) -> bool:
+        return cp in scattered or any(lo <= cp <= hi for lo, hi in blocks)
+
+    family: list[int] = []
+    for cp in range(0x110000):
+        name = unicodedata.name(chr(cp), "")
+        if not name or "ARROW" not in name or closed(cp):
+            continue
+        if (
+            "RIGHT" in name
+            or "RIGHTWARDS" in name
+            or "LEFT RIGHT" in name
+            or ("ARABIC" in name and "ARROWHEAD" in name)
+        ):
+            family.append(cp)
+    # Collapse the ascending codepoints into contiguous ranges.
+    parts: list[str] = []
+    start = prev = family[0]
+    for cp in [*family[1:], None]:
+        if cp is None or cp != prev + 1:
+            if start == prev:
+                parts.append(
+                    rf"\u{start:04X}" if start < 0x10000
+                    else rf"\U{start:08X}"
+                )
+            else:
+                parts.append(
+                    rf"\u{start:04X}-\u{prev:04X}"
+                    if prev < 0x10000
+                    else rf"\U{start:08X}-\U{prev:08X}"
+                )
+            if cp is None:
+                break
+            start = cp
+        prev = cp
+    return "".join(parts)
+
+
 _UNICODE_ARROW_BLOCK_CLASS = (
     r"[\u2190-\u21FF\u27F0-\u27FF\u2900-\u297F\u2794-\u27BF"
     r"\u2B00-\u2BFF\U0001F800-\U0001F8FF"
-    r"\u0362\u2348\U0001F4F2\U0001F500-\U0001F502\U0001F51C\U0001FBB6]"
-)
+    r"\u0362\u2348\U0001F4F2\U0001F500-\U0001F502\U0001F51C\U0001FBB6"
+    + _rightward_arrow_family_ranges()
+    + "]")
+
 _CREDENTIAL_NARRATION_BIND_OP = (
     r"(?:is|was|were|are|equals?|becomes)\b[ \t]*"
     r"|[:=]|" + _UNICODE_ARROW_BLOCK_CLASS + r"|->|=>"

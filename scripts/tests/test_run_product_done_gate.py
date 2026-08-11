@@ -15167,3 +15167,197 @@ def test_r31_full_chain_producer_seal_consumer_block53_arrow_c_both_finals(
                 "live-canary-certified.json.failure.json",
                 credential_field_check=False,
             )
+
+
+def test_r32_block54_rightward_arrow_family_fail_closed_both_paths() -> None:
+    """C-122 round-32 Block 54 counter-examples (architect independent review of
+    25ca9ea): the arrow operator class must close the RIGHTWARD-ARROW FAMILY by
+    Unicode name semantics, not the codepoints a review happens to name.  R31
+    closed the six arrow blocks + 8 scattered codepoints but 17 same-family
+    codepoints OUTSIDE them (U+02C3 / U+02F2 / U+034D / U+0350 / U+0355 /
+    U+0356 / U+08F8-U+08FD / U+1DFF / U+20D7 / U+20E1 / U+20EF / U+29B3 /
+    U+1F51B - combining marks, modifier letters, Arabic arrowheads, an enclosed
+    bidirectional arrow) escaped BOTH finals: U+0362 (closed) and U+034D / U+0350
+    (open) are the SAME Combining Diacritical Marks block.  Every out-of-block
+    family codepoint now fails BOTH finals closed; the covered operators stay
+    rejected; ordinary RIGHT-POINTING non-arrow symbols and plain prose stay
+    accepted."""
+    family = [
+        0x02C3, 0x02F2, 0x034D, 0x0350, 0x0355, 0x0356,
+        0x08F7, 0x08F8, 0x08F9, 0x08FA, 0x08FB, 0x08FC, 0x08FD,
+        0x1DFF, 0x20D7, 0x20E1, 0x20EF, 0x237C,
+        0x29A8, 0x29AA, 0x29AC, 0x29AE, 0x29B3,
+        0xFFEB, 0x1F51B, 0x1F5D8, 0x1FBB7, 0x1FBB8,
+    ]
+    for cp in family:
+        raw = f"passphrase {chr(cp)} plannerV2"
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # Covered operators stay rejected (regression): arrows + ASCII + full-width
+    # + halfwidth (U+FFEB folds to U+2192 via NFKC).
+    for op in ("⇒", "→", "=>", ":", "=", "：", "＝", "￫"):
+        raw = f"passphrase {op} plannerV2"
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+    # Ordinary RIGHT-POINTING non-arrow symbols are NOT binding operators
+    # (triangles / quotes / brackets / magnifier / Palmyrene fleuron).
+    for cp in (
+        0x25B6, 0x25B7, 0x25B8, 0x25B9, 0x25BA, 0x25BB,
+        0x23E9, 0x23ED, 0x23EF, 0x23F5,
+        0x00BB, 0x203A, 0x232A, 0x1F50E, 0x10878,
+    ):
+        raw = f"passphrase {chr(cp)} plannerV2"
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    # A designation word alone in prose stays accepted.
+    for raw in (
+        "the passcode was not stored anywhere",
+        "login page loads today",
+        "key: a plain discussion of the itinerary",
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+
+
+def test_r32_block54_family_closure_complete_all_rightward_arrows_reject() -> None:
+    """C-122 round-32 Block 54 closure completeness: the operator class is
+    derived from the whole rightward / bidirectional ARROW/ARROWHEAD family in
+    the Unicode database, so it can never be a stale enumeration.  This test
+    re-derives the family independently (the same name-semantic rule written in
+    the test) and asserts every member fails BOTH finals - all in-block rightward
+    arrows (187 observed) plus the out-of-block family.  The out-of-block class
+    is pinned exactly so any rule drift is caught as a test failure."""
+    import unicodedata as _unicodedata
+
+    from tripchord._secret_redact import _rightward_arrow_family_ranges
+
+    family = []
+    for cp in range(0x110000):
+        name = _unicodedata.name(chr(cp), "")
+        if not name or "ARROW" not in name:
+            continue
+        if "RIGHT" in name or "RIGHTWARDS" in name or "LEFT RIGHT" in name:
+            family.append(cp)
+    assert family, "family derivation must not be empty"
+    for cp in family:
+        raw = f"passphrase {chr(cp)} plannerV2"
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # Out-of-block family class is pinned exactly (guards against rule drift).
+    assert _rightward_arrow_family_ranges() == (
+        r"\u02C3\u02F2\u034D\u0350\u0355-\u0356\u08F7-\u08FD\u1DFF\u20D7"
+        r"\u20E1\u20EF\u237C\u29A8\u29AA\u29AC\u29AE\u29B3\uFFEB"
+        r"\U0001F51B\U0001F5D8\U0001FBB7-\U0001FBB8"
+    )
+
+
+def test_r32_full_chain_producer_seal_consumer_block54_family_both_finals(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-32 full chain (Block 54): the producer masks a narration
+    assignment whose binding operator is an out-of-block rightward-arrow family
+    codepoint (U+0350 / U+034D / U+20D7 / U+08F9 / U+1F51B / U+29B3 / U+1DFF /
+    U+20E1) BEFORE the 0600 seal, so the sealed diagnostic is clean and BOTH
+    finals pass; the RAW value still fails BOTH finals (defense in depth)."""
+    from benchmarks import live_canary_certified as canary
+
+    def seal(message: str) -> Path:
+        output = tmp_path / "live-canary-certified.json"
+        return canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(message),
+            output,
+            run_id="r32chain",
+            tested_sha="13d76ae" + "0" * 33,
+        )
+
+    for cp in (0x0350, 0x034D, 0x20D7, 0x08F9, 0x1F51B, 0x29B3, 0x1DFF, 0x20E1):
+        raw = f"passphrase {chr(cp)} plannerV2"
+        masked = canary._desensitize(raw)
+        assert masked != raw, "producer must mask the arrow-narration value"
+        assert "[REDACTED]" in masked
+        diag = seal(masked)
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                f'{{"summary": "{masked}"}}', "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
