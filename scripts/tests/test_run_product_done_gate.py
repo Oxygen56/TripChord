@@ -13235,8 +13235,10 @@ def test_r23_block33_structured_bare_credential_identifier_both_paths() -> None:
     structurally identical to ``flightOption12``) is rejected by BOTH finals,
     ``abcD1xyz9`` is restored, while the business identifiers ``tokenizationV1``
     / ``secretariatV1`` (V<digits> version markers, whose word prefixes are
-    irrelevant) and ``refreshTokenCount1`` (all segments common English, with
-    ``token`` only a MIDDLE segment) stay accepted."""
+    irrelevant) stay accepted.  ``refreshTokenCount1`` moved to REJECT in R25
+    Block 39: the keyword check is symmetric (ANY segment, not just the last),
+    so a middle ``Token`` segment is a credential keyword just like a final
+    one."""
     for raw in (
         "qwerTy1",
         '{"summary": "qwerTy1"}',
@@ -13244,6 +13246,8 @@ def test_r23_block33_structured_bare_credential_identifier_both_paths() -> None:
         '{"summary": "qwerTy12"}',
         "abcD1xyz9",
         '{"summary": "abcD1xyz9"}',
+        "refreshTokenCount1",
+        '{"summary": "refreshTokenCount1"}',
     ):
         with pytest.raises(gate.GateStateChangedError):
             gate._secret_scan_bytes(
@@ -13266,7 +13270,6 @@ def test_r23_block33_structured_bare_credential_identifier_both_paths() -> None:
         '{"summary": "flightOption12"}',
         '{"summary": "tokenizationV1"}',
         '{"summary": "secretariatV1"}',
-        '{"summary": "refreshTokenCount1"}',
     ):
         gate._secret_scan_bytes(
             raw.encode(),
@@ -13413,11 +13416,13 @@ def test_r23_full_chain_producer_seal_consumer_final_structured_both_paths(
     tmp_path: Path,
 ) -> None:
     """C-122 round-23 full chain: the producer leaves the new bare tokens
-    (``qwerTy1`` / ``qwerTy12``) unmasked so they reach the 0600 seal and fail
-    BOTH finals closed; the business identifiers (``refreshTokenCount1`` /
-    ``tokenizationV1`` / ``secretariatV1`` / ``flightOption12``) survive the
-    whole chain accepted; and a REAL Digest credential is masked by the
-    producer before the seal, so the sealed artifact stays clean end-to-end."""
+    (``qwerTy1`` / ``qwerTy12``, plus ``refreshTokenCount1`` since R25 Block 39
+    made the keyword check symmetric — a middle ``Token`` segment now rejects)
+    unmasked so they reach the 0600 seal and fail BOTH finals closed; the
+    business identifiers (``tokenizationV1`` / ``secretariatV1`` /
+    ``flightOption12``) survive the whole chain accepted; and a REAL Digest
+    credential is masked by the producer before the seal, so the sealed
+    artifact stays clean end-to-end."""
     from benchmarks import live_canary_certified as canary
 
     def seal(message: str) -> Path:
@@ -13430,7 +13435,7 @@ def test_r23_full_chain_producer_seal_consumer_final_structured_both_paths(
             tested_sha="13d76ae" + "0" * 33,
         )
 
-    for leak in ("qwerTy1", "qwerTy12"):
+    for leak in ("qwerTy1", "qwerTy12", "refreshTokenCount1"):
         assert leak == canary._desensitize(leak), "producer must not mask bare token"
         diag = seal(leak)
         assert stat.S_IMODE(diag.stat().st_mode) == 0o600
@@ -13455,7 +13460,6 @@ def test_r23_full_chain_producer_seal_consumer_final_structured_both_paths(
             )
     # Business identifiers survive producer + seal + BOTH finals.
     for business in (
-        "refreshTokenCount1",
         "tokenizationV1",
         "secretariatV1",
         "flightOption12",
@@ -13677,6 +13681,165 @@ def test_r24_full_chain_producer_seal_consumer_final_block36_37_both_paths(
                 credential_field_check=True,
             )
     for business in ("hotelAmenity3", "bookingReference1"):
+        assert business == canary._desensitize(business)
+        diag = seal(business)
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+
+
+def test_r25_block39_symmetric_keyword_any_segment_both_paths() -> None:
+    """C-122 round-25 Block 39: the bare-token keyword check is SYMMETRIC with
+    the version branch — ANY camelCase segment that is a credential keyword
+    fails closed on BOTH finals, not just the last segment (``clientSecretTree1``
+    / ``passwordCheck1`` / ``secretSauce1`` / ``signaturePad1`` put the keyword
+    in a NON-final position, which the R24 last-segment check let through), and
+    the business determination is the controlled Trip vocabulary, so non-Trip
+    English chains (``accessLogCount1`` / ``purpleMonkeyDishwasher1``) also fail
+    closed in ANY segment position.  The business identifiers
+    ``hotelAmenity3`` / ``bookingReference1`` / ``tokenizationV1`` /
+    ``secretariatV1`` / ``plannerV2`` / ``providerV4`` stay accepted."""
+    for t in (
+        "clientSecretTree1",
+        "passwordCheck1",
+        "credentialNumber1",
+        "secretTree1",
+        "mySecretTree1",
+        "secretSauce1",
+        "signaturePad1",
+        "accessLogCount1",
+        "purpleMonkeyDishwasher1",
+        # keyword-in-any-segment variants (R25 symmetric rule)
+        "refreshTokenCount1",
+        "userPasswordCheck1",
+        "myApiSecretKey2",
+        "privateSessionKey1",
+        "accessCredential3",
+        "clientSecretKey3",
+        "tokenCounter9",
+        "purpleMonkeyDishwasher5",
+    ):
+        for raw in (t, f'{{"summary": "{t}"}}'):
+            with pytest.raises(gate.GateStateChangedError):
+                gate._secret_scan_bytes(
+                    raw.encode(),
+                    gate._SecretNeedles(()),
+                    "evidence",
+                    "ev.json",
+                    credential_field_check=True,
+                )
+            with pytest.raises(gate.GateStateChangedError):
+                gate._secret_scan_bytes(
+                    raw.encode(),
+                    gate._SecretNeedles(()),
+                    "evidence",
+                    "live-canary-certified.json.failure.json",
+                    credential_field_check=False,
+                )
+    for t in (
+        "hotelAmenity3",
+        "bookingReference1",
+        "tokenizationV1",
+        "secretariatV1",
+        "plannerV2",
+        "providerV4",
+        "flightOption1",
+        "flightOption12",
+    ):
+        for raw in (t, f'{{"summary": "{t}"}}'):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+
+
+def test_r25_full_chain_producer_seal_consumer_final_block39_both_paths(
+    tmp_path: Path,
+) -> None:
+    """C-122 round-25 full chain: the Block 39 bare credentials
+    (``clientSecretTree1`` / ``passwordCheck1`` / ``credentialNumber1`` /
+    ``secretTree1`` / ``mySecretTree1`` / ``secretSauce1`` / ``signaturePad1`` /
+    ``accessLogCount1`` / ``purpleMonkeyDishwasher1``) are left unmasked by the
+    producer, reach the 0600 seal, and fail BOTH finals closed — the R24
+    fail-open regression, where every one of them passed the whole done-gate
+    unseen; the business identifiers (``hotelAmenity3`` / ``bookingReference1`` /
+    ``tokenizationV1`` / ``secretariatV1`` / ``plannerV2`` / ``providerV4``)
+    survive producer + seal + BOTH finals accepted."""
+    from benchmarks import live_canary_certified as canary
+
+    def seal(message: str) -> Path:
+        output = tmp_path / "live-canary-certified.json"
+        return canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(message),
+            output,
+            run_id="r25fullchain",
+            tested_sha="13d76ae" + "0" * 33,
+        )
+
+    for leak in (
+        "clientSecretTree1",
+        "passwordCheck1",
+        "credentialNumber1",
+        "secretTree1",
+        "mySecretTree1",
+        "secretSauce1",
+        "signaturePad1",
+        "accessLogCount1",
+        "purpleMonkeyDishwasher1",
+    ):
+        assert leak == canary._desensitize(leak), "producer must not mask bare token"
+        diag = seal(leak)
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        assert leak in diag.read_text(encoding="utf-8"), "leak must reach the seal"
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                diag.read_bytes(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                gate._sanitize_canary_diag_field(
+                    canary._desensitize(leak), "fallback"
+                ).encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+    for business in (
+        "hotelAmenity3",
+        "bookingReference1",
+        "tokenizationV1",
+        "secretariatV1",
+        "plannerV2",
+        "providerV4",
+    ):
         assert business == canary._desensitize(business)
         diag = seal(business)
         assert stat.S_IMODE(diag.stat().st_mode) == 0o600

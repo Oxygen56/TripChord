@@ -36,7 +36,6 @@ import unicodedata
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Flag, auto
-from pathlib import Path
 from typing import Any
 
 # Hard budgets for the recursive JSON walk.  ``_MAX_JSON_SCAN_DEPTH`` covers
@@ -433,14 +432,21 @@ _BASIC_VALUE_TOKEN_RE = re.compile(r"(?i)\bBasic[ \t]+(?P<payload>[A-Za-z0-9+/]{
 # (The span used is :func:`_BASIC_VALUE_TOKEN_RE`'s ``payload`` group.)
 
 
-# Common-English identifier vocabulary used by the STRUCTURED recognizers
-# (R23 Block 33/34): a bare camelCase-and-digit token or an invalid-base64
-# Basic payload is non-credential business English ONLY when every word segment
-# is in this set.  The vocabulary is an English-word set, NOT a
-# credential-keyword blacklist — credential keywords are deliberately absent
-# so ``secret``/``password``/``token`` in final-segment position still fail
-# closed, while ``token`` as a MIDDLE segment (``refreshTokenCount``) is
-# ordinary business English.
+# Trip business-identifier vocabulary used by the STRUCTURED recognizers
+# (R23 Block 33/34, restored for the business check by R25 Block 39): a bare
+# camelCase-and-digit token is non-credential business English ONLY when EVERY
+# word segment is in this controlled Trip vocabulary.  R24 Block 37 shipped a
+# 207k-word English dictionary in this position, which contained
+# ``secret``/``password``/``credential``/``signature`` AND ``access``/
+# ``purple``/``monkey``/``dishwasher`` — every one of the nine R25 regression
+# tokens was "all real English words" and passed, re-opening the R23
+# fail-closed defense.  The vocabulary deliberately keeps credential-keyword
+# segments out (``secret``/``password``/``token``/… fail closed in ANY
+# position via the symmetric keyword check, R25 Block 39) and keeps non-Trip
+# English words out (``purple``/``monkey``/``dishwasher`` are real English but
+# are not a verifiable Trip business identifier).  ``amenity`` / ``booking`` /
+# ``reference`` complete the R23 set with the exact words the R24 Block 37
+# contract requires (``hotelAmenity3`` / ``bookingReference1`` stay positive).
 _CREDENTIAL_VALUE_WORDS = frozenset(
     {
         # function words
@@ -472,7 +478,8 @@ _CREDENTIAL_VALUE_WORDS = frozenset(
         "send", "receive", "give", "show", "hide", "read", "write", "run",
         "stop", "check", "verify", "test", "build", "deploy",
         "plan", "planner", "trip", "flight", "hotel",
-        "hotels", "route", "itinerary", "destination", "city", "country",
+        "hotels", "amenity", "booking", "reference",
+        "route", "itinerary", "destination", "city", "country",
         "rating", "score", "review", "reviews", "availability", "capacity",
         "currency",
         "duration", "distance", "discount", "tax", "fee", "deposit",
@@ -791,35 +798,25 @@ _BARE_CREDENTIAL_KEYWORD_SEGMENTS = frozenset(
 )
 
 
-# R24 Block 37: business-identifier determination is a VERIFIABLE English
-# check — every camelCase segment of a bare trailing-digit token must be a real
-# English word, looked up in a complete bundled dictionary (an objective,
-# external resource), NOT a hand-curated word list.  The R23
-# ``_CREDENTIAL_VALUE_WORDS`` misrejected ``hotelAmenity3`` / ``bookingReference1``
-# because ``amenity`` / ``booking`` / ``reference`` were simply missing from the
-# curated set; a full dictionary is complete by construction and verifiable.
-# ``_CREDENTIAL_VALUE_WORDS`` remains ONLY for the R21/R23 prose-phrase check
-# (``Basic is required``), which needs a small controlled function-word set.
-_ENGLISH_WORDS_PATH = Path(__file__).with_name("_english_words.txt")
-_ENGLISH_WORDS_CACHE: frozenset[str] | None = None
-
-
-def _english_words() -> frozenset[str]:
-    """The bundled English dictionary, loaded once (207k lowercase words)."""
-    global _ENGLISH_WORDS_CACHE
-    if _ENGLISH_WORDS_CACHE is None:
-        with _ENGLISH_WORDS_PATH.open(encoding="utf-8") as _fh:
-            _ENGLISH_WORDS_CACHE = frozenset(_fh.read().splitlines())
-    return _ENGLISH_WORDS_CACHE
-
-
+# R25 Block 39: the R24 207k-word English dictionary is REMOVED from the
+# business-identifier determination.  A complete English dictionary cannot
+# separate a Trip business identifier from an arbitrary English word chain —
+# ``hotelAmenity3`` and ``purpleMonkeyDishwasher1`` are structurally identical
+# (every segment a real English word), and the dictionary also contains the
+# sensitive words themselves (``secret`` / ``password`` / ``credential`` /
+# ``signature``), so R24 silently accepted all nine regression tokens.  The
+# business determination is the controlled Trip vocabulary
+# ``_CREDENTIAL_VALUE_WORDS`` (fail-closed by construction: credential-keyword
+# segments and non-Trip English words alike fail closed), completed with the
+# three words the R24 Block 37 contract requires.
 def _is_bare_credential_token(token: str) -> bool:
     """True when a camelCase-and-digit token is a BARE credential value —
-    the STRUCTURED recognizer (R23 Block 33 / R24 Block 36-37), NOT a
-    keyword/threshold heuristic.  ``qwerTy1`` (a short keyboard mash + digit)
-    and ``mySuperSecret1`` structurally share the shape of ``flightOption12``
-    (lower+Upper+lower+digits), so no length/digit-position/punctuation rule
-    can separate them: the decision is identifier STRUCTURE:
+    the STRUCTURED recognizer (R23 Block 33 / R24 Block 36 / R25 Block 39),
+    NOT a keyword/threshold heuristic.  ``qwerTy1`` (a short keyboard mash +
+    digit) and ``mySuperSecret1`` structurally share the shape of
+    ``flightOption12`` (lower+Upper+lower+digits), so no
+    length/digit-position/punctuation rule can separate them: the decision is
+    identifier STRUCTURE:
 
     * a digit run followed by a letter INSIDE the token (``1xyz`` in
       ``abcD1xyz9``) — the digit is embedded, not a trailing number — is a
@@ -829,13 +826,20 @@ def _is_bare_credential_token(token: str) -> bool:
       identifier ONLY AFTER the credential-keyword segments are excluded —
       ``mySuperSecretV1`` / ``refreshTokenV1`` end in credential keywords and
       stay credentials (R24 Block 36);
-    * a trailing-digit token whose FINAL camelCase segment is a credential
-      keyword (``Secret`` in ``mySuperSecret1``) is a credential;
-    * a trailing-digit token whose camelCase segments are ALL verifiable
-      English words (``flightOption`` = ``flight`` + ``Option``,
-      ``refreshTokenCount`` = ``refresh`` + ``Token`` + ``Count``,
-      ``hotelAmenity`` = ``hotel`` + ``Amenity``) is a business identifier
-      (R24 Block 37 — dictionary-verified, no curated word list);
+    * a trailing-digit token ANY of whose camelCase segments is a credential
+      keyword fails closed — SYMMETRIC with the version branch, ANY segment
+      position, not just the last (R25 Block 39: ``clientSecretTree1`` /
+      ``passwordCheck1`` / ``secretSauce1`` / ``signaturePad1`` put the
+      keyword in a non-final segment; the R24 last-segment check let them
+      through);
+    * a trailing-digit token whose camelCase segments are ALL in the Trip
+      business vocabulary (``flightOption`` = ``flight`` + ``Option``,
+      ``hotelAmenity`` = ``hotel`` + ``Amenity``,
+      ``bookingReference`` = ``booking`` + ``Reference``) is a business
+      identifier — R25 Block 39 restores the R23 controlled-vocabulary
+      fail-closed (the R24 dictionary accepted ``accessLogCount1`` and
+      ``purpleMonkeyDishwasher1`` because every segment was "a real English
+      word");
     * ANY other digit-bearing camelCase token (``qwerTy1`` — a short
       keyboard-mash prefix with a digit) fails closed as a credential shape.
     """
@@ -860,10 +864,20 @@ def _is_bare_credential_token(token: str) -> bool:
     segments = _split_camel_case(prefix)
     if not segments:
         return False
-    if segments[-1].lower() in _BARE_CREDENTIAL_KEYWORD_SEGMENTS:
+    # R25 Block 39: symmetric with the version branch — ANY segment that is a
+    # credential keyword fails closed, not just the last segment.
+    if any(
+        segment.lower() in _BARE_CREDENTIAL_KEYWORD_SEGMENTS
+        for segment in segments
+    ):
         return True
+    # R25 Block 39: business determination is the controlled Trip vocabulary
+    # (fail-closed), not the 207k English dictionary (fail-open).  A single
+    # non-Trip segment — ``access`` in ``accessLogCount1``, ``purple`` /
+    # ``monkey`` / ``dishwasher`` in ``purpleMonkeyDishwasher1`` — rejects the
+    # identifier in ANY position.
     return not all(
-        segment.lower() in _english_words() for segment in segments
+        segment.lower() in _CREDENTIAL_VALUE_WORDS for segment in segments
     )
 
 
