@@ -4728,6 +4728,54 @@ def test_layer6_bridge_token_env_only_not_argv(
         assert kwargs["env"]["TRIPCHORD_BROWSER_BRIDGE_TOKEN"] == token  # type: ignore[index]
 
 
+def test_layer6_reports_executor_failure_before_done_gate_truthfully(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, tmp_path: Path
+) -> None:
+    """C-122 supervision 14:52: when the real E2E executor fails BEFORE the done
+    gate (``run_status: failed_before_done_gate`` + a ``failure`` record), layer
+    6 must surface the executor's actual failing stage and message as the REAL
+    report — it must NEVER be folded into a generic "pending user authorization"
+    wrapper.  The layer stays ``passed=False`` (no fabrication)."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "D" * 64)
+    monkeypatch.setenv("TRIPCHORD_ACK_MODEL_COST", "1")
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (2, "executor stderr"))
+    monkeypatch.setattr(gate, "_live_state_lease_preflight", lambda *a, **k: [])
+    monkeypatch.setattr(gate, "_bridge_state_lease_preflight", lambda *a, **k: [])
+    monkeypatch.setattr(gate, "_bridge_state_postcheck", lambda *a, **k: [])
+    monkeypatch.setattr(gate, "_runtime_provenance_mismatches", lambda *a, **k: [])
+    monkeypatch.setattr(gate, "_extract_build_fingerprint", lambda *a, **k: None)
+    start = _expected_snapshot(clean_repo)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-live-evidence-v4",
+                "run_status": "failed_before_done_gate",
+                "repo_revision": {
+                    "commit_sha": start.commit_sha,
+                    "worktree_dirty": False,
+                    "toplevel": os.fspath(clean_repo),
+                },
+                "failure": {
+                    "stage": "companion_preflight",
+                    "type": "RuntimeError",
+                    "message": "no connected Companion declaring ctrip/qunar/tongcheng",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = gate.layer6_full_e2e(staging_dir, start)
+    assert result.passed is False
+    assert (
+        "executor failed before the done gate at stage 'companion_preflight'"
+        in result.detail
+    )
+    assert "no connected Companion declaring ctrip/qunar/tongcheng" in result.detail
+    assert "pending user authorization" not in result.detail
+
+
 # ---------------------------------------------------------------------------
 # C-114 R7: read-only live-state lease preflight (residual queued/claimed
 # leases must not pollute a new live run)
@@ -17962,6 +18010,221 @@ def test_r42_block76_77_structural_tail_and_normal_language_both_paths(
             RuntimeError(masked),
             output,
             run_id="r42b7677",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r42_block78_sentence_punctuation_and_unicode_orthography_both_paths(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-42 Block 78 (supervision 14:52): a COMPLETE natural sentence
+    carrying a legitimate sentence-final / clause-final punctuation or Unicode
+    orthography was wrongly rejected by the R42 phrase rule — Block 78 accepts it
+    WITHOUT reopening Block 73-77.  The fix is a Unicode LEXICAL-CATEGORY +
+    SYNTACTIC-POSITION rule, not a longer punctuation ban table:
+    * a MULTI-WORD sentence may END a word in a sentence-final / clause-final
+      terminator (``is a version.`` / ``is a version;`` / ``is a version, not a
+      secret``) and a CJK sentence is a single whitespace token
+      (``这是版本。``);
+    * a contraction / hyphenated word may carry a Unicode apostrophe / dash
+      (``isn't`` with a U+2019 curly apostrophe / ``non-secret`` with a U+2011
+      non-breaking hyphen) — a word-internal separator is an apostrophe (ASCII /
+      Unicode single quote) or any ``Pd``-category dash;
+    * a structural symbol (``=`` / ``_`` / ``)`` / ``]`` / ``}`` / ``"`` / ``/``)
+      is never a word char, a BARE terminator is a boundary, and a single ASCII
+      word glued to a terminator (``note.`` — Block 76 disguise; ``version.``)
+      is NOT prose — the Block 73/76/77 rejects stay closed on BOTH finals and
+      on the JSON member-value path."""
+    from benchmarks import live_canary_certified as canary
+
+    b78_accept = (
+        # sentence-final / clause-final punctuation on a multi-word sentence
+        "verification code is (plannerV2) is a version.",
+        "verification code is (plannerV2) is a version;",
+        "verification code is (plannerV2) is a version, not a secret",
+        # Unicode orthography: curly apostrophe U+2019 / non-breaking hyphen
+        # U+2011 read as word-internal separators
+        "verification code is (plannerV2) isn’t active",
+        "verification code is (plannerV2) non‑secret version",
+        # a CJK sentence is a single whitespace token
+        "verification code is (plannerV2)这是版本。",
+        # JSON member values carry the same sentence rule
+        '{"summary": "(plannerV2) is a version."}',
+        '{"summary": "(plannerV2) is a version;"}',
+        '{"summary": "(plannerV2) is a version, not a secret"}',
+        '{"summary": "(plannerV2) isn’t active"}',
+        '{"summary": "(plannerV2) non‑secret version"}',
+        '{"summary": "(plannerV2)这是版本。"}',
+    )
+    for raw in b78_accept:
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    b78_reject = (
+        # Block 76 structural tails stay closed (the ``note.`` disguise is a
+        # SINGLE ASCII word glued to a terminator, never prose)
+        "verification code is (plannerV2)note)",
+        "verification code is (plannerV2)note]",
+        "verification code is (plannerV2)note}",
+        "verification code is (plannerV2)note))))",
+        'verification code is (plannerV2)note"',
+        "verification code is (plannerV2)note.",
+        "verification code is (plannerV2)note\n=",
+        # Block 78 discriminator: ONE ASCII word + a terminator is the Block 76
+        # disguise class, unlike the multi-word sentence ``is a version.``
+        "verification code is (plannerV2)version.",
+        # Block 73 bare terminators / structural separators / path separators /
+        # dangling closers stay closed
+        "verification code is (plannerV2).",
+        "verification code is (plannerV2)?",
+        "verification code is (plannerV2)!",
+        "verification code is (plannerV2)。",
+        "verification code is (plannerV2)/next",
+        "verification code is (plannerV2)#",
+        "verification code is (plannerV2)@",
+        "verification code is (plannerV2))",
+        "verification code is (plannerV2)]",
+        "verification code is (plannerV2)) in the report",
+        "verification code is (plannerV2)。then",
+        "verification code is (plannerV2)-version",
+        "verification code is (plannerV2)…next",
+        "verification code is (plannerV2).next",
+        # Block 74 single-char placeholder / underscore pseudo-word stay closed
+        "verification code is (plannerV2)x=",
+        "verification code is (plannerV2)_=",
+        "verification code is (plannerV2)x",
+        "verification code is (plannerV2)_",
+        "verification code is (plannerV2)_note",
+        # Block 75 a prose dash + structural operator stays closed
+        "verification code is (plannerV2) — =",
+        "verification code is (plannerV2) — /next",
+        # JSON member-value path carries the same exact-value rule
+        '{"otp": "(plannerV2)."}',
+        '{"otp": "(plannerV2))"}',
+        '{"otp": "(plannerV2)]"}',
+        '{"otp": "(plannerV2)="}',
+        '{"otp": "(plannerV2)x="}',
+        '{"otp": "(plannerV2)_="}',
+        '{"otp": "(plannerV2)note."}',
+        '{"otp": "(plannerV2)note)"}',
+    )
+    for raw in b78_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # full chain: the producer masks every Block 78 reject BEFORE the 0600 seal,
+    # so the sealed diagnostic and the consumer-synthesized field are clean and
+    # BOTH finals pass; the Block 78 positives survive the seal untouched; the
+    # RAW values still fail BOTH finals (defense in depth).
+    for raw in b78_reject:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b78",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in b78_accept:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked
+        assert "plannerV2" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b78",
             tested_sha="9" * 40,
         )
         assert stat.S_IMODE(diag.stat().st_mode) == 0o600

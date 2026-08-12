@@ -1969,16 +1969,21 @@ def _registered_base_value_info(value: str) -> tuple[str, bool] | str | None:
             return base, is_version
         return _WRAPPED_BASE_ILLEGAL
     if j < n:
-        # trailing content after a fully balanced wrapper.  R40 Block 73/74/75:
-        # the ONLY prose acceptance is a MEANINGFUL natural-language phrase on
-        # the SAME line — real words (two or more letters / CJK), optionally
-        # introduced by a prose dash (``(tokenizationV1) in the report`` /
-        # ``(plannerV2)版本`` / ``(plannerV2) — note``).  A sentence terminator /
-        # structural separator / assignment operator / single-char placeholder /
-        # underscore pseudo-word / dangling closer / EOL / EOT means the wrapped
-        # value COMPLETELY consumed a semantic boundary and is an EXACT
-        # credential value, so the caller's documented-path exemption decides it
-        # (an unbound JSON path ``{"otp": "(plannerV2)."}`` fails closed, as do
+        # trailing content after a fully balanced wrapper.  R40 Block 73/74/75
+        # + R42 Block 77/78: the ONLY prose acceptance is a MEANINGFUL
+        # natural-language phrase on the SAME line — real words (two or more
+        # letters / CJK), optionally introduced by a prose dash
+        # (``(tokenizationV1) in the report`` / ``(plannerV2)版本`` /
+        # ``(plannerV2) — note``) and, since Block 78, a MULTI-WORD sentence
+        # carrying a sentence-final / clause-final punctuation
+        # (``(plannerV2) is a version.``) or a CJK sentence
+        # (``(plannerV2)这是版本。``).  A structural separator / assignment
+        # operator / single-char placeholder / underscore pseudo-word / dangling
+        # closer / EOL / EOT — or a BARE sentence terminator / a single ASCII
+        # word glued to a terminator (``note.``) — means the wrapped value
+        # COMPLETELY consumed a semantic boundary and is an EXACT credential
+        # value, so the caller's documented-path exemption decides it (an
+        # unbound JSON path ``{"otp": "(plannerV2)."}`` fails closed, as do
         # ``{"otp": "(plannerV2)x="}`` and ``{"otp": "(plannerV2) — ="}``).
         if not _exact_value_at_semantic_boundary(v, j):
             return None
@@ -2157,23 +2162,63 @@ _NATURAL_PROSE_DASHES = frozenset(("—", "–"))
 # pronoun ``I``) are real words; a bare single-letter placeholder (``x``) is
 # not.  This is grammar, not a lexical ban table.
 _SINGLE_LETTER_FUNCTION_WORDS = frozenset(("a", "i"))
+# R42 Block 78: a word-internal separator is an apostrophe — ASCII ``'`` or a
+# Unicode single quote (U+2018 LEFT / U+2019 RIGHT SINGLE QUOTATION MARK, so
+# ``isn't`` and its U+2019 curly-apostrophe spelling both read as ONE word) —
+# or ANY Unicode dash (category ``Pd``, so ASCII hyphen-minus ``-``, the U+2011
+# NON-BREAKING HYPHEN spelling of ``non-secret`` and the prose en/em dashes all
+# read as word-internal).  A structural operator / connector / closer / path
+# separator (``=`` / ``_`` / ``)`` / ``/`` …) is NEVER a word char — this is a
+# Unicode lexical CATEGORY rule, not an ASCII-only table.
+_CONTRACTION_APOSTROPHES = frozenset(("'", "‘", "’"))
+# R42 Block 78: the legitimate SENTENCE-FINAL / CLAUSE-FINAL punctuation of a
+# complete natural sentence — ASCII ``. , ; : ! ?`` and the CJK forms
+# (ideographic full stop ``。``, FULLWIDTH comma / semicolon / colon /
+# exclamation / question mark, enumeration comma ``、``, ellipsis ``…``).  These
+# may END a word inside a MULTI-WORD sentence (``is a version.`` /
+# ``is a version;`` / ``is a version, not a secret``), or end a CJK sentence
+# that is a SINGLE whitespace token (``这是版本。``).  A STRUCTURAL symbol
+# (``)`` / ``]`` / ``}`` / ``"`` / ``=`` / ``/`` / ``_`` …) is never in this
+# set and always fails closed.
+_SENTENCE_CLAUSE_TERMINATORS = frozenset(".,;:!?。，；：！？、…")
+_CJK_SENTENCE_TERMINATORS = frozenset("。，；：！？、…")
+
+
+def _is_word_internal_separator(ch: str) -> bool:
+    """True when ``ch`` is a legitimate word-INTERNAL separator under Unicode
+    lexical categories: an apostrophe (ASCII ``'`` or a Unicode single quote,
+    U+2018 / U+2019) or a dash (any ``Pd`` category char, incl. ASCII
+    hyphen-minus and U+2011 NON-BREAKING HYPHEN).  Structural symbols (``=`` /
+    ``_`` / ``)`` / ``/`` / sentence terminators) are never word-internal."""
+    return ch in _CONTRACTION_APOSTROPHES or unicodedata.category(ch) == "Pd"
 
 
 def _is_natural_word_token(token: str) -> bool:
-    """True when ``token`` is a REAL natural-language word: an ASCII letter run
-    with optional INTERNAL apostrophes / hyphens (``isn't`` / ``non-secret``),
-    a CJK run, or the single-letter function words ``a`` / ``I``.  A
-    single-char placeholder (``x`` / ``_``), an underscore pseudo-word
-    (``_note``), a leading / trailing / doubled apostrophe or hyphen
-    (``-version`` / ``note-`` / ``a--b``) and any structural / quote /
-    punctuation / digit char are NOT words."""
+    """True when ``token`` is a REAL natural-language word / CJK sentence: an
+    ASCII letter run with optional INTERNAL apostrophes / hyphens — ASCII or
+    Unicode orthography (``isn't``, its U+2019 curly-apostrophe spelling,
+    ``non-secret``, its U+2011 non-breaking-hyphen spelling) — a CJK run that
+    may carry ONE trailing CJK sentence terminator (``版本`` / ``这是版本。``),
+    or the single-letter function words ``a`` / ``I``.  A single-char
+    placeholder (``x`` / ``_``), an underscore pseudo-word (``_note``), a
+    leading / trailing / doubled apostrophe or hyphen (``-version`` /
+    ``note-`` / ``a--b``) and any structural / quote / operator / digit char
+    are NOT words (R42 Block 77/78; R40 Block 74)."""
     if not token:
         return False
     if "_" in token:
         return False
-    # a CJK run is a word (``版本``); a CJK run plus ANY non-CJK char — a CJK
-    # sentence terminator (``版本。``) — is a boundary, never prose
-    if all("一" <= ch <= "鿿" for ch in token):
+    # a CJK run is a word (``版本``); a CJK SENTENCE is a single whitespace
+    # token (CJK has no spaces) and may end in one CJK sentence terminator
+    # (``这是版本。`` — Block 78).  A CJK run plus ANY other non-CJK char — a
+    # CJK terminator followed by more text (``。then``), an ASCII sentence
+    # terminator (``版本.``), a structural symbol — is a boundary, never prose.
+    core = (
+        token[:-1]
+        if token[-1] in _CJK_SENTENCE_TERMINATORS
+        else token
+    )
+    if core and all("一" <= ch <= "鿿" for ch in core):
         return True
     letters = 0
     prev = ""
@@ -2181,8 +2226,8 @@ def _is_natural_word_token(token: str) -> bool:
         if ch.isalpha():
             letters += 1
             prev = ch
-        elif ch in "'-":
-            # an apostrophe / hyphen is a word char only INTERNAL to the word
+        elif _is_word_internal_separator(ch):
+            # an apostrophe / dash is a word char only INTERNAL to the word
             # (a letter on both sides) and not doubled
             if idx == 0 or idx == len(token) - 1 or prev == ch:
                 return False
@@ -2200,10 +2245,15 @@ def _is_natural_language_phrase(rest: str) -> bool:
     lexical phrase — the wrapped value did NOT completely consume a semantic
     boundary and is a phrase, not an exact credential value.  The phrase is an
     INDEPENDENT complete sentence structure on the SAME line: every
-    whitespace-separated token must be a real word and NO structural symbol,
-    quote, sentence terminator, underscore or cross-line operator may appear —
-    the wrapped value fails closed when any unconsumed boundary symbol sits in
-    the remainder (R42 Block 76/77)."""
+    whitespace-separated token must be a real word, with R42 Block 78 a
+    sentence-final / clause-final punctuation allowed to END a word in a
+    MULTI-WORD sentence (``is a version.`` / ``is a version;`` /
+    ``is a version, not a secret``) and a CJK sentence allowed as a single
+    whitespace token (``这是版本。``).  NO structural symbol, quote, assignment
+    operator, underscore, cross-line operator or extra closer may appear — a
+    single ASCII word glued to a terminator (``note.`` — Block 76 disguise) is
+    NOT prose, and the wrapped value fails closed when any unconsumed boundary
+    symbol sits in the remainder (R42 Block 76/77; R40 Block 73/74/75)."""
     # a phrase is judged on the SAME line the wrapped value appears; a
     # cross-line operator / EOL is a boundary the value fully consumed
     # (``(plannerV2)note␊=`` — Block 76)
@@ -2216,7 +2266,26 @@ def _is_natural_language_phrase(rest: str) -> bool:
     rest = rest.lstrip(" \t")
     if not rest:
         return False
-    return all(_is_natural_word_token(word) for word in rest.split())
+    tokens = rest.split()
+    if len(tokens) == 1:
+        # Block 78: a CJK sentence (``这是版本。``) is a single whitespace token;
+        # a single ASCII word with a glued terminator (``note.`` — Block 76
+        # structural-tail disguise) or a placeholder / operator (``x`` / ``=`` /
+        # ``.`` / ``。``) is NOT prose and stays fail-closed.
+        return _is_natural_word_token(tokens[0])
+    # Block 78: a MULTI-WORD sentence may carry ONE sentence-final / clause-final
+    # terminator at the end of each word (``version.`` / ``version,`` /
+    # ``version;``).  A structural symbol is never in the terminator set, so
+    # ``note)`` / ``x=`` / ``_note`` / ``。then`` / ``.next`` still fail closed.
+    for token in tokens:
+        core = (
+            token[:-1]
+            if token[-1] in _SENTENCE_CLAUSE_TERMINATORS
+            else token
+        )
+        if not _is_natural_word_token(core):
+            return False
+    return True
 
 
 def _exact_value_at_semantic_boundary(text: str, end: int) -> bool:
@@ -2225,8 +2294,11 @@ def _exact_value_at_semantic_boundary(text: str, end: int) -> bool:
     or a NON-NATURAL-LANGUAGE continuation — so the exact-value rule applies.
     The ONLY prose acceptance is a MEANINGFUL natural-language lexical phrase
     (R40 Block 74: validated COMPLETE, not just the first character; R40 Block
-    75: a prose dash ``(plannerV2) — note`` is restored as acceptance):
-    ``verification code is (plannerV2) in the report`` /
+    75: a prose dash ``(plannerV2) — note`` is restored as acceptance; R42 Block
+    78: a sentence-final / clause-final punctuation ending a MULTI-WORD sentence
+    ``(plannerV2) is a version.`` and a CJK sentence ``(plannerV2)这是版本。``
+    are prose too, while a single ASCII word glued to a terminator ``note.``
+    is NOT): ``verification code is (plannerV2) in the report`` /
     ``verification code is (plannerV2)版本`` / ``(plannerV2) — note``.  An
     ILLEGAL wrapper is rejected BEFORE this check, so Block 69-71 closure is
     never reopened by appending prose."""
@@ -2367,17 +2439,19 @@ def _credential_narration_binds(text: str) -> bool:
             # a phrase (``see (tokenizationV1)``) — never an exact-value
             # assignment, never a credential
             continue
-        # R40 Block 73/74/75 + R42 Block 76/77: the exact-value rule applies
+        # R40 Block 73/74/75 + R42 Block 76/77/78: the exact-value rule applies
         # ONLY when the wrapped value COMPLETELY consumes a semantic boundary —
-        # end of line / end of text / a NON-PHRASE continuation (sentence
-        # terminator, structural separator, assignment operator, single-char
-        # placeholder, underscore pseudo-word, dangling closer, cross-line
-        # operator).  Trailing MEANINGFUL natural-language phrase on the SAME
-        # line (``verification code is (plannerV2) in the report`` /
+        # end of line / end of text / a NON-PHRASE continuation (structural
+        # separator, assignment operator, single-char placeholder, underscore
+        # pseudo-word, dangling closer, cross-line operator, or a BARE sentence
+        # terminator / a single ASCII word glued to a terminator ``note.``).
+        # Trailing MEANINGFUL natural-language phrase on the SAME line
+        # (``verification code is (plannerV2) in the report`` /
         # ``(plannerV2)版本`` / ``(plannerV2) — note`` / ``(plannerV2) isn't
-        # active`` / ``(plannerV2) non-secret version``) makes the assignment a
-        # phrase and stays accepted — an ILLEGAL wrapper was rejected above, so
-        # Block 69-71 closure is never reopened by appending prose.  The JSON
+        # active`` / ``(plannerV2) non-secret version`` / ``(plannerV2) is a
+        # version.`` / ``(plannerV2)这是版本。``) makes the assignment a phrase
+        # and stays accepted — an ILLEGAL wrapper was rejected above, so Block
+        # 69-71 closure is never reopened by appending prose.  The JSON
         # envelope of a string value the assignment sits inside is the
         # document's own structure and is stripped FIRST (R42 Block 76).
         if not _exact_value_at_free_text_boundary(text, m.end(), spans):

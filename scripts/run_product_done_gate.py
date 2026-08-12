@@ -3756,13 +3756,32 @@ def layer6_full_e2e(
         detail = f"full-platform real E2E passed; evidence {output_path}"
     else:
         parts: list[str] = []
+        # C-122 supervision 14:52: an executor that failed BEFORE the done gate
+        # writes ``run_status: failed_before_done_gate`` with a ``failure``
+        # record naming the exact stage and message.  Surface that REAL executor
+        # failure truthfully — never fold it into a generic "pending user
+        # authorization" wrapper (the layer's clean not-attempted cases are the
+        # token / model-cost returns above).
+        runner_failure = (
+            runner_evidence.get("failure")
+            if isinstance(runner_evidence, dict)
+            else None
+        )
+        if isinstance(runner_failure, dict):
+            stage = runner_failure.get("stage") or "unknown"
+            message = runner_failure.get("message") or "no failure message"
+            parts.append(
+                f"executor failed before the done gate at stage {stage!r}: {message}"
+            )
         if mismatches:
             parts.append("evidence cross-check failed: " + "; ".join(mismatches))
         elif code != 0:
             parts.append(f"run_live_done_gate_v4.py exited {code}")
-        if out and not mismatches:
+        if out and not mismatches and not runner_failure:
             parts.append(out[-300:])
-        detail = "pending user authorization or executor failure: " + " | ".join(parts)
+        if not parts:
+            parts.append(f"run_live_done_gate_v4.py exited {code}")
+        detail = " | ".join(parts)
     return LayerResult(
         name="6_full_e2e",
         passed=passed,
