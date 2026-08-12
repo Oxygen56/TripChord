@@ -812,7 +812,7 @@ def _digest_response_hex_value(value: str) -> bool:
     non-credential, exactly like the normal parse."""
     tok = value.strip()
     depth = 0
-    while depth < 8:
+    while depth < _STRUCTURAL_WRAPPER_DEPTH_LIMIT:
         nxt = tok
         stripped = False
         if nxt.startswith(('\\"', "\\'")):
@@ -833,6 +833,16 @@ def _digest_response_hex_value(value: str) -> bool:
             break
         tok = nxt
         depth += 1
+    # R39 Block 70: the strip budget is exhausted while a wrapper layer is
+    # STILL open (nesting deeper than the bound, or an unclosed wrapper that
+    # kept stripping in lockstep) — the value is still a wrapped credential
+    # shape, so fail CLOSED instead of falling back to a fullmatch on the
+    # wrapper residue, which would read ``(deadbeef)`` as a non-hex phrase and
+    # ACCEPT the credential.
+    if depth >= _STRUCTURAL_WRAPPER_DEPTH_LIMIT and (
+        tok[:1] in _DIGEST_VALUE_WRAPPER_CHARS or tok[-1:] in _DIGEST_VALUE_WRAPPER_CHARS
+    ):
+        return True
     return bool(_HEX_FULL_RE.fullmatch(tok))
 
 
@@ -1837,6 +1847,14 @@ _WRAPPER_CLOSE_CLASS = "[" + "".join(
 _DIGEST_VALUE_WRAPPER_CHARS = frozenset(
     dict.fromkeys([*_WRAPPER_PAIR, *_WRAPPER_PAIR.values()])
 )
+# The BOUNDED structural wrapper-strip depth shared by every wrapper resolver
+# (R39 Block 69 / R38 Block 68): ``_registered_base_value_info`` and
+# ``_digest_response_hex_value`` strip at most this many nested wrapper layers
+# before the value is too structurally deep to be a legitimate phrase — a value
+# whose budget is exhausted while a wrapper layer is still open fails CLOSED
+# (never falls back to reading the wrapper residue as a non-base phrase).  The
+# bound is an internal DoS/structure limit, not an enumerated layer count.
+_STRUCTURAL_WRAPPER_DEPTH_LIMIT = 8
 # Sentinel returned by :func:`_registered_base_value_info` for an ILLEGAL
 # STRUCTURAL wrapper (opener present, matching pair absent) — callers fail
 # closed (never exempt) on it.
@@ -1859,18 +1877,39 @@ def _registered_base_value_info(value: str) -> tuple[str, bool] | str | None:
     parenthetical base then continues (``"(tokenizationV1) in the report"``)
     is unchanged and stays a non-credential."""
     v = value.strip()
+    depth = 0
     while len(v) >= 2 and v[0] in _WRAPPER_PAIR:
+        if depth >= _STRUCTURAL_WRAPPER_DEPTH_LIMIT:
+            # R39 Block 69: the strip budget is exhausted while a wrapper layer
+            # is STILL open (nesting deeper than the bound) — the value is too
+            # structurally wrapped to be a legitimate phrase, so fail CLOSED
+            # instead of reading the residue as a non-base value.
+            return _WRAPPED_BASE_ILLEGAL
         closer = _WRAPPER_PAIR[v[0]]
         if v[-1] == closer:
             v = v[1:-1].strip()
+            depth += 1
             continue
-        # Outer wrapper is not closed at the very end.  An exact base that
-        # immediately follows the opener with a WRONG closer or nothing after
-        # it (``(plannerV2]`` / ``[plannerV2``) is an illegal structural
-        # appearance; a base followed by its MATCHING closer and then prose
+        # Outer wrapper is not closed at the very end.  R39 Block 69: a
+        # SELF-PAIRING quote / apostrophe / backtick opener (``"`` / ``'`` /
+        # ``` ``) with no close inside this value is the JSON string delimiter
+        # that opens a LONGER value (``"summary":"plannerV2 providerV4"``), not
+        # an illegal wrapper — the exact base right after the delimiter still
+        # binds, and the caller's documented-path exemption decides it (the R38
+        # Block 67 refinement, now shared by the free-text narration path).  For
+        # a NON-self-pairing opener, an exact base that immediately follows it
+        # with a WRONG closer or nothing after it (``(plannerV2]`` /
+        # ``[plannerV2``) is an illegal structural appearance; a base followed
+        # by its MATCHING closer and then prose
         # (``(tokenizationV1) in the report``) is a phrase; a base followed by a
         # word char (``(plannerV2plus)``) is a longer non-base token; and any
         # content that is not an exact base right after the opener is a phrase.
+        if closer == v[0]:
+            inner = v[1:].lstrip()
+            m = _REGISTERED_BASE_VALUE_RE.match(inner)
+            if m is not None:
+                return m.group("base").lower(), m.group("suffix").startswith("V")
+            return None
         inner = v[1:].lstrip()
         m = _REGISTERED_BASE_VALUE_PREFIX_RE.match(inner)
         if m is not None:
@@ -1986,34 +2025,11 @@ _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE = re.compile(
     r"(?P<field>[\w\u4e00-\u9fff/\[\]]"
     r"(?:[^\s\"']|(?<![:,\s{[])['\"])*)"
     r"[ \t]*(?:" + _CREDENTIAL_NARRATION_BIND_OP + r")[ \t]*"
-    r"(?P<open>" + _WRAPPER_OPEN_CLASS + r")?"
-    r"(?P<value>(?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+))"
-    r"(?P<close>" + _WRAPPER_CLOSE_CLASS + r")?"
+    r"(?P<token>(?:" + _WRAPPER_OPEN_CLASS + r"[ \t]*)*"
+    r"(?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+)"
+    r"(?:[ \t]*" + _WRAPPER_CLOSE_CLASS + r")*)"
     r"(?![A-Za-z0-9_\u4e00-\u9fff])"
 )
-
-
-def _exact_assign_wrapper_mismatch(m: re.Match[str]) -> bool:
-    """True when the exact-registered-base assignment ``m`` (R37 Block 65)
-    carries an ILLEGAL STRUCTURAL wrapper — the value OPENS with a wrapper
-    character but the closing char is missing or is not the opener's pair
-    (``verification code is [plannerV2`` / ``verification code is (plannerV2]``).
-    A bare value or a value whose opener has its own matching pair
-    (``(plannerV2)`` / ``[plannerV2]``) is a tolerable mask and not a mismatch —
-    the documented-path exemption then decides it.  R38 Block 67: a MISSING
-    close is only a mismatch for a NON-self-pairing bracket (``[`` / ``(`` /
-    ``{`` / ``<`` and the Unicode paired brackets) — a self-pairing quote /
-    backtick opener (``"`` / ``'`` / ``` ``) with no close is the JSON string
-    delimiter that opens a LONGER value (``"summary":"plannerV2 providerV4"``),
-    not an illegal wrapper, so the documented-path exemption still decides it."""
-    open_c = m.group("open")
-    close_c = m.group("close")
-    if open_c is None:
-        return False
-    pair = _WRAPPER_PAIR.get(open_c)
-    if close_c is None:
-        return pair != open_c
-    return pair != close_c
 
 
 def _documented_version_field_exempt(m: re.Match[str]) -> bool:
@@ -2036,7 +2052,7 @@ def _documented_version_field_exempt(m: re.Match[str]) -> bool:
     if len(field) >= 2 and field[-1] in "\"'":
         field = field[:-1].strip()
     path = tuple(part.strip().lower() for part in field.split("."))
-    return _registered_base_value_exempt_at_path(path, m.group("value"))
+    return _registered_base_value_exempt_at_path(path, m.group("token"))
 
 
 def _credential_narration_binds(text: str) -> bool:
@@ -2065,10 +2081,16 @@ def _credential_narration_binds(text: str) -> bool:
         if _REGISTERED_BASE_TOKEN_IN_VALUE_RE.search(m.group("value")):
             return True
     for m in _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE.finditer(text):
-        # R37 Block 65: a missing/mismatched wrapper pair around the exact base
-        # (``code is [plannerV2`` / ``code is (plannerV2]``) is an illegal
-        # structural appearance and fails closed before the exemption check.
-        if _exact_assign_wrapper_mismatch(m):
+        # R37/R39: the exact-base assignment resolves through the SHARED bounded
+        # structural wrapper parser ``_registered_base_value_info`` — the SAME
+        # resolver the JSON path uses — so free text and JSON share one nested +
+        # inner-whitespace strip with a budget.  A NESTED / inner-whitespace
+        # wrapper (``((plannerV2))`` / ``【“plannerV2”】`` / ``[ plannerV2 ]``)
+        # resolves to the exact base, and a budget-exhausted / mismatched /
+        # unclosed wrapper (``(plannerV2]`` / ``(plannerV2``) is an illegal
+        # structural appearance that fails closed BEFORE the documented-path
+        # exemption decides.
+        if _registered_base_value_info(m.group("token")) is _WRAPPED_BASE_ILLEGAL:
             return True
         if _documented_version_field_exempt(m):
             continue

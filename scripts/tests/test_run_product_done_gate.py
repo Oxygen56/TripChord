@@ -17199,3 +17199,234 @@ def test_r38_full_chain_producer_seal_consumer_block67_68_both_finals(
             "ev.json",
             credential_field_check=True,
         )
+
+def test_r39_block69_bounded_structural_wrapper_both_paths() -> None:
+    r"""C-122 round-39 Block 69 (supervision 10:16): free text and JSON must
+    SHARE the bounded structural wrapper parser for an exact registered base —
+    a NESTED or inner-whitespace wrapper run (double parens, the CJK
+    corner-bracket pair enclosing the LEFT/RIGHT DOUBLE QUOTATION MARKS, square
+    brackets with inner whitespace) around the base in a credential-narration
+    assignment resolves to the same registered base and fails closed on BOTH
+    finals, exactly like the JSON member-value path.  A wrapper that is
+    budget-exhausted, MISMATCHED (``(plannerV2]``) or UNCLOSED (``(plannerV2``)
+    is an illegal structural appearance and fails closed.  The documented
+    business-value paths and the prose positives keep their exemption."""
+    LQ, RQ = "\u201c", "\u201d"
+    CJL, CJR = "\u3010", "\u3011"
+    b69_reject = (
+        "verification code is ((plannerV2))",
+        "verification code is " + CJL + LQ + "plannerV2" + RQ + CJR,
+        "verification code is [ plannerV2 ]",
+        "verification code is (plannerV2]",
+        "verification code is (plannerV2",
+        '{"otp": "((plannerV2))"}',
+        '{"otp": "' + CJL + LQ + "plannerV2" + RQ + CJR + '"}',
+        '{"otp": "[ plannerV2 ]"}',
+        '{"otp": "(plannerV2]"}',
+        '{"otp": "(plannerV2"}',
+        # nesting deeper than the structural bound stays a wrapped exact base
+        "verification code is " + "(" * 12 + "plannerV2" + ")" * 12,
+        '{"otp": "' + "[" * 12 + "plannerV2" + "]" * 12 + '"}',
+    )
+    for raw in b69_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in (
+        "planner_version = plannerV2",
+        "plan.planner_version = plannerV2",
+        '{"summary": "plannerV2 providerV4"}',
+        '{"planner_version": "' + LQ + "plannerV2" + RQ + '"}',
+        '{"summary": "' + LQ + "plannerV2" + RQ + ' released"}',
+        "access is granted to plannerV2 users",
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r39_block70_digest_budget_exhaustion_fail_closed_both_paths() -> None:
+    r"""C-122 round-39 Block 70 (supervision 10:16): when the Digest
+    response-value wrapper strip EXHAUSTS its budget with a wrapper layer still
+    open, the value fails CLOSED instead of falling back to a fullmatch on the
+    wrapper residue — a response value nested deeper than the structural bound
+    is a wrapped credential shape on BOTH finals, as is the boundary value that
+    strips cleanly to the bare hex.  The algorithm-description narrations and
+    the non-hex prose positives keep their acceptance — the recovery never
+    diverges from the normal parse."""
+    b70_reject = (
+        "service Digest username=\"user\", response=" + "(" * 8 + "deadbeef" + ")" * 8,
+        "service Digest username=\"user\", response=" + "(" * 9 + "deadbeef" + ")" * 9,
+        "service Digest username=\"user\", response=" + "(" * 10 + "deadbeef" + ")" * 10,
+        "service Digest username=\"user\", response=" + "(" * 12 + "deadbeef" + ")" * 12,
+        'service Digest username="user", bad="unterminated, response='
+        + "(" * 9
+        + "deadbeef"
+        + ")" * 9,
+    )
+    for raw in b70_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in (
+        'client digest note="response=deadbeef", algorithm=md5',
+        'client digest algorithm="md5 response=deadbeef"',
+        "WWW-Authenticate: Digest realm=\"test\", nonce=abc123",
+        'service Digest username="user", response=xyz',
+        'service Digest username="user", response=deadbeefxyz',
+        'service Digest username="user", response=deadbeef.g',
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r39_full_chain_producer_seal_consumer_block69_70_both_finals(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-39 full chain (Block 69 + Block 70): the producer masks the
+    nested / inner-whitespace-wrapped registered base and the deeply-wrapped
+    Digest response credential BEFORE the 0600 seal, so the sealed diagnostic
+    and the consumer-synthesized field are clean and BOTH finals pass; the RAW
+    value still fails BOTH finals (defense in depth).  The documented business
+    paths with a wrapped base and the algorithm-narration prose survive the
+    seal untouched."""
+    from benchmarks import live_canary_certified as canary
+
+    LQ, RQ = "\u201c", "\u201d"
+    CJL, CJR = "\u3010", "\u3011"
+    raw_cases = (
+        "verification code is ((plannerV2))",
+        "verification code is " + CJL + LQ + "plannerV2" + RQ + CJR,
+        "verification code is [ plannerV2 ]",
+        "service Digest username=\"user\", response=" + "(" * 9 + "deadbeef" + ")" * 9,
+        "service Digest username=\"user\", response=" + "(" * 11 + "deadbeef" + ")" * 11,
+    )
+    for raw in raw_cases:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r39b6970",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in (
+        '{"planner_version": "' + LQ + "plannerV2" + RQ + '"}',
+        "plan.planner_version = plannerV2",
+        '{"summary": "' + LQ + "plannerV2" + RQ + ' released"}',
+        "access is granted to plannerV2 users",
+        'client digest note="response=deadbeef", algorithm=md5',
+        'client digest algorithm="md5 response=deadbeef"',
+    ):
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked
+        assert "plannerV2" in masked or "deadbeef" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r39b6970",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
