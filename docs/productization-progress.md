@@ -6,11 +6,11 @@
 
 ## 当前状态
 
-- **当前版本**：v1.0 Done-Gate C-122 R42（Block 76–77 监督退回续跑收口）——监督退回的 Block 76/77 全部关闭：JSON 与自由文本解析路径拆分，共享 verified registered-base 核心。Block 76 结构尾部 fail-closed（`verification code is (plannerV2)note)`/`note]`/`note}`/`note))))`/`note"`/`note.`/跨行 `note␊=` 及 JSON 未授权路径同型值一律拒绝；**任何 envelope closer 不无条件剥除**——JSON 路径按真实 JSON 结构/字段边界、自由文本按独立完整句结构判定，余部残留任何结构符号/句终止符/跨行算子即 fail-closed）；Block 77 正常语言降门（`(plannerV2) is a version`/`— a note`/`isn't active`/`non-secret version` 接受；**不依赖「每词 ≥2 字母」或禁撇号/连字符的自造词表**——`_is_natural_word_token` 只认 ASCII 字母（内嵌撇号/连字符合法）+CJK 串+单字母虚词 a/i，`x=`/`_=`/`_note` 及 Block76 结构伪装仍拒绝）。共享模块 `tripchord._secret_redact` 修复：`_exact_value_at_free_text_boundary`（仅当赋值位于引号串内时先剥合法 JSON 围栏）、`_quoted_string_spans`、`_is_natural_word_token`、`_is_natural_language_phrase` 去字符表；JSON walker 走 `_registered_base_value_info` 未加引号共享核心。全量 1008 passed（apps/api/tests + benchmarks/tests）、clean-env 505 passed（scripts/tests）、ruff 全绿。
-- **当前分支**：`productization/v1.0`（未 push；API 已在提交 `fa88479` 受控重启并硬校验 provenance 三哈希匹配，pid 40902）
+- **当前版本**：v1.0 Done-Gate C-122 R42（Block 76–78 监督退回续跑收口）——监督退回的 Block 76/77 全部关闭：JSON 与自由文本解析路径拆分，共享 verified registered-base 核心。Block 76 结构尾部 fail-closed（`verification code is (plannerV2)note)`/`note]`/`note}`/`note))))`/`note"`/`note.`/跨行 `note␊=` 及 JSON 未授权路径同型值一律拒绝；**任何 envelope closer 不无条件剥除**——JSON 路径按真实 JSON 结构/字段边界、自由文本按独立完整句结构判定，余部残留任何结构符号/句终止符/跨行算子即 fail-closed）；Block 77 正常语言降门（`(plannerV2) is a version`/`— a note`/`isn't active`/`non-secret version` 接受；**不依赖「每词 ≥2 字母」或禁撇号/连字符的自造词表**——`_is_natural_word_token` 只认 ASCII 字母（内嵌撇号/连字符合法）+CJK 串+单字母虚词 a/i，`x=`/`_=`/`_note` 及 Block76 结构伪装仍拒绝）。共享模块 `tripchord._secret_redact` 修复：`_exact_value_at_free_text_boundary`（仅当赋值位于引号串内时先剥合法 JSON 围栏）、`_quoted_string_spans`、`_is_natural_word_token`、`_is_natural_language_phrase` 去字符表；JSON walker 走 `_registered_base_value_info` 未加引号共享核心。Block 78（监督 14:52 增量）按 **Unicode 词法类+句法位置**区分句末/从句标点与结构尾部：多词句每词可带一个句末/从句终结符（`is a version.`/`is a version;`/`is a version, not a secret`）、Unicode 弯引号（U+2018/2019）与任意 `Pd` 破折号（含 U+2011 非断连字符）为**词内**分隔符（`isn't` 弯引号形式/`non-secret` U+2011 形式）、CJK 句为单 whitespace token（`这是版本。`）；`note.`/`version.` 单 ASCII 词+终结符（Block76 伪装）、`x=`/`_=`、跨行算子、结构尾部仍 fail-closed（Block 73–77 不回归）。全量 1008 passed（apps/api/tests + benchmarks/tests）、clean-env 507 passed（scripts/tests）、ruff 全绿。
+- **当前分支**：`productization/v1.0`（未 push；API 已在提交 `eb68a44` 受控重启并硬校验 provenance 三哈希匹配，pid 48622）
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
-- **最后完成的最小任务**：C-122 R42 Block 76–77 收口——全量 1008 passed、clean-env 505 passed、ruff 全绿、API 绑定 `fa88479`、六层门从头重跑如实记录（层 1/2/3/4 PASS、层 5/6 FAIL pending user authorization、passed=false、exit 2、worktree 干净、evidence_commit 未提交），passed=true 前不声称通过。R40（Block 71–73，提交 `9f31333`/`50f45a9`）与 R41（Block 74–75，提交 `a24635a`）代码已提交、回归全绿、API 曾重启，但六层门/账本因 TCC 被阻断，统一并入本轮 R42 在最终 HEAD `fa88479` 上收口。
+- **最后完成的最小任务**：C-122 R42 Block 78 收口（监督 14:52 增量，直接并入 R42 现有运行）——Block 78 代码+正式正反例+L6 如实报告修复提交 `eb68a44`；全量 1008 passed、clean-env 507 passed、ruff 全绿（RUF002/003 注释歧义 Unicode 已改写）、API 绑定 `eb68a44`（provenance 三哈希匹配，pid 48622）、六层门从头重跑如实记录（层 1/2/3/4 PASS、层 5 FAIL pending user authorization、层 6 FAIL 如实报告 executor 在 done-gate 前于 `companion_preflight` 失败、passed=false、exit 2、worktree 干净、evidence_commit 未提交），passed=true 前不声称通过。R40（Block 71–73，提交 `9f31333`/`50f45a9`）与 R41（Block 74–75，提交 `a24635a`）代码已提交、回归全绿，六层门/账本统一并入 R42 在最终 HEAD 收口。
 
 ## 版本状态
 
@@ -152,13 +152,27 @@
 | `launchctl kickstart -k gui/<uid>/com.tripchord.live-api` | API 受控重启绑定**最终 HEAD=`fa88479`**；`verify_api_runtime_provenance.py` provenance `passed=true`、`commit_sha`=`fa8847926b47fdc53c0a2996a52f98e1eda0ba87`/`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 40902、mismatches 空 |
 | `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit fa8847926b47fdc53c0a2996a52f98e1eda0ba87 --commit-evidence` | 从零重跑严格六层门（run_id=`7bb23abd343a`，evidence `gate-20260812T064713Z-7bb23abd343a`），tested_commit_sha=`fa88479`：层 1/2/3/4 PASS（层 4 required-model smoke 实际运行通过）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL（pending user authorization：全平台 E2E 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权后真实执行）；`passed=false` 退出码 2（`--commit-evidence` + passed=false 恒 return 2）、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）；证据 `.runtime/done-gate-evidence/gate-20260812T064713Z-7bb23abd343a/product-v1-done-gate.json`。`passed=false` 如实记录，不包装为收口；passed=true 前不启 C-125 |
 
+### 第四十二轮（续，C-122 R42 Block 78 监督 14:52 增量修正 + L6 诊断）验证结果
+
+> 监督 14:52：Block 78 修复直接并入现有 R42 运行，禁止另开写者/提前交付/审查；完成 Block 78 后必须诊断并修复/重跑 L6 至产生真实报告（L5 授权不足如实保留）。本表全部命令在最终 HEAD `eb68a44` 上执行。
+
+| 命令 | 结果 |
+|---|---|
+| `uv run pytest scripts/tests/test_run_product_done_gate.py`（全量 gate 测试） | 479 passed，退出码 0（R42 Block 76–77 465 项 + Block 78 正式正反例 13 项 + L6 如实报告 1 项） |
+| `uv run pytest`（全量，apps/api/tests + benchmarks/tests + scripts/tests） | 1008 passed，退出码 0 |
+| `uv run python scripts/tests/run_tests_clean_env.py`（clean-env，scripts/tests 全量） | 507 passed，退出码 0（R42 505 + Block 78/L6 新增 2 项）；live `tripchord.db` 与 `.runtime/browser-bridge-state.json` 字节数与 mtime 均不变 |
+| `uv run ruff check .` | All checks passed（0 错误；Block 78 注释/docstring 中 RUF002/003 歧义 Unicode 已改写为字符名描述，`’`/`‑`/全角标点不再直接出现） |
+| `git rev-parse HEAD` | `eb68a44`（R42 Block 78 单提交；`_secret_redact.py` + `run_product_done_gate.py` + gate 测试） |
+| API 重启 + `uv run python scripts/verify_api_runtime_provenance.py` | API 受控重启绑定**最终 HEAD=`eb68a44`**；provenance `passed=true`、`commit_sha`=`eb68a44a9618c44b67746ac1c7fb49316dd6f913`、`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 48622、mismatches 空 |
+| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit eb68a44a9618c44b67746ac1c7fb49316dd6f913 --commit-evidence` | 从零重跑严格六层门（evidence `gate-20260812T104339Z-d688327b4b81`），tested_commit_sha=`eb68a44`：层 1/2/3/4 PASS（层 4 required-model smoke 实际运行通过）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL——**已如实报告真实 executor 失败**（`executor failed before the done gate at stage 'companion_preflight'`：浏览器 Companion 预检失败，未发现同时声明携程/去哪儿/同程且心跳未过期（>45s 过期）的已连接 Companion；实时搜索未提交），不再包装成「pending user authorization」通用文案；`passed=false` 退出码 2、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）；证据 `.runtime/done-gate-evidence/gate-20260812T104339Z-d688327b4b81/product-v1-done-gate.json`。`passed=false` 如实记录；L5/L6 均为真实未过，passed=true 前不启 C-125 |
+
 ## 当前可对外声明
 
 - v0.5/v0.6/v0.7 接入生产路径：reprice/handoff 端点 + 前端两步 handoff 流；预订保护 gate 被 Verifier/ReVerifier 与 live_system 事件重规划共同消费（v0.6 收尾完成）；SDK 冷却/一致性 API 接线。
 - v0.8 完整本地产品体验：启动器/向导 + 首页旅行工作流拆分 + 高技术细节默认折叠 + WCAG 已知缺口整改（字号 ≥12px / aria-live / 表单标签 / 目标尺寸）；v0.9 CI（Companion release gate + 安全扫描 + acceptance/faults benchmark）、本地可观测性端点。
 - v0.9 收尾完成：第三方 Actions SHA 固定（CI 不再跟随 `@v5/@v6` 浮动标签）、CycloneDX SBOM + 构建 provenance 漂移门（`source_digests` 绑定，避免 `commit_sha` 自引用失效）、job/monitor 可恢复持久化（重启后 ACTIVE 监控自动续跑、run 不可恢复如实 FAILED）、干净 Chrome + 本地 fixture 浏览器 E2E（CDP 驱动，无 Playwright/Puppeteer，验证四阶段工作流步骤条与回放规划渲染）。
 - 五类反表面端到端验收全 PASS（`benchmarks/evaluate_acceptance.py`）。
-- C-54 返工完成：层 5 改为 per-scope 认证 OTA canary（`live_canary_certified.py`，6 个 certified scope 逐项 fresh/authorized/read-only 证据，open-meteo/故宫 仅作公开页面连通性标注）；层 6 接入 `run_live_done_gate_v4.py` 真实 E2E 执行器（删除「gated behind layer 5」误导文案）。本机复跑层 1/2/3/4 PASS、层 5/6 如实 FAIL（pending user authorization）。
+- C-54 返工完成：层 5 改为 per-scope 认证 OTA canary（`live_canary_certified.py`，6 个 certified scope 逐项 fresh/authorized/read-only 证据，open-meteo/故宫 仅作公开页面连通性标注）；层 6 接入 `run_live_done_gate_v4.py` 真实 E2E 执行器（删除「gated behind layer 5」误导文案）。本机复跑层 1/2/3/4 PASS、层 5 FAIL（pending user authorization）、层 6 FAIL（executor 在 `companion_preflight` 失败——无已连接 Companion，实时搜索未提交），均如实记录。
 - **当前支持与默认选择的 provider × vertical（certified-active 精确集合，6 scope）**：`ctrip:flight`、`ctrip:lodging`、`qunar:flight`、`qunar:lodging`、`tongcheng:flight`、`icom:transfer`（默认选择按 certified-active 过滤，见 `platform/registry.py` `build_default_registry()`）。`tongcheng:lodging`（用户 2026-08-05 跳过）与 `fliggy:flight/lodging`（2026-08-04 验证门失败移出活跃矩阵，仅存于 `LEGACY_V4_CAPABILITIES`）均为 **DISABLED**，不在活跃矩阵。
 - 不做任何 Done-Gate 通过 / 双平台住宿精确报价 / 完整 OTA 闭环声明。
 
@@ -177,7 +191,7 @@ cd /Users/oxygen/Documents/个人项目/tripchord
 uv run python benchmarks/live_canary_certified.py --bridge-token "$(cat .runtime/browser-bridge-token)"
 TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence
 ```
-（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行。API 已受控重启并绑定新 HEAD=`fa88479`（C-122 R42 Block 76–77 收口提交，含 R40/R41 并账），provenance 三哈希匹配。）
+（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行——当前无已连接 Companion 时，层 6 如实报告 executor 在 `companion_preflight` 阶段失败（failed_before_done_gate），不包装为授权问题。API 已受控重启并绑定新 HEAD=`eb68a44`（C-122 R42 Block 76–78 收口提交，含 R40/R41 并账），provenance 三哈希匹配。）
 
 ## 基线记录（业务代码修改前）
 
