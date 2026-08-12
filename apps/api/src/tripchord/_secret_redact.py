@@ -783,7 +783,8 @@ def _is_digest_identity_params(params: dict[str, list[str]]) -> bool:
 # lengths the response credential accepts — with complete boundaries, so
 # ``response=abc`` prose or a hex run inside a longer token never matches.
 _DIGEST_RESPONSE_HEX_RE = re.compile(
-    r"(?i)(?:^|[^\w])response[ \t]*=[ \t]*(?P<token>[^\s,]+)"
+    r"(?i)(?:^|[^\w])response[ \t]*=[ \t]*"
+    r"(?P<token>[\"']?[!#$%&'*+\-.^_`|~0-9A-Za-z]+)"
 )
 
 
@@ -951,15 +952,18 @@ class _DigestAuthScan:
                 # R36 Block 64: a TERMINATED quoted value can still tear a
                 # ``response=<hex>`` binding — ``bad="unterminated, response="
                 # <32hex>"`` — the closing quote cuts the member short and the
-                # quoted hex dangles after it.  When the value text itself
-                # contains a ``response=`` binding (a normal member value never
-                # does), re-scan the line from the opening quote with the SAME
-                # any-non-empty-hex determination and extend the span to cover
-                # the swallowed tail, so the credential is not erased by the
-                # early closing quote.  A value without ``response=`` (e.g.
-                # ``algorithm="md5", response=<hex>``) stays untouched and the
-                # algorithm-description positive is preserved.
-                if re.search(r"(?i)response[ \t]*=", val):
+                # quoted hex dangles after it.  Re-scan the line from the
+                # opening quote with the SAME any-non-empty-hex determination
+                # and extend the span to cover the swallowed tail, so the
+                # credential is not erased by the early closing quote.
+                # R37 Block 66: the re-scan fires ONLY when the value ENDS
+                # with a torn ``response=`` binding (the tail the closing quote
+                # cut off) — a value that merely CONTAINS ``response=`` in its
+                # prose (``note="response=deadbeef"`` /
+                # ``algorithm="md5 response=deadbeef"``) is ordinary quoted
+                # prose, shares the normal parse's value determination, and is
+                # never re-scanned as a credential.
+                if re.search(r"(?i)response[ \t]*=[ \t]*$", val):
                     line_end = text.find("\n", value_start)
                     if line_end == -1:
                         line_end = n
@@ -1059,7 +1063,13 @@ class _DigestAuthScan:
             ):
                 continue
             if binding == "descriptor":
-                if _is_digest_identity_params(params) or malformed_response_hex:
+                # R37 Block 66: a malformed-member response is evaluated with
+                # the SAME syntax/value determination as a normally-parsed
+                # response — an algorithm-description digest (no identity)
+                # stays accepted even when the hex was swallowed by a
+                # malformed member, and the descriptor only fails closed on a
+                # real identity+response structure.
+                if _is_digest_identity_params(params):
                     spans.append((m.start(), end))
                     continue
                 if "algorithm" in params:
@@ -1099,11 +1109,14 @@ class _DigestAuthScan:
             # and must fail closed (恢复描述符上下文 Digest 任意 hex 拒绝, 含仅
             # response= 无身份参数形态).
             if binding == "descriptor":
-                # R36 Block 62: a real response swallowed by a malformed member
-                # is a credential even without an identity param — the syntax
-                # error cannot hide it behind the algorithm-description
-                # exception.
-                if _is_digest_identity_params(params) or malformed_response_hex:
+                # R37 Block 66: recovery shares the normal parse's
+                # determination — a malformed-member ``response=<hex>`` is the
+                # same credential signal as a parsed one (identity or
+                # identity-less descriptor with no algorithm fails closed;
+                # ``R28 Block 49``), and an algorithm-description digest with
+                # no identity stays accepted even when the hex sat inside a
+                # malformed member.
+                if _is_digest_identity_params(params):
                     return m
                 if "algorithm" in params:
                     continue
@@ -1658,24 +1671,78 @@ _REGISTERED_BASE_VALUE_RE = re.compile(
     r"(?P<suffix>V[0-9]+|[0-9]+)$"
 )
 
+# R37 Block 65: the exact-base PREFIX (no trailing ``$``) used to inspect what
+# immediately follows an opener in the illegal-structure branch — a base then a
+# WRONG closer or nothing (``(plannerV2]`` / ``[plannerV2``) is illegal
+# structure, a base then its MATCHING closer and prose (``(plannerV2) in the
+# report``) is a phrase, and a base then a word char (``(plannerV2plus)``) is a
+# longer non-base token.
+_REGISTERED_BASE_VALUE_PREFIX_RE = re.compile(
+    r"(?i)(?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+)"
+)
 
-def _registered_base_value_info(value: str) -> tuple[str, bool] | None:
+
+# R37 Block 65: the generic STRUCTURAL wrapper PAIRS a JSON/prose value uses
+# around an exact registered base — ``(plannerV2)`` / ``[plannerV2]`` /
+# ``{plannerV2}`` / ``<plannerV2>`` / ``'plannerV2'`` / ``"plannerV2"``.  A value
+# that OPENS with a wrapper character is a structural appearance: the wrapper is
+# a tolerable mask around the base only when it closes with its own PAIR.  A
+# missing or MISMATCHED closer (``(plannerV2]`` / ``[plannerV2``) is an ILLEGAL
+# STRUCTURAL APPEARANCE and must FAIL CLOSED (Block 65: 非法结构外观 一律
+# fail-closed), not read as a non-base phrase — 禁止继续枚举分隔符/括号, so the
+# wrapper set is the paired closure, not an enumerable list.
+_WRAPPER_PAIR: dict[str, str] = {
+    "(": ")",
+    "[": "]",
+    "{": "}",
+    "<": ">",
+    '"': '"',
+    "'": "'",
+}
+# Sentinel returned by :func:`_registered_base_value_info` for an ILLEGAL
+# STRUCTURAL wrapper (opener present, matching pair absent) — callers fail
+# closed (never exempt) on it.
+_WRAPPED_BASE_ILLEGAL = "WRAPPED_BASE_ILLEGAL"
+
+
+def _registered_base_value_info(value: str) -> tuple[str, bool] | str | None:
     """Resolve ``value`` to ``(base_lower, is_version_form)`` when it is an
     EXACT registered base value.  R36 Block 63: a balanced ``(...)`` /
     ``'...'`` / ``"..."`` wrapper around the exact base (``{"otp":
     "(plannerV2)"}`` — a JSON string or prose parenthetical wrapping the
     value) is unwrapped before the match, so an UNBOUND path carrying a
     wrapped exact base still fails closed instead of reading as a non-base
-    phrase.  Mismatched wrappers (``(plannerV2"``) and phrases that merely
-    mention a base (``"see (tokenizationV1)"``) are unchanged and stay
-    non-credentials."""
+    phrase.  R37 Block 65: the wrapper set is the generic structural PAIRS
+    ``()`` / ``[]`` / ``{}`` / ``<>`` / ``""`` / ``''``, and a value that
+    OPENS with a wrapper character must close with its PAIR — a missing or
+    mismatched closer (``(plannerV2]`` / ``[plannerV2``) returns the
+    ``_WRAPPED_BASE_ILLEGAL`` sentinel so the caller fails closed.  A phrase
+    that merely mentions a base (``"see (tokenizationV1)"``) or opens with a
+    parenthetical base then continues (``"(tokenizationV1) in the report"``)
+    is unchanged and stays a non-credential."""
     v = value.strip()
-    while len(v) >= 2 and v[0] in "\"'(":
-        opener, closer = v[0], v[-1]
-        pair = {"\"": "\"", "'": "'", "(": ")"}[opener]
-        if closer != pair:
-            break
-        v = v[1:-1].strip()
+    while len(v) >= 2 and v[0] in _WRAPPER_PAIR:
+        closer = _WRAPPER_PAIR[v[0]]
+        if v[-1] == closer:
+            v = v[1:-1].strip()
+            continue
+        # Outer wrapper is not closed at the very end.  An exact base that
+        # immediately follows the opener with a WRONG closer or nothing after
+        # it (``(plannerV2]`` / ``[plannerV2``) is an illegal structural
+        # appearance; a base followed by its MATCHING closer and then prose
+        # (``(tokenizationV1) in the report``) is a phrase; a base followed by a
+        # word char (``(plannerV2plus)``) is a longer non-base token; and any
+        # content that is not an exact base right after the opener is a phrase.
+        inner = v[1:].lstrip()
+        m = _REGISTERED_BASE_VALUE_PREFIX_RE.match(inner)
+        if m is not None:
+            rest = inner[m.end():]
+            if rest[:1] == closer:
+                return None
+            if rest[:1] and rest[0].isalnum():
+                return None
+            return _WRAPPED_BASE_ILLEGAL
+        return None
     m = _REGISTERED_BASE_VALUE_RE.match(v)
     if m is None:
         return None
@@ -1731,6 +1798,8 @@ def _registered_base_value_exempt_at_path(
     info = _registered_base_value_info(value)
     if info is None:
         return True
+    if info is _WRAPPED_BASE_ILLEGAL:
+        return False
     base, _is_version = info
     allowed = _DOCUMENTED_BUSINESS_VALUE_PATHS.get(path)
     if allowed is None:
@@ -1754,18 +1823,42 @@ def _registered_base_value_exempt_at_path(
 # parenthetical uses (``{"planner_version": "plannerV2"}`` /
 # ``verification code is 'plannerV2'`` / ``verification code is (plannerV2)``)
 # tolerated — R36 Block 61 extends the wrapper class from ``\"?`` to all three.
+# R37 Block 65: the wrapper is now the generic structural PAIR set ``()`` /
+# ``[]`` / ``{}`` / ``<>`` / ``""`` / ``''`` (``verification code is
+# [plannerV2]``), and the field continuation is a PRINCIPLED NEGATIVE class —
+# every structural separator (``\`` / ``::`` / ``/`` / ``.`` / ``[`` …) is a
+# legal path character, so no separator is ever enumerated.
+# ``evil\planner_version = plannerV2`` / ``evil::planner_version = plannerV2``
+# are one complete field and fail closed; a missing/mismatched wrapper pair
+# (``code is [plannerV2`` / ``code is (plannerV2]``) is an illegal structural
+# appearance and fails closed.
 # ``access is granted to plannerV2 users`` (value is a phrase, not the exact
 # base) and a bare ``plannerV2 providerV4`` run (no bind operator) stay exempt
 # — only the exact-value assignment is a credential.
 _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_\u4e00-\u9fff])"
-    r"(?P<field>[\w\u4e00-\u9fff/\[\]][\w\u4e00-\u9fff./\[\]-]*)"
+    r"(?P<field>[\w\u4e00-\u9fff/\[\]][^\s\"'=]*)"
     r"[ \t]*(?:" + _CREDENTIAL_NARRATION_BIND_OP + r")[ \t]*"
-    r"(?:[\"'(])?"
+    r"(?P<open>[\"'(\[{<])?"
     r"(?P<value>(?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+))"
-    r"(?:[\"')])?"
+    r"(?P<close>[\"')}\]>])?"
     r"(?![A-Za-z0-9_\u4e00-\u9fff])"
 )
+
+
+def _exact_assign_wrapper_mismatch(m: re.Match[str]) -> bool:
+    """True when the exact-registered-base assignment ``m`` (R37 Block 65)
+    carries an ILLEGAL STRUCTURAL wrapper — the value OPENS with a wrapper
+    character but the closing char is missing or is not the opener's pair
+    (``verification code is [plannerV2`` / ``verification code is (plannerV2]``).
+    A bare value or a value whose opener has its own matching pair
+    (``(plannerV2)`` / ``[plannerV2]``) is a tolerable mask and not a mismatch —
+    the documented-path exemption then decides it."""
+    open_c = m.group("open")
+    close_c = m.group("close")
+    if open_c:
+        return close_c is None or _WRAPPER_PAIR.get(open_c) != close_c
+    return False
 
 
 def _documented_version_field_exempt(m: re.Match[str]) -> bool:
@@ -1809,6 +1902,11 @@ def _credential_narration_binds(text: str) -> bool:
         if _REGISTERED_BASE_TOKEN_IN_VALUE_RE.search(m.group("value")):
             return True
     for m in _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE.finditer(text):
+        # R37 Block 65: a missing/mismatched wrapper pair around the exact base
+        # (``code is [plannerV2`` / ``code is (plannerV2]``) is an illegal
+        # structural appearance and fails closed before the exemption check.
+        if _exact_assign_wrapper_mismatch(m):
+            return True
         if _documented_version_field_exempt(m):
             continue
         return True
