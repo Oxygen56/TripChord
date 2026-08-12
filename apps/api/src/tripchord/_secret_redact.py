@@ -2120,78 +2120,103 @@ def _documented_version_field_exempt(m: re.Match[str]) -> bool:
     return _registered_base_value_exempt_at_path(path, m.group("token"))
 
 
-# R40 Block 74/75: a semantic boundary that TERMINATES an exact-value
-# assignment is decided by a MEANINGFUL NATURAL-LANGUAGE PHRASE, never by a
-# character table or a single word-initial char.  End of text / end of line
-# means the wrapped value COMPLETELY consumed the boundary and the exact-value
-# rule applies.  The ONLY prose acceptance is a phrase on the SAME line made of
-# real words (TWO or more letters / CJK with only natural whitespace between
-# them), optionally introduced by a prose dash (``verification code is
-# (plannerV2) in the report`` / ``(plannerV2)版本`` / ``(plannerV2) — note``).
-# Block 74: the phrase is validated COMPLETE, not by its first character — a
-# single-character placeholder (``x`` / ``_``), an assignment / path / structure
-# operator (``=`` / ``:`` / ``;`` / ``,`` / ``/`` / ``\`` / ``|`` / ``#`` /
-# ``@`` / ``{`` / ``}`` / ``[`` / ``]`` / ``(`` / ``)`` / ``<`` / ``>``), or an
-# underscore pseudo-word (``_=`` / ``_note``) is NOT prose, so a structural
-# symbol can never hide behind a one-character word-initial prefix.  Block 75:
-# a prose dash that introduces real words (``(plannerV2) — note``) is restored
-# as acceptance, but a dash followed by a structural operator (``— =`` /
-# ``— /next``) fails closed.  A sentence terminator / structural separator /
-# dangling closer / EOL / EOT means the wrapped value COMPLETELY consumed the
-# boundary and the exact-value rule applies — the caller's documented-path
-# exemption decides it.
+# R40 Block 74/75, R42 Block 76/77: a semantic boundary that TERMINATES an
+# exact-value assignment is decided by a MEANINGFUL NATURAL-LANGUAGE PHRASE,
+# never by a character table and never by a single word-initial char.  End of
+# text / end of line means the wrapped value COMPLETELY consumed the boundary
+# and the exact-value rule applies.  The ONLY prose acceptance is an
+# INDEPENDENT complete sentence structure on the SAME line, optionally
+# introduced by a prose dash (``verification code is (plannerV2) in the
+# report`` / ``(plannerV2)版本`` / ``(plannerV2) — note``).
+#
+# R42 Block 76 (structural tail): NO envelope closer is stripped
+# unconditionally.  A dangling structural symbol / sentence terminator /
+# cross-line operator right after the wrapped value is an UNCONSUMED boundary,
+# so ``(plannerV2)note)`` / ``note]`` / ``note}`` / ``note))))`` / ``note"`` /
+# ``note.`` / ``note␊=`` fail closed on the free-text narration path AND on the
+# JSON member-value path (the JSON walker already hands the UNQUOTED string
+# content, so the JSON path never needs — and never does — a context-free
+# envelope strip).  The JSON and free-text paths are separate: JSON uses the
+# real JSON structure/field boundaries (the walker), free text uses this
+# independent sentence structure; both share the ``_registered_base_value_info``
+# core.
+#
+# R42 Block 77 (normal language): a real word is an ASCII letter run with
+# optional INTERNAL apostrophes (``isn't`` / ``don't``) and hyphens
+# (``non-secret``), or a CJK run, or the single-letter English function words
+# ``a`` / ``I`` — NEVER a ``two-or-more-letters / alpha-only`` table that
+# rejects articles, contractions and hyphenated words.  A single-char
+# placeholder (``x`` / ``_``), an underscore pseudo-word (``_note``), a leading
+# / trailing / doubled apostrophe or hyphen (``-version`` / ``note-``), and any
+# structural / quote / punctuation char anywhere in the phrase (``x=`` / ``_=``
+# / ``— =`` / ``— /next`` / ``,`` / ``;`` / ``:`` / ``.`` / ``。``) is NOT
+# prose — the remainder is a boundary and the exact-value rule applies, so the
+# caller's documented-path exemption decides it.
 _NATURAL_PROSE_DASHES = frozenset(("—", "–"))
-_SENTENCE_TERMINATORS = frozenset(".!?。！？…")
-_STRUCTURAL_OR_OPERATOR_CHARS = frozenset("=:;/,|\\#@{}[]()<>")
-# JSON / syntax envelope that may trail a phrase inside a scanned file — the
-# string close (``"`` / ``'``) and the enclosing structure closers
-# (``"summary": "… report"}`` → the phrase ends at ``report``, then ``"}"``
-# closes the JSON).  A trailing envelope is NOT prose and NOT part of the
-# value, so it is stripped before the word-phrase validation.
-_JSON_ENVELOPE_CLOSERS = frozenset("\"'}>])")
+# R42 Block 77: the single-letter English function words (article ``a`` /
+# pronoun ``I``) are real words; a bare single-letter placeholder (``x``) is
+# not.  This is grammar, not a lexical ban table.
+_SINGLE_LETTER_FUNCTION_WORDS = frozenset(("a", "i"))
+
+
+def _is_natural_word_token(token: str) -> bool:
+    """True when ``token`` is a REAL natural-language word: an ASCII letter run
+    with optional INTERNAL apostrophes / hyphens (``isn't`` / ``non-secret``),
+    a CJK run, or the single-letter function words ``a`` / ``I``.  A
+    single-char placeholder (``x`` / ``_``), an underscore pseudo-word
+    (``_note``), a leading / trailing / doubled apostrophe or hyphen
+    (``-version`` / ``note-`` / ``a--b``) and any structural / quote /
+    punctuation / digit char are NOT words."""
+    if not token:
+        return False
+    if "_" in token:
+        return False
+    # a CJK run is a word (``版本``); a CJK run plus ANY non-CJK char — a CJK
+    # sentence terminator (``版本。``) — is a boundary, never prose
+    if all("一" <= ch <= "鿿" for ch in token):
+        return True
+    letters = 0
+    prev = ""
+    for idx, ch in enumerate(token):
+        if ch.isalpha():
+            letters += 1
+            prev = ch
+        elif ch in "'-":
+            # an apostrophe / hyphen is a word char only INTERNAL to the word
+            # (a letter on both sides) and not doubled
+            if idx == 0 or idx == len(token) - 1 or prev == ch:
+                return False
+            prev = ch
+        else:
+            return False
+    if letters == 1:
+        return token.lower() in _SINGLE_LETTER_FUNCTION_WORDS
+    return letters >= 2
 
 
 def _is_natural_language_phrase(rest: str) -> bool:
     """True when ``rest`` (trailing text right after a fully balanced wrapper,
     leading spaces/tabs already stripped) is a MEANINGFUL natural-language
     lexical phrase — the wrapped value did NOT completely consume a semantic
-    boundary and is a phrase, not an exact credential value."""
-    # a phrase is judged on the SAME line the wrapped value appears; an EOL
-    # ends the phrase context (Block 72)
-    rest = rest.split("\r", 1)[0].split("\n", 1)[0]
+    boundary and is a phrase, not an exact credential value.  The phrase is an
+    INDEPENDENT complete sentence structure on the SAME line: every
+    whitespace-separated token must be a real word and NO structural symbol,
+    quote, sentence terminator, underscore or cross-line operator may appear —
+    the wrapped value fails closed when any unconsumed boundary symbol sits in
+    the remainder (R42 Block 76/77)."""
+    # a phrase is judged on the SAME line the wrapped value appears; a
+    # cross-line operator / EOL is a boundary the value fully consumed
+    # (``(plannerV2)note␊=`` — Block 76)
+    if "\r" in rest or "\n" in rest:
+        return False
+    rest = rest.lstrip(" \t")
     # a prose dash (em / en dash) may introduce the phrase; a lone dash is not
     while rest and rest[0] in _NATURAL_PROSE_DASHES:
         rest = rest[1:]
     rest = rest.lstrip(" \t")
     if not rest:
         return False
-    # a trailing JSON / syntax envelope (``"`` / ``'`` / ``}`` / ``]`` / ``)``)
-    # is not part of the prose — the free-text narration scan sees it when the
-    # phrase sits inside a JSON string value (``"summary": "… in the report"}``)
-    while rest and rest[-1] in _JSON_ENVELOPE_CLOSERS:
-        rest = rest[:-1]
-    rest = rest.rstrip(" \t")
-    if not rest:
-        return False
-    # an assignment / path / structure operator ANYWHERE in the prose is not
-    # prose (``x=`` / ``_=`` / ``— /next`` / ``,`` / ``;`` / ``:``)
-    if any(ch in _STRUCTURAL_OR_OPERATOR_CHARS for ch in rest):
-        return False
-    words = rest.split()
-    if not words:
-        return False
-    # the LAST word may carry ONE sentence-final terminator (``note.`` /
-    # ``版本。``); a terminator anywhere else is a boundary
-    last = words[-1]
-    if len(last) > 1 and last[-1] in _SENTENCE_TERMINATORS:
-        words[-1] = last[:-1]
-        if any(ch in _SENTENCE_TERMINATORS for ch in words[-1]):
-            return False
-    # a real word is TWO or more letters / CJK — a single-char placeholder
-    # (``x`` / ``_``), an underscore pseudo-word (``_note``), a dotted /
-    # hyphenated / embedded-punctuation token (``.next`` / ``-version`` /
-    # ``版本。then``) is not a word
-    return all(len(word) >= 2 and word.isalpha() for word in words)
+    return all(_is_natural_word_token(word) for word in rest.split())
 
 
 def _exact_value_at_semantic_boundary(text: str, end: int) -> bool:
@@ -2212,6 +2237,83 @@ def _exact_value_at_semantic_boundary(text: str, end: int) -> bool:
     if not rest or rest[0] in "\r\n":
         # end of text, or a line boundary the value fully consumed
         return True
+    return not _is_natural_language_phrase(rest)
+
+
+# R42 Block 76: the JSON string-value close (``"`` / ``'``) plus the enclosing
+# JSON structure closers (``]`` / ``}``) that may follow an assignment that sits
+# INSIDE a JSON string value.  When the free-text narration scan meets such a
+# remainder, the envelope is the DOCUMENT's own structure (the assignment is
+# inside a quote-delimited string that opened earlier), not an assignment tail —
+# it is stripped before the sentence check.  An UNMATCHED closer in free text
+# (``(plannerV2)note)`` / ``note]`` / ``note}`` / ``note))))`` / ``note"``) has
+# no opener and is never stripped: it stays in the remainder and fails closed.
+_JSON_STRUCTURE_CLOSERS = frozenset("]}")
+
+
+def _quoted_string_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Return ``(start, close)`` spans of every quote-delimited string in
+    ``text`` (``start`` = the opening quote's index, ``close`` = the closing
+    quote's index; backslash escapes are skipped so ``\\"`` does not toggle the
+    state; an unclosed trailing string has ``close`` = len).  Used once per
+    free-text narration scan (R42 Block 76) to decide whether an assignment's
+    position is INSIDE a string value — i.e. a trailing quote is the document's
+    own string close, not an assignment tail."""
+    spans: list[tuple[int, int]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "\"'":
+            quote = ch
+            start = i
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            spans.append((start, i))
+        else:
+            i += 1
+    return tuple(spans)
+
+
+def _exact_value_at_free_text_boundary(
+    text: str, end: int, spans: tuple[tuple[int, int], ...]
+) -> bool:
+    """R42 Block 76: the free-text narration variant of
+    :func:`_exact_value_at_semantic_boundary` — True when the exact-base
+    assignment token ending at ``end`` COMPLETELY consumes a semantic boundary.
+    When the assignment sits inside a quote-delimited string (``spans`` has an
+    open string around ``end``), a LEGITIMATE trailing JSON envelope — the string
+    close plus the ``]``/``}`` structure closers after it — is the document's own
+    structure and is stripped before the sentence check, so a JSON-embedded
+    narration remainder (``"summary": "verification code is (plannerV2) in the
+    report"}``) is judged on the string CONTENT, never on the document envelope.
+    An UNMATCHED closer in free text has no opener, is never stripped, and fails
+    closed.  The JSON member-value path does not need this — the JSON walker
+    already hands UNQUOTED string values to the shared
+    :func:`_is_natural_language_phrase` core."""
+    after = text[end:]
+    if not after:
+        return True
+    rest = after.lstrip(" \t")
+    if not rest or rest[0] in "\r\n":
+        # end of text, or a line boundary the value fully consumed
+        return True
+    if any(start < end < close for start, close in spans):
+        # the assignment is inside a JSON string value: the trailing envelope is
+        # the document's own string close + structure closers — strip it
+        rest = rest.rstrip(" \t")
+        while rest and rest[-1] in _JSON_STRUCTURE_CLOSERS:
+            rest = rest[:-1]
+        if rest and rest[-1] in "\"'":
+            rest = rest[:-1]
+        rest = rest.rstrip(" \t")
     return not _is_natural_language_phrase(rest)
 
 
@@ -2240,6 +2342,14 @@ def _credential_narration_binds(text: str) -> bool:
     for m in _CREDENTIAL_NARRATION_ASSIGN_RE.finditer(text):
         if _REGISTERED_BASE_TOKEN_IN_VALUE_RE.search(m.group("value")):
             return True
+    # R42 Block 76: the free-text path precomputes the quote-delimited string
+    # spans ONCE so a trailing JSON envelope (the string close of a value the
+    # assignment sits inside, plus the enclosing ``]``/``}``) is recognised as
+    # the document's own structure — NOT a credential structural tail.  The JSON
+    # member-value path is separate: it walks REAL JSON and hands UNQUOTED values
+    # to the shared ``_registered_base_value_info`` core, so it never needs —
+    # and never does — a context-free envelope strip.
+    spans = _quoted_string_spans(text)
     for m in _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE.finditer(text):
         # R37/R39: the exact-base assignment resolves through the SHARED bounded
         # structural wrapper parser ``_registered_base_value_info`` — the SAME
@@ -2257,16 +2367,20 @@ def _credential_narration_binds(text: str) -> bool:
             # a phrase (``see (tokenizationV1)``) — never an exact-value
             # assignment, never a credential
             continue
-        # R40 Block 73/74/75: the exact-value rule applies ONLY when the wrapped
-        # value COMPLETELY consumes a semantic boundary — end of line / end of
-        # text / a NON-PHRASE continuation (sentence terminator, structural
-        # separator, assignment operator, single-char placeholder, underscore
-        # pseudo-word, dangling closer).  Trailing MEANINGFUL natural-language
-        # phrase (``verification code is (plannerV2) in the report`` /
-        # ``(plannerV2)版本`` / ``(plannerV2) — note``) makes the assignment a
+        # R40 Block 73/74/75 + R42 Block 76/77: the exact-value rule applies
+        # ONLY when the wrapped value COMPLETELY consumes a semantic boundary —
+        # end of line / end of text / a NON-PHRASE continuation (sentence
+        # terminator, structural separator, assignment operator, single-char
+        # placeholder, underscore pseudo-word, dangling closer, cross-line
+        # operator).  Trailing MEANINGFUL natural-language phrase on the SAME
+        # line (``verification code is (plannerV2) in the report`` /
+        # ``(plannerV2)版本`` / ``(plannerV2) — note`` / ``(plannerV2) isn't
+        # active`` / ``(plannerV2) non-secret version``) makes the assignment a
         # phrase and stays accepted — an ILLEGAL wrapper was rejected above, so
-        # Block 69-71 closure is never reopened by appending prose.
-        if not _exact_value_at_semantic_boundary(text, m.end()):
+        # Block 69-71 closure is never reopened by appending prose.  The JSON
+        # envelope of a string value the assignment sits inside is the
+        # document's own structure and is stripped FIRST (R42 Block 76).
+        if not _exact_value_at_free_text_boundary(text, m.end(), spans):
             continue
         if _documented_version_field_exempt(m):
             continue

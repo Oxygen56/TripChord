@@ -17819,3 +17819,179 @@ def test_r40_full_chain_producer_seal_consumer_block71_72_both_finals(
             "ev.json",
             credential_field_check=True,
         )
+
+
+def test_r42_block76_77_structural_tail_and_normal_language_both_paths(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-42 Block 76/77 (supervision 14:19): the JSON and free-text
+    parsing paths are SPLIT — JSON walks REAL JSON structure (``_reject_unbound_
+    registered_base_values`` hands UNQUOTED string values to the shared
+    ``_registered_base_value_info`` core), free text uses an INDEPENDENT
+    complete-sentence check that strips a LEGITIMATE trailing JSON envelope
+    (the string close of a value the assignment sits inside, plus the enclosing
+    ``]``/``}``) BEFORE the sentence check — so a JSON-embedded narration
+    remainder is judged on the string CONTENT, never on the document envelope.
+    Block 76: an UNCONSUMED structural tail right after the wrapped value
+    (``note)`` / ``note]`` / ``note}`` / ``note))))`` / ``note"`` / ``note.`` /
+    a cross-line ``note␊=``) fails closed on BOTH finals AND on the JSON
+    member-value path — NO envelope closer is stripped unconditionally.  Block
+    77: NORMAL language is accepted — real articles / contractions / hyphenated
+    words (``is a version`` / ``— a note`` / ``isn't active`` /
+    ``non-secret version``) are words, never a lexical ``two-or-more-letters /
+    alpha-only`` table; ``x=`` / ``_=`` and the Block 76 structural disguises
+    still fail closed."""
+    from benchmarks import live_canary_certified as canary
+
+    b76_reject = (
+        # Block 76 free text: unmatched structural tail fails closed
+        "verification code is (plannerV2)note)",
+        "verification code is (plannerV2)note]",
+        "verification code is (plannerV2)note}",
+        "verification code is (plannerV2)note))))",
+        'verification code is (plannerV2)note"',
+        "verification code is (plannerV2)note.",
+        "verification code is (plannerV2)note\n=",
+        # Block 76 JSON: same-type value at an unauthorized member path fails
+        # closed on the JSON member-value path too
+        '{"otp": "(plannerV2)note)"}',
+        '{"otp": "(plannerV2)note]"}',
+        '{"otp": "(plannerV2)note}"}',
+        '{"otp": "(plannerV2)note))))"}',
+        '{"otp": "(plannerV2)note."}',
+    )
+    for raw in b76_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    b77_accept = (
+        # Block 77 normal language: articles / contractions / hyphenated words
+        "verification code is (plannerV2) is a version",
+        "verification code is (plannerV2) — a note",
+        "verification code is (plannerV2) isn't active",
+        "verification code is (plannerV2) non-secret version",
+        # Block 77 JSON member values at documented paths stay accepted
+        '{"summary": "(plannerV2) is a version"}',
+        '{"summary": "(plannerV2) — a note"}',
+        '{"summary": "(plannerV2) isn\'t active"}',
+        '{"summary": "(plannerV2) non-secret version"}',
+    )
+    for raw in b77_accept:
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    # full chain: the producer masks every Block 76 reject BEFORE the 0600 seal,
+    # so the sealed diagnostic and the consumer-synthesized field are clean and
+    # BOTH finals pass; the Block 77 positives survive the seal untouched; the
+    # RAW values still fail BOTH finals (defense in depth).
+    for raw in b76_reject:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b7677",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in b77_accept:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked
+        assert "plannerV2" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b7677",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
