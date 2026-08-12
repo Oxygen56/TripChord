@@ -114,6 +114,18 @@
 | `launchctl kickstart -k gui/<uid>/com.tripchord.live-api` | API 受控重启绑定**最终 HEAD=`8d74bd4`**；`verify_api_runtime_provenance.py` provenance `commit_sha`=`8d74bd4`/`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 33147、mismatches 空 |
 | `uv run python scripts/run_product_done_gate.py --commit 8d74bd4 --commit-evidence`（scrubbed env：无模型 key、无 `TRIPCHORD_ACK_MODEL_COST`、不配对 Companion） | 从零重跑严格六层门（run_id=`364eeb1ba2a8`，evidence `gate-20260812T003003Z-364eeb1ba2a8`），tested_commit_sha=`8d74bd4`：层 1/2/3 PASS、层 4 SKIP（no model API key authorised; bounded live model cost not acknowledged）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL（pending user authorization：全平台 E2E 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权后真实执行）；`passed=false` 退出码 2（`--commit-evidence` + passed=false 恒 return 2）、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）；证据 `.runtime/done-gate-evidence/gate-20260812T003003Z-364eeb1ba2a8/product-v1-done-gate.json`。`passed=false` 如实记录，不包装为收口；passed=true 前不启 C-125 |
 
+### 第三十八轮（C-122，R38 Block 67–68 监督 09:15 退回续跑）验证结果
+
+| 命令 | 结果 |
+|---|---|
+| `uv run pytest`（全量，apps/api/tests + benchmarks/tests） | 1008 passed，退出码 0（与 R37 同量；R38 代码改动集中在 `tripchord._secret_redact`，apps/api 既有 gate 测试全过） |
+| `uv run python scripts/tests/run_tests_clean_env.py`（clean-env，scripts/tests 全量） | 497 passed，退出码 0（R37 494 + R38 新增 3 项）——含 R38 新增 raw/JSON/全链反例：Block 67 通用 Unicode 配对包装（非 LEFT/RIGHT 命名引号 `“plannerV2”`/`‘plannerV2’`、藏文 `༺plannerV2༻`、欧甘 `᚛plannerV2᚜` 于叙述与中立 JSON 路径双 final fail-closed；`evil"planner_version = …`/`evil=planner_version = …` 包装精确 base 全拒；文档路径 `planner_version`/`plan.planner_version`/`summary` 含包装正例保留；Ps/Pe/Pi/Pf 按 NAME 镜像 + 码点邻接结构闭合，禁止继续补字符表）；Block 68 Digest 恢复同判定（`response=(deadbeef)`/`[deadbeef]`/`( deadbeef )`/`((deadbeef))`/`" deadbeef "`/`“deadbeef”`/`༺deadbeef༻`/`᚛deadbeef᚜`、坏成员 `bad="unterminated, response=…` 恢复与正常解析同 any-non-empty-hex 判定全拒；`client digest note="response=deadbeef", algorithm=md5`/`algorithm="md5 response=deadbeef"`/`response=xyz`/`deadbeefxyz`/`deadbeef.g` 叙述正例不误报） |
+| `uv run python scripts/tests/run_tests_clean_env.py`（clean-env 全量） | 497 passed，退出码 0；live `tripchord.db` 与 `.runtime/browser-bridge-state.json` 字节数与 mtime 均不变 |
+| `uv run ruff check .` | All checks passed（0 错误；RUF002/003 对文档化 Unicode 包装字按行 noqa） |
+| `git rev-parse HEAD` | `11f244e`（R38 Block 67–68 单提交；2 文件 +437/−34） |
+| `launchctl kickstart -k gui/<uid>/com.tripchord.live-api` | API 受控重启绑定**最终 HEAD=`11f244e`**；`verify_api_runtime_provenance.py` provenance `passed=true`、`commit_sha`=`11f244e2bc9042762270facd0ae0a210d8af800e`/`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 74193、mismatches 空 |
+| `uv run python scripts/run_product_done_gate.py --commit 11f244e2bc9042762270facd0ae0a210d8af800e --commit-evidence`（scrubbed env：不设 `TRIPCHORD_ACK_MODEL_COST`、不配对 Companion） | 从零重跑严格六层门（evidence `gate-20260812T014910Z-6110661a3bc9`），tested_commit_sha=`11f244e2bc9042762270facd0ae0a210d8af800e`：层 1/2/3 PASS、层 4 SKIP（model key present but bounded live model cost not acknowledged；不设 `TRIPCHORD_ACK_MODEL_COST=1`）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL（pending user authorization：全平台 E2E 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权后真实执行）；`passed=false` 退出码 2（`--commit-evidence` + passed=false 恒 return 2）、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）；证据 `.runtime/done-gate-evidence/gate-20260812T014910Z-6110661a3bc9/product-v1-done-gate.json`。`passed=false` 如实记录，不包装为收口；passed=true 前不启 C-125 |
+
 ## 当前可对外声明
 
 - v0.5/v0.6/v0.7 接入生产路径：reprice/handoff 端点 + 前端两步 handoff 流；预订保护 gate 被 Verifier/ReVerifier 与 live_system 事件重规划共同消费（v0.6 收尾完成）；SDK 冷却/一致性 API 接线。
@@ -139,7 +151,7 @@ cd /Users/oxygen/Documents/个人项目/tripchord
 uv run python benchmarks/live_canary_certified.py --bridge-token "$(cat .runtime/browser-bridge-token)"
 TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence
 ```
-（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行。API 已受控重启并绑定新 HEAD=`8d74bd4`（C-122 R37 Block 65–66 收口提交），provenance 三哈希匹配。）
+（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行。API 已受控重启并绑定新 HEAD=`11f244e`（C-122 R38 Block 67–68 收口提交），provenance 三哈希匹配。）
 
 ## 基线记录（业务代码修改前）
 
