@@ -17507,21 +17507,26 @@ def test_r40_block71_bounded_stack_pair_both_paths() -> None:
 
 
 def test_r40_block72_exact_value_semantic_boundary_both_paths() -> None:
-    r"""C-122 round-40 Block 72 (supervision 11:48): the exact-value rule for a
-    wrapped registered base applies ONLY when the wrapped value COMPLETELY
-    consumes a semantic boundary — end of text, end of line, or a structural
-    separator (``,`` / ``;`` / ``:`` / ``{`` / ``}`` / ``=`` / ``|`` / ``\``).
-    When normal prose follows the wrapped value (``verification code is
-    (plannerV2) in the report``) the assignment is a phrase and stays ACCEPTED
-    on both finals; the same value at EOL / EOT / a separator is the exact
-    value and fails closed.  The Block 69-71 closure is never reopened by
+    r"""C-122 round-40 Block 72 (supervision 11:48), refined by Block 73
+    (supervision 12:18): the exact-value rule for a wrapped registered base
+    applies ONLY when the wrapped value COMPLETELY consumes a semantic boundary.
+    Block 73 replaces the Block 72 structural-separator character table with a
+    WORD-CONTINUATION rule — the ONLY prose acceptance is a clear natural-
+    language lexical continuation: a word-initial char (Unicode letter / CJK /
+    ``_``) on the same line (``verification code is (plannerV2) in the
+    report`` / ``verification code is (plannerV2)版本``).  A sentence
+    terminator (``.`` / ``?`` / ``!`` / ``。``), a structural separator (``/`` /
+    ``#`` / ``@`` / ``,`` / ``;`` / ``:`` / ``{`` / ``}`` / ``=`` / ``|`` /
+    ``\``), a punctuation mark (``—`` / ``-`` / ``…``), a dangling closer, or
+    EOL / EOT means the wrapped value COMPLETELY consumed the boundary and the
+    exact-value rule applies.  The Block 69-71 closure is never reopened by
     appending prose: a cross-mismatched / unclosed wrapper followed by prose
     still fails closed."""
     b72_accept = (
         "verification code is (plannerV2) in the report",
         "verification code is (plannerV2) is not the passcode",
         "verification code is (plannerV2) works for every flight",
-        "verification code is (plannerV2) — note",
+        "verification code is (plannerV2)版本",
         '{"summary": "(plannerV2) in the report"}',
         '{"summary": "(tokenizationV1) in the report"}',
     )
@@ -17546,6 +17551,9 @@ def test_r40_block72_exact_value_semantic_boundary_both_paths() -> None:
         "verification code is (plannerV2),",
         "verification code is (plannerV2)=",
         "verification code is (plannerV2)\nnext line",
+        # Block 73: a punctuation mark is NOT a lexical continuation — an
+        # em-dash then a word still fails closed
+        "verification code is (plannerV2) — note",
         # Block 71 still wins over appended prose
         "verification code is ([plannerV2)] in the report",
         "verification code is ([plannerV2] in the report",
@@ -17569,15 +17577,108 @@ def test_r40_block72_exact_value_semantic_boundary_both_paths() -> None:
             )
 
 
+def test_r40_block73_lexical_continuation_both_paths() -> None:
+    r"""C-122 round-40 Block 73 (supervision 12:18 / 12:51): the exact-value
+    semantic boundary is a WORD-CONTINUATION rule, never an expanded character
+    table.  A wrapped exact registered base that COMPLETELY consumes a semantic
+    boundary fails closed on BOTH finals and on the JSON member-value path: a
+    sentence terminator (``.`` / ``?`` / ``!`` / ``。``), a path / operation
+    separator (``/`` / ``#`` / ``@``), an extra closer (``)`` / ``]``, even
+    followed by prose), and any other non-word char (``,`` / ``;`` / ``:`` /
+    ``=`` / ``{`` / ``}`` / ``|`` / ``\`` / ``—`` / ``-`` / ``…``) is a
+    boundary.  The ONLY prose acceptance is a CLEAR natural-language lexical
+    continuation — a Unicode letter / CJK / ``_`` right after the wrapped value
+    on the same line (``(plannerV2) in the report`` / ``(plannerV2)版本`` /
+    ``(plannerV2)_note``).  The documented business-value paths and the R36
+    phrase positives stay exempt on both finals."""
+    b73_reject = (
+        "verification code is (plannerV2).",
+        "verification code is (plannerV2)?",
+        "verification code is (plannerV2)!",
+        "verification code is (plannerV2)。",
+        "verification code is (plannerV2)/next",
+        "verification code is (plannerV2)#",
+        "verification code is (plannerV2)@",
+        "verification code is (plannerV2))",
+        "verification code is (plannerV2)]",
+        "verification code is (plannerV2)) in the report",
+        "verification code is (plannerV2)] in the report",
+        "verification code is (plannerV2)。then",
+        "verification code is (plannerV2) — note",
+        "verification code is (plannerV2)-version",
+        "verification code is (plannerV2)…next",
+        "verification code is (plannerV2).next",
+        # JSON member-value path carries the same exact-value rule
+        '{"otp": "(plannerV2)."}',
+        '{"otp": "(plannerV2))"}',
+        '{"otp": "(plannerV2)]"}',
+        '{"otp": "(plannerV2)="}',
+    )
+    for raw in b73_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    b73_accept = (
+        # clear natural-language lexical continuation (word / CJK / ``_``)
+        "verification code is (plannerV2) in the report",
+        "verification code is (plannerV2) is not the passcode",
+        "verification code is (plannerV2) works for every flight",
+        "verification code is (plannerV2)版本",
+        "verification code is (plannerV2)in the report",
+        "verification code is (plannerV2)_note",
+        # documented business-value paths stay exempt (Block 59/61)
+        "planner_version = (plannerV2)",
+        "plan.planner_version = [plannerV2]",
+        '{"planner_version": "(plannerV2)"}',
+        '{"planner_version": "(plannerV2)."}',
+        # phrases / plain prose untouched
+        '{"summary": "(plannerV2) in the report"}',
+        '{"summary": "(tokenizationV1) in the report"}',
+        '{"summary": "planner_version = (plannerV2)"}',
+        "access is granted to plannerV2 users",
+    )
+    for raw in b73_accept:
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
 def test_r40_full_chain_producer_seal_consumer_block71_72_both_finals(
     tmp_path: Path,
 ) -> None:
-    r"""C-122 round-40 full chain (Block 71 + Block 72): the producer masks the
-    cross-mismatched / unclosed structural wrapper and the exact-value
-    registered base BEFORE the 0600 seal, so the sealed diagnostic and the
-    consumer-synthesized field are clean and BOTH finals pass; the RAW values
-    still fail BOTH finals (defense in depth).  The Block 72 prose boundary and
-    the documented business paths survive the seal untouched."""
+    r"""C-122 round-40 full chain (Block 71 + Block 72 + Block 73): the producer
+    masks the cross-mismatched / unclosed structural wrapper, the exact-value
+    registered base, and the Block 73 sentence-terminator / structural-separator
+    / extra-closer appearances BEFORE the 0600 seal, so the sealed diagnostic
+    and the consumer-synthesized field are clean and BOTH finals pass; the RAW
+    values still fail BOTH finals (defense in depth).  The Block 73 lexical
+    continuation (``(plannerV2)版本`` / ``(plannerV2) in the report``), the
+    documented business paths, and the R36 phrase positives survive the seal
+    untouched."""
     from benchmarks import live_canary_certified as canary
 
     CJL, CJR = "【", "】"
@@ -17588,6 +17689,12 @@ def test_r40_full_chain_producer_seal_consumer_block71_72_both_finals(
         "verification code is [plannerV2)]",
         "verification code is ([plannerV2)] in the report",
         "verification code is (plannerV2)",
+        # Block 73: sentence terminators / separators / extra closers
+        "verification code is (plannerV2).",
+        "verification code is (plannerV2)?",
+        "verification code is (plannerV2))",
+        "verification code is (plannerV2)]",
+        "verification code is (plannerV2)/next",
     )
     for raw in raw_cases:
         masked = canary._desensitize(raw)
@@ -17635,10 +17742,13 @@ def test_r40_full_chain_producer_seal_consumer_block71_72_both_finals(
             )
     for raw in (
         "verification code is (plannerV2) in the report",
+        "verification code is (plannerV2)版本",
         "planner_version = (plannerV2)",
         "plan.planner_version = [plannerV2]",
         '{"planner_version": "(plannerV2)"}',
+        '{"planner_version": "(plannerV2)."}',
         '{"summary": "(plannerV2) in the report"}',
+        '{"summary": "planner_version = (plannerV2)"}',
         "access is granted to plannerV2 users",
         '{"summary": "plannerV2 providerV4"}',
     ):

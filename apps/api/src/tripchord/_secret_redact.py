@@ -1938,8 +1938,19 @@ def _registered_base_value_info(value: str) -> tuple[str, bool] | str | None:
         return None
     while j < n and v[j] in _WRAPPER_CLOSE_CHARS:
         if not stack:
-            # a dangling closer after a fully balanced wrapper — prose
-            return None
+            # a dangling closer after a fully balanced wrapper around an EXACT
+            # base.  R40 Block 73: an extra NON-self-pairing closer
+            # (``(plannerV2))`` / ``(plannerV2)]`` / ``(plannerV2)) in the
+            # report``) is an ILLEGAL structural appearance and fails closed —
+            # never read back as a phrase.  A SELF-PAIRING quote dangling
+            # closer (``(plannerV2)"``) is the R39 JSON-string delimiter, and a
+            # ``}`` / ``>`` / ``)`` dangling closer after a ``"``-opened token
+            # (``"(plannerV2)"}``) closes the surrounding JSON object — both sit
+            # at a semantic boundary and the caller's documented-path exemption
+            # decides them.
+            if v[j] in _SELF_PAIRING_QUOTES or v[0] in _SELF_PAIRING_QUOTES:
+                return base, is_version
+            return _WRAPPED_BASE_ILLEGAL
         if _WRAPPER_PAIR[stack[-1]] != v[j]:
             # cross-mismatched closer (``(plannerV2]`` / ``([plannerV2)]`` /
             # ``【(plannerV2】)``) — ILLEGAL structural appearance
@@ -1958,9 +1969,18 @@ def _registered_base_value_info(value: str) -> tuple[str, bool] | str | None:
             return base, is_version
         return _WRAPPED_BASE_ILLEGAL
     if j < n:
-        # trailing prose after a fully balanced wrapper
-        # (``(tokenizationV1) in the report``) — a phrase
-        return None
+        # trailing content after a fully balanced wrapper.  R40 Block 73: the
+        # ONLY prose acceptance is a CLEAR natural-language lexical
+        # continuation — a word-initial char (Unicode letter / CJK / ``_``) on
+        # the SAME line (``(tokenizationV1) in the report`` /
+        # ``(plannerV2)版本``).  A sentence terminator / structural separator /
+        # dangling closer / EOL / EOT means the wrapped value COMPLETELY
+        # consumed a semantic boundary and is an EXACT credential value, so the
+        # caller's documented-path exemption decides it (an unbound JSON path
+        # ``{"otp": "(plannerV2)."}`` fails closed).
+        if not _exact_value_at_semantic_boundary(v, j):
+            return None
+        return base, is_version
     return base, is_version
 
 
@@ -2065,8 +2085,13 @@ _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE = re.compile(
     r"[ \t]*(?:" + _CREDENTIAL_NARRATION_BIND_OP + r")[ \t]*"
     r"(?P<token>(?:" + _WRAPPER_OPEN_CLASS + r"[ \t]*)*"
     r"(?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+)"
-    r"(?:[ \t]*" + _WRAPPER_CLOSE_CLASS + r")*)"
+    # R40 Block 73: the word-char guard sits right after the BASE (before any
+    # closer), so a longer token (``(plannerV2plus)``) is never an exact value,
+    # while a balanced wrapper that continues into a CJK / letter word
+    # (``(plannerV2)\u7248\u672c``) still captures ALL of its closers and lets the
+    # natural-language-continuation boundary decide the exact-value rule.
     r"(?![A-Za-z0-9_\u4e00-\u9fff])"
+    r"(?:[ \t]*" + _WRAPPER_CLOSE_CLASS + r")*)"
 )
 
 
@@ -2093,30 +2118,36 @@ def _documented_version_field_exempt(m: re.Match[str]) -> bool:
     return _registered_base_value_exempt_at_path(path, m.group("token"))
 
 
-# R40 Block 72: a semantic boundary that TERMINATES an exact-value assignment —
-# end of line / end of text / a structural separator (the same value-bounding
-# separators the designation-value capture uses, ``[^\r\n,;{}]``, plus the bind
-# operators).  A letter / digit / CJK / ``_`` after the wrapped value is prose
-# continuation (``verification code is (plannerV2) in the report``) and stays
-# accepted; a separator means the value COMPLETELY consumed the boundary and the
-# exact-value rule applies.
-_EXACT_VALUE_BOUNDARY_CHARS = frozenset(",;{}:=|\\")
+# R40 Block 73: a semantic boundary that TERMINATES an exact-value assignment is
+# decided by WORD CONTINUATION, never by a character table — end of text / end
+# of line, or a NON-WORD character after the wrapped value.  The ONLY prose
+# acceptance is a CLEAR natural-language lexical continuation: a word-initial
+# char (Unicode letter / CJK / ``_``) on the SAME line (``verification code is
+# (plannerV2) in the report`` / ``verification code is (plannerV2)版本``).  A
+# sentence terminator (``.`` / ``?`` / ``!`` / ``。``), a structural separator
+# (``/`` / ``#`` / ``@`` / ``,`` / ``;`` / ``:`` / ``{`` / ``}`` / ``=`` /
+# ``|`` / ``\``), a dangling closer, or EOL / EOT means the wrapped value
+# COMPLETELY consumed the boundary and the exact-value rule applies.
 
 
 def _exact_value_at_semantic_boundary(text: str, end: int) -> bool:
-    """R40 Block 72: True when the exact-base assignment token that ends at
+    """R40 Block 73: True when the exact-base assignment token that ends at
     ``end`` COMPLETELY consumes a semantic boundary — end of text, end of line,
-    or a structural separator — so the exact-value rule applies.  When normal
-    prose follows the wrapped value (``verification code is (plannerV2) in the
-    report``) the assignment is a phrase, not an exact value, and stays
-    accepted.  An ILLEGAL wrapper is rejected BEFORE this check, so Block 69-71
-    closure is never reopened by appending prose."""
+    or a NON-WORD character — so the exact-value rule applies.  The ONLY prose
+    acceptance is a CLEAR natural-language lexical continuation: after the
+    wrapped value (skipping spaces/tabs) the next character on the SAME line is
+    a Unicode letter / CJK / ``_`` (``verification code is (plannerV2) in the
+    report`` / ``verification code is (plannerV2)版本``).  An ILLEGAL wrapper is
+    rejected BEFORE this check, so Block 69-71 closure is never reopened by
+    appending prose."""
     after = text[end:]
     if not after:
         return True
-    if re.match(r"[ \t]*(?:\r?\n|$)", after):
+    rest = after.lstrip(" \t")
+    if not rest or rest[0] in "\r\n":
+        # end of text, or a line boundary the value fully consumed
         return True
-    return after.lstrip(" \t")[:1] in _EXACT_VALUE_BOUNDARY_CHARS
+    return not (rest[0].isalpha() or rest[0] == "_")
 
 
 def _credential_narration_binds(text: str) -> bool:
@@ -2161,12 +2192,14 @@ def _credential_narration_binds(text: str) -> bool:
             # a phrase (``see (tokenizationV1)``) — never an exact-value
             # assignment, never a credential
             continue
-        # R40 Block 72: the exact-value rule applies ONLY when the wrapped value
-        # COMPLETELY consumes a semantic boundary (end of line / end of text /
-        # structural separator).  Trailing normal prose (``verification code is
-        # (plannerV2) in the report``) makes the assignment a phrase and stays
-        # accepted — an ILLEGAL wrapper was rejected above, so Block 69-71
-        # closure is never reopened by appending prose.
+        # R40 Block 73: the exact-value rule applies ONLY when the wrapped value
+        # COMPLETELY consumes a semantic boundary — end of line / end of text /
+        # a NON-WORD char (sentence terminator, structural separator, dangling
+        # closer).  Trailing natural-language continuation (``verification code
+        # is (plannerV2) in the report`` / ``verification code is (plannerV2)版本``)
+        # makes the assignment a phrase and stays accepted — an ILLEGAL wrapper
+        # was rejected above, so Block 69-71 closure is never reopened by
+        # appending prose.
         if not _exact_value_at_semantic_boundary(text, m.end()):
             continue
         if _documented_version_field_exempt(m):
