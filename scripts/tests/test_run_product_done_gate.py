@@ -17430,3 +17430,243 @@ def test_r39_full_chain_producer_seal_consumer_block69_70_both_finals(
             "ev.json",
             credential_field_check=True,
         )
+
+def test_r40_block71_bounded_stack_pair_both_paths() -> None:
+    r"""C-122 round-40 Block 71 (supervision 11:48): free text and JSON are
+    parsed by ONE REAL bounded-stack pair matcher — a value that opens with a
+    wrapper char must close every opener in LIFO order with its matching pair.
+    A CROSS-MISMATCHED closer (``([plannerV2)]`` / ``【(plannerV2】)`` /
+    ``[plannerV2)]``), an UNCLOSED opener (``([plannerV2]`` / ``(plannerV2``),
+    or a nesting deeper than the shared structural bound is an ILLEGAL
+    structural appearance that fails closed on BOTH finals and on the JSON
+    member-value path — it NEVER falls back to reading the wrapper residue as a
+    non-credential phrase.  The adjacent pass side keeps its exemptions: a
+    balanced wrapper resolves to the exact base, the documented business-value
+    paths stay exempt, and a cross-mismatch followed by normal prose still
+    fails closed (Block 71 wins over the Block 72 prose boundary)."""
+    CJL, CJR = "【", "】"
+    b71_reject = (
+        # narration: cross-mismatched / unclosed structural pairs
+        "verification code is ([plannerV2)]",
+        "verification code is ([plannerV2]",
+        "verification code is " + CJL + "(plannerV2" + CJR + ")",
+        "verification code is [plannerV2)]",
+        # JSON member-value path: the SAME shared matcher
+        '{"otp": "([plannerV2)]"}',
+        '{"otp": "([plannerV2]"}',
+        '{"otp": "' + CJL + "(plannerV2" + CJR + ')"}',
+        '{"otp": "[plannerV2)]"}',
+        # Block 71 wins over Block 72 prose: a cross-mismatch with trailing
+        # normal prose still fails closed
+        "verification code is ([plannerV2)] in the report",
+        "verification code is ([plannerV2] in the report",
+        "verification code is " + CJL + "(plannerV2" + CJR + ") in the report",
+    )
+    for raw in b71_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in (
+        # documented business-value path exemption is NOT regressed
+        "planner_version = (plannerV2)",
+        "plan.planner_version = [plannerV2]",
+        '{"planner_version": "(plannerV2)"}',
+        # plain business prose / phrase untouched
+        '{"summary": "(tokenizationV1) in the report"}',
+        "access is granted to plannerV2 users",
+        '{"summary": "plannerV2 providerV4"}',
+        "verification code is (plannerV2) in the report",
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r40_block72_exact_value_semantic_boundary_both_paths() -> None:
+    r"""C-122 round-40 Block 72 (supervision 11:48): the exact-value rule for a
+    wrapped registered base applies ONLY when the wrapped value COMPLETELY
+    consumes a semantic boundary — end of text, end of line, or a structural
+    separator (``,`` / ``;`` / ``:`` / ``{`` / ``}`` / ``=`` / ``|`` / ``\``).
+    When normal prose follows the wrapped value (``verification code is
+    (plannerV2) in the report``) the assignment is a phrase and stays ACCEPTED
+    on both finals; the same value at EOL / EOT / a separator is the exact
+    value and fails closed.  The Block 69-71 closure is never reopened by
+    appending prose: a cross-mismatched / unclosed wrapper followed by prose
+    still fails closed."""
+    b72_accept = (
+        "verification code is (plannerV2) in the report",
+        "verification code is (plannerV2) is not the passcode",
+        "verification code is (plannerV2) works for every flight",
+        "verification code is (plannerV2) — note",
+        '{"summary": "(plannerV2) in the report"}',
+        '{"summary": "(tokenizationV1) in the report"}',
+    )
+    for raw in b72_accept:
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    b72_reject = (
+        "verification code is (plannerV2)",
+        "verification code is (plannerV2);",
+        "verification code is (plannerV2),",
+        "verification code is (plannerV2)=",
+        "verification code is (plannerV2)\nnext line",
+        # Block 71 still wins over appended prose
+        "verification code is ([plannerV2)] in the report",
+        "verification code is ([plannerV2] in the report",
+    )
+    for raw in b72_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+
+
+def test_r40_full_chain_producer_seal_consumer_block71_72_both_finals(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-40 full chain (Block 71 + Block 72): the producer masks the
+    cross-mismatched / unclosed structural wrapper and the exact-value
+    registered base BEFORE the 0600 seal, so the sealed diagnostic and the
+    consumer-synthesized field are clean and BOTH finals pass; the RAW values
+    still fail BOTH finals (defense in depth).  The Block 72 prose boundary and
+    the documented business paths survive the seal untouched."""
+    from benchmarks import live_canary_certified as canary
+
+    CJL, CJR = "【", "】"
+    raw_cases = (
+        "verification code is ([plannerV2)]",
+        "verification code is ([plannerV2]",
+        "verification code is " + CJL + "(plannerV2" + CJR + ")",
+        "verification code is [plannerV2)]",
+        "verification code is ([plannerV2)] in the report",
+        "verification code is (plannerV2)",
+    )
+    for raw in raw_cases:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r40b7172",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in (
+        "verification code is (plannerV2) in the report",
+        "planner_version = (plannerV2)",
+        "plan.planner_version = [plannerV2]",
+        '{"planner_version": "(plannerV2)"}',
+        '{"summary": "(plannerV2) in the report"}',
+        "access is granted to plannerV2 users",
+        '{"summary": "plannerV2 providerV4"}',
+    ):
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked
+        assert "plannerV2" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r40b7172",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )

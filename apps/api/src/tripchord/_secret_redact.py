@@ -1847,6 +1847,12 @@ _WRAPPER_CLOSE_CLASS = "[" + "".join(
 _DIGEST_VALUE_WRAPPER_CHARS = frozenset(
     dict.fromkeys([*_WRAPPER_PAIR, *_WRAPPER_PAIR.values()])
 )
+# R40 Block 71: the CLOSER chars of the paired closure (a bounded-stack pair
+# matcher resolves each closer against the TOP of its stack), and the
+# SELF-PAIRING quote / apostrophe / backtick — an unclosed SELF-PAIRING residue
+# is the R39 JSON string delimiter, never an illegal wrapper.
+_WRAPPER_CLOSE_CHARS = frozenset(dict.fromkeys(_WRAPPER_PAIR.values()))
+_SELF_PAIRING_QUOTES = frozenset(ch for ch, closer in _WRAPPER_PAIR.items() if closer == ch)
 # The BOUNDED structural wrapper-strip depth shared by every wrapper resolver
 # (R39 Block 69 / R38 Block 68): ``_registered_base_value_info`` and
 # ``_digest_response_hex_value`` strip at most this many nested wrapper layers
@@ -1875,55 +1881,87 @@ def _registered_base_value_info(value: str) -> tuple[str, bool] | str | None:
     ``_WRAPPED_BASE_ILLEGAL`` sentinel so the caller fails closed.  A phrase
     that merely mentions a base (``"see (tokenizationV1)"``) or opens with a
     parenthetical base then continues (``"(tokenizationV1) in the report"``)
-    is unchanged and stays a non-credential."""
+    is unchanged and stays a non-credential.  R40 Block 71: a value that
+    opens with a wrapper char is parsed by a REAL bounded-stack pair matcher —
+    every opener is pushed, every closer must close the TOP of the stack
+    (LIFO), and a cross-mismatched closer (``([plannerV2)]`` /
+    ``【(plannerV2】)``), an unclosed opener (``([plannerV2]`` /
+    ``(plannerV2``), or a nesting deeper than the shared structural bound is an
+    ILLEGAL structural appearance that fails closed — never read back as a
+    phrase.  The only structural exception is the R39 JSON-string delimiter: a
+    SELF-PAIRING quote / apostrophe / backtick still unclosed at the end
+    (``"plannerV2`` — ``"summary":"plannerV2 providerV4"``) is the delimiter
+    that opens a LONGER value, so the exact base right after it still binds."""
     v = value.strip()
-    depth = 0
-    while len(v) >= 2 and v[0] in _WRAPPER_PAIR:
-        if depth >= _STRUCTURAL_WRAPPER_DEPTH_LIMIT:
+    # A value that does NOT open with a wrapper char is not a structural
+    # wrapper appearance — resolve the exact base or a phrase directly.
+    if not v or v[0] not in _WRAPPER_PAIR:
+        m = _REGISTERED_BASE_VALUE_RE.match(v)
+        if m is None:
+            return None
+        return m.group("base").lower(), m.group("suffix").startswith("V")
+    # Real bounded-stack pair matcher (R40 Block 71): consume the leading
+    # openers first (inner whitespace between wrapper layers is tolerated).
+    stack: list[str] = []
+    i = 0
+    n = len(v)
+    while i < n and v[i] in _WRAPPER_PAIR:
+        if len(stack) >= _STRUCTURAL_WRAPPER_DEPTH_LIMIT:
             # R39 Block 69: the strip budget is exhausted while a wrapper layer
-            # is STILL open (nesting deeper than the bound) — the value is too
-            # structurally wrapped to be a legitimate phrase, so fail CLOSED
+            # is STILL open (nesting deeper than the bound) — fail CLOSED
             # instead of reading the residue as a non-base value.
             return _WRAPPED_BASE_ILLEGAL
-        closer = _WRAPPER_PAIR[v[0]]
-        if v[-1] == closer:
-            v = v[1:-1].strip()
-            depth += 1
-            continue
-        # Outer wrapper is not closed at the very end.  R39 Block 69: a
-        # SELF-PAIRING quote / apostrophe / backtick opener (``"`` / ``'`` /
-        # ``` ``) with no close inside this value is the JSON string delimiter
-        # that opens a LONGER value (``"summary":"plannerV2 providerV4"``), not
-        # an illegal wrapper — the exact base right after the delimiter still
-        # binds, and the caller's documented-path exemption decides it (the R38
-        # Block 67 refinement, now shared by the free-text narration path).  For
-        # a NON-self-pairing opener, an exact base that immediately follows it
-        # with a WRONG closer or nothing after it (``(plannerV2]`` /
-        # ``[plannerV2``) is an illegal structural appearance; a base followed
-        # by its MATCHING closer and then prose
-        # (``(tokenizationV1) in the report``) is a phrase; a base followed by a
-        # word char (``(plannerV2plus)``) is a longer non-base token; and any
-        # content that is not an exact base right after the opener is a phrase.
-        if closer == v[0]:
-            inner = v[1:].lstrip()
-            m = _REGISTERED_BASE_VALUE_RE.match(inner)
-            if m is not None:
-                return m.group("base").lower(), m.group("suffix").startswith("V")
-            return None
-        inner = v[1:].lstrip()
-        m = _REGISTERED_BASE_VALUE_PREFIX_RE.match(inner)
-        if m is not None:
-            rest = inner[m.end():]
-            if rest[:1] == closer:
-                return None
-            if rest[:1] and rest[0].isalnum():
-                return None
-            return _WRAPPED_BASE_ILLEGAL
-        return None
-    m = _REGISTERED_BASE_VALUE_RE.match(v)
+        stack.append(v[i])
+        i += 1
+        while i < n and v[i].isspace():
+            i += 1
+    m = _REGISTERED_BASE_VALUE_PREFIX_RE.match(v, i)
     if m is None:
+        # no exact base right after the openers — a phrase, never a credential
         return None
-    return m.group("base").lower(), m.group("suffix").startswith("V")
+    exact = _REGISTERED_BASE_VALUE_RE.match(m.group(0))
+    if exact is None:
+        return None
+    base = exact.group("base").lower()
+    is_version = exact.group("suffix").startswith("V")
+    base_end = m.end()
+    # a word char immediately after the base is a longer non-base token
+    # (``(plannerV2plus)``) — a phrase, not an exact value
+    if base_end < n and (v[base_end].isalnum() or v[base_end] == "_"):
+        return None
+    j = base_end
+    while j < n and v[j].isspace():
+        j += 1
+    if j < n and v[j] not in _WRAPPER_CLOSE_CHARS:
+        # content between the base and any closer — the wrapped value is a
+        # phrase (``(plannerV2-1)`` / ``(plannerV2 providerV4)``)
+        return None
+    while j < n and v[j] in _WRAPPER_CLOSE_CHARS:
+        if not stack:
+            # a dangling closer after a fully balanced wrapper — prose
+            return None
+        if _WRAPPER_PAIR[stack[-1]] != v[j]:
+            # cross-mismatched closer (``(plannerV2]`` / ``([plannerV2)]`` /
+            # ``【(plannerV2】)``) — ILLEGAL structural appearance
+            return _WRAPPED_BASE_ILLEGAL
+        stack.pop()
+        j += 1
+        while j < n and v[j].isspace():
+            j += 1
+    if stack:
+        # unclosed openers at end of text.  R39: a SELF-PAIRING quote /
+        # apostrophe / backtick residue is the JSON string delimiter that opens
+        # a LONGER value (``"plannerV2``) — the exact base right after it still
+        # binds; any other unclosed opener (``(plannerV2`` / ``([plannerV2]``)
+        # is an ILLEGAL structural appearance.
+        if all(ch in _SELF_PAIRING_QUOTES for ch in stack):
+            return base, is_version
+        return _WRAPPED_BASE_ILLEGAL
+    if j < n:
+        # trailing prose after a fully balanced wrapper
+        # (``(tokenizationV1) in the report``) — a phrase
+        return None
+    return base, is_version
 
 
 # R36 Block 61: the exact JSON member-key PATHS where a registered business
@@ -2055,6 +2093,32 @@ def _documented_version_field_exempt(m: re.Match[str]) -> bool:
     return _registered_base_value_exempt_at_path(path, m.group("token"))
 
 
+# R40 Block 72: a semantic boundary that TERMINATES an exact-value assignment —
+# end of line / end of text / a structural separator (the same value-bounding
+# separators the designation-value capture uses, ``[^\r\n,;{}]``, plus the bind
+# operators).  A letter / digit / CJK / ``_`` after the wrapped value is prose
+# continuation (``verification code is (plannerV2) in the report``) and stays
+# accepted; a separator means the value COMPLETELY consumed the boundary and the
+# exact-value rule applies.
+_EXACT_VALUE_BOUNDARY_CHARS = frozenset(",;{}:=|\\")
+
+
+def _exact_value_at_semantic_boundary(text: str, end: int) -> bool:
+    """R40 Block 72: True when the exact-base assignment token that ends at
+    ``end`` COMPLETELY consumes a semantic boundary — end of text, end of line,
+    or a structural separator — so the exact-value rule applies.  When normal
+    prose follows the wrapped value (``verification code is (plannerV2) in the
+    report``) the assignment is a phrase, not an exact value, and stays
+    accepted.  An ILLEGAL wrapper is rejected BEFORE this check, so Block 69-71
+    closure is never reopened by appending prose."""
+    after = text[end:]
+    if not after:
+        return True
+    if re.match(r"[ \t]*(?:\r?\n|$)", after):
+        return True
+    return after.lstrip(" \t")[:1] in _EXACT_VALUE_BOUNDARY_CHARS
+
+
 def _credential_narration_binds(text: str) -> bool:
     """True when ``text`` puts a registered business-identifier base in a
     credential-narration context (R28 Block 48): a credential-designation word
@@ -2090,8 +2154,21 @@ def _credential_narration_binds(text: str) -> bool:
         # unclosed wrapper (``(plannerV2]`` / ``(plannerV2``) is an illegal
         # structural appearance that fails closed BEFORE the documented-path
         # exemption decides.
-        if _registered_base_value_info(m.group("token")) is _WRAPPED_BASE_ILLEGAL:
+        info = _registered_base_value_info(m.group("token"))
+        if info is _WRAPPED_BASE_ILLEGAL:
             return True
+        if info is None:
+            # a phrase (``see (tokenizationV1)``) — never an exact-value
+            # assignment, never a credential
+            continue
+        # R40 Block 72: the exact-value rule applies ONLY when the wrapped value
+        # COMPLETELY consumes a semantic boundary (end of line / end of text /
+        # structural separator).  Trailing normal prose (``verification code is
+        # (plannerV2) in the report``) makes the assignment a phrase and stays
+        # accepted — an ILLEGAL wrapper was rejected above, so Block 69-71
+        # closure is never reopened by appending prose.
+        if not _exact_value_at_semantic_boundary(text, m.end()):
+            continue
         if _documented_version_field_exempt(m):
             continue
         return True
