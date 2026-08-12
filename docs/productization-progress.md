@@ -6,11 +6,11 @@
 
 ## 当前状态
 
-- **当前版本**：v1.0 Done-Gate C-122 R39（Block 69–70 监督退回续跑收口）——监督退回的两个硬缺口全部关闭：Block 69 自由文本有界结构包装（`verification code is ((plannerV2))`/`【“plannerV2”】`/`[ plannerV2 ]` 等嵌套+内空白包装经共享 `_registered_base_value_info` 有界去壳回归同一登记 base，叙述与中立 JSON 值双 final fail-closed；预算耗尽/错配/未闭合 `(plannerV2]`/`(plannerV2`/12 层嵌套非法结构外观 fail-closed；正常业务叙述与精确文档路径正例保留。禁止列字符或点名层数——包装按共享有界去壳+结构闭合覆盖，不枚举字符表）；Block 70 Digest 包装剥离预算耗尽 fail-closed（`response=(((((((((deadbeef)))))))))` 9/10/11 层双 final 全拒且 producer 遮蔽，预算耗尽不回落 fullmatch 放行；正常非 hex/算法叙述正例保留）。共享模块 `tripchord._secret_redact` 修复：`_STRUCTURAL_WRAPPER_DEPTH_LIMIT=8` 共享有界常量、`_registered_base_value_info` 有界去壳+预算先于旁路+自配对引号未闭合按 JSON 字符串分隔符、`_EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE` token 整体捕获、`_digest_response_hex_value` 预算耗尽带开层 fail-closed。全量 1008 passed（apps/api/tests + benchmarks/tests）、clean-env 500 passed（scripts/tests，含 R39 新增 3 项）、ruff 全绿。
-- **当前分支**：`productization/v1.0`（未 push；API 已在提交 `b673c00` 受控重启并硬校验 provenance 三哈希匹配，pid 5556）
+- **当前版本**：v1.0 Done-Gate C-122 R42（Block 76–77 监督退回续跑收口）——监督退回的 Block 76/77 全部关闭：JSON 与自由文本解析路径拆分，共享 verified registered-base 核心。Block 76 结构尾部 fail-closed（`verification code is (plannerV2)note)`/`note]`/`note}`/`note))))`/`note"`/`note.`/跨行 `note␊=` 及 JSON 未授权路径同型值一律拒绝；**任何 envelope closer 不无条件剥除**——JSON 路径按真实 JSON 结构/字段边界、自由文本按独立完整句结构判定，余部残留任何结构符号/句终止符/跨行算子即 fail-closed）；Block 77 正常语言降门（`(plannerV2) is a version`/`— a note`/`isn't active`/`non-secret version` 接受；**不依赖「每词 ≥2 字母」或禁撇号/连字符的自造词表**——`_is_natural_word_token` 只认 ASCII 字母（内嵌撇号/连字符合法）+CJK 串+单字母虚词 a/i，`x=`/`_=`/`_note` 及 Block76 结构伪装仍拒绝）。共享模块 `tripchord._secret_redact` 修复：`_exact_value_at_free_text_boundary`（仅当赋值位于引号串内时先剥合法 JSON 围栏）、`_quoted_string_spans`、`_is_natural_word_token`、`_is_natural_language_phrase` 去字符表；JSON walker 走 `_registered_base_value_info` 未加引号共享核心。全量 1008 passed（apps/api/tests + benchmarks/tests）、clean-env 505 passed（scripts/tests）、ruff 全绿。
+- **当前分支**：`productization/v1.0`（未 push；API 已在提交 `fa88479` 受控重启并硬校验 provenance 三哈希匹配，pid 40902）
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
-- **最后完成的最小任务**：C-122 R37 Block 65–66 收口——全量 1008 passed、clean-env 494 passed、ruff 全绿、API 绑定 `8d74bd4`、六层门从头重跑如实记录（层 1/2/3 PASS、层 4 SKIP no model API key authorized、层 5/6 FAIL pending user authorization、passed=false、exit 2、worktree 干净、evidence_commit 未提交），passed=true 前不声称通过
+- **最后完成的最小任务**：C-122 R42 Block 76–77 收口——全量 1008 passed、clean-env 505 passed、ruff 全绿、API 绑定 `fa88479`、六层门从头重跑如实记录（层 1/2/3/4 PASS、层 5/6 FAIL pending user authorization、passed=false、exit 2、worktree 干净、evidence_commit 未提交），passed=true 前不声称通过。R40（Block 71–73，提交 `9f31333`/`50f45a9`）与 R41（Block 74–75，提交 `a24635a`）代码已提交、回归全绿、API 曾重启，但六层门/账本因 TCC 被阻断，统一并入本轮 R42 在最终 HEAD `fa88479` 上收口。
 
 ## 版本状态
 
@@ -138,6 +138,20 @@
 | `launchctl kickstart -k gui/<uid>/com.tripchord.live-api` | API 受控重启绑定**最终 HEAD=`b673c00`**；`verify_api_runtime_provenance.py` provenance `passed=true`、`commit_sha`=`b673c00b22effcb942fb0c6474ffb711dd722770`/`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 5556、mismatches 空 |
 | `uv run python scripts/run_product_done_gate.py --commit b673c00b22effcb942fb0c6474ffb711dd722770 --commit-evidence`（scrubbed env：不设 `TRIPCHORD_ACK_MODEL_COST`、不配对 Companion） | 从零重跑严格六层门（run_id=`99e32f9002e5`，evidence `gate-20260812T033748Z-99e32f9002e5`），tested_commit_sha=`b673c00`：层 1/2/3 PASS、层 4 SKIP（model key present but bounded live model cost not acknowledged；不设 `TRIPCHORD_ACK_MODEL_COST=1`）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL（pending user authorization：全平台 E2E 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权后真实执行）；`passed=false` 退出码 2（`--commit-evidence` + passed=false 恒 return 2）、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）；证据 `.runtime/done-gate-evidence/gate-20260812T033748Z-99e32f9002e5/product-v1-done-gate.json`。`passed=false` 如实记录，不包装为收口；passed=true 前不启 C-125 |
 
+### 第四十二轮（C-122，R42 Block 76–77 监督退回续跑收口，含 R40/R41 账本并账）验证结果
+
+> R40（Block 71–73，提交 `9f31333`/`50f45a9`）与 R41（Block 74–75，提交 `a24635a`）代码已提交且各自回归全绿，但六层门/账本因 TCC 被阻断，统一并入本轮 R42 在最终 HEAD `fa88479` 上收口。本表全部命令均在 `fa88479` 工作树上执行。
+
+| 命令 | 结果 |
+|---|---|
+| `uv run pytest apps/api/tests/ benchmarks/tests/`（全量） | 1008 passed，退出码 0（与 R39 同量） |
+| `uv run pytest scripts/tests/test_run_product_done_gate.py -k "r40 or r41 or r42"` | 5 passed（R40/R41/R42 聚焦回归，含 R42 新增 `test_r42_block76_77_structural_tail_and_normal_language_both_paths`） |
+| `uv run python scripts/tests/run_tests_clean_env.py`（clean-env，scripts/tests 全量） | 505 passed，退出码 0（R39 500 + R40–R42 新增 5 项）；live `tripchord.db` 与 `.runtime/browser-bridge-state.json` 字节数与 mtime 均不变 |
+| `uv run ruff check .` | All checks passed（0 错误） |
+| `git rev-parse HEAD` | `fa88479`（R42 Block 76–77 单提交；`_secret_redact.py` + gate 测试） |
+| `launchctl kickstart -k gui/<uid>/com.tripchord.live-api` | API 受控重启绑定**最终 HEAD=`fa88479`**；`verify_api_runtime_provenance.py` provenance `passed=true`、`commit_sha`=`fa8847926b47fdc53c0a2996a52f98e1eda0ba87`/`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 40902、mismatches 空 |
+| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit fa8847926b47fdc53c0a2996a52f98e1eda0ba87 --commit-evidence` | 从零重跑严格六层门（run_id=`7bb23abd343a`，evidence `gate-20260812T064713Z-7bb23abd343a`），tested_commit_sha=`fa88479`：层 1/2/3/4 PASS（层 4 required-model smoke 实际运行通过）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL（pending user authorization：全平台 E2E 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权后真实执行）；`passed=false` 退出码 2（`--commit-evidence` + passed=false 恒 return 2）、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）；证据 `.runtime/done-gate-evidence/gate-20260812T064713Z-7bb23abd343a/product-v1-done-gate.json`。`passed=false` 如实记录，不包装为收口；passed=true 前不启 C-125 |
+
 ## 当前可对外声明
 
 - v0.5/v0.6/v0.7 接入生产路径：reprice/handoff 端点 + 前端两步 handoff 流；预订保护 gate 被 Verifier/ReVerifier 与 live_system 事件重规划共同消费（v0.6 收尾完成）；SDK 冷却/一致性 API 接线。
@@ -163,7 +177,7 @@ cd /Users/oxygen/Documents/个人项目/tripchord
 uv run python benchmarks/live_canary_certified.py --bridge-token "$(cat .runtime/browser-bridge-token)"
 TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence
 ```
-（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行。API 已受控重启并绑定新 HEAD=`b673c00`（C-122 R39 Block 69–70 收口提交），provenance 三哈希匹配。）
+（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行。API 已受控重启并绑定新 HEAD=`fa88479`（C-122 R42 Block 76–77 收口提交，含 R40/R41 并账），provenance 三哈希匹配。）
 
 ## 基线记录（业务代码修改前）
 
