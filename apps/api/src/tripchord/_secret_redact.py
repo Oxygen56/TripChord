@@ -782,10 +782,58 @@ def _is_digest_identity_params(params: dict[str, list[str]]) -> bool:
 # syntax error can hide it.  The value is a genuine 16+ hex run — the same
 # lengths the response credential accepts — with complete boundaries, so
 # ``response=abc`` prose or a hex run inside a longer token never matches.
+# R38 Block 68: the token is captured up to the next member separator
+# (``,;`` / end of line) — NOT truncated at whitespace, so a whitespace-padded
+# wrapped value (``response=" deadbeef "`` / ``response=( deadbeef )``) stays a
+# single token — and :func:`_digest_response_hex_value` recursively strips the
+# legal paired wrappers + JSON-artifact escape layer, so an illegal-wrapped
+# value (``response=(deadbeef)`` / ``response=[deadbeef]`` /
+# ``response=((deadbeef))`` / ``response=“deadbeef”``) and a JSON-escaped /
+# quoted-pair value (``response=\"deadbeef\"``) resolve to the SAME
+# any-non-empty-hex determination as a normal parsed response value
+# (``_HEX_FULL_RE.fullmatch``), never a hand-enumerated character table.
 _DIGEST_RESPONSE_HEX_RE = re.compile(
-    r"(?i)(?:^|[^\w])response[ \t]*=[ \t]*"
-    r"(?P<token>[\"']?[!#$%&'*+\-.^_`|~0-9A-Za-z]+)"
+    r"(?i)(?:^|[^\w])response[ \t]*=[ \t]*(?P<token>[^,;\r\n]+)"
 )
+
+
+def _digest_response_hex_value(value: str) -> bool:
+    """R38 Block 68: the any-non-empty-hex determination the NORMAL parse makes
+    on a parsed response value (``_HEX_FULL_RE.fullmatch``), applied after a
+    BOUNDED (max 8) RECURSIVE strip of one leading and one trailing wrapper
+    layer with inner-whitespace tolerance — the R36 Block 64 single leading /
+    trailing quote (TORN by the member boundary or JSON escaping,
+    ``response="deadbeef``) and the JSON-artifact backslash-quoted-pair
+    (``\"`` / ``\'``) are the same wrapper layer, now applied repeatedly so a
+    whitespace-padded or nested value — ``( deadbeef )`` / ``((deadbeef))`` /
+    ``\"deadbeef\"`` / ``“deadbeef”`` — resolves to the SAME ``deadbeef`` the
+    normal parse sees.  An empty wrapper (``()``), a hex prefix of a longer
+    non-hex token (``deadbeefxyz``) or a mixed value (``deadbeef.g``) stays a
+    non-credential, exactly like the normal parse."""
+    tok = value.strip()
+    depth = 0
+    while depth < 8:
+        nxt = tok
+        stripped = False
+        if nxt.startswith(('\\"', "\\'")):
+            nxt = nxt[2:]
+            stripped = True
+        elif nxt[:1] in _DIGEST_VALUE_WRAPPER_CHARS:
+            nxt = nxt[1:]
+            stripped = True
+        nxt = nxt.strip()
+        if nxt.endswith(('\\"', "\\'")):
+            nxt = nxt[:-2]
+            stripped = True
+        elif nxt[-1:] in _DIGEST_VALUE_WRAPPER_CHARS:
+            nxt = nxt[:-1]
+            stripped = True
+        nxt = nxt.strip()
+        if not stripped or nxt == tok:
+            break
+        tok = nxt
+        depth += 1
+    return bool(_HEX_FULL_RE.fullmatch(tok))
 
 
 def _digest_malformed_response_hex(text: str, start: int, end: int) -> bool:
@@ -798,19 +846,12 @@ def _digest_malformed_response_hex(text: str, start: int, end: int) -> bool:
     ignored a quoted response (``response="<32hex>"``) entirely; both are now
     detected and fail closed.  ``response=abc`` prose, an empty value, or a hex
     prefix of a longer non-hex token (``response=deadbeefxyz``) are not
-    credentials — matching the normal parse exactly."""
+    credentials — matching the normal parse exactly.  R38 Block 68: the value
+    resolution is the shared :func:`_digest_response_hex_value` — a wrapper
+    (paren/bracket/quoted-pair/backtick) around the hex is stripped before the
+    same any-non-empty-hex determination runs."""
     for m in _DIGEST_RESPONSE_HEX_RE.finditer(text, start, end):
-        tok = m.group("token")
-        # R36 Block 64: the quote pair is often torn by the member boundary
-        # (``response="deadbeef`` — the closing quote was swallowed / never
-        # written) or JSON-escaped; strip a leading and/or trailing quote
-        # independently so tail damage never erases the hex, then apply the
-        # SAME any-non-empty-hex determination as the normal parse.
-        if tok.startswith(("\"", "'")):
-            tok = tok[1:]
-        if tok.endswith(("\"", "'")):
-            tok = tok[:-1]
-        if _HEX_FULL_RE.fullmatch(tok.strip()):
+        if _digest_response_hex_value(m.group("token")):
             return True
     return False
 
@@ -963,10 +1004,28 @@ class _DigestAuthScan:
                 # ``algorithm="md5 response=deadbeef"``) is ordinary quoted
                 # prose, shares the normal parse's value determination, and is
                 # never re-scanned as a credential.
-                if re.search(r"(?i)response[ \t]*=[ \t]*$", val):
-                    line_end = text.find("\n", value_start)
-                    if line_end == -1:
-                        line_end = n
+                # R38 Block 68: a ``\"...\"`` quoted-pair wrapper can ALSO tear
+                # the member so the credential DANGLES right after the closing
+                # quote with no comma (``bad=\"unterminated, \"response=deadbeef\"``)
+                # — the escaped-quote wrapper cut the value short and the hex
+                # sits in the torn member tail.  Re-scan the non-comma TAIL
+                # from the closing quote with the same any-non-empty-hex
+                # determination and extend the span over the swallowed tail.
+                # The scan starts one char back (the closing quote) so the
+                # ``response`` at the tail start still sits behind a boundary.
+                line_end = text.find("\n", i)
+                if line_end == -1:
+                    line_end = n
+                tail_comma = text.find(",", i)
+                tail_end = (
+                    tail_comma
+                    if tail_comma != -1 and tail_comma < line_end
+                    else line_end
+                )
+                if _digest_malformed_response_hex(text, max(i - 1, 0), tail_end):
+                    malformed_response_hex = True
+                    i = line_end
+                elif re.search(r"(?i)response[ \t]*=[ \t]*$", val):
                     if _digest_malformed_response_hex(text, value_start, line_end):
                         malformed_response_hex = True
                         i = line_end
@@ -981,6 +1040,16 @@ class _DigestAuthScan:
                     region_end = text.find(",", i)
                     if region_end == -1:
                         region_end = n
+                    # R38 Block 68: when the member itself is ``response``, its
+                    # non-token value can carry the credential behind an ILLEGAL
+                    # wrapper (``response=(deadbeef)`` / ``response=[deadbeef]``)
+                    # — the region after ``=`` has no ``response=`` binding for
+                    # the recovery scan, so the member VALUE is resolved with the
+                    # same any-non-empty-hex determination directly.
+                    if name == "response" and _digest_response_hex_value(
+                        text[i:region_end]
+                    ):
+                        malformed_response_hex = True
                     if _digest_malformed_response_hex(text, i, region_end):
                         malformed_response_hex = True
                     i = region_end
@@ -1691,14 +1760,83 @@ _REGISTERED_BASE_VALUE_PREFIX_RE = re.compile(
 # STRUCTURAL APPEARANCE and must FAIL CLOSED (Block 65: 非法结构外观 一律
 # fail-closed), not read as a non-base phrase — 禁止继续枚举分隔符/括号, so the
 # wrapper set is the paired closure, not an enumerable list.
-_WRAPPER_PAIR: dict[str, str] = {
-    "(": ")",
-    "[": "]",
-    "{": "}",
-    "<": ">",
-    '"': '"',
-    "'": "'",
-}
+#
+# R38 Block 67: the closure is now the generic Unicode Ps/Pe pair set PLUS the
+# self-pair quote / apostrophe / backtick — every PS code point whose Unicode
+# name mirrors a Pe ("LEFT X" -> "RIGHT X") is paired by NAME, not enumerated,
+# so a CJK corner bracket (``「plannerV2」`` / ``【plannerV2】`` / ``《plannerV2》``),
+# a full-width bracket (``（plannerV2）`` / ``［plannerV2］`` / ``｛plannerV2｝``)  # noqa: RUF003
+# or a backtick (``\`plannerV2\```) wrapper is recognized by STRUCTURE, and any
+# future Ps/Pe pair is covered without a table edit (supervision: 按真实结构 +
+# 通用 Unicode 配对包装解析, 禁止继续补字符表).
+def _build_wrapper_pairs() -> dict[str, str]:
+    pairs: dict[str, str] = {
+        "(": ")",
+        "[": "]",
+        "{": "}",
+        "<": ">",
+        '"': '"',
+        "'": "'",
+        "`": "`",
+    }
+    # Generic Unicode paired closure by STRUCTURE (R38 Block 67 —
+    # 禁止继续补字符表, never a hand-maintained table).  Two rules cover the
+    # whole BMP+ range in one import-time scan (≈0.2s):
+    #   1. NAME mirroring — every ``LEFT``-named opener (category Ps or Pi)
+    #      closes with the ``RIGHT``-named closer (category Pe or Pf) of the
+    #      SAME name.  This pairs the Ps/Pe bracket families AND the
+    #      LEFT/RIGHT quotation marks (``“”`` U+201C/U+201D, ``‘’``  # noqa: RUF003
+    #      U+2018/U+2019, ``«»`` U+00AB/U+00BB, ``‹›`` U+2039/U+203A) and the  # noqa: RUF003
+    #      substitution / transposition / omission brackets — the Pi/Pf scan
+    #      is what the old Ps/Pe-only scan missed.
+    #   2. CODE-POINT adjacency — an opener that is NOT LEFT/RIGHT-named
+    #      closes with the code point exactly at ``cp+1`` when that is an
+    #      unclaimed close-category (Pe/Pf) character.  The pairs the Unicode
+    #      standard assigns for these families ARE adjacent: Tibetan
+    #      ``༺༻`` U+0F3A/U+0F3B + ``༼༽`` U+0F3C/U+0F3D, Ogham ``᚛᚜``
+    #      U+169B/U+169C, the arc brackets U+2993/U+2994 + U+2995/U+2996, the
+    #      double-prime quotes U+301D/U+301E, and the vertical lenticular
+    #      brackets U+FE17/U+FE18.
+    close_by_name: dict[str, str] = {}
+    open_chars: list[tuple[str, str]] = []
+    for cp in range(0x110000):
+        name = unicodedata.name(chr(cp), "")
+        if not name:
+            continue
+        cat = unicodedata.category(chr(cp))
+        if cat in ("Pe", "Pf"):
+            close_by_name[name] = chr(cp)
+        elif cat in ("Ps", "Pi"):
+            open_chars.append((name, chr(cp)))
+    for name, ch in open_chars:
+        if "LEFT" in name:
+            closer = close_by_name.get(name.replace("LEFT", "RIGHT", 1))
+            if closer is not None:
+                pairs[ch] = closer
+    used_close = set(dict.fromkeys(pairs.values()))
+    for _name, ch in open_chars:
+        if ch in pairs:
+            continue
+        nxt = chr(ord(ch) + 1)
+        if unicodedata.category(nxt) in ("Pe", "Pf") and nxt not in used_close:
+            pairs[ch] = nxt
+            used_close.add(nxt)
+    return pairs
+
+
+_WRAPPER_PAIR: dict[str, str] = _build_wrapper_pairs()
+# Char classes for the open/close groups of the exact-assignment regex, built
+# from the same paired closure so a wrapper char is never hard-coded twice.
+_WRAPPER_OPEN_CLASS = "[" + "".join(re.escape(c) for c in _WRAPPER_PAIR) + "]"
+_WRAPPER_CLOSE_CLASS = "[" + "".join(
+    re.escape(c) for c in dict.fromkeys(_WRAPPER_PAIR.values())
+) + "]"
+# Every opener and closer of the paired closure, as a plain char set — the
+# digest response-value wrapper strip (R38 Block 68) uses it, and it is defined
+# after ``_WRAPPER_PAIR`` so the earlier digest helpers resolve it at call time.
+_DIGEST_VALUE_WRAPPER_CHARS = frozenset(
+    dict.fromkeys([*_WRAPPER_PAIR, *_WRAPPER_PAIR.values()])
+)
 # Sentinel returned by :func:`_registered_base_value_info` for an ILLEGAL
 # STRUCTURAL wrapper (opener present, matching pair absent) — callers fail
 # closed (never exempt) on it.
@@ -1835,13 +1973,22 @@ def _registered_base_value_exempt_at_path(
 # ``access is granted to plannerV2 users`` (value is a phrase, not the exact
 # base) and a bare ``plannerV2 providerV4`` run (no bind operator) stay exempt
 # — only the exact-value assignment is a credential.
+# R38 Block 67: the field continuation is the non-space class, BUT a quote /
+# apostrophe is a legal field-name character only when the char BEFORE it is
+# not a JSON string-opening structural delimiter (``:`` / ``,`` / ``{`` / ``[``
+# / space) — ``evil"planner_version`` (quote embedded in the name) stays ONE
+# field and fails closed, while a JSON member ``"summary":"plan.planner_version
+# = …`` (the ``"`` after the ``:`` OPENS the string value) never lets the field
+# swallow the member structure: the assignment binds the REAL field
+# ``plan.planner_version`` and the documented-path exemption decides it.
 _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_\u4e00-\u9fff])"
-    r"(?P<field>[\w\u4e00-\u9fff/\[\]][^\s\"'=]*)"
+    r"(?P<field>[\w\u4e00-\u9fff/\[\]]"
+    r"(?:[^\s\"']|(?<![:,\s{[])['\"])*)"
     r"[ \t]*(?:" + _CREDENTIAL_NARRATION_BIND_OP + r")[ \t]*"
-    r"(?P<open>[\"'(\[{<])?"
+    r"(?P<open>" + _WRAPPER_OPEN_CLASS + r")?"
     r"(?P<value>(?:" + _REGISTERED_BASE_ALT + r")(?:V[0-9]+|[0-9]+))"
-    r"(?P<close>[\"')}\]>])?"
+    r"(?P<close>" + _WRAPPER_CLOSE_CLASS + r")?"
     r"(?![A-Za-z0-9_\u4e00-\u9fff])"
 )
 
@@ -1853,12 +2000,20 @@ def _exact_assign_wrapper_mismatch(m: re.Match[str]) -> bool:
     (``verification code is [plannerV2`` / ``verification code is (plannerV2]``).
     A bare value or a value whose opener has its own matching pair
     (``(plannerV2)`` / ``[plannerV2]``) is a tolerable mask and not a mismatch —
-    the documented-path exemption then decides it."""
+    the documented-path exemption then decides it.  R38 Block 67: a MISSING
+    close is only a mismatch for a NON-self-pairing bracket (``[`` / ``(`` /
+    ``{`` / ``<`` and the Unicode paired brackets) — a self-pairing quote /
+    backtick opener (``"`` / ``'`` / ``` ``) with no close is the JSON string
+    delimiter that opens a LONGER value (``"summary":"plannerV2 providerV4"``),
+    not an illegal wrapper, so the documented-path exemption still decides it."""
     open_c = m.group("open")
     close_c = m.group("close")
-    if open_c:
-        return close_c is None or _WRAPPER_PAIR.get(open_c) != close_c
-    return False
+    if open_c is None:
+        return False
+    pair = _WRAPPER_PAIR.get(open_c)
+    if close_c is None:
+        return pair != open_c
+    return pair != close_c
 
 
 def _documented_version_field_exempt(m: re.Match[str]) -> bool:
@@ -1870,8 +2025,16 @@ def _documented_version_field_exempt(m: re.Match[str]) -> bool:
     matching — ``evilplanner_version`` is the field ``evilplanner_version``,
     never a prefix-stripped ``planner_version`` (R36 fake-suffix), and the
     value base must be in the path's allowed set (``planner_version =
-    providerV4`` is a cross-field value, not exempt)."""
+    providerV4`` is a cross-field value, not exempt).  R38 Block 67: a single
+    trailing ``"`` / ``'`` — the JSON field-name delimiter the non-space field
+    continuation now keeps inside the name (``{"planner_version":
+    "plannerV2"}`` yields field ``planner_version"``) — is stripped before the
+    path build, so the DOCUMENTED key is still matched exactly; a field that
+    merely EMBEDS the delimiter (``evil"planner_version``) is untouched and
+    never documented."""
     field = m.group("field").strip()
+    if len(field) >= 2 and field[-1] in "\"'":
+        field = field[:-1].strip()
     path = tuple(part.strip().lower() for part in field.split("."))
     return _registered_base_value_exempt_at_path(path, m.group("value"))
 

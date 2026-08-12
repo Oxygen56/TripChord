@@ -16959,3 +16959,243 @@ def test_r37_full_chain_producer_seal_consumer_block65_66_both_finals(
             credential_field_check=True,
         )
 
+
+
+def test_r38_block67_unicode_paired_wrapper_fail_closed_both_paths() -> None:
+    r"""C-122 round-38 Block 67 (supervision 09:15): the generic Unicode paired
+    wrapper closure must cover the non-LEFT/RIGHT-named quotation marks and the
+    Tibetan / Ogham bracket families by STRUCTURE — the Pi/Pf name mirror
+    (``“plannerV2”`` U+201C/U+201D, ``plannerV2`` in the LEFT/RIGHT SINGLE
+    QUOTATION MARKS U+2018/U+2019) and the
+    code-point-adjacency pairs (``༺plannerV2༻`` U+0F3A/U+0F3B,
+    ``᚛plannerV2᚜`` U+169B/U+169C) — never a hand-enumerated character table
+    (禁止继续补字符表).  A wrapped exact base in narration or a neutral JSON
+    member value fails closed on BOTH finals; the documented business paths
+    keep their wrapped-value exemption."""
+    LQ, RQ = "“", "”"
+    SQ, SB = "‘", "’"
+    TG, TB = "༺", "༻"
+    OG, OB = "᚛", "᚜"
+    b67_reject = (
+        "verification code is " + LQ + "plannerV2" + RQ,
+        "verification code is " + SQ + "plannerV2" + SB,
+        "verification code is " + TG + "plannerV2" + TB,
+        "verification code is " + OG + "plannerV2" + OB,
+        '{"otp": "' + LQ + "plannerV2" + RQ + '"}',
+        '{"otp": "' + TG + "plannerV2" + TB + '"}',
+        '{"otp": "' + OG + "plannerV2" + OB + '"}',
+        'evil"planner_version = ' + LQ + "plannerV2" + RQ,
+        "evil=planner_version = " + TG + "plannerV2" + TB,
+    )
+    for raw in b67_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in (
+        '{"planner_version": "' + LQ + "plannerV2" + RQ + '"}',
+        '{"plan": {"planner_version": "' + TG + "plannerV2" + TB + '"}}',
+        "plan.planner_version = " + OG + "plannerV2" + OB,
+        '{"summary": "' + LQ + "plannerV2" + RQ + ' released"}',
+        '{"summary": "' + TG + "tokenizationV1" + TB + '"}',
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r38_block68_digest_recovery_same_hex_determination_both_paths() -> None:
+    r"""C-122 round-38 Block 68 (supervision 09:15): the malformed-member
+    recovery scan must NOT truncate at whitespace and must resolve the value
+    with the SAME any-non-empty-hex determination as the normal parse — a
+    whitespace-padded wrapper (``response=" deadbeef "`` /
+    ``response=( deadbeef )``), a nested wrapper (``response=((deadbeef))``), a
+    Unicode paired wrapper (``response=“deadbeef”`` / ``༺deadbeef༻`` /
+    ``᚛deadbeef᚜``) and the torn-quote / quoted-pair forms
+    (``response="deadbeef"`` / ``response=\"deadbeef\"``) all fail closed on
+    BOTH finals.  An empty value, a non-hex value, a hex prefix of a longer
+    token, and the algorithm-description narrations (no request identity) stay
+    accepted — the recovery never diverges from the normal parse."""
+    h32 = "ab" * 16
+    b68_reject = (
+        'service Digest username="user", response=(deadbeef)',
+        'service Digest username="user", response=[deadbeef]',
+        'service Digest username="user", response=( deadbeef )',
+        'service Digest username="user", response=((deadbeef))',
+        'service Digest username="user", response=" deadbeef "',
+        'service Digest username="user", response="deadbeef"',
+        'service Digest username="user", response=“deadbeef”',
+        'service Digest username="user", response=༺deadbeef༻',
+        'service Digest username="user", response=᚛deadbeef᚜',
+        'service Digest username="user", bad="unterminated, response=( deadbeef )',
+        'service Digest username="user", bad="unterminated, response=((deadbeef))',
+        'service Digest username="user", bad="unterminated, response=“deadbeef”',
+        'service Digest username="user", bad="unterminated, response="deadbeef"',
+        f'service Digest username="user", bad="unterminated, response="{h32}"',
+    )
+    for raw in b68_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in (
+        'client digest note="response=deadbeef", algorithm=md5',
+        'client digest algorithm="md5 response=deadbeef"',
+        'client digest algorithm=md5, response=deadbeef',
+        "WWW-Authenticate: Digest realm=\"test\", nonce=abc123",
+        'service Digest username="user", response=xyz',
+        'service Digest username="user", response=deadbeefxyz',
+        'service Digest username="user", response=deadbeef.g',
+        f'client digest algorithm="md5 response={h32}"',
+    ):
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+
+
+def test_r38_full_chain_producer_seal_consumer_block67_68_both_finals(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-38 full chain (Block 67 + Block 68): the producer masks the
+    Unicode-pair-wrapped registered base and the wrapper/whitespace-padded
+    Digest response credential BEFORE the 0600 seal, so the sealed diagnostic
+    and the consumer-synthesized field are clean and BOTH finals pass; the RAW
+    value still fails BOTH finals (defense in depth).  The documented business
+    paths with a wrapped base and the algorithm-narration prose survive the
+    seal untouched."""
+    from benchmarks import live_canary_certified as canary
+
+    LQ, RQ = "“", "”"
+    TG, TB = "༺", "༻"
+    raw_cases = (
+        "verification code is " + LQ + "plannerV2" + RQ,
+        '{"otp": "' + TG + "plannerV2" + TB + '"}',
+        'service Digest username="user", response=( deadbeef )',
+        'service Digest username="user", response=((deadbeef))',
+        'service Digest username="user", response=' + LQ + "deadbeef" + RQ,
+    )
+    for raw in raw_cases:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r38b6768",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in (
+        '{"planner_version": "' + LQ + "plannerV2" + RQ + '"}',
+        "plan.planner_version = " + TG + "plannerV2" + TB,
+        '{"summary": "' + LQ + "plannerV2" + RQ + ' released"}',
+        'client digest note="response=deadbeef", algorithm=md5',
+        'client digest algorithm="md5 response=deadbeef"',
+    ):
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked
+        assert "plannerV2" in masked or "deadbeef" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r38b6768",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
