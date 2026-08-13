@@ -2071,8 +2071,38 @@ for _base in sorted(_VERSION_MARKER_BUSINESS_BASES):
 del _base, _version_field
 
 
+class _ArrayPathMarker:
+    """Typed array-element path segment (R42 Block 87 / 打回八).
+
+    A JSON list item is recorded in a carried path as this sentinel, NEVER as
+    the literal string ``"[]"``: a real object member KEY literally named
+    ``"[]"`` (``{"planner_version": {"[]": "plannerV2"}}``) is a distinct
+    STRING path segment and must never be stripped as an array marker.  The
+    shared exact-path matcher strips only the typed sentinel, so a documented
+    outer member's real array / nested-array elements (``("planner_version",
+    <array>, ...)``) keep inheriting the exemption while a genuine ``"[]"``
+    member key (``("planner_version", "[]")``) and an assignment field that
+    ends in ``.[]`` (``planner_version.[] = plannerV2``) stay unbound and fail
+    closed.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<array-element>"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _ArrayPathMarker)
+
+    def __hash__(self) -> int:
+        return hash(_ArrayPathMarker)
+
+
+_ARRAY_PATH_ELEMENT = _ArrayPathMarker()
+
+
 def _registered_base_value_exempt_at_path(
-    path: tuple[str, ...], value: str
+    path: tuple[str | _ArrayPathMarker, ...], value: str
 ) -> bool:
     """True when the exact registered-base ``value`` may sit at the JSON
     member-key ``path`` without being a credential (R36 Block 61): either it is
@@ -2089,15 +2119,21 @@ def _registered_base_value_exempt_at_path(
         return False
     base, _is_version = info
     # R42 Block 86 (打回七): a decoded ARRAY / nested-ARRAY element sits at a
-    # ``(carried_path, "[]", ...)`` path — strip the trailing ``[]`` markers and
-    # consult the documented PREFIX's allowed base set, so a documented outer
-    # member (``("planner_version", "[]")`` -> ``("planner_version",)`` /
-    # ``("summary", "[]", "[]")`` -> ``("summary",)``) inherits the exemption
-    # for its elements while an unbound / cross-field array element
-    # (``("otp", "[]")`` / ``("planner_version", "[]")`` + ``providerV4``)
-    # still fails closed.
+    # ``(carried_path, <array>, ...)`` path — strip the trailing typed ARRAY
+    # markers and consult the documented PREFIX's allowed base set, so a
+    # documented outer member (``("planner_version", <array>)`` ->
+    # ``("planner_version",)`` / ``("summary", <array>, <array>)`` ->
+    # ``("summary",)``) inherits the exemption for its elements while an
+    # unbound / cross-field array element (``("otp", <array>)`` /
+    # ``("planner_version", <array>)`` + ``providerV4``) still fails closed.
+    # R42 Block 87 (打回八): only the TYPED sentinel is stripped — a real object
+    # member key literally named ``"[]"`` is a string segment (never equal to
+    # the sentinel) and stays part of the path, so ``("planner_version", "[]")``
+    # / ``("summary", "[]")`` are unbound and fail closed; the assignment helper
+    # ``planner_version.[] = plannerV2`` (a dotted field name, string segments
+    # only) is not documented either.
     base_path = path
-    while base_path and base_path[-1] == "[]":
+    while base_path and base_path[-1] is _ARRAY_PATH_ELEMENT:
         base_path = base_path[:-1]
     allowed = _DOCUMENTED_BUSINESS_VALUE_PATHS.get(base_path)
     if allowed is None:
@@ -3290,7 +3326,9 @@ def bounded_json_mask(
         return norm != key and any(p.search(norm) for p in key_patterns)
 
     def mask_text(
-        current: str, depth: int, path: tuple[str, ...] = ()
+        current: str,
+        depth: int,
+        path: tuple[str | _ArrayPathMarker, ...] = (),
     ) -> str:
         nonlocal budget_nodes, budget_chars
         if depth > _MAX_JSON_SCAN_DEPTH:
@@ -3356,7 +3394,9 @@ def bounded_json_mask(
         # key, struct_depth, path) commits an already-built container.  ``path``
         # is the exact member-key path of ``node`` (a list index collapses to
         # the ``[]`` placeholder).
-        stack: list[tuple[str, Any, Any, Any, int, tuple[str, ...]]] = [
+        stack: list[
+            tuple[str, Any, Any, Any, int, tuple[str | _ArrayPathMarker, ...]]
+        ] = [
             ("value", parsed, root_slot, "__out__", 0, ())
         ]
         while stack:
@@ -3436,19 +3476,33 @@ def bounded_json_mask(
                 )
                 for i, item in enumerate(node):
                     if isinstance(item, str):
-                        child_path = (*path, "[]")
+                        # R42 Block 87 (打回八): the array element is recorded
+                        # at the TYPED sentinel, never the string ``"[]"`` — a
+                        # real ``"[]"`` member KEY is a string segment and must
+                        # not be stripped as an array marker by the shared
+                        # matcher.
+                        child_path = (*path, _ARRAY_PATH_ELEMENT)
                         # R42 Block 85 (打回七): a JSON-text array element is a
                         # serialization envelope — recurse first (``mask_text``
                         # defers the judgment to the real inner value).
                         if looks_like_json(item) or _registered_base_value_exempt_at_path(
                             child_path, item
                         ):
-                            out_list[i] = mask_text(item, level_depth + 1, (*path, "[]"))
+                            out_list[i] = mask_text(
+                                item, level_depth + 1, child_path
+                            )
                         else:
                             out_list[i] = marker
                     elif isinstance(item, (dict, list)):
                         stack.append(
-                            ("value", item, out_list, i, struct_depth + 1, (*path, "[]"))
+                            (
+                                "value",
+                                item,
+                                out_list,
+                                i,
+                                struct_depth + 1,
+                                (*path, _ARRAY_PATH_ELEMENT),
+                            )
                         )
                     else:
                         budget_nodes += 1

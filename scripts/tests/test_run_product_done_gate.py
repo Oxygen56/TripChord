@@ -19773,3 +19773,241 @@ def test_r42_block86_encoded_array_per_item_path_five_route(
     )
     for raw in preserved:
         accepts(raw)
+
+
+def test_r42_block87_typed_array_marker_five_route(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-42 Block 87 (打回八): the shared exact-path matcher
+    ``_registered_base_value_exempt_at_path`` stripped EVERY trailing string
+    path segment equal to ``"[]"``, conflating a REAL JSON object member KEY
+    literally named ``"[]"`` (``{"planner_version": {"[]": "plannerV2"}}``)
+    with the array-element marker a list item appends.  A documented outer
+    member (``("planner_version", "[]")`` -> ``("planner_version",)``) then
+    inherited the exemption for a value sitting at the genuine ``"[]"`` key,
+    and the free-text assignment helper (``planner_version.[] = plannerV2``)
+    laundered an EXACT base through the documented prefix — raw committed +
+    failure dual finals ACCEPTED, the producer left it UNTOUCHED.
+
+    The fix makes the array marker a TYPED sentinel (``_ARRAY_PATH_ELEMENT``):
+    a real ``"[]"`` member key is a STRING segment the matcher never strips, so
+    the unescaped/escaped dict-key / documented-prefix / summary / nested /
+    pseudo-path JSON forms AND the dotted assignment fields (``.[] =``) fail
+    closed on both raw finals while the producer masks whole; the sealed 0600
+    diagnostic -> consumer dual finals accept ONLY because the producer already
+    masked.  A truly documented outer ARRAY / nested-ARRAY element (the
+    string-encoded ``{"planner_version": "[plannerV2]"}`` family and a real
+    array element not bound at the ``:``) still keeps the exemption and is
+    finals-accepted (Block 86 positives preserved).
+    """
+    from benchmarks import live_canary_certified as canary
+
+    def final(raw: str, label: str, field_check: bool) -> None:
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            label,
+            credential_field_check=field_check,
+        )
+
+    def rejects(raw: str) -> None:
+        with pytest.raises(gate.GateStateChangedError):
+            final(raw, "ev.json", True)
+        with pytest.raises(gate.GateStateChangedError):
+            final(raw, "live-canary-certified.json.failure.json", False)
+
+    def accepts(raw: str) -> None:
+        final(raw, "ev.json", True)
+        final(raw, "live-canary-certified.json.failure.json", False)
+
+    def sealed_accepts(masked: str, run_id: str) -> None:
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id=run_id,
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+
+    # Block 87 negatives — a genuine ``"[]"`` MEMBER KEY (unescaped /
+    # escaped), under a documented prefix / summary / nested / pseudo-path, and
+    # the free-text assignment field ``<documented>.[] = <base>`` all fail
+    # closed on both raw finals; the producer masks; the sealed + consumer dual
+    # finals accept only because the producer already masked.
+    b87_reject = (
+        # unescaped / escaped literal ``"[]"`` object keys under a documented
+        # member (the supervisor's repro shapes).
+        '{"planner_version":{"[]":"plannerV2"}}',
+        '{"planner_version":{"\\u005b\\u005d":"plannerV2"}}',
+        '{"planner_version":{"\\u005B\\u005D":"plannerV2"}}',
+        '{"summary":{"[]":"plannerV2"}}',
+        '{"summary":{"[]":"providerV4"}}',
+        # nested / deeper ``"[]"`` keys.
+        '{"plan":{"planner_version":{"[]":"plannerV2"}}}',
+        '{"planner_version":{"x":{"[]":"plannerV2"}}}',
+        '{"summary":{"[]":{"[]":"plannerV2"}}}',
+        # pseudo / unbound paths.
+        '{"evilplanner_version":{"[]":"plannerV2"}}',
+        '{"otp":{"[]":"plannerV2"}}',
+        '{"planner_version":{"[]":"providerV4"}}',
+        # assignment / helper callers — a dotted documented field ending in
+        # ``.[]`` binds an exact base into the laundered documented prefix.
+        "planner_version.[] = plannerV2",
+        "plan.planner_version.[] = plannerV2",
+        "summary.[] = plannerV2",
+        "planner_version.[] = providerV4",
+    )
+    for raw in b87_reject:
+        rejects(raw)
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked, raw
+        sealed_accepts(masked, "r42b87")
+
+    # Block 87 positives — a truly documented outer ARRAY / nested-ARRAY
+    # element still inherits the exemption and is finals-accepted (Block 86
+    # ``doc_pos`` preserved).
+    b87_pos = (
+        '{"planner_version":"[plannerV2]"}',
+        '{"planner_version":"[[plannerV2]]"}',
+        '{"planner_version":"[\\"plannerV2\\"]"}',
+        '{"planner_version":"[[\\"plannerV2\\"]]"}',
+        '{"plan":{"planner_version":"[plannerV2]"}}',
+        '{"summary":"[\\"plannerV2\\", \\"providerV4\\"]"}',
+        '{"planner_version":["x","plannerV2","y"]}',
+    )
+    for raw in b87_pos:
+        accepts(raw)
+
+
+def test_r42_block86_prose_position_matrix_and_unicode_bracket_negatives(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-42 Block 86 matrix completion (打回八 要求 2): the earlier
+    Block 86 prose positives only exercised the MIDDLE array position; a legal
+    language phrase must be accepted at FIRST / MIDDLE / LAST / NESTED positions
+    through every decode depth (2/3/4) on all five routes, producer-untouched.
+    The negative matrix additionally covers a bracket-wrapped registered base
+    (``[providerV4]``) and a Unicode-escaped spelling of a base
+    (``providerV4``) as array elements — the exact-base family (Block 86
+    ``b86_reject`` already asserts ``plannerV2`` / ``(plannerV2)`` /
+    ``providerV4`` at every position) — all failing closed on both raw finals
+    with the producer masking, and the sealed 0600 diagnostic -> consumer dual
+    finals accepting only the already-masked producer output.
+    """
+    from benchmarks import live_canary_certified as canary
+
+    def layered(base: str, n: int) -> str:
+        s = base
+        for _ in range(n):
+            s = json.dumps(s)
+        return s
+
+    def final(raw: str, label: str, field_check: bool) -> None:
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            label,
+            credential_field_check=field_check,
+        )
+
+    def rejects(raw: str) -> None:
+        with pytest.raises(gate.GateStateChangedError):
+            final(raw, "ev.json", True)
+        with pytest.raises(gate.GateStateChangedError):
+            final(raw, "live-canary-certified.json.failure.json", False)
+
+    def accepts(raw: str) -> None:
+        final(raw, "ev.json", True)
+        final(raw, "live-canary-certified.json.failure.json", False)
+
+    def sealed_accepts(masked: str, run_id: str) -> None:
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id=run_id,
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+
+    # Legal prose at FIRST / MIDDLE / LAST / NESTED array positions, re-encoded
+    # 2/3/4 times: accepted by all five routes, producer-untouched.
+    b86_prose_matrix = tuple(
+        layered(arr, n)
+        for n in (2, 3, 4)
+        for arr in (
+            '["(plannerV2) is a version.", "x", "y"]',
+            '["x", "(plannerV2) is a version.", "y"]',
+            '["x", "y", "(plannerV2) is a version."]',
+            '["x", ["(plannerV2) is a version."]]',
+            '["plannerV2 is a non-secret version", "x", "y"]',
+            '["x", "plannerV2 is a non-secret version", "y"]',
+            '["x", "y", "plannerV2 is a non-secret version"]',
+            '["x", ["plannerV2 is a non-secret version"]]',
+        )
+    )
+    for raw in b86_prose_matrix:
+        accepts(raw)
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked, raw
+        sealed_accepts(masked, "r42b86m")
+
+    # Bracket-wrapped ``[providerV4]`` and Unicode-escaped base array elements
+    # (``providerV4``) at FIRST / MIDDLE / NESTED positions, depth 2/3/4:
+    # both raw finals reject, the producer masks, the sealed + consumer dual
+    # finals accept only the masked producer output.
+    b86_neg_matrix = tuple(
+        layered(arr, n)
+        for n in (2, 3, 4)
+        for arr in (
+            '["x", "[providerV4]", "y"]',
+            '["[providerV4]", "x", "y"]',
+            '["x", ["[providerV4]"]]',
+            '["x", "\\u0070roviderV4", "y"]',
+            '["\\u0070roviderV4", "x", "y"]',
+            '["x", ["\\u0070roviderV4"]]',
+        )
+    )
+    for raw in b86_neg_matrix:
+        rejects(raw)
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked, raw
+        assert "providerV4" not in masked, raw
+        sealed_accepts(masked, "r42b86m")

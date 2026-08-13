@@ -49,6 +49,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from tripchord._secret_redact import (
+    _ARRAY_PATH_ELEMENT,
     _CREDENTIAL_FIELD_STRONG_NAME_ALT,
     _MAX_JSON_SCAN_CHARS,
     _MAX_JSON_SCAN_DEPTH,
@@ -60,6 +61,7 @@ from tripchord._secret_redact import (
     DuplicateJsonKeyError,
     PatternScope,
     RecursiveJsonBudgetError,
+    _ArrayPathMarker,
     _is_registered_base_key_token,
     _is_whole_header_prose,
     _mask_bare_credential_text,
@@ -1390,7 +1392,11 @@ def _reject_unbound_registered_base_values(
     budget_nodes = 0
     budget_chars = 0
 
-    def walk_level(level_text: str, path: tuple[str, ...], depth: int) -> None:
+    def walk_level(
+        level_text: str,
+        path: tuple[str | _ArrayPathMarker, ...],
+        depth: int,
+    ) -> None:
         """Judge ONE decoded JSON level at the member path of the string VALUE
         that carried it (``()`` for the artifact's own text).  Bounded by the
         same depth / node / size budgets as the shared scan walker."""
@@ -1461,14 +1467,18 @@ def _reject_unbound_registered_base_values(
         # to ``()`` — the decoded document is judged on its OWN member paths
         # (R36 Block 61 / R42 Block 82), exactly like the producer's structure
         # walk.  A decoded LIST level CARRIES the path of the string VALUE that
-        # carried it: every array element is judged at ``(carried_path, "[]",
+        # carried it: every array element is judged at ``(carried_path, <array>,
         # ...)``, so a documented outer member inherits the exemption for its
-        # array / nested-array elements while a top-level array (``("[]",)``) /
-        # an unbound member array (``("otp", "[]")``) / a cross-field element
-        # (``("planner_version", "[]")`` + ``providerV4``) fails closed.  The
+        # array / nested-array elements while a top-level array (``(<array>,)``) /
+        # an unbound member array (``("otp", <array>)``) / a cross-field element
+        # (``("planner_version", <array>)`` + ``providerV4``) fails closed.  The
         # Block 82 ``depth == 0`` gate on direct array elements is GONE: the
-        # carried ``[]`` path, not the decode depth, decides every element.
-        stack: list[tuple[Any, tuple[str, ...]]] = (
+        # carried ``<array>`` path, not the decode depth, decides every element.
+        # R42 Block 87 (打回八): the array marker is the TYPED
+        # ``_ARRAY_PATH_ELEMENT`` sentinel — never the string ``"[]"`` — so a
+        # real object member KEY literally named ``"[]"`` is a distinct string
+        # path segment the shared matcher never strips.
+        stack: list[tuple[Any, tuple[str | _ArrayPathMarker, ...]]] = (
             [(parsed, ())] if isinstance(parsed, dict) else [(parsed, path)]
         )
         while stack:
@@ -1522,10 +1532,12 @@ def _reject_unbound_registered_base_values(
                             raise RecursiveJsonBudgetError(
                                 "JSON scan node budget exceeded"
                             )
-                        item_path = (*node_path, "[]")
+                        # R42 Block 87 (打回八): the array element sits at the
+                        # typed sentinel, never the string ``"[]"``.
+                        item_path = (*node_path, _ARRAY_PATH_ELEMENT)
                         # R42 Block 86 (打回七): every decoded array element is
-                        # judged at its carried ``[]`` path (recurse-first for
-                        # JSON-text elements, Block 85) — never skipped by
+                        # judged at its carried ``<array>`` path (recurse-first
+                        # for JSON-text elements, Block 85) — never skipped by
                         # decode depth.
                         if looks_like_json(item):
                             walk_level(item, item_path, depth + 1)
@@ -1538,7 +1550,9 @@ def _reject_unbound_registered_base_values(
                                 f"in {label} file {name}"
                             )
                     elif isinstance(item, (dict, list)):
-                        stack.append((item, (*node_path, "[]")))
+                        stack.append(
+                            (item, (*node_path, _ARRAY_PATH_ELEMENT))
+                        )
                     else:
                         budget_nodes += 1
                         if budget_nodes > _MAX_JSON_SCAN_NODES:
