@@ -10,7 +10,7 @@
 - **当前分支**：`productization/v1.0`（未 push；API 已在提交 `eb68a44` 受控重启并硬校验 provenance 三哈希匹配，pid 48622）
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
-- **最后完成的最小任务**：C-122 R42 Block 79–80（监督 18:22 增量纠偏，并入 R42 现有运行）——Block 79 所有 Unicode 行/段分隔与控制换行（U+2028/U+2029/VT/FF/NEL，类别 Cc/Zl/Zp）作为语义边界 fail-closed、Block 80 词内分隔符必须左右均为字母（连续/混合分隔 `a--b`/`a-'b`/`a-’b`/`a-—b` fail-closed）修复提交 `4014432`（`_secret_redact.py` + gate 测试）；全量 1008 passed、clean-env 508 passed、ruff 全绿、API 绑定 `4014432`（provenance 三哈希匹配，pid 82960）、六层门从头重跑如实记录（run_id=`bf5de0bc7b32`：层 1/2/3/4 PASS、层 5 FAIL pending user authorization、层 6 FAIL 如实报告 executor 在 done-gate 前于 `companion_preflight` 失败、passed=false、exit 2、worktree 干净、evidence_commit 未提交），passed=true 前不声称通过。Block 78 收口（提交 `eb68a44`，监督 14:52）为上一轮；R40（Block 71–73，`9f31333`/`50f45a9`）与 R41（Block 74–75，`a24635a`）代码已提交、回归全绿，六层门/账本统一并入 R42 在最终 HEAD 收口。
+- **最后完成的最小任务**：C-122 R42 Block 79–80（监督 18:22 增量纠偏，并入 R42 现有运行）——Block 79 所有 Unicode 行/段分隔与控制换行（U+2028/U+2029/VT/FF/NEL，类别 Cc/Zl/Zp）作为语义边界 fail-closed、Block 80 词内分隔符必须左右均为字母（连续/混合分隔 `a--b`/`a-'b`/`a-’b`/`a-—b` fail-closed）修复提交 `4014432`（`_secret_redact.py` + gate 测试）；全量 1008 passed、clean-env 508 passed、ruff 全绿、API 绑定最终 HEAD=`3a388ea`（provenance 三哈希匹配，pid 39679；代码 `4014432` 门跑时绑定经 82960 验证）、六层门从头重跑如实记录（run_id=`bf5de0bc7b32`：层 1/2/3/4 PASS、层 5 FAIL pending user authorization、层 6 FAIL 如实报告 executor 在 done-gate 前于 `companion_preflight` 失败、passed=false、exit 2、worktree 干净、evidence_commit 未提交），passed=true 前不声称通过。Block 78 收口（提交 `eb68a44`，监督 14:52）为上一轮；R40（Block 71–73，`9f31333`/`50f45a9`）与 R41（Block 74–75，`a24635a`）代码已提交、回归全绿，六层门/账本统一并入 R42 在最终 HEAD 收口。
 
 ## 版本状态
 
@@ -206,7 +206,7 @@ cd /Users/oxygen/Documents/个人项目/tripchord
 uv run python benchmarks/live_canary_certified.py --bridge-token "$(cat .runtime/browser-bridge-token)"
 TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence
 ```
-（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行——当前无已连接 Companion 时，层 6 如实报告 executor 在 `companion_preflight` 阶段失败（failed_before_done_gate），不包装为授权问题。API 已受控重启并绑定 HEAD=`4014432`（C-122 R42 Block 79–80 代码提交），provenance 三哈希匹配；本账本文档提交见本轮 ledger 行。）
+（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行——当前无已连接 Companion 时，层 6 如实报告 executor 在 `companion_preflight` 阶段失败（failed_before_done_gate），不包装为授权问题。API 已受控重启并绑定最终 HEAD=`3a388ea`（C-122 R42 Block 79–80 代码+文档全提交），provenance 三哈希匹配。）
 
 ## 基线记录（业务代码修改前）
 
