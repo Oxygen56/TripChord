@@ -2385,7 +2385,7 @@ def _blank_exact_marker_assignments(text: str) -> str:
 # the bare constant in a decoded string-value callback (the bounded walker fires
 # on the VALUE, not the assignment).
 _DIAGNOSTIC_SCHEMA_VERSION_RE = re.compile(
-    r'((?i:"schema_version")[ \t]*:[ \t]*)(?:"(?:\\.|[^"\\])*"|[A-Za-z0-9_.\-:/]+)'
+    r'((?i:"schema_version")[ \t]*:[ \t]*)((?:"(?:\\.|[^"\\])*"|[A-Za-z0-9_.\-:/]+))'
     r'|(?:"'
     + re.escape(_CANARY_DIAG_SCHEMA_VERSION)
     + r'"|'
@@ -2395,17 +2395,34 @@ _DIAGNOSTIC_SCHEMA_VERSION_RE = re.compile(
 
 
 def _blank_diagnostic_schema_version(text: str) -> str:
-    """Same-length-space the diagnostic's own fixed ``schema_version`` assignment
-    / constant, so the canary's sealed failure diagnostic does not trip its own
-    failure-final token-run scan."""
+    """Same-length-space the diagnostic's own fixed ``schema_version`` VALUE (the
+    key, colon and string quotes stay), so the canary's sealed failure diagnostic
+    does not trip its own failure-final token-run scan AND the text REMAINS a
+    valid JSON document — R42 Block 81: the free-text narration decode is gated
+    on a real JSON parse (``_is_json_document``), so blanking the whole
+    assignment (which left a dangling member comma) would turn the sealed
+    diagnostic's summary into a false fail-open/closed.  The value is a FIXED
+    gate-written constant (never user-controlled), so blanking it cannot mask a
+    real leak; the ``summary`` (the actual free-form carrier) is scanned
+    unchanged."""
     if not text:
         return text
-    spans = [m.span() for m in _DIAGNOSTIC_SCHEMA_VERSION_RE.finditer(text)]
-    if not spans:
-        return text
     chars = list(text)
-    for start, end in spans:
-        for i in range(start, end):
+    for m in _DIAGNOSTIC_SCHEMA_VERSION_RE.finditer(text):
+        value_start, value_end = m.start(2), m.end(2)
+        if value_start == -1:
+            # second alternative: the bare constant (no assignment) — blank the
+            # whole match; it sits inside a decoded string value whose surrounding
+            # quotes remain, so JSON validity is unaffected.
+            value_start, value_end = m.span()
+        else:
+            quoted = m.group(2)
+            if len(quoted) >= 2 and quoted[0] == '"' and quoted[-1] == '"':
+                # a quoted JSON string value: blank only the content between the
+                # quotes so ``"schema_version": "<value>"`` stays valid JSON.
+                value_start += 1
+                value_end -= 1
+        for i in range(value_start, value_end):
             if chars[i] not in "\r\n":
                 chars[i] = " "
     return "".join(chars)

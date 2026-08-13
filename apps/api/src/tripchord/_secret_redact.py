@@ -2385,8 +2385,28 @@ def _quoted_string_spans(text: str) -> tuple[tuple[int, int], ...]:
     return tuple(spans)
 
 
+def _is_json_document(text: str) -> bool:
+    """True when ``text`` is a GENUINE JSON document — the canonical
+    :func:`json_loads_no_dupes` parse (a real JSON parser, not the quote
+    scanner) succeeds on the whole text.  R42 Block 81: only a genuine
+    DOUBLE-QUOTED string value inside a real JSON document is RFC-8259 text
+    whose escapes are safe to decode; arbitrary quoted prose — even
+    double-quoted prose — is never decoded.  A truncated / duplicate-key /
+    non-JSON text is not a JSON document and returns False (the caller then
+    fails closed on the raw form)."""
+    try:
+        json_loads_no_dupes(text)
+    except (ValueError, TypeError, RecursionError):
+        return False
+    return True
+
+
 def _exact_value_at_free_text_boundary(
-    text: str, end: int, spans: tuple[tuple[int, int], ...]
+    text: str,
+    end: int,
+    spans: tuple[tuple[int, int], ...],
+    *,
+    is_json_document: bool = False,
 ) -> bool:
     """R42 Block 76: the free-text narration variant of
     :func:`_exact_value_at_semantic_boundary` — True when the exact-base
@@ -2411,7 +2431,16 @@ def _exact_value_at_free_text_boundary(
     documented ``summary``/``detail``/``reason`` field the 09:40 correction
     requires to stay accepted.  An incomplete / invalid escape is left
     untouched and the caller fails closed on the raw text — the decode never
-    weakens a rejection."""
+    weakens a rejection.
+
+    R42 Block 81 (12:07 re-review): the decode is now GATED on the enclosing
+    span being a GENUINE DOUBLE-QUOTED string value in a REAL JSON document
+    (``is_json_document``, proven by the canonical parse).  Arbitrary quoted
+    prose — even double-quoted prose — and single-quoted spans are NEVER
+    decoded, so a literal ``\\t`` / ``\\u0009`` / ``\\u0020`` / ``\\u0061`` in a
+    free-text quote stays a literal backslash-escape, fails the same-line
+    phrase check closed and the narration binds exactly as it did before the
+    09:40 correction — no deterministic bypass."""
     after = text[end:]
     if not after:
         return True
@@ -2429,11 +2458,19 @@ def _exact_value_at_free_text_boundary(
         if rest and rest[-1] in "\"'":
             rest = rest[:-1]
         rest = rest.rstrip(" \t")
-        # 09:40 correction: decode the RFC-8259 escapes in the string CONTENT
-        # so a real TAB serialized as ``\t`` is judged as horizontal whitespace
-        # (a same-line phrase may span it), while a JSON-escaped newline still
-        # decodes to a line boundary and stays fail-closed.
-        rest = _decode_json_string_escapes(rest)
+        # 09:40 + Block 81: decode the RFC-8259 escapes in the string CONTENT
+        # ONLY when the enclosing span is a genuine DOUBLE-QUOTED JSON string
+        # value of a REAL JSON document (``is_json_document``).  A sealed
+        # diagnostic legitimately carries ``\t`` for a real TAB and the decode
+        # makes it judged as horizontal whitespace (a same-line phrase may span
+        # it); a JSON-escaped newline still decodes to a line boundary and
+        # stays fail-closed.  Quoted prose and single-quoted spans are never
+        # decoded, so a literal escape in prose fails closed.
+        if is_json_document and any(
+            start < end < close and text[start] == '"'
+            for start, close in spans
+        ):
+            rest = _decode_json_string_escapes(rest)
     return not _is_natural_language_phrase(rest)
 
 
@@ -2485,6 +2522,13 @@ def _credential_narration_binds(text: str) -> bool:
     # to the shared ``_registered_base_value_info`` core, so it never needs —
     # and never does — a context-free envelope strip.
     spans = _quoted_string_spans(text)
+    # R42 Block 81: whether ``text`` is a GENUINE JSON document is decided ONCE
+    # by a real parse (``json_loads_no_dupes``).  The escape decode in
+    # ``_exact_value_at_free_text_boundary`` runs ONLY for a double-quoted value
+    # of such a document — arbitrary quoted prose / single-quoted spans are
+    # never decoded, so a literal ``\\t`` / ``\\u0009`` / ``\\u0020`` / ``\\u0061`` in
+    # prose fails closed exactly as it did before the 09:40 correction.
+    is_json_document = _is_json_document(text)
     for m in _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE.finditer(text):
         # R37/R39: the exact-base assignment resolves through the SHARED bounded
         # structural wrapper parser ``_registered_base_value_info`` — the SAME
@@ -2517,7 +2561,9 @@ def _credential_narration_binds(text: str) -> bool:
         # 69-71 closure is never reopened by appending prose.  The JSON
         # envelope of a string value the assignment sits inside is the
         # document's own structure and is stripped FIRST (R42 Block 76).
-        if not _exact_value_at_free_text_boundary(text, m.end(), spans):
+        if not _exact_value_at_free_text_boundary(
+            text, m.end(), spans, is_json_document=is_json_document
+        ):
             continue
         if _documented_version_field_exempt(m):
             continue

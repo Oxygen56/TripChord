@@ -18281,6 +18281,17 @@ def test_r42_block79_80_line_separators_and_mixed_separator_pseudo_words_both_pa
     by a curly apostrophe U+2019, or by an em dash) read as a word; a separator
     must be flanked by a letter on BOTH sides.
 
+    R42 Block 81 (12:07 re-review): the RFC-8259 escape DECODE added at 09:40 is
+    gated on a genuine DOUBLE-QUOTED JSON string value of a real JSON document
+    (proven by the canonical ``json_loads_no_dupes`` parse).  A LITERAL escape
+    (``\\t`` / ``\\u0009`` / ``\\u0020`` / ``\\u0061``) inside a QUOTED free-text
+    span is never decoded -- double-quoted prose AND single-quoted spans alike --
+    so ``verification code is "(plannerV2) is\ta version."`` binds the exact-base
+    assignment, the producer masks it BEFORE the 0600 seal, and the RAW value
+    still fails BOTH finals (fail-closed).  The legal JSON TAB positive (the
+    ``\t``-escaped real TAB at the documented ``summary`` path) and the
+    FS/GS/RS/NEL rejects stay exactly as the 09:40 correction fixed them.
+
     Both stay fail-closed while the Block 78 Unicode-orthography positives
     (curly-apostrophe contraction, U+2011 hyphenation, sentence-final /
     clause-final punctuation) and the Block 73-77 rejects stay closed on both
@@ -18344,7 +18355,24 @@ def test_r42_block79_80_line_separators_and_mixed_separator_pseudo_words_both_pa
         "verification code is (plannerV2) is\ta version.",
         '{"summary": "(plannerV2) is\\ta version."}',
     )
-    for raw in b79_reject + b80_reject:
+    b81_reject = (
+        # R42 Block 81 (12:07 re-review): a LITERAL RFC-8259 escape inside a
+        # QUOTED free-text span is NOT a JSON value -- the decode must NOT run,
+        # so a literal ``\\t`` / ``\\u0009`` / ``\\u0020`` / ``\\u0061`` stays a
+        # literal backslash-escape, fails the same-line phrase check closed and
+        # the exact-base assignment BINDS (fail-closed).  Before this fix the
+        # blind ``_decode_json_string_escapes`` turned the same prose into a
+        # "phrase" and the producer preserved ``(plannerV2)`` through the 0600
+        # seal and both finals -- a deterministic bypass.  Double-quoted AND
+        # single-quoted prose spans are both never decoded.
+        'verification code is "(plannerV2) is\\ta version."',
+        'verification code is "(plannerV2) is\\u0009a version."',
+        'verification code is "(plannerV2) is\\u0020a version."',
+        'verification code is "(plannerV2) is\\u0061 version."',
+        "verification code is '(plannerV2) is\\ta version.'",
+        "verification code is '(plannerV2) is\\u0009a version.'",
+    )
+    for raw in b79_reject + b80_reject + b81_reject:
         with pytest.raises(gate.GateStateChangedError):
             gate._secret_scan_bytes(
                 raw.encode(),
@@ -18376,11 +18404,11 @@ def test_r42_block79_80_line_separators_and_mixed_separator_pseudo_words_both_pa
             "live-canary-certified.json.failure.json",
             credential_field_check=False,
         )
-    # full chain: the producer masks every Block 79/80 reject BEFORE the 0600
-    # seal, so the sealed diagnostic and the consumer-synthesized field are clean
-    # and BOTH finals pass; the RAW values still fail BOTH finals (defense in
-    # depth).  The Block 78 positives survive the seal untouched.
-    for raw in b79_reject + b80_reject:
+    # full chain: the producer masks every Block 79/80/81 reject BEFORE the
+    # 0600 seal, so the sealed diagnostic and the consumer-synthesized field are
+    # clean and BOTH finals pass; the RAW values still fail BOTH finals (defense
+    # in depth).  The Block 78 positives survive the seal untouched.
+    for raw in b79_reject + b80_reject + b81_reject:
         masked = canary._desensitize(raw)
         assert "[REDACTED]" in masked
         output = tmp_path / "live-canary-certified.json"
