@@ -7,12 +7,12 @@
 ## 当前状态
 
 - **当前版本**：v1.0 Done-Gate C-122 R42（Block 89/90 已测试实现收口，R42 实现基线 `dc075ef`）——Block 89 修复合法 JSON 误拒（escaped documented 成员键与数组括号间合法 JSON 空白 SPACE/TAB/CR/LF 按结构一致处理）；Block 90 修复**首字符转义** documented 成员键误拒——free-text 赋值 regex 的 field 以 word 字符开头、键首字符为反斜杠时捕获从反斜杠后开始、真实键首字符上下文丢失；新增 `_json_member_key_at` 从**真实已解析 JSON 的 quoted span** 取 RFC-8259 解码后的真实成员键（闭引号后为 `:` 才视为成员 KEY，value 位置 span 返回 None 走原 regex field 回退），`_documented_version_field_exempt` 与 `_is_documented_json_array_element_assign` 均改为从真实 span 取键，不再依赖截断 regex field、全局替换或字符表修补。正式矩阵升级为**可审计生成式覆盖**（数量断言 + `len(set(...))` 唯一性断言，缺维度/重复 padding 即失败）：主矩阵 2 转义样式×3 documented 键×6 value 形式×depth 0/2/3/4 = **144**；空白矩阵 JSON 空白 {SPACE,TAB,CR,LF} 四型独立×2×3×6×4 = **576**（scalar 在 member colon/value 边界实际注入空白、`len(set)==576` 全唯一）；转义 `plan` 父×转义子（`planner_version`/`provider_version`）×depth = **32**；共 **752 例全五路正例 + 24 负例全部通过**（raw committed/failure 双 final→producer 不动→真实 0600 seal→consumer 双 final）；Block87–89 负例全部保留、不回归。聚焦 10 passed、全量 gate 491 collected、全量 1526 passed、clean-env 1526 passed、ruff 全绿、`git diff --check` exit 0。以上全部在 **R42 已测试实现基线 `dc075ef`**（Block90 代码+测试+账本/进度文档同提交）上验证。
-- **当前分支**：`productization/v1.0`（未 push；**R43 文档收尾为本 docs-only 提交，产生新 HEAD（当前提交），已越过 R42 实现基线 `dc075ef`**。API 与旧六层门 `f83b` 证据只绑定 **R42 已测试实现基线 `dc075ef`**（provenance 三哈希匹配、`passed=true`、pid 与三哈希见 provenance 机器证据与最终结果评论、mismatches 空），**不绑定 R43 文档新 HEAD**。待用户 Companion 授权后必须先受控重启 API 绑定 R43 新 HEAD，再从头重跑六层门，证据 `tested_commit` 与新 HEAD 一致后才可终验。）
+- **当前分支**：`productization/v1.0`（未 push；**R43 文档收尾为本 docs-only 提交，产生新 HEAD（当前提交），已越过 R42 实现基线 `dc075ef`**。API 与旧六层门 `f83b` 证据只绑定 **R42 已测试实现基线 `dc075ef`**（provenance 三哈希匹配、`passed=true`、pid 与三哈希见 provenance 机器证据与最终结果评论、mismatches 空），**不绑定 R43 文档新 HEAD**。待用户完成 Companion 只读连接配对后必须先受控重启 API 绑定届时当前 clean HEAD，再从头重跑六层门，证据 `tested_commit` 与届时 HEAD 一致后才可终验。）
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
-- **最后完成的最小任务**：C-122 R42 Block 90（监督打回十一）——`_json_member_key_at` 真实 quoted span 成员键解析修复首字符转义 documented 键误拒；生成式矩阵 144 main + 576 ws{SPACE,TAB,CR,LF} 全唯一 + 32 plan{planner/provider_version} 子键 = **752 例全五路正例 + 24 负例**全通过（聚焦 10 passed、全量 gate 491 collected、全量 1526 passed、clean-env 1526 passed、ruff 全绿）。**该项为 R42 已测试实现/旧证据基线 `dc075ef`**；R43 文档收尾（本提交）仅改 docs，未触碰代码/测试/gate/账本。
+- **最后完成的最小任务**：C-122 R42 Block 90（监督打回十一）——`_json_member_key_at` 真实 quoted span 成员键解析修复首字符转义 documented 键误拒；生成式矩阵 144 main + 576 ws{SPACE,TAB,CR,LF} 全唯一 + 32 plan{planner/provider_version} 子键 = **752 例全五路正例 + 24 负例**全通过（聚焦 10 passed、全量 gate 491 collected、全量 1526 passed、clean-env 1526 passed、ruff 全绿）。**该项为 R42 已测试实现/旧证据基线 `dc075ef`**；R43 文档收尾（本提交）仅改本进度账本文档，未触碰代码/测试/gate。
 - **最新六层门**（**R42 已测试实现基线 `dc075ef`**，run_id `f83b165a`）：层 1/2/3/4 PASS（层 4 required-model smoke 实际运行通过）；层 5 real_canary FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）；层 6 full_e2e FAIL（executor 在 done-gate 前于 `companion_preflight` 失败：未发现同时声明携程/去哪儿/同程且仍新鲜的已连接 Companion，心跳过期 >45s，实时搜索未提交）；`passed=false` 退出码 2、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）、gate_ref=null、`tested_commit_sha=dc075ef`。**该门绑定 `dc075ef` 而非 R43 文档新 HEAD，不得把 pending authorization / companion_preflight 包装成完成，不声称六层 passed=true，不得用旧 f83b 收口**。
-- **审查/终验状态**：C-125 独立架构师审查对 **R42 Block90 已测试实现基线 `dc075ef`** **PASS**（仅 Block90 代码审查范围，无新增绕过/删测/gate 放松）；C-124 终验尚未启动（保持 backlog）。C-122 保持 in_progress，直至 API 绑定 R43 新 HEAD、同新 HEAD 六层 `passed=true` 且证据 `tested_commit` 与新 HEAD 一致后最终收口。
+- **审查/终验状态**：C-125 独立架构师审查已 **done**——PASS comment `e23f359a-3358-44b4-86cf-03406764607d` 仅批准 **Block90@`dc075ef`**（R42 已测试实现基线）的代码审查范围（无新增绕过/删测/gate 放松），**不是当前 docs HEAD 的 Done-Gate 批准**；C-124 终验尚未启动（保持 backlog）。C-122 保持 in_progress，直至用户完成 Companion 只读连接配对后先受控重启 API 绑定届时当前 clean HEAD、同该 HEAD 六层 `passed=true` 且证据 `tested_commit` 与 HEAD 一致后最终收口。
 
 ## 版本状态
 
@@ -370,18 +370,18 @@
 
 - 任何"Done-Gate 已通过""双平台住宿精确报价""完整 OTA 闭环"。
 - 任何把 login/captcha/pending/empty/timed_out 包装成报价的行为。
-- 任何"代码完成=已验证"的表述：真实 OTA 重核价、浏览器 scope 真实 canary、全平台 E2E 均未执行（需用户配对 Companion、授权官方域名并保持登录态）。`icom:transfer` 真实只读公共 API canary 已 PASS，但该单 scope 不构成层 5 通过。
+- 任何"代码完成=已验证"的表述：真实 OTA 重核价、浏览器 scope 真实 canary、全平台 E2E 均未执行（需用户完成 Companion 只读连接配对；Chrome Profile 3 已安装 TripChord Read-only Browser Companion、ctrip/qunar/ly/elong 权限 active，仅登录失效/CAPTCHA 时在官方域名处理）。`icom:transfer` 真实只读公共 API canary 已 PASS，但该单 scope 不构成层 5 通过。
 
 ## 下一条可直接执行的命令
 
 ```bash
-# 0) 用户侧唯一动作：浏览器配对 Companion（Chrome 加载 apps/browser-companion，登录 ctrip/qunar/tongcheng 官方域名）
+# 0) 用户侧唯一动作：Companion 只读连接——Chrome Profile 3 已安装 TripChord Read-only Browser Companion（ctrip/qunar/ly/elong 权限 active）；打开已安装扩展 popup，安全复制当前 .runtime/browser-bridge-token 并粘贴（不得读取/回显 token），保留默认 http://127.0.0.1:8000/browser-bridge，点击“连接只读查询”，确认“已连接，只读轮询中”；仅登录失效/CAPTCHA 时在官方域名处理；不执行下单/支付/优惠券/账号修改
 # 1) 配对完成后先跑 canary，再从头跑六层门：
 cd /Users/oxygen/Documents/个人项目/tripchord
 uv run python benchmarks/live_canary_certified.py --bridge-token "$(cat .runtime/browser-bridge-token)"
 TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence
 ```
-（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行——当前无已连接 Companion 时，层 6 如实报告 executor 在 `companion_preflight` 阶段失败（failed_before_done_gate），不包装为授权问题。C-122 R42 Block 90（监督打回十一）代码+测试+账本/进度文档同提交，冻结唯一最终 HEAD（当前账本提交），API 已受控重启绑定该最终 HEAD，provenance 三哈希匹配、`passed=true`、mismatches 空（精确 SHA 与 pid 见 provenance 机器证据与最终结果评论）；六层门在同一最终 HEAD 上从头重跑如实记录（passed=false、exit 2，最新 evidence 目录与 run_id 见最终结果评论）；`passed=false` 期间 C-122 保持 in_progress，C-125/C-124 保持 backlog 不提前审查/终验。）
+（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需已连接 Companion 且 `ctrip/qunar/ly/elong` 官方域名处于 fresh authorised 只读状态后才会逐 scope 真正 PASS——扩展已安装、权限 active，用户仅需按上方步骤完成只读连接配对，登录失效/CAPTCHA 时在官方域名处理；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行——当前无已连接 Companion 时，层 6 如实报告 executor 在 `companion_preflight` 阶段失败（failed_before_done_gate），不包装为授权问题。**当前仓库 HEAD 是本次 R43 docs-only 纠偏提交**；已测试实现/API/旧六层门 `f83b` evidence 基线**仍仅为 `dc075ef`**，绝不声称与当前 docs HEAD 同 SHA。C-125 已 **done**：PASS comment `e23f359a-3358-44b4-86cf-03406764607d` 仅批准 **Block90@`dc075ef`**，不是当前 HEAD 的 Done-Gate 批准；C-124 终验尚未启动（保持 backlog）。`passed=false` 期间 C-122 保持 in_progress；用户配对后须**先受控重启 API 绑定届时当前 clean HEAD**，再**从头重跑六层门**，证据 `tested_commit` 与届时 HEAD 一致后才可终验。）
 
 ## 基线记录（业务代码修改前）
 
