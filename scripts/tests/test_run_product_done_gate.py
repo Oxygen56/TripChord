@@ -19496,3 +19496,280 @@ def test_r42_block84_recursive_json_scalar_producer_final_symmetry(
                 "live-canary-certified.json.failure.json",
                 credential_field_check=False,
             )
+
+
+def test_r42_block85_legal_language_recursive_json_five_route(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-42 Block 85 (打回七): a legal-language phrase re-encoded
+    with ``json.dumps`` 2/3/4 times — ``(plannerV2) is a version.``, the TAB
+    narration ``(plannerV2) is<TAB>a version.``, ``plannerV2 isn't active`` and
+    ``plannerV2 is a non-secret version`` — was misjudged by the Block 84
+    walker as a WRAPPED exact base at decode L1: the outer JSON text
+    ``"(plannerV2) is a version."`` opens AND closes with ``"`` and carries the
+    base, so ``_registered_base_value_info`` resolved it to ``('planner',
+    True)`` and the outer level was REJECTED by both finals / masked by the
+    producer (Block 84 only judged the DECODED value, never re-decoding the
+    outer JSON text first).
+
+    The Block 85 fix DEFERS the registered-base judgment while the decoded
+    scalar is STILL JSON text: recurse to the REAL inner value FIRST, then
+    judge it at the carried path — ``"..."`` -> ``(plannerV2) is a version.`` ->
+    phrase (exempt).  All four legal phrases at depth 2/3/4 are accepted by
+    all FIVE routes (raw committed/failure finals accept, producer leaves the
+    value untouched, real 0600 seal -> consumer committed/failure finals
+    accept); the Block 84 exact / balanced-wrapped / provider / Unicode-
+    escaped negatives and the Block 61 decoded negatives keep failing closed
+    on the raw routes and stay producer-masked.
+    """
+    from benchmarks import live_canary_certified as canary
+
+    def layered(base: str, n: int) -> str:
+        s = base
+        for _ in range(n):
+            s = json.dumps(s)
+        return s
+
+    def final(raw: str, label: str, field_check: bool) -> None:
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            label,
+            credential_field_check=field_check,
+        )
+
+    def sealed_accepts(masked: str, run_id: str) -> None:
+        """Real 0600 seal + consumer-synthesized field both accept the
+        artifact (the producer masked / left it BEFORE the seal)."""
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id=run_id,
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+
+    # Block 85 positives: the four legal-language phrases re-encoded 2/3/4
+    # times must be accepted by BOTH finals, left UNTOUCHED by the producer,
+    # and accepted through the real 0600 seal + consumer field.
+    b85_pos = tuple(
+        layered(base, n)
+        for base in (
+            "(plannerV2) is a version.",
+            "(plannerV2) is\ta version.",  # real TAB (json.dumps -> \t)
+            "plannerV2 isn't active",
+            "plannerV2 is a non-secret version",
+        )
+        for n in (2, 3, 4)
+    )
+    for raw in b85_pos:
+        final(raw, "ev.json", True)
+        final(raw, "live-canary-certified.json.failure.json", False)
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked, raw
+        sealed_accepts(masked, "r42b85")
+
+    # Block 84 negatives preserved: an exact / balanced-wrapped / provider /
+    # Unicode-escaped base re-encoded 2/3/4 times still fails both finals and
+    # is masked WHOLE by the producer, so the sealed diagnostic and the
+    # consumer field only pass because the producer already masked.
+    b84_neg = tuple(
+        layered(base, n)
+        for base in ("plannerV2", "(plannerV2)", "providerV4", "[providerV4]")
+        for n in (2, 3, 4)
+    ) + tuple(layered('"\\u0070lannerV2"', n) for n in (1, 2, 3))
+    for raw in b84_neg:
+        with pytest.raises(gate.GateStateChangedError):
+            final(raw, "ev.json", True)
+        with pytest.raises(gate.GateStateChangedError):
+            final(raw, "live-canary-certified.json.failure.json", False)
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked, raw
+        assert "plannerV2" not in masked and "providerV4" not in masked, raw
+        sealed_accepts(masked, "r42b85")
+
+    # Block 61 decoded negative preserved: an UNBOUND key inside a decoded
+    # dict level still fails closed on both finals and is producer-masked.
+    decoded_neg = '{"summary": "{\\"otp\\": \\"plannerV2\\"}"}'
+    with pytest.raises(gate.GateStateChangedError):
+        final(decoded_neg, "ev.json", True)
+    with pytest.raises(gate.GateStateChangedError):
+        final(decoded_neg, "live-canary-certified.json.failure.json", False)
+    masked = canary._desensitize(decoded_neg)
+    assert "[REDACTED]" in masked
+    sealed_accepts(masked, "r42b85")
+
+
+def test_r42_block86_encoded_array_per_item_path_five_route(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-42 Block 86 (打回七): an ARRAY re-encoded with
+    ``json.dumps`` 2/3/4 times laundered a registered base through the decode
+    recursion at EVERY position but the first — the Block 84 walker judged
+    direct array ELEMENTS only at ``depth == 0`` with paths RESET to ``()``,
+    so a decoded array at depth >= 1 had its items never judged (depth 2/3/4
+    ``["x", "plannerV2", "y"]`` -> middle / last / nested launder through the
+    raw committed + failure finals).
+
+    The Block 86 fix carries the member path through the decode recursion for
+    LIST levels (list items sit at ``(carried_path, "[]", ...)``) and judges
+    EVERY decoded item per its carried path, so an exact / balanced-wrapped /
+    provider base at FIRST / MIDDLE / LAST / NESTED position, depth 2/3/4,
+    fails closed on both raw finals and is masked WHOLE by the producer; the
+    real 0600 seal -> consumer dual finals accept ONLY because the producer
+    already masked.  The same positions with a legal-language phrase
+    (``["x", "(plannerV2) is a version.", "y"]`` /
+    ``["x", "plannerV2 is a non-secret version", "y"]``) are accepted by all
+    five routes and left producer-untouched.  A documented OUTER member
+    inherits the exemption for its decoded array elements
+    (``("planner_version", "[]")`` -> ``("planner_version",)`` ->
+    ``planner`` allowed), so ``{"planner_version": "[plannerV2]"}`` /
+    ``"[[plannerV2]]"`` / ``"[\"plannerV2\"]"`` / ``"[[\"plannerV2\"]]"`` /
+    ``{"plan": {"planner_version": "[plannerV2]"}}`` and the free-form
+    ``{"summary": "[\"plannerV2\", \"providerV4\"]"}`` are finals-accepted,
+    while a cross-field element (``planner_version`` + ``providerV4``) and an
+    UNBOUND element (``("otp", "[]")`` / ``("otp",)`` + ``"[plannerV2]"``)
+    fail closed on both finals.  Block 65 / Block 84 finals are preserved.
+    """
+    from benchmarks import live_canary_certified as canary
+
+    def layered(base: str, n: int) -> str:
+        s = base
+        for _ in range(n):
+            s = json.dumps(s)
+        return s
+
+    def final(raw: str, label: str, field_check: bool) -> None:
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            label,
+            credential_field_check=field_check,
+        )
+
+    def rejects(raw: str) -> None:
+        with pytest.raises(gate.GateStateChangedError):
+            final(raw, "ev.json", True)
+        with pytest.raises(gate.GateStateChangedError):
+            final(raw, "live-canary-certified.json.failure.json", False)
+
+    def accepts(raw: str) -> None:
+        final(raw, "ev.json", True)
+        final(raw, "live-canary-certified.json.failure.json", False)
+
+    def sealed_accepts(masked: str, run_id: str) -> None:
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id=run_id,
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+
+    # Block 86 negatives: an exact / balanced-wrapped / provider base at
+    # FIRST / MIDDLE / LAST / NESTED array position, re-encoded 2/3/4 times.
+    b86_reject = tuple(
+        layered(arr, n)
+        for base in ("plannerV2", "(plannerV2)", "providerV4")
+        for n in (2, 3, 4)
+        for arr in (
+            f"[{json.dumps(base)}, \"x\", \"y\"]",
+            f"[\"x\", {json.dumps(base)}, \"y\"]",
+            f"[\"x\", \"y\", {json.dumps(base)}]",
+            f"[\"x\", [{json.dumps(base)}]]",
+        )
+    )
+    for raw in b86_reject:
+        rejects(raw)
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked, raw
+        assert "plannerV2" not in masked and "providerV4" not in masked, raw
+        sealed_accepts(masked, "r42b86")
+
+    # Same-position legal prose: five-route accept, producer-untouched.
+    b86_prose = tuple(
+        layered(arr, n)
+        for n in (2, 3, 4)
+        for arr in (
+            '["x", "(plannerV2) is a version.", "y"]',
+            '["x", "plannerV2 is a non-secret version", "y"]',
+        )
+    )
+    for raw in b86_prose:
+        accepts(raw)
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked, raw
+        sealed_accepts(masked, "r42b86")
+
+    # Documented-outer-member array semantics (finals; the producer
+    # conservatively over-masks the inner decoded item in several of these).
+    doc_pos = (
+        '{"planner_version": "[plannerV2]"}',
+        '{"planner_version": "[[plannerV2]]"}',
+        '{"planner_version": "[\\"plannerV2\\"]"}',
+        '{"planner_version": "[[\\"plannerV2\\"]]"}',
+        '{"plan": {"planner_version": "[plannerV2]"}}',
+        '{"summary": "[\\"plannerV2\\", \\"providerV4\\"]"}',
+    )
+    doc_neg = (
+        '{"planner_version": "[providerV4]"}',
+        '{"planner_version": "[\\"providerV4\\"]"}',
+        '{"otp": "[plannerV2]"}',
+        '{"otp": "[\\"plannerV2\\"]"}',
+        '{"otp": "[[\\"plannerV2\\"]]"}',
+        '{"otp": "\\"[plannerV2]\\""}',
+    )
+    for raw in doc_pos:
+        accepts(raw)
+    for raw in doc_neg:
+        rejects(raw)
+
+    # Block 65 / 84 finals preserved for the top-level TAB-prose array, nested
+    # arrays and the documented direct values.
+    preserved = (
+        '["x", "(plannerV2) is\\ta version.", "y"]',
+        '{"a": ["x", "(plannerV2) is\\ta version.", "y"]}',
+        '{"a": [["(plannerV2) is\\ta version."]]}',
+        '{"summary": "plannerV2"}',
+        '{"planner_version": "plannerV2"}',
+    )
+    for raw in preserved:
+        accepts(raw)

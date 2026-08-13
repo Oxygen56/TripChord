@@ -272,6 +272,21 @@
 | API 重启 + `uv run python scripts/verify_api_runtime_provenance.py` | API 受控重启绑定最终 HEAD（本提交）；provenance `passed=true`、`commit_sha`/`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 存活、mismatches 空（精确值见最终结果评论） |
 | `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit <最终 HEAD 全 SHA> --commit-evidence` | 同 HEAD 从头重跑严格六层门（最新 evidence 目录，run_id 与 tested_commit_sha 见最终结果评论）：层 1/2/3/4 PASS（层 4 required-model smoke 实际运行通过）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL——executor 在 done-gate 前于 `companion_preflight` 失败（未发现同时声明携程/去哪儿/同程且仍新鲜的已连接 Companion，心跳过期 >45s，实时搜索未提交）；`passed=false` 退出码 2、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）、gate_ref=null。`passed=false` 如实记录，不包装为收口；passed=true 前不启 C-125/C-124 |
 
+### 第四十二轮（续 8，C-122 R42 Block 85/86 监督打回七）验证结果
+
+> 监督打回七：上一 run（Block84）的 walker 提前把外层 JSON 文本当 registered-base phrase，合法语言短语重编码 2/3/4 次被误拒/误遮；且数组直接元素只在 decode depth 0 判定，depth 2/3/4 编码数组在首/中/末及 nested 位置的 exact/wrapped/provider base 借任一 decode 层洗白。确定性复现——`"(plannerV2) is a version."` 在 decode L1 被 `_registered_base_value_info` 解析为 `('planner', True)`（外层 JSON 文本携带 base），raw 双 final 拒绝、producer 遮盖；`["x", "plannerV2", "y"]` 重编码 2/3/4 次后中间/末尾/嵌套项 raw 双 final 放行。修复要求：①decoded scalar 仍 `looks_like_json` 时**先递归到真实内层值**再按携带 path 对称判定，不得提前把外层 JSON 文本当 registered-base phrase；②final **按 decoded 结构和携带 path 逐 item 判断**（list 层携带 path、item 落在 `(carried_path, "[]", ...)`）、producer/final 对称，depth 2-4 首/中/末/nested 位置 exact/wrapped/provider base 五路（raw committed/failure→producer→真实 0600 seal→consumer→双 final）拒绝→遮盖→接受仅因已遮；③同一位置合法语言短语（`(plannerV2) is a version.` / TAB 叙述 / `plannerV2 is a non-secret version`）五路接受、producer 不动；documented outer member 下 array/nested-array 路径语义明确（剥 `[]` 后继承 allowed base；cross-field/unbound 元素 fail-closed），禁止一概放行或一概拒绝；④不回归——保持 Block81–84 全部正/负例、JSON key/quoted-prose/行界反例，不得删测试、放宽 finals、粗暴遮盖全部多层 JSON、降递归预算；⑤重跑全套→提交干净 HEAD→API 绑定最终 HEAD、provenance passed=true→同 HEAD 从头六层门；一次性收口，之后不再新增提交。本表全部命令在最终 HEAD（当前账本提交，代码+文档同提交）上执行。
+
+| 命令 | 结果 |
+|---|---|
+| `uv run pytest scripts/tests/test_run_product_done_gate.py -k "r42_block85 or r42_block86"`（聚焦） | 2 passed（Block85 合法语言多层 JSON 五路接受 + Block86 编码数组逐 item 五路拒绝/遮盖 + documented outer member 路径语义 + Block84/65 不回归断言） |
+| `uv run pytest scripts/tests/test_run_product_done_gate.py`（全量 gate 测试） | 486 collected，退出码 0 |
+| `uv run pytest apps/api/tests benchmarks/tests scripts/tests`（全量） | 1521 passed，退出码 0 |
+| `uv run python scripts/tests/run_tests_clean_env.py apps/api/tests benchmarks/tests scripts/tests`（clean-env） | 1521 passed，退出码 0；clean-env 重定向临时 DB/bridge-state，live `tripchord.db`/`.runtime/browser-bridge-state.json` 不被测试触碰 |
+| `uv run ruff check .` | All checks passed |
+| `git rev-parse HEAD` | 最终 HEAD（当前账本提交；`_secret_redact.py` + `run_product_done_gate.py` + gate 测试 + 账本/进度文档同提交，精确 SHA 见最终结果评论） |
+| API 重启 + `uv run python scripts/verify_api_runtime_provenance.py` | API 受控重启绑定最终 HEAD（本提交）；provenance `passed=true`、`commit_sha`/`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 存活、mismatches 空（精确值见最终结果评论） |
+| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit <最终 HEAD 全 SHA> --commit-evidence` | 同 HEAD 从头重跑严格六层门（最新 evidence 目录，run_id 与 tested_commit_sha 见最终结果评论）：层 1/2/3/4 PASS（层 4 required-model smoke 实际运行通过）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL——executor 在 done-gate 前于 `companion_preflight` 失败（未发现同时声明携程/去哪儿/同程且仍新鲜的已连接 Companion，心跳过期 >45s，实时搜索未提交）；`passed=false` 退出码 2、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）、gate_ref=null。`passed=false` 如实记录，不包装为收口；passed=true 前不启 C-125/C-124 |
+
 ## 当前可对外声明
 
 

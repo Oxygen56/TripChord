@@ -2088,7 +2088,18 @@ def _registered_base_value_exempt_at_path(
     if info is _WRAPPED_BASE_ILLEGAL:
         return False
     base, _is_version = info
-    allowed = _DOCUMENTED_BUSINESS_VALUE_PATHS.get(path)
+    # R42 Block 86 (打回七): a decoded ARRAY / nested-ARRAY element sits at a
+    # ``(carried_path, "[]", ...)`` path — strip the trailing ``[]`` markers and
+    # consult the documented PREFIX's allowed base set, so a documented outer
+    # member (``("planner_version", "[]")`` -> ``("planner_version",)`` /
+    # ``("summary", "[]", "[]")`` -> ``("summary",)``) inherits the exemption
+    # for its elements while an unbound / cross-field array element
+    # (``("otp", "[]")`` / ``("planner_version", "[]")`` + ``providerV4``)
+    # still fails closed.
+    base_path = path
+    while base_path and base_path[-1] == "[]":
+        base_path = base_path[:-1]
+    allowed = _DOCUMENTED_BUSINESS_VALUE_PATHS.get(base_path)
     if allowed is None:
         return False
     return base in allowed
@@ -3318,6 +3329,16 @@ def bounded_json_mask(
             # base value at ``('summary',)`` and stays a positive).  The Block
             # 83 ``depth == 0`` gate is gone: the carried path, not the depth,
             # now decides every decoded scalar.
+            # R42 Block 85 (打回七): the judgment is DEFERRED while the decoded
+            # scalar is STILL JSON text — a serialization envelope, never a
+            # registered-base phrase in its own right.  A legal phrase wrapped
+            # in a JSON string (``"(plannerV2) is a version."`` at decode L1)
+            # is no longer mis-masked as a wrapped base; an exact base at an
+            # unbound path still masks at the decoded scalar.
+            if looks_like_json(parsed):
+                return json.dumps(
+                    mask_text(parsed, depth + 1, path), ensure_ascii=False
+                )
             if not _registered_base_value_exempt_at_path(path, parsed):
                 return marker
             return json.dumps(mask_text(parsed, depth + 1, path), ensure_ascii=False)
@@ -3387,7 +3408,11 @@ def bounded_json_mask(
                             # path (``{"planner_version": "plannerV2"}`` /
                             # ``{"summary": "tokenizationV1"}``) is left to the
                             # normal level masker and survives.
-                            if _registered_base_value_exempt_at_path(
+                            # R42 Block 85 (打回七): a JSON-text value is a
+                            # serialization envelope — recurse into it first
+                            # (``mask_text`` defers the judgment to the real
+                            # inner value), never mask the outer text whole.
+                            if looks_like_json(v) or _registered_base_value_exempt_at_path(
                                 child_path, v
                             ):
                                 out[k] = mask_text(v, level_depth + 1, child_path)
@@ -3412,7 +3437,12 @@ def bounded_json_mask(
                 for i, item in enumerate(node):
                     if isinstance(item, str):
                         child_path = (*path, "[]")
-                        if _registered_base_value_exempt_at_path(child_path, item):
+                        # R42 Block 85 (打回七): a JSON-text array element is a
+                        # serialization envelope — recurse first (``mask_text``
+                        # defers the judgment to the real inner value).
+                        if looks_like_json(item) or _registered_base_value_exempt_at_path(
+                            child_path, item
+                        ):
                             out_list[i] = mask_text(item, level_depth + 1, (*path, "[]"))
                         else:
                             out_list[i] = marker

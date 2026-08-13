@@ -1355,6 +1355,33 @@ def _reject_unbound_registered_base_values(
     keeps ``('summary',)`` and stays exempt.  This replaces the Block 83
     ``depth == 0`` skip: the carried path, not the depth, decides every decoded
     scalar.
+
+    R42 Block 85 (打回七): the Block 84 judgment is DEFERRED until the decoded
+    scalar is no longer JSON text.  A scalar that still starts with a JSON
+    structural opener (``{`` / ``[`` / ``"``) is a serialization ENVELOPE, not a
+    registered-base value in its own right — recurse to the REAL inner value
+    FIRST, then judge it at the carried path.  A legal phrase wrapped in a JSON
+    string (``"(plannerV2) is a version."`` at decode L1 of ``layered('(
+    plannerV2) is a version.', 2)``) is no longer misread as a wrapped exact
+    base (its outer text opens AND closes with ``"`` and carries the base), so
+    it stays accepted on all five routes; a structural-start value that does
+    NOT parse as JSON (``[plannerV2]`` / ``"[plannerV2]"``) is a REAL value and
+    is judged at the carried path — a documented base stays exempt, an unbound
+    wrapped base fails closed, exactly like the producer's mask.
+
+    R42 Block 86 (打回七): a decoded LIST level CARRIES its path (array elements
+    sit at ``(carried_path, "[]", ...)``); a decoded DICT level resets to ``()``
+    (Block 61/82 decoded-document semantics).  The Block 82 ``depth == 0`` gate
+    on direct array elements is gone — EVERY decoded array element is judged at
+    its carried ``[]`` path, so an encoded array (``layered('["x", "plannerV2",
+    "y"]', 2)``) laundered through 2/3/4 decode layers can no longer slip a base
+    at the MIDDLE / LAST / NESTED position (first position was already caught).
+    A documented outer member inherits the exemption for its array / nested-array
+    elements (``{"planner_version": "[plannerV2]"}`` / ``{"summary":
+    "[\\"plannerV2\\"]"}`` stay accepted) while a top-level array
+    (``("[]",)``) / an unbound member array (``("otp", "[]")``) / a cross-field
+    array element (``("planner_version", "[]")`` + ``providerV4``) still fail
+    closed — the path, not the position, decides every element.
     """
     try:
         text = data.decode("utf-8")
@@ -1388,10 +1415,24 @@ def _reject_unbound_registered_base_values(
             # A malformed NESTED level (a truncated / obfuscated JSON-string
             # attempt hiding a credential) fails closed; a non-JSON TOP-LEVEL is
             # not a JSON artifact and passes through to the byte/pattern scan
-            # and the schema check, exactly like a non-JSON file.
+            # and the schema check, exactly like a non-JSON file.  R42 Block 85
+            # (打回七): a structural-start NESTED value that does NOT parse is a
+            # REAL value that merely begins with a JSON opener — a truncated
+            # JSON OBJECT attempt still fails closed; a ``[`` / ``"``-starting
+            # value (``[plannerV2]`` reached through the recursion-first
+            # decode, or ``"[plannerV2]"`` at an unbound field) is judged at
+            # the carried path, so a documented base stays exempt while an
+            # unbound wrapped base fails closed — never a silent pass.
             if depth >= 1 and level_text.lstrip().startswith("{"):
                 raise GateStateChangedError(
                     f"secret leak: malformed nested JSON in {label} file {name}"
+                ) from None
+            if depth >= 1 and not _registered_base_value_exempt_at_path(
+                path, level_text
+            ):
+                raise GateStateChangedError(
+                    f"secret leak: registered business base value at "
+                    f"unbound field path {path!r} in {label} file {name}"
                 ) from None
             return
         if isinstance(parsed, str):
@@ -1401,25 +1442,35 @@ def _reject_unbound_registered_base_values(
             # ``()`` and fails closed; a documented member value
             # (``{"summary": ""plannerV2""}``) keeps ``('summary',)`` and
             # stays exempt.  The producer masks the same way (symmetry).
+            # R42 Block 85 (打回七): the judgment is DEFERRED while the decoded
+            # scalar is still JSON text — recurse to the real inner value FIRST
+            # (the outer JSON text is a serialization envelope, never a
+            # registered-base phrase), then judge at the carried path.
+            if looks_like_json(parsed):
+                walk_level(parsed, path, depth + 1)
+                return
             if not _registered_base_value_exempt_at_path(path, parsed):
                 raise GateStateChangedError(
                     f"secret leak: registered business base value at "
                     f"unbound field path {path!r} in {label} file {name}"
                 )
-            if looks_like_json(parsed):
-                walk_level(parsed, path, depth + 1)
             return
         if not isinstance(parsed, (dict, list)):
             return
-        # Walk the decoded structure with paths RESET to ``()`` — the decoded
-        # document is judged on its OWN member paths (R36 Block 61 / R42 Block
-        # 82), exactly like the producer's structure walk.  A direct string
-        # ELEMENT of an ARRAY is judged only at the TOP-LEVEL parse
-        # (``depth == 0``): a decoded nested level has already been judged as
-        # the outer string VALUE at its real member path (``{"planner_version":
-        # "[plannerV2]"}`` is the documented base value), so re-judging the
-        # decoded array items with a RESET path would wrongly reject it.
-        stack: list[tuple[Any, tuple[str, ...]]] = [(parsed, ())]
+        # R42 Block 86 (打回七): a decoded DICT level is walked with paths RESET
+        # to ``()`` — the decoded document is judged on its OWN member paths
+        # (R36 Block 61 / R42 Block 82), exactly like the producer's structure
+        # walk.  A decoded LIST level CARRIES the path of the string VALUE that
+        # carried it: every array element is judged at ``(carried_path, "[]",
+        # ...)``, so a documented outer member inherits the exemption for its
+        # array / nested-array elements while a top-level array (``("[]",)``) /
+        # an unbound member array (``("otp", "[]")``) / a cross-field element
+        # (``("planner_version", "[]")`` + ``providerV4``) fails closed.  The
+        # Block 82 ``depth == 0`` gate on direct array elements is GONE: the
+        # carried ``[]`` path, not the decode depth, decides every element.
+        stack: list[tuple[Any, tuple[str, ...]]] = (
+            [(parsed, ())] if isinstance(parsed, dict) else [(parsed, path)]
+        )
         while stack:
             node, node_path = stack.pop()
             if isinstance(node, dict):
@@ -1440,7 +1491,14 @@ def _reject_unbound_registered_base_values(
                             raise RecursiveJsonBudgetError(
                                 "JSON scan node budget exceeded"
                             )
-                        if not _registered_base_value_exempt_at_path(
+                        # R42 Block 85 (打回七): recurse-first — a JSON-text
+                        # value is a serialization envelope, judged at the
+                        # REAL inner value's carried path (a legal phrase
+                        # ``"(plannerV2) is a version."`` at an unbound member
+                        # stays accepted); a non-JSON value is judged here.
+                        if looks_like_json(value):
+                            walk_level(value, child_path, depth + 1)
+                        elif not _registered_base_value_exempt_at_path(
                             child_path, value
                         ):
                             raise GateStateChangedError(
@@ -1448,8 +1506,6 @@ def _reject_unbound_registered_base_values(
                                 f"value at unbound field path {child_path!r} "
                                 f"in {label} file {name}"
                             )
-                        if looks_like_json(value):
-                            walk_level(value, child_path, depth + 1)
                     elif isinstance(value, (dict, list)):
                         stack.append((value, child_path))
                     else:
@@ -1467,7 +1523,13 @@ def _reject_unbound_registered_base_values(
                                 "JSON scan node budget exceeded"
                             )
                         item_path = (*node_path, "[]")
-                        if depth == 0 and not _registered_base_value_exempt_at_path(
+                        # R42 Block 86 (打回七): every decoded array element is
+                        # judged at its carried ``[]`` path (recurse-first for
+                        # JSON-text elements, Block 85) — never skipped by
+                        # decode depth.
+                        if looks_like_json(item):
+                            walk_level(item, item_path, depth + 1)
+                        elif not _registered_base_value_exempt_at_path(
                             item_path, item
                         ):
                             raise GateStateChangedError(
@@ -1475,8 +1537,6 @@ def _reject_unbound_registered_base_values(
                                 f"value at unbound field path {item_path!r} "
                                 f"in {label} file {name}"
                             )
-                        if looks_like_json(item):
-                            walk_level(item, item_path, depth + 1)
                     elif isinstance(item, (dict, list)):
                         stack.append((item, (*node_path, "[]")))
                     else:
