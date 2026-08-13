@@ -2440,7 +2440,25 @@ def _exact_value_at_free_text_boundary(
     decoded, so a literal ``\\t`` / ``\\u0009`` / ``\\u0020`` / ``\\u0061`` in a
     free-text quote stays a literal backslash-escape, fails the same-line
     phrase check closed and the narration binds exactly as it did before the
-    09:40 correction — no deterministic bypass."""
+    09:40 correction — no deterministic bypass.
+
+    R42 Block 82 (打回三): the raw narration backstop must judge EACH decoded
+    string VALUE of a genuine JSON document INDEPENDENTLY — never re-scan
+    across a sibling member / array / nested value.  The Block 76 envelope
+    strip removes only the trailing ``]``/``}`` closers and ONE quote, so a
+    value followed by a sibling member (``{"a": "(plannerV2) is\\ta version.",
+    "b": "x"}``) leaves ``", "b": "x"`` in the remainder and the phrase check
+    fails on the DOCUMENT structure, not on the value — the exact-base
+    assignment wrongly binds.  For a genuine JSON document, when the assignment
+    sits inside a genuine DOUBLE-QUOTED member VALUE (its opening quote is the
+    value of a ``"key": "value"`` member, preceded by ``:``), the remainder is
+    truncated at the CURRENT value's own closing quote — the decoded content of
+    that ONE value is judged, never the document tail.  A member KEY
+    (``{"(plannerV2) is\\ta version.": "x"}``) is NOT a value: it never gets the
+    value decode-and-truncate path, so a key never gains a value exemption from
+    value decoding, and the raw tail (``": "x"``) still fails the phrase check
+    closed exactly as before.  This is structural — the real JSON value
+    boundary, not a comma strip and not a wider envelope character set."""
     after = text[end:]
     if not after:
         return True
@@ -2449,28 +2467,40 @@ def _exact_value_at_free_text_boundary(
         # end of text, or a line/paragraph boundary the value fully consumed
         # (CR/LF plus U+2028/U+2029/VT/FF/NEL — Block 79)
         return True
-    if any(start < end < close for start, close in spans):
-        # the assignment is inside a JSON string value: the trailing envelope is
-        # the document's own string close + structure closers — strip it
+    for start, close in spans:
+        if not (start < end < close):
+            continue
+        # the span enclosing ``end``.  A genuine JSON member VALUE's opening
+        # quote is preceded (skipping whitespace) by the ``:`` of
+        # ``"key": "value"``; a KEY span is preceded by ``{`` / ``,`` / ``[``.
+        i = start
+        while i > 0 and text[i - 1].isspace():
+            i -= 1
+        is_member_value = i > 0 and text[i - 1] == ":"
+        if is_json_document and text[start] == '"' and is_member_value:
+            # R42 Block 82: judge ONLY the current decoded value.  ``close`` is
+            # the index AFTER the closing quote (``_quoted_string_spans``), so
+            # ``text[end:close - 1]`` is the value's remaining content without
+            # its own closing quote — a sibling member / array / nested
+            # structure after the quote is never seen.  The RFC-8259 escapes in
+            # that ONE value are decoded, so a real TAB serialized as ``\\t`` is
+            # judged as horizontal whitespace; a decoded newline / separator
+            # stays a line boundary and fails closed.
+            rest = text[end:close - 1].strip(" \t")
+            rest = _decode_json_string_escapes(rest)
+            return not _is_natural_language_phrase(rest)
+        # key spans / free text: the trailing envelope (string close + the
+        # document's own structure closers) is still stripped, and the RFC-8259
+        # escape decode NEVER runs here — a JSON member KEY and arbitrary
+        # quoted prose both keep the raw remainder and fail closed on a literal
+        # ``\\t`` / ``\\u0009`` / ``\\u0020`` / ``\\u0061``.
         rest = rest.rstrip(" \t")
         while rest and rest[-1] in _JSON_STRUCTURE_CLOSERS:
             rest = rest[:-1]
         if rest and rest[-1] in "\"'":
             rest = rest[:-1]
         rest = rest.rstrip(" \t")
-        # 09:40 + Block 81: decode the RFC-8259 escapes in the string CONTENT
-        # ONLY when the enclosing span is a genuine DOUBLE-QUOTED JSON string
-        # value of a REAL JSON document (``is_json_document``).  A sealed
-        # diagnostic legitimately carries ``\t`` for a real TAB and the decode
-        # makes it judged as horizontal whitespace (a same-line phrase may span
-        # it); a JSON-escaped newline still decodes to a line boundary and
-        # stays fail-closed.  Quoted prose and single-quoted spans are never
-        # decoded, so a literal escape in prose fails closed.
-        if is_json_document and any(
-            start < end < close and text[start] == '"'
-            for start, close in spans
-        ):
-            rest = _decode_json_string_escapes(rest)
+        return not _is_natural_language_phrase(rest)
     return not _is_natural_language_phrase(rest)
 
 

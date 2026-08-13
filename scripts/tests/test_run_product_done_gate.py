@@ -18495,3 +18495,240 @@ def test_r42_block79_80_line_separators_and_mixed_separator_pseudo_words_both_pa
             "live-canary-certified.json.failure.json",
             credential_field_check=False,
         )
+
+def test_r42_block82_json_value_independent_narration_both_paths(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-42 Block 82 (打回三): the raw narration backstop must judge
+    EACH decoded string VALUE of a genuine JSON document independently — it must
+    never re-scan across a sibling member / array / nested value.
+
+    The Block 76 envelope strip removed only the trailing ``]``/``}`` closers
+    and ONE quote, so a value followed by a sibling member
+    (``{"a": "(plannerV2) is\ta version.", "b": "x"}``) left ``", "b": "x"`` in
+    the remainder and the phrase check failed on the DOCUMENT structure — the
+    exact-base assignment wrongly bound and a legal JSON TAB positive was
+    REJECTED at both finals AND masked by the producer.  The fix truncates the
+    remainder at the CURRENT value's own closing quote for a genuine
+    DOUBLE-QUOTED member VALUE of a real JSON document (its opening quote is
+    preceded by the member ``:``), so each value is judged on its own decoded
+    content.
+
+    Legal multi-member / array / nested TAB positives now stay accepted on the
+    raw scans and survive the producer -> 0600 seal -> consumer -> both finals
+    chain unchanged.  A JSON member KEY never gets the value decode-and-truncate
+    path, so the JSON key quoted-literal escape negatives still fail closed
+    (a registered base as a key is a credential-shaped field with no schema
+    binding).  The Block 81 quoted-prose literal-escape rejects and the
+    FS/GS/RS/NEL real-line-boundary rejects are preserved exactly."""
+    from benchmarks import live_canary_certified as canary
+
+    ls, ps = " ", " "  # LINE / PARAGRAPH SEPARATOR
+    fs, gs, rs = "\x1c", "\x1d", "\x1e"  # FILE / GROUP / RECORD SEPARATOR
+    nel = "\x85"  # NEXT LINE
+
+    b82_pos = (
+        # Block 82: legal multi-member / array / nested JSON TAB positives —
+        # each decoded string value is judged independently, so a sibling
+        # member / array / nested structure after the value's own closing quote
+        # is never re-scanned.  The ``\t`` is the RFC-8259 escaped real TAB the
+        # producer emits.
+        '{"a": "(plannerV2) is\\ta version.", "b": "x"}',
+        '{"otp": "(plannerV2) is\\ta version.", "other": 1}',
+        '{"summary": "(plannerV2) is\\ta version.", "b": "x"}',
+        '{"results": [{"otp": "(plannerV2) is\\ta version."}]}',
+        '{"level1": {"level2": "(plannerV2) is\\ta version."}}',
+        '{"otp": {"inner": "(plannerV2) is\\ta version."}, "other": 1}',
+        '{"results": [{"otp": "(plannerV2) is\\ta version.", "other": 1}]}',
+        '{"results": [{"otp": "(plannerV2) is\\ta version."}], "other": 1}',
+        '{"a": {"inner": "(plannerV2) is\\ta version."}, "b": "x"}',
+    )
+    b82_key_reject = (
+        # Block 82: a registered base as a JSON member KEY is a
+        # credential-shaped field with NO schema/field-path binding.  A key must
+        # never gain a value exemption from value decoding — the raw tail
+        # (``": "x"``) keeps the phrase check fail-closed on every quoted-literal
+        # escape spelling.
+        '{"(plannerV2) is\\ta version.": "x"}',
+        '{"(plannerV2) is\\u0009a version.": "x"}',
+        '{"(plannerV2) is\\u0020a version.": "x"}',
+        '{"(plannerV2) is\\u0061 version.": "x"}',
+    )
+    b82_prose_reject = (
+        # Block 81 preserved: a LITERAL RFC-8259 escape inside a QUOTED free-text
+        # span is not a JSON value — the decode must NOT run, so the exact-base
+        # assignment binds and fails closed (both quote styles).
+        'verification code is "(plannerV2) is\\ta version."',
+        'verification code is "(plannerV2) is\\u0009a version."',
+        'verification code is "(plannerV2) is\\u0020a version."',
+        'verification code is "(plannerV2) is\\u0061 version."',
+        "verification code is '(plannerV2) is\\ta version.'",
+        "verification code is '(plannerV2) is\\u0009a version.'",
+    )
+    b82_nl_reject = (
+        # Block 79 preserved: the REAL line-boundary set FS/GS/RS/NEL (plus the
+        # U+2028 separator) stays a semantic boundary that fails closed on both
+        # the free-text and the JSON member-value paths.
+        f"verification code is (plannerV2) is{fs}a version.",
+        f"verification code is (plannerV2) is{gs}a version.",
+        f"verification code is (plannerV2) is{rs}a version.",
+        f"verification code is (plannerV2) is{nel}a version.",
+        f"verification code is (plannerV2) is{ls}a version.",
+        f"verification code is (plannerV2) is{ps}a version.",
+        f'{{"otp": "(plannerV2) is{fs}a version."}}',
+        f'{{"otp": "(plannerV2) is{gs}a version."}}',
+        f'{{"otp": "(plannerV2) is{rs}a version."}}',
+        f'{{"otp": "(plannerV2) is{ls}a version."}}',
+        f'{{"otp": "(plannerV2) is{ps}a version."}}',
+    )
+    # raw + legal JSON positives: both finals ACCEPT
+    for raw in b82_pos:
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    # JSON key negatives + Block 81 prose rejects + FS/GS/RS/NEL rejects: both
+    # finals fail closed.
+    for raw in b82_key_reject + b82_prose_reject + b82_nl_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # full chain: the producer leaves the legal TAB positives untouched, so the
+    # 0600-sealed diagnostic and the consumer-synthesized field pass both finals
+    # and the raw positives stay accepted.
+    for raw in b82_pos:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked
+        assert "plannerV2" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b82",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    # full chain, key negatives: a registered base as a member KEY is not
+    # sanitized by the producer, so the sealed diagnostic still fails the
+    # failure-final closed (defense in depth) — the key never gains a value
+    # exemption.
+    for raw in b82_key_reject:
+        masked = canary._desensitize(raw)
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b82",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                diag.read_bytes(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # full chain, prose / real-line-boundary rejects: the producer masks them
+    # BEFORE the 0600 seal, so the sealed diagnostic and the consumer field are
+    # clean and pass both finals; the RAW values still fail both finals.
+    for raw in b82_prose_reject + b82_nl_reject:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b82",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
