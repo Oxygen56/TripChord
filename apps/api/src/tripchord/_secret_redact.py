@@ -2652,6 +2652,72 @@ def _match_inside_genuine_json_string_value(
     return False
 
 
+def _is_documented_json_array_element_assign(
+    m: re.Match[str],
+    is_json_document: bool,
+) -> bool:
+    """True when the exact-registered-base assignment ``m`` is a genuine JSON
+    document's REAL ARRAY element at a DOCUMENTED member path whose allowed base
+    set contains that element's exact base.
+
+    R42 Block 88 (打回九): a real array value (``{"planner_version":
+    ["plannerV2", "x", "y"]}``) is the document's OWN structure — the ``[``
+    opener and the first element's string close are JSON, never a tight prose
+    wrapper around the base.  The free-text narration regex captures the token
+    as the malformed ``["plannerV2"`` (WRAPPED_BASE_ILLEGAL — the array bracket
+    never gets its ``]`` inside the token), so the narration backstop must
+    judge the element at the carried ARRAY path exactly like the JSON walker
+    does: the documented exemption is position-independent (first / middle /
+    last and nested are one contract, never a first-element mis-rejection).
+    ``summary`` / ``detail`` / ``reason`` are judged by the same
+    free-text/documented contract, and ``plan.planner_version`` accepts through
+    the inner ``planner_version`` member key the regex captures.  False for a
+    non-JSON document, an object / brace wrapper (``{"[]": "plannerV2"}``), a
+    tight prose wrapper (``(plannerV2]`` / ``[plannerV2`` with no string
+    close), an unbound field or a cross-field base — all of those still fail
+    closed exactly as before."""
+    if not is_json_document:
+        return False
+    field = m.group("field").strip()
+    if len(field) >= 2 and field[-1] in "\"'":
+        field = field[:-1].strip()
+    if not field:
+        return False
+    base_path = tuple(part.strip().lower() for part in field.split("."))
+    stripped = m.group("token").lstrip(" \t")
+    i = 0
+    n = len(stripped)
+    # The token must open with one or more REAL array brackets, then a
+    # double-quoted string element — never an object / brace wrapper.
+    while i < n and stripped[i] == "[":
+        i += 1
+    if i == 0:
+        return False
+    while i < n and stripped[i] in " \t":
+        i += 1
+    if i >= n or stripped[i] != '"':
+        return False
+    j = i + 1
+    elem_start = j
+    while j < n:
+        if stripped[j] == "\\":
+            j += 2
+            continue
+        if stripped[j] == '"':
+            break
+        j += 1
+    if j >= n:
+        return False
+    info = _registered_base_value_info(stripped[elem_start:j])
+    if info is None or info is _WRAPPED_BASE_ILLEGAL:
+        return False
+    base, _is_version = info
+    allowed = _DOCUMENTED_BUSINESS_VALUE_PATHS.get(base_path)
+    if allowed is None:
+        return False
+    return base in allowed
+
+
 def _credential_narration_binds(text: str) -> bool:
     """True when ``text`` puts a registered business-identifier base in a
     credential-narration context (R28 Block 48): a credential-designation word
@@ -2725,6 +2791,15 @@ def _credential_narration_binds(text: str) -> bool:
                     continue
                 if _documented_version_field_exempt(m):
                     continue
+            # R42 Block 88 (打回九): a WRAPPED_BASE_ILLEGAL token that is a
+            # genuine JSON document's REAL ARRAY element at a documented member
+            # path (``{"planner_version":["plannerV2","x","y"]}``) is the
+            # document's own structure, not a tight prose wrapper — judge it at
+            # the carried array path exactly like the JSON walker does, so the
+            # documented exemption never depends on the array position
+            # (first / middle / last / nested are one contract).
+            if _is_documented_json_array_element_assign(m, is_json_document):
+                continue
             return True
         if info is None:
             # a phrase (``see (tokenizationV1)``) — never an exact-value
