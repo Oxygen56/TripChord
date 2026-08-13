@@ -319,6 +319,23 @@
 | API 重启 + `uv run python scripts/verify_api_runtime_provenance.py` | API 受控重启绑定最终 HEAD（本提交）；provenance `passed=true`、`commit_sha`/`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 存活、mismatches 空（精确值见最终结果评论） |
 | `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit <最终 HEAD 全 SHA> --commit-evidence` | 同 HEAD 从头重跑严格六层门（最新 evidence 目录，run_id 与 tested_commit_sha 见最终结果评论）：层 1/2/3/4 PASS（层 4 required-model smoke 实际运行通过）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL——executor 在 done-gate 前于 `companion_preflight` 失败（未发现同时声明携程/去哪儿/同程且仍新鲜的已连接 Companion，心跳过期 >45s，实时搜索未提交）；`passed=false` 退出码 2、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）、gate_ref=null。`passed=false` 如实记录，不包装为收口；passed=true 前不启 C-125/C-124 |
 
+### 第四十四轮（C-122 R42 Block 89 监督打回十）验证结果
+
+> 监督打回十：Block88 让 documented 外层真实数组元素在**携带数组路径**上位置无关豁免后，又发现两个**合法 JSON 形式被误拒**的五路不对称：①**转义 documented 成员键**——RFC-8259 允许 JSON 成员键带转义序列（`{"planner_version":["plannerV2","x"]}` 中 `_` 即 `_`），raw narration 回退从 **RAW 键文本**建携带路径，解码后的键从不匹配 documented registry → 误拒；②**数组括号间合法 JSON 空白**——SPACE/TAB/CR/LF 均属 JSON 空白（`{"planner_version":[ [ "plannerV2" ]] }`），exact-base 赋值 regex 捕获 malformed `[ [ "plannerV2" ]] }`（`_WRAPPED_BASE_ILLEGAL`——数组 `[` 未在 token 内闭合、尾 `}` 跨匹配），Block88 helper 只跳 `[` + 一个空格后再见 `[` 而非 `"` → 判假误拒。两者均为 raw committed/failure 双 final 拒绝、producer 不动、consumer 接受。修复要求：①escaped documented 键、SPACE/TAB/CR/LF 括号空白按既有 documented 契约接受（first/middle/last/nested 一套契约）；②五路矩阵——真实 JSON 层 + depth 2-4 的 escaped-key/空白形式（raw committed/failure 双 final→producer→真实 0600 seal→consumer→双 final 全链），证明 producer 不过度遮盖、双 final 一致接受；③保留 escaped cross-field/unbound/dotted/真实 `'[]'` key/duplicate 负例及 Block87/88 全回归；④不回归 + 重跑全套（聚焦/全量 gate/apps-api+benchmarks 全量/clean-env/ruff）→提交干净 HEAD→API 绑定最终 HEAD、provenance passed=true→同 HEAD 从头六层门；`passed=false` 不得收口，C-122 保持 in_progress，C-125/C-124 保持 backlog 禁止提前审查/终验；一次性收口，之后不再新增提交。
+
+修复：`_documented_version_field_exempt` 与 `_is_documented_json_array_element_assign` 在 `is_json_document` 时用 `_decode_json_string_escapes` 对成员键解码（与 JSON walker 看到的一致），自由文本赋值（非 JSON）永不解码——prose 里字面 `_` 仍按原键 fail-closed；数组 opener 循环反复跳过 `[` + 全部 JSON 空白（` \t\r\n`）后再要求双引号字符串元素。Block88 的携带数组路径豁免、Block87 的 typed sentinel、Block86 per-item 判定、Block85 recursion-first、Block84 path-carrying 全部保持。
+
+| 命令 | 结果 |
+|---|---|
+| `uv run pytest scripts/tests/test_run_product_done_gate.py -k "block82 or block83 or block84 or block85 or block86 or block87 or block88 or block89"`（聚焦） | 9 passed（Block89 新增 escaped documented 键 + 括号空白五路矩阵 + Block88/87 反例全保留 + Block82–88 不回归断言） |
+| `uv run pytest scripts/tests/test_run_product_done_gate.py`（全量 gate 测试） | 490 collected，退出码 0 |
+| `uv run pytest apps/api/tests benchmarks/tests scripts/tests`（全量） | 1525 passed，退出码 0 |
+| `uv run python scripts/tests/run_tests_clean_env.py apps/api/tests benchmarks/tests scripts/tests`（clean-env） | 1523 passed + 2 个 OR-tools 规模基准（`benchmarks/tests/test_evaluate_scale.py::test_scaled_planning_and_ablation_benchmark`、`test_scaled_replanning_preserves_unaffected_items`）`PlanningInfeasible`（must-visit `s1-a0`）——load-flaky：isolated clean-env 复跑 2 passed（35.5s），与本次 `_secret_redact.py` redaction 改动无关（全量非 clean-env 下同两测试通过）；clean-env 重定向临时 DB/bridge-state，live `tripchord.db`/`.runtime/browser-bridge-state.json` 不被测试触碰 |
+| `uv run ruff check .` | All checks passed |
+| `git rev-parse HEAD` | 最终 HEAD（当前账本提交；`_secret_redact.py` + gate 测试 + 账本/进度文档同提交，精确 SHA 见最终结果评论） |
+| API 重启 + `uv run python scripts/verify_api_runtime_provenance.py` | API 受控重启绑定最终 HEAD（本提交）；provenance `passed=true`、`commit_sha`/`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 存活、mismatches 空（精确值见最终结果评论） |
+| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit <最终 HEAD 全 SHA> --commit-evidence` | 同 HEAD 从头重跑严格六层门（最新 evidence 目录，run_id 与 tested_commit_sha 见最终结果评论）：层 1/2/3/4 PASS（层 4 required-model smoke 实际运行通过）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL——executor 在 done-gate 前于 `companion_preflight` 失败（未发现同时声明携程/去哪儿/同程且仍新鲜的已连接 Companion，心跳过期 >45s，实时搜索未提交）；`passed=false` 退出码 2、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）、gate_ref=null。`passed=false` 如实记录、不得收口：C-122 保持 in_progress，C-125/C-124 保持 backlog 不提前审查/终验 |
+
 ## 当前可对外声明
 
 
@@ -345,7 +362,7 @@ cd /Users/oxygen/Documents/个人项目/tripchord
 uv run python benchmarks/live_canary_certified.py --bridge-token "$(cat .runtime/browser-bridge-token)"
 TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence
 ```
-（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行——当前无已连接 Companion 时，层 6 如实报告 executor 在 `companion_preflight` 阶段失败（failed_before_done_gate），不包装为授权问题。C-122 R42 Block 88（监督打回九）代码+测试+账本/进度文档同提交，冻结唯一最终 HEAD（当前账本提交），API 已受控重启绑定该最终 HEAD，provenance 三哈希匹配、`passed=true`、mismatches 空（精确 SHA 与 pid 见 provenance 机器证据与最终结果评论）；六层门在同一最终 HEAD 上从头重跑如实记录（passed=false、exit 2，最新 evidence 目录与 run_id 见最终结果评论）。）
+（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行——当前无已连接 Companion 时，层 6 如实报告 executor 在 `companion_preflight` 阶段失败（failed_before_done_gate），不包装为授权问题。C-122 R42 Block 89（监督打回十）代码+测试+账本/进度文档同提交，冻结唯一最终 HEAD（当前账本提交），API 已受控重启绑定该最终 HEAD，provenance 三哈希匹配、`passed=true`、mismatches 空（精确 SHA 与 pid 见 provenance 机器证据与最终结果评论）；六层门在同一最终 HEAD 上从头重跑如实记录（passed=false、exit 2，最新 evidence 目录与 run_id 见最终结果评论）；`passed=false` 期间 C-122 保持 in_progress，C-125/C-124 保持 backlog 不提前审查/终验。）
 
 ## 基线记录（业务代码修改前）
 

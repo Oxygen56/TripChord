@@ -2194,7 +2194,9 @@ _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE = re.compile(
 )
 
 
-def _documented_version_field_exempt(m: re.Match[str]) -> bool:
+def _documented_version_field_exempt(
+    m: re.Match[str], is_json_document: bool = False
+) -> bool:
     """True when the exact-registered-base assignment ``m`` (R35 Block 59 / R36
     Block 61) binds at a DOCUMENTED business-value field path.  The field name
     is the exact member-key path derived from the closed
@@ -2209,10 +2211,17 @@ def _documented_version_field_exempt(m: re.Match[str]) -> bool:
     "plannerV2"}`` yields field ``planner_version"``) — is stripped before the
     path build, so the DOCUMENTED key is still matched exactly; a field that
     merely EMBEDS the delimiter (``evil"planner_version``) is untouched and
-    never documented."""
+    never documented.  R42 Block 89 (打回十): a GENUINE JSON document's member
+    key may carry RFC-8259 escape sequences (``{"planner\\u005fversion":
+    ...}``), so when ``is_json_document`` the path is built from the DECODED
+    key exactly like the JSON walker sees it; free-text assignment
+    (``planner_version = plannerV2``) is never decoded, so a literal
+    ``\\u005f`` in prose stays the raw key and fails closed as before."""
     field = m.group("field").strip()
     if len(field) >= 2 and field[-1] in "\"'":
         field = field[:-1].strip()
+    if is_json_document:
+        field = _decode_json_string_escapes(field)
     path = tuple(part.strip().lower() for part in field.split("."))
     return _registered_base_value_exempt_at_path(path, m.group("token"))
 
@@ -2683,18 +2692,32 @@ def _is_documented_json_array_element_assign(
         field = field[:-1].strip()
     if not field:
         return False
+    # R42 Block 89 (打回十): a genuine JSON document's member key may carry
+    # RFC-8259 escape sequences (``planner\\u005fversion``), so the carried
+    # path is built from the DECODED key — never from the raw key text that
+    # only matches the documented registry when written literally.
+    field = _decode_json_string_escapes(field)
     base_path = tuple(part.strip().lower() for part in field.split("."))
-    stripped = m.group("token").lstrip(" \t")
+    stripped = m.group("token").lstrip(" \t\r\n")
     i = 0
     n = len(stripped)
     # The token must open with one or more REAL array brackets, then a
-    # double-quoted string element — never an object / brace wrapper.
-    while i < n and stripped[i] == "[":
-        i += 1
-    if i == 0:
+    # double-quoted string element — never an object / brace wrapper.  R42
+    # Block 89 (打回十): legal JSON whitespace (SPACE/TAB/CR/LF) between array
+    # openers (``[ [ "plannerV2" ]]``) is the document's OWN structure, so it
+    # is skipped exactly like the JSON walker does — a nested element still
+    # inherits the documented exemption of its carried member path.
+    opener_seen = False
+    while i < n:
+        if stripped[i] == "[":
+            opener_seen = True
+            i += 1
+            while i < n and stripped[i] in " \t\r\n":
+                i += 1
+            continue
+        break
+    if not opener_seen:
         return False
-    while i < n and stripped[i] in " \t":
-        i += 1
     if i >= n or stripped[i] != '"':
         return False
     j = i + 1
@@ -2789,7 +2812,9 @@ def _credential_narration_binds(text: str) -> bool:
                     text, m.end(), spans, is_json_document=True
                 ):
                     continue
-                if _documented_version_field_exempt(m):
+                if _documented_version_field_exempt(
+                    m, is_json_document=is_json_document
+                ):
                     continue
             # R42 Block 88 (打回九): a WRAPPED_BASE_ILLEGAL token that is a
             # genuine JSON document's REAL ARRAY element at a documented member
@@ -2824,7 +2849,9 @@ def _credential_narration_binds(text: str) -> bool:
             text, m.end(), spans, is_json_document=is_json_document
         ):
             continue
-        if _documented_version_field_exempt(m):
+        if _documented_version_field_exempt(
+            m, is_json_document=is_json_document
+        ):
             continue
         return True
     return False
