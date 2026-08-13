@@ -20379,3 +20379,174 @@ def test_r42_block89_documented_escaped_key_and_bracket_whitespace_five_route(
         assert "[REDACTED]" in masked, raw
         assert "providerV4" not in masked, raw
         sealed_accepts(masked, "r42b89n")
+
+
+def test_r42_block90_leading_and_full_escaped_member_key_five_route(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-42 Block 90 (打回十一): a genuine JSON document whose member
+    KEY's FIRST character is a backslash-escape (``{"planner_version":
+    ["plannerV2","x"]}`` = ``{"planner_version": ...}``) was mis-rejected by
+    both raw finals while the producer stayed UNTOUCHED and the consumer
+    accepted — a five-route asymmetry on inputs the contract exempts.
+
+    R42 Block 89 (打回十) fixed the escape decode on the regex-CAPTURED field,
+    but the free-text assignment regex opens its field with a WORD character,
+    so a member key whose first character is an escape (``p``) is
+    captured starting AFTER the backslash (field ``u0070lanner_version"``) and
+    the true key's leading context is lost — the truncated field can never
+    decode to the documented key.  The Block 90 fix resolves the ACTUAL
+    decoded member key from the REAL parsed-JSON quoted span that contains the
+    field start (``_json_member_key_at``): the span's closing quote is followed
+    by ``:``, so it is the member KEY string literal and its RFC-8259-decoded
+    content is the authoritative key — the same decoded key the JSON walker
+    sees.  A VALUE-position span (closing quote followed by anything else) is
+    prose, not a member path, and returns None so the regex field stays
+    authoritative exactly as before.
+
+    Every leading / full-escaped documented key — planner / provider / summary,
+    ``plan.`` nested, FIRST / MIDDLE / LAST / NESTED array positions and the
+    scalar form, every decode depth (real layer plus 2/3/4 ``json.dumps``
+    encodings) — accepts on all five routes with the producer leaving it
+    UNTOUCHED.  The preserved negatives (escaped cross-field / unbound /
+    fake-suffix keys, object / ``[]`` wrappers, duplicate escaped documented
+    keys, the dotted assignment-helper with an escaped field) still fail closed
+    on both raw finals with the producer masking, and the sealed 0600
+    diagnostic -> consumer dual finals accept ONLY the already-masked producer
+    output.
+    """
+    from benchmarks import live_canary_certified as canary
+
+    def layered(base: str, n: int) -> str:
+        s = base
+        for _ in range(n):
+            s = json.dumps(s)
+        return s
+
+    def final(raw: str, label: str, field_check: bool) -> None:
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            label,
+            credential_field_check=field_check,
+        )
+
+    def rejects(raw: str) -> None:
+        with pytest.raises(gate.GateStateChangedError):
+            final(raw, "ev.json", True)
+        with pytest.raises(gate.GateStateChangedError):
+            final(raw, "live-canary-certified.json.failure.json", False)
+
+    def accepts(raw: str) -> None:
+        final(raw, "ev.json", True)
+        final(raw, "live-canary-certified.json.failure.json", False)
+
+    def sealed_accepts(masked: str, run_id: str) -> None:
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id=run_id,
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+
+    # Block 90 positives — the leading-escaped member key (``p`` = ``p``,
+    # ``s`` = ``s``) and the FULLY-escaped key (every char an RFC-8259
+    # ``\uXXXX`` escape), for the planner / provider documented bases, the
+    # ``plan.`` prefix, the ``summary`` free-text contract, every array position
+    # and the scalar form: accepted by all five routes, producer-untouched.
+    doc_pos = (
+        '{"\\u0070lanner_version":["plannerV2","x"]}',
+        '{"\\u0070lanner_version":["x","plannerV2","y"]}',
+        '{"\\u0070lanner_version":["x","y","plannerV2"]}',
+        '{"\\u0070lanner_version":[["plannerV2"]]}',
+        '{"\\u0070lanner_version":"plannerV2"}',
+        '{"\\u0070rovider_version":["providerV4","x"]}',
+        '{"plan":{"\\u0070lanner_version":["plannerV2","x"]}}',
+        '{"plan":{"\\u0070rovider_version":["providerV4","x"]}}',
+        '{"\\u0073ummary":["plannerV2","x"]}',
+        '{"\\u0073ummary":"plannerV2"}',
+        '{"\\u0070\\u006c\\u0061\\u006e\\u006e\\u0065\\u0072\\u005f\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e":["plannerV2","x"]}',
+        '{"\\u0070\\u006c\\u0061\\u006e\\u006e\\u0065\\u0072\\u005f\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e":"plannerV2"}',
+        '{"\\u0070\\u0072\\u006f\\u0076\\u0069\\u0064\\u0065\\u0072\\u005f\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e":["providerV4","x"]}',
+        '{"\\u0073\\u0075\\u006d\\u006d\\u0061\\u0072\\u0079":["plannerV2","x"]}',
+        '{"\\u0073\\u0075\\u006d\\u006d\\u0061\\u0072\\u0079":"plannerV2"}',
+    )
+    for raw in doc_pos:
+        accepts(raw)
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked, raw
+        sealed_accepts(masked, "r42b90p")
+
+    # Same leading / full-escaped key forms re-encoded 2/3/4 times: the decoded
+    # key is carried through the decode recursion at every layer, so each depth
+    # accepts and the producer stays untouched.
+    doc_pos_layered = tuple(
+        layered(arr, n)
+        for n in (2, 3, 4)
+        for arr in (
+            '{"\\u0070lanner_version":["plannerV2","x","y"]}',
+            '{"\\u0070lanner_version":["x",["plannerV2"],"y"]}',
+            '{"plan":{"\\u0070rovider_version":["providerV4","x"]}}',
+            '{"\\u0073ummary":"plannerV2"}',
+            '{"\\u0070\\u0072\\u006f\\u0076\\u0069\\u0064\\u0065\\u0072\\u005f\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e":["providerV4","x"]}',
+        )
+    )
+    for raw in doc_pos_layered:
+        accepts(raw)
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked, raw
+        sealed_accepts(masked, "r42b90p")
+
+    # Block 90 negatives — ESCAPED cross-field / unbound / fake-suffix keys, the
+    # object / ``[]`` member-key wrapper (escaped and unescaped), duplicate
+    # leading-escaped documented keys, and the dotted assignment-helper with an
+    # ESCAPED field (a non-JSON document, so the escape is never decoded): both
+    # raw finals reject, the producer masks, the sealed + consumer dual finals
+    # accept only the masked output.
+    doc_neg = (
+        '{"\\u0070lanner_version":["providerV4","x"]}',
+        '{"\\u0070lanner_version":["\\u0070roviderV4","x"]}',
+        '{"\\u0070\\u006c\\u0061\\u006e\\u006e\\u0065\\u0072\\u005f\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e":["providerV4","x"]}',
+        '{"\\u0070tp":["plannerV2","x"]}',
+        '{"\\u0070lanner_versionx":["plannerV2","x"]}',
+        '{"\\u0070lanner_version":{"[]":"plannerV2"}}',
+        '{"\\u0070lanner_version":{"\\u005b\\u005d":"plannerV2"}}',
+        '{"\\u0070lanner_version":"providerV4"}',
+        '{"\\u0070lanner_version":["plannerV2","x"],"\\u0070lanner_version":["x","plannerV2","y"]}',
+        "\\u0070lanner_version.[] = plannerV2",
+    )
+    doc_neg_layered = tuple(
+        layered(arr, n)
+        for n in (2, 3, 4)
+        for arr in (
+            '{"\\u0070lanner_version":["x","\\u0070roviderV4","y"]}',
+            '{"\\u0070tp":["plannerV2","x"]}',
+            '{"\\u0070lanner_version":{"[]":"plannerV2"}}',
+        )
+    )
+    for raw in (*doc_neg, *doc_neg_layered):
+        rejects(raw)
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked, raw
+        assert "providerV4" not in masked, raw
+        sealed_accepts(masked, "r42b90n")

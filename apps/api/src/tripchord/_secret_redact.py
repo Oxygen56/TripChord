@@ -2194,8 +2194,52 @@ _EXACT_REGISTERED_BASE_VALUE_ASSIGN_RE = re.compile(
 )
 
 
+def _json_member_key_at(
+    m: re.Match[str],
+    text: str,
+    spans: tuple[tuple[int, int], ...],
+    is_json_document: bool,
+) -> str | None:
+    """Resolve the ACTUAL RFC-8259-decoded member key the assignment match
+    ``m`` binds under, from the real JSON string-literal span that contains
+    the regex field start.
+
+    R42 Block 90 (打回十一): the free-text assignment regex opens its field
+    with a WORD character, so a member key whose FIRST character is a
+    backslash-escape (``{"\\u0070lanner_version": [...]}`` =
+    ``{"planner_version": [...]}``) is captured starting AFTER the backslash
+    (field ``u0070lanner_version"``) and the ``\\u0070`` context is lost —
+    decoding the truncated field can never recover the documented key.  The
+    real quoted span containing ``m.start("field")`` is the member KEY string
+    literal (its closing quote is followed by ``:``), so the DECODED span
+    content is the authoritative key — the same decoded key the JSON walker
+    sees.  A span whose closing quote is followed by anything else is a VALUE
+    (its content is prose, never a member path) and returns None — the regex
+    field stays authoritative there.  None is also returned for a non-JSON
+    document or a field start outside any quoted span, so the caller falls
+    back to the regex field exactly as before."""
+    if not is_json_document:
+        return None
+    fstart = m.start("field")
+    for start, close in spans:
+        if not (start < fstart < close):
+            continue
+        j = close
+        while j < len(text) and text[j].isspace():
+            j += 1
+        if j >= len(text) or text[j] != ":":
+            # a VALUE span (its content is prose, not a member key) — the
+            # regex field must not be replaced by the value's text
+            return None
+        return _decode_json_string_escapes(text[start + 1 : close - 1])
+    return None
+
+
 def _documented_version_field_exempt(
-    m: re.Match[str], is_json_document: bool = False
+    m: re.Match[str],
+    text: str,
+    spans: tuple[tuple[int, int], ...],
+    is_json_document: bool = False,
 ) -> bool:
     """True when the exact-registered-base assignment ``m`` (R35 Block 59 / R36
     Block 61) binds at a DOCUMENTED business-value field path.  The field name
@@ -2216,13 +2260,21 @@ def _documented_version_field_exempt(
     ...}``), so when ``is_json_document`` the path is built from the DECODED
     key exactly like the JSON walker sees it; free-text assignment
     (``planner_version = plannerV2``) is never decoded, so a literal
-    ``\\u005f`` in prose stays the raw key and fails closed as before."""
-    field = m.group("field").strip()
-    if len(field) >= 2 and field[-1] in "\"'":
-        field = field[:-1].strip()
-    if is_json_document:
-        field = _decode_json_string_escapes(field)
-    path = tuple(part.strip().lower() for part in field.split("."))
+    ``\\u005f`` in prose stays the raw key and fails closed as before.  R42
+    Block 90 (打回十一): the decoded key is taken from the REAL parsed-JSON
+    quoted span (``_json_member_key_at``) — never from the regex-captured
+    field text, which truncates a member key whose FIRST character is a
+    backslash-escape (``\\u0070lanner_version``); a value-position span falls
+    back to the regex field exactly as before."""
+    key = _json_member_key_at(m, text, spans, is_json_document)
+    if key is None:
+        field = m.group("field").strip()
+        if len(field) >= 2 and field[-1] in "\"'":
+            field = field[:-1].strip()
+        if is_json_document:
+            field = _decode_json_string_escapes(field)
+        key = field
+    path = tuple(part.strip().lower() for part in key.split("."))
     return _registered_base_value_exempt_at_path(path, m.group("token"))
 
 
@@ -2663,6 +2715,8 @@ def _match_inside_genuine_json_string_value(
 
 def _is_documented_json_array_element_assign(
     m: re.Match[str],
+    text: str,
+    spans: tuple[tuple[int, int], ...],
     is_json_document: bool,
 ) -> bool:
     """True when the exact-registered-base assignment ``m`` is a genuine JSON
@@ -2687,17 +2741,27 @@ def _is_documented_json_array_element_assign(
     closed exactly as before."""
     if not is_json_document:
         return False
-    field = m.group("field").strip()
-    if len(field) >= 2 and field[-1] in "\"'":
-        field = field[:-1].strip()
-    if not field:
-        return False
-    # R42 Block 89 (打回十): a genuine JSON document's member key may carry
-    # RFC-8259 escape sequences (``planner\\u005fversion``), so the carried
-    # path is built from the DECODED key — never from the raw key text that
-    # only matches the documented registry when written literally.
-    field = _decode_json_string_escapes(field)
-    base_path = tuple(part.strip().lower() for part in field.split("."))
+    # R42 Block 90 (打回十一): the carried path is built from the REAL
+    # parsed-JSON member key (``_json_member_key_at``) — a member key whose
+    # FIRST character is a backslash-escape (``\\u0070lanner_version``) is
+    # truncated by the regex field capture and can never decode, so the raw
+    # backstop must resolve the DECODED key from the genuine quoted span that
+    # contains the field start.  A value-position span (None) falls back to the
+    # regex field with the R42 Block 89 RFC-8259 escape decode exactly as
+    # before.
+    key = _json_member_key_at(m, text, spans, is_json_document)
+    if key is None:
+        field = m.group("field").strip()
+        if len(field) >= 2 and field[-1] in "\"'":
+            field = field[:-1].strip()
+        if not field:
+            return False
+        # R42 Block 89 (打回十): a genuine JSON document's member key may carry
+        # RFC-8259 escape sequences (``planner\\u005fversion``), so the carried
+        # path is built from the DECODED key — never from the raw key text that
+        # only matches the documented registry when written literally.
+        key = _decode_json_string_escapes(field)
+    base_path = tuple(part.strip().lower() for part in key.split("."))
     stripped = m.group("token").lstrip(" \t\r\n")
     i = 0
     n = len(stripped)
@@ -2813,7 +2877,7 @@ def _credential_narration_binds(text: str) -> bool:
                 ):
                     continue
                 if _documented_version_field_exempt(
-                    m, is_json_document=is_json_document
+                    m, text, spans, is_json_document=is_json_document
                 ):
                     continue
             # R42 Block 88 (打回九): a WRAPPED_BASE_ILLEGAL token that is a
@@ -2823,7 +2887,9 @@ def _credential_narration_binds(text: str) -> bool:
             # the carried array path exactly like the JSON walker does, so the
             # documented exemption never depends on the array position
             # (first / middle / last / nested are one contract).
-            if _is_documented_json_array_element_assign(m, is_json_document):
+            if _is_documented_json_array_element_assign(
+                m, text, spans, is_json_document
+            ):
                 continue
             return True
         if info is None:
@@ -2850,7 +2916,7 @@ def _credential_narration_binds(text: str) -> bool:
         ):
             continue
         if _documented_version_field_exempt(
-            m, is_json_document=is_json_document
+            m, text, spans, is_json_document=is_json_document
         ):
             continue
         return True
