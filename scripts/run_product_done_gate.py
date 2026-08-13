@@ -50,6 +50,9 @@ from urllib.parse import parse_qsl, urlsplit
 
 from tripchord._secret_redact import (
     _CREDENTIAL_FIELD_STRONG_NAME_ALT,
+    _MAX_JSON_SCAN_CHARS,
+    _MAX_JSON_SCAN_DEPTH,
+    _MAX_JSON_SCAN_NODES,
     _REGISTERED_BASE_HEADER_FIELD_RE,
     _SHAPE_PATTERN_DIGEST_AUTH_RE,
     BARE_CREDENTIAL_FIELD_NAMES,
@@ -1333,101 +1336,158 @@ def _reject_unbound_registered_base_values(
 
     R42 Block 82 纠偏 (打回四): a DIRECT string element of an ARRAY and a
     TOP-LEVEL scalar string are REAL JSON values and are judged by the same
-    per-value contract — a phrase element (``["(plannerV2) is\\ta version."]``)
+    per-value contract — a phrase element (``["(plannerV2) is\ta version."]``)
     stays accepted, an exact registered base at the unbound ``[]`` / ``()``
-    path fails closed.  Only at the TOP-LEVEL parse (``depth == 0``): a DECODED
-    nested level has already been judged as the outer string VALUE at its real
-    member path (``{"planner_version": "[plannerV2]"}`` is the documented base
-    value), so re-judging the decoded array items / scalar with a RESET path
-    would wrongly reject a documented value.
+    path fails closed.  At the TOP-LEVEL parse (``depth == 0``) a direct array
+    element is judged; a DECODED nested level has already been judged as the
+    outer string VALUE at its real member path (``{"planner_version":
+    "[plannerV2]"}`` is the documented base value), so re-judging the decoded
+    array items with a RESET path would wrongly reject a documented value.
+
+    R42 Block 84 (打回六): every DECODED scalar string is judged at the member
+    path of the string VALUE that carried it — the path is carried through the
+    decode recursion, never reset.  A top-level scalar re-encoded 2/3/4 times
+    (``"\"plannerV2\""`` -> ``"\"\\\"plannerV2\\\"\""`` -> ...)
+    keeps landing at the root path ``()`` and fails closed at EVERY layer —
+    exact / balanced wrapped / provider base (``plannerV2`` / ``(plannerV2)``
+    / ``providerV4`` / ``[providerV4]``) — symmetric with the masking walker,
+    never launder.  A documented member value (``{"summary": ""plannerV2""}``)
+    keeps ``('summary',)`` and stays exempt.  This replaces the Block 83
+    ``depth == 0`` skip: the carried path, not the depth, decides every decoded
+    scalar.
     """
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return  # not UTF-8 text; the byte/pattern scan still applies
-    try:
-        for level_text, depth, malformed in iter_json_levels(text):
+    budget_nodes = 0
+    budget_chars = 0
+
+    def walk_level(level_text: str, path: tuple[str, ...], depth: int) -> None:
+        """Judge ONE decoded JSON level at the member path of the string VALUE
+        that carried it (``()`` for the artifact's own text).  Bounded by the
+        same depth / node / size budgets as the shared scan walker."""
+        nonlocal budget_nodes, budget_chars
+        if depth > _MAX_JSON_SCAN_DEPTH:
+            raise RecursiveJsonBudgetError("JSON scan depth budget exceeded")
+        budget_nodes += 1
+        if budget_nodes > _MAX_JSON_SCAN_NODES:
+            raise RecursiveJsonBudgetError("JSON scan node budget exceeded")
+        budget_chars += len(level_text)
+        if budget_chars > _MAX_JSON_SCAN_CHARS:
+            raise RecursiveJsonBudgetError("JSON scan size budget exceeded")
+        if not looks_like_json(level_text):
+            return  # not JSON text at this level; the pattern scan applies
+        try:
+            parsed = json_loads_no_dupes(level_text)
+        except DuplicateJsonKeyError:
+            raise GateStateChangedError(
+                f"secret leak: duplicate JSON object key in {label} file {name}"
+            ) from None
+        except ValueError:
             # A malformed NESTED level (a truncated / obfuscated JSON-string
             # attempt hiding a credential) fails closed; a non-JSON TOP-LEVEL is
             # not a JSON artifact and passes through to the byte/pattern scan
             # and the schema check, exactly like a non-JSON file.
-            if malformed and depth >= 1:
+            if depth >= 1 and level_text.lstrip().startswith("{"):
                 raise GateStateChangedError(
                     f"secret leak: malformed nested JSON in {label} file {name}"
-                )
-            try:
-                parsed = json_loads_no_dupes(level_text)
-            except DuplicateJsonKeyError:
-                raise GateStateChangedError(
-                    f"secret leak: duplicate JSON object key in {label} file {name}"
                 ) from None
-            except ValueError:
-                continue  # not JSON text at this level; the pattern scan applies
-            if isinstance(parsed, str):
-                # R42 Block 82 纠偏 (打回四): a TOP-LEVEL JSON scalar string is
-                # judged by the SAME real-JSON-value contract — a phrase
-                # (``"(plannerV2) is\\ta version."``) stays accepted, an exact
-                # registered base at the unbound root path fails closed (the
-                # producer already masks it the same way).  Only at the
-                # TOP-LEVEL parse (``depth == 0``): a DECODED nested string has
-                # already been judged as the outer string VALUE at its real
-                # member path (``{"summary": "\"plannerV2\""}`` is the
-                # documented base value), so re-judging the decoded scalar with
-                # a RESET path would wrongly reject a documented value.
-                if depth == 0 and not _registered_base_value_exempt_at_path(
-                    (), parsed
-                ):
-                    raise GateStateChangedError(
-                        f"secret leak: registered business base value at "
-                        f"unbound field path {()!r} in {label} file {name}"
-                    )
-                continue
-            if not isinstance(parsed, (dict, list)):
-                continue
-            stack: list[tuple[Any, tuple[str, ...]]] = [(parsed, ())]
-            while stack:
-                node, path = stack.pop()
-                if isinstance(node, dict):
-                    for key, value in node.items():
-                        if not isinstance(key, str):
-                            continue
-                        child_path = (*path, key)
-                        if isinstance(value, str):
-                            if not _registered_base_value_exempt_at_path(
-                                child_path, value
-                            ):
-                                raise GateStateChangedError(
-                                    f"secret leak: registered business base "
-                                    f"value at unbound field path {child_path!r} "
-                                    f"in {label} file {name}"
-                                )
-                        elif isinstance(value, (dict, list)):
-                            stack.append((value, child_path))
-                elif isinstance(node, list):
-                    for item in node:
-                        if isinstance(item, str):
-                            # R42 Block 82 纠偏 (打回四): a DIRECT string element
-                            # of an ARRAY is a real JSON value and is judged by
-                            # the same per-value contract — a phrase element
-                            # (``["(plannerV2) is\\ta version."]``) stays
-                            # accepted, an exact registered base at the unbound
-                            # ``[]`` path fails closed.  ONLY at the TOP-LEVEL
-                            # parse (``depth == 0``): a DECODED nested level has
-                            # already been judged as the outer string VALUE at
-                            # its real member path (``{"planner_version":
-                            # "[plannerV2]"}`` is the documented base value), so
-                            # re-judging the decoded array items with a RESET
-                            # path would wrongly reject a documented value.
-                            if depth == 0 and not _registered_base_value_exempt_at_path(
-                                (*path, "[]"), item
-                            ):
-                                raise GateStateChangedError(
-                                    f"secret leak: registered business base "
-                                    f"value at unbound field path "
-                                    f"{(*path, '[]')!r} in {label} file {name}"
-                                )
-                        elif isinstance(item, (dict, list)):
-                            stack.append((item, (*path, "[]")))
+            return
+        if isinstance(parsed, str):
+            # R42 Block 84 (打回六): a decoded scalar string is judged at the
+            # path of the string VALUE that carried it (never a RESET path) — a
+            # multi-layer ``json.dumps`` top-level scalar keeps landing at
+            # ``()`` and fails closed; a documented member value
+            # (``{"summary": ""plannerV2""}``) keeps ``('summary',)`` and
+            # stays exempt.  The producer masks the same way (symmetry).
+            if not _registered_base_value_exempt_at_path(path, parsed):
+                raise GateStateChangedError(
+                    f"secret leak: registered business base value at "
+                    f"unbound field path {path!r} in {label} file {name}"
+                )
+            if looks_like_json(parsed):
+                walk_level(parsed, path, depth + 1)
+            return
+        if not isinstance(parsed, (dict, list)):
+            return
+        # Walk the decoded structure with paths RESET to ``()`` — the decoded
+        # document is judged on its OWN member paths (R36 Block 61 / R42 Block
+        # 82), exactly like the producer's structure walk.  A direct string
+        # ELEMENT of an ARRAY is judged only at the TOP-LEVEL parse
+        # (``depth == 0``): a decoded nested level has already been judged as
+        # the outer string VALUE at its real member path (``{"planner_version":
+        # "[plannerV2]"}`` is the documented base value), so re-judging the
+        # decoded array items with a RESET path would wrongly reject it.
+        stack: list[tuple[Any, tuple[str, ...]]] = [(parsed, ())]
+        while stack:
+            node, node_path = stack.pop()
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    # The object MEMBER KEY counts as a node, matching the
+                    # shared scan walker's counting.
+                    budget_nodes += 1
+                    if budget_nodes > _MAX_JSON_SCAN_NODES:
+                        raise RecursiveJsonBudgetError(
+                            "JSON scan node budget exceeded"
+                        )
+                    if not isinstance(key, str):
+                        continue
+                    child_path = (*node_path, key)
+                    if isinstance(value, str):
+                        budget_nodes += 1
+                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                            raise RecursiveJsonBudgetError(
+                                "JSON scan node budget exceeded"
+                            )
+                        if not _registered_base_value_exempt_at_path(
+                            child_path, value
+                        ):
+                            raise GateStateChangedError(
+                                f"secret leak: registered business base "
+                                f"value at unbound field path {child_path!r} "
+                                f"in {label} file {name}"
+                            )
+                        if looks_like_json(value):
+                            walk_level(value, child_path, depth + 1)
+                    elif isinstance(value, (dict, list)):
+                        stack.append((value, child_path))
+                    else:
+                        budget_nodes += 1
+                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                            raise RecursiveJsonBudgetError(
+                                "JSON scan node budget exceeded"
+                            )
+            elif isinstance(node, list):
+                for item in node:
+                    if isinstance(item, str):
+                        budget_nodes += 1
+                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                            raise RecursiveJsonBudgetError(
+                                "JSON scan node budget exceeded"
+                            )
+                        item_path = (*node_path, "[]")
+                        if depth == 0 and not _registered_base_value_exempt_at_path(
+                            item_path, item
+                        ):
+                            raise GateStateChangedError(
+                                f"secret leak: registered business base "
+                                f"value at unbound field path {item_path!r} "
+                                f"in {label} file {name}"
+                            )
+                        if looks_like_json(item):
+                            walk_level(item, item_path, depth + 1)
+                    elif isinstance(item, (dict, list)):
+                        stack.append((item, (*node_path, "[]")))
+                    else:
+                        budget_nodes += 1
+                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                            raise RecursiveJsonBudgetError(
+                                "JSON scan node budget exceeded"
+                            )
+
+    try:
+        walk_level(text, (), 0)
     except RecursiveJsonBudgetError:
         raise GateStateChangedError(
             f"secret leak: nested JSON budget exceeded in {label} file {name}"

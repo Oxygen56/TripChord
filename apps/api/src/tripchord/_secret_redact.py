@@ -3278,7 +3278,9 @@ def bounded_json_mask(
             return True
         return norm != key and any(p.search(norm) for p in key_patterns)
 
-    def mask_text(current: str, depth: int) -> str:
+    def mask_text(
+        current: str, depth: int, path: tuple[str, ...] = ()
+    ) -> str:
         nonlocal budget_nodes, budget_chars
         if depth > _MAX_JSON_SCAN_DEPTH:
             raise RecursiveJsonBudgetError("JSON mask depth budget exceeded")
@@ -3301,24 +3303,24 @@ def bounded_json_mask(
             # JSON attempt — mask the whole level (fail closed).
             return marker
         if isinstance(parsed, str):
-            # R42 Block 83 (打回五): a TOP-LEVEL JSON scalar string that is an
-            # EXACT registered business base (or a wrapped / Unicode-escaped
-            # spelling of one — ``plannerV2`` / ``providerV4`` /
-            # ``"(plannerV2)"`` / ``\u0070lannerV2``) at the UNBOUND root path
-            # is masked WHOLE, so the producer / consumer never seals an
-            # unbound business value the finals reject (the previous code
-            # recursed into the decoded scalar and the documented-base level
-            # mask kept it, letting producer -> 0600 seal -> consumer ->
-            # documented summary launder it).  Mirrors the final rejector's
-            # top-level-scalar contract: only at the TOP-LEVEL parse
-            # (``depth == 0``); a DECODED nested level has already been judged
-            # as the outer string VALUE at its real member path
-            # (``{"summary": "\"plannerV2\""}`` is the documented base value),
-            # so re-judging the decoded scalar with a RESET path would wrongly
-            # mask a documented value.
-            if depth == 0 and not _registered_base_value_exempt_at_path((), parsed):
+            # R42 Block 84 (打回六): a JSON scalar string that is an EXACT
+            # registered business base (or a wrapped / Unicode-escaped spelling
+            # of one — ``plannerV2`` / ``providerV4`` / ``"(plannerV2)"`` /
+            # ``\u0070lannerV2``) at an UNBOUND path is masked WHOLE, so the
+            # producer / consumer never seals an unbound business value the
+            # finals reject.  The judgment runs at EVERY decoded layer of a
+            # multi-layer ``json.dumps`` value: the ``path`` argument is CARRIED
+            # through the decode recursion (never reset), so a top-level scalar
+            # re-encoded 2/3/4 times (``"\"plannerV2\""`` ->
+            # ``"\"\\\"plannerV2\\\"\""`` -> ...) still lands at the root path
+            # ``()`` and masks, while a DECODED member value keeps its real
+            # member path (``{"summary": "\"plannerV2\""}`` is the documented
+            # base value at ``('summary',)`` and stays a positive).  The Block
+            # 83 ``depth == 0`` gate is gone: the carried path, not the depth,
+            # now decides every decoded scalar.
+            if not _registered_base_value_exempt_at_path(path, parsed):
                 return marker
-            return json.dumps(mask_text(parsed, depth + 1), ensure_ascii=False)
+            return json.dumps(mask_text(parsed, depth + 1, path), ensure_ascii=False)
         if isinstance(parsed, (dict, list)):
             return json.dumps(
                 mask_structure(parsed, depth), ensure_ascii=False
@@ -3388,7 +3390,7 @@ def bounded_json_mask(
                             if _registered_base_value_exempt_at_path(
                                 child_path, v
                             ):
-                                out[k] = mask_text(v, level_depth + 1)
+                                out[k] = mask_text(v, level_depth + 1, child_path)
                             else:
                                 out[k] = marker
                         elif isinstance(v, (dict, list)):
@@ -3411,7 +3413,7 @@ def bounded_json_mask(
                     if isinstance(item, str):
                         child_path = (*path, "[]")
                         if _registered_base_value_exempt_at_path(child_path, item):
-                            out_list[i] = mask_text(item, level_depth + 1)
+                            out_list[i] = mask_text(item, level_depth + 1, (*path, "[]"))
                         else:
                             out_list[i] = marker
                     elif isinstance(item, (dict, list)):
