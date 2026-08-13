@@ -1867,6 +1867,40 @@ _STRUCTURAL_WRAPPER_DEPTH_LIMIT = 8
 _WRAPPED_BASE_ILLEGAL = "WRAPPED_BASE_ILLEGAL"
 
 
+def _is_phrase_closing_stack(v: str, j: int, stack: list[str]) -> bool:
+    """True when the value tail ``v[j:]`` is a natural-language phrase that
+    closes the UNCLOSED ``stack`` openers of
+    :func:`_registered_base_value_info` in LIFO order.  R42 Block 82 纠偏
+    (打回四): a value whose leading wrappers are a serialized JSON document's
+    OWN structure around a prose mention of the base
+    (``["(plannerV2) is\\ta version."]`` — the ``[`` / ``"`` are the JSON array
+    / string delimiters, closed by the value's own trailing ``"]``) is a
+    PHRASE, never a tight prose wrapper around an exact base.  The phrase is
+    tried both in its raw form and in its RFC-8259-decoded form (the producer
+    escaped a real TAB as ``\\t`` in a JSON string value), and the trailing
+    closers must EXACTLY match the unclosed stack in LIFO order — a truncated
+    serialization (``["(plannerV2) is\\ta version.``) has no closer, and a
+    mismatched closer (``["(plannerV2) is\\ta version.]``) is not a phrase,
+    so both still fail closed as ILLEGAL structural appearances."""
+    tail = v[j:]
+    k = len(tail)
+    while k > 0 and tail[k - 1] in _WRAPPER_CLOSE_CHARS:
+        k -= 1
+    closers = tail[k:]
+    if len(closers) != len(stack):
+        return False
+    for idx, closer in enumerate(closers):
+        if _WRAPPER_PAIR[stack[-1 - idx]] != closer:
+            return False
+    phrase = tail[:k].strip(" \t")
+    if not phrase:
+        return False
+    if _is_natural_language_phrase(phrase):
+        return True
+    decoded = _decode_json_string_escapes(phrase).strip(" \t")
+    return decoded != phrase and _is_natural_language_phrase(decoded)
+
+
 def _registered_base_value_info(value: str) -> tuple[str, bool] | str | None:
     """Resolve ``value`` to ``(base_lower, is_version_form)`` when it is an
     EXACT registered base value.  R36 Block 63: a balanced ``(...)`` /
@@ -1963,10 +1997,21 @@ def _registered_base_value_info(value: str) -> tuple[str, bool] | str | None:
         # unclosed openers at end of text.  R39: a SELF-PAIRING quote /
         # apostrophe / backtick residue is the JSON string delimiter that opens
         # a LONGER value (``"plannerV2``) — the exact base right after it still
-        # binds; any other unclosed opener (``(plannerV2`` / ``([plannerV2]``)
-        # is an ILLEGAL structural appearance.
+        # binds.  R42 Block 82 纠偏 (打回四): the OTHER unclosed openers are a
+        # value whose leading wrappers are a serialized JSON document's OWN
+        # structure around a prose mention of the base
+        # (``["(plannerV2) is\\ta version."]`` — the ``[`` / ``"`` are the JSON
+        # array/string delimiters, closed by the value's own trailing closers,
+        # never a tight prose wrapper around an exact base): when the tail is a
+        # natural-language phrase (in its RFC-8259-decoded form, since the
+        # producer escaped a real TAB as ``\\t``) that ends with the stack's
+        # matching closers in LIFO order, the value is a phrase and never a
+        # credential.  Anything else — ``(plannerV2`` / ``([plannerV2]`` — is an
+        # ILLEGAL structural appearance and fails closed.
         if all(ch in _SELF_PAIRING_QUOTES for ch in stack):
             return base, is_version
+        if _is_phrase_closing_stack(v, j, stack):
+            return None
         return _WRAPPED_BASE_ILLEGAL
     if j < n:
         # trailing content after a fully balanced wrapper.  R40 Block 73/74/75
@@ -2442,23 +2487,30 @@ def _exact_value_at_free_text_boundary(
     phrase check closed and the narration binds exactly as it did before the
     09:40 correction — no deterministic bypass.
 
-    R42 Block 82 (打回三): the raw narration backstop must judge EACH decoded
-    string VALUE of a genuine JSON document INDEPENDENTLY — never re-scan
-    across a sibling member / array / nested value.  The Block 76 envelope
-    strip removes only the trailing ``]``/``}`` closers and ONE quote, so a
-    value followed by a sibling member (``{"a": "(plannerV2) is\\ta version.",
-    "b": "x"}``) leaves ``", "b": "x"`` in the remainder and the phrase check
-    fails on the DOCUMENT structure, not on the value — the exact-base
-    assignment wrongly binds.  For a genuine JSON document, when the assignment
-    sits inside a genuine DOUBLE-QUOTED member VALUE (its opening quote is the
-    value of a ``"key": "value"`` member, preceded by ``:``), the remainder is
-    truncated at the CURRENT value's own closing quote — the decoded content of
-    that ONE value is judged, never the document tail.  A member KEY
-    (``{"(plannerV2) is\\ta version.": "x"}``) is NOT a value: it never gets the
-    value decode-and-truncate path, so a key never gains a value exemption from
-    value decoding, and the raw tail (``": "x"``) still fails the phrase check
-    closed exactly as before.  This is structural — the real JSON value
-    boundary, not a comma strip and not a wider envelope character set."""
+    R42 Block 82 (打回三 / 打回四): the raw narration backstop must judge EACH
+    decoded string VALUE of a genuine JSON document INDEPENDENTLY — never
+    re-scan across a sibling member / array / nested value.  The Block 76
+    envelope strip removes only the trailing ``]``/``}`` closers and ONE quote,
+    so a value followed by a sibling member (``{"a": "(plannerV2) is\\ta
+    version.", "b": "x"}``) leaves ``", "b": "x"`` in the remainder and the
+    phrase check fails on the DOCUMENT structure, not on the value — the
+    exact-base assignment wrongly binds.  For a genuine JSON document, when the
+    assignment sits inside a genuine DOUBLE-QUOTED string VALUE, the remainder
+    is truncated at the CURRENT value's own closing quote — the decoded content
+    of that ONE value is judged, never the document tail.  A string token is a
+    VALUE iff the next non-whitespace char after its closing quote is NOT ``:``
+    (a member KEY is exactly a string token followed by ``:``); the structural
+    discriminator covers object member values, ARRAY direct string elements
+    (top-level / nested, first / middle / last) and a TOP-LEVEL scalar string
+    (followed by end of text) — the 打回三 opening-quote-preceded-by-colon test
+    only saw object member values, so a genuine array element / top-level
+    scalar was sent down the key / free-text envelope path and wrongly bound on
+    the document tail.  A member KEY (``{"(plannerV2) is\\ta version.": "x"}``)
+    is NOT a value: it never gets the value decode-and-truncate path, so a key
+    never gains a value exemption from value decoding, and the raw tail
+    (``": "x"``) still fails the phrase check closed exactly as before.  This
+    is structural — the real JSON value boundary, not a comma strip and not a
+    wider envelope character set."""
     after = text[end:]
     if not after:
         return True
@@ -2470,25 +2522,34 @@ def _exact_value_at_free_text_boundary(
     for start, close in spans:
         if not (start < end < close):
             continue
-        # the span enclosing ``end``.  A genuine JSON member VALUE's opening
-        # quote is preceded (skipping whitespace) by the ``:`` of
-        # ``"key": "value"``; a KEY span is preceded by ``{`` / ``,`` / ``[``.
-        i = start
-        while i > 0 and text[i - 1].isspace():
-            i -= 1
-        is_member_value = i > 0 and text[i - 1] == ":"
-        if is_json_document and text[start] == '"' and is_member_value:
-            # R42 Block 82: judge ONLY the current decoded value.  ``close`` is
-            # the index AFTER the closing quote (``_quoted_string_spans``), so
-            # ``text[end:close - 1]`` is the value's remaining content without
-            # its own closing quote — a sibling member / array / nested
-            # structure after the quote is never seen.  The RFC-8259 escapes in
-            # that ONE value are decoded, so a real TAB serialized as ``\\t`` is
-            # judged as horizontal whitespace; a decoded newline / separator
-            # stays a line boundary and fails closed.
-            rest = text[end:close - 1].strip(" \t")
-            rest = _decode_json_string_escapes(rest)
-            return not _is_natural_language_phrase(rest)
+        # the span enclosing ``end``.  R42 Block 82 纠偏 (打回四): a string
+        # token of a genuine JSON document is a VALUE iff the next
+        # non-whitespace char after its closing quote is NOT ``:`` — a member
+        # KEY is exactly a string token followed by ``:``.  This structural
+        # discriminator covers object member values (followed by `,` / `}` /
+        # `]`), ARRAY direct string elements (top-level / nested, first /
+        # middle / last), and a TOP-LEVEL scalar string (followed by end of
+        # text) — the 打回三 opening-quote-preceded-by-colon test only saw
+        # object member values, so a genuine array element / top-level scalar
+        # was sent down the key / free-text envelope path and wrongly bound on
+        # the document tail.
+        if is_json_document and text[start] == '"':
+            j = close
+            while j < len(text) and text[j].isspace():
+                j += 1
+            if j >= len(text) or text[j] != ":":
+                # R42 Block 82: judge ONLY the current decoded value.  ``close``
+                # is the index AFTER the closing quote
+                # (``_quoted_string_spans``), so ``text[end:close - 1]`` is the
+                # value's remaining content without its own closing quote — a
+                # sibling member / array / nested structure after the quote is
+                # never seen.  The RFC-8259 escapes in that ONE value are
+                # decoded, so a real TAB serialized as ``\\t`` is judged as
+                # horizontal whitespace; a decoded newline / separator stays a
+                # line boundary and fails closed.
+                rest = text[end:close - 1].strip(" \t")
+                rest = _decode_json_string_escapes(rest)
+                return not _is_natural_language_phrase(rest)
         # key spans / free text: the trailing envelope (string close + the
         # document's own structure closers) is still stripped, and the RFC-8259
         # escape decode NEVER runs here — a JSON member KEY and arbitrary
@@ -2517,6 +2578,31 @@ def _decode_json_string_escapes(text: str) -> str:
         return json.loads('"' + text + '"')
     except (ValueError, TypeError):
         return text
+
+
+def _match_inside_genuine_json_string_value(
+    text: str, end: int, spans: tuple[tuple[int, int], ...]
+) -> bool:
+    """True when the exact-base assignment ending at ``end`` sits inside a
+    GENUINE JSON string VALUE of a real JSON document — a DOUBLE-QUOTED span
+    whose next non-whitespace char after its closing quote is NOT ``:``.  A
+    member KEY is exactly a string token followed by ``:``; every other string
+    token of a valid JSON document (object member value, ARRAY direct element,
+    top-level scalar) is a VALUE.  R42 Block 82 纠偏 (打回四): the leading
+    wrapper chars of an array element's token (``["(plannerV2)``) are the JSON
+    document's OWN structure, so ``_credential_narration_binds`` must re-judge
+    such a token as a value instead of short-circuiting on the
+    ``_WRAPPED_BASE_ILLEGAL`` structural wrapper."""
+    for start, close in spans:
+        if not (start < end < close):
+            continue
+        if text[start] != '"':
+            return False
+        j = close
+        while j < len(text) and text[j].isspace():
+            j += 1
+        return j >= len(text) or text[j] != ":"
+    return False
 
 
 def _credential_narration_binds(text: str) -> bool:
@@ -2571,6 +2657,27 @@ def _credential_narration_binds(text: str) -> bool:
         # exemption decides.
         info = _registered_base_value_info(m.group("token"))
         if info is _WRAPPED_BASE_ILLEGAL:
+            # R42 Block 82 纠偏 (打回四): a WRAPPED_BASE_ILLEGAL token inside a
+            # genuine JSON string VALUE — an ARRAY direct element
+            # (``{"a": ["(plannerV2) is\\ta version."]}``), a top-level scalar,
+            # or an object member value whose token opens with ``[`` / ``{`` —
+            # is the JSON document's OWN structure around the base, not a tight
+            # prose wrapper.  Such a value is re-judged by the SAME per-value
+            # truncate + RFC-8259 decode + phrase check the object member-value
+            # path uses, so a legal array element is judged on its own decoded
+            # content and stays accepted.  Arbitrary quoted prose / a member
+            # KEY / the Block 81 quoted-literal escapes never reach this route
+            # (a non-JSON document or a key span fails the gate), so the
+            # wrapper-ILLEGAL fail-closed is preserved everywhere else.
+            if is_json_document and _match_inside_genuine_json_string_value(
+                text, m.end(), spans
+            ):
+                if not _exact_value_at_free_text_boundary(
+                    text, m.end(), spans, is_json_document=True
+                ):
+                    continue
+                if _documented_version_field_exempt(m):
+                    continue
             return True
         if info is None:
             # a phrase (``see (tokenizationV1)``) — never an exact-value

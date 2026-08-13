@@ -18514,6 +18514,20 @@ def test_r42_block82_json_value_independent_narration_both_paths(
     preceded by the member ``:``), so each value is judged on its own decoded
     content.
 
+    R42 Block 82 纠偏 (打回四): the member-value discriminator is now the
+    STRUCTURAL one — a string token of a genuine JSON document is a VALUE iff
+    the next non-whitespace char after its closing quote is NOT ``:`` (a member
+    KEY is exactly a string token followed by ``:``).  The structural
+    discriminator covers object member values, ARRAY direct string elements
+    (top-level / nested, first / middle / last) and a TOP-LEVEL scalar string,
+    so an array element whose token opens with the JSON ``[`` / ``"`` structure
+    (``{"a": ["(plannerV2) is\ta version."]}``) is judged on its OWN decoded
+    content instead of binding on the document tail.  The shared bounded
+    structural wrapper parser recognizes a serialized JSON array around a
+    prose mention as a phrase (never a tight wrapper around an exact base), and
+    the JSON walker judges a direct array string element / top-level scalar by
+    the same per-value contract at the top-level parse.
+
     Legal multi-member / array / nested TAB positives now stay accepted on the
     raw scans and survive the producer -> 0600 seal -> consumer -> both finals
     chain unchanged.  A JSON member KEY never gets the value decode-and-truncate
@@ -18542,6 +18556,28 @@ def test_r42_block82_json_value_independent_narration_both_paths(
         '{"results": [{"otp": "(plannerV2) is\\ta version.", "other": 1}]}',
         '{"results": [{"otp": "(plannerV2) is\\ta version."}], "other": 1}',
         '{"a": {"inner": "(plannerV2) is\\ta version."}, "b": "x"}',
+        # R42 Block 82 纠偏 (打回四): a DIRECT string element of a REAL ARRAY
+        # (top-level / nested, first / middle / last position) and a TOP-LEVEL
+        # JSON scalar string are REAL JSON values — each is truncated at its
+        # OWN closing quote, RFC-8259-decoded and judged independently by the
+        # shared per-value phrase contract.  The array/nested-array FIRST
+        # element's token opens with the JSON ``[`` / ``"`` structure, so the
+        # old opening-quote-preceded-by-colon discriminator sent it down the
+        # key / free-text envelope path and wrongly bound on the document tail;
+        # the raw narration backstop and the JSON walker now judge each decoded
+        # value on its own content.  The ``\t`` is the RFC-8259 escaped real
+        # TAB the producer emits.
+        '{"a": ["(plannerV2) is\\ta version."]}',
+        '{"a": ["x", "(plannerV2) is\\ta version.", "y"]}',
+        '{"a": ["x", "y", "(plannerV2) is\\ta version."]}',
+        '{"a": [["(plannerV2) is\\ta version."]]}',
+        '{"a": [["(plannerV2) is\\ta version.", "x"]]}',
+        '{"a": [["x", "(plannerV2) is\\ta version.", "y"]]}',
+        '{"a": [["x", "(plannerV2) is\\ta version."]]}',
+        '["(plannerV2) is\\ta version."]',
+        '["x", "(plannerV2) is\\ta version.", "y"]',
+        '["x", "y", "(plannerV2) is\\ta version."]',
+        '"(plannerV2) is\\ta version."',
     )
     b82_key_reject = (
         # Block 82: a registered base as a JSON member KEY is a

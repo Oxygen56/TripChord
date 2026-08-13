@@ -1330,6 +1330,16 @@ def _reject_unbound_registered_base_values(
     field names, over EVERY DECODED JSON level — a base smuggled through a
     ``json.dumps`` value fails closed at the decoded path, not the wrapping
     ``summary`` field.
+
+    R42 Block 82 纠偏 (打回四): a DIRECT string element of an ARRAY and a
+    TOP-LEVEL scalar string are REAL JSON values and are judged by the same
+    per-value contract — a phrase element (``["(plannerV2) is\\ta version."]``)
+    stays accepted, an exact registered base at the unbound ``[]`` / ``()``
+    path fails closed.  Only at the TOP-LEVEL parse (``depth == 0``): a DECODED
+    nested level has already been judged as the outer string VALUE at its real
+    member path (``{"planner_version": "[plannerV2]"}`` is the documented base
+    value), so re-judging the decoded array items / scalar with a RESET path
+    would wrongly reject a documented value.
     """
     try:
         text = data.decode("utf-8")
@@ -1353,6 +1363,25 @@ def _reject_unbound_registered_base_values(
                 ) from None
             except ValueError:
                 continue  # not JSON text at this level; the pattern scan applies
+            if isinstance(parsed, str):
+                # R42 Block 82 纠偏 (打回四): a TOP-LEVEL JSON scalar string is
+                # judged by the SAME real-JSON-value contract — a phrase
+                # (``"(plannerV2) is\\ta version."``) stays accepted, an exact
+                # registered base at the unbound root path fails closed (the
+                # producer already masks it the same way).  Only at the
+                # TOP-LEVEL parse (``depth == 0``): a DECODED nested string has
+                # already been judged as the outer string VALUE at its real
+                # member path (``{"summary": "\"plannerV2\""}`` is the
+                # documented base value), so re-judging the decoded scalar with
+                # a RESET path would wrongly reject a documented value.
+                if depth == 0 and not _registered_base_value_exempt_at_path(
+                    (), parsed
+                ):
+                    raise GateStateChangedError(
+                        f"secret leak: registered business base value at "
+                        f"unbound field path {()!r} in {label} file {name}"
+                    )
+                continue
             if not isinstance(parsed, (dict, list)):
                 continue
             stack: list[tuple[Any, tuple[str, ...]]] = [(parsed, ())]
@@ -1376,7 +1405,28 @@ def _reject_unbound_registered_base_values(
                             stack.append((value, child_path))
                 elif isinstance(node, list):
                     for item in node:
-                        if isinstance(item, (dict, list)):
+                        if isinstance(item, str):
+                            # R42 Block 82 纠偏 (打回四): a DIRECT string element
+                            # of an ARRAY is a real JSON value and is judged by
+                            # the same per-value contract — a phrase element
+                            # (``["(plannerV2) is\\ta version."]``) stays
+                            # accepted, an exact registered base at the unbound
+                            # ``[]`` path fails closed.  ONLY at the TOP-LEVEL
+                            # parse (``depth == 0``): a DECODED nested level has
+                            # already been judged as the outer string VALUE at
+                            # its real member path (``{"planner_version":
+                            # "[plannerV2]"}`` is the documented base value), so
+                            # re-judging the decoded array items with a RESET
+                            # path would wrongly reject a documented value.
+                            if depth == 0 and not _registered_base_value_exempt_at_path(
+                                (*path, "[]"), item
+                            ):
+                                raise GateStateChangedError(
+                                    f"secret leak: registered business base "
+                                    f"value at unbound field path "
+                                    f"{(*path, '[]')!r} in {label} file {name}"
+                                )
+                        elif isinstance(item, (dict, list)):
                             stack.append((item, (*path, "[]")))
     except RecursiveJsonBudgetError:
         raise GateStateChangedError(
