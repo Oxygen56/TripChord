@@ -166,6 +166,21 @@
 | API 重启 + `uv run python scripts/verify_api_runtime_provenance.py` | API 受控重启绑定**最终 HEAD=`eb68a44`**；provenance `passed=true`、`commit_sha`=`eb68a44a9618c44b67746ac1c7fb49316dd6f913`、`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 48622、mismatches 空 |
 | `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit eb68a44a9618c44b67746ac1c7fb49316dd6f913 --commit-evidence` | 从零重跑严格六层门（evidence `gate-20260812T104339Z-d688327b4b81`），tested_commit_sha=`eb68a44`：层 1/2/3/4 PASS（层 4 required-model smoke 实际运行通过）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL——**已如实报告真实 executor 失败**（`executor failed before the done gate at stage 'companion_preflight'`：浏览器 Companion 预检失败，未发现同时声明携程/去哪儿/同程且心跳未过期（>45s 过期）的已连接 Companion；实时搜索未提交），不再包装成「pending user authorization」通用文案；`passed=false` 退出码 2、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）；证据 `.runtime/done-gate-evidence/gate-20260812T104339Z-d688327b4b81/product-v1-done-gate.json`。`passed=false` 如实记录；L5/L6 均为真实未过，passed=true 前不启 C-125 |
 
+### 第四十二轮（续，C-122 R42 Block 79–80 监督 18:22 增量纠偏）验证结果
+
+> 监督 18:22：Block 79 要求所有 Unicode 行/段分隔与控制换行（U+2028/U+2029/VT/FF/NEL，类别 Cc/Zl/Zp）作为语义边界 fail-closed，不得只列 CR/LF；Block 80 要求词内分隔符必须左右均为字母，连续或混合 separator fail-closed。补正式 raw/JSON/producer→0600 seal→consumer→双 final 反例与相邻正常语言正例；保持 Block 78 正例不回归；修完重跑聚焦/完整门/全量/clean-env/ruff，并继续诊断 L6 至真实 done_gate 报告；passed=false 不收口。本表全部命令在最终 HEAD `4014432` 上执行。
+
+| 命令 | 结果 |
+|---|---|
+| `uv run pytest scripts/tests/test_run_product_done_gate.py -k "r42_block79_80"`（聚焦） | 1 passed（`test_r42_block79_80_line_separators_and_mixed_separator_pseudo_words_both_paths`，raw/JSON/双 final + 0600 seal→consumer 全链） |
+| `uv run pytest scripts/tests/test_run_product_done_gate.py`（全量 gate 测试） | 481 collected，退出码 0（collect 481 项全过；Block 78 479 项 + Block 79–80 新增正式正反例） |
+| `uv run pytest`（全量，apps/api/tests + benchmarks/tests + scripts/tests） | **1008 passed，退出码 0**（首轮 1008 项中出现 1 例 `benchmarks/tests/test_agent_suite.py::test_concurrency_gate_uses_declared_nonzero_external_wait` p50_speedup 0.2947<0.35 的主机负载抖动——非红改模块性能断言，隔离复跑 4/4 通过；完整复跑 1008 passed 确认无回归） |
+| `uv run python scripts/tests/run_tests_clean_env.py`（clean-env，scripts/tests 全量） | 508 passed，退出码 0（R42 Block 78 的 507 + Block 79–80 新增 1 项）；live `tripchord.db` 与 `.runtime/browser-bridge-state.json` 字节数与 mtime 均不变 |
+| `uv run ruff check .` | All checks passed（0 错误；RUF002/RUF003 歧义 Unicode 已改写为字符名描述，F841 死变量 `prev` 移除） |
+| `git rev-parse HEAD` | `4014432`（R42 Block 79–80 单提交；`_secret_redact.py` + gate 测试） |
+| API 重启 + `uv run python scripts/verify_api_runtime_provenance.py` | API 受控重启绑定**最终 HEAD=`4014432`**；provenance `passed=true`、`commit_sha`=`401443284ec40571d0c001e7af7561364771e5e7`、`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 82960、mismatches 空 |
+| `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit 401443284ec40571d0c001e7af7561364771e5e7 --commit-evidence` | 从零重跑严格六层门（run_id=`bf5de0bc7b32`，evidence `gate-20260813T020327Z-bf5de0bc7b32`），tested_commit_sha=`4014432`：层 1/2/3/4 PASS（层 4 required-model smoke 实际运行通过）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL——executor 在 done-gate 前于 `companion_preflight` 失败（`live-canary-certified.json` companion_status=`disconnected`、companions 为空、心跳过期 >45s）：未发现同时声明携程/去哪儿/同程且仍新鲜的已连接 Companion，实时搜索未提交；`passed=false` 退出码 2、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）、gate_ref=null；证据 `.runtime/done-gate-evidence/gate-20260813T020327Z-bf5de0bc7b32/product-v1-done-gate.json`。`passed=false` 如实记录，不包装为收口；passed=true 前不启 C-125 |
+
 ## 当前可对外声明
 
 - v0.5/v0.6/v0.7 接入生产路径：reprice/handoff 端点 + 前端两步 handoff 流；预订保护 gate 被 Verifier/ReVerifier 与 live_system 事件重规划共同消费（v0.6 收尾完成）；SDK 冷却/一致性 API 接线。
