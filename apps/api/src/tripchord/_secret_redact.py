@@ -2182,6 +2182,14 @@ _CONTRACTION_APOSTROPHES = frozenset(("'", "‘", "’"))
 # set and always fails closed.
 _SENTENCE_CLAUSE_TERMINATORS = frozenset(".,;:!?。，；：！？、…")
 _CJK_SENTENCE_TERMINATORS = frozenset("。，；：！？、…")
+# R42 Block 79 (09:40 correction): the REAL Unicode newline / line-separator
+# set — the control newlines CR / LF / VT / FF / FS / GS / RS / NEL plus the
+# two Unicode separators U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR.
+# U+0009 TAB is DELIBERATELY NOT here: it is ordinary horizontal whitespace a
+# same-line phrase spans (``(plannerV2) is<TAB>a version.`` stays prose), and
+# the earlier category-based check (``Cc``/``Zl``/``Zp``) wrongly swallowed it.
+_CONTROL_NEWLINES = frozenset("\x0a\x0d\x0b\x0c\x1c\x1d\x1e\x85")
+_LINE_BOUNDARY_CHARS = _CONTROL_NEWLINES | frozenset("\u2028\u2029")
 
 
 def _is_word_internal_separator(ch: str) -> bool:
@@ -2194,14 +2202,17 @@ def _is_word_internal_separator(ch: str) -> bool:
 
 
 def _is_line_boundary_char(ch: str) -> bool:
-    """True for ANY Unicode line / paragraph separator or control newline: the
-    control chars CR / LF / VT / FF / NEL (category ``Cc``) plus U+2028 LINE
-    SEPARATOR and U+2029 PARAGRAPH SEPARATOR (categories ``Zl`` / ``Zp``).
-    R42 Block 79: these are ALWAYS a semantic boundary the exact-base value fully
-    consumed — never prose whitespace.  Python's ``str.split()`` swallows them as
-    whitespace, so they must be rejected explicitly instead of being relied on
-    as line terminators (the old check only named CR/LF)."""
-    return unicodedata.category(ch) in ("Cc", "Zl", "Zp")
+    """True ONLY for the real Unicode line / paragraph boundary set (R42 Block 79,
+    09:40 correction): the control newlines CR / LF / VT / FF / FS / GS / RS /
+    NEL plus U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR.  U+0009 TAB
+    and every other ``Cc`` control char are NOT boundaries — they are ordinary
+    whitespace a same-line phrase spans (``(plannerV2) is<TAB>a version.`` stays
+    prose).  These ARE always a semantic boundary the exact-base value fully
+    consumed — never prose whitespace.  Python's ``str.split()`` swallows them
+    as whitespace, so they must be rejected explicitly instead of being relied
+    on as line terminators (the old check only named CR/LF, and the Cc-category
+    version wrongly swallowed TAB)."""
+    return ch in _LINE_BOUNDARY_CHARS
 
 
 def _is_natural_word_token(token: str) -> bool:
@@ -2270,11 +2281,12 @@ def _is_natural_language_phrase(rest: str) -> bool:
     symbol sits in the remainder (R42 Block 76/77; R40 Block 73/74/75)."""
     # a phrase is judged on the SAME line the wrapped value appears; a
     # cross-line operator / EOL is a boundary the value fully consumed
-    # (``(plannerV2)note␊=`` — Block 76).  R42 Block 79: EVERY Unicode line /
-    # paragraph separator and control newline (U+2028 / U+2029 / VT / FF / NEL,
-    # categories Cc/Zl/Zp) is such a boundary — Python's str.split() would
-    # otherwise swallow them as whitespace and join two lines into one "prose"
-    # phrase (``(plannerV2) is<U+2028>a version.``).
+    # (``(plannerV2)note␊=`` — Block 76).  R42 Block 79 (09:40 correction): the
+    # real newline set CR / LF / VT / FF / FS / GS / RS / NEL plus U+2028 /
+    # U+2029 is such a boundary — Python's str.split() would otherwise swallow
+    # them as whitespace and join two lines into one "prose" phrase
+    # (``(plannerV2) is<U+2028>a version.``).  TAB is NOT a boundary: a
+    # same-line phrase may span it (``(plannerV2) is<TAB>a version.``).
     if any(_is_line_boundary_char(ch) for ch in rest):
         return False
     rest = rest.lstrip(" \t")
@@ -2388,7 +2400,18 @@ def _exact_value_at_free_text_boundary(
     An UNMATCHED closer in free text has no opener, is never stripped, and fails
     closed.  The JSON member-value path does not need this — the JSON walker
     already hands UNQUOTED string values to the shared
-    :func:`_is_natural_language_phrase` core."""
+    :func:`_is_natural_language_phrase` core.
+
+    R42 Block 79 (09:40 correction): the string CONTENT is still the RAW JSON
+    text inside the value, so a control char the producer emitted as an
+    RFC-8259 escape is decoded back to its real char BEFORE the phrase check —
+    a sealed diagnostic legitimately carries ``\t`` for a real TAB, and without
+    the decode ``(plannerV2) is\ta version.`` would read the escape as a
+    literal backslash, fail the same-line phrase closed, and wrongly reject the
+    documented ``summary``/``detail``/``reason`` field the 09:40 correction
+    requires to stay accepted.  An incomplete / invalid escape is left
+    untouched and the caller fails closed on the raw text — the decode never
+    weakens a rejection."""
     after = text[end:]
     if not after:
         return True
@@ -2406,7 +2429,27 @@ def _exact_value_at_free_text_boundary(
         if rest and rest[-1] in "\"'":
             rest = rest[:-1]
         rest = rest.rstrip(" \t")
+        # 09:40 correction: decode the RFC-8259 escapes in the string CONTENT
+        # so a real TAB serialized as ``\t`` is judged as horizontal whitespace
+        # (a same-line phrase may span it), while a JSON-escaped newline still
+        # decodes to a line boundary and stays fail-closed.
+        rest = _decode_json_string_escapes(rest)
     return not _is_natural_language_phrase(rest)
+
+
+def _decode_json_string_escapes(text: str) -> str:
+    """Decode the RFC-8259 string escapes (``\\t`` / ``\\n`` / ``\\r`` / ``\\f``
+    / ``\\b`` / ``\\\\`` / ``\\\"`` / ``\\uXXXX``) in a JSON string VALUE's raw
+    text back to their characters, so a control char the producer escaped (a
+    real TAB serialized as ``\\t``) is judged as the char itself by the phrase
+    resolver.  Only used on the JSON-embedded free-text branch — the JSON
+    walker path already hands UNQUOTED (decoded) values to the shared core.
+    An invalid or incomplete escape leaves ``text`` untouched and the caller
+    fails closed on the raw form — decoding never makes a rejection weaker."""
+    try:
+        return json.loads('"' + text + '"')
+    except (ValueError, TypeError):
+        return text
 
 
 def _credential_narration_binds(text: str) -> bool:

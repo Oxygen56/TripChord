@@ -18263,15 +18263,18 @@ def test_r42_block78_sentence_punctuation_and_unicode_orthography_both_paths(
 def test_r42_block79_80_line_separators_and_mixed_separator_pseudo_words_both_paths(
     tmp_path: Path,
 ) -> None:
-    r"""C-122 round-42 Block 79/80 (supervision 18:22): two deterministic
-    fail-opens found by independent quick review after Block 78 closed.
+    r"""C-122 round-42 Block 79/80 (supervision 18:22 + 09:40 correction): two
+    deterministic fail-opens found by independent quick review after Block 78
+    closed.
 
     Block 79: the "same line" guard only banned CR/LF, so U+2028 (LINE
     SEPARATOR) / U+2029 (PARAGRAPH SEPARATOR) / VT / FF / NEL were swallowed as
-    whitespace by str.split() and two lines joined into one "prose" phrase --
-    EVERY Unicode line / paragraph separator and control newline (categories
-    Cc/Zl/Zp) must be a semantic boundary that fails closed on narration, BOTH
-    finals AND the JSON unbound-otp member-value path.
+    whitespace by str.split() and two lines joined into one "prose" phrase.
+    The 09:40 correction: only the REAL newline set CR / LF / VT / FF / FS / GS
+    / RS / NEL plus U+2028 / U+2029 is a semantic boundary that fails closed on
+    narration, BOTH finals AND the JSON unbound-otp member-value path.  U+0009
+    TAB is NOT a boundary -- it is ordinary horizontal whitespace, so a same-line
+    phrase may span it (``(plannerV2) is<TAB>a version.`` stays accepted prose).
 
     Block 80: a word-internal separator never verified the FOLLOWING char was a
     letter, so a doubled run (a--b) or a MIXED run (a dash immediately followed
@@ -18285,7 +18288,8 @@ def test_r42_block79_80_line_separators_and_mixed_separator_pseudo_words_both_pa
     from benchmarks import live_canary_certified as canary
 
     ls, ps = " ", " "  # LINE / PARAGRAPH SEPARATOR
-    vt, ff, nel = "\x0b", "\x0c", ""  # VT / FF / NEL
+    vt, ff, nel = "\x0b", "\x0c", "\x85"  # VT / FF / NEL
+    fs, gs, rs = "\x1c", "\x1d", "\x1e"  # FILE / GROUP / RECORD SEPARATOR
 
     b79_reject = (
         f"verification code is (plannerV2) is{ls}a version.",
@@ -18293,11 +18297,17 @@ def test_r42_block79_80_line_separators_and_mixed_separator_pseudo_words_both_pa
         f"verification code is (plannerV2) is{vt}a version.",
         f"verification code is (plannerV2) is{ff}a version.",
         f"verification code is (plannerV2) is{nel}a version.",
+        f"verification code is (plannerV2) is{fs}a version.",
+        f"verification code is (plannerV2) is{gs}a version.",
+        f"verification code is (plannerV2) is{rs}a version.",
         f'{{"otp": "(plannerV2) is{ls}a version."}}',
         f'{{"otp": "(plannerV2) is{ps}a version."}}',
         f'{{"otp": "(plannerV2) is{vt}a version."}}',
         f'{{"otp": "(plannerV2) is{ff}a version."}}',
         f'{{"otp": "(plannerV2) is{nel}a version."}}',
+        f'{{"otp": "(plannerV2) is{fs}a version."}}',
+        f'{{"otp": "(plannerV2) is{gs}a version."}}',
+        f'{{"otp": "(plannerV2) is{rs}a version."}}',
     )
     b80_reject = (
         "verification code is (plannerV2) a-’b note",   # U+2019 after a dash
@@ -18324,6 +18334,16 @@ def test_r42_block79_80_line_separators_and_mixed_separator_pseudo_words_both_pa
         '{"summary": "(plannerV2) is a version."}',
         '{"summary": "(plannerV2) isn’t active"}',
     )
+    b79_tab_pos = (
+        # 09:40 correction: TAB (U+0009) is ordinary horizontal whitespace, NOT
+        # a line boundary -- the same-line phrase stays prose (raw + JSON).
+        # The JSON case carries the RFC-8259 ESCAPED form: a raw TAB inside a
+        # JSON string is malformed and the top-level guard would reject it, so
+        # the real producer emits ``\t`` and the walker decodes it to a real
+        # TAB -- the value is still the same-line phrase and is accepted.
+        "verification code is (plannerV2) is\ta version.",
+        '{"summary": "(plannerV2) is\\ta version."}',
+    )
     for raw in b79_reject + b80_reject:
         with pytest.raises(gate.GateStateChangedError):
             gate._secret_scan_bytes(
@@ -18341,7 +18361,7 @@ def test_r42_block79_80_line_separators_and_mixed_separator_pseudo_words_both_pa
                 "live-canary-certified.json.failure.json",
                 credential_field_check=False,
             )
-    for raw in b78_pos_keep:
+    for raw in b78_pos_keep + b79_tab_pos:
         gate._secret_scan_bytes(
             raw.encode(),
             gate._SecretNeedles(()),
@@ -18404,7 +18424,7 @@ def test_r42_block79_80_line_separators_and_mixed_separator_pseudo_words_both_pa
                 "live-canary-certified.json.failure.json",
                 credential_field_check=False,
             )
-    for raw in b78_pos_keep:
+    for raw in b78_pos_keep + b79_tab_pos:
         masked = canary._desensitize(raw)
         assert "[REDACTED]" not in masked
         assert "plannerV2" in masked
