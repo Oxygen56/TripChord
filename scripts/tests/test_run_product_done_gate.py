@@ -20381,39 +20381,70 @@ def test_r42_block89_documented_escaped_key_and_bracket_whitespace_five_route(
         sealed_accepts(masked, "r42b89n")
 
 
-def test_r42_block90_leading_and_full_escaped_member_key_five_route(
+
+def test_r42_block90_generative_escaped_member_key_matrix(
     tmp_path: Path,
 ) -> None:
-    r"""C-122 round-42 Block 90 (打回十一): a genuine JSON document whose member
-    KEY's FIRST character is a backslash-escape (``{"planner_version":
+    r"""C-122 round-42 Block 90 (打回十一, matrix 增量): the formal test matrix
+    for the leading / full-escaped documented member key must be an AUDITABLE
+    GENERATIVE coverage — every Cartesian dimension is enumerated by code and
+    the case counts are asserted, so a dropped dimension fails the test instead
+    of staying green.
+
+    Root cause (打回十一): a genuine JSON document whose member KEY's FIRST
+    character is a backslash-escape (``{"planner_version":
     ["plannerV2","x"]}`` = ``{"planner_version": ...}``) was mis-rejected by
-    both raw finals while the producer stayed UNTOUCHED and the consumer
-    accepted — a five-route asymmetry on inputs the contract exempts.
+    both raw finals while the producer stayed untouched — the free-text
+    assignment regex opens its field with a WORD character, so the capture
+    starts AFTER the backslash (field ``u0070lanner_version"``) and the true
+    key's leading context is lost; the Block 89 fix only decodes the
+    regex-captured field, which can never recover the documented key.  The
+    fix resolves the ACTUAL RFC-8259-decoded member key from the REAL
+    parsed-JSON quoted span containing the field start (``_json_member_key_at``):
+    a span whose closing quote is followed by ``:`` is the member KEY string
+    literal and its decoded content is authoritative — the same key the JSON
+    walker sees; a VALUE-position span (closing quote followed by anything
+    else) returns None and the regex field stays authoritative exactly as
+    before.  No reliance on the truncated regex field, global replacement, or
+    char-table patching.
 
-    R42 Block 89 (打回十) fixed the escape decode on the regex-CAPTURED field,
-    but the free-text assignment regex opens its field with a WORD character,
-    so a member key whose first character is an escape (``p``) is
-    captured starting AFTER the backslash (field ``u0070lanner_version"``) and
-    the true key's leading context is lost — the truncated field can never
-    decode to the documented key.  The Block 90 fix resolves the ACTUAL
-    decoded member key from the REAL parsed-JSON quoted span that contains the
-    field start (``_json_member_key_at``): the span's closing quote is followed
-    by ``:``, so it is the member KEY string literal and its RFC-8259-decoded
-    content is the authoritative key — the same decoded key the JSON walker
-    sees.  A VALUE-position span (closing quote followed by anything else) is
-    prose, not a member path, and returns None so the regex field stays
-    authoritative exactly as before.
+    The matrix enumerates every combination of:
 
-    Every leading / full-escaped documented key — planner / provider / summary,
-    ``plan.`` nested, FIRST / MIDDLE / LAST / NESTED array positions and the
-    scalar form, every decode depth (real layer plus 2/3/4 ``json.dumps``
-    encodings) — accepts on all five routes with the producer leaving it
-    UNTOUCHED.  The preserved negatives (escaped cross-field / unbound /
-    fake-suffix keys, object / ``[]`` wrappers, duplicate escaped documented
-    keys, the dotted assignment-helper with an escaped field) still fail closed
-    on both raw finals with the producer masking, and the sealed 0600
-    diagnostic -> consumer dual finals accept ONLY the already-masked producer
-    output.
+    * escape style — LEADING (only the first char escaped) and FULL (every
+      char an RFC-8259 ``\uXXXX`` escape);
+    * documented key — ``planner_version`` / ``provider_version`` /
+      ``summary``;
+    * value form — scalar / array-first / array-middle / array-last /
+      nested-array / deep-nested;
+    * decode depth — the real JSON layer plus 2/3/4 ``json.dumps`` encodings;
+    * legal JSON whitespace — SPACE / TAB / CR / LF enumerated independently
+      (never a combined CRLF), injected at every structural gap of the array
+      brackets and, for the scalar form, at the member colon/value boundary.
+
+    All positive families are enumerated with exact case-count assertions AND
+    uniqueness assertions (``len(set(...)) == <count>``, so duplicates cannot
+    be padded into a fake dimension), and EVERY positive case — depth 0 AND
+    the 2/3/4 encodings — walks the FULL real five-route: raw
+    committed/failure dual finals -> producer untouched (``_desensitize`` must
+    not over-mask) -> real 0600 O_CREAT|O_EXCL seal
+    (``_seal_failure_diagnostic``, mode check) -> consumer dual finals
+    (``_sanitize_canary_diag_field`` + committed/failure scans).
+
+    1. Main documented matrix: 2 x 3 x 6 x 4 = 144 unique cases
+       (escape style x documented key x value form x depth).
+    2. Whitespace matrix: 4 x 2 x 3 x 6 x 4 = 576 unique cases
+       (JSON whitespace {SPACE,TAB,CR,LF} x escape style x documented key x
+       value form x depth) — every scalar raw carries the actual whitespace at
+       its member colon/value boundary, so all 576 raws are distinct.
+    3. Escaped parent ``plan`` x escaped child: child is ``planner_version``
+       OR ``provider_version``, each child leading/full escaped, parent
+       leading/full escaped, depth 0/2/3/4: 2 x 2 x 2 x 4 = 32 unique cases.
+
+    Block 87-90 negatives are preserved with counts (12 real + 12 layered):
+    escaped cross-field / unbound / fake-suffix, object-wrapped / real
+    ``[]``-key / escaped ``[]``-key, scalar cross-field, duplicate escaped
+    key, bracket-whitespace cross-field / fake, and the escaped assignment
+    helper dotted form; every raw final rejects and the producer masks.
     """
     from benchmarks import live_canary_certified as canary
 
@@ -20469,60 +20500,103 @@ def test_r42_block90_leading_and_full_escaped_member_key_five_route(
             credential_field_check=True,
         )
 
-    # Block 90 positives — the leading-escaped member key (``p`` = ``p``,
-    # ``s`` = ``s``) and the FULLY-escaped key (every char an RFC-8259
-    # ``\uXXXX`` escape), for the planner / provider documented bases, the
-    # ``plan.`` prefix, the ``summary`` free-text contract, every array position
-    # and the scalar form: accepted by all five routes, producer-untouched.
-    doc_pos = (
-        '{"\\u0070lanner_version":["plannerV2","x"]}',
-        '{"\\u0070lanner_version":["x","plannerV2","y"]}',
-        '{"\\u0070lanner_version":["x","y","plannerV2"]}',
-        '{"\\u0070lanner_version":[["plannerV2"]]}',
-        '{"\\u0070lanner_version":"plannerV2"}',
-        '{"\\u0070rovider_version":["providerV4","x"]}',
-        '{"plan":{"\\u0070lanner_version":["plannerV2","x"]}}',
-        '{"plan":{"\\u0070rovider_version":["providerV4","x"]}}',
-        '{"\\u0073ummary":["plannerV2","x"]}',
-        '{"\\u0073ummary":"plannerV2"}',
-        '{"\\u0070\\u006c\\u0061\\u006e\\u006e\\u0065\\u0072\\u005f\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e":["plannerV2","x"]}',
-        '{"\\u0070\\u006c\\u0061\\u006e\\u006e\\u0065\\u0072\\u005f\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e":"plannerV2"}',
-        '{"\\u0070\\u0072\\u006f\\u0076\\u0069\\u0064\\u0065\\u0072\\u005f\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e":["providerV4","x"]}',
-        '{"\\u0073\\u0075\\u006d\\u006d\\u0061\\u0072\\u0079":["plannerV2","x"]}',
-        '{"\\u0073\\u0075\\u006d\\u006d\\u0061\\u0072\\u0079":"plannerV2"}',
-    )
+    def full_five_route(raw: str, tag: str) -> None:
+        accepts(raw)
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked, raw
+        sealed_accepts(masked, tag)
+
+    def esc_leading(key: str) -> str:
+        return f"\\u00{ord(key[0]):02x}" + key[1:]
+
+    def esc_full(key: str) -> str:
+        return "".join(f"\\u{ord(c):04x}" for c in key)
+
+    def json_with(escaped_key: str, value: str) -> str:
+        return '{"' + escaped_key + '":' + value + "}"
+
+    escape_styles = (("leading", esc_leading), ("full", esc_full))
+    documented_base = {
+        "planner_version": "plannerV2",
+        "provider_version": "providerV4",
+        "summary": "plannerV2",
+    }
+    value_forms = {
+        "scalar": lambda b: f'"{b}"',
+        "array-first": lambda b: f'["{b}","x"]',
+        "array-middle": lambda b: f'["x","{b}","y"]',
+        "array-last": lambda b: f'["x","y","{b}"]',
+        "nested-array": lambda b: f'[["{b}"]]',
+        "deep-nested": lambda b: f'[[["{b}"]]]',
+    }
+    ws_types = (("SPACE", " "), ("TAB", "\t"), ("CR", "\r"), ("LF", "\n"))
+
+    def ws_bracket(ws: str, inner: str) -> str:
+        return f"[{ws}{inner}{ws}]"
+
+    ws_value_forms = {
+        # scalar injects the whitespace at the member colon/value boundary so
+        # each whitespace type yields a distinct raw (never a duplicate).
+        "scalar": lambda b, ws: f'{ws}"{b}"{ws}',
+        "array-first": lambda b, ws: ws_bracket(ws, f'"{b}"{ws},{ws}"x"'),
+        "array-middle": lambda b, ws: ws_bracket(
+            ws, f'"x"{ws},{ws}"{b}"{ws},{ws}"y"'
+        ),
+        "array-last": lambda b, ws: ws_bracket(
+            ws, f'"x"{ws},{ws}"y"{ws},{ws}"{b}"'
+        ),
+        "nested-array": lambda b, ws: ws_bracket(
+            ws, ws_bracket(ws, f'"{b}"')
+        ),
+        "deep-nested": lambda b, ws: ws_bracket(
+            ws, ws_bracket(ws, ws_bracket(ws, f'"{b}"'))
+        ),
+    }
+
+    # --- 1. main documented matrix: esc(2) x key(3) x vf(6) x depth(4) ---
+    doc_pos: list[str] = []
+    for _en, esc in escape_styles:
+        for key in ("planner_version", "provider_version", "summary"):
+            for _vn, vf in value_forms.items():
+                raw = json_with(esc(key), vf(documented_base[key]))
+                doc_pos.append(raw)
+                doc_pos.extend(layered(raw, n) for n in (2, 3, 4))
+    assert len(doc_pos) == 144, "2 escape styles x 3 keys x 6 value forms x depths"
+    assert len(set(doc_pos)) == 144, "main raw cases must be unique"
     for raw in doc_pos:
-        accepts(raw)
-        masked = canary._desensitize(raw)
-        assert "[REDACTED]" not in masked, raw
-        sealed_accepts(masked, "r42b90p")
+        full_five_route(raw, "r42b90m")
 
-    # Same leading / full-escaped key forms re-encoded 2/3/4 times: the decoded
-    # key is carried through the decode recursion at every layer, so each depth
-    # accepts and the producer stays untouched.
-    doc_pos_layered = tuple(
-        layered(arr, n)
-        for n in (2, 3, 4)
-        for arr in (
-            '{"\\u0070lanner_version":["plannerV2","x","y"]}',
-            '{"\\u0070lanner_version":["x",["plannerV2"],"y"]}',
-            '{"plan":{"\\u0070rovider_version":["providerV4","x"]}}',
-            '{"\\u0073ummary":"plannerV2"}',
-            '{"\\u0070\\u0072\\u006f\\u0076\\u0069\\u0064\\u0065\\u0072\\u005f\\u0076\\u0065\\u0072\\u0073\\u0069\\u006f\\u006e":["providerV4","x"]}',
-        )
-    )
-    for raw in doc_pos_layered:
-        accepts(raw)
-        masked = canary._desensitize(raw)
-        assert "[REDACTED]" not in masked, raw
-        sealed_accepts(masked, "r42b90p")
+    # --- 2. whitespace matrix: ws(4) x esc(2) x key(3) x vf(6) x depth(4) ---
+    ws_pos: list[str] = []
+    for _wn, ws in ws_types:
+        for _en, esc in escape_styles:
+            for key in ("planner_version", "provider_version", "summary"):
+                for _vn, vf in ws_value_forms.items():
+                    raw = json_with(esc(key), vf(documented_base[key], ws))
+                    ws_pos.append(raw)
+                    ws_pos.extend(layered(raw, n) for n in (2, 3, 4))
+    assert len(ws_pos) == 576, "4 ws{SPACE,TAB,CR,LF} x 2 esc x 3 keys x 6 vf x 4 depths"
+    assert len(set(ws_pos)) == 576, "ws raw cases must be unique per whitespace type"
+    for raw in ws_pos:
+        full_five_route(raw, "r42b90w")
 
-    # Block 90 negatives — ESCAPED cross-field / unbound / fake-suffix keys, the
-    # object / ``[]`` member-key wrapper (escaped and unescaped), duplicate
-    # leading-escaped documented keys, and the dotted assignment-helper with an
-    # ESCAPED field (a non-JSON document, so the escape is never decoded): both
-    # raw finals reject, the producer masks, the sealed + consumer dual finals
-    # accept only the masked output.
+    # --- 3. escaped plan parent x escaped child (planner_version / provider_version) ---
+    plan_pos: list[str] = []
+    for _pn, parent in (("leading", esc_leading("plan")), ("full", esc_full("plan"))):
+        for child_key in ("planner_version", "provider_version"):
+            for _cn, child in (
+                ("leading", esc_leading(child_key)),
+                ("full", esc_full(child_key)),
+            ):
+                raw = f'{{"{parent}":{{"{child}":["{documented_base[child_key]}","x"]}}}}'
+                plan_pos.append(raw)
+                plan_pos.extend(layered(raw, n) for n in (2, 3, 4))
+    assert len(plan_pos) == 32, "2 parent esc x 2 child keys x 2 child esc x 4 depths"
+    assert len(set(plan_pos)) == 32, "plan raw cases must be unique"
+    for raw in plan_pos:
+        full_five_route(raw, "r42b90p")
+
+    # --- Block 87-90 negatives preserved (count-asserted) ---
     doc_neg = (
         '{"\\u0070lanner_version":["providerV4","x"]}',
         '{"\\u0070lanner_version":["\\u0070roviderV4","x"]}',
@@ -20533,6 +20607,8 @@ def test_r42_block90_leading_and_full_escaped_member_key_five_route(
         '{"\\u0070lanner_version":{"\\u005b\\u005d":"plannerV2"}}',
         '{"\\u0070lanner_version":"providerV4"}',
         '{"\\u0070lanner_version":["plannerV2","x"],"\\u0070lanner_version":["x","plannerV2","y"]}',
+        '{"\\u0070lanner_version":[ [ "providerV4" ]] }',
+        '{"\\u0070tp":[ [ "plannerV2" ]] }',
         "\\u0070lanner_version.[] = plannerV2",
     )
     doc_neg_layered = tuple(
@@ -20542,8 +20618,11 @@ def test_r42_block90_leading_and_full_escaped_member_key_five_route(
             '{"\\u0070lanner_version":["x","\\u0070roviderV4","y"]}',
             '{"\\u0070tp":["plannerV2","x"]}',
             '{"\\u0070lanner_version":{"[]":"plannerV2"}}',
+            '{"\\u0070lanner_version":[ [ "providerV4" ]] }',
         )
     )
+    assert len(doc_neg) == 12, "negatives: [] key/cross-field/unbound/fake/dot/dup"
+    assert len(doc_neg_layered) == 12, "4 negative bases x depths {2,3,4}"
     for raw in (*doc_neg, *doc_neg_layered):
         rejects(raw)
         masked = canary._desensitize(raw)
