@@ -18258,3 +18258,192 @@ def test_r42_block78_sentence_punctuation_and_unicode_orthography_both_paths(
             "live-canary-certified.json.failure.json",
             credential_field_check=False,
         )
+
+
+def test_r42_block79_80_line_separators_and_mixed_separator_pseudo_words_both_paths(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-42 Block 79/80 (supervision 18:22): two deterministic
+    fail-opens found by independent quick review after Block 78 closed.
+
+    Block 79: the "same line" guard only banned CR/LF, so U+2028 (LINE
+    SEPARATOR) / U+2029 (PARAGRAPH SEPARATOR) / VT / FF / NEL were swallowed as
+    whitespace by str.split() and two lines joined into one "prose" phrase --
+    EVERY Unicode line / paragraph separator and control newline (categories
+    Cc/Zl/Zp) must be a semantic boundary that fails closed on narration, BOTH
+    finals AND the JSON unbound-otp member-value path.
+
+    Block 80: a word-internal separator never verified the FOLLOWING char was a
+    letter, so a doubled run (a--b) or a MIXED run (a dash immediately followed
+    by a curly apostrophe U+2019, or by an em dash) read as a word; a separator
+    must be flanked by a letter on BOTH sides.
+
+    Both stay fail-closed while the Block 78 Unicode-orthography positives
+    (curly-apostrophe contraction, U+2011 hyphenation, sentence-final /
+    clause-final punctuation) and the Block 73-77 rejects stay closed on both
+    finals and on the JSON member-value path."""
+    from benchmarks import live_canary_certified as canary
+
+    ls, ps = " ", " "  # LINE / PARAGRAPH SEPARATOR
+    vt, ff, nel = "\x0b", "\x0c", ""  # VT / FF / NEL
+
+    b79_reject = (
+        f"verification code is (plannerV2) is{ls}a version.",
+        f"verification code is (plannerV2) is{ps}a version.",
+        f"verification code is (plannerV2) is{vt}a version.",
+        f"verification code is (plannerV2) is{ff}a version.",
+        f"verification code is (plannerV2) is{nel}a version.",
+        f'{{"otp": "(plannerV2) is{ls}a version."}}',
+        f'{{"otp": "(plannerV2) is{ps}a version."}}',
+        f'{{"otp": "(plannerV2) is{vt}a version."}}',
+        f'{{"otp": "(plannerV2) is{ff}a version."}}',
+        f'{{"otp": "(plannerV2) is{nel}a version."}}',
+    )
+    b80_reject = (
+        "verification code is (plannerV2) a-’b note",   # U+2019 after a dash
+        "verification code is (plannerV2) a-—b note",   # em dash after a dash
+        "verification code is (plannerV2) a-'b note",   # ASCII apostrophe after
+        "verification code is (plannerV2) a--b note",   # doubled dash
+        '{"otp": "(plannerV2) a-’b note"}',
+        '{"otp": "(plannerV2) a-—b note"}',
+        '{"otp": "(plannerV2) a--b note"}',
+        '{"otp": "(plannerV2) a-\'b note"}',
+    )
+    b78_pos_keep = (
+        # Block 78 Unicode orthography + sentence punctuation stay accepted
+        "verification code is (plannerV2) isn't active",
+        "verification code is (plannerV2) isn’t active",
+        "verification code is (plannerV2) non-secret version",
+        "verification code is (plannerV2) non‑secret version",
+        "verification code is (plannerV2) is a version.",
+        "verification code is (plannerV2) is a version;",
+        "verification code is (plannerV2) is a version, not a secret",
+        "verification code is (plannerV2)这是版本。",
+        "verification code is (plannerV2) in the report",
+        "verification code is (plannerV2) — a note",
+        '{"summary": "(plannerV2) is a version."}',
+        '{"summary": "(plannerV2) isn’t active"}',
+    )
+    for raw in b79_reject + b80_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in b78_pos_keep:
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    # full chain: the producer masks every Block 79/80 reject BEFORE the 0600
+    # seal, so the sealed diagnostic and the consumer-synthesized field are clean
+    # and BOTH finals pass; the RAW values still fail BOTH finals (defense in
+    # depth).  The Block 78 positives survive the seal untouched.
+    for raw in b79_reject + b80_reject:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b7980",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in b78_pos_keep:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" not in masked
+        assert "plannerV2" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b7980",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )

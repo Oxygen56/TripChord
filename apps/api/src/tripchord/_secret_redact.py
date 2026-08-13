@@ -2193,6 +2193,17 @@ def _is_word_internal_separator(ch: str) -> bool:
     return ch in _CONTRACTION_APOSTROPHES or unicodedata.category(ch) == "Pd"
 
 
+def _is_line_boundary_char(ch: str) -> bool:
+    """True for ANY Unicode line / paragraph separator or control newline: the
+    control chars CR / LF / VT / FF / NEL (category ``Cc``) plus U+2028 LINE
+    SEPARATOR and U+2029 PARAGRAPH SEPARATOR (categories ``Zl`` / ``Zp``).
+    R42 Block 79: these are ALWAYS a semantic boundary the exact-base value fully
+    consumed — never prose whitespace.  Python's ``str.split()`` swallows them as
+    whitespace, so they must be rejected explicitly instead of being relied on
+    as line terminators (the old check only named CR/LF)."""
+    return unicodedata.category(ch) in ("Cc", "Zl", "Zp")
+
+
 def _is_natural_word_token(token: str) -> bool:
     """True when ``token`` is a REAL natural-language word / CJK sentence: an
     ASCII letter run with optional INTERNAL apostrophes / hyphens — ASCII or
@@ -2201,9 +2212,10 @@ def _is_natural_word_token(token: str) -> bool:
     may carry ONE trailing CJK sentence terminator (``版本`` / ``这是版本。``),
     or the single-letter function words ``a`` / ``I``.  A single-char
     placeholder (``x`` / ``_``), an underscore pseudo-word (``_note``), a
-    leading / trailing / doubled apostrophe or hyphen (``-version`` /
-    ``note-`` / ``a--b``) and any structural / quote / operator / digit char
-    are NOT words (R42 Block 77/78; R40 Block 74)."""
+    leading / trailing / doubled / MIXED apostrophe or hyphen (``-version`` /
+    ``note-`` / ``a--b`` / ``a-'b`` and its U+2019 / em-dash MIXED variants —
+    Block 80) and any structural / quote / operator / digit char are NOT words
+    (R42 Block 77/78/80; R40 Block 74)."""
     if not token:
         return False
     if "_" in token:
@@ -2221,17 +2233,19 @@ def _is_natural_word_token(token: str) -> bool:
     if core and all("一" <= ch <= "鿿" for ch in core):
         return True
     letters = 0
-    prev = ""
     for idx, ch in enumerate(token):
         if ch.isalpha():
             letters += 1
-            prev = ch
         elif _is_word_internal_separator(ch):
-            # an apostrophe / dash is a word char only INTERNAL to the word
-            # (a letter on both sides) and not doubled
-            if idx == 0 or idx == len(token) - 1 or prev == ch:
+            # R42 Block 80: an apostrophe / dash is a word char only INTERNAL to
+            # the word, flanked by a LETTER on BOTH sides.  The lookahead rejects
+            # a trailing separator and any separator run — doubled (``a--b``) or
+            # MIXED (``a-'b`` and its U+2019 / em-dash variants) — because the
+            # next char is another separator instead of a letter.
+            if idx == 0:
                 return False
-            prev = ch
+            if idx + 1 >= len(token) or not token[idx + 1].isalpha():
+                return False
         else:
             return False
     if letters == 1:
@@ -2256,8 +2270,12 @@ def _is_natural_language_phrase(rest: str) -> bool:
     symbol sits in the remainder (R42 Block 76/77; R40 Block 73/74/75)."""
     # a phrase is judged on the SAME line the wrapped value appears; a
     # cross-line operator / EOL is a boundary the value fully consumed
-    # (``(plannerV2)note␊=`` — Block 76)
-    if "\r" in rest or "\n" in rest:
+    # (``(plannerV2)note␊=`` — Block 76).  R42 Block 79: EVERY Unicode line /
+    # paragraph separator and control newline (U+2028 / U+2029 / VT / FF / NEL,
+    # categories Cc/Zl/Zp) is such a boundary — Python's str.split() would
+    # otherwise swallow them as whitespace and join two lines into one "prose"
+    # phrase (``(plannerV2) is<U+2028>a version.``).
+    if any(_is_line_boundary_char(ch) for ch in rest):
         return False
     rest = rest.lstrip(" \t")
     # a prose dash (em / en dash) may introduce the phrase; a lone dash is not
@@ -2306,8 +2324,9 @@ def _exact_value_at_semantic_boundary(text: str, end: int) -> bool:
     if not after:
         return True
     rest = after.lstrip(" \t")
-    if not rest or rest[0] in "\r\n":
-        # end of text, or a line boundary the value fully consumed
+    if not rest or _is_line_boundary_char(rest[0]):
+        # end of text, or a line/paragraph boundary the value fully consumed
+        # (CR/LF plus U+2028/U+2029/VT/FF/NEL — Block 79)
         return True
     return not _is_natural_language_phrase(rest)
 
@@ -2374,8 +2393,9 @@ def _exact_value_at_free_text_boundary(
     if not after:
         return True
     rest = after.lstrip(" \t")
-    if not rest or rest[0] in "\r\n":
-        # end of text, or a line boundary the value fully consumed
+    if not rest or _is_line_boundary_char(rest[0]):
+        # end of text, or a line/paragraph boundary the value fully consumed
+        # (CR/LF plus U+2028/U+2029/VT/FF/NEL — Block 79)
         return True
     if any(start < end < close for start, close in spans):
         # the assignment is inside a JSON string value: the trailing envelope is
