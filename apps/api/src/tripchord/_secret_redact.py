@@ -3301,6 +3301,23 @@ def bounded_json_mask(
             # JSON attempt — mask the whole level (fail closed).
             return marker
         if isinstance(parsed, str):
+            # R42 Block 83 (打回五): a TOP-LEVEL JSON scalar string that is an
+            # EXACT registered business base (or a wrapped / Unicode-escaped
+            # spelling of one — ``plannerV2`` / ``providerV4`` /
+            # ``"(plannerV2)"`` / ``\u0070lannerV2``) at the UNBOUND root path
+            # is masked WHOLE, so the producer / consumer never seals an
+            # unbound business value the finals reject (the previous code
+            # recursed into the decoded scalar and the documented-base level
+            # mask kept it, letting producer -> 0600 seal -> consumer ->
+            # documented summary launder it).  Mirrors the final rejector's
+            # top-level-scalar contract: only at the TOP-LEVEL parse
+            # (``depth == 0``); a DECODED nested level has already been judged
+            # as the outer string VALUE at its real member path
+            # (``{"summary": "\"plannerV2\""}`` is the documented base value),
+            # so re-judging the decoded scalar with a RESET path would wrongly
+            # mask a documented value.
+            if depth == 0 and not _registered_base_value_exempt_at_path((), parsed):
+                return marker
             return json.dumps(mask_text(parsed, depth + 1), ensure_ascii=False)
         if isinstance(parsed, (dict, list)):
             return json.dumps(

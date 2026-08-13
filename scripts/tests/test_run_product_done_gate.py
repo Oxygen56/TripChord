@@ -18768,3 +18768,323 @@ def test_r42_block82_json_value_independent_narration_both_paths(
                 "live-canary-certified.json.failure.json",
                 credential_field_check=False,
             )
+
+def test_r42_block83_top_level_scalar_producer_final_symmetry(
+    tmp_path: Path,
+) -> None:
+    r"""C-122 round-42 Block 83 (打回五): a TOP-LEVEL JSON scalar string that is
+    an EXACT registered business base (or a WRAPPED / Unicode-escaped spelling
+    of one -- ``plannerV2`` / ``providerV4`` / ``"(plannerV2)"`` /
+    ``"plannerV2"``) is rejected by BOTH raw finals as an UNBOUND root-path
+    value, but the producer's ``bounded_json_mask`` used to recurse into the
+    decoded scalar and the DOCUMENTED-base level mask kept it -- so the raw
+    scalar was sealed into the 0600 failure diagnostic's documented summary
+    field and ACCEPTED again after the consumer's sanitize: producer -> 0600
+    seal -> consumer -> documented-summary laundering.
+
+    The fix restores producer / final symmetry: the shared ``bounded_json_mask``
+    now masks a top-level JSON scalar that is an exact registered base at the
+    UNBOUND root path WHOLE (``[REDACTED]``), mirroring the final rejector's
+    ``depth == 0`` / ``path == ()`` contract.  A DECODED nested level is not
+    re-judged with a reset path (``{"summary": "\\"plannerV2\\""}`` is already
+    the documented base VALUE at its real member path and stays a positive).
+    The supervisor's Block 83 narrative still holds: a legal top-level PROSE
+    narration (``"(plannerV2) is\ta version."``) must continue to be accepted
+    and the producer must NOT crudely mask all top-level JSON scalars -- only
+    exact / wrapped / Unicode-escaped registered bases at the root path.
+    providerV4 and the other registered bases (tokenizationV1, ...) are covered
+    alongside the planner singleton.
+
+    All Block 81/82 positives (arrays / multi-member / nested / JSON-key
+    negatives / quoted-prose rejects / FS-GS-RS-NEL-LS-PS line-boundary
+    rejects) are re-asserted so this fix does not regress them."""
+    from benchmarks import live_canary_certified as canary
+
+    ls, ps = " ", " "  # LINE / PARAGRAPH SEPARATOR
+    fs, gs, rs = "\x1c", "\x1d", "\x1e"  # FILE / GROUP / RECORD SEPARATOR
+    nel = "\x85"  # NEXT LINE
+
+    b83_reject = (
+        # Block 83: a TOP-LEVEL JSON scalar that is an EXACT registered base is
+        # an UNBOUND root-path value -- both raw finals reject it, and the
+        # producer must now mask it WHOLE (previously left unmasked -> sealed
+        # into the documented summary field -> laundered past both finals).
+        '"plannerV2"',
+        '"providerV4"',
+        '"tokenizationV1"',
+        # WRAPPED spellings of an exact registered base at the root path.
+        '"(plannerV2)"',
+        '"[providerV4]"',
+        # Unicode-escaped spellings (``p`` = "p") of an exact registered
+        # base at the root path.
+        '"\\u0070lannerV2"',
+        '"\\u0070roviderV4"',
+    )
+    b83_pos = (
+        # Block 83: the supervisor's legal top-level PROSE narration stays
+        # accepted -- the producer must NOT crudely mask all top-level JSON
+        # scalars; only exact / wrapped / escaped registered bases are masked.
+        '"(plannerV2) is\\ta version."',
+        # Block 82 preserved: array / multi-member / nested positives.
+        '["(plannerV2) is\\ta version."]',
+        '["x", "(plannerV2) is\\ta version.", "y"]',
+        '{"a": "(plannerV2) is\\ta version.", "b": "x"}',
+        '{"results": [{"otp": "(plannerV2) is\\ta version."}]}',
+        '{"level1": {"level2": "(plannerV2) is\\ta version."}}',
+        # DOCUMENTED base-value paths stay accepted and the producer leaves
+        # them untouched (a documented summary / ``<base>_version`` member
+        # value is exempt -- never masked).
+        '{"summary": "plannerV2"}',
+        '{"planner_version": "plannerV2"}',
+        '{"provider_version": "providerV4"}',
+        '{"summary": "tokenizationV1"}',
+    )
+    b83_key_reject = (
+        # Block 82 preserved: a registered base as a JSON member KEY is a
+        # credential-shaped field with NO schema/field-path binding -- it never
+        # gains a value exemption, so both finals fail closed.
+        '{"plannerV2": "x"}',
+        '{"providerV4": "x"}',
+        '{"(plannerV2) is\\ta version.": "x"}',
+    )
+    b83_prose_reject = (
+        # Block 81 preserved: a LITERAL RFC-8259 escape inside a QUOTED
+        # free-text span is not a JSON value -- the decode must NOT run, so the
+        # exact-base assignment binds and fails closed (both quote styles).
+        'verification code is "(plannerV2) is\\ta version."',
+        'verification code is "(plannerV2) is\\u0009a version."',
+        'verification code is "(plannerV2) is\\u0020a version."',
+        "verification code is '(plannerV2) is\\ta version.'",
+    )
+    b83_nl_reject = (
+        # Block 79 preserved: the REAL line-boundary set FS/GS/RS/NEL (plus the
+        # U+2028 / U+2029 separators) stays a semantic boundary that fails
+        # closed on both the free-text and the JSON member-value paths.
+        f"verification code is (plannerV2) is{fs}a version.",
+        f"verification code is (plannerV2) is{gs}a version.",
+        f"verification code is (plannerV2) is{rs}a version.",
+        f"verification code is (plannerV2) is{nel}a version.",
+        f"verification code is (plannerV2) is{ls}a version.",
+        f"verification code is (plannerV2) is{ps}a version.",
+    )
+    # raw + legal JSON: both finals REJECT every bare top-level scalar base and
+    # ACCEPT every prose / documented / Block 81/82 positive.
+    for raw in b83_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    for raw in b83_pos:
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    # Block 82/81/79 preserved negatives: both finals fail closed.
+    for raw in b83_key_reject + b83_prose_reject + b83_nl_reject:
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # producer symmetry: a bare top-level scalar base is masked WHOLE (never
+    # reaches the 0600 seal); every prose / documented positive is left
+    # untouched -- no blanket top-level scalar masking.
+    for raw in b83_reject:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked, raw
+        assert "plannerV2" not in masked and "providerV4" not in masked, raw
+    for raw in b83_pos:
+        assert "[REDACTED]" not in canary._desensitize(raw), raw
+    # full chain, reject set: the producer masks the bare scalar BEFORE the
+    # 0600 seal, so the diagnostic and the consumer-synthesized field carry no
+    # plaintext and BOTH finals accept -- the documented-summary laundering is
+    # closed.  The RAW values still fail both finals.
+    for raw in b83_reject:
+        masked = canary._desensitize(raw)
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b83",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # full chain, pos set: the untouched prose / documented values survive the
+    # seal and the consumer field, and both finals accept the chain AND the raw.
+    for raw in b83_pos:
+        masked = canary._desensitize(raw)
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b83",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        gate._secret_scan_bytes(
+            raw.encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+    # full chain, key negatives: a registered base as a member KEY is not
+    # sanitized by the producer, so the sealed diagnostic still fails the
+    # failure-final closed (defense in depth) -- the key never gains a value
+    # exemption.
+    for raw in b83_key_reject:
+        masked = canary._desensitize(raw)
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b83",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                diag.read_bytes(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
+    # full chain, prose / real-line-boundary rejects: the producer masks them
+    # BEFORE the 0600 seal, so the sealed diagnostic and the consumer field are
+    # clean and pass both finals; the RAW values still fail both finals.
+    for raw in b83_prose_reject + b83_nl_reject:
+        masked = canary._desensitize(raw)
+        assert "[REDACTED]" in masked
+        output = tmp_path / "live-canary-certified.json"
+        diag = canary._seal_failure_diagnostic(
+            "evaluate",
+            RuntimeError(masked),
+            output,
+            run_id="r42b83",
+            tested_sha="9" * 40,
+        )
+        assert stat.S_IMODE(diag.stat().st_mode) == 0o600
+        gate._secret_scan_bytes(
+            diag.read_bytes(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-canary-certified.json.failure.json",
+            credential_field_check=False,
+        )
+        gate._secret_scan_bytes(
+            gate._sanitize_canary_diag_field(
+                json.dumps({"summary": masked}), "fallback"
+            ).encode(),
+            gate._SecretNeedles(()),
+            "evidence",
+            "ev.json",
+            credential_field_check=True,
+        )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "ev.json",
+                credential_field_check=True,
+            )
+        with pytest.raises(gate.GateStateChangedError):
+            gate._secret_scan_bytes(
+                raw.encode(),
+                gate._SecretNeedles(()),
+                "evidence",
+                "live-canary-certified.json.failure.json",
+                credential_field_check=False,
+            )
