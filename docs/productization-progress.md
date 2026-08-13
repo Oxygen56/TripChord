@@ -251,7 +251,7 @@ cd /Users/oxygen/Documents/个人项目/tripchord
 uv run python benchmarks/live_canary_certified.py --bridge-token "$(cat .runtime/browser-bridge-token)"
 TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence
 ```
-（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行——当前无已连接 Companion 时，层 6 如实报告 executor 在 `companion_preflight` 阶段失败（failed_before_done_gate），不包装为授权问题。C-122 R42 Block 82（监督 13:10 打回三）代码 `c2e8afb` 已提交，六层门从头重跑如实记录（run_id=`74e400e4804d`，passed=false），账本与进度文档已同步；最终 HEAD 受控重启绑定见下方最新验证结果行。）
+（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需配对 Companion 且 `ctrip/qunar/tongcheng` 官方域名保持登录态后才会逐 scope 真正 PASS；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行——当前无已连接 Companion 时，层 6 如实报告 executor 在 `companion_preflight` 阶段失败（failed_before_done_gate），不包装为授权问题。C-122 R42 Block 82（监督 13:10 打回三）代码 `c2e8afb` 已提交，六层门从头重跑如实记录（run_id=`74e400e4804d`，passed=false），账本与进度文档已同步；API 已受控重启并绑定**最终 HEAD `e490f2d`**（代码+文档全提交），provenance 三哈希匹配、pid 64749、mismatches 空。）
 
 ## 基线记录（业务代码修改前）
 
