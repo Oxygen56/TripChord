@@ -2545,6 +2545,11 @@ _LINEAR_BARE_TOKEN_RE = re.compile(
     r"secretariat|flightOption|provider|planner|day)(?:V[0-9]+|[0-9]+)"
     r")(?![A-Za-z0-9_])"
 )
+_FORMAL_RAW_SENSITIVE_CANDIDATE_RE = re.compile(
+    r"(?P<header>(?i:authorization|proxy-authorization|cookie|set-cookie))"
+    r"|(?P<account>(?i:account|user|member|passenger|contact|order))"
+    r"|(?P<phone>(?<![A-Za-z0-9])1[3-9]\d{9}(?![A-Za-z0-9]))"
+)
 
 
 def _linear_bare_credential_match(text: str) -> re.Match[str] | None:
@@ -2554,6 +2559,23 @@ def _linear_bare_credential_match(text: str) -> re.Match[str] | None:
         token = match.group(0)
         if _is_bare_credential_token(token):
             return match
+    return None
+
+
+def _formal_whole_text_sensitive_match(text: str) -> str | None:
+    """One token-aware pass for the authenticated artifact's raw backstop."""
+
+    for candidate in _FORMAL_RAW_SENSITIVE_CANDIDATE_RE.finditer(text):
+        if candidate.lastgroup == "phone":
+            return "phone number"
+        start = max(0, candidate.start() - 128)
+        end = min(len(text), candidate.end() + 1024)
+        window = text[start:end]
+        if candidate.lastgroup == "header":
+            if _AUTH_COOKIE_LEAK_SCAN.search(window):
+                return "Authorization/Cookie"
+        elif _ACCOUNT_ID_PATTERN.search(window):
+            return "account identifier"
     return None
 
 
@@ -2882,15 +2904,22 @@ def _secret_scan_bytes_impl(
     # not a leak, and a bare phone number is always decimal (never hex).
     masked_text = _mask_formal_proofs_and_hex_spans(text, public_proofs)
     check_resource_budget("proof and digest masking")
-    for pattern, kind in (
-        (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
-        (_ACCOUNT_ID_PATTERN, "account identifier"),
-        (_PHONE_PATTERN, "phone number"),
-    ):
-        if pattern.search(masked_text):
+    if public_proofs:
+        raw_sensitive_kind = _formal_whole_text_sensitive_match(masked_text)
+        if raw_sensitive_kind is not None:
             raise GateStateChangedError(
-                f"secret leak: {kind} in {label} file {name}"
+                f"secret leak: {raw_sensitive_kind} in {label} file {name}"
             )
+    else:
+        for pattern, kind in (
+            (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
+            (_ACCOUNT_ID_PATTERN, "account identifier"),
+            (_PHONE_PATTERN, "phone number"),
+        ):
+            if pattern.search(masked_text):
+                raise GateStateChangedError(
+                    f"secret leak: {kind} in {label} file {name}"
+                )
     # C-122 supervision 00:06 (要求 B): the SAME value patterns run on the
     # NORMALIZED copy (NFKC + casefold, Cf/U+200B dropped) — a full-width /
     # zero-width-obfuscated value the ASCII regexes stop seeing is still a leak.

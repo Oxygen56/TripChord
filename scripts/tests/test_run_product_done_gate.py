@@ -15784,6 +15784,34 @@ def test_formal_secret_scan_rejects_input_over_frozen_budget() -> None:
         )
 
 
+def test_formal_authenticated_whole_text_backstop_rejects_unbound_header() -> None:
+    binding = _fixture_formal_source_binding()
+    challenge = binding["challenge"]
+    payload = {
+        "gate_run_id": challenge["run_id"],
+        "repo_revision": {"commit_sha": challenge["tested_commit_sha"]},
+        "runtime_before_run": {
+            "runtime_provenance": challenge["runtime_identity"]
+        },
+        "request_identity": {"api_payload_sha256": challenge["request_sha256"]},
+        "api_payload_candidate_set_sha256": challenge["candidate_set_sha256"],
+        "scenario_sha256": challenge["scenario_sha256"],
+        "formal_job_graph": challenge["job_graph"],
+        "formal_live_source_binding": binding,
+        "formal_live_source_authority_receipt": binding["authority_receipt"],
+        "formal_live_source_challenge": challenge,
+        "ordinary_summary": "upstream Authorization: Basic ab",
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    with pytest.raises(gate.GateStateChangedError, match="Authorization/Cookie"):
+        gate._secret_scan_bytes(
+            raw,
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-done-gate-v4.json",
+        )
+
+
 def test_formal_source_compact_summary_is_minimal_and_cross_swap_safe() -> None:
     from tripchord.formal_live_source import (
         formal_source_evidence_summary,
