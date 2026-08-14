@@ -363,6 +363,9 @@
 | 真实 iCom provider | composition 实例化精确 `IComTransferProvider`；测试只在 `httpx.MockTransport` 返回 schedules/base-fare/policy 原始 JSON，三条官方 public GET path 均有调用回执；provider 自行做 URL/schema/字段标准化、证据 SHA 与领域结果。领域 provider 桩、空 HTTP 回执、直接 heartbeat/手工 composition 均不能满足正向回执 |
 | 正式 raw 对抗矩阵 | foreign/cross-pair/missing/extra query，missing/extra/cross-pair checkpoint，foreign request identity，extra check，empty evidence 均从同一正式 raw 深拷贝并由正式 writer 落盘；producer/compact/consumer 按责任边界拒绝 |
 | compact 顶层绑定 | 正式顶层 `pair_checkpoint_binding` 被消费；legacy `context` 仅作旧证据兼容；两份同时存在且不同立即拒绝 |
+| 正式入口回执绑定 | `_install_browser_bridge` 在生产装配时创建单一 installation authority；只有 mounted Companion HTTP heartbeat/claim/complete 与精确 `IComTransferProvider` 三条 public GET 成功调用能写入哈希链回执。raw/compact/final 共验 installation、composition、事件次序、claim-complete 对应、精确路径及 source commit；手工拼接同名类型/路径/HTTP 200、direct heartbeat、领域 provider 桩均 fail-closed |
+| 顶层字段存在语义 | `pair_checkpoint_binding` **缺席**时才允许读取 legacy `context`；字段一旦存在，`null`、list 或其他非 object 值均立即拒绝，不能借 legacy 正值回退洗白 |
+| 来源能力防自证 | 追加独审评论 `3d5717e4-913b-446a-ae7a-f92008bca8ea`：每个 installation 由生产 Browser bridge token 派生独立 HMAC capability；snapshot、逐事件 receipt 与 before/after binding 均带 capability MAC。只重算公开 SHA、完整字段、精确顺序/路径/状态并用 foreign key 自签的手工 binding，在 raw writer、compact 与 final 三层均拒绝；`formal_live_source_binding` missing/null/list 在 raw writer 当场拒绝 |
 | 进程与持久化隔离 | 不替换生产类/函数；运行后方法/函数 identity、FastAPI routes/state、模块 globals 均保持原值；pytest session 使用临时 DB 与 bridge-state，不读写 live 数据库/桥接状态 |
 | 最终验证与机器门 | 聚焦、全量、clean-env、ruff、API provenance 与同 HEAD 六层门的精确结果以 C-122 唯一交付评论为准；`passed=false` 时仍如实保留空 evidence/ref，不触发 C-125/C-124 |
 

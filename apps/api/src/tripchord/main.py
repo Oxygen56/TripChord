@@ -151,6 +151,7 @@ from tripchord.config import Settings, get_settings
 from tripchord.domain.common import Coordinates
 from tripchord.domain.offers import TravelOffer
 from tripchord.domain.travel_data import Place, RouteLeg, WeatherWindow
+from tripchord.formal_live_source import FormalLiveSourceAuthority
 from tripchord.jobs import (
     JobConflictError,
     JobNotFoundError,
@@ -675,6 +676,7 @@ def _install_browser_bridge(
         target_app.state.live_package_agent_system = None
         target_app.state.flexible_live_agent_system = None
         target_app.state.icom_transfer_provider = None
+        target_app.state.formal_live_source_authority = None
         target_app.state.browser_bridge_token = None
         target_app.state.browser_bridge_control_token = None
         target_app.state.browser_bridge_control_enabled = False
@@ -682,8 +684,20 @@ def _install_browser_bridge(
         target_app.state.browser_companion_runtime_agent = None
         target_app.state.browser_companion_runtime_supervisor = None
         return None, None
+    commit_sha = PROVENANCE.commit_sha
+    if commit_sha is None:
+        raise RuntimeError("formal browser composition requires a git commit identity")
+    source_authority = FormalLiveSourceAuthority(
+        commit_sha=commit_sha,
+        authority_secret=token,
+        now=now,
+    )
     bridge = BrowserTaskBridge(now=now)
-    icom_provider = IComTransferProvider(client=icom_http_client, now=now)
+    icom_provider = IComTransferProvider(
+        client=icom_http_client,
+        now=now,
+        source_authority=source_authority,
+    )
     selected_memory_store = memory_store or MemoryStore()
     selected_context_builder = context_builder or BudgetedAgentContextBuilder(
         EvidenceRagRetriever(selected_memory_store)
@@ -720,12 +734,14 @@ def _install_browser_bridge(
             bridge_token=token,
             control_token=configured_settings.browser_bridge_control_token,
             allowed_origin_regex=configured_settings.browser_bridge_allowed_origin_regex,
+            source_authority=source_authority,
         ),
     )
     target_app.state.browser_task_bridge = bridge
     target_app.state.live_package_agent_system = live_system
     target_app.state.flexible_live_agent_system = flexible_system
     target_app.state.icom_transfer_provider = icom_provider
+    target_app.state.formal_live_source_authority = source_authority
     target_app.state.browser_bridge_token = token
     control_token = configured_settings.browser_bridge_control_token
     auto_reload_enabled = configured_settings.browser_companion_auto_reload_enabled
@@ -744,6 +760,13 @@ def _install_browser_bridge(
         BrowserCompanionRuntimeSupervisor(bridge, runtime_agent)
         if auto_reload_enabled and runtime_agent is not None
         else None
+    )
+    source_authority.bind(
+        target_app=target_app,
+        bridge=bridge,
+        icom_provider=icom_provider,
+        live_system=live_system,
+        flexible_system=flexible_system,
     )
     return bridge, live_system
 
@@ -1263,6 +1286,14 @@ async def agent_runtime_status_endpoint(
         model_trace_count=len(model_trace_sink.records),
         effective_flexible_timeout_seconds=_flexible_total_timeout_seconds(None),
         runtime_provenance=AgentRuntimeProvenance(**PROVENANCE.to_dict()),
+        formal_live_source=(
+            cast(
+                FormalLiveSourceAuthority | None,
+                getattr(app.state, "formal_live_source_authority", None),
+            ).snapshot()
+            if getattr(app.state, "formal_live_source_authority", None) is not None
+            else None
+        ),
         memory_backend=(
             "single-process checksummed atomic JSON snapshot"
             if isinstance(memory_store, PersistentMemoryStore)

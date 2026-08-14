@@ -36,6 +36,7 @@ from tripchord.api import (
     LiveFlexibleFromTextPlanningRequest,
     StartLiveFlexibleFromTextJobResponse,
 )
+from tripchord.formal_live_source import build_formal_source_binding
 from tripchord.planning.event_contracts import EventDisposition
 from tripchord.planning.offer_semantics import (
     OfferIdentityConfidence,
@@ -124,6 +125,7 @@ _RUNTIME_EVIDENCE_FIELDS = (
     "effective_flexible_timeout_seconds",
     "rag_enabled",
     "runtime_provenance",
+    "formal_live_source",
 )
 
 
@@ -514,7 +516,11 @@ async def _runtime_evidence(
 
     response = await client.get(f"{base}/api/v1/agents/runtime")
     payload = _safe_response_json(response, label)
-    return {field: payload.get(field) for field in _RUNTIME_EVIDENCE_FIELDS}
+    return {
+        field: payload.get(field)
+        for field in _RUNTIME_EVIDENCE_FIELDS
+        if field != "formal_live_source" or payload.get(field) is not None
+    }
 
 
 def _validate_required_model_runtime(
@@ -1574,6 +1580,7 @@ async def _run(
                 base,
                 label="live-v4 runtime preflight",
             )
+            formal_source_before = runtime_before.pop("formal_live_source", None)
             context["runtime_before_run"] = runtime_before
             stage = "validate_runtime_timeout_contract"
             _validate_runtime_timeout_contract(runtime_before)
@@ -1646,7 +1653,26 @@ async def _run(
                 base,
                 label="live-v4 runtime postflight",
             )
+            formal_source_after = runtime_after.pop("formal_live_source", None)
             context["runtime_after_run"] = runtime_after
+            stage = "validate_formal_live_source_binding"
+            if formal_source_before is not None or formal_source_after is not None:
+                formal_source_binding = build_formal_source_binding(
+                    formal_source_before,
+                    formal_source_after,
+                    authority_secret=args.bridge_token,
+                )
+                runtime_commit_sha = (
+                    runtime_before.get("runtime_provenance") or {}
+                ).get("commit_sha")
+                if (
+                    formal_source_binding["composition"].get("commit_sha")
+                    != runtime_commit_sha
+                ):
+                    raise RuntimeError(
+                        "formal live source composition is not bound to runtime provenance"
+                    )
+                context["formal_live_source_binding"] = formal_source_binding
             before_trace_count = TypeAdapter(int).validate_python(
                 runtime_before["model_trace_count"]
             )
@@ -1795,6 +1821,10 @@ async def _run(
                 request["stay_plan_profile"]["minimum_exact_providers_per_selected_segment"]
             ),
         )
+        if report.passed and "formal_live_source_binding" not in context:
+            raise RuntimeError(
+                "passing live-v4 evidence has no formal production source binding"
+            )
     except (RuntimeError, ValueError, OSError) as exc:
         failed_job_control = context.get("live_job_control")
         if isinstance(failed_job_control, dict) and failed_job_control.get("job_id"):

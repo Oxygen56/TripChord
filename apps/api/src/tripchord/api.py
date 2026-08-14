@@ -211,6 +211,7 @@ class AgentRuntimeStatusResponse(ApiModel):
     browser_companion_last_reconcile: BrowserCompanionBuildReconcileResponse | None = None
     rag_enabled: bool = True
     runtime_provenance: AgentRuntimeProvenance | None = None
+    formal_live_source: dict[str, JsonValue] | None = None
     rag_boundary: str = (
         "只检索用户偏好、历史决策、平台能力与非实时证据；实时价格、余票和库存禁止进入 RAG。"
     )

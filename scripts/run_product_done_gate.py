@@ -78,6 +78,7 @@ from tripchord._secret_redact import (
     registry_shape_pairs,
 )
 from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
+from tripchord.formal_live_source import validate_formal_source_binding
 from tripchord.planning.frozen_graph import (
     FROZEN_V4_PAIR_COUNT,
     frozen_v4_browser_source_ids,
@@ -1053,6 +1054,51 @@ _DIGEST_BINDING_PATHS: frozenset[tuple[str | None, ...]] = frozenset(
         ("bridge_state_lease_preflight", "sha256"),
         ("bridge_state_lease_postcheck", "sha256"),
         ("raw_evidence", "sha256"),
+        ("formal_live_source_binding", "composition_sha256"),
+        ("formal_live_source_binding", "authority_key_id"),
+        ("formal_live_source_binding", "pre_chain_sha256"),
+        ("formal_live_source_binding", "pre_authority_mac"),
+        ("formal_live_source_binding", "post_chain_sha256"),
+        ("formal_live_source_binding", "post_authority_mac"),
+        (
+            "formal_live_source_binding",
+            "companion_heartbeat_receipt",
+            "previous_receipt_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "companion_heartbeat_receipt",
+            "receipt_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "companion_heartbeat_receipt",
+            "authority_mac",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "previous_receipt_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "receipt_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "authority_mac",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "response_sha256",
+        ),
         (
             "done_gate",
             "checks",
@@ -4374,6 +4420,7 @@ _LAYER6_COMPACT_ALLOWED_TOP_LEVEL = frozenset(
         "api_payload_sha256",
         "scenario_sha256",
         "runtime_before_run",
+        "formal_live_source_binding",
         "companion_preflight",
         "bridge_state_lease_preflight",
         "bridge_state_lease_postcheck",
@@ -5246,6 +5293,25 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
     companions = cp.get("companions") or []
     dg = payload.get("done_gate") or {}
     checks = dg.get("checks") or []
+    if "formal_live_source_binding" not in payload:
+        raise GateStateChangedError(
+            "layer-6 raw evidence is missing formal_live_source_binding"
+        )
+    formal_source_binding = payload["formal_live_source_binding"]
+    if not isinstance(formal_source_binding, dict):
+        raise GateStateChangedError(
+            "layer-6 raw evidence formal_live_source_binding is present but is not an object"
+        )
+    try:
+        formal_source_binding = validate_formal_source_binding(
+            formal_source_binding,
+            authority_secret=_bridge_token(),
+        )
+    except ValueError as exc:
+        raise GateStateChangedError(
+            f"layer-6 raw evidence has invalid formal production source "
+            f"binding: {exc}"
+        ) from exc
     # C-122 supervision 01:10: the run's checkpoint-bound sealed pair ids from
     # the job control plane (the terminal job's pair checkpoints), merged into
     # the v4_source_graph evidence so the compact carries an independent record
@@ -5263,6 +5329,7 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
     # ``pair_checkpoint_binding`` is a TOP-LEVEL raw field.  Older fixtures used
     # a literal ``context`` wrapper; keep that read-only compatibility path, but
     # reject two self-consistent copies that disagree instead of choosing one.
+    formal_checkpoint_binding_present = "pair_checkpoint_binding" in payload
     formal_checkpoint_binding = payload.get("pair_checkpoint_binding")
     legacy_context = payload.get("context")
     legacy_checkpoint_binding = (
@@ -5270,6 +5337,13 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
         if isinstance(legacy_context, dict)
         else None
     )
+    if formal_checkpoint_binding_present and not isinstance(
+        formal_checkpoint_binding, dict
+    ):
+        raise GateStateChangedError(
+            "layer-6 raw evidence top-level pair_checkpoint_binding is present "
+            "but is not an object"
+        )
     if (
         isinstance(formal_checkpoint_binding, dict)
         and isinstance(legacy_checkpoint_binding, dict)
@@ -5281,7 +5355,7 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
         )
     raw_checkpoint_binding = (
         formal_checkpoint_binding
-        if isinstance(formal_checkpoint_binding, dict)
+        if formal_checkpoint_binding_present
         else legacy_checkpoint_binding
         if isinstance(legacy_checkpoint_binding, dict)
         else {}
@@ -5405,6 +5479,7 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
                 "started_at": rp.get("started_at"),
             },
         },
+        "formal_live_source_binding": formal_source_binding,
         "companion_preflight": {
             "status": cp.get("status"),
             "stale_after_seconds": cp.get("stale_after_seconds"),
@@ -7341,6 +7416,7 @@ def _verify_layer6_compact_contract(
     for key in (
         "repo_revision",
         "runtime_before_run",
+        "formal_live_source_binding",
         "companion_preflight",
         "event_injection_contract",
         "timeout_contract",
@@ -7350,6 +7426,16 @@ def _verify_layer6_compact_contract(
             raise GateStateChangedError(
                 f"evidence commit E layer-6 compact {tracked_rel} missing {key!r}"
             )
+    try:
+        formal_source_binding = validate_formal_source_binding(
+            compact.get("formal_live_source_binding"),
+            authority_secret=_bridge_token(),
+        )
+    except ValueError as exc:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} has invalid "
+            f"formal production source binding: {exc}"
+        ) from exc
     if not isinstance(compact.get("repo_revision"), dict):
         raise GateStateChangedError(
             f"evidence commit E layer-6 compact {tracked_rel} repo_revision is "
@@ -7451,6 +7537,12 @@ def _verify_layer6_compact_contract(
         raise GateStateChangedError(
             f"evidence commit E layer-6 compact {tracked_rel} repo_revision "
             f"commit_sha {repo_sha!r} != tested_commit_sha {tested_commit_sha!r}"
+        )
+    formal_source_commit = formal_source_binding["composition"]["commit_sha"]
+    if formal_source_commit.lower() != repo_sha.lower():
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} formal production "
+            "source commit_sha != repo/runtime provenance commit_sha"
         )
     companion_preflight = compact.get("companion_preflight") or {}
     stale_after = companion_preflight.get("stale_after_seconds")

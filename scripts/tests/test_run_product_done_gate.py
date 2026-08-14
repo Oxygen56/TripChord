@@ -185,6 +185,154 @@ def _populating_passing_layers_without(
         )
 
 
+def _fixture_formal_source_binding(
+    commit_sha: str = "a" * 40,
+    *,
+    install_id: str = "00000000-0000-4000-8000-000000000001",
+    authority_secret: str | None = None,
+    trust: bool = True,
+) -> dict[str, object]:
+    """Valid compact receipt chain for unit tests of unrelated gate behavior.
+
+    The formal end-to-end positive never uses this synthetic helper; it reads
+    the binding emitted by the production composition and transport boundaries.
+    """
+    from tripchord.formal_live_source import (
+        _authority_key_id,
+        _authority_mac,
+        _derive_authority_key,
+        _snapshot_mac_payload,
+        formal_composition_contract,
+        validate_formal_source_binding,
+    )
+
+    composition = formal_composition_contract(commit_sha)
+
+    def digest(value: object) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    composition_sha256 = digest(
+        {"install_id": install_id, "composition": composition}
+    )
+    authority_secret = authority_secret or gate._bridge_token() or ("B" * 64)
+    authority_key = _derive_authority_key(
+        authority_secret,
+        install_id=install_id,
+        composition_sha256=composition_sha256,
+    )
+    authority_key_id = _authority_key_id(authority_key)
+    previous = composition_sha256
+    events: list[dict[str, object]] = []
+    rows = (
+        (
+            "browser_heartbeat",
+            "POST",
+            "/browser-bridge/v1/companions/heartbeat",
+            ["comp-1"],
+            None,
+        ),
+        (
+            "browser_claim",
+            "POST",
+            "/browser-bridge/v1/tasks/claim",
+            ["task-1"],
+            None,
+        ),
+        (
+            "browser_complete",
+            "POST",
+            "/browser-bridge/v1/tasks/{task_id}/complete",
+            ["task-1"],
+            None,
+        ),
+        (
+            "icom_public_get",
+            "GET",
+            "/api/v1/public/trips/schedules",
+            [],
+            "1" * 64,
+        ),
+        (
+            "icom_public_get",
+            "GET",
+            "/api/v1/public/ferry-fares/schedule-base-price",
+            [],
+            "2" * 64,
+        ),
+        (
+            "icom_public_get",
+            "GET",
+            "/api/v1/public/policy-sections",
+            [],
+            "3" * 64,
+        ),
+    )
+    for sequence, (kind, method, path, subject_ids, response_sha256) in enumerate(
+        rows, start=1
+    ):
+        event: dict[str, object] = {
+            "sequence": sequence,
+            "kind": kind,
+            "method": method,
+            "path": path,
+            "subject_ids": subject_ids,
+            "response_sha256": response_sha256,
+            "observed_at": f"2026-08-10T00:00:0{sequence}+00:00",
+            "previous_receipt_sha256": previous,
+        }
+        event["receipt_sha256"] = digest(event)
+        event["authority_mac"] = _authority_mac(
+            authority_key,
+            {
+                "purpose": "tripchord-formal-live-source-receipt-v1",
+                "receipt_sha256": event["receipt_sha256"],
+            },
+        )
+        previous = str(event["receipt_sha256"])
+        events.append(event)
+    binding = {
+        "schema_version": "tripchord-formal-live-source-binding-v1",
+        "install_id": install_id,
+        "composition": composition,
+        "composition_sha256": composition_sha256,
+        "authority_key_id": authority_key_id,
+        "pre_event_count": 1,
+        "pre_chain_sha256": events[0]["receipt_sha256"],
+        "pre_authority_mac": _authority_mac(
+            authority_key,
+            _snapshot_mac_payload(
+                install_id=install_id,
+                composition_sha256=composition_sha256,
+                event_count=1,
+                chain_sha256=str(events[0]["receipt_sha256"]),
+            ),
+        ),
+        "post_event_count": len(events),
+        "post_chain_sha256": events[-1]["receipt_sha256"],
+        "post_authority_mac": _authority_mac(
+            authority_key,
+            _snapshot_mac_payload(
+                install_id=install_id,
+                composition_sha256=composition_sha256,
+                event_count=len(events),
+                chain_sha256=str(events[-1]["receipt_sha256"]),
+            ),
+        ),
+        "companion_heartbeat_receipt": events[0],
+        "receipts": events[1:],
+    }
+    if not trust:
+        return binding
+    return validate_formal_source_binding(binding, authority_secret=authority_secret)
+
+
 def _realistic_e2e_evidence() -> dict[str, object]:
     """A full passing layer-6 runner bundle that survives the strong compact
     contract (C-118): ``run_status`` completed, the 15-item ``done_gate`` all
@@ -214,6 +362,7 @@ def _realistic_e2e_evidence() -> dict[str, object]:
                 "started_at": "2026-08-10T00:00:00+00:00",
             },
         },
+        "formal_live_source_binding": _fixture_formal_source_binding(),
         "companion_preflight": {
             "status": "connected",
             "stale_after_seconds": 45,
@@ -309,6 +458,7 @@ def _populate_required_evidence(staging_dir: Path) -> None:
     if head is not None:
         raw_e2e["repo_revision"]["commit_sha"] = head  # type: ignore[index]
         raw_e2e["runtime_before_run"]["runtime_provenance"]["commit_sha"] = head  # type: ignore[index]
+        raw_e2e["formal_live_source_binding"] = _fixture_formal_source_binding(head)
     (staging_dir / "live-done-gate-v4.json").write_text(
         json.dumps(raw_e2e), encoding="utf-8"
     )
@@ -3934,8 +4084,10 @@ def test_compact_live_e2e_emits_fixed_raw_origin(staging_dir: Path) -> None:
     emits the fixed raw origin from the shared mapping — name, tracked path,
     committed=false, the raw file's real 64-hex sha256 and positive size."""
     staging_dir.mkdir()
+    payload = _matching_done_gate()
+    payload["formal_live_source_binding"] = _fixture_formal_source_binding()
     (staging_dir / "live-done-gate-v4.json").write_text(
-        json.dumps(_matching_done_gate()), encoding="utf-8"
+        json.dumps(payload), encoding="utf-8"
     )
     compact = gate._compact_live_e2e(staging_dir)
     assert compact is not None
@@ -6033,6 +6185,7 @@ def test_compact_live_e2e_carries_15_checks(staging_dir: Path) -> None:
     re-verify each verdict without the raw runner payload."""
     staging_dir.mkdir()
     done_gate = _matching_done_gate()
+    formal_source_binding = _fixture_formal_source_binding()
     (staging_dir / "live-done-gate-v4.json").write_text(
         json.dumps(
             {
@@ -6041,6 +6194,7 @@ def test_compact_live_e2e_carries_15_checks(staging_dir: Path) -> None:
                 "repo_revision": "abc123",
                 "captured_at": "2026-08-10T00:00:00Z",
                 "done_gate": done_gate,
+                "formal_live_source_binding": formal_source_binding,
             }
         ),
         encoding="utf-8",
@@ -10901,6 +11055,7 @@ def _layer6_compact_fixture() -> dict[str, object]:
                 "commit_sha": "a" * 40,
             },
         },
+        "formal_live_source_binding": _fixture_formal_source_binding(),
         "companion_preflight": {
             "status": "connected",
             "stale_after_seconds": 45,
@@ -12954,6 +13109,7 @@ def _c4_validate_formal_transport_receipts(
     composition_types: dict[str, str],
     icom_http_paths: tuple[str, ...],
     companion_heartbeat_status: int,
+    formal_source_binding: dict[str, object] | None = None,
 ) -> None:
     expected_types = {
         "bridge": "BrowserTaskBridge",
@@ -12972,6 +13128,21 @@ def _c4_validate_formal_transport_receipts(
         raise AssertionError("real iCom provider did not cross every public HTTP boundary")
     if companion_heartbeat_status != 200:
         raise AssertionError("Companion was not registered through the mounted HTTP entry")
+    if formal_source_binding is None:
+        raise AssertionError("formal production source binding is missing")
+    from tripchord.formal_live_source import validate_formal_source_binding
+
+    try:
+        validated_source = validate_formal_source_binding(formal_source_binding)
+    except ValueError as exc:
+        raise AssertionError(f"formal production source binding is invalid: {exc}") from exc
+    receipt_paths = {
+        receipt["path"]
+        for receipt in validated_source["receipts"]
+        if receipt["kind"] == "icom_public_get"
+    }
+    if receipt_paths != required_icom_paths:
+        raise AssertionError("formal production source binding lacks exact iCom receipts")
 
 
 class _RealChainArtifacts:
@@ -12996,6 +13167,7 @@ class _RealChainArtifacts:
         composition_types: dict[str, str],
         icom_http_paths: tuple[str, ...],
         companion_heartbeat_status: int,
+        formal_source_binding: dict[str, object],
     ) -> None:
         self.run = run
         self.cs = cs
@@ -13012,6 +13184,7 @@ class _RealChainArtifacts:
         self.composition_types = composition_types
         self.icom_http_paths = icom_http_paths
         self.companion_heartbeat_status = companion_heartbeat_status
+        self.formal_source_binding = formal_source_binding
 
 
 async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts:
@@ -13056,6 +13229,7 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
         "live_package_agent_system",
         "flexible_live_agent_system",
         "icom_transfer_provider",
+        "formal_live_source_authority",
         "browser_bridge_token",
         "browser_bridge_control_token",
         "browser_bridge_control_enabled",
@@ -13271,6 +13445,7 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
     )
     event = LiveEventReplanRun.model_validate(raw_payload["event_run"])
     binding = dict(raw_payload["pair_checkpoint_binding"])
+    formal_source_binding = dict(raw_payload["formal_live_source_binding"])
     request_sha256 = str(raw_payload["request_identity"]["api_payload_sha256"])
     observed_by_pair = {
         execution.date_pair.id: tuple(task.id for task in execution.query_tasks)
@@ -13292,6 +13467,7 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
         composition_types=composition_types,
         icom_http_paths=tuple(icom_harness.paths),
         companion_heartbeat_status=companion_heartbeat_status,
+        formal_source_binding=formal_source_binding,
     )
 
 
@@ -13647,6 +13823,7 @@ def test_verify_layer6_compact_contract_accepts_real_production_chain(
         composition_types=artifacts.composition_types,
         icom_http_paths=artifacts.icom_http_paths,
         companion_heartbeat_status=artifacts.companion_heartbeat_status,
+        formal_source_binding=artifacts.formal_source_binding,
     )
     assert all(
         execution.run is not None
@@ -13773,6 +13950,227 @@ def test_c4_formal_entry_rejects_provider_and_companion_bypasses() -> None:
                 "/api/v1/public/policy-sections",
             ),
             companion_heartbeat_status=0,
+        )
+
+
+def test_c4_formal_entry_rejects_self_consistent_manual_receipts() -> None:
+    """A hand-authored type/path/status tuple is not production provenance.
+
+    This is the exact independent-review bypass: no app composition entry and
+    no mounted HTTP request ran, yet the old receipt validator accepted three
+    type names, three public paths, and HTTP 200 as if they proved the source.
+    """
+
+    with pytest.raises(AssertionError, match="production source"):
+        _c4_validate_formal_transport_receipts(
+            composition_types={
+                "bridge": "BrowserTaskBridge",
+                "live_system": "LivePackageAgentSystem",
+                "flexible_system": "FlexibleLiveAgentSystem",
+                "icom_provider": "IComTransferProvider",
+            },
+            icom_http_paths=(
+                "/api/v1/public/trips/schedules",
+                "/api/v1/public/ferry-fares/schedule-base-price",
+                "/api/v1/public/policy-sections",
+            ),
+            companion_heartbeat_status=200,
+        )
+
+
+def test_c4_complete_self_consistent_binding_requires_production_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    staging_dir: Path,
+) -> None:
+    """A complete, correctly hashed and MACed hand forge fails all consumers.
+
+    This is the faithful bypass from independent comment
+    3d5717e4-913b-446a-ae7a-f92008bca8ea: the attacker supplies every field,
+    exact event order/path/status and recomputes every public digest plus an
+    internally consistent MAC using its own key.  It still lacks the bridge
+    token capability held by the production installation.
+    """
+
+    from tripchord.formal_live_source import validate_formal_source_binding
+
+    artifacts = _real_production_chain(staging_dir)
+    forged = _fixture_formal_source_binding(
+        artifacts.head,
+        install_id="99999999-9999-4999-8999-999999999999",
+        authority_secret="foreign-manual-authority-secret-000000000000000000000000",
+        trust=False,
+    )
+
+    with pytest.raises(ValueError, match="trusted production authority capability"):
+        validate_formal_source_binding(forged)
+    with pytest.raises(AssertionError, match="production source binding"):
+        _c4_validate_formal_transport_receipts(
+            composition_types=artifacts.composition_types,
+            icom_http_paths=artifacts.icom_http_paths,
+            companion_heartbeat_status=artifacts.companion_heartbeat_status,
+            formal_source_binding=forged,
+        )
+
+    raw_payload = _c4_raw_variant(artifacts)
+    raw_payload["formal_live_source_binding"] = copy.deepcopy(forged)
+    forged_raw = _persist_c4_raw_variant(
+        artifacts,
+        staging_dir,
+        raw_payload,
+    )
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="formal production source binding",
+    ):
+        _compact_via_real_writer(monkeypatch, staging_dir, forged_raw)
+
+    compact = _compact_via_real_writer(
+        monkeypatch,
+        staging_dir,
+        artifacts.raw_output,
+    )
+    compact["formal_live_source_binding"] = copy.deepcopy(forged)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="formal production source binding",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha=artifacts.head,
+        )
+
+
+def test_layer6_raw_formal_source_binding_presence_is_strict(
+    monkeypatch: pytest.MonkeyPatch,
+    staging_dir: Path,
+) -> None:
+    """Missing/null/list formal source authority fails at the raw writer."""
+
+    artifacts = _real_production_chain(staging_dir)
+    for marker in ("missing", None, []):
+        payload = _c4_raw_variant(artifacts)
+        if marker == "missing":
+            payload.pop("formal_live_source_binding")
+        else:
+            payload["formal_live_source_binding"] = marker
+        raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
+        with pytest.raises(
+            gate.GateStateChangedError,
+            match="formal_live_source_binding",
+        ):
+            _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
+
+
+def test_layer6_raw_top_level_checkpoint_binding_presence_is_strict(
+    monkeypatch: pytest.MonkeyPatch,
+    staging_dir: Path,
+) -> None:
+    """Present-but-invalid formal binding must not fall back to legacy data."""
+
+    artifacts = _real_production_chain(staging_dir)
+    for invalid in (None, []):
+        payload = _c4_raw_variant(artifacts)
+        payload["pair_checkpoint_binding"] = invalid
+        payload["context"] = {
+            "pair_checkpoint_binding": copy.deepcopy(artifacts.binding)
+        }
+        raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
+        with pytest.raises(
+            gate.GateStateChangedError,
+            match="top-level pair_checkpoint_binding",
+        ):
+            _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
+
+    legacy_payload = _c4_raw_variant(artifacts)
+    del legacy_payload["pair_checkpoint_binding"]
+    legacy_payload["context"] = {
+        "pair_checkpoint_binding": copy.deepcopy(artifacts.binding)
+    }
+    raw_variant = _persist_c4_raw_variant(
+        artifacts,
+        staging_dir,
+        legacy_payload,
+    )
+    compact = _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
+    gate._verify_layer6_compact_contract(
+        "done-gate-layer6-compact.json",
+        compact,
+        tested_commit_sha=artifacts.head,
+    )
+
+
+def test_layer6_formal_source_binding_rejects_missing_mismatch_and_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    staging_dir: Path,
+) -> None:
+    """Raw producer/compact and final consumer share one exact source contract."""
+
+    artifacts = _real_production_chain(staging_dir)
+    raw_cases: dict[str, object] = {
+        "foreign_install": {
+            **copy.deepcopy(artifacts.formal_source_binding),
+            "install_id": "11111111-1111-4111-8111-111111111111",
+        },
+        "foreign_composition": {
+            **copy.deepcopy(artifacts.formal_source_binding),
+            "composition": {
+                **copy.deepcopy(
+                    artifacts.formal_source_binding["composition"]
+                ),
+                "entrypoint": "tests.manual_composition",
+            },
+        },
+        "missing_claim_receipt": {
+            **copy.deepcopy(artifacts.formal_source_binding),
+            "receipts": [
+                item
+                for item in copy.deepcopy(
+                    artifacts.formal_source_binding["receipts"]
+                )
+                if item["kind"] != "browser_claim"
+            ],
+        },
+    }
+    for source_binding in raw_cases.values():
+        payload = _c4_raw_variant(artifacts)
+        payload["formal_live_source_binding"] = source_binding
+        raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
+        with pytest.raises(
+            gate.GateStateChangedError,
+            match="formal production source binding",
+        ):
+            _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
+
+    missing_payload = _c4_raw_variant(artifacts)
+    missing_payload.pop("formal_live_source_binding")
+    missing_raw = _persist_c4_raw_variant(
+        artifacts,
+        staging_dir,
+        missing_payload,
+    )
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="formal_live_source_binding",
+    ):
+        _compact_via_real_writer(monkeypatch, staging_dir, missing_raw)
+
+    compact = _compact_via_real_writer(
+        monkeypatch,
+        staging_dir,
+        artifacts.raw_output,
+    )
+    compact["formal_live_source_binding"]["receipts"][0]["path"] = (
+        "/manual/bypass"
+    )
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="formal production source binding",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha=artifacts.head,
         )
 
 

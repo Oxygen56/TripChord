@@ -22,6 +22,7 @@ from pydantic import (
 )
 
 from tripchord.domain.common import DomainModel
+from tripchord.formal_live_source import FormalLiveSourceAuthority
 from tripchord.planning.package import (
     PackageArea,
     PackagePlaceKey,
@@ -405,6 +406,7 @@ class IComTransferProvider:
         *,
         client: httpx.AsyncClient | None = None,
         now: Callable[[], datetime] | None = None,
+        source_authority: FormalLiveSourceAuthority | None = None,
     ) -> None:
         self._config = config or IComTransferConfig()
         self._client = client or httpx.AsyncClient(
@@ -414,6 +416,7 @@ class IComTransferProvider:
         )
         self._owns_client = client is None
         self._now = now or (lambda: datetime.now(UTC))
+        self._source_authority = source_authority
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -509,13 +512,19 @@ class IComTransferProvider:
                     IComFailureCode.INVALID_JSON,
                     "iCom public endpoint returned invalid JSON",
                 ) from exc
-            return _FetchedPayload(
+            fetched = _FetchedPayload(
                 endpoint=endpoint,
                 source_url=str(response.url),
                 captured_at=self._now(),
                 response_sha256=hashlib.sha256(raw).hexdigest(),
                 payload=payload,
             )
+            if self._source_authority is not None:
+                self._source_authority.record_icom_http(
+                    endpoint.value,
+                    response_sha256=fetched.response_sha256,
+                )
+            return fetched
         except ProviderError:
             raise
         except httpx.TimeoutException as exc:

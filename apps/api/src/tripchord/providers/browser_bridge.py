@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import Field, JsonValue, ValidationInfo, field_validator, model_validator
 
 from tripchord.domain.common import DomainModel
+from tripchord.formal_live_source import FormalLiveSourceAuthority
 
 BRIDGE_TOKEN_HEADER = "X-TripChord-Bridge-Token"
 CONTROL_TOKEN_HEADER = "X-TripChord-Control-Token"
@@ -3484,6 +3485,7 @@ def create_browser_bridge_app(
         r"^(chrome-extension://[a-p]{32}|"
         r"http://(?:127\.0\.0\.1|localhost)(?::\d+)?)$"
     ),
+    source_authority: FormalLiveSourceAuthority | None = None,
 ) -> FastAPI:
     if len(bridge_token) < 32:
         raise ValueError("bridge_token must contain at least 32 characters")
@@ -3566,7 +3568,7 @@ def create_browser_bridge_app(
     ) -> ClaimBrowserTasksResponse:
         await authorize(request, token)
         try:
-            return await task_bridge.claim_response(
+            response = await task_bridge.claim_response(
                 payload.companion_id,
                 providers=payload.providers,
                 limit=payload.limit,
@@ -3577,6 +3579,12 @@ def create_browser_bridge_app(
                 runtime_instance_id=payload.runtime_instance_id,
                 reload_receipt=payload.reload_receipt,
             )
+            if source_authority is not None and response.leases:
+                source_authority.record_browser_http(
+                    "browser_claim",
+                    subject_ids=tuple(lease.task_id for lease in response.leases),
+                )
+            return response
         except BrowserCompanionReloadNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except BrowserCompanionControlError as exc:
@@ -3603,7 +3611,7 @@ def create_browser_bridge_app(
         token: Annotated[str | None, Header(alias=BRIDGE_TOKEN_HEADER)] = None,
     ) -> BrowserCompanionHeartbeat:
         await authorize(request, token)
-        return await task_bridge.heartbeat(
+        heartbeat = await task_bridge.heartbeat(
             payload.companion_id,
             providers=payload.providers,
             authorized_scope_keys=payload.authorized_scope_keys,
@@ -3611,6 +3619,12 @@ def create_browser_bridge_app(
             contract_version=payload.contract_version,
             runtime_instance_id=payload.runtime_instance_id,
         )
+        if source_authority is not None:
+            source_authority.record_browser_http(
+                "browser_heartbeat",
+                subject_ids=(heartbeat.companion_id,),
+            )
+        return heartbeat
 
     @app.post(
         "/v1/companions/{companion_id}/reload-requests",
@@ -3714,7 +3728,17 @@ def create_browser_bridge_app(
     ) -> BrowserTaskSnapshot:
         await authorize(request, token)
         try:
-            return await task_bridge.complete(task_id, payload.claim_token, payload.completion)
+            snapshot = await task_bridge.complete(
+                task_id,
+                payload.claim_token,
+                payload.completion,
+            )
+            if source_authority is not None:
+                source_authority.record_browser_http(
+                    "browser_complete",
+                    subject_ids=(task_id,),
+                )
+            return snapshot
         except BrowserTaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except BrowserClaimError as exc:
