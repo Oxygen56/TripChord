@@ -566,6 +566,26 @@ def _frozen_v4_fixture_pair_id(departure: str, return_date: str) -> str:
     return f"date-pair:{departure}:{return_date}:{digest}"
 
 
+def _frozen_query_task_ids(
+    pair_id: str, departure_s: str, return_s: str
+) -> tuple[str, ...]:
+    """Full ``query:<platform>:<kind>:<digest>`` task ids for one frozen pair —
+    the SAME id namespace the real producer's ``FlexibleQueryTask.id`` seals in
+    every pair checkpoint (``query:ctrip:flight:…``), so the fixture mirrors the
+    real production contract instead of a bare ``platform:kind`` ownership id or
+    a ``source-*`` browser Source id.  The digest is deterministic over the
+    pair's own identity (the validator checks the QUERY OWNERSHIP projection,
+    not the digest suffix)."""
+    task_ids: list[str] = []
+    for platform_kind in sorted(gate._V4_FROZEN_QUERY_SHAPES):
+        platform, kind = platform_kind.split(":", 1)
+        digest = hashlib.sha256(
+            f"{pair_id}|{platform}|{kind}|{departure_s}|{return_s}".encode()
+        ).hexdigest()[:16]
+        task_ids.append(f"query:{platform}:{kind}:{digest}")
+    return tuple(task_ids)
+
+
 # The passing fixture's pair-id set: the CANONICAL frozen ordered trio, DERIVED
 # (not hardcoded — C-122 R44 forbids a hand-written fixture trio as production
 # truth) from the same committed inputs producer / compact / consumer share
@@ -607,7 +627,15 @@ def _checkpoint_binding_for_pair_ids(
     bindings: list[dict[str, object]] = []
     for index, pair_id in enumerate(pair_ids):
         departure_s, return_s = pair_dates[index]
-        query_task_ids = sorted(gate._V4_FROZEN_BROWSER_SOURCE_IDS)
+        # R44 后续 (blocker C): the REAL producer / checkpoint seals FULL
+        # query-task ids — ``query:<platform>:<kind>:<digest>`` (the
+        # ``FlexibleQueryTask.id`` namespace, ``query:ctrip:flight:…``) — whose
+        # OWNERSHIP part is ``<platform>:<kind>`` (``ctrip:flight``).  The
+        # fixture must mirror the real production contract so it cannot mask a
+        # validator that forces ``source-*`` ids or bare ownership ids.
+        query_task_ids = list(
+            _frozen_query_task_ids(pair_id, departure_s, return_s)
+        )
         captured_at = "2026-08-10T00:00:00+00:00"
         # C-122 round-19 (gap 4): the full business-summary fields for a
         # COMPLETED checkpoint — run_purpose / finalization / decision typed, a
@@ -1521,6 +1549,160 @@ def test_layer5_rejects_wrong_canary_failure_python_version(
     assert not any(
         c.get("name") == "canary_failure_diagnostic" for c in result.sub_checks
     )
+
+
+def test_layer5_rejects_arbitrary_canary_failure_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R44 后续 (blocker B): a failure diagnostic whose stage is an ARBITRARY /
+    defaulted value (not the certified canary's ``evaluate`` / ``dump`` enum)
+    must fail closed — the stage is bound to the canary's own seal points."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    diag_path = _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    diagnostic["stage"] = "postmortem"
+    diag_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    joined = " ; ".join(str(c.get("detail", "")) for c in result.sub_checks)
+    assert "stage" in joined and "certified canary stages" in joined
+    assert not any(
+        c.get("name") == "canary_failure_diagnostic" for c in result.sub_checks
+    )
+
+
+def test_layer5_rejects_missing_canary_failure_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R44 后续 (blocker B): a failure diagnostic with NO stage must fail closed —
+    the stage is a required bound field, not optional."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    diag_path = _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    del diagnostic["stage"]
+    diag_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    joined = " ; ".join(str(c.get("detail", "")) for c in result.sub_checks)
+    assert "missing stage" in joined
+    assert not any(
+        c.get("name") == "canary_failure_diagnostic" for c in result.sub_checks
+    )
+
+
+def test_layer5_rejects_foreign_canary_failure_script(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R44 后续 (blocker B): a failure diagnostic whose run_identity.script is a
+    DIFFERENT script (not the certified canary) must fail closed — the diagnostic
+    is bound to the canary's own script identity, not merely present."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    diag_path = _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    diagnostic["run_identity"]["script"] = "evil_canary.py"
+    diag_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    joined = " ; ".join(str(c.get("detail", "")) for c in result.sub_checks)
+    assert "script" in joined and "certified canary script" in joined
+    assert not any(
+        c.get("name") == "canary_failure_diagnostic" for c in result.sub_checks
+    )
+
+
+def test_layer5_rejects_wrong_canary_failure_output_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R44 后续 (blocker B): a failure diagnostic whose run_identity.output is a
+    DIFFERENT path than this run's evidence path must fail closed — the output
+    path is an exact binding to THIS run's evidence file, not a plausible path."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    diag_path = _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha
+    )
+    diagnostic = json.loads(diag_path.read_text(encoding="utf-8"))
+    diagnostic["run_identity"]["output"] = str(
+        tmp_path / "some-other-canary.json"
+    )
+    diag_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    joined = " ; ".join(str(c.get("detail", "")) for c in result.sub_checks)
+    assert "output" in joined and "evidence path" in joined
+    assert not any(
+        c.get("name") == "canary_failure_diagnostic" for c in result.sub_checks
+    )
+
+
+def test_layer5_consumes_dump_stage_canary_failure_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R44 后续 (blocker B, producer→seal→consumer positive): a diagnostic sealed
+    at the ``dump`` stage (the canary crashed writing its evidence) must be
+    consumed and classified — BOTH certified seal points (``evaluate`` AND
+    ``dump``) are bound, so a dump-stage crash is not a foreign diagnostic."""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
+    monkeypatch.setattr(gate, "_run", lambda cmd, **kwargs: (1, "crashed"))
+    evidence_path = staging_dir / "live-canary-certified.json"
+    run_id = "abc123def456"
+    tested_sha = "a" * 40
+    _seal_canary_failure_diagnostic(
+        evidence_path, run_id=run_id, tested_sha=tested_sha, stage="dump"
+    )
+    result = gate.layer5_real_canary(
+        staging_dir, run_id=run_id, tested_commit_sha=tested_sha
+    )
+    assert result.passed is False
+    diag_checks = [
+        c for c in result.sub_checks if c.get("name") == "canary_failure_diagnostic"
+    ]
+    assert diag_checks, "a valid dump-stage diagnostic still keeps its classification"
+    detail = diag_checks[0]["detail"]
+    assert "stage=dump" in detail
+    assert "exception=RuntimeError" in detail
+    assert f"run_id={run_id}" in detail
+    assert f"tested_sha={tested_sha[:12]}" in detail
+    assert "runtime=python" in detail
 
 
 def test_layer5_sanitizes_credential_bearing_canary_failure_summary(
@@ -2537,17 +2719,23 @@ def _forge_repointed_chain(
     *,
     mutate_e_manifest: Callable[[dict[str, object]], dict[str, object]],
     drop_from_e: tuple[str, ...] = (),
+    mutate_e_blobs: Callable[[dict[str, bytes]], dict[str, bytes]] | None = None,
 ) -> tuple[str, str]:
     """Publish a real trail, then forge a CONSISTENT E2/P2 chain (S -> E2 -> P2)
     and repoint the gate ref at P2.
 
     ``mutate_e_manifest`` receives the parsed E manifest and returns the forged
     manifest dict (which P2's manifest also derives from, bound to E2);
-    ``drop_from_e`` names repo-relative paths to remove from E2's tree.  The
-    forgery is full-graph: E2 = S + (E tree minus drops, forged manifest), P2 =
-    E2 + (report/manifest bound to E2), so the consumer resolver sees a coherent
-    chain whose violation is exactly what each counter-example targets.  Returns
-    (forged_e2, forged_p2).
+    ``drop_from_e`` names repo-relative paths to remove from E2's tree;
+    ``mutate_e_blobs`` (optional) receives every committed E blob as a
+    ``{repo-relative path: bytes}`` map and returns replacement blobs written
+    into E2's tree in place of the originals (e.g. a compact whose raw_evidence
+    was cross-swapped; the callback may also read the populated ``staging_dir``
+    to compute a swapped raw's real sha/size).  The forgery is full-graph:
+    E2 = S + (E tree minus drops plus replaced blobs, forged manifest), P2 =
+    E2 + (report/manifest bound to E2), so the consumer resolver sees a
+    coherent chain whose violation is exactly what each counter-example
+    targets.  Returns (forged_e2, forged_p2).
     """
     report, start, tested_sha = _minimal_evidence_commit_args(
         monkeypatch, clean_repo, staging_dir
@@ -2558,7 +2746,8 @@ def _forge_repointed_chain(
     )
     index = tmp_path / "forge-index"
     env = dict(os.environ, GIT_INDEX_FILE=str(index))
-    # E2 tree = E's tree minus dropped paths, with the forged manifest.
+    # E2 tree = E's tree minus dropped paths (plus replaced blobs), with the
+    # forged manifest.
     subprocess.run(
         ["git", "-C", str(clean_repo), "read-tree", evidence_commit], env=env, check=True
     )
@@ -2568,6 +2757,36 @@ def _forge_repointed_chain(
             env=env,
             check=True,
         )
+    if mutate_e_blobs is not None:
+        e_blobs: dict[str, bytes] = {}
+        e_tree_files = subprocess.run(
+            ["git", "-C", str(clean_repo), "ls-tree", "-r", "--name-only", evidence_commit],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+        for rel in e_tree_files:
+            try:
+                e_blobs[rel] = _cat_blob(clean_repo, f"{evidence_commit}:{rel}")
+            except Exception:
+                continue
+        for rel, blob_bytes in (mutate_e_blobs(e_blobs) or {}).items():
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(clean_repo),
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    (
+                        "100644,"
+                        f"{_hash_blob(clean_repo, blob_bytes)},{rel}"
+                    ),
+                ],
+                env=env,
+                check=True,
+            )
     e_manifest = json.loads(
         _cat_blob(clean_repo, f"{evidence_commit}:{gate._MANIFEST_REL}")
     )
@@ -3333,6 +3552,325 @@ def test_verify_gate_ref_rejects_raw_evidence_sha_mismatch(
     assert any(
         "raw_evidence.sha256" in problem for problem in verdict["problems"]
     )
+
+
+def test_verify_gate_ref_rejects_bidirectional_compact_raw_evidence_cross_swap(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, tmp_path: Path
+) -> None:
+    """R44 后续 (blocker A) counter-example: two VALID raw evidence files A↔B
+    bidirectionally swapped between the layer-5/6 compacts — the layer-5 compact
+    certifies ``live-done-gate-v4.json`` and the layer-6 compact certifies
+    ``live-canary-certified.json``, each with the swapped raw's REAL sha256/size
+    and every other field self-consistent — must FAIL closed at the final
+    consumer.  The compact→raw association is FIXED and unique; a cross-swap
+    that the OLD manifest-existence + hash check would have accepted is
+    rejected by the shared binding."""
+    l5_rel = "benchmarks/results/done-gate-layer5-compact.json"
+    l6_rel = "benchmarks/results/done-gate-layer6-compact.json"
+    swapped_blobs: dict[str, bytes] = {}
+
+    def mutate_e_blobs(blobs: dict[str, bytes]) -> dict[str, bytes]:
+        raw_canary = staging_dir / "live-canary-certified.json"
+        raw_e2e = staging_dir / "live-done-gate-v4.json"
+        for rel, blob in blobs.items():
+            if rel == l5_rel:
+                payload = json.loads(blob.decode("utf-8"))
+                payload["raw_evidence"] = {
+                    "file": "live-done-gate-v4.json",
+                    "path": "benchmarks/results/live-done-gate-v4.json",
+                    "committed": False,
+                    "sha256": hashlib.sha256(raw_e2e.read_bytes()).hexdigest(),
+                    "size_bytes": raw_e2e.stat().st_size,
+                }
+                swapped_blobs[rel] = json.dumps(payload).encode("utf-8")
+            elif rel == l6_rel:
+                payload = json.loads(blob.decode("utf-8"))
+                payload["raw_evidence"] = {
+                    "file": "live-canary-certified.json",
+                    "path": "benchmarks/results/live-canary-certified.json",
+                    "committed": False,
+                    "sha256": hashlib.sha256(raw_canary.read_bytes()).hexdigest(),
+                    "size_bytes": raw_canary.stat().st_size,
+                }
+                swapped_blobs[rel] = json.dumps(payload).encode("utf-8")
+        return swapped_blobs
+
+    def mutate(manifest: dict[str, object]) -> dict[str, object]:
+        for entry in manifest["files"]:  # type: ignore[index]
+            if entry["name"] == gate._COMPACT_CANARY_STAGED_NAME:
+                entry["sha256"] = hashlib.sha256(swapped_blobs[l5_rel]).hexdigest()
+            elif entry["name"] == gate._COMPACT_E2E_STAGED_NAME:
+                entry["sha256"] = hashlib.sha256(swapped_blobs[l6_rel]).hexdigest()
+        return manifest
+
+    _forge_repointed_chain(
+        monkeypatch,
+        clean_repo,
+        staging_dir,
+        tmp_path,
+        mutate_e_manifest=mutate,
+        mutate_e_blobs=mutate_e_blobs,
+    )
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is False
+    assert any(
+        "fixed raw origin" in problem for problem in verdict["problems"]
+    )
+
+
+def test_verify_gate_ref_rejects_compact_raw_evidence_size_mismatch(
+    monkeypatch: pytest.MonkeyPatch, clean_repo: Path, staging_dir: Path, tmp_path: Path
+) -> None:
+    """R44 后续 (blocker A, size) counter-example: a compact certifying a raw
+    size different from the size the E manifest records for that raw must fail
+    closed — the compact→raw→blob mapping binds sha256 AND size, never just the
+    hash."""
+    def mutate(manifest: dict[str, object]) -> dict[str, object]:
+        for entry in manifest["files"]:  # type: ignore[index]
+            if entry["name"] == "live-canary-certified.json":
+                entry["size_bytes"] = int(entry["size_bytes"]) + 1  # type: ignore[arg-type]
+                break
+        return manifest
+
+    _forge_repointed_chain(
+        monkeypatch,
+        clean_repo,
+        staging_dir,
+        tmp_path,
+        mutate_e_manifest=mutate,
+    )
+    verdict = gate.verify_gate_ref(_TEST_RUN_ID)
+    assert verdict["verified"] is False
+    assert any(
+        "raw_evidence.size_bytes" in problem for problem in verdict["problems"]
+    )
+
+
+def test_verify_layer5_compact_contract_rejects_raw_evidence_cross_swap() -> None:
+    """R44 后续 (blocker A, A↔B) counter-example: the layer-5 compact certifying
+    the OTHER valid raw (``live-done-gate-v4.json``) — with a self-consistent
+    path / committed=false / sha / size for that raw — fails the compact
+    validator closed: the layer-5 compact's raw origin is FIXED."""
+    compact = _layer5_compact_fixture()
+    compact["raw_evidence"] = {  # type: ignore[index]
+        "file": "live-done-gate-v4.json",
+        "path": "benchmarks/results/live-done-gate-v4.json",
+        "committed": False,
+        "sha256": "a" * 64,
+        "size_bytes": 1234,
+    }
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="fixed raw origin",
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_raw_evidence_cross_swap() -> None:
+    """R44 后续 (blocker A, A↔B reverse) counter-example: the layer-6 compact
+    certifying the OTHER valid raw (``live-canary-certified.json``) fails the
+    compact validator closed — the layer-6 compact's raw origin is FIXED."""
+    compact = _layer6_compact_fixture()
+    compact["raw_evidence"] = {  # type: ignore[index]
+        "file": "live-canary-certified.json",
+        "path": "benchmarks/results/live-canary-certified.json",
+        "committed": False,
+        "sha256": "a" * 64,
+        "size_bytes": 5678,
+    }
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="fixed raw origin",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_missing_raw_evidence() -> None:
+    """R44 后续 (blocker A, missing) counter-example: a compact with NO
+    raw_evidence fails the compact validator closed."""
+    compact = _layer5_compact_fixture()
+    del compact["raw_evidence"]  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="lacks raw_evidence",
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_extra_raw_evidence_field() -> None:
+    """R44 后续 (blocker A, extra) counter-example: a raw_evidence dict carrying
+    an EXTRA unknown sub-field — a smuggled foreign association — fails the
+    compact validator closed."""
+    compact = _layer5_compact_fixture()
+    compact["raw_evidence"]["origin_id"] = "smuggled-extra-origin"  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="unknown field",
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_duplicate_raw_origin() -> None:
+    """R44 后续 (blocker A, duplicate) counter-example: the layer-6 compact
+    certifying the SAME raw origin as the layer-5 compact (a duplicate
+    association — two compacts claiming one raw) fails the compact validator
+    closed."""
+    compact = _layer6_compact_fixture()
+    compact["raw_evidence"] = {  # type: ignore[index]
+        "file": "live-canary-certified.json",
+        "path": "benchmarks/results/live-canary-certified.json",
+        "committed": False,
+        "sha256": "a" * 64,
+        "size_bytes": 5678,
+    }
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="fixed raw origin",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_wrong_raw_name() -> None:
+    """R44 后续 (blocker A, wrong-name) counter-example: a raw_evidence.file
+    naming a tracked but NON-raw evidence (``browser-e2e.json``) fails the
+    compact validator closed — the raw origin must be the fixed live-* file."""
+    compact = _layer5_compact_fixture()
+    compact["raw_evidence"] = {  # type: ignore[index]
+        "file": "browser-e2e.json",
+        "path": "benchmarks/results/browser-e2e.json",
+        "committed": False,
+        "sha256": "a" * 64,
+        "size_bytes": 1234,
+    }
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="fixed raw origin",
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_wrong_raw_path() -> None:
+    """R44 后续 (blocker A, wrong-path) counter-example: a compact naming the
+    correct raw file but a RELOCATED tracked path fails the compact validator
+    closed — the path leg of the mapping must match the fixed tracked raw path."""
+    compact = _layer5_compact_fixture()
+    compact["raw_evidence"]["path"] = "benchmarks/elsewhere/live-canary-certified.json"  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match=re.escape("raw_evidence.path"),
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_raw_hash_not_64hex() -> None:
+    """R44 后续 (blocker A, hash) counter-example: a raw_evidence.sha256 that is
+    not an exact 64-hex sha256 fails the compact validator closed — the blob
+    binding must be the precise digest."""
+    compact = _layer5_compact_fixture()
+    compact["raw_evidence"]["sha256"] = "b" * 32  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="64-hex sha256",
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_rejects_raw_size_nonpositive() -> None:
+    """R44 后续 (blocker A, size) counter-example: a raw_evidence.size_bytes that
+    is not a positive integer fails the compact validator closed — the compact
+    must bind the raw blob's real byte size."""
+    compact = _layer5_compact_fixture()
+    compact["raw_evidence"]["size_bytes"] = 0  # type: ignore[index]
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="size_bytes",
+    ):
+        gate._verify_layer5_compact_contract(
+            "done-gate-layer5-compact.json", compact
+        )
+
+
+def test_verify_layer5_compact_contract_accepts_fixed_raw_origin() -> None:
+    """R44 后续 (blocker A, legal original) positive: the layer-5 compact's
+    ORIGINAL fixed mapping — file name, tracked path, committed=false, 64-hex
+    sha256 and positive size_bytes — passes the compact validator's binding."""
+    gate._verify_layer5_compact_contract(
+        "done-gate-layer5-compact.json", _layer5_compact_fixture()
+    )
+
+
+def test_verify_layer6_compact_contract_accepts_fixed_raw_origin() -> None:
+    """R44 后续 (blocker A, legal original) positive: the layer-6 compact's
+    ORIGINAL fixed mapping passes the compact validator's binding."""
+    gate._verify_layer6_compact_contract(
+        "done-gate-layer6-compact.json",
+        _layer6_compact_fixture(),
+        tested_commit_sha="a" * 40,
+    )
+
+
+def test_compact_canary_emits_fixed_raw_origin(staging_dir: Path) -> None:
+    """R44 后续 (blocker A, producer) positive: the layer-5 compact PRODUCER
+    emits the fixed raw origin from the shared mapping — name, tracked path,
+    committed=false, the raw file's real 64-hex sha256 and positive size."""
+    staging_dir.mkdir()
+    (staging_dir / "live-canary-certified.json").write_text(
+        json.dumps(_matching_canary()), encoding="utf-8"
+    )
+    compact = gate._compact_canary(staging_dir)
+    assert compact is not None
+    raw = compact["raw_evidence"]  # type: ignore[index]
+    assert raw["file"] == gate._COMPACT_RAW_EVIDENCE_MAPPING[
+        gate._COMPACT_CANARY_STAGED_NAME
+    ]
+    assert raw["path"] == gate._COMPACT_RAW_EVIDENCE_TRACKED[
+        gate._COMPACT_CANARY_STAGED_NAME
+    ]
+    assert raw["committed"] is False
+    assert gate._SHA256_HEX_RE.fullmatch(raw["sha256"])
+    assert isinstance(raw["size_bytes"], int) and raw["size_bytes"] > 0
+
+
+def test_compact_live_e2e_emits_fixed_raw_origin(staging_dir: Path) -> None:
+    """R44 后续 (blocker A, producer) positive: the layer-6 compact PRODUCER
+    emits the fixed raw origin from the shared mapping — name, tracked path,
+    committed=false, the raw file's real 64-hex sha256 and positive size."""
+    staging_dir.mkdir()
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps(_matching_done_gate()), encoding="utf-8"
+    )
+    compact = gate._compact_live_e2e(staging_dir)
+    assert compact is not None
+    raw = compact["raw_evidence"]  # type: ignore[index]
+    assert raw["file"] == gate._COMPACT_RAW_EVIDENCE_MAPPING[
+        gate._COMPACT_E2E_STAGED_NAME
+    ]
+    assert raw["path"] == gate._COMPACT_RAW_EVIDENCE_TRACKED[
+        gate._COMPACT_E2E_STAGED_NAME
+    ]
+    assert raw["committed"] is False
+    assert gate._SHA256_HEX_RE.fullmatch(raw["sha256"])
+    assert isinstance(raw["size_bytes"], int) and raw["size_bytes"] > 0
 
 
 def test_verify_gate_ref_rejects_credential_field_in_manifest(
@@ -10098,9 +10636,15 @@ def _layer5_compact_fixture() -> dict[str, object]:
             "companions": companions,
         },
         "raw_evidence": {
-            "file": "live-canary-certified.json",
+            "file": gate._COMPACT_RAW_EVIDENCE_MAPPING[
+                gate._COMPACT_CANARY_STAGED_NAME
+            ],
+            "path": gate._COMPACT_RAW_EVIDENCE_TRACKED[
+                gate._COMPACT_CANARY_STAGED_NAME
+            ],
             "committed": False,
             "sha256": "a" * 64,
+            "size_bytes": 1234,
         },
     }
 
@@ -10321,6 +10865,16 @@ def _layer6_compact_fixture() -> dict[str, object]:
             "file": ".runtime/done-gate-test-fixture-bridge-state.json",
             "sha256": "a" * 64,
             "residual": [],
+        },
+        # R44 后续 (blocker A): the compact's raw_evidence binds to its FIXED raw
+        # origin — file name, tracked path, committed=false, 64-hex sha256 and
+        # positive size_bytes — matching the layer-6 producer's emission.
+        "raw_evidence": {
+            "file": gate._COMPACT_RAW_EVIDENCE_MAPPING[gate._COMPACT_E2E_STAGED_NAME],
+            "path": gate._COMPACT_RAW_EVIDENCE_TRACKED[gate._COMPACT_E2E_STAGED_NAME],
+            "committed": False,
+            "sha256": "a" * 64,
+            "size_bytes": 5678,
         },
     }
 
@@ -11542,6 +12096,268 @@ def test_verify_layer6_compact_contract_rejects_checkpoint_binding_foreign_query
             compact,
             tested_commit_sha="a" * 40,
         )
+
+
+def _recompute_checkpoint_binding_digests(
+    binding: dict[str, object], index: int
+) -> None:
+    """Recompute every digest downstream of one checkpoint-binding entry after a
+    ``query_task_ids`` mutation so the ONLY surviving failure is the per-group
+    member-set semantic check — a stale digest would trip the digest check first
+    and mask the semantic counter-example this targets."""
+    from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
+
+    entry = binding["bindings"][index]  # type: ignore[index]
+    entry["query_task_ids_sha256"] = gate._canonical_sha256(
+        entry["query_task_ids"]
+    )
+    entry["checkpoint_sha256"] = LivePlanningPairCheckpoint._digest(
+        LivePlanningPairCheckpoint._checkpoint_summary(
+            {
+                "schema_version": "live-pair-checkpoint-v1",
+                "request_sha256": entry["request_sha256"],
+                "sequence": entry["sequence"],
+                "date_pair_id": entry["date_pair_id"],
+                "departure_date": entry["departure_date"],
+                "return_date": entry["return_date"],
+                "state": entry["state"],
+                "query_task_ids": entry["query_task_ids"],
+                "run_summary_sha256": entry["run_summary_sha256"],
+                "captured_at": entry["captured_at"],
+            }
+        )
+    )
+    ordered = [
+        str(b["checkpoint_sha256"]) for b in binding["bindings"]  # type: ignore[index]
+    ]
+    binding["ordered_checkpoint_sha256"] = ordered
+    binding["checkpoint_chain_sha256"] = gate._canonical_sha256(ordered)
+
+
+def test_verify_layer6_compact_contract_rejects_checkpoint_binding_source_owned_query_ids() -> None:
+    """R44 后续 (blocker C, cross query/source): a checkpoint binding whose
+    per-group query-task set is the ``source-*`` BROWSER Source id set — the id
+    namespace the old-contract fixture masked the validator into forcing — must
+    REJECT.  The real producer / checkpoint seals ``query:<platform>:<kind>:…``
+    QUERY task ids; a source-owned set is foreign even when every digest is
+    recomputed consistently."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                binding = check["evidence"]["checkpoint_binding"]
+                binding["bindings"][0]["query_task_ids"] = sorted(  # type: ignore[index]
+                    gate._V4_FROZEN_BROWSER_SOURCE_IDS
+                )
+                _recompute_checkpoint_binding_digests(binding, 0)
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="query_task_ids member set != the canonical frozen graph",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_checkpoint_binding_foreign_query_owner() -> None:
+    """R44 后续 (blocker C, wrong owner): replacing one canonical full query-task
+    id with a foreign OWNER (``query:evil:flight:…``) must REJECT — the per-group
+    member set's QUERY OWNERSHIP projection must be EXACTLY the canonical frozen
+    query ownership set."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                binding = check["evidence"]["checkpoint_binding"]
+                base = list(binding["bindings"][0]["query_task_ids"])  # type: ignore[index]
+                binding["bindings"][0]["query_task_ids"] = [  # type: ignore[index]
+                    f"query:evil:flight:{'0' * 16}",
+                    *base[1:],
+                ]
+                _recompute_checkpoint_binding_digests(binding, 0)
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="query_task_ids member set != the canonical frozen graph",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_checkpoint_binding_missing_query_id() -> None:
+    """R44 后续 (blocker C, missing): dropping one canonical full query-task id
+    from a per-group set must REJECT — an incomplete per-group plan is not the
+    frozen per-pair plan."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                binding = check["evidence"]["checkpoint_binding"]
+                binding["bindings"][0]["query_task_ids"] = list(  # type: ignore[index]
+                    binding["bindings"][0]["query_task_ids"]  # type: ignore[index]
+                )[:-1]
+                _recompute_checkpoint_binding_digests(binding, 0)
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="query_task_ids member set != the canonical frozen graph",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_checkpoint_binding_extra_query_id() -> None:
+    """R44 后续 (blocker C, extra): adding a non-canonical full query-task id —
+    even one in the ``query:*`` namespace with a foreign owner such as
+    ``query:ctrip:train:…`` — must REJECT; the per-group member set's ownership
+    projection must equal the canonical frozen query ownership set exactly."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                binding = check["evidence"]["checkpoint_binding"]
+                binding["bindings"][0]["query_task_ids"] = [  # type: ignore[index]
+                    *binding["bindings"][0]["query_task_ids"],  # type: ignore[index]
+                    f"query:ctrip:train:{'0' * 16}",
+                ]
+                _recompute_checkpoint_binding_digests(binding, 0)
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="query_task_ids member set != the canonical frozen graph",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_cross_pair_query_set() -> None:
+    """R44 后续 (blocker C, cross pair): a doctored per-group query set on a
+    NON-FIRST binding entry (bindings[1]) must REJECT — the member-set check
+    must fire per binding entry, not only on the first."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                binding = check["evidence"]["checkpoint_binding"]
+                binding["bindings"][1]["query_task_ids"] = [  # type: ignore[index]
+                    *binding["bindings"][1]["query_task_ids"],  # type: ignore[index]
+                    f"query:evil:flight:{'0' * 16}",
+                ]
+                _recompute_checkpoint_binding_digests(binding, 1)
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="query_task_ids member set != the canonical frozen graph",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_accepts_real_checkpoint_query_ownership() -> None:
+    """R44 后续 (blocker C, real producer→checkpoint→compact→consumer positive): a
+    compact whose checkpoint binding is assembled the way the REAL runner
+    assembles it — real ``LivePlanningPairCheckpoint.create`` objects carrying
+    FULL ``query:<platform>:<kind>:<digest>`` task ids (the same
+    ``FlexibleQueryTask.id`` namespace the producer seals) — must PASS the
+    consumer.  The consumer projects each full task id to its QUERY OWNERSHIP id
+    and requires the set to equal the canonical frozen query shapes exactly."""
+
+    from tripchord.agents.live_jobs import (
+        LivePlanningPairCheckpoint,
+        LivePlanningPairCheckpointState,
+    )
+
+    request_sha256 = _FIXTURE_REQUEST_SHA256
+    checkpoints: list[LivePlanningPairCheckpoint] = []
+    bindings: list[dict[str, object]] = []
+    for index, pair_id in enumerate(_FIXTURE_PAIR_IDS):
+        departure_s, return_s = _FIXTURE_PAIR_DATES[index]
+        task_ids = _frozen_query_task_ids(pair_id, departure_s, return_s)
+        checkpoint = LivePlanningPairCheckpoint.create(
+            sequence=index + 1,
+            request_sha256=request_sha256,
+            date_pair_id=pair_id,
+            departure_date=date.fromisoformat(departure_s),
+            return_date=date.fromisoformat(return_s),
+            state=LivePlanningPairCheckpointState.COMPLETED,
+            query_task_ids=task_ids,
+            run_purpose="exploration_and_publication",
+            finalization_state="finalized",
+            decision_state="recommended",
+            source_task_count=len(task_ids),
+            exploration_seal_passed=True,
+            all_platforms_complete=True,
+            captured_at=datetime.fromisoformat("2026-08-10T00:00:00+00:00"),
+        )
+        checkpoints.append(checkpoint)
+        bindings.append(
+            {
+                "sequence": checkpoint.sequence,
+                "date_pair_id": checkpoint.date_pair_id,
+                "departure_date": checkpoint.departure_date.isoformat(),
+                "return_date": checkpoint.return_date.isoformat(),
+                "state": checkpoint.state.value,
+                "query_task_ids": list(checkpoint.query_task_ids),
+                "query_task_ids_sha256": gate._canonical_sha256(
+                    list(checkpoint.query_task_ids)
+                ),
+                "run_purpose": checkpoint.run_purpose,
+                "finalization_state": checkpoint.finalization_state,
+                "decision_state": checkpoint.decision_state,
+                "source_task_count": checkpoint.source_task_count,
+                "exploration_seal_passed": checkpoint.exploration_seal_passed,
+                "all_platforms_complete": checkpoint.all_platforms_complete,
+                "failure_class": checkpoint.failure_class,
+                "run_summary_sha256": checkpoint.run_summary_sha256,
+                "captured_at": checkpoint.captured_at.isoformat(),
+                "checkpoint_sha256": checkpoint.checkpoint_sha256,
+                "request_sha256": checkpoint.request_sha256,
+            }
+        )
+    real_binding: dict[str, object] = {
+        "passed": True,
+        "count": len(bindings),
+        "ordered_checkpoint_sha256": [
+            checkpoint.checkpoint_sha256 for checkpoint in checkpoints
+        ],
+        "checkpoint_chain_sha256": gate._canonical_sha256(
+            [checkpoint.checkpoint_sha256 for checkpoint in checkpoints]
+        ),
+        "request_sha256": request_sha256,
+        "bindings": bindings,
+    }
+
+    def patch(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                check["evidence"]["checkpoint_binding"] = real_binding  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(patch)
+    gate._verify_layer6_compact_contract(
+        "done-gate-layer6-compact.json",
+        compact,
+        tested_commit_sha="a" * 40,
+    )
 
 
 def test_frozen_v4_pair_id_generation_enforces_time_contract() -> None:

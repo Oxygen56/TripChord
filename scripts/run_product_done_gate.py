@@ -2429,6 +2429,15 @@ _CANARY_DIAG_MAX_AGE_SECONDS = 1800
 # can never pass by being merely non-empty.
 _CANARY_DIAG_EXPECTED_PYTHON = ".".join(str(part) for part in sys.version_info[:3])
 _CANARY_DIAG_EXPECTED_PLATFORM = sys.platform
+# R44 后续 (blocker B): the canary failure diagnostic is bound to the certified
+# canary's OWN lifecycle — the only stages ``benchmarks/live_canary_certified.py``
+# can seal are ``evaluate`` (the crash happened inside ``evaluate``) and ``dump``
+# (the crash happened writing the evidence file), and the only script that seals
+# diagnostics is the certified canary itself.  An arbitrary / default / foreign
+# stage or a different script is a forged or misplaced diagnostic and fails
+# closed even when every other field looks valid.
+_CANARY_DIAG_ALLOWED_STAGES = frozenset({"evaluate", "dump"})
+_CANARY_DIAG_EXPECTED_SCRIPT = "live_canary_certified.py"
 # Upper bound for a free-form diagnostic field (summary / exception_class /
 # stage) carried into the committed report — a crafted 10 MB summary cannot bloat
 # or smuggle the committed trail (consumer whitelist, Block 3).
@@ -2796,6 +2805,15 @@ def _consume_canary_failure_diagnostic(
     exception_class = diagnostic.get("exception_class")
     if not isinstance(stage, str) or not stage:
         return None, "canary failure diagnostic missing stage"
+    # R44 后续 (blocker B): the stage is a STRICT enum of the certified canary's
+    # own seal points (``evaluate`` / ``dump``) — an arbitrary or defaulted
+    # stage value is a forged / misplaced diagnostic and fails closed.
+    if stage not in _CANARY_DIAG_ALLOWED_STAGES:
+        return None, (
+            "canary failure diagnostic stage "
+            f"{stage!r} not in the certified canary stages "
+            f"({', '.join(sorted(_CANARY_DIAG_ALLOWED_STAGES))})"
+        )
     if not isinstance(exception_class, str) or not exception_class:
         return None, "canary failure diagnostic missing exception_class"
     run_identity = diagnostic.get("run_identity")
@@ -2806,6 +2824,22 @@ def _consume_canary_failure_diagnostic(
         return None, (
             "canary failure diagnostic run_identity carries unknown field(s): "
             f"{', '.join(sorted(unknown_identity_fields))}"
+        )
+    # R44 后续 (blocker B): the diagnostic must carry the EXACT script identity
+    # and output path of THIS canary run — a different script (or a rewritten /
+    # defaulted / foreign ``output``) is a cross-run or forged diagnostic and
+    # fails closed even when run_id / tested_sha / runtime all look valid.
+    if run_identity.get("script") != _CANARY_DIAG_EXPECTED_SCRIPT:
+        return None, (
+            "canary failure diagnostic script "
+            f"{run_identity.get('script')!r} != the certified canary script "
+            f"{_CANARY_DIAG_EXPECTED_SCRIPT!r}"
+        )
+    if run_identity.get("output") != str(evidence_path):
+        return None, (
+            "canary failure diagnostic output "
+            f"{run_identity.get('output')!r} != this run's evidence path "
+            f"{str(evidence_path)!r}"
         )
     diag_run_id = run_identity.get("run_id")
     if not isinstance(diag_run_id, str) or not diag_run_id:
@@ -3206,6 +3240,29 @@ _V4_FROZEN_TASKS_PER_PAIR = frozen_v4_tasks_per_pair()
 _V4_FROZEN_BROWSER_SOURCE_IDS = frozen_v4_browser_source_ids()
 _V4_FROZEN_QUERY_SHAPES = frozen_v4_query_shapes()
 _V4_FROZEN_ICOM_TASK_IDS = frozen_v4_icom_task_ids()
+
+
+# R44 后续 (blocker C): the checkpoint binding's ``query_task_ids`` members are
+# the FULL query-task ids the real producer seals — ``query:<platform>:<kind>:<
+# digest>`` (e.g. ``query:ctrip:flight:…``, the same ``FlexibleQueryTask.id``
+# namespace), NOT the bare ``<platform>:<kind>`` ownership id and NOT the
+# ``source-<platform>-…`` browser Source id.  This helper projects each full
+# task id to its QUERY OWNERSHIP id and fails closed (returns ``None``) when ANY
+# member is not a well-formed ``query:*`` task id, so a foreign / source-owned /
+# non-query member can never be silently dropped to make the canonical-set
+# comparison pass.
+def _checkpoint_query_ownership_set(
+    query_task_ids: list[object],
+) -> frozenset[str] | None:
+    ownership: set[str] = set()
+    for raw in query_task_ids:
+        if not isinstance(raw, str) or not raw.startswith("query:"):
+            return None
+        parts = raw.split(":")
+        if len(parts) < 3 or not parts[1] or not parts[2]:
+            return None
+        ownership.add(f"{parts[1]}:{parts[2]}")
+    return frozenset(ownership)
 
 # C-122 supervision 01:10: pair-id canonical binding.  The SEALED pair-id set of
 # a real run is not a fixed constant — the API applies ``minimum_departure_
@@ -4375,6 +4432,54 @@ if set(name for name, _ in _EVIDENCE_TRACKED_PATHS) != set(
         "paths (rule-drift guard)"
     )
 
+# R44 后续 (blocker A): the FIXED, UNIQUE compact→raw mapping.  Each compact
+# artifact is the desensitized view of EXACTLY ONE raw evidence origin — the
+# layer-5 compact reads ``live-canary-certified.json`` and the layer-6 compact
+# reads ``live-done-gate-v4.json``, never the reverse, never an extra raw,
+# never none.  Producer (``_compact_canary`` / ``_compact_live_e2e``), compact
+# validator (``_verify_layer*_compact_contract``) and final consumer (the E-blob
+# read-back) all derive the association from THIS one frozen mapping, so a
+# bidirectional A↔B cross-swap of two valid raw files — or a missing / extra /
+# duplicate / wrong-name / wrong-path / hash / size disagreement — fails closed
+# everywhere.
+_COMPACT_RAW_EVIDENCE_MAPPING: dict[str, str] = {
+    _COMPACT_CANARY_STAGED_NAME: "live-canary-certified.json",
+    _COMPACT_E2E_STAGED_NAME: "live-done-gate-v4.json",
+}
+# The second leg of the mapping — the raw origin's TRACKED relative path — so
+# the committed compact names the same repo-relative path the manifest uses
+# (never an absolute host path, never a relocated path).
+_COMPACT_RAW_EVIDENCE_TRACKED: dict[str, str] = {
+    compact_name: dict(_EVIDENCE_TRACKED_PATHS)[raw_name]
+    for compact_name, raw_name in _COMPACT_RAW_EVIDENCE_MAPPING.items()
+}
+# Every compact must have EXACTLY one raw origin, every raw live-* evidence must
+# be the origin of exactly one compact (no duplicate associations), and every
+# origin must itself be a tracked evidence path — a missing / extra / duplicate
+# association is a contract drift and must fail loudly at import time, not
+# silently at publish time.
+if set(_COMPACT_RAW_EVIDENCE_MAPPING) != {
+    name for name, _ in _EVIDENCE_TRACKED_PATHS if "compact" in name
+}:
+    raise RuntimeError(
+        "compact raw-evidence mapping does not cover exactly the compact "
+        "evidence paths (rule-drift guard)"
+    )
+if set(_COMPACT_RAW_EVIDENCE_MAPPING.values()) != {
+    name for name, _ in _EVIDENCE_TRACKED_PATHS if "live-" in name
+}:
+    raise RuntimeError(
+        "compact raw-evidence mapping does not cover exactly the raw live-* "
+        "evidence paths (rule-drift guard)"
+    )
+if len(set(_COMPACT_RAW_EVIDENCE_MAPPING.values())) != len(
+    _COMPACT_RAW_EVIDENCE_MAPPING
+):
+    raise RuntimeError(
+        "compact raw-evidence mapping associates two compacts with the same "
+        "raw origin (duplicate rule-drift guard)"
+    )
+
 
 # The committed-evidence contract manifest.  The manifest is the *only* record
 # of the git-ignored sensitive live-* evidence that E may not carry: it lists
@@ -4650,9 +4755,11 @@ def _compact_canary(staging_dir: Path) -> dict[str, Any] | None:
             ],
         },
         "raw_evidence": {
-            "file": "live-canary-certified.json",
+            "file": _COMPACT_RAW_EVIDENCE_MAPPING[_COMPACT_CANARY_STAGED_NAME],
+            "path": _COMPACT_RAW_EVIDENCE_TRACKED[_COMPACT_CANARY_STAGED_NAME],
             "committed": False,
             "sha256": _sha256_file(path),
+            "size_bytes": path.stat().st_size,
         },
     }
 
@@ -4736,6 +4843,91 @@ _HEX_HASH_RE = re.compile(r"^[0-9a-fA-F]{32,128}$")
 # manifest entry hashes - must be exact 64-hex, not the looser 32-128 range of
 # ``_HEX_HASH_RE`` (which is a secret-scanning shape, not a schema validator).
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+# The EXACT sub-field set a compact's raw_evidence may carry: the raw origin
+# name + tracked path (the fixed mapping), the committed=false flag, and the
+# independently-recomputable raw blob sha256 + size.  Any extra sub-field is a
+# smuggled foreign association and fails the binding check closed.
+_COMPACT_RAW_EVIDENCE_ALLOWED_FIELDS = frozenset(
+    {"file", "path", "committed", "sha256", "size_bytes"}
+)
+
+
+def _verify_compact_raw_evidence_binding(
+    tracked_rel: str, compact: dict[str, Any]
+) -> None:
+    """Bind a compact's raw_evidence to its FIXED raw origin (R44 后续 A).
+
+    Shared by the compact validators (``_verify_layer*_compact_contract``) and
+    the final E-blob consumer: a compact's ``raw_evidence`` must name the ONE
+    raw evidence file this compact is the desensitized view of — exactly
+    ``_COMPACT_RAW_EVIDENCE_MAPPING[Path(tracked_rel).name]`` — carry that raw's
+    TRACKED relative path, the canonical ``committed=False`` flag, and a valid
+    64-hex sha256 + positive size_bytes of the raw bytes, and nothing else.
+
+    Any deviation — a bidirectional A↔B cross-swap of two valid raw files, a
+    missing raw_evidence, a missing / extra / duplicate association, a
+    wrong-name, a wrong-path, a non-canonical committed flag, a malformed
+    hash, or a non-positive size — fails the phase closed.  ``tracked_rel`` is
+    the compact's own tracked relative path; its basename identifies the
+    staged compact name, so the expected origin is looked up from the same
+    frozen mapping the producer emits from.
+    """
+    staged_name = Path(tracked_rel).name
+    try:
+        expected_name = _COMPACT_RAW_EVIDENCE_MAPPING[staged_name]
+        expected_tracked = _COMPACT_RAW_EVIDENCE_TRACKED[staged_name]
+    except KeyError:
+        raise GateStateChangedError(
+            f"evidence commit E compact {tracked_rel} has no fixed raw-evidence "
+            "mapping (foreign compact artifact)"
+        ) from None
+    raw = compact.get("raw_evidence")
+    if not isinstance(raw, dict):
+        raise GateStateChangedError(
+            f"evidence commit E compact {tracked_rel} lacks raw_evidence"
+        )
+    raw_file = raw.get("file")
+    if not isinstance(raw_file, str) or raw_file != expected_name:
+        raise GateStateChangedError(
+            f"evidence commit E compact {tracked_rel} raw_evidence.file "
+            f"{raw_file!r} != the fixed raw origin {expected_name!r} for this "
+            "compact (cross-swap / wrong-name / foreign raw)"
+        )
+    raw_path = raw.get("path")
+    if not isinstance(raw_path, str) or raw_path != expected_tracked:
+        raise GateStateChangedError(
+            f"evidence commit E compact {tracked_rel} raw_evidence.path "
+            f"{raw_path!r} != the tracked raw path {expected_tracked!r} for "
+            f"{expected_name!r} (wrong-path / relocated raw)"
+        )
+    if raw.get("committed") is not False:
+        raise GateStateChangedError(
+            f"evidence commit E compact {tracked_rel} raw_evidence.committed "
+            f"{raw.get('committed')!r} != false for raw {expected_name!r}"
+        )
+    raw_sha = raw.get("sha256")
+    if not isinstance(raw_sha, str) or _SHA256_HEX_RE.fullmatch(raw_sha) is None:
+        raise GateStateChangedError(
+            f"evidence commit E compact {tracked_rel} raw_evidence.sha256 is "
+            f"not a valid 64-hex sha256 for {expected_name!r}"
+        )
+    raw_size = raw.get("size_bytes")
+    if (
+        not isinstance(raw_size, int)
+        or isinstance(raw_size, bool)
+        or raw_size <= 0
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E compact {tracked_rel} raw_evidence.size_bytes "
+            f"{raw_size!r} is not a positive integer for {expected_name!r}"
+        )
+    # EXACTLY one raw association — no extra sub-fields, no duplicate origin.
+    unknown = set(raw) - _COMPACT_RAW_EVIDENCE_ALLOWED_FIELDS
+    if unknown:
+        raise GateStateChangedError(
+            f"evidence commit E compact {tracked_rel} raw_evidence carries "
+            f"unknown field(s): {sorted(unknown)!r}"
+        )
 # Token-like strings: long, dense, no whitespace — covers base64url JWTs
 # (header.payload.signature) and bearer-token shapes.
 _TOKEN_ISH_RE = re.compile(r"^[A-Za-z0-9+/=_.\-]{48,}$")
@@ -5213,9 +5405,11 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
         "bridge_state_lease_preflight": _bridge_state_binding(),
         "bridge_state_lease_postcheck": _bridge_state_after_binding(),
         "raw_evidence": {
-            "file": "live-done-gate-v4.json",
+            "file": _COMPACT_RAW_EVIDENCE_MAPPING[_COMPACT_E2E_STAGED_NAME],
+            "path": _COMPACT_RAW_EVIDENCE_TRACKED[_COMPACT_E2E_STAGED_NAME],
             "committed": False,
             "sha256": _sha256_file(path),
+            "size_bytes": path.stat().st_size,
         },
     }
 
@@ -5795,6 +5989,11 @@ def _verify_layer5_compact_contract(tracked_rel: str, compact: dict[str, Any]) -
             f"evidence commit E layer-5 compact {tracked_rel} scope set != the "
             "certified scopes"
         )
+    # R44 后续 (blocker A): the compact's raw_evidence must bind to its FIXED raw
+    # origin (file name, tracked path, committed=false, 64-hex sha256, positive
+    # size) — a bidirectional A↔B cross-swap of two valid raw files fails closed
+    # here, at the compact validator, before any downstream consumer.
+    _verify_compact_raw_evidence_binding(tracked_rel, compact)
 
 
 def _canonical_sha256(payload: object) -> str:
@@ -6113,16 +6312,26 @@ def _verify_layer6_checkpoint_binding(
                 f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
                 "query_task_ids_sha256 does not recompute from query_task_ids"
             )
-        # C-122 round-19 (gap 4): the per-group query-task set must be EXACTLY
-        # the canonical frozen graph's browser Source-id set.  A binding with a
-        # foreign / missing / swapped query member is not the frozen per-pair
-        # plan — even when the digest chain is internally consistent.
-        if set(query_ids) != _V4_FROZEN_BROWSER_SOURCE_IDS:
+        # C-122 round-19 (gap 4) + R44 后续 (blocker C): the per-group query-task
+        # set must be EXACTLY the canonical frozen graph's QUERY OWNERSHIP set.
+        # The real producer / checkpoint seals FULL query-task ids —
+        # ``query:<platform>:<kind>:<digest>`` (``query:ctrip:flight:…``, the
+        # ``FlexibleQueryTask.id`` namespace) — whose OWNERSHIP part is
+        # ``<platform>:<kind>`` (``ctrip:flight``), the same
+        # ``frozen_v4_query_shapes()`` set the graph's ``expected_query_shapes``
+        # carries.  Forcing the ``source-<platform>-…`` browser Source-id set
+        # here masks the real contract behind fixtures that coincidentally used
+        # ``source-*`` ids in ``query_task_ids``; a binding with a foreign /
+        # missing / source-owned / swapped query owner is not the frozen
+        # per-pair plan — even when the digest chain is internally consistent.
+        ownership_set = _checkpoint_query_ownership_set(query_ids)
+        if ownership_set is None or ownership_set != _V4_FROZEN_QUERY_SHAPES:
             raise GateStateChangedError(
                 f"evidence commit E layer-6 compact {tracked_rel} check "
                 f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
-                "query_task_ids member set != the canonical frozen graph "
-                "browser Source-id set (foreign, missing or swapped member)"
+                "query_task_ids member set != the canonical frozen graph query "
+                "ownership set (foreign, missing, source-owned or swapped "
+                "member)"
             )
         # C-122 round-19 (gap 4): the full business-summary recompute —
         # ``run_summary_sha256`` must RECOMPUTE from the binding's carried
@@ -7247,6 +7456,11 @@ def _verify_layer6_compact_contract(
             f"evidence commit E layer-6 compact {tracked_rel} runner_contract "
             "lacks require_model_enhancement"
         )
+    # R44 后续 (blocker A): the compact's raw_evidence must bind to its FIXED raw
+    # origin (file name, tracked path, committed=false, 64-hex sha256, positive
+    # size) — a bidirectional A↔B cross-swap of two valid raw files fails closed
+    # here, at the compact validator, before any downstream consumer.
+    _verify_compact_raw_evidence_binding(tracked_rel, compact)
 
 
 def _verify_manifest_recomputes(
@@ -8686,43 +8900,48 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
                             )
                         except GateStateChangedError as exc:
                             problems.append(str(exc))
-                    raw = compact.get("raw_evidence")
-                    if not isinstance(raw, dict):
-                        problems.append(
-                            f"evidence commit E compact {tracked_rel} lacks raw_evidence"
-                        )
+                    # R44 后续 (blocker A): each compact's raw_evidence must bind
+                    # to its FIXED raw origin — file name, tracked path,
+                    # committed=false, 64-hex sha256 and positive size_bytes,
+                    # and nothing else.  A bidirectional A↔B cross-swap of two
+                    # valid raw files fails closed here, at the final consumer,
+                    # via the SAME mapping the producer emits from and the
+                    # compact validators enforce.
+                    try:
+                        _verify_compact_raw_evidence_binding(tracked_rel, compact)
+                    except GateStateChangedError as exc:
+                        problems.append(str(exc))
                         continue
-                    raw_file = raw.get("file")
-                    raw_sha = raw.get("sha256")
-                    if not isinstance(raw_file, str) or not raw_file:
+                    raw = compact["raw_evidence"]
+                    raw_file = raw["file"]
+                    raw_sha = raw["sha256"]
+                    raw_size = raw["size_bytes"]
+                    raw_entry = by_name.get(raw_file)
+                    if raw_entry is None:
                         problems.append(
                             f"evidence commit E compact {tracked_rel} "
-                            "raw_evidence.file is invalid"
+                            f"raw_evidence.file {raw_file!r} is not listed in "
+                            "the E manifest"
                         )
                     else:
-                        raw_entry = by_name.get(raw_file)
-                        if raw_entry is None:
+                        if raw_entry.get("committed") is not False:
                             problems.append(
                                 f"evidence commit E compact {tracked_rel} "
-                                f"raw_evidence.file {raw_file!r} is not listed in "
-                                "the E manifest"
+                                f"raw_evidence.file {raw_file!r} is not "
+                                "recorded as committed=false in the manifest"
                             )
-                        else:
-                            if raw_entry.get("committed") is not False:
-                                problems.append(
-                                    f"evidence commit E compact {tracked_rel} "
-                                    f"raw_evidence.file {raw_file!r} is not "
-                                    "recorded as committed=false in the manifest"
-                                )
-                            if (
-                                not isinstance(raw_sha, str)
-                                or raw_entry.get("sha256") != raw_sha
-                            ):
-                                problems.append(
-                                    f"evidence commit E compact {tracked_rel} "
-                                    "raw_evidence.sha256 does not match the "
-                                    "manifest's recorded hash for the raw file"
-                                )
+                        if raw_entry.get("sha256") != raw_sha:
+                            problems.append(
+                                f"evidence commit E compact {tracked_rel} "
+                                "raw_evidence.sha256 does not match the "
+                                "manifest's recorded hash for the raw file"
+                            )
+                        if raw_entry.get("size_bytes") != raw_size:
+                            problems.append(
+                                f"evidence commit E compact {tracked_rel} "
+                                "raw_evidence.size_bytes does not match the "
+                                "manifest's recorded size for the raw file"
+                            )
         # C-122 round-18 HG-H2 (supervision 16:03): per-entry binding between P's
         # manifest and the E canonical manifest + the real committed blob.  A
         # forged P manifest that records an arbitrary-but-well-formed sha256, size
