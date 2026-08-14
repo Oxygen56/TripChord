@@ -37,8 +37,10 @@ from tripchord.api import (
     StartLiveFlexibleFromTextJobResponse,
 )
 from tripchord.formal_live_source import (
-    build_formal_source_binding,
+    read_owner_only_text,
     validate_formal_source_binding,
+    validate_formal_source_challenge,
+    validate_formal_source_evidence,
 )
 from tripchord.planning.event_contracts import EventDisposition
 from tripchord.planning.offer_semantics import (
@@ -101,6 +103,13 @@ _SENSITIVE_FIELD_NAMES = frozenset(
         "secret",
     }
 )
+_SIGNED_FORMAL_SOURCE_FIELDS = frozenset(
+    {
+        "formal_live_source_binding",
+        "formal_live_source_authority_receipt",
+        "formal_live_source_challenge",
+    }
+)
 _TERMINAL_JOB_STATES = frozenset(
     {
         LivePlanningJobState.SUCCEEDED,
@@ -140,6 +149,15 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=_DEFAULT_OUTPUT)
     parser.add_argument("--api-base", default="http://127.0.0.1:8000")
     parser.add_argument("--api-token", default="")
+    parser.add_argument(
+        "--gate-run-id",
+        default=os.environ.get("TRIPCHORD_DONE_GATE_RUN_ID", ""),
+    )
+    parser.add_argument(
+        "--formal-source-control-token-file",
+        type=Path,
+        default=_REPO_ROOT / ".runtime" / "formal-source-control-token",
+    )
     parser.add_argument(
         "--bridge-token",
         default=os.environ.get("TRIPCHORD_BROWSER_BRIDGE_TOKEN", ""),
@@ -361,11 +379,20 @@ def _write_evidence_bundle(
 ) -> Path:
     if passed and bundle.get("run_status") == "completed":
         binding = bundle.get("formal_live_source_binding")
-        if not isinstance(binding, dict):
+        receipt = bundle.get("formal_live_source_authority_receipt")
+        challenge = bundle.get("formal_live_source_challenge")
+        if not all(isinstance(item, dict) for item in (binding, receipt, challenge)):
             raise RuntimeError(
-                "completed raw evidence formal_live_source_binding is missing or not an object"
+                "completed raw evidence formal_live_source_binding/receipt/challenge "
+                "is missing or not an exact object"
             )
         try:
+            validate_formal_source_evidence(
+                binding,
+                receipt,
+                challenge,
+                expected_context=_formal_source_expected_context(bundle),
+            )
             (formal_source_validator or validate_formal_source_binding)(binding)
         except ValueError as exc:
             raise RuntimeError(
@@ -446,11 +473,23 @@ def _completed_evidence_bundle(
 
     if report.passed:
         binding = context.get("formal_live_source_binding")
-        if not isinstance(binding, dict):
+        receipt = context.get("formal_live_source_authority_receipt")
+        challenge = context.get("formal_live_source_challenge")
+        if not all(isinstance(item, dict) for item in (binding, receipt, challenge)):
             raise RuntimeError(
-                "completed bundle formal_live_source_binding is missing or not an object"
+                "completed bundle formal_live_source_binding/receipt/challenge "
+                "is missing or not an exact object"
             )
         try:
+            validate_formal_source_evidence(
+                binding,
+                receipt,
+                challenge,
+                expected_context=_formal_source_expected_context(
+                    context,
+                    request=request,
+                ),
+            )
             (formal_source_validator or validate_formal_source_binding)(binding)
         except ValueError as exc:
             raise RuntimeError(
@@ -466,6 +505,39 @@ def _completed_evidence_bundle(
         "request": request,
         **context,
         "done_gate": report.model_dump(mode="json"),
+    }
+
+
+def _formal_source_expected_context(
+    payload: dict[str, Any],
+    *,
+    request: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    runtime_container = payload.get("runtime_before_run")
+    runtime_identity = (
+        runtime_container.get("runtime_provenance")
+        if isinstance(runtime_container, dict)
+        else None
+    )
+    request_identity = payload.get("request_identity")
+    scenario_sha256 = payload.get("scenario_sha256")
+    if scenario_sha256 is None and request is not None:
+        scenario_sha256 = _canonical_sha256(request)
+    return {
+        "run_id": payload.get("gate_run_id"),
+        "tested_commit_sha": (
+            runtime_identity.get("commit_sha")
+            if isinstance(runtime_identity, dict)
+            else None
+        ),
+        "runtime_identity": runtime_identity,
+        "request_sha256": (
+            request_identity.get("api_payload_sha256")
+            if isinstance(request_identity, dict)
+            else None
+        ),
+        "candidate_set_sha256": payload.get("api_payload_candidate_set_sha256"),
+        "scenario_sha256": scenario_sha256,
     }
 
 
@@ -516,6 +588,8 @@ def _redact_explicit_secrets(value: Any, secrets: tuple[str, ...]) -> Any:
             key: (
                 "[REDACTED]"
                 if _is_sensitive_field_name(key)
+                else item
+                if key in _SIGNED_FORMAL_SOURCE_FIELDS and isinstance(item, dict)
                 else _redact_explicit_secrets(item, active)
             )
             for key, item in value.items()
@@ -553,59 +627,82 @@ async def _runtime_evidence(
     }
 
 
-async def _build_formal_source_binding_remote(
+def _formal_source_control_token(path: Path | None = None) -> str:
+    path = path or (_REPO_ROOT / ".runtime" / "formal-source-control-token")
+    return read_owner_only_text(
+        path,
+        "formal source control token",
+        minimum_length=64,
+    )
+
+
+async def _issue_formal_source_challenge_remote(
     client: httpx.AsyncClient,
     base: str,
-    before: object,
-    after: object,
+    context: dict[str, object],
+    control_token_path: Path | None = None,
 ) -> dict[str, object]:
-    try:
-        return build_formal_source_binding(before, after)
-    except ValueError:
-        pass
     response = await client.post(
-        f"{base}/api/v1/agents/runtime/formal-live-source/bind",
-        json={"before": before, "after": after},
+        f"{base}/api/v1/internal/formal-live-source/challenge",
+        json=context,
+        headers={
+            "X-TripChord-Formal-Source-Control": _formal_source_control_token(
+                control_token_path
+            ),
+        },
     )
-    payload = _safe_response_json(response, "formal live source bind")
-    try:
-        return TypeAdapter(dict[str, object]).validate_python(payload.get("binding"))
-    except ValueError as exc:
-        raise RuntimeError("formal live source bind returned no binding") from exc
+    payload = _safe_response_json(response, "formal live source challenge")
+    challenge = TypeAdapter(dict[str, object]).validate_python(payload.get("challenge"))
+    validate_formal_source_challenge(challenge)
+    return challenge
 
 
-async def _validate_formal_source_binding_remote(
+async def _finalize_formal_source_binding_remote(
     client: httpx.AsyncClient,
     base: str,
-    binding: object,
-) -> None:
-    try:
-        validate_formal_source_binding(binding)
-        return
-    except ValueError:
-        pass
+    context: dict[str, object],
+    control_token_path: Path | None = None,
+) -> dict[str, object]:
     response = await client.post(
-        f"{base}/api/v1/agents/runtime/formal-live-source/validate",
-        json={"binding": binding},
+        f"{base}/api/v1/internal/formal-live-source/finalize",
+        json=context,
+        headers={
+            "X-TripChord-Formal-Source-Control": _formal_source_control_token(
+                control_token_path
+            ),
+        },
     )
-    payload = _safe_response_json(response, "formal live source validation")
-    if payload.get("valid") is not True:
-        raise RuntimeError("formal live source authority did not validate the binding")
+    payload = _safe_response_json(response, "formal live source finalize")
+    binding = TypeAdapter(dict[str, object]).validate_python(payload.get("binding"))
+    receipt = TypeAdapter(dict[str, object]).validate_python(
+        payload.get("authority_receipt")
+    )
+    challenge = TypeAdapter(dict[str, object]).validate_python(payload.get("challenge"))
+    validate_formal_source_evidence(
+        binding,
+        receipt,
+        challenge,
+        expected_context=context,
+    )
+    return {
+        "binding": binding,
+        "authority_receipt": receipt,
+        "challenge": challenge,
+    }
 
 
 def _validated_binding_guard(
-    validated: dict[str, object],
+    receipt: dict[str, object],
+    challenge: dict[str, object],
+    context: dict[str, object],
 ) -> Callable[[object], dict[str, object]]:
-    """Keep the remotely validated object as a process-local writer capability."""
-
-    expected_sha256 = _canonical_sha256(validated)
-
     def guard(candidate: object) -> dict[str, object]:
-        if not isinstance(candidate, dict) or _canonical_sha256(candidate) != expected_sha256:
-            raise ValueError(
-                "formal source binding differs from the API-authority validated binding"
-            )
-        return dict(candidate)
+        return validate_formal_source_evidence(
+            candidate,
+            receipt,
+            challenge,
+            expected_context=context,
+        )
 
     return guard
 
@@ -683,9 +780,6 @@ def _validate_model_trace_receipt(
     counts = (total_count, success_count, failure_count)
     if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in counts):
         raise RuntimeError("live-v4 terminal model trace receipt has invalid counters")
-    assert isinstance(total_count, int) and not isinstance(total_count, bool)
-    assert isinstance(success_count, int) and not isinstance(success_count, bool)
-    assert isinstance(failure_count, int) and not isinstance(failure_count, bool)
     if total_count != success_count + failure_count:
         raise RuntimeError("live-v4 terminal model trace counters do not reconcile")
     result_receipt = {
@@ -1561,8 +1655,10 @@ def _validate_synthetic_sold_out_replan(
         raise RuntimeError(
             "synthetic sold_out Done-Gate event contract failed: " + "；".join(errors)
         )
-    assert resolution is not None
-    assert replacement_component_id is not None
+    if resolution is None or replacement_component_id is None:
+        raise RuntimeError(
+            "synthetic sold_out Done-Gate event contract has no exact resolution"
+        )
     return {
         "passed": True,
         "source": _SYNTHETIC_DONE_GATE_EVENT_SOURCE,
@@ -1679,6 +1775,30 @@ async def _run(
             )
             stage = "validate_runtime_provenance"
             _validate_runtime_provenance(runtime_before)
+            if not args.gate_run_id:
+                raise RuntimeError(
+                    "formal live source requires the outer six-layer gate run_id"
+                )
+            runtime_identity = TypeAdapter(dict[str, object]).validate_python(
+                runtime_before.get("runtime_provenance")
+            )
+            formal_source_context: dict[str, object] = {
+                "run_id": args.gate_run_id,
+                "tested_commit_sha": runtime_identity["commit_sha"],
+                "runtime_identity": runtime_identity,
+                "request_sha256": api_payload_sha256,
+                "candidate_set_sha256": candidate_set.candidate_set_sha256,
+                "scenario_sha256": scenario_sha256,
+            }
+            context["gate_run_id"] = args.gate_run_id
+            stage = "issue_formal_live_source_challenge"
+            formal_source_challenge = await _issue_formal_source_challenge_remote(
+                client,
+                base,
+                formal_source_context,
+                getattr(args, "formal_source_control_token_file", None),
+            )
+            context["formal_live_source_challenge"] = formal_source_challenge
             stage = "companion_preflight"
             companion = await _preflight_companion(
                 client,
@@ -1741,35 +1861,8 @@ async def _run(
                 base,
                 label="live-v4 runtime postflight",
             )
-            formal_source_after = runtime_after.pop("formal_live_source", None)
+            runtime_after.pop("formal_live_source", None)
             context["runtime_after_run"] = runtime_after
-            stage = "validate_formal_live_source_binding"
-            if formal_source_before is not None or formal_source_after is not None:
-                formal_source_binding = await _build_formal_source_binding_remote(
-                    client,
-                    base,
-                    formal_source_before,
-                    formal_source_after,
-                )
-                await _validate_formal_source_binding_remote(
-                    client,
-                    base,
-                    formal_source_binding,
-                )
-                formal_source_validator = _validated_binding_guard(
-                    formal_source_binding
-                )
-                runtime_commit_sha = (
-                    runtime_before.get("runtime_provenance") or {}
-                ).get("commit_sha")
-                if (
-                    formal_source_binding["composition"].get("commit_sha")
-                    != runtime_commit_sha
-                ):
-                    raise RuntimeError(
-                        "formal live source composition is not bound to runtime provenance"
-                    )
-                context["formal_live_source_binding"] = formal_source_binding
             before_trace_count = TypeAdapter(int).validate_python(
                 runtime_before["model_trace_count"]
             )
@@ -1854,6 +1947,28 @@ async def _run(
                     affected_provider=provider,
                 )
                 context["event_execution"]["status"] = "validated"
+            stage = "validate_formal_live_source_binding"
+            if formal_source_before is None:
+                raise RuntimeError(
+                    "runtime exposes no fixed formal source verification anchor"
+                )
+            finalized_source = await _finalize_formal_source_binding_remote(
+                client,
+                base,
+                formal_source_context,
+                getattr(args, "formal_source_control_token_file", None),
+            )
+            formal_source_binding = finalized_source["binding"]
+            formal_source_receipt = finalized_source["authority_receipt"]
+            formal_source_challenge = finalized_source["challenge"]
+            formal_source_validator = _validated_binding_guard(
+                formal_source_receipt,
+                formal_source_challenge,
+                formal_source_context,
+            )
+            context["formal_live_source_binding"] = formal_source_binding
+            context["formal_live_source_authority_receipt"] = formal_source_receipt
+            context["formal_live_source_challenge"] = formal_source_challenge
     except (RuntimeError, ValueError, OSError, httpx.HTTPError) as exc:
         failed_job_control = context.get("live_job_control")
         if isinstance(failed_job_control, dict) and failed_job_control.get("job_id"):
@@ -1904,7 +2019,8 @@ async def _run(
 
     stage = "evaluate_done_gate"
     captured_at = now_factory()
-    assert request is not None
+    if request is None:
+        raise RuntimeError("live-v4 request disappeared before Done-Gate evaluation")
     try:
         report = evaluate_live_v4_done_gate(
             run,

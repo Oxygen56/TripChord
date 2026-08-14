@@ -1012,7 +1012,12 @@ class _FakeIComProvider:
             int,
         ] = {}
 
-    async def search(self, query: IComTransferQuery) -> IComTransferSearchResult:
+    async def search(
+        self,
+        query: IComTransferQuery,
+        *,
+        query_task_id: str | None = None,
+    ) -> IComTransferSearchResult:
         self.queries.append(query)
         query_key = (query.travel_date, query.origin, query.destination)
         query_count = self.query_counts.get(query_key, 0) + 1
@@ -1177,7 +1182,12 @@ class _RetryOnceIComProvider:
         self.delegate = delegate
         self.failures = 0
 
-    async def search(self, query: IComTransferQuery) -> IComTransferSearchResult:
+    async def search(
+        self,
+        query: IComTransferQuery,
+        *,
+        query_task_id: str | None = None,
+    ) -> IComTransferSearchResult:
         if query.travel_date == END and self.failures == 0:
             self.failures += 1
             raise ProviderError(
@@ -1186,7 +1196,7 @@ class _RetryOnceIComProvider:
                 "temporary connection reset",
                 retryable=True,
             )
-        return await self.delegate.search(query)
+        return await self.delegate.search(query, query_task_id=query_task_id)
 
 
 async def _run(

@@ -3583,6 +3583,16 @@ def create_browser_bridge_app(
                 source_authority.record_browser_http(
                     "browser_claim",
                     subject_ids=tuple(lease.task_id for lease in response.leases),
+                    details={
+                        "request": payload.model_dump(
+                            mode="json",
+                            exclude={"reload_receipt"},
+                        ),
+                        "leases": [
+                            lease.model_dump(mode="json", exclude={"claim_token"})
+                            for lease in response.leases
+                        ],
+                    },
                 )
             return response
         except BrowserCompanionReloadNotFoundError as exc:
@@ -3623,6 +3633,10 @@ def create_browser_bridge_app(
             source_authority.record_browser_http(
                 "browser_heartbeat",
                 subject_ids=(heartbeat.companion_id,),
+                details={
+                    "request": payload.model_dump(mode="json"),
+                    "heartbeat": heartbeat.model_dump(mode="json"),
+                },
             )
         return heartbeat
 
@@ -3737,6 +3751,19 @@ def create_browser_bridge_app(
                 source_authority.record_browser_http(
                     "browser_complete",
                     subject_ids=(task_id,),
+                    details={
+                        "task_id": task_id,
+                        "completion": payload.completion.model_dump(mode="json"),
+                        "snapshot": snapshot.model_dump(mode="json"),
+                        "result_sha256": hashlib.sha256(
+                            json.dumps(
+                                snapshot.model_dump(mode="json"),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ).encode("utf-8")
+                        ).hexdigest(),
+                    },
                 )
             return snapshot
         except BrowserTaskNotFoundError as exc:

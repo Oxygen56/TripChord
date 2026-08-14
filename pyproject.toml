@@ -27,6 +27,7 @@ dependencies = [
   "redis>=6.0.0",
   "sqlalchemy[asyncio]>=2.0.40",
   "uvicorn[standard]>=0.34.0",
+  "cryptography>=44.0",
 ]
 
 [project.urls]

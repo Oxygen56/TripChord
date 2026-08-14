@@ -48,7 +48,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
-import httpx
 from tripchord._secret_redact import (
     _ARRAY_PATH_ELEMENT,
     _CREDENTIAL_FIELD_STRONG_NAME_ALT,
@@ -79,7 +78,11 @@ from tripchord._secret_redact import (
     registry_shape_pairs,
 )
 from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
-from tripchord.formal_live_source import validate_formal_source_binding
+from tripchord.formal_live_source import (
+    formal_source_evidence_summary,
+    validate_formal_source_evidence,
+    validate_formal_source_summary,
+)
 from tripchord.planning.frozen_graph import (
     FROZEN_V4_PAIR_COUNT,
     frozen_v4_browser_source_ids,
@@ -688,51 +691,14 @@ def _bridge_token() -> str:
 
 def _validate_formal_source_with_production_authority(
     binding: object,
+    authority_receipt: object | None = None,
+    challenge: object | None = None,
 ) -> dict[str, Any]:
-    """Validate locally or ask the exact running API authority.
-
-    Unit/in-process production chains resolve the random authority capability
-    from the process registry.  The real Done-Gate runs in a separate process,
-    so it uses the running API as a verification oracle.  No caller credential
-    can derive or register an authority key and the endpoint never returns one.
-    """
+    """Verify only with the fixed public anchor; no API/registry oracle exists."""
 
     if not isinstance(binding, dict):
         raise ValueError("formal source binding is not an object")
-    try:
-        return validate_formal_source_binding(binding)
-    except ValueError as local_error:
-        api_base = os.environ.get(
-            "TRIPCHORD_API_BASE",
-            "http://127.0.0.1:8000",
-        ).rstrip("/")
-        try:
-            response = httpx.post(
-                f"{api_base}/api/v1/agents/runtime/formal-live-source/validate",
-                json={"binding": binding},
-                timeout=10.0,
-            )
-            response.raise_for_status()
-            receipt = response.json()
-        except (httpx.HTTPError, ValueError):
-            raise ValueError(
-                "formal source binding has no validating production authority"
-            ) from local_error
-        if not isinstance(receipt, dict) or receipt.get("valid") is not True:
-            raise ValueError(
-                "formal source binding production authority rejected it"
-            ) from local_error
-        for key in (
-            "install_id",
-            "composition_sha256",
-            "authority_key_id",
-            "post_chain_sha256",
-        ):
-            if receipt.get(key) != binding.get(key):
-                raise ValueError(
-                    "formal source binding production authority identity mismatch"
-                ) from local_error
-        return dict(binding)
+    return validate_formal_source_evidence(binding, authority_receipt, challenge)
 
 
 def _bridge_env(bridge_token: str) -> dict[str, str]:
@@ -1091,6 +1057,16 @@ _DIGEST_BINDING_PATHS: frozenset[tuple[str | None, ...]] = frozenset(
         ("api_payload_candidate_set_sha256",),
         ("api_payload_sha256",),
         ("scenario_sha256",),
+        ("runtime_identity_sha256",),
+        ("formal_live_source_summary", "authority_key_id"),
+        ("formal_live_source_summary", "nonce_digest"),
+        ("formal_live_source_summary", "binding_digest"),
+        ("formal_live_source_summary", "delta_digest"),
+        ("formal_live_source_summary", "runtime_identity_sha256"),
+        ("formal_live_source_summary", "request_sha256"),
+        ("formal_live_source_summary", "candidate_set_sha256"),
+        ("formal_live_source_summary", "scenario_sha256"),
+        ("formal_live_source_summary", "composition_sha256"),
         (
             "runtime_before_run",
             "runtime_provenance",
@@ -1106,10 +1082,44 @@ _DIGEST_BINDING_PATHS: frozenset[tuple[str | None, ...]] = frozenset(
         ("raw_evidence", "sha256"),
         ("formal_live_source_binding", "composition_sha256"),
         ("formal_live_source_binding", "authority_key_id"),
+        ("formal_live_source_binding", "binding_digest"),
         ("formal_live_source_binding", "pre_chain_sha256"),
-        ("formal_live_source_binding", "pre_authority_mac"),
         ("formal_live_source_binding", "post_chain_sha256"),
-        ("formal_live_source_binding", "post_authority_mac"),
+        ("formal_live_source_binding", "runtime_identity", "dependency_lock_sha256"),
+        ("formal_live_source_binding", "runtime_identity", "live_system_source_sha256"),
+        ("formal_live_source_binding", "challenge", "authority_key_id"),
+        ("formal_live_source_binding", "challenge", "nonce_digest"),
+        ("formal_live_source_binding", "challenge", "request_sha256"),
+        ("formal_live_source_binding", "challenge", "candidate_set_sha256"),
+        ("formal_live_source_binding", "challenge", "scenario_sha256"),
+        (
+            "formal_live_source_binding",
+            "challenge",
+            "runtime_identity",
+            "dependency_lock_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "challenge",
+            "runtime_identity",
+            "live_system_source_sha256",
+        ),
+        ("formal_live_source_binding", "authority_receipt", "authority_key_id"),
+        ("formal_live_source_binding", "authority_receipt", "nonce_digest"),
+        ("formal_live_source_binding", "authority_receipt", "binding_digest"),
+        ("formal_live_source_binding", "authority_receipt", "delta_digest"),
+        (
+            "formal_live_source_binding",
+            "authority_receipt",
+            "runtime_identity",
+            "dependency_lock_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "authority_receipt",
+            "runtime_identity",
+            "live_system_source_sha256",
+        ),
         (
             "formal_live_source_binding",
             "companion_heartbeat_receipt",
@@ -1123,7 +1133,20 @@ _DIGEST_BINDING_PATHS: frozenset[tuple[str | None, ...]] = frozenset(
         (
             "formal_live_source_binding",
             "companion_heartbeat_receipt",
-            "authority_mac",
+            "nonce_digest",
+        ),
+        (
+            "formal_live_source_binding",
+            "companion_heartbeat_receipt",
+            "details",
+            "heartbeat",
+            "build_identity",
+            "build_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "companion_heartbeat_receipt",
+            "signature",
         ),
         (
             "formal_live_source_binding",
@@ -1141,7 +1164,7 @@ _DIGEST_BINDING_PATHS: frozenset[tuple[str | None, ...]] = frozenset(
             "formal_live_source_binding",
             "receipts",
             _ARRAY_MARKER,
-            "authority_mac",
+            "signature",
         ),
         (
             "formal_live_source_binding",
@@ -1149,6 +1172,70 @@ _DIGEST_BINDING_PATHS: frozenset[tuple[str | None, ...]] = frozenset(
             _ARRAY_MARKER,
             "response_sha256",
         ),
+        ("formal_live_source_binding", "receipts", _ARRAY_MARKER, "nonce_digest"),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "result_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "heartbeat",
+            "build_identity",
+            "build_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "snapshot",
+            "quotes",
+            _ARRAY_MARKER,
+            "content_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "completion",
+            "quotes",
+            _ARRAY_MARKER,
+            "content_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "raw_response_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "normalized_evidence_sha256",
+        ),
+        ("formal_live_source_authority_receipt", "authority_key_id"),
+        ("formal_live_source_authority_receipt", "nonce_digest"),
+        ("formal_live_source_authority_receipt", "binding_digest"),
+        ("formal_live_source_authority_receipt", "delta_digest"),
+        ("formal_live_source_authority_receipt", "runtime_identity", "dependency_lock_sha256"),
+        ("formal_live_source_authority_receipt", "runtime_identity", "live_system_source_sha256"),
+        ("formal_live_source_challenge", "authority_key_id"),
+        ("formal_live_source_challenge", "nonce_digest"),
+        ("formal_live_source_challenge", "request_sha256"),
+        ("formal_live_source_challenge", "candidate_set_sha256"),
+        ("formal_live_source_challenge", "scenario_sha256"),
+        ("formal_live_source_challenge", "runtime_identity", "dependency_lock_sha256"),
+        ("formal_live_source_challenge", "runtime_identity", "live_system_source_sha256"),
         (
             "done_gate",
             "checks",
@@ -2034,6 +2121,7 @@ def _scan_decoded_string_value(
     needles: _SecretNeedles,
     label: str,
     name: str,
+    public_proofs: frozenset[str] = frozenset(),
 ) -> None:
     """Scan ONE decoded string value with the full value-pattern set.
 
@@ -2078,6 +2166,8 @@ def _scan_decoded_string_value(
                 f"secret leak: secret value found in decoded value in "
                 f"{label} file {name}"
             )
+    if value in public_proofs:
+        return
     for pattern, kind in (
         (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
         (_ACCOUNT_ID_PATTERN, "account identifier"),
@@ -2138,14 +2228,87 @@ def _make_decoded_value_scanner(
     needles: _SecretNeedles,
     label: str,
     name: str,
+    public_proofs: frozenset[str] = frozenset(),
 ) -> Callable[[str], None]:
     """The ``on_string_value`` callback for :func:`_secret_scan_bytes`'s shared
     bounded walker — scans every decoded string value (补充 A) and aborts the
     walk by raising."""
     def scan(value: str) -> None:
-        _scan_decoded_string_value(value, needles, label, name)
+        _scan_decoded_string_value(
+            value,
+            needles,
+            label,
+            name,
+            public_proofs,
+        )
 
     return scan
+
+
+def _formal_public_proofs(data: bytes, name: str) -> frozenset[str]:
+    if name not in {_COMPACT_E2E_STAGED_NAME, "live-done-gate-v4.json"}:
+        return frozenset()
+    try:
+        payload = json_loads_no_dupes(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return frozenset()
+    if not isinstance(payload, dict):
+        return frozenset()
+    if name == "live-done-gate-v4.json":
+        binding = payload.get("formal_live_source_binding")
+        receipt = payload.get("formal_live_source_authority_receipt")
+        challenge = payload.get("formal_live_source_challenge")
+        expected_context = {
+            "run_id": payload.get("gate_run_id"),
+            "tested_commit_sha": (payload.get("repo_revision") or {}).get(
+                "commit_sha"
+            ),
+            "runtime_identity": (payload.get("runtime_before_run") or {}).get(
+                "runtime_provenance"
+            ),
+            "request_sha256": (payload.get("request_identity") or {}).get(
+                "api_payload_sha256"
+            ),
+            "candidate_set_sha256": payload.get(
+                "api_payload_candidate_set_sha256"
+            ),
+            "scenario_sha256": payload.get("scenario_sha256"),
+        }
+        try:
+            checked = validate_formal_source_evidence(
+                binding,
+                receipt,
+                challenge,
+                expected_context=expected_context,
+            )
+        except ValueError:
+            return frozenset()
+        proofs = {
+            str(checked["challenge"]["signature"]),
+            str(checked["authority_receipt"]["signature"]),
+        }
+        proofs.update(str(event["signature"]) for event in checked["receipts"])
+        return frozenset(proofs)
+    summary = payload.get("formal_live_source_summary")
+    expected_context = {
+        "run_id": payload.get("gate_run_id"),
+        "tested_commit_sha": (payload.get("repo_revision") or {}).get("commit_sha"),
+        "runtime_identity_sha256": payload.get("runtime_identity_sha256"),
+        "request_sha256": payload.get("api_payload_sha256"),
+        "candidate_set_sha256": payload.get("api_payload_candidate_set_sha256"),
+        "scenario_sha256": payload.get("scenario_sha256"),
+    }
+    try:
+        checked = validate_formal_source_summary(
+            summary,
+            expected_context=expected_context,
+        )
+    except ValueError:
+        return frozenset()
+    return frozenset(
+        str(checked[key])
+        for key in ("challenge_signature", "authority_receipt_signature")
+    )
 
 
 def _secret_scan_bytes(
@@ -2208,6 +2371,11 @@ def _secret_scan_bytes(
     # scan: a hash that happens to contain a phone-shaped run of digits is
     # not a leak, and a bare phone number is always decimal (never hex).
     masked_text = _mask_hex_hash_spans(text)
+    # Ed25519 signatures are public fixed-shape proofs, not bearer secrets.
+    # Their exact objects were verified before this generic text-shape scan.
+    masked_text = _FORMAL_SIGNATURE_VALUE_RE.sub(
+        r"\1[FORMAL-SIGNED]\2", masked_text
+    )
     for pattern, kind in (
         (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
         (_ACCOUNT_ID_PATTERN, "account identifier"),
@@ -2350,7 +2518,12 @@ def _secret_scan_bytes(
     # per-value scan (known-needle + shapes + tracking URL, both paths) runs
     # INSIDE the one walker, so a 20k-string document fails closed at node
     # 10001 before any separate traversal could scan all 20k.
-    decoded_value_scanner = _make_decoded_value_scanner(needles, label, name)
+    decoded_value_scanner = _make_decoded_value_scanner(
+        needles,
+        label,
+        name,
+        _formal_public_proofs(data, name),
+    )
     try:
         for level_text, depth, malformed in iter_json_levels(
             text, on_string_value=decoded_value_scanner
@@ -3978,7 +4151,11 @@ def _runtime_provenance_mismatches(
 
 
 def layer6_full_e2e(
-    staging_dir: Path, start: GitSnapshot, *, live_state_db: Path | None = None
+    staging_dir: Path,
+    start: GitSnapshot,
+    *,
+    run_id: str,
+    live_state_db: Path | None = None,
 ) -> LayerResult:
     """Full-platform real E2E only when every external condition is met.
 
@@ -4050,6 +4227,8 @@ def layer6_full_e2e(
             "--api-base",
             "http://127.0.0.1:8000",
             "--require-model-enhancement",
+            "--gate-run-id",
+            run_id,
             "--output",
             str(output_path),
         ],
@@ -4310,7 +4489,12 @@ def run_gate(
             run_id=resolved_run_id,
             tested_commit_sha=tested_commit_sha,
         ),
-        layer6_full_e2e(staging_dir, start, live_state_db=live_state_db),
+        layer6_full_e2e(
+            staging_dir,
+            start,
+            run_id=resolved_run_id,
+            live_state_db=live_state_db,
+        ),
     ]
     # B1 secret scan: bridge token + model API keys must never reach logs or
     # evidence.  Fail closed (exit-2 semantics) before any verdict is certified
@@ -4435,7 +4619,7 @@ _COMPACT_E2E_STAGED_NAME = "done-gate-layer6-compact.json"
 # read-back validator requires — a compact built by any other schema version is
 # rejected (C-122 acceptance).
 _LAYER5_COMPACT_SCHEMA = "tripchord-done-gate-layer5-compact-v2"
-_LAYER6_COMPACT_SCHEMA = "tripchord-done-gate-layer6-compact-v2"
+_LAYER6_COMPACT_SCHEMA = "tripchord-done-gate-layer6-compact-v3"
 # C-122 supervision 09:59 (Block 1): a compact is a PUBLIC contract — its
 # top-level field set is fixed.  A non-canonical ALIAS of a whitelisted digest
 # key (``API_PAYLOAD_CANDIDATE_SET_SHA256``, ``api-payload-candidate-set-
@@ -4469,8 +4653,10 @@ _LAYER6_COMPACT_ALLOWED_TOP_LEVEL = frozenset(
         "api_payload_candidate_set_sha256",
         "api_payload_sha256",
         "scenario_sha256",
+        "gate_run_id",
         "runtime_before_run",
-        "formal_live_source_binding",
+        "runtime_identity_sha256",
+        "formal_live_source_summary",
         "companion_preflight",
         "bridge_state_lease_preflight",
         "bridge_state_lease_postcheck",
@@ -4934,6 +5120,10 @@ _HEX_HASH_RE = re.compile(r"^[0-9a-fA-F]{32,128}$")
 # manifest entry hashes - must be exact 64-hex, not the looser 32-128 range of
 # ``_HEX_HASH_RE`` (which is a secret-scanning shape, not a schema validator).
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_FORMAL_SIGNATURE_VALUE_RE = re.compile(
+    r'("(?:signature|challenge_signature|authority_receipt_signature)"\s*:\s*")'
+    r"[A-Za-z0-9+/]{86}==(\")"
+)
 # The EXACT sub-field set a compact's raw_evidence may carry: the raw origin
 # name + tracked path (the fixed mapping), the committed=false flag, and the
 # independently-recomputable raw blob sha256 + size.  Any extra sub-field is a
@@ -5352,14 +5542,51 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
         raise GateStateChangedError(
             "layer-6 raw evidence formal_live_source_binding is present but is not an object"
         )
+    for source_field in (
+        "formal_live_source_authority_receipt",
+        "formal_live_source_challenge",
+    ):
+        if source_field not in payload or not isinstance(payload[source_field], dict):
+            raise GateStateChangedError(
+                f"layer-6 raw evidence {source_field} is missing or not an exact object"
+            )
+    formal_source_receipt = payload["formal_live_source_authority_receipt"]
+    formal_source_challenge = payload["formal_live_source_challenge"]
+    raw_runtime_identity = (payload.get("runtime_before_run") or {}).get(
+        "runtime_provenance"
+    )
+    raw_expected_context = {
+        "run_id": payload.get("gate_run_id"),
+        "tested_commit_sha": (payload.get("repo_revision") or {}).get("commit_sha"),
+        "runtime_identity": raw_runtime_identity,
+        "request_sha256": (payload.get("request_identity") or {}).get(
+            "api_payload_sha256"
+        ),
+        "candidate_set_sha256": payload.get("api_payload_candidate_set_sha256"),
+        "scenario_sha256": payload.get("scenario_sha256"),
+    }
     try:
-        formal_source_binding = _validate_formal_source_with_production_authority(
-            formal_source_binding
+        formal_source_binding = validate_formal_source_evidence(
+            formal_source_binding,
+            formal_source_receipt,
+            formal_source_challenge,
+            expected_context=raw_expected_context,
         )
     except ValueError as exc:
         raise GateStateChangedError(
             f"layer-6 raw evidence has invalid formal production source "
             f"binding: {exc}"
+        ) from exc
+    try:
+        formal_source_summary = formal_source_evidence_summary(
+            formal_source_binding,
+            formal_source_receipt,
+            formal_source_challenge,
+            expected_context=raw_expected_context,
+        )
+    except ValueError as exc:
+        raise GateStateChangedError(
+            f"layer-6 raw evidence cannot minimize formal source proof: {exc}"
         ) from exc
     # C-122 supervision 01:10: the run's checkpoint-bound sealed pair ids from
     # the job control plane (the terminal job's pair checkpoints), merged into
@@ -5515,6 +5742,7 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
             "api_payload_sha256"
         ),
         "scenario_sha256": payload.get("scenario_sha256"),
+        "gate_run_id": formal_source_challenge.get("run_id"),
         "runtime_before_run": {
             "model_provider": rb.get("model_provider"),
             "primary_model": rb.get("primary_model"),
@@ -5528,7 +5756,8 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
                 "started_at": rp.get("started_at"),
             },
         },
-        "formal_live_source_binding": formal_source_binding,
+        "runtime_identity_sha256": formal_source_summary["runtime_identity_sha256"],
+        "formal_live_source_summary": formal_source_summary,
         "companion_preflight": {
             "status": cp.get("status"),
             "stale_after_seconds": cp.get("stale_after_seconds"),
@@ -5583,16 +5812,47 @@ def _generate_compact_evidence(staging_dir: Path) -> None:
         if payload is None:
             continue
         if staged_name == _COMPACT_E2E_STAGED_NAME:
-            binding = payload.get("formal_live_source_binding")
-            if not isinstance(binding, dict):
+            forbidden_raw = {
+                "formal_live_source_binding",
+                "formal_live_source_authority_receipt",
+                "formal_live_source_challenge",
+            } & set(payload)
+            if forbidden_raw:
                 raise GateStateChangedError(
-                    "layer-6 compact writer formal_live_source_binding is missing or not an object"
+                    "layer-6 compact writer forbids raw formal source evidence: "
+                    + ", ".join(sorted(forbidden_raw))
+                )
+            unknown = set(payload) - _LAYER6_COMPACT_ALLOWED_TOP_LEVEL
+            if unknown:
+                raise GateStateChangedError(
+                    "layer-6 compact writer rejects unknown fields: "
+                    + ", ".join(sorted(unknown))
+                )
+            summary = payload.get("formal_live_source_summary")
+            expected_context = {
+                "run_id": payload.get("gate_run_id"),
+                "tested_commit_sha": (payload.get("repo_revision") or {}).get(
+                    "commit_sha"
+                ),
+                "runtime_identity_sha256": payload.get("runtime_identity_sha256"),
+                "request_sha256": payload.get("api_payload_sha256"),
+                "candidate_set_sha256": payload.get(
+                    "api_payload_candidate_set_sha256"
+                ),
+                "scenario_sha256": payload.get("scenario_sha256"),
+            }
+            if not isinstance(summary, dict):
+                raise GateStateChangedError(
+                    "layer-6 compact writer formal_live_source_summary is missing"
                 )
             try:
-                _validate_formal_source_with_production_authority(binding)
+                validate_formal_source_summary(
+                    summary,
+                    expected_context=expected_context,
+                )
             except ValueError as exc:
                 raise GateStateChangedError(
-                    f"layer-6 compact writer has invalid formal production source binding: {exc}"
+                    f"layer-6 compact writer has invalid formal source summary: {exc}"
                 ) from exc
         # Atomic + owner-only from the start (C-118): the tmp is sealed to 0600
         # before the rename, so no window exposes a partially-written compact
@@ -7287,6 +7547,7 @@ def _verify_layer6_compact_contract(
     compact: dict[str, Any],
     *,
     tested_commit_sha: str | None = None,
+    expected_run_id: str | None = None,
 ) -> None:
     """C-118: hard-verify the committed layer-6 compact from E's blob.
 
@@ -7477,7 +7738,8 @@ def _verify_layer6_compact_contract(
     for key in (
         "repo_revision",
         "runtime_before_run",
-        "formal_live_source_binding",
+        "runtime_identity_sha256",
+        "formal_live_source_summary",
         "companion_preflight",
         "event_injection_contract",
         "timeout_contract",
@@ -7487,9 +7749,33 @@ def _verify_layer6_compact_contract(
             raise GateStateChangedError(
                 f"evidence commit E layer-6 compact {tracked_rel} missing {key!r}"
             )
+    summary_value = compact.get("formal_live_source_summary")
+    if not isinstance(summary_value, dict):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} has no exact formal summary"
+        )
+    gate_run_id = compact.get("gate_run_id")
+    if not isinstance(gate_run_id, str) or not gate_run_id:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} has no gate_run_id"
+        )
+    if expected_run_id is not None and gate_run_id != expected_run_id:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} replays a foreign run_id"
+        )
+    expected_formal_context = {
+        "run_id": gate_run_id,
+        "tested_commit_sha": tested_commit_sha
+        or (compact.get("repo_revision") or {}).get("commit_sha"),
+        "runtime_identity_sha256": compact.get("runtime_identity_sha256"),
+        "request_sha256": compact.get("api_payload_sha256"),
+        "candidate_set_sha256": compact.get("api_payload_candidate_set_sha256"),
+        "scenario_sha256": compact.get("scenario_sha256"),
+    }
     try:
-        formal_source_binding = _validate_formal_source_with_production_authority(
-            compact.get("formal_live_source_binding")
+        validate_formal_source_summary(
+            summary_value,
+            expected_context=expected_formal_context,
         )
     except ValueError as exc:
         raise GateStateChangedError(
@@ -7598,7 +7884,12 @@ def _verify_layer6_compact_contract(
             f"evidence commit E layer-6 compact {tracked_rel} repo_revision "
             f"commit_sha {repo_sha!r} != tested_commit_sha {tested_commit_sha!r}"
         )
-    formal_source_commit = formal_source_binding["composition"]["commit_sha"]
+    formal_source_commit = summary_value.get("tested_commit_sha")
+    if not isinstance(formal_source_commit, str):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} formal source "
+            "summary has no tested commit"
+        )
     if formal_source_commit.lower() != repo_sha.lower():
         raise GateStateChangedError(
             f"evidence commit E layer-6 compact {tracked_rel} formal production "
@@ -7887,7 +8178,10 @@ def _verify_evidence_contract(
             _verify_layer5_compact_contract(tracked_rel, compact)
         elif staged_name == _COMPACT_E2E_STAGED_NAME:
             _verify_layer6_compact_contract(
-                tracked_rel, compact, tested_commit_sha=tested_commit_sha
+                tracked_rel,
+                compact,
+                tested_commit_sha=tested_commit_sha,
+                expected_run_id=run_id,
             )
 
 
@@ -9114,6 +9408,7 @@ def verify_gate_ref(run_id: str) -> dict[str, Any]:
                                 tracked_rel,
                                 compact,
                                 tested_commit_sha=tested_commit_sha,
+                                expected_run_id=run_id,
                             )
                         except GateStateChangedError as exc:
                             problems.append(str(exc))

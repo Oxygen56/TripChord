@@ -422,9 +422,25 @@ class IComTransferProvider:
         if self._owns_client:
             await self._client.aclose()
 
-    async def search(self, query: IComTransferQuery) -> IComTransferSearchResult:
+    async def search(
+        self,
+        query: IComTransferQuery,
+        *,
+        query_task_id: str | None = None,
+    ) -> IComTransferSearchResult:
+        if (
+            not query_task_id
+            and self._source_authority is not None
+            and self._source_authority.public_status()["challenge_active"] is True
+        ):
+            raise ValueError("iCom query_task_id is required")
+        recorded_task_id = query_task_id or "non-formal-query"
+        query_identity = query.model_dump(mode="json")
         requests = (
-            self._fetch(_Endpoint.SCHEDULES, params={"date": query.travel_date.isoformat()}),
+            self._fetch(
+                _Endpoint.SCHEDULES,
+                params={"date": query.travel_date.isoformat()},
+            ),
             self._fetch(_Endpoint.BASE_FARE),
             self._fetch(_Endpoint.POLICY),
         )
@@ -450,6 +466,35 @@ class IComTransferProvider:
                     f"unexpected iCom {endpoint.name.lower()} failure: {type(result).__name__}",
                 ) from result
             fetched_by_endpoint[endpoint] = result
+
+        if self._source_authority is not None:
+            for endpoint in _ENDPOINTS:
+                fetched = fetched_by_endpoint[endpoint]
+                parsed_query = dict(
+                    httpx.QueryParams(httpx.URL(fetched.source_url).query)
+                )
+                self._source_authority.record_icom_http(
+                    endpoint.value,
+                    response_sha256=fetched.response_sha256,
+                    details={
+                        "query_task_id": recorded_task_id,
+                        "query_identity": query_identity,
+                        "url": fetched.source_url,
+                        "path": endpoint.value,
+                        "query": parsed_query,
+                        "travel_date": parsed_query.get("date"),
+                        "captured_at": fetched.captured_at.isoformat(),
+                        "raw_response_sha256": fetched.response_sha256,
+                        "normalized_evidence_sha256": hashlib.sha256(
+                            json.dumps(
+                                fetched.payload,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ).encode("utf-8")
+                        ).hexdigest(),
+                    },
+                )
 
         schedules_source = fetched_by_endpoint[_Endpoint.SCHEDULES]
         fare_source = fetched_by_endpoint[_Endpoint.BASE_FARE]
@@ -519,11 +564,6 @@ class IComTransferProvider:
                 response_sha256=hashlib.sha256(raw).hexdigest(),
                 payload=payload,
             )
-            if self._source_authority is not None:
-                self._source_authority.record_icom_http(
-                    endpoint.value,
-                    response_sha256=fetched.response_sha256,
-                )
             return fetched
         except ProviderError:
             raise

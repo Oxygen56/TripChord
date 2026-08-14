@@ -35,6 +35,57 @@ from scripts import run_product_done_gate as gate
 # very end, while the product branch / HEAD / real index / worktree stay
 # byte-for-byte read-only.  A 12-hex run_id is required to name the ref.
 _TEST_RUN_ID = "a1b2c3d4e5f6"
+_TEST_FORMAL_PRIVATE_KEY_PATH: Path | None = None
+_TEST_FORMAL_LEDGER_PATH: Path | None = None
+_TEST_FORMAL_CONTROL_TOKEN_PATH: Path | None = None
+_TEST_FORMAL_PUBLIC_KEY_DER: bytes | None = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def isolated_formal_source_trust_root(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Any:
+    """Every formal-source test uses a fresh tmp trust root and ledger."""
+    import tripchord.formal_live_source as formal_source
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    global _TEST_FORMAL_CONTROL_TOKEN_PATH
+    global _TEST_FORMAL_LEDGER_PATH
+    global _TEST_FORMAL_PRIVATE_KEY_PATH
+    global _TEST_FORMAL_PUBLIC_KEY_DER
+
+    root = tmp_path_factory.mktemp("formal-source-trust")
+    private_key = Ed25519PrivateKey.generate()
+    private_path = root / "authority-private.pem"
+    private_path.write_bytes(
+        private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    private_path.chmod(0o600)
+    control_path = root / "control-token"
+    control_path.write_text("T" * 64 + "\n", encoding="utf-8")
+    control_path.chmod(0o600)
+    public_der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    original_der = formal_source._PUBLIC_KEY_DER
+    original_key_id = formal_source._AUTHORITY_KEY_ID
+    formal_source._PUBLIC_KEY_DER = public_der
+    formal_source._AUTHORITY_KEY_ID = hashlib.sha256(public_der).hexdigest()
+    _TEST_FORMAL_PRIVATE_KEY_PATH = private_path
+    _TEST_FORMAL_LEDGER_PATH = root / "challenge-ledger.json"
+    _TEST_FORMAL_CONTROL_TOKEN_PATH = control_path
+    _TEST_FORMAL_PUBLIC_KEY_DER = public_der
+    try:
+        yield
+    finally:
+        formal_source._PUBLIC_KEY_DER = original_der
+        formal_source._AUTHORITY_KEY_ID = original_key_id
 
 
 def _init_git_repo(root: Path) -> None:
@@ -127,11 +178,12 @@ def _populating_passing_layers(
         encoding="utf-8",
     )
     monkeypatch.setenv(gate._BRIDGE_STATE_ENV, str(bridge_state_path))
+    monkeypatch.setattr(gate, "_new_run_id", lambda: _TEST_RUN_ID)
     monkeypatch.setattr(
         gate,
         "layer1_reproducibility",
         lambda *args, sd=staging_dir: (
-            _populate_required_evidence(sd),
+            _populate_required_evidence(sd, run_id=_TEST_RUN_ID),
             gate.LayerResult(name="1_reproducibility", passed=True),
         )[1],
     )
@@ -163,11 +215,12 @@ def _populating_passing_layers_without(
         sd: Path = staging_dir,
         names: tuple[str, ...] = missing_names,
     ) -> gate.LayerResult:
-        _populate_required_evidence(sd)
+        _populate_required_evidence(sd, run_id=_TEST_RUN_ID)
         for name in names:
             (sd / name).unlink(missing_ok=True)
         return gate.LayerResult(name="1_reproducibility", passed=True)
 
+    monkeypatch.setattr(gate, "_new_run_id", lambda: _TEST_RUN_ID)
     monkeypatch.setattr(gate, "layer1_reproducibility", layer1)
     for attr, layer_name in (
         ("layer2_replay", "2_replay"),
@@ -188,6 +241,7 @@ def _populating_passing_layers_without(
 def _fixture_formal_source_binding(
     commit_sha: str = "a" * 40,
     *,
+    run_id: str = "fixture-formal-run",
     install_id: str = "00000000-0000-4000-8000-000000000001",
     authority_secret: str | None = None,
     trust: bool = True,
@@ -197,12 +251,18 @@ def _fixture_formal_source_binding(
     The formal end-to-end positive never uses this synthetic helper; it reads
     the binding emitted by the production composition and transport boundaries.
     """
+    import base64
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from tripchord.formal_live_source import (
-        _AUTHORITY_KEYS,
-        _authority_key_id,
-        _authority_mac,
-        _derive_authority_key,
-        _snapshot_mac_payload,
+        _ANCHOR_VERSION,
+        _AUTHORITY_KEY_ID,
+        _BINDING_SCHEMA_VERSION,
+        _CHALLENGE_SCHEMA_VERSION,
+        _RECEIPT_SCHEMA_VERSION,
+        _challenge_proof_payload,
+        _receipt_proof_payload,
         formal_composition_contract,
         validate_formal_source_binding,
     )
@@ -222,13 +282,55 @@ def _fixture_formal_source_binding(
     composition_sha256 = digest(
         {"install_id": install_id, "composition": composition}
     )
-    authority_secret = authority_secret or gate._bridge_token() or ("B" * 64)
-    authority_key = _derive_authority_key(
-        authority_secret,
-        install_id=install_id,
-        composition_sha256=composition_sha256,
-    )
-    authority_key_id = _authority_key_id(authority_key)
+    if trust:
+        assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
+        loaded = serialization.load_pem_private_key(
+            _TEST_FORMAL_PRIVATE_KEY_PATH.read_bytes(),
+            password=None,
+        )
+        assert isinstance(loaded, Ed25519PrivateKey)
+        private_key = loaded
+    else:
+        seed = hashlib.sha256(
+            (authority_secret or "foreign-formal-source-authority").encode()
+        ).digest()
+        private_key = Ed25519PrivateKey.from_private_bytes(seed)
+
+    def sign(value: object) -> str:
+        raw = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        return base64.b64encode(private_key.sign(raw)).decode()
+
+    runtime_identity = {
+        "pid": 1,
+        "started_at": "2026-08-10T00:00:00+00:00",
+        "repo_toplevel": "/repo",
+        "commit_sha": commit_sha,
+        "dependency_lock_sha256": "d" * 64,
+        "live_system_source_sha256": "e" * 64,
+        "python_version": "3.12.0",
+        "python_executable": "/usr/bin/python3",
+    }
+    challenge: dict[str, object] = {
+        "schema_version": _CHALLENGE_SCHEMA_VERSION,
+        "anchor_version": _ANCHOR_VERSION,
+        "authority_key_id": _AUTHORITY_KEY_ID,
+        "challenge_id": "10000000-0000-4000-8000-000000000001",
+        "nonce_digest": "f" * 64,
+        "run_id": run_id,
+        "tested_commit_sha": commit_sha,
+        "runtime_identity": runtime_identity,
+        "request_sha256": "f" * 64,
+        "candidate_set_sha256": "a" * 64,
+        "scenario_sha256": "a" * 64,
+        "issued_at": "2026-08-10T00:00:00+00:00",
+        "expires_at": "2026-08-10T01:00:00+00:00",
+    }
+    challenge["signature"] = sign(_challenge_proof_payload(challenge))
     previous = composition_sha256
     events: list[dict[str, object]] = []
     rows = (
@@ -278,72 +380,228 @@ def _fixture_formal_source_binding(
     for sequence, (kind, method, path, subject_ids, response_sha256) in enumerate(
         rows, start=1
     ):
+        companion_identity = {
+            "companion_id": "comp-1",
+            "providers": ["ctrip", "qunar", "tongcheng"],
+            "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
+            "adapter_version": "fixture-adapter",
+            "contract_version": "tripchord-browser-companion-v1",
+            "runtime_instance_id": "fixture-runtime-instance-0001",
+        }
+        query_identity = {
+            "origin": "HGH",
+            "destination": "MLE",
+            "start_date": "2026-08-23",
+            "end_date": "2026-08-30",
+            "adults": 1,
+            "rooms": 1,
+            "currency": "CNY",
+            "origin_code": "HGH",
+            "destination_code": "MLE",
+            "search_url": None,
+            "options": {},
+        }
+        if kind == "browser_heartbeat":
+            details = {
+                "request": companion_identity,
+                "heartbeat": {
+                    **companion_identity,
+                    "last_seen": "2026-08-10T00:00:01+00:00",
+                    "age_seconds": 0.0,
+                    "is_fresh": True,
+                    "build_identity": {
+                        "protocol_version": "tripchord-companion-control-v1",
+                        "manifest_version": "1.0.0",
+                        "build_sha256": "9" * 64,
+                        "content_runtime_version": "1.0.0",
+                    },
+                },
+            }
+        elif kind == "browser_claim":
+            details = {
+                "request": {
+                    **companion_identity,
+                    "limit": 6,
+                    "build_identity": {
+                        "protocol_version": "tripchord-companion-control-v1",
+                        "manifest_version": "1.0.0",
+                        "build_sha256": "9" * 64,
+                        "content_runtime_version": "1.0.0",
+                    },
+                },
+                "leases": [
+                    {
+                        "task_id": "task-1",
+                        "provider": "ctrip",
+                        "kind": "flight",
+                        "query": query_identity,
+                        "timeout_seconds": 30,
+                        "claimed_at": "2026-08-10T00:00:02+00:00",
+                        "lease_expires_at": "2026-08-10T00:00:32+00:00",
+                    }
+                ],
+            }
+        elif kind == "browser_complete":
+            quotes = [
+                {
+                    "provider": "ctrip",
+                    "kind": "flight",
+                    "page_url": "https://flights.ctrip.com/online/list/oneway-hgh-mle",
+                    "captured_at": "2026-08-10T00:00:03+00:00",
+                    "parser_version": "fixture-v1",
+                    "visible_evidence": "fixture visible result",
+                    "evidence_sha256": "8" * 64,
+                    "currency": "CNY",
+                    "amount": "100.00",
+                    "price_basis": "per_person",
+                    "taxes_included": True,
+                    "title": "fixture flight",
+                    "details": {},
+                }
+            ]
+            snapshot = {
+                "id": "task-1",
+                "provider": "ctrip",
+                "kind": "flight",
+                "query": query_identity,
+                "state": "succeeded",
+                "created_at": "2026-08-10T00:00:01+00:00",
+                "updated_at": "2026-08-10T00:00:03+00:00",
+                "attempt_count": 1,
+                "claimed_by": "comp-1",
+                "claimed_at": "2026-08-10T00:00:02+00:00",
+                "quotes": quotes,
+                "failure": None,
+                "reused_from_task_id": None,
+                "reuse_age_seconds": None,
+                "inflight_coalesced": False,
+            }
+            details = {
+                "task_id": "task-1",
+                "completion": {
+                    "state": "succeeded",
+                    "quotes": quotes,
+                    "failure": None,
+                },
+                "snapshot": snapshot,
+                "result_sha256": digest(snapshot),
+            }
+        else:
+            query = (
+                {"date": "2026-08-23"}
+                if path == "/api/v1/public/trips/schedules"
+                else {}
+            )
+            suffix = f"?date={query['date']}" if query else ""
+            details = {
+                "query_task_id": "public-transfer-icom-continuous-outbound",
+                "query_identity": {
+                    "travel_date": "2026-08-23",
+                    "origin": "Airport",
+                    "destination": "Maafushi",
+                    "adults": 1,
+                },
+                "url": f"https://sfs-api.icomtours.com{path}{suffix}",
+                "path": path,
+                "query": query,
+                "travel_date": query.get("date"),
+                "captured_at": f"2026-08-10T00:00:0{sequence}+00:00",
+                "raw_response_sha256": response_sha256,
+                "normalized_evidence_sha256": str(sequence) * 64,
+            }
         event: dict[str, object] = {
             "sequence": sequence,
             "kind": kind,
             "method": method,
             "path": path,
             "subject_ids": subject_ids,
+            "details": details,
             "response_sha256": response_sha256,
             "observed_at": f"2026-08-10T00:00:0{sequence}+00:00",
+            "challenge_id": challenge["challenge_id"],
+            "nonce_digest": challenge["nonce_digest"],
+            "context": {
+                **{
+                    key: challenge[key]
+                    for key in (
+                        "run_id",
+                        "tested_commit_sha",
+                        "runtime_identity",
+                        "request_sha256",
+                        "candidate_set_sha256",
+                        "scenario_sha256",
+                    )
+                },
+                "challenge_id": challenge["challenge_id"],
+                "nonce_digest": challenge["nonce_digest"],
+                "install_id": install_id,
+                "composition_sha256": composition_sha256,
+            },
             "previous_receipt_sha256": previous,
         }
         event["receipt_sha256"] = digest(event)
-        event["authority_mac"] = _authority_mac(
-            authority_key,
+        event["signature"] = sign(
             {
-                "purpose": "tripchord-formal-live-source-receipt-v1",
+                "purpose": "tripchord-formal-live-source-event-v3",
                 "receipt_sha256": event["receipt_sha256"],
-            },
+            }
         )
         previous = str(event["receipt_sha256"])
         events.append(event)
     binding = {
-        "schema_version": "tripchord-formal-live-source-binding-v1",
+        "schema_version": _BINDING_SCHEMA_VERSION,
+        "anchor_version": _ANCHOR_VERSION,
         "install_id": install_id,
         "composition": composition,
         "composition_sha256": composition_sha256,
-        "authority_key_id": authority_key_id,
-        "pre_event_count": 1,
-        "pre_chain_sha256": events[0]["receipt_sha256"],
-        "pre_authority_mac": _authority_mac(
-            authority_key,
-            _snapshot_mac_payload(
-                install_id=install_id,
-                composition_sha256=composition_sha256,
-                event_count=1,
-                chain_sha256=str(events[0]["receipt_sha256"]),
-            ),
-        ),
+        "authority_key_id": _AUTHORITY_KEY_ID,
+        "runtime_identity": runtime_identity,
+        "challenge": challenge,
+        "pre_event_count": 0,
+        "pre_chain_sha256": composition_sha256,
         "post_event_count": len(events),
         "post_chain_sha256": events[-1]["receipt_sha256"],
-        "post_authority_mac": _authority_mac(
-            authority_key,
-            _snapshot_mac_payload(
-                install_id=install_id,
-                composition_sha256=composition_sha256,
-                event_count=len(events),
-                chain_sha256=str(events[-1]["receipt_sha256"]),
-            ),
-        ),
         "companion_heartbeat_receipt": events[0],
-        "receipts": events[1:],
+        "receipts": events,
     }
+    binding["binding_digest"] = digest(binding)
+    authority_receipt: dict[str, object] = {
+        "schema_version": _RECEIPT_SCHEMA_VERSION,
+        "anchor_version": _ANCHOR_VERSION,
+        "authority_key_id": _AUTHORITY_KEY_ID,
+        "challenge_id": challenge["challenge_id"],
+        "nonce_digest": challenge["nonce_digest"],
+        "binding_digest": binding["binding_digest"],
+        "run_id": challenge["run_id"],
+        "tested_commit_sha": commit_sha,
+        "runtime_identity": runtime_identity,
+        "pre_event_count": 0,
+        "post_event_count": len(events),
+        "delta_digest": digest(events),
+        "issued_at": challenge["issued_at"],
+        "verified_at": "2026-08-10T00:00:07+00:00",
+    }
+    authority_receipt["signature"] = sign(
+        _receipt_proof_payload(authority_receipt)
+    )
+    binding["authority_receipt"] = authority_receipt
     if not trust:
         return binding
-    _AUTHORITY_KEYS[(install_id, authority_key_id)] = authority_key
     return validate_formal_source_binding(binding)
 
 
-def _realistic_e2e_evidence() -> dict[str, object]:
+def _realistic_e2e_evidence(
+    *, run_id: str = "fixture-formal-run"
+) -> dict[str, object]:
     """A full passing layer-6 runner bundle that survives the strong compact
     contract (C-118): ``run_status`` completed, the 15-item ``done_gate`` all
     passed, and the repo / runtime / Companion identity plus the
     event-injection / timeout / runner contracts the committed layer-6 compact
     must preserve.  Values are synthetic and secret-free."""
-    return {
+    evidence: dict[str, object] = {
         "schema_version": "tripchord-live-v4-done-gate-report",
         "run_status": "completed",
+        "gate_run_id": run_id,
         "repo_revision": {
             "toplevel": "/repo",
             "branch": "main",
@@ -356,11 +614,13 @@ def _realistic_e2e_evidence() -> dict[str, object]:
             "model_enabled": True,
             "model_required": True,
             "runtime_provenance": {
+                "pid": 1,
                 "repo_toplevel": "/repo",
                 "commit_sha": "a" * 40,
-                "dependency_lock_sha256": None,
-                "live_system_source_sha256": None,
-                "python_version": "3.12",
+                "dependency_lock_sha256": "d" * 64,
+                "live_system_source_sha256": "e" * 64,
+                "python_version": "3.12.0",
+                "python_executable": "/usr/bin/python3",
                 "started_at": "2026-08-10T00:00:00+00:00",
             },
         },
@@ -421,6 +681,11 @@ def _realistic_e2e_evidence() -> dict[str, object]:
         # complete desensitized checkpoint binding.
         "context": {"pair_checkpoint_binding": _fixture_checkpoint_binding()},
     }
+    source = evidence["formal_live_source_binding"]
+    assert isinstance(source, dict)
+    evidence["formal_live_source_authority_receipt"] = source["authority_receipt"]
+    evidence["formal_live_source_challenge"] = source["challenge"]
+    return evidence
 
 
 def _repo_head_or_none() -> str | None:
@@ -434,7 +699,9 @@ def _repo_head_or_none() -> str | None:
         return None
 
 
-def _populate_required_evidence(staging_dir: Path) -> None:
+def _populate_required_evidence(
+    staging_dir: Path, *, run_id: str = "fixture-formal-run"
+) -> None:
     """Write the fixed required raw-evidence inputs into staging so main()'s
     evidence-contract gate passes and the commit phase is actually exercised.
 
@@ -455,12 +722,17 @@ def _populate_required_evidence(staging_dir: Path) -> None:
     (staging_dir / "live-canary-certified.json").write_text(
         json.dumps(_matching_canary()), encoding="utf-8"
     )
-    raw_e2e = _realistic_e2e_evidence()
+    raw_e2e = _realistic_e2e_evidence(run_id=run_id)
     head = _repo_head_or_none()
     if head is not None:
         raw_e2e["repo_revision"]["commit_sha"] = head  # type: ignore[index]
         raw_e2e["runtime_before_run"]["runtime_provenance"]["commit_sha"] = head  # type: ignore[index]
-        raw_e2e["formal_live_source_binding"] = _fixture_formal_source_binding(head)
+        source = _fixture_formal_source_binding(head, run_id=run_id)
+        raw_e2e["formal_live_source_binding"] = source
+        raw_e2e["formal_live_source_authority_receipt"] = source[
+            "authority_receipt"
+        ]
+        raw_e2e["formal_live_source_challenge"] = source["challenge"]
     (staging_dir / "live-done-gate-v4.json").write_text(
         json.dumps(raw_e2e), encoding="utf-8"
     )
@@ -497,7 +769,7 @@ def _populate_full_required_evidence(
     monkeypatch.setenv(gate._BRIDGE_STATE_ENV, str(bridge_state_path))
     gate._BRIDGE_STATE_SNAPSHOT = None
     gate._BRIDGE_STATE_SNAPSHOT_AFTER = None
-    _populate_required_evidence(staging_dir)
+    _populate_required_evidence(staging_dir, run_id=_TEST_RUN_ID)
     gate._generate_compact_evidence(staging_dir)
 
 
@@ -4086,8 +4358,7 @@ def test_compact_live_e2e_emits_fixed_raw_origin(staging_dir: Path) -> None:
     emits the fixed raw origin from the shared mapping — name, tracked path,
     committed=false, the raw file's real 64-hex sha256 and positive size."""
     staging_dir.mkdir()
-    payload = _matching_done_gate()
-    payload["formal_live_source_binding"] = _fixture_formal_source_binding()
+    payload = _realistic_e2e_evidence()
     (staging_dir / "live-done-gate-v4.json").write_text(
         json.dumps(payload), encoding="utf-8"
     )
@@ -4393,7 +4664,7 @@ def _minimal_evidence_commit_args(
     gate._BRIDGE_STATE_SNAPSHOT_AFTER = None
     # Full required raw evidence + the deterministic layer-5/6 compact artifacts.
     staging_dir.mkdir(exist_ok=True)
-    _populate_required_evidence(staging_dir)
+    _populate_required_evidence(staging_dir, run_id=_TEST_RUN_ID)
     gate._generate_compact_evidence(staging_dir)
     tested_sha = _head(clean_repo)
     report = gate.GateReport(
@@ -5498,7 +5769,7 @@ def test_layer6_bridge_token_env_only_not_argv(
         ),
         encoding="utf-8",
     )
-    result = gate.layer6_full_e2e(staging_dir, start)
+    result = gate.layer6_full_e2e(staging_dir, start, run_id="test-layer6-run")
     assert result.passed is True
     assert any(
         any("run_live_done_gate_v4.py" in part for part in cmd) for cmd, _ in calls
@@ -5549,7 +5820,7 @@ def test_layer6_reports_executor_failure_before_done_gate_truthfully(
         ),
         encoding="utf-8",
     )
-    result = gate.layer6_full_e2e(staging_dir, start)
+    result = gate.layer6_full_e2e(staging_dir, start, run_id="test-layer6-run")
     assert result.passed is False
     assert (
         "executor failed before the done gate at stage 'companion_preflight'"
@@ -5789,7 +6060,9 @@ def test_layer6_fails_when_residual_lease_present(
     monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
     monkeypatch.setenv("TRIPCHORD_ACK_MODEL_COST", "1")
     start = _expected_snapshot(clean_repo)
-    result = gate.layer6_full_e2e(staging_dir, start, live_state_db=db_path)
+    result = gate.layer6_full_e2e(
+        staging_dir, start, run_id="test-layer6-run", live_state_db=db_path
+    )
     assert result.passed is False
     assert "lease preflight" in result.detail
 
@@ -5830,7 +6103,9 @@ def test_layer6_lease_preflight_passes_on_clean_live_state(
         json.dumps({"run_status": "completed", "done_gate": _matching_done_gate()}),
         encoding="utf-8",
     )
-    result = gate.layer6_full_e2e(staging_dir, start, live_state_db=db_path)
+    result = gate.layer6_full_e2e(
+        staging_dir, start, run_id="test-layer6-run", live_state_db=db_path
+    )
     assert result.passed is True
 
 
@@ -6186,19 +6461,10 @@ def test_compact_live_e2e_carries_15_checks(staging_dir: Path) -> None:
     evidence, and the event-injection repair/re-verify master) so a reviewer can
     re-verify each verdict without the raw runner payload."""
     staging_dir.mkdir()
-    done_gate = _matching_done_gate()
-    formal_source_binding = _fixture_formal_source_binding()
+    payload = _realistic_e2e_evidence()
+    payload["captured_at"] = "2026-08-10T00:00:00Z"
     (staging_dir / "live-done-gate-v4.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "tripchord-live-v4-done-gate-report",
-                "run_status": "completed",
-                "repo_revision": "abc123",
-                "captured_at": "2026-08-10T00:00:00Z",
-                "done_gate": done_gate,
-                "formal_live_source_binding": formal_source_binding,
-            }
-        ),
+        json.dumps(payload),
         encoding="utf-8",
     )
     compact = gate._compact_live_e2e(staging_dir)
@@ -6224,14 +6490,16 @@ def test_verify_evidence_contract_rejects_blank_compact_content(
     fail the post-commit re-verify — a blank or hash-only artifact is not enough."""
     _patch_root(monkeypatch, clean_repo)
     _populate_full_required_evidence(monkeypatch, staging_dir)
-    blank_payload = '{"schema_version": "tripchord-done-gate-layer6-compact-v2"}\n'
+    blank_payload = json.dumps(
+        {"schema_version": gate._LAYER6_COMPACT_SCHEMA}
+    ) + "\n"
     staged_compact = staging_dir / gate._COMPACT_E2E_STAGED_NAME
     staged_compact.write_text(blank_payload, encoding="utf-8")
     tested_sha = _head(clean_repo)
     manifest = {
         "schema_version": gate._MANIFEST_SCHEMA,
         "tested_commit_sha": tested_sha,
-        "run_id": "test-run",
+        "run_id": "fixture-formal-run",
         "evidence_commit": tested_sha,
         "generated_at": "2026-08-10T00:00:00+00:00",
         "branch": "main",
@@ -6261,7 +6529,7 @@ def test_verify_evidence_contract_rejects_blank_compact_content(
     with pytest.raises(gate.GateStateChangedError, match="done-gate report"):
         gate._verify_evidence_contract(
             _head(clean_repo), staging_dir, tested_commit_sha=tested_sha,
-            run_id="test-run",
+            run_id="fixture-formal-run",
         )
 
 
@@ -10648,7 +10916,9 @@ def test_layer6_fails_when_bridge_state_holds_residual_work(
     monkeypatch.setattr(gate, "_bridge_token", lambda: "B" * 64)
     monkeypatch.setenv("TRIPCHORD_ACK_MODEL_COST", "1")
     start = _expected_snapshot(clean_repo)
-    result = gate.layer6_full_e2e(staging_dir, start, live_state_db=db_path)
+    result = gate.layer6_full_e2e(
+        staging_dir, start, run_id="test-layer6-run", live_state_db=db_path
+    )
     assert result.passed is False
     assert "bridge" in result.detail
 
@@ -10808,7 +11078,9 @@ def test_layer6_fails_when_postcheck_finds_residual_work(
         json.dumps({"run_status": "completed", "done_gate": _matching_done_gate()}),
         encoding="utf-8",
     )
-    result = gate.layer6_full_e2e(staging_dir, start, live_state_db=db_path)
+    result = gate.layer6_full_e2e(
+        staging_dir, start, run_id="test-layer6-run", live_state_db=db_path
+    )
     assert result.passed is False
     assert "postcheck" in result.detail
 
@@ -11041,8 +11313,27 @@ def _layer6_compact_fixture() -> dict[str, object]:
     done_gate = _matching_done_gate()
     done_gate["check_count"] = 15  # type: ignore[index]
     done_gate["passed_check_count"] = 15  # type: ignore[index]
-    return {
-        "schema_version": "tripchord-done-gate-layer6-compact-v2",
+    source = _fixture_formal_source_binding()
+    from tripchord.formal_live_source import formal_source_evidence_summary
+
+    formal_summary = formal_source_evidence_summary(
+        source,
+        source["authority_receipt"],
+        source["challenge"],
+        expected_context={
+            key: source["challenge"][key]  # type: ignore[index]
+            for key in (
+                "run_id",
+                "tested_commit_sha",
+                "runtime_identity",
+                "request_sha256",
+                "candidate_set_sha256",
+                "scenario_sha256",
+            )
+        },
+    )
+    compact: dict[str, object] = {
+        "schema_version": gate._LAYER6_COMPACT_SCHEMA,
         "run_status": "completed",
         "done_gate": done_gate,
         "repo_revision": {
@@ -11057,7 +11348,9 @@ def _layer6_compact_fixture() -> dict[str, object]:
                 "commit_sha": "a" * 40,
             },
         },
-        "formal_live_source_binding": _fixture_formal_source_binding(),
+        "formal_live_source_summary": formal_summary,
+        "runtime_identity_sha256": formal_summary["runtime_identity_sha256"],
+        "gate_run_id": source["challenge"]["run_id"],  # type: ignore[index]
         "companion_preflight": {
             "status": "connected",
             "stale_after_seconds": 45,
@@ -11112,6 +11405,7 @@ def _layer6_compact_fixture() -> dict[str, object]:
             "size_bytes": 5678,
         },
     }
+    return compact
 
 
 def test_verify_layer6_compact_contract_accepts_full_passing_set() -> None:
@@ -11598,7 +11892,10 @@ def test_verify_layer6_compact_contract_rejects_repo_tested_sha_mismatch() -> No
     compact = _layer6_compact_fixture()
     compact["repo_revision"]["commit_sha"] = "b" * 40  # type: ignore[index]
     compact["runtime_before_run"]["runtime_provenance"]["commit_sha"] = "b" * 40  # type: ignore[index]
-    with pytest.raises(gate.GateStateChangedError, match="!= tested_commit_sha"):
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="invalid formal production source binding",
+    ):
         gate._verify_layer6_compact_contract(
             "done-gate-layer6-compact.json",
             compact,
@@ -13246,10 +13543,18 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
     }
     original_model_router = api_main.model_router
     original_model_trace_sink = api_main.model_trace_sink
+    original_control_path = api_main._FORMAL_SOURCE_CONTROL_PATH
     restored: dict[str, bool] = {}
 
     bridge_token = "c4-formal-run-local-bridge-token-000000000000"
     companion_id = "c4-formal-run-companion"
+    companion_runtime_id = "c4-formal-runtime-instance-0001"
+    companion_build_identity = {
+        "protocol_version": "tripchord-companion-control-v1",
+        "manifest_version": "c4-formal-build-v1",
+        "build_sha256": "9" * 64,
+        "content_runtime_version": "c4-formal-runtime-v1",
+    }
     raw_output = staging_dir.parent / "formal-run" / "live-done-gate-v4.json"
     icom_harness = _C4IComHTTPHarness()
     icom_client = httpx.AsyncClient(
@@ -13269,6 +13574,18 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
             headers=headers,
         ) as companion_client:
             while True:
+                heartbeat = await companion_client.post(
+                    "/browser-bridge/v1/companions/heartbeat",
+                    json={
+                        "companion_id": companion_id,
+                        "providers": ["ctrip", "qunar", "tongcheng"],
+                        "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
+                        "adapter_version": "c4-formal-http-transport",
+                        "contract_version": "tripchord-browser-companion-v1",
+                        "runtime_instance_id": companion_runtime_id,
+                    },
+                )
+                heartbeat.raise_for_status()
                 response = await companion_client.post(
                     "/browser-bridge/v1/tasks/claim",
                     json={
@@ -13279,6 +13596,8 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
                         ),
                         "adapter_version": "c4-formal-http-transport",
                         "contract_version": "tripchord-browser-companion-v1",
+                        "build_identity": companion_build_identity,
+                        "runtime_instance_id": companion_runtime_id,
                         "limit": 6,
                     },
                 )
@@ -13323,6 +13642,10 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
 
     serve_task: asyncio.Task[None] | None = None
     try:
+        assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
+        assert _TEST_FORMAL_LEDGER_PATH is not None
+        assert _TEST_FORMAL_CONTROL_TOKEN_PATH is not None
+        api_main._FORMAL_SOURCE_CONTROL_PATH = _TEST_FORMAL_CONTROL_TOKEN_PATH
         # The production composition entry creates and binds the real bridge,
         # provider, pair runner, flexible runner, and mounted bridge API.  The
         # test never assembles those objects or writes their app.state slots.
@@ -13342,6 +13665,8 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
             icom_http_client=icom_client,
             now=lambda: NOW,
             sleep=_c4_noop_sleep,
+            formal_source_private_key_path=_TEST_FORMAL_PRIVATE_KEY_PATH,
+            formal_source_ledger_path=_TEST_FORMAL_LEDGER_PATH,
         )
         assert bridge is not None and live_system is not None
         flexible_system = app.state.flexible_live_agent_system
@@ -13373,10 +13698,26 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
                     ),
                     "adapter_version": "c4-formal-http-transport",
                     "contract_version": "tripchord-browser-companion-v1",
+                    "runtime_instance_id": companion_runtime_id,
                 },
             )
             companion_heartbeat_status = heartbeat.status_code
             heartbeat.raise_for_status()
+            prime = await setup_client.post(
+                "/browser-bridge/v1/tasks/claim",
+                headers={BRIDGE_TOKEN_HEADER: bridge_token},
+                json={
+                    "companion_id": companion_id,
+                    "providers": ["ctrip", "qunar", "tongcheng"],
+                    "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
+                    "adapter_version": "c4-formal-http-transport",
+                    "contract_version": "tripchord-browser-companion-v1",
+                    "build_identity": companion_build_identity,
+                    "runtime_instance_id": companion_runtime_id,
+                    "limit": 6,
+                },
+            )
+            prime.raise_for_status()
 
         serve_task = asyncio.create_task(serve_browser_transport())
         args = SimpleNamespace(
@@ -13388,6 +13729,11 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
             api_base="http://tripchord.test",
             api_token="",
             bridge_token=bridge_token,
+            gate_run_id=(
+                "test-c4-"
+                + hashlib.sha256(str(staging_dir).encode()).hexdigest()[:24]
+            ),
+            formal_source_control_token_file=_TEST_FORMAL_CONTROL_TOKEN_PATH,
             request_timeout_seconds=3900.0,
             maximum_quote_age_minutes=15,
             minimum_recommendable_options=2,
@@ -13399,6 +13745,30 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
             now_factory=lambda: NOW,
         )
         assert code == 0, "formal live-v4 runner must complete and pass"
+        sealed = json.loads(raw_output.read_text(encoding="utf-8"))
+        sealed_challenge = sealed["formal_live_source_challenge"]
+        replay_context = {
+            key: sealed_challenge[key]
+            for key in (
+                "run_id",
+                "tested_commit_sha",
+                "runtime_identity",
+                "request_sha256",
+                "candidate_set_sha256",
+                "scenario_sha256",
+            )
+        }
+        async with client_factory(base_url="http://tripchord.test") as replay_client:
+            replay = await replay_client.post(
+                "/api/v1/internal/formal-live-source/finalize",
+                headers={
+                    "X-TripChord-Formal-Source-Control": (
+                        api_main._formal_source_control_token()
+                    )
+                },
+                json=replay_context,
+            )
+        assert replay.status_code == 409, "a consumed challenge must fail closed"
     finally:
         if serve_task is not None:
             serve_task.cancel()
@@ -13406,6 +13776,7 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
                 await serve_task
         await icom_client.aclose()
         app.router.routes[:] = original_routes
+        api_main._FORMAL_SOURCE_CONTROL_PATH = original_control_path
         for name, value in original_state.items():
             if value is missing:
                 delattr(app.state, name)
@@ -13888,6 +14259,10 @@ def test_verify_layer6_compact_contract_accepts_real_production_chain(
         staging_dir,
         artifacts.raw_output,
     )
+    assert "formal_live_source_summary" in compact
+    assert "formal_live_source_binding" not in compact
+    assert "formal_live_source_authority_receipt" not in compact
+    assert "formal_live_source_challenge" not in compact
     gate._verify_layer6_compact_contract(
         "done-gate-layer6-compact.json",
         compact,
@@ -14017,7 +14392,7 @@ def test_c4_complete_self_consistent_binding_requires_production_capability(
         trust=False,
     )
 
-    with pytest.raises(ValueError, match="trusted production authority capability"):
+    with pytest.raises(ValueError, match="fixed production authority proof"):
         validate_formal_source_binding(forged)
     with pytest.raises(AssertionError, match="production source binding"):
         _c4_validate_formal_transport_receipts(
@@ -14038,7 +14413,13 @@ def test_c4_complete_self_consistent_binding_requires_production_capability(
             captured_at=datetime.fromisoformat(
                 str(artifacts.raw_payload["captured_at"])
             ),
-            context={"formal_live_source_binding": copy.deepcopy(forged)},
+            context={
+                "formal_live_source_binding": copy.deepcopy(forged),
+                "formal_live_source_authority_receipt": copy.deepcopy(
+                    forged["authority_receipt"]
+                ),
+                "formal_live_source_challenge": copy.deepcopy(forged["challenge"]),
+            },
         )
     with pytest.raises(RuntimeError, match="formal production source binding"):
         _persist_c4_raw_variant(artifacts, staging_dir, raw_payload)
@@ -14065,12 +14446,12 @@ def test_c4_complete_self_consistent_binding_requires_production_capability(
     )
     with pytest.raises(
         gate.GateStateChangedError,
-        match=r"compact writer.*formal production source binding",
+        match=r"compact writer forbids raw formal source evidence",
     ):
         gate._generate_compact_evidence(staging_dir)
     with pytest.raises(
         gate.GateStateChangedError,
-        match="formal production source binding",
+        match="unknown top-level field",
     ):
         gate._verify_layer6_compact_contract(
             "done-gate-layer6-compact.json",
@@ -14099,6 +14480,426 @@ def test_c4_complete_binding_cannot_be_retrusted_with_bridge_token() -> None:
 
     with pytest.raises(ValueError, match="production authority"):
         validate_formal_source_binding(forged)
+
+
+def test_formal_source_public_constructor_cannot_self_register_trust() -> None:
+    """13:47Z faithful red: ordinary code cannot mint a trusted authority.
+
+    The rejected implementation exposed a zero-capability constructor which
+    generated a key and immediately inserted it into a mutable process-global
+    registry.  Merely constructing the object therefore made its future
+    hand-authored receipts trusted in that process.
+    """
+
+    from tripchord.formal_live_source import FormalLiveSourceAuthority
+
+    with pytest.raises(TypeError, match="formal API startup"):
+        FormalLiveSourceAuthority(commit_sha="a" * 40)
+
+
+def test_formal_source_signing_is_not_a_business_principal_route() -> None:
+    """13:47Z faithful red: normal API principals cannot bind or validate."""
+
+    import tripchord.main as api_main
+
+    paths = {getattr(route, "path", None) for route in api_main.app.routes}
+    assert "/api/v1/agents/runtime" in paths
+    assert "/api/v1/agents/runtime/formal-live-source/bind" not in paths
+    assert "/api/v1/agents/runtime/formal-live-source/validate" not in paths
+
+
+def _fresh_installed_formal_authority(
+    tmp_path: Path,
+    *,
+    ledger_name: str = "ledger.json",
+) -> tuple[Any, dict[str, object]]:
+    import httpx
+    import tripchord.main as api_main
+    from fastapi import FastAPI
+
+    assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
+    target = FastAPI()
+    configured = api_main.settings.model_copy(
+        update={
+            "browser_bridge_enabled": True,
+            "browser_bridge_token": "isolated-formal-test-bridge-token-" + "B" * 32,
+            "browser_bridge_control_token": None,
+            "browser_companion_auto_reload_enabled": False,
+            "model_agents_required": False,
+            "adaptive_agent_scaling_enabled": False,
+        }
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: None))
+    api_main._install_browser_bridge(
+        target,
+        configured,
+        icom_http_client=client,
+        now=lambda: NOW,
+        sleep=_c4_noop_sleep,
+        formal_source_private_key_path=_TEST_FORMAL_PRIVATE_KEY_PATH,
+        formal_source_ledger_path=tmp_path / ledger_name,
+    )
+    authority = target.state.formal_live_source_authority
+    runtime = api_main.PROVENANCE.to_dict()
+    context = {
+        "run_id": "isolated-formal-run",
+        "tested_commit_sha": runtime["commit_sha"],
+        "runtime_identity": runtime,
+        "request_sha256": "1" * 64,
+        "candidate_set_sha256": "2" * 64,
+        "scenario_sha256": "3" * 64,
+    }
+    return authority, context
+
+
+def test_formal_challenge_single_active_is_atomic_across_restart(tmp_path: Path) -> None:
+    authority, context = _fresh_installed_formal_authority(tmp_path)
+    issued = authority.issue_challenge(context)
+    ledger = tmp_path / "ledger.json"
+    before = ledger.read_bytes()
+    snapshot = authority.snapshot()
+
+    with pytest.raises(ValueError, match="active challenge"):
+        authority.issue_challenge({**context, "run_id": "second-formal-run"})
+    assert ledger.read_bytes() == before
+    assert authority.snapshot() == snapshot
+    assert authority.public_status()["challenge_active"] is True
+
+    restarted, _ = _fresh_installed_formal_authority(tmp_path)
+    with pytest.raises(ValueError, match="active challenge"):
+        restarted.issue_challenge({**context, "run_id": "restart-foreign-run"})
+    assert ledger.read_bytes() == before
+    assert issued["challenge"]["run_id"] == context["run_id"]
+
+
+def test_formal_source_owner_only_files_reject_links_and_wide_modes(
+    tmp_path: Path,
+) -> None:
+    import tripchord.main as api_main
+    from tripchord.formal_live_source import (
+        load_formal_live_source_authority,
+        read_owner_only_text,
+    )
+
+    assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
+    hardlink = tmp_path / "hardlink-private.pem"
+    os.link(_TEST_FORMAL_PRIVATE_KEY_PATH, hardlink)
+    with pytest.raises(RuntimeError, match="exactly one link"):
+        load_formal_live_source_authority(
+            commit_sha=str(api_main.PROVENANCE.commit_sha),
+            runtime_identity=api_main.PROVENANCE.to_dict(),
+            private_key_path=hardlink,
+            ledger_path=tmp_path / "unused-ledger.json",
+        )
+    hardlink.unlink()
+
+    token = tmp_path / "control-token"
+    token.write_text("C" * 64, encoding="utf-8")
+    token.chmod(0o644)
+    with pytest.raises(RuntimeError, match="owner-only"):
+        read_owner_only_text(token, "test control token", minimum_length=64)
+    token.chmod(0o600)
+    symlink = tmp_path / "control-token-link"
+    symlink.symlink_to(token)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        read_owner_only_text(symlink, "test control token", minimum_length=64)
+
+
+def test_formal_source_compact_summary_is_minimal_and_cross_swap_safe() -> None:
+    from tripchord.formal_live_source import (
+        formal_source_evidence_summary,
+        validate_formal_source_summary,
+    )
+
+    binding = _fixture_formal_source_binding()
+    challenge = binding["challenge"]
+    assert isinstance(challenge, dict)
+    expected = {
+        key: challenge[key]
+        for key in (
+            "run_id",
+            "tested_commit_sha",
+            "runtime_identity",
+            "request_sha256",
+            "candidate_set_sha256",
+            "scenario_sha256",
+        )
+    }
+    summary = formal_source_evidence_summary(
+        binding,
+        binding["authority_receipt"],
+        challenge,
+        expected_context=expected,
+    )
+    forbidden = {
+        "binding",
+        "receipts",
+        "completion",
+        "snapshot",
+        "visible_evidence",
+        "runtime_identity",
+    }
+    assert not (forbidden & set(summary))
+    assert "/repo" not in json.dumps(summary)
+    validate_formal_source_summary(summary, expected_context=expected)
+
+    other = _fixture_formal_source_binding(
+        install_id="00000000-0000-4000-8000-000000000099"
+    )
+    other_summary = formal_source_evidence_summary(
+        other,
+        other["authority_receipt"],
+        other["challenge"],
+        expected_context=expected,
+    )
+    mutations = []
+    swapped = copy.deepcopy(summary)
+    swapped["binding_digest"] = other_summary["binding_digest"]
+    mutations.append(swapped)
+    missing = copy.deepcopy(summary)
+    missing.pop("delta_digest")
+    mutations.append(missing)
+    extra = copy.deepcopy(summary)
+    extra["binding"] = binding
+    mutations.append(extra)
+    wrong = copy.deepcopy(summary)
+    wrong["runtime_identity_sha256"] = "f" * 64
+    mutations.append(wrong)
+    for mutation in mutations:
+        with pytest.raises(ValueError):
+            validate_formal_source_summary(mutation, expected_context=expected)
+
+
+def _reseal_test_formal_binding(binding: dict[str, object]) -> dict[str, object]:
+    import base64
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from tripchord.formal_live_source import _receipt_proof_payload
+
+    assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
+    loaded = serialization.load_pem_private_key(
+        _TEST_FORMAL_PRIVATE_KEY_PATH.read_bytes(),
+        password=None,
+    )
+    assert isinstance(loaded, Ed25519PrivateKey)
+
+    def digest(value: object) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+
+    def sign(value: object) -> str:
+        raw = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        return base64.b64encode(loaded.sign(raw)).decode()
+
+    candidate = copy.deepcopy(binding)
+    events = candidate["receipts"]
+    assert isinstance(events, list)
+    previous = str(candidate["composition_sha256"])
+    for event in events:
+        assert isinstance(event, dict)
+        event["previous_receipt_sha256"] = previous
+        unsigned = {
+            key: value
+            for key, value in event.items()
+            if key not in {"receipt_sha256", "signature"}
+        }
+        event["receipt_sha256"] = digest(unsigned)
+        event["signature"] = sign(
+            {
+                "purpose": "tripchord-formal-live-source-event-v3",
+                "receipt_sha256": event["receipt_sha256"],
+            }
+        )
+        previous = str(event["receipt_sha256"])
+    candidate["companion_heartbeat_receipt"] = copy.deepcopy(events[0])
+    candidate["post_chain_sha256"] = previous
+    candidate["post_event_count"] = len(events)
+    unsigned_binding = {
+        key: value
+        for key, value in candidate.items()
+        if key not in {"binding_digest", "authority_receipt"}
+    }
+    candidate["binding_digest"] = digest(unsigned_binding)
+    receipt = candidate["authority_receipt"]
+    assert isinstance(receipt, dict)
+    receipt["binding_digest"] = candidate["binding_digest"]
+    receipt["post_event_count"] = len(events)
+    receipt["delta_digest"] = digest(events)
+    receipt["signature"] = sign(_receipt_proof_payload(receipt))
+    return candidate
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda binding: binding["receipts"][0].update({"sequence": True}),
+        lambda binding: binding["receipts"][0]["details"]["heartbeat"].update(
+            {"age_seconds": 0}
+        ),
+        lambda binding: binding["receipts"][1]["details"]["request"].update(
+            {"limit": True}
+        ),
+        lambda binding: binding["receipts"][1]["details"]["leases"][0].update(
+            {"timeout_seconds": -1}
+        ),
+        lambda binding: binding["receipts"][2]["details"]["snapshot"].update(
+            {"attempt_count": True}
+        ),
+        lambda binding: binding["receipts"][3]["details"]["query_identity"].update(
+            {"adults": True}
+        ),
+        lambda binding: binding["receipts"][3]["details"].update(
+            {"foreign": "field"}
+        ),
+        lambda binding: binding["receipts"].pop(),
+        lambda binding: binding["receipts"].append(
+            {
+                **copy.deepcopy(binding["receipts"][-1]),
+                "sequence": len(binding["receipts"]) + 1,
+            }
+        ),
+    ],
+)
+def test_formal_source_full_reseal_type_matrix_fails_closed(
+    mutate: Callable[[dict[str, object]], None],
+) -> None:
+    from tripchord.formal_live_source import validate_formal_source_evidence
+
+    candidate = copy.deepcopy(_fixture_formal_source_binding())
+    mutate(candidate)
+    candidate = _reseal_test_formal_binding(candidate)
+    challenge = candidate["challenge"]
+    assert isinstance(challenge, dict)
+    expected = {
+        key: challenge[key]
+        for key in (
+            "run_id",
+            "tested_commit_sha",
+            "runtime_identity",
+            "request_sha256",
+            "candidate_set_sha256",
+            "scenario_sha256",
+        )
+    }
+    with pytest.raises(ValueError):
+        validate_formal_source_evidence(
+            candidate,
+            candidate["authority_receipt"],
+            challenge,
+            expected_context=expected,
+        )
+
+
+def test_formal_source_fixed_anchor_is_offline_and_run_specific(
+    tmp_path: Path,
+) -> None:
+    """A valid receipt survives a new process, but not a foreign run context."""
+    from tripchord.formal_live_source import validate_formal_source_evidence
+
+    binding = _fixture_formal_source_binding()
+    challenge = binding["challenge"]
+    receipt = binding["authority_receipt"]
+    assert isinstance(challenge, dict)
+    expected = {
+        key: challenge[key]
+        for key in (
+            "run_id",
+            "tested_commit_sha",
+            "runtime_identity",
+            "request_sha256",
+            "candidate_set_sha256",
+            "scenario_sha256",
+        )
+    }
+    validate_formal_source_evidence(binding, receipt, challenge, expected_context=expected)
+    replay = {**expected, "run_id": "foreign-formal-run"}
+    with pytest.raises(ValueError, match="foreign run_id"):
+        validate_formal_source_evidence(
+            binding,
+            receipt,
+            challenge,
+            expected_context=replay,
+        )
+
+    from tripchord.formal_live_source import formal_source_evidence_summary
+
+    summary = formal_source_evidence_summary(
+        binding,
+        receipt,
+        challenge,
+        expected_context=expected,
+    )
+    artifact = tmp_path / "formal-source-binding.json"
+    artifact.write_text(
+        json.dumps(
+            {"binding": binding, "summary": summary, "expected": expected}
+        ),
+        encoding="utf-8",
+    )
+    assert _TEST_FORMAL_PUBLIC_KEY_DER is not None
+    public_anchor = tmp_path / "formal-source-public.der"
+    public_anchor.write_bytes(_TEST_FORMAL_PUBLIC_KEY_DER)
+    public_anchor.chmod(0o600)
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import hashlib,json,sys; "
+                "import tripchord.formal_live_source as f; "
+                "f._PUBLIC_KEY_DER=open(sys.argv[2],'rb').read(); "
+                "f._AUTHORITY_KEY_ID=hashlib.sha256(f._PUBLIC_KEY_DER).hexdigest(); "
+                "p=json.load(open(sys.argv[1], encoding='utf-8')); "
+                "f.validate_formal_source_binding(p['binding']); "
+                "f.validate_formal_source_summary("
+                "p['summary'],expected_context=p['expected'])"
+            ),
+            str(artifact),
+            str(public_anchor),
+        ],
+        cwd=_C4_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+
+
+@pytest.mark.parametrize(
+    "field,marker",
+    [
+        ("formal_live_source_authority_receipt", None),
+        ("formal_live_source_authority_receipt", []),
+        ("formal_live_source_challenge", None),
+        ("formal_live_source_challenge", []),
+    ],
+)
+def test_layer6_raw_requires_exact_authority_receipt_and_challenge(
+    staging_dir: Path,
+    field: str,
+    marker: object,
+) -> None:
+    staging_dir.mkdir()
+    payload = _realistic_e2e_evidence()
+    payload[field] = marker
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.GateStateChangedError, match=field):
+        gate._compact_live_e2e(staging_dir)
 
 
 def test_layer6_raw_formal_source_binding_presence_is_strict(
@@ -14146,9 +14947,9 @@ def test_layer6_raw_formal_source_binding_presence_is_strict(
             artifacts.raw_output,
         )
         if marker == "missing":
-            compact.pop("formal_live_source_binding")
+            compact.pop("formal_live_source_summary")
         else:
-            compact["formal_live_source_binding"] = marker
+            compact["formal_live_source_summary"] = marker
         monkeypatch.setattr(gate, "_compact_canary", lambda _staging: None)
         monkeypatch.setattr(
             gate,
@@ -14157,13 +14958,13 @@ def test_layer6_raw_formal_source_binding_presence_is_strict(
         )
         with pytest.raises(
             gate.GateStateChangedError,
-            match="compact writer formal_live_source_binding",
+            match="compact writer formal_live_source_summary",
         ):
             gate._generate_compact_evidence(staging_dir)
         monkeypatch.setattr(gate, "_compact_live_e2e", real_compact_live_e2e)
         with pytest.raises(
             gate.GateStateChangedError,
-            match=r"formal_live_source_binding|formal production source binding",
+            match=r"formal_live_source_summary|exact formal summary",
         ):
             gate._verify_layer6_compact_contract(
                 "done-gate-layer6-compact.json",
@@ -14280,9 +15081,7 @@ def test_layer6_formal_source_binding_rejects_missing_mismatch_and_replacement(
         staging_dir,
         artifacts.raw_output,
     )
-    compact["formal_live_source_binding"]["receipts"][0]["path"] = (
-        "/manual/bypass"
-    )
+    compact["formal_live_source_summary"]["binding_digest"] = "f" * 64
     with pytest.raises(
         gate.GateStateChangedError,
         match="formal production source binding",
@@ -15180,7 +15979,7 @@ def _commit_compact_to_evidence_commit(
     manifest = {
         "schema_version": gate._MANIFEST_SCHEMA,
         "tested_commit_sha": tested_sha,
-        "run_id": "test-run",
+        "run_id": "fixture-formal-run",
         "evidence_commit": tested_sha,
         "generated_at": "2026-08-10T00:00:00+00:00",
         "branch": "main",
@@ -15199,7 +15998,10 @@ def _commit_compact_to_evidence_commit(
     gate._git("add", "--", str(results), check=True)
     gate._git("commit", "-q", "-m", "crafted compact evidence", check=True)
     gate._verify_evidence_contract(
-        _head(clean_repo), staging_dir, tested_commit_sha=tested_sha, run_id="test-run"
+        _head(clean_repo),
+        staging_dir,
+        tested_commit_sha=tested_sha,
+        run_id="fixture-formal-run",
     )
     return _head(clean_repo)
 
@@ -15234,12 +16036,36 @@ def test_blob_readback_rejects_sha_mismatch(
     closed when re-read from the blob."""
 
     def build(tested_sha: str) -> dict[str, object]:
+        from tripchord.formal_live_source import formal_source_evidence_summary
+
         compact = _layer6_compact_fixture()
         compact["repo_revision"]["commit_sha"] = "b" * 40  # type: ignore[index]
         compact["runtime_before_run"]["runtime_provenance"]["commit_sha"] = "b" * 40  # type: ignore[index]
+        source = _fixture_formal_source_binding("b" * 40)
+        summary = formal_source_evidence_summary(
+            source,
+            source["authority_receipt"],
+            source["challenge"],
+            expected_context={
+                key: source["challenge"][key]  # type: ignore[index]
+                for key in (
+                    "run_id",
+                    "tested_commit_sha",
+                    "runtime_identity",
+                    "request_sha256",
+                    "candidate_set_sha256",
+                    "scenario_sha256",
+                )
+            },
+        )
+        compact["formal_live_source_summary"] = summary
+        compact["runtime_identity_sha256"] = summary["runtime_identity_sha256"]
         return compact
 
-    with pytest.raises(gate.GateStateChangedError, match="!= tested_commit_sha"):
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="invalid formal production source binding",
+    ):
         _commit_compact_to_evidence_commit(
             monkeypatch, clean_repo, staging_dir, build
         )

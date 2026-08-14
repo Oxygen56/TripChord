@@ -151,7 +151,11 @@ from tripchord.config import Settings, get_settings
 from tripchord.domain.common import Coordinates
 from tripchord.domain.offers import TravelOffer
 from tripchord.domain.travel_data import Place, RouteLeg, WeatherWindow
-from tripchord.formal_live_source import FormalLiveSourceAuthority
+from tripchord.formal_live_source import (
+    FormalLiveSourceAuthority,
+    load_formal_live_source_authority,
+    read_owner_only_text,
+)
 from tripchord.jobs import (
     JobConflictError,
     JobNotFoundError,
@@ -669,6 +673,8 @@ def _install_browser_bridge(
     icom_http_client: httpx.AsyncClient | None = None,
     now: Callable[[], datetime] | None = None,
     sleep: Callable[[float], Awaitable[None]] | None = None,
+    formal_source_private_key_path: Path | None = None,
+    formal_source_ledger_path: Path | None = None,
 ) -> tuple[BrowserTaskBridge | None, LivePackageAgentSystem | None]:
     token = configured_settings.browser_bridge_token
     if not configured_settings.browser_bridge_enabled or token is None or len(token) < 32:
@@ -687,9 +693,16 @@ def _install_browser_bridge(
     commit_sha = PROVENANCE.commit_sha
     if commit_sha is None:
         raise RuntimeError("formal browser composition requires a git commit identity")
-    source_authority = FormalLiveSourceAuthority(
+    authority_kwargs: dict[str, Any] = {}
+    if formal_source_private_key_path is not None:
+        authority_kwargs["private_key_path"] = formal_source_private_key_path
+    if formal_source_ledger_path is not None:
+        authority_kwargs["ledger_path"] = formal_source_ledger_path
+    source_authority = load_formal_live_source_authority(
         commit_sha=commit_sha,
+        runtime_identity=PROVENANCE.to_dict(),
         now=now,
+        **authority_kwargs,
     )
     bridge = BrowserTaskBridge(now=now)
     icom_provider = IComTransferProvider(
@@ -1289,7 +1302,7 @@ async def agent_runtime_status_endpoint(
             cast(
                 FormalLiveSourceAuthority | None,
                 getattr(app.state, "formal_live_source_authority", None),
-            ).snapshot()
+            ).public_status()
             if getattr(app.state, "formal_live_source_authority", None) is not None
             else None
         ),
@@ -1332,67 +1345,75 @@ async def agent_runtime_status_endpoint(
     )
 
 
-@app.post("/api/v1/agents/runtime/formal-live-source/bind")
-async def bind_formal_live_source_endpoint(
-    payload: dict[str, Any],
-    principal: PrincipalDep,
-) -> dict[str, Any]:
-    """Build a binding inside the API process that owns the source authority.
+_FORMAL_SOURCE_CONTROL_HEADER = "X-TripChord-Formal-Source-Control"
+_FORMAL_SOURCE_CONTROL_PATH = (
+    Path(__file__).resolve().parents[4]
+    / ".runtime"
+    / "formal-source-control-token"
+)
 
-    The Browser token is deliberately irrelevant here: snapshots are accepted
-    only when their install/key identities and MACs belong to the exact formal
-    composition currently mounted by this API process.
-    """
 
-    await rate_limiter.check(principal.tenant_id, "formal-live-source-bind")
-    if set(payload) != {"before", "after"}:
-        raise HTTPException(
-            status_code=422,
-            detail="formal source bind request shape is invalid",
-        )
+def _formal_source_control_token() -> str:
+    return read_owner_only_text(
+        _FORMAL_SOURCE_CONTROL_PATH,
+        "formal source control token",
+        minimum_length=64,
+    )
+
+
+def _authorize_formal_source_control(
+    request: Request,
+    credential: str | None,
+) -> FormalLiveSourceAuthority:
+    host = request.client.host if request.client else None
+    if not is_loopback_client(host):
+        raise HTTPException(status_code=403, detail="formal source control is loopback-only")
+    try:
+        expected = _formal_source_control_token()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if credential is None or not hmac.compare_digest(credential, expected):
+        raise HTTPException(status_code=403, detail="formal source control is unauthorized")
     authority = cast(
         FormalLiveSourceAuthority | None,
-        getattr(app.state, "formal_live_source_authority", None),
+        getattr(request.app.state, "formal_live_source_authority", None),
     )
     if authority is None:
         raise HTTPException(status_code=503, detail="formal source authority is unavailable")
-    try:
-        binding = authority.build_binding(payload["before"], payload["after"])
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"binding": binding}
+    return authority
 
 
-@app.post("/api/v1/agents/runtime/formal-live-source/validate")
-async def validate_formal_live_source_endpoint(
+@app.post("/api/v1/internal/formal-live-source/challenge")
+async def issue_formal_live_source_challenge_endpoint(
     payload: dict[str, Any],
-    principal: PrincipalDep,
+    request: Request,
+    credential: Annotated[
+        str | None,
+        Header(alias=_FORMAL_SOURCE_CONTROL_HEADER),
+    ] = None,
 ) -> dict[str, Any]:
-    """Verify a binding with the payload-external production authority."""
-
-    await rate_limiter.check(principal.tenant_id, "formal-live-source-validate")
-    if set(payload) != {"binding"}:
-        raise HTTPException(
-            status_code=422,
-            detail="formal source validation request shape is invalid",
-        )
-    authority = cast(
-        FormalLiveSourceAuthority | None,
-        getattr(app.state, "formal_live_source_authority", None),
-    )
-    if authority is None:
-        raise HTTPException(status_code=503, detail="formal source authority is unavailable")
+    authority = _authorize_formal_source_control(request, credential)
     try:
-        binding = authority.validate_binding(payload["binding"])
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {
-        "valid": True,
-        "install_id": binding["install_id"],
-        "composition_sha256": binding["composition_sha256"],
-        "authority_key_id": binding["authority_key_id"],
-        "post_chain_sha256": binding["post_chain_sha256"],
-    }
+        return cast(dict[str, Any], authority.issue_challenge(payload))
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/internal/formal-live-source/finalize")
+async def finalize_formal_live_source_endpoint(
+    payload: dict[str, Any],
+    request: Request,
+    credential: Annotated[
+        str | None,
+        Header(alias=_FORMAL_SOURCE_CONTROL_HEADER),
+    ] = None,
+) -> dict[str, Any]:
+    authority = _authorize_formal_source_control(request, credential)
+    try:
+        return cast(dict[str, Any], authority.finalize(payload))
+    except (RuntimeError, ValueError) as exc:
+        logger.warning("formal source finalize rejected: %s", exc)
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post(

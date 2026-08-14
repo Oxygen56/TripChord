@@ -1526,7 +1526,12 @@ def _record_scope_cancellation(
 
 
 class IComTransferSearcher(Protocol):
-    async def search(self, query: IComTransferQuery) -> IComTransferSearchResult: ...
+    async def search(
+        self,
+        query: IComTransferQuery,
+        *,
+        query_task_id: str | None = None,
+    ) -> IComTransferSearchResult: ...
 
 
 class LivePackageAgentSystem:
@@ -7164,7 +7169,10 @@ class LivePackageAgentSystem:
                 query = IComTransferQuery.model_validate(call.arguments.get("query"))
                 for attempt_index in range(2):
                     try:
-                        result = await icom_provider.search(query)
+                        result = await icom_provider.search(
+                            query,
+                            query_task_id=call.task_id,
+                        )
                     except ProviderError as exc:
                         if not exc.retryable or attempt_index == 1:
                             raise
