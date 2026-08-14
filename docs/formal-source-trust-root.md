@@ -22,17 +22,23 @@ The API fails closed if any object is absent, linked, has the wrong owner/mode,
 changes while read, or if the private key and public anchor key id differ.
 
 The API process and the gate runner must receive the same absolute
-`TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT`.  Ordinary API and Browser principals never
-receive the control token or signing key.  Offline validation reads only the
-current generation's public anchor.
+`TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT`; put that explicit value in the service
+manager configuration before starting the controlled API.  There is no
+repository-local or implicit default.  Ordinary API and Browser principals
+never receive the control token or signing key.  Offline validation selects the
+exact retained public generation named by each signed proof.
 
 ## Cold restart and active challenges
 
 The ledger atomically stores the signed challenge, pre-event baseline, complete
-event chain, count/hash, heartbeat and finalization context.  A cold API restart
-restores the one unexpired active flow.  Operators must finalize it or use the
-protected `abort`/`expire` control transition; a second challenge cannot replace
-it.  A consumed, aborted, or expired challenge cannot record or finalize again.
+event chain, count/hash, heartbeat and finalization context.  TripChord uses the
+explicit **non-continuation** restart model: if `pid`/`started_at` changes while a
+challenge is active, startup atomically marks that attempt `aborted` with
+`runtime_restart_requires_new_attempt` and removes its active state.  The old
+signed proof remains auditable, but it cannot record or finalize in the new
+process.  The runner must prepare a new job attempt and receive a new job and
+challenge identity.  A consumed, aborted, or expired challenge cannot record or
+finalize again.
 
 ## Rotation
 
@@ -46,7 +52,11 @@ uv run python scripts/formal_source_trust.py verify
 
 Rotation creates and `fsync`s a complete new generation before atomically
 replacing the owner-only current-generation pointer.  A crash before that final
-replace leaves the old generation authoritative; after it, only the new public
-anchor is authoritative and old-key evidence is deliberately rejected.  Never
-copy a development/test key into this root and never repair permissions with a
-post-creation `chmod`; reprovision a new protected root instead.
+replace leaves the old signing generation current.  After replacement, only the
+new private key can sign new evidence; retained old public anchors continue to
+verify already committed evidence by exact `anchor_version` and `key_id`.
+Unknown, cross-generation, rollback and old-private-key signing attempts remain
+fail-closed.  Restart the controlled API after rotation so no resident process
+can keep the retired private key.  Never copy a development/test key into this
+root and never repair secret-file permissions after creation; reprovision a new
+protected root instead.
