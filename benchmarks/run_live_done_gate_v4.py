@@ -10,7 +10,7 @@ import re
 import secrets
 import subprocess
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -37,6 +37,8 @@ from tripchord.api import (
     StartLiveFlexibleFromTextJobResponse,
 )
 from tripchord.formal_live_source import (
+    formal_job_graph_for_frozen_v4,
+    formal_source_trust_root,
     read_owner_only_text,
     validate_formal_source_binding,
     validate_formal_source_challenge,
@@ -156,7 +158,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument(
         "--formal-source-control-token-file",
         type=Path,
-        default=_REPO_ROOT / ".runtime" / "formal-source-control-token",
+        default=formal_source_trust_root() / "control-token",
     )
     parser.add_argument(
         "--bridge-token",
@@ -375,7 +377,6 @@ def _write_evidence_bundle(
     *,
     passed: bool,
     captured_at: datetime,
-    formal_source_validator: Callable[[object], dict[str, object]] | None = None,
 ) -> Path:
     if passed and bundle.get("run_status") == "completed":
         binding = bundle.get("formal_live_source_binding")
@@ -393,7 +394,7 @@ def _write_evidence_bundle(
                 challenge,
                 expected_context=_formal_source_expected_context(bundle),
             )
-            (formal_source_validator or validate_formal_source_binding)(binding)
+            validate_formal_source_binding(binding)
         except ValueError as exc:
             raise RuntimeError(
                 f"completed raw evidence has invalid formal production source binding: {exc}"
@@ -467,7 +468,6 @@ def _completed_evidence_bundle(
     captured_at: datetime,
     context: dict[str, Any],
     repo_revision: dict[str, Any] | None = None,
-    formal_source_validator: Callable[[object], dict[str, object]] | None = None,
 ) -> dict[str, Any]:
     """Materialize a completed run without dropping pre-run evidence context."""
 
@@ -490,7 +490,7 @@ def _completed_evidence_bundle(
                     request=request,
                 ),
             )
-            (formal_source_validator or validate_formal_source_binding)(binding)
+            validate_formal_source_binding(binding)
         except ValueError as exc:
             raise RuntimeError(
                 f"completed bundle has invalid formal production source binding: {exc}"
@@ -523,7 +523,7 @@ def _formal_source_expected_context(
     scenario_sha256 = payload.get("scenario_sha256")
     if scenario_sha256 is None and request is not None:
         scenario_sha256 = _canonical_sha256(request)
-    return {
+    result: dict[str, object] = {
         "run_id": payload.get("gate_run_id"),
         "tested_commit_sha": (
             runtime_identity.get("commit_sha")
@@ -538,7 +538,17 @@ def _formal_source_expected_context(
         ),
         "candidate_set_sha256": payload.get("api_payload_candidate_set_sha256"),
         "scenario_sha256": scenario_sha256,
+        "job_graph": payload.get("formal_job_graph"),
     }
+    # Completed bundle/raw boundaries require both objects even when a caller
+    # supplies null/list/missing values.  Always pass the exact observed values
+    # into the validator so a present-invalid object cannot silently downgrade
+    # to challenge-only validation or fall back to a legacy context copy.
+    result["terminal_job"] = payload.get("formal_terminal_job")
+    result["pair_checkpoint_binding"] = payload.get(
+        "pair_checkpoint_binding"
+    )
+    return result
 
 
 def _normalized_field_name(value: object) -> str:
@@ -628,7 +638,7 @@ async def _runtime_evidence(
 
 
 def _formal_source_control_token(path: Path | None = None) -> str:
-    path = path or (_REPO_ROOT / ".runtime" / "formal-source-control-token")
+    path = path or (formal_source_trust_root() / "control-token")
     return read_owner_only_text(
         path,
         "formal source control token",
@@ -691,20 +701,30 @@ async def _finalize_formal_source_binding_remote(
     }
 
 
-def _validated_binding_guard(
-    receipt: dict[str, object],
-    challenge: dict[str, object],
-    context: dict[str, object],
-) -> Callable[[object], dict[str, object]]:
-    def guard(candidate: object) -> dict[str, object]:
-        return validate_formal_source_evidence(
-            candidate,
-            receipt,
-            challenge,
-            expected_context=context,
+async def _abort_formal_source_challenge_remote(
+    client: httpx.AsyncClient,
+    base: str,
+    challenge: Mapping[str, object],
+    control_token_path: Path | None = None,
+) -> None:
+    response = await client.post(
+        f"{base}/api/v1/internal/formal-live-source/abort",
+        json={
+            "challenge_id": challenge.get("challenge_id"),
+            "run_id": challenge.get("run_id"),
+            "reason_code": "runner_failed_before_finalize",
+        },
+        headers={
+            "X-TripChord-Formal-Source-Control": _formal_source_control_token(
+                control_token_path
+            ),
+        },
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            "formal source challenge abort must return HTTP 200; "
+            f"observed {response.status_code}"
         )
-
-    return guard
 
 
 def _validate_required_model_runtime(
@@ -1121,13 +1141,19 @@ async def _submit_flexible_live_job(
     base: str,
     payload: dict[str, Any],
     control: dict[str, Any],
+    control_token_path: Path | None = None,
 ) -> StartLiveFlexibleFromTextJobResponse:
     idempotency = TypeAdapter(dict[str, Any]).validate_python(control["idempotency"])
     idempotency_key = TypeAdapter(str).validate_python(idempotency["key"])
     response = await client.post(
         f"{base}{_FROM_TEXT_JOBS_ENDPOINT}",
         json=payload,
-        headers={"Idempotency-Key": idempotency_key},
+        headers={
+            "Idempotency-Key": idempotency_key,
+            "X-TripChord-Formal-Source-Control": _formal_source_control_token(
+                control_token_path
+            ),
+        },
     )
     response_payload = _safe_response_json(response, "live-v4 async job submission")
     if response.status_code != 202:
@@ -1152,6 +1178,63 @@ async def _submit_flexible_live_job(
     )
     _record_job_snapshot(control, started.job)
     return started
+
+
+async def _activate_prepared_flexible_live_job(
+    client: httpx.AsyncClient,
+    base: str,
+    control: dict[str, Any],
+    control_token_path: Path | None = None,
+) -> None:
+    job_id = TypeAdapter(str).validate_python(control.get("job_id"))
+    response = await client.post(
+        f"{base}/api/v1/internal/formal-live-source/jobs/{job_id}/activate",
+        headers={
+            "X-TripChord-Formal-Source-Control": _formal_source_control_token(
+                control_token_path
+            ),
+        },
+    )
+    payload = _safe_response_json(response, "formal prepared live job activation")
+    if response.status_code != 200:
+        raise RuntimeError(
+            "formal prepared live job activation must return HTTP 200; "
+            f"observed {response.status_code}"
+        )
+    activated = LivePlanningJobSnapshot.model_validate(payload.get("job"))
+    if activated.id != job_id or activated.state != LivePlanningJobState.QUEUED:
+        raise RuntimeError("formal prepared live job activation identity/state is invalid")
+
+
+def _formal_terminal_job_contract(
+    snapshot: LivePlanningJobSnapshot,
+    job_graph: dict[str, object],
+) -> dict[str, object]:
+    if snapshot.result is None:
+        raise RuntimeError("formal terminal job has no result")
+    checkpoint_sha256 = [item.checkpoint_sha256 for item in snapshot.pair_checkpoints]
+    return {
+        "id": snapshot.id,
+        "state": snapshot.state.value,
+        "request_sha256": snapshot.request_sha256,
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_chain_sha256": _canonical_sha256(checkpoint_sha256),
+        "result_sha256": _canonical_sha256(snapshot.result),
+        "job_graph_sha256": job_graph["job_graph_sha256"],
+        "ordered_pair_ids_sha256": job_graph["ordered_pair_ids_sha256"],
+        "query_task_membership_sha256": job_graph[
+            "query_task_membership_sha256"
+        ],
+        "publication_query_task_membership_sha256": job_graph[
+            "publication_query_task_membership_sha256"
+        ],
+        "icom_query_membership_sha256": job_graph[
+            "icom_query_membership_sha256"
+        ],
+        "publication_icom_query_membership_sha256": job_graph[
+            "publication_icom_query_membership_sha256"
+        ],
+    }
 
 
 async def _cancel_flexible_live_job(
@@ -1706,7 +1789,6 @@ async def _run(
     event: LiveEventReplanRun | None = None
     stage = "load_request"
     context: dict[str, Any] = {}
-    formal_source_validator: Callable[[object], dict[str, object]] | None = None
     base = args.api_base.rstrip("/")
     # Capture the repo revision BEFORE any work: every evidence bundle is later
     # checked against this marker, so a HEAD move or tracked-tree change during
@@ -1791,6 +1873,29 @@ async def _run(
                 "scenario_sha256": scenario_sha256,
             }
             context["gate_run_id"] = args.gate_run_id
+            live_job_control = _new_live_job_control(
+                request,
+                payload,
+                client_wait_timeout_seconds=request_timeout_seconds,
+            )
+            context["live_job_control"] = live_job_control
+            stage = "prepare_flexible_live_job"
+            await _submit_flexible_live_job(
+                client,
+                base,
+                payload,
+                live_job_control,
+                getattr(args, "formal_source_control_token_file", None),
+            )
+            formal_job_graph = formal_job_graph_for_frozen_v4(
+                terminal_job_id=TypeAdapter(str).validate_python(
+                    live_job_control.get("job_id")
+                ),
+                request_sha256=api_payload_sha256,
+                adults=2,
+            )
+            formal_source_context["job_graph"] = formal_job_graph
+            context["formal_job_graph"] = formal_job_graph
             stage = "issue_formal_live_source_challenge"
             formal_source_challenge = await _issue_formal_source_challenge_remote(
                 client,
@@ -1806,18 +1911,12 @@ async def _run(
                 args.bridge_token,
             )
             context["companion_preflight"] = companion
-            live_job_control = _new_live_job_control(
-                request,
-                payload,
-                client_wait_timeout_seconds=request_timeout_seconds,
-            )
-            context["live_job_control"] = live_job_control
-            stage = "submit_flexible_live_job"
-            await _submit_flexible_live_job(
+            stage = "activate_flexible_live_job"
+            await _activate_prepared_flexible_live_job(
                 client,
                 base,
-                payload,
                 live_job_control,
+                getattr(args, "formal_source_control_token_file", None),
             )
             stage = "await_flexible_live_job"
             terminal_job = await _await_flexible_live_job(
@@ -1846,6 +1945,10 @@ async def _run(
             context["pair_checkpoint_binding"] = _validate_terminal_pair_checkpoints(
                 terminal_job,
                 run,
+            )
+            context["formal_terminal_job"] = _formal_terminal_job_contract(
+                terminal_job,
+                formal_job_graph,
             )
             stage = "validate_job_bound_model_trace_receipt"
             context["model_trace_receipt"] = _validate_model_trace_receipt(
@@ -1878,6 +1981,28 @@ async def _run(
                     "Done-Gate 只信任 terminal job 绑定的模型调用回执。"
                 ),
             }
+            stage = "validate_formal_live_source_binding"
+            if formal_source_before is None:
+                raise RuntimeError(
+                    "runtime exposes no fixed formal source verification anchor"
+                )
+            formal_finalize_context = {
+                **formal_source_context,
+                "terminal_job": context["formal_terminal_job"],
+                "pair_checkpoint_binding": context["pair_checkpoint_binding"],
+            }
+            finalized_source = await _finalize_formal_source_binding_remote(
+                client,
+                base,
+                formal_finalize_context,
+                getattr(args, "formal_source_control_token_file", None),
+            )
+            formal_source_binding = finalized_source["binding"]
+            formal_source_receipt = finalized_source["authority_receipt"]
+            formal_source_challenge = finalized_source["challenge"]
+            context["formal_live_source_binding"] = formal_source_binding
+            context["formal_live_source_authority_receipt"] = formal_source_receipt
+            context["formal_live_source_challenge"] = formal_source_challenge
             if not run.recommended_option_ids:
                 context["event_execution"] = {
                     "status": "skipped",
@@ -1947,29 +2072,25 @@ async def _run(
                     affected_provider=provider,
                 )
                 context["event_execution"]["status"] = "validated"
-            stage = "validate_formal_live_source_binding"
-            if formal_source_before is None:
-                raise RuntimeError(
-                    "runtime exposes no fixed formal source verification anchor"
-                )
-            finalized_source = await _finalize_formal_source_binding_remote(
-                client,
-                base,
-                formal_source_context,
-                getattr(args, "formal_source_control_token_file", None),
-            )
-            formal_source_binding = finalized_source["binding"]
-            formal_source_receipt = finalized_source["authority_receipt"]
-            formal_source_challenge = finalized_source["challenge"]
-            formal_source_validator = _validated_binding_guard(
-                formal_source_receipt,
-                formal_source_challenge,
-                formal_source_context,
-            )
-            context["formal_live_source_binding"] = formal_source_binding
-            context["formal_live_source_authority_receipt"] = formal_source_receipt
-            context["formal_live_source_challenge"] = formal_source_challenge
     except (RuntimeError, ValueError, OSError, httpx.HTTPError) as exc:
+        active_challenge = context.get("formal_live_source_challenge")
+        if isinstance(active_challenge, dict):
+            try:
+                async with (client_factory or httpx.AsyncClient)(
+                    timeout=httpx.Timeout(30),
+                    headers=_headers(args.api_token),
+                ) as abort_client:
+                    await _abort_formal_source_challenge_remote(
+                        abort_client,
+                        base,
+                        active_challenge,
+                        getattr(args, "formal_source_control_token_file", None),
+                    )
+                context["formal_live_source_terminal_transition"] = "aborted"
+            except (RuntimeError, OSError, httpx.HTTPError) as abort_exc:
+                context["formal_live_source_terminal_transition"] = (
+                    f"abort_failed:{type(abort_exc).__name__}"
+                )
         failed_job_control = context.get("live_job_control")
         if isinstance(failed_job_control, dict) and failed_job_control.get("job_id"):
             cancellation_receipt = await _cancel_after_runner_failure(
@@ -2102,7 +2223,6 @@ async def _run(
         captured_at=captured_at,
         context=context,
         repo_revision=repo_revision,
-        formal_source_validator=formal_source_validator,
     )
     bundle = TypeAdapter(dict[str, Any]).validate_python(
         _redact_explicit_secrets(bundle, _runner_secrets(args))
@@ -2112,7 +2232,6 @@ async def _run(
         bundle,
         passed=report.passed,
         captured_at=captured_at,
-        formal_source_validator=formal_source_validator,
     )
     print(
         json.dumps(

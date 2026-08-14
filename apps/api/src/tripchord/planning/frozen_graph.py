@@ -464,7 +464,9 @@ def frozen_v4_query_task_id(
 
 
 @lru_cache(maxsize=1)
-def frozen_v4_per_pair_query_task_ids() -> tuple[dict[str, frozenset[str]], ...]:
+def frozen_v4_ordered_per_pair_query_task_ids() -> tuple[
+    dict[str, tuple[str, ...]], ...
+]:
     """The canonical EXACT per-pair FULL query-task id sets, in trio order.
 
     C-round2 (04:05Z 增量打回): comparing the checkpoint binding's query-task
@@ -497,7 +499,7 @@ def frozen_v4_per_pair_query_task_ids() -> tuple[dict[str, frozenset[str]], ...]
             PlatformRatePolicy(platform=platform) for platform in LIVE_V5_PLATFORMS
         ),
     )
-    per_pair: list[dict[str, frozenset[str]]] = []
+    per_pair: list[dict[str, tuple[str, ...]]] = []
     for index, pair_id in enumerate(frozen_v4_canonical_pair_ids()):
         departure_s, return_s = pair_id.split(":")[1], pair_id.split(":")[2]
         departure = date.fromisoformat(departure_s)
@@ -533,10 +535,19 @@ def frozen_v4_per_pair_query_task_ids() -> tuple[dict[str, frozenset[str]], ...]
             policy,
             stay_plan_candidate_set=candidate_set,
         )
-        per_pair.append(
-            {pair_id: frozenset(task.id for task in plan.tasks)}
-        )
+        per_pair.append({pair_id: tuple(task.id for task in plan.tasks)})
     return tuple(per_pair)
+
+
+@lru_cache(maxsize=1)
+def frozen_v4_per_pair_query_task_ids() -> tuple[dict[str, frozenset[str]], ...]:
+    """The canonical exact per-pair task membership, preserving legacy API."""
+
+    return tuple(
+        {pair_id: frozenset(task_ids)}
+        for item in frozen_v4_ordered_per_pair_query_task_ids()
+        for pair_id, task_ids in item.items()
+    )
 
 
 def frozen_v4_window_for_run(

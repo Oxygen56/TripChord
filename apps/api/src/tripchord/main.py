@@ -48,6 +48,7 @@ from tripchord.agents.live_jobs import (
     LiveJobProgressReporter,
     LivePlanningJobCapacityError,
     LivePlanningJobIdempotencyConflictError,
+    LivePlanningJobInactiveError,
     LivePlanningJobRegistry,
     LivePlanningJobSnapshot,
     LiveSourceTerminalEvent,
@@ -153,6 +154,7 @@ from tripchord.domain.offers import TravelOffer
 from tripchord.domain.travel_data import Place, RouteLeg, WeatherWindow
 from tripchord.formal_live_source import (
     FormalLiveSourceAuthority,
+    formal_source_trust_root,
     load_formal_live_source_authority,
     read_owner_only_text,
 )
@@ -429,7 +431,7 @@ class LiveRunCache:
 
     def _new_run_id(self) -> str:
         while True:
-            candidate = f"live-run-{secrets.token_urlsafe(18)}"
+            candidate = f"live-run-{uuid4()}"
             if candidate not in self._entries:
                 return candidate
 
@@ -1347,9 +1349,7 @@ async def agent_runtime_status_endpoint(
 
 _FORMAL_SOURCE_CONTROL_HEADER = "X-TripChord-Formal-Source-Control"
 _FORMAL_SOURCE_CONTROL_PATH = (
-    Path(__file__).resolve().parents[4]
-    / ".runtime"
-    / "formal-source-control-token"
+    formal_source_trust_root() / "control-token"
 )
 
 
@@ -1387,6 +1387,8 @@ def _authorize_formal_source_control(
 async def issue_formal_live_source_challenge_endpoint(
     payload: dict[str, Any],
     request: Request,
+    registry: LivePlanningJobRegistryDep,
+    principal: PrincipalDep,
     credential: Annotated[
         str | None,
         Header(alias=_FORMAL_SOURCE_CONTROL_HEADER),
@@ -1394,8 +1396,45 @@ async def issue_formal_live_source_challenge_endpoint(
 ) -> dict[str, Any]:
     authority = _authorize_formal_source_control(request, credential)
     try:
+        job_graph = payload.get("job_graph")
+        if not isinstance(job_graph, dict):
+            raise ValueError("formal source challenge requires an exact job graph")
+        job_id = job_graph.get("terminal_job_id")
+        request_sha256 = job_graph.get("request_sha256")
+        if not isinstance(job_id, str) or not isinstance(request_sha256, str):
+            raise ValueError("formal source challenge job graph identity is invalid")
+        if not await registry.is_prepared(
+            job_id,
+            principal.tenant_id,
+            request_sha256=request_sha256,
+        ):
+            raise ValueError(
+                "formal source challenge job is not a matching unactivated prepared job"
+            )
         return cast(dict[str, Any], authority.issue_challenge(payload))
     except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/internal/formal-live-source/jobs/{job_id}/activate")
+async def activate_formal_live_source_job_endpoint(
+    job_id: str,
+    request: Request,
+    registry: LivePlanningJobRegistryDep,
+    principal: PrincipalDep,
+    credential: Annotated[
+        str | None,
+        Header(alias=_FORMAL_SOURCE_CONTROL_HEADER),
+    ] = None,
+) -> dict[str, Any]:
+    authority = _authorize_formal_source_control(request, credential)
+    try:
+        authority.require_active_job(job_id)
+        snapshot = await registry.activate(job_id, principal.tenant_id)
+        if snapshot is None:
+            raise ValueError("formal source prepared job is unavailable")
+        return {"job": snapshot.model_dump(mode="json")}
+    except (LivePlanningJobInactiveError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
@@ -1413,6 +1452,38 @@ async def finalize_formal_live_source_endpoint(
         return cast(dict[str, Any], authority.finalize(payload))
     except (RuntimeError, ValueError) as exc:
         logger.warning("formal source finalize rejected: %s", exc)
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/internal/formal-live-source/abort")
+async def abort_formal_live_source_endpoint(
+    payload: dict[str, Any],
+    request: Request,
+    credential: Annotated[
+        str | None,
+        Header(alias=_FORMAL_SOURCE_CONTROL_HEADER),
+    ] = None,
+) -> dict[str, Any]:
+    authority = _authorize_formal_source_control(request, credential)
+    try:
+        return cast(dict[str, Any], authority.abort(payload))
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/internal/formal-live-source/expire")
+async def expire_formal_live_source_endpoint(
+    payload: dict[str, Any],
+    request: Request,
+    credential: Annotated[
+        str | None,
+        Header(alias=_FORMAL_SOURCE_CONTROL_HEADER),
+    ] = None,
+) -> dict[str, Any]:
+    authority = _authorize_formal_source_control(request, credential)
+    try:
+        return cast(dict[str, Any], authority.expire(payload))
+    except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
@@ -2346,6 +2417,10 @@ async def start_live_flexible_from_text_job_endpoint(
         str | None,
         Header(alias="Idempotency-Key", max_length=200),
     ] = None,
+    formal_prepare_credential: Annotated[
+        str | None,
+        Header(alias="X-TripChord-Formal-Source-Control"),
+    ] = None,
 ) -> StartLiveFlexibleFromTextJobResponse:
     await _preflight_live_flexible_from_text(
         payload,
@@ -2356,6 +2431,9 @@ async def start_live_flexible_from_text_job_endpoint(
     target_app = http_request.app
     request_digest = _live_flexible_from_text_request_sha256(payload)
     effective_total_timeout_seconds = _flexible_total_timeout_seconds(payload.total_timeout_seconds)
+    defer_start = formal_prepare_credential is not None
+    if defer_start:
+        _authorize_formal_source_control(http_request, formal_prepare_credential)
 
     async def operation(report: LiveJobProgressReporter) -> dict[str, Any]:
         response = await _execute_live_flexible_from_text(
@@ -2378,6 +2456,7 @@ async def start_live_flexible_from_text_job_endpoint(
             idempotency_key=idempotency_key,
             request_digest=request_digest,
             deadline_seconds=effective_total_timeout_seconds,
+            defer_start=defer_start,
         )
     except LivePlanningJobIdempotencyConflictError as exc:
         raise HTTPException(

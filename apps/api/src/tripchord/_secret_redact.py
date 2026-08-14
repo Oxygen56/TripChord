@@ -3285,6 +3285,9 @@ def iter_json_levels(
     text: str,
     *,
     on_string_value: Callable[[str], None] | None = None,
+    max_nodes: int = _MAX_JSON_SCAN_NODES,
+    max_chars: int = _MAX_JSON_SCAN_CHARS,
+    max_depth: int = _MAX_JSON_SCAN_DEPTH,
 ) -> Iterator[tuple[str, int, bool]]:
     """Yield ``(level_text, depth, malformed)`` for ``text`` and every nested
     JSON-string value found by bounded recursive ``json.loads``.
@@ -3317,20 +3320,28 @@ def iter_json_levels(
 
     Raises :class:`RecursiveJsonBudgetError` when a depth / node / size budget
     is exceeded — a maliciously deep or huge document can never force
-    unbounded work.
+    unbounded work.  Callers may supply smaller or larger *bounded* node/size
+    caps when an independently authenticated exact schema determines the
+    document's legitimate maximum; the recursive depth cap is never mutable.
     """
+    if type(max_nodes) is not int or max_nodes <= 0:
+        raise ValueError("JSON scan max_nodes must be a positive int")
+    if type(max_chars) is not int or max_chars <= 0:
+        raise ValueError("JSON scan max_chars must be a positive int")
+    if type(max_depth) is not int or max_depth <= 0:
+        raise ValueError("JSON scan max_depth must be a positive int")
     budget_nodes = 0
     budget_chars = 0
     stack: list[tuple[str, int]] = [(text, 0)]
     while stack:
         current, depth = stack.pop()
-        if depth > _MAX_JSON_SCAN_DEPTH:
+        if depth > max_depth:
             raise RecursiveJsonBudgetError("JSON scan depth budget exceeded")
         budget_nodes += 1
-        if budget_nodes > _MAX_JSON_SCAN_NODES:
+        if budget_nodes > max_nodes:
             raise RecursiveJsonBudgetError("JSON scan node budget exceeded")
         budget_chars += len(current)
-        if budget_chars > _MAX_JSON_SCAN_CHARS:
+        if budget_chars > max_chars:
             raise RecursiveJsonBudgetError("JSON scan size budget exceeded")
         parsed: Any = None
         malformed = False
@@ -3373,12 +3384,12 @@ def iter_json_levels(
         pending: list[tuple[Any, int]] = [(parsed, 0)]
         while pending:
             node, struct_depth = pending.pop()
-            if struct_depth > _MAX_JSON_SCAN_DEPTH:
+            if struct_depth > max_depth:
                 raise RecursiveJsonBudgetError(
                     "JSON structural depth budget exceeded"
                 )
             budget_nodes += 1
-            if budget_nodes > _MAX_JSON_SCAN_NODES:
+            if budget_nodes > max_nodes:
                 raise RecursiveJsonBudgetError("JSON scan node budget exceeded")
             if isinstance(node, dict):
                 for _key, value in node.items():
@@ -3387,7 +3398,7 @@ def iter_json_levels(
                     # member object fails closed on its keys alone, and every
                     # key is subject to the caller's normalized key scan.
                     budget_nodes += 1
-                    if budget_nodes > _MAX_JSON_SCAN_NODES:
+                    if budget_nodes > max_nodes:
                         raise RecursiveJsonBudgetError(
                             "JSON scan node budget exceeded"
                         )
@@ -3397,7 +3408,7 @@ def iter_json_levels(
                         # whether the strings are JSON text (scanned at the next
                         # decoded level) or plain text.
                         budget_nodes += 1
-                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                        if budget_nodes > max_nodes:
                             raise RecursiveJsonBudgetError(
                                 "JSON scan node budget exceeded"
                             )
@@ -3409,7 +3420,7 @@ def iter_json_levels(
                         pending.append((value, struct_depth + 1))
                     else:
                         budget_nodes += 1
-                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                        if budget_nodes > max_nodes:
                             raise RecursiveJsonBudgetError(
                                 "JSON scan node budget exceeded"
                             )
@@ -3418,7 +3429,7 @@ def iter_json_levels(
                     if isinstance(item, str):
                         # Same string-VALUE node accounting as the dict branch.
                         budget_nodes += 1
-                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                        if budget_nodes > max_nodes:
                             raise RecursiveJsonBudgetError(
                                 "JSON scan node budget exceeded"
                             )
@@ -3430,7 +3441,7 @@ def iter_json_levels(
                         pending.append((item, struct_depth + 1))
                     else:
                         budget_nodes += 1
-                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                        if budget_nodes > max_nodes:
                             raise RecursiveJsonBudgetError(
                                 "JSON scan node budget exceeded"
                             )

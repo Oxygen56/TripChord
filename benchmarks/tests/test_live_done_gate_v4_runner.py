@@ -57,7 +57,67 @@ def _runtime_payload(*, model_trace_count: int = 7) -> dict[str, Any]:
         "effective_flexible_timeout_seconds": 3600,
         "rag_enabled": True,
         "runtime_provenance": _runtime_provenance_payload(),
+        "formal_live_source": {"fixture_anchor_available": True},
     }
+
+
+def _install_failed_run_formal_control_double(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    issued: dict[str, object] = {}
+
+    async def issue(
+        _client: object,
+        _base: str,
+        context: dict[str, object],
+        _control_path: Path | None = None,
+    ) -> dict[str, object]:
+        challenge = {
+            **context,
+            "challenge_id": "fixture-formal-challenge",
+            "run_id": context["run_id"],
+        }
+        issued["challenge"] = challenge
+        return challenge
+
+    async def activate(*_: object, **__: object) -> None:
+        return None
+
+    async def finalize(*_: object, **__: object) -> dict[str, object]:
+        return {
+            "binding": {"fixture": "failed-run-formal-binding"},
+            "authority_receipt": {"fixture": "failed-run-formal-receipt"},
+            "challenge": dict(issued["challenge"]),
+        }
+
+    async def abort(*_: object, **__: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        run_live_done_gate_v4,
+        "_formal_source_control_token",
+        lambda _path=None: "fixture-formal-control-token-" + "F" * 64,
+    )
+    monkeypatch.setattr(
+        run_live_done_gate_v4,
+        "_issue_formal_source_challenge_remote",
+        issue,
+    )
+    monkeypatch.setattr(
+        run_live_done_gate_v4,
+        "_activate_prepared_flexible_live_job",
+        activate,
+    )
+    monkeypatch.setattr(
+        run_live_done_gate_v4,
+        "_finalize_formal_source_binding_remote",
+        finalize,
+    )
+    monkeypatch.setattr(
+        run_live_done_gate_v4,
+        "_abort_formal_source_challenge_remote",
+        abort,
+    )
 
 
 def _api_payload_sha256() -> str:
@@ -1040,7 +1100,7 @@ def test_v4_failure_bundle_records_stage_and_retry_boundary() -> None:
     assert bundle["flexible_run"]["final_decision"]["state"] == "human_block"
 
 
-def test_v4_completed_bundle_preserves_the_full_runner_context() -> None:
+def test_v4_completed_bundle_rejects_context_without_formal_receipt() -> None:
     captured_at = datetime(2026, 8, 4, 9, 0, tzinfo=UTC)
     context = {
         "formal_live_source_binding": {"fixture": "already-authority-validated"},
@@ -1074,25 +1134,13 @@ def test_v4_completed_bundle_preserves_the_full_runner_context() -> None:
         }
     )
 
-    bundle = run_live_done_gate_v4._completed_evidence_bundle(
-        request=_request(),
-        report=report,
-        captured_at=captured_at,
-        context=context,
-        formal_source_validator=lambda value: dict(value),
-    )
-
-    assert bundle["run_status"] == "completed"
-    assert bundle["timeout_contract"] == context["timeout_contract"]
-    assert bundle["runner_contract"] == context["runner_contract"]
-    assert bundle["model_enhancement_enabled"] is True
-    assert bundle["cached_pair_runs"] == context["cached_pair_runs"]
-    assert bundle["runtime_before_run"]["model_provider"] == "openai_compatible"
-    assert bundle["runtime_after_run"]["primary_model"] == "deepseek-v4-flash"
-    assert bundle["runtime_before_run"]["model_required"] is True
-    assert bundle["model_trace_count_delta"] == 15
-    assert bundle["done_gate"]["passed"] is True
-    assert bundle["scenario_sha256"] == run_live_done_gate_v4._canonical_sha256(_request())
+    with pytest.raises(RuntimeError, match="binding/receipt/challenge"):
+        run_live_done_gate_v4._completed_evidence_bundle(
+            request=_request(),
+            report=report,
+            captured_at=captured_at,
+            context=context,
+        )
 
 
 def test_v4_model_trace_receipt_is_job_bound_and_reconciled_with_result() -> None:
@@ -1384,6 +1432,7 @@ async def test_v4_run_without_recommendation_emits_gate_failure_and_skips_event(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    _install_failed_run_formal_control_double(monkeypatch)
     response_payload = {
         "interpretation": {"state": "ready"},
         "execution_boundary": "fixture boundary",
@@ -1525,6 +1574,8 @@ async def test_v4_run_without_recommendation_emits_gate_failure_and_skips_event(
         maximum_quote_age_minutes=15,
         minimum_recommendable_options=2,
         require_model_enhancement=True,
+        gate_run_id="fixture-no-recommendation-run",
+        formal_source_control_token_file=None,
     )
 
     assert await run_live_done_gate_v4._run(args) == 2
@@ -1588,6 +1639,7 @@ async def test_v4_required_model_gate_rejects_silent_deterministic_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    _install_failed_run_formal_control_double(monkeypatch)
     delete_calls: list[str] = []
     response_payload = {
         "interpretation": {"state": "ready"},
@@ -1677,6 +1729,8 @@ async def test_v4_required_model_gate_rejects_silent_deterministic_fallback(
         maximum_quote_age_minutes=15,
         minimum_recommendable_options=2,
         require_model_enhancement=True,
+        gate_run_id="fixture-model-mismatch-run",
+        formal_source_control_token_file=None,
     )
 
     assert await run_live_done_gate_v4._run(args) == 2
@@ -1698,6 +1752,7 @@ async def test_v4_job_bound_trace_receipt_ignores_non_positive_global_delta(
     before_count: int,
     after_count: int,
 ) -> None:
+    _install_failed_run_formal_control_double(monkeypatch)
     runtime_payloads = iter(
         (
             _runtime_payload(model_trace_count=before_count),
@@ -1813,6 +1868,8 @@ async def test_v4_job_bound_trace_receipt_ignores_non_positive_global_delta(
         maximum_quote_age_minutes=15,
         minimum_recommendable_options=2,
         require_model_enhancement=True,
+        gate_run_id="fixture-trace-delta-run",
+        formal_source_control_token_file=None,
     )
 
     assert await run_live_done_gate_v4._run(args) == 2

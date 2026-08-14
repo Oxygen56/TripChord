@@ -473,12 +473,40 @@ class IComTransferProvider:
                 parsed_query = dict(
                     httpx.QueryParams(httpx.URL(fetched.source_url).query)
                 )
+                formal_call = self._source_authority.formal_icom_call(
+                    source_task_id=recorded_task_id,
+                    query_identity=query_identity,
+                    path=endpoint.value,
+                )
                 self._source_authority.record_icom_http(
                     endpoint.value,
+                    subject_ids=(str(formal_call["call_id"]),),
                     response_sha256=fetched.response_sha256,
                     details={
-                        "query_task_id": recorded_task_id,
-                        "query_identity": query_identity,
+                        "source_task_id": formal_call["source_task_id"],
+                        "query_task_id": formal_call["query_task_id"],
+                        "call_id": formal_call["call_id"],
+                        "call_identity_sha256": formal_call[
+                            "call_identity_sha256"
+                        ],
+                        "query_identity": {
+                            key: formal_call[key]
+                            for key in (
+                                "pair_id",
+                                "source_task_id",
+                                "query_task_id",
+                                "direction",
+                                "travel_date",
+                                "departure_date",
+                                "return_date",
+                                "origin",
+                                "destination",
+                                "adults",
+                            )
+                        },
+                        "query_identity_sha256": formal_call[
+                            "query_identity_sha256"
+                        ],
                         "url": fetched.source_url,
                         "path": endpoint.value,
                         "query": parsed_query,

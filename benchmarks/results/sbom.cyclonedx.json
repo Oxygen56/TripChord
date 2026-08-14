@@ -1523,6 +1523,19 @@
       "version": "2026.7.22"
     },
     {
+      "bom-ref": "pypi:cffi@2.1.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be"
+        }
+      ],
+      "name": "cffi",
+      "purl": "pkg:pypi/cffi@2.1.1",
+      "type": "library",
+      "version": "2.1.1"
+    },
+    {
       "bom-ref": "pypi:charset-normalizer@3.4.9",
       "hashes": [
         {
@@ -1560,6 +1573,19 @@
       "purl": "pkg:pypi/colorama@0.4.6",
       "type": "library",
       "version": "0.4.6"
+    },
+    {
+      "bom-ref": "pypi:cryptography@50.0.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "eeac2acb5a20ed25e0ad6d1df9891a520b78b404266b6d11778f25d5d691a6c9"
+        }
+      ],
+      "name": "cryptography",
+      "purl": "pkg:pypi/cryptography@50.0.0",
+      "type": "library",
+      "version": "50.0.0"
     },
     {
       "bom-ref": "pypi:cuda-bindings@13.3.1",
@@ -2316,6 +2342,19 @@
       "version": "25.0.0"
     },
     {
+      "bom-ref": "pypi:pycparser@3.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29"
+        }
+      ],
+      "name": "pycparser",
+      "purl": "pkg:pypi/pycparser@3.0",
+      "type": "library",
+      "version": "3.0"
+    },
+    {
       "bom-ref": "pypi:pydantic-core@2.46.4",
       "hashes": [
         {
@@ -2846,16 +2885,16 @@
     "properties": [
       {
         "name": "tripchord:commit_sha",
-        "value": "c1f3c884dfb9397e2eba8e256f8f8bed7585441d"
+        "value": "f8f0b8611011788182c72ac84f8e1e88c04e9933"
       },
       {
         "name": "tripchord:committed_at",
-        "value": "2026-08-07T20:41:30+08:00"
+        "value": "2026-08-15T02:53:42+08:00"
       }
     ],
-    "timestamp": "2026-08-07T12:43:10Z"
+    "timestamp": "2026-08-14T19:12:00Z"
   },
-  "serialNumber": "urn:uuid:ddf487fa-2baa-4e13-bd4c-0104230eb0b1",
+  "serialNumber": "urn:uuid:059336a2-129d-4cd3-92ac-6e85f6f40d30",
   "specVersion": "1.5",
   "version": 1
 }

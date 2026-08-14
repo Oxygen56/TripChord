@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Any, Protocol, Self
+from uuid import uuid4
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 
@@ -660,10 +661,14 @@ class _RuntimeJob:
         tenant_partition: str,
         snapshot: LivePlanningJobSnapshot,
         deadline_monotonic: float,
+        operation: LiveJobOperation,
+        prepared: bool = False,
     ) -> None:
         self.tenant_partition = tenant_partition
         self.snapshot = snapshot
         self.deadline_monotonic = deadline_monotonic
+        self.operation = operation
+        self.prepared = prepared
         self.generation = 1
         self.task: asyncio.Task[None] | None = None
         self.operation_task: asyncio.Task[dict[str, Any]] | None = None
@@ -731,6 +736,7 @@ class LivePlanningJobRegistry:
         idempotency_key: str | None = None,
         request_digest: str | None = None,
         deadline_seconds: float = 3600,
+        defer_start: bool = False,
     ) -> tuple[LivePlanningJobSnapshot, bool]:
         if not math.isfinite(deadline_seconds) or deadline_seconds <= 0:
             raise ValueError("deadline_seconds must be a finite positive number")
@@ -746,7 +752,9 @@ class LivePlanningJobRegistry:
 
         now = self._utc_now()
         deadline_at = now + timedelta(seconds=deadline_seconds)
-        job_id = f"live-job-{secrets.token_urlsafe(16)}"
+        # Canonical UUID ids remain globally unique without the mixed-case
+        # random runs that resemble bare credentials in committed evidence.
+        job_id = f"live-job-{uuid4()}"
         runtime = _RuntimeJob(
             tenant_partition=self._tenant_partition(tenant_id),
             deadline_monotonic=asyncio.get_running_loop().time() + deadline_seconds,
@@ -762,6 +770,8 @@ class LivePlanningJobRegistry:
                 updated_at=now,
                 deadline_at=deadline_at,
             ),
+            operation=operation,
+            prepared=defer_start,
         )
         async with self._changed:
             if self._closed:
@@ -787,12 +797,64 @@ class LivePlanningJobRegistry:
                     job_id=job_id,
                     request_digest=request_digest,
                 )
+            if not defer_start:
+                runtime.task = asyncio.create_task(
+                    self._run(runtime, operation),
+                    name=f"tripchord:{job_id}",
+                )
+            self._changed.notify_all()
+            return runtime.snapshot, False
+
+    async def activate(
+        self,
+        job_id: str,
+        tenant_id: str,
+    ) -> LivePlanningJobSnapshot | None:
+        """Start one explicitly prepared job exactly once.
+
+        Formal evidence uses this split so its signed challenge can bind the
+        already allocated terminal job id before any provider or Companion
+        event is allowed to occur.
+        """
+
+        async with self._changed:
+            self._prune_locked(self._utc_now())
+            runtime = self._owned_locked(job_id, tenant_id)
+            if runtime is None:
+                return None
+            if not runtime.prepared or runtime.task is not None:
+                raise LivePlanningJobInactiveError(
+                    "live planning job is not an unactivated prepared job"
+                )
+            if runtime.snapshot.state != LivePlanningJobState.QUEUED:
+                raise LivePlanningJobInactiveError(
+                    "prepared live planning job is no longer queued"
+                )
+            runtime.prepared = False
             runtime.task = asyncio.create_task(
-                self._run(runtime, operation),
+                self._run(runtime, runtime.operation),
                 name=f"tripchord:{job_id}",
             )
             self._changed.notify_all()
-            return runtime.snapshot, False
+            return runtime.snapshot
+
+    async def is_prepared(
+        self,
+        job_id: str,
+        tenant_id: str,
+        *,
+        request_sha256: str,
+    ) -> bool:
+        async with self._lock:
+            self._prune_locked(self._utc_now())
+            runtime = self._owned_locked(job_id, tenant_id)
+            return bool(
+                runtime is not None
+                and runtime.prepared
+                and runtime.task is None
+                and runtime.snapshot.state == LivePlanningJobState.QUEUED
+                and runtime.snapshot.request_sha256 == request_sha256
+            )
 
     async def get(
         self,

@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import stat
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -21,20 +22,29 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from tripchord.agents.stay_area import (
+    StayAreaSearchProfile,
+    system_stay_area_search_profile,
+)
+from tripchord.planning.frozen_graph import (
+    frozen_v4_canonical_pair_ids,
+    frozen_v4_icom_task_ids,
+    frozen_v4_ordered_per_pair_query_task_ids,
+)
+from tripchord.planning.stay_plans import (
+    StayPlanCandidateSet,
+    system_stay_plan_candidate_set,
+)
+
 _SCHEMA_VERSION = "tripchord-formal-live-source-v3"
 _BINDING_SCHEMA_VERSION = "tripchord-formal-live-source-binding-v3"
-_CHALLENGE_SCHEMA_VERSION = "tripchord-formal-live-source-challenge-v2"
-_RECEIPT_SCHEMA_VERSION = "tripchord-formal-live-source-authority-receipt-v2"
-_ANCHOR_VERSION = "tripchord-formal-source-anchor-v1"
-_PUBLIC_KEY_DER = base64.b64decode(
-    "MCowBQYDK2VwAyEAnzhuCoYECUY1LsjPfT+yI4NZjs8r1BBUcu5DPFNdNg8=",
-    validate=True,
-)
-_AUTHORITY_KEY_ID = hashlib.sha256(_PUBLIC_KEY_DER).hexdigest()
+_CHALLENGE_SCHEMA_VERSION = "tripchord-formal-live-source-challenge-v3"
+_RECEIPT_SCHEMA_VERSION = "tripchord-formal-live-source-authority-receipt-v3"
 _STARTUP_CAPABILITY = object()
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_DEFAULT_PRIVATE_KEY = _REPO_ROOT / ".runtime" / "formal-source-authority-private.pem"
-_DEFAULT_LEDGER = _REPO_ROOT / ".runtime" / "formal-source-challenges-v2.json"
+_TRUST_ROOT_ENV = "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"
+_DEFAULT_TRUST_ROOT = _REPO_ROOT / ".runtime" / "formal-source"
+_GENERATION_PATTERN = re.compile(r"^generation-([1-9][0-9]*)-([0-9a-f]{12})$")
 
 _BROWSER_MOUNT = "/browser-bridge"
 _BROWSER_PATHS = {
@@ -61,7 +71,216 @@ _CHALLENGE_CONTEXT_FIELDS = {
     "request_sha256",
     "candidate_set_sha256",
     "scenario_sha256",
+    "job_graph",
 }
+_FINALIZE_CONTEXT_FIELDS = _CHALLENGE_CONTEXT_FIELDS | {
+    "terminal_job",
+    "pair_checkpoint_binding",
+}
+_EVENT_CONTEXT_FIELDS = (_CHALLENGE_CONTEXT_FIELDS - {"job_graph"}) | {
+    "job_graph_sha256"
+}
+
+
+def _frozen_per_pair_tasks() -> dict[str, tuple[str, ...]]:
+    result: dict[str, tuple[str, ...]] = {}
+    for item in frozen_v4_ordered_per_pair_query_task_ids():
+        if len(item) != 1:
+            raise RuntimeError("frozen query-task authority has an invalid shape")
+        pair_id, task_ids = next(iter(item.items()))
+        result[pair_id] = tuple(task_ids)
+    if tuple(result) != frozen_v4_canonical_pair_ids():
+        raise RuntimeError("frozen query-task authority order differs from pair authority")
+    return result
+
+
+def formal_job_graph_for_frozen_v4(
+    *,
+    terminal_job_id: str,
+    request_sha256: str,
+    adults: int,
+) -> dict[str, object]:
+    """Build the exact pre-execution graph a formal challenge is allowed to bind.
+
+    The terminal job id already exists at this point, but its prepared operation
+    has not started.  Every pair, Browser query task, checkpoint identity and
+    iCom query is derived from the committed frozen graph rather than supplied
+    by the caller as a self-consistent set.
+    """
+
+    job_id = _nonempty_string(terminal_job_id, "formal terminal job id")
+    if not job_id.startswith("live-job-"):
+        raise ValueError("formal terminal job id is invalid")
+    request_digest = _require_sha256(request_sha256, "formal job request_sha256")
+    party_size = _exact_int(adults, "formal job adults", minimum=1)
+    if party_size > 9:
+        raise ValueError("formal job adults is invalid")
+    per_pair = _frozen_per_pair_tasks()
+    icom_source_ids = tuple(
+        item
+        for item in (
+            "public-transfer-icom-continuous-outbound",
+            "public-transfer-icom-split-outbound",
+            "public-transfer-icom-split-inbound",
+            "public-transfer-icom-continuous-inbound",
+        )
+        if item in frozen_v4_icom_task_ids()
+    )
+    if set(icom_source_ids) != set(frozen_v4_icom_task_ids()):
+        raise RuntimeError("frozen iCom task authority differs from formal order")
+    pairs: list[dict[str, object]] = []
+    icom_queries: list[dict[str, object]] = []
+    publication_icom_queries: list[dict[str, object]] = []
+    for sequence, pair_id in enumerate(frozen_v4_canonical_pair_ids(), start=1):
+        parts = pair_id.split(":")
+        if len(parts) != 4:
+            raise RuntimeError("frozen pair authority has an invalid identity")
+        departure, returning = parts[1], parts[2]
+        departure_date = datetime.strptime(departure, "%Y-%m-%d").date()
+        return_date = datetime.strptime(returning, "%Y-%m-%d").date()
+        task_ids = list(per_pair[pair_id])
+        publication_task_ids = (
+            [
+                task_id
+                for task_id in task_ids
+                if task_id.startswith("query:ctrip:flight:")
+                or task_id.startswith("query:ctrip:lodging_full_stay:")
+            ]
+            if sequence in {1, 3}
+            else []
+        )
+        if len(publication_task_ids) != (2 if sequence in {1, 3} else 0):
+            raise RuntimeError("frozen publication query authority is invalid")
+        checkpoint_identity = {
+            "sequence": sequence,
+            "date_pair_id": pair_id,
+            "departure_date": departure,
+            "return_date": returning,
+            "request_sha256": request_digest,
+            "query_task_ids": task_ids,
+        }
+        pairs.append(
+            {
+                **checkpoint_identity,
+                "query_task_ids_sha256": _sha256(task_ids),
+                "publication_query_task_ids": publication_task_ids,
+                "publication_query_task_ids_sha256": _sha256(
+                    publication_task_ids
+                ),
+                "checkpoint_identity_sha256": _sha256(checkpoint_identity),
+            }
+        )
+        query_specs = (
+            (
+                icom_source_ids[0],
+                "outbound",
+                departure_date,
+                "Airport",
+                "Maafushi",
+            ),
+            (
+                icom_source_ids[1],
+                "outbound",
+                departure_date + timedelta(days=1),
+                "Airport",
+                "Maafushi",
+            ),
+            (
+                icom_source_ids[2],
+                "inbound",
+                return_date - timedelta(days=1),
+                "Maafushi",
+                "Airport",
+            ),
+            (
+                icom_source_ids[3],
+                "inbound",
+                return_date,
+                "Maafushi",
+                "Airport",
+            ),
+        )
+        for source_task_id, direction, travel_date, origin, destination in query_specs:
+            query_task_id = f"{pair_id}|{source_task_id}"
+            identity = {
+                "pair_id": pair_id,
+                "source_task_id": source_task_id,
+                "query_task_id": query_task_id,
+                "direction": direction,
+                "travel_date": travel_date.isoformat(),
+                "departure_date": departure,
+                "return_date": returning,
+                "origin": origin,
+                "destination": destination,
+                "adults": party_size,
+            }
+            icom_queries.append(
+                {**identity, "query_identity_sha256": _sha256(identity)}
+            )
+        publication_specs = (
+            (
+                ("outbound", departure_date, "Airport", "Maafushi"),
+                ("inbound", return_date, "Maafushi", "Airport"),
+            )
+            if sequence in {1, 3}
+            else ()
+        )
+        for direction, travel_date, origin, destination in publication_specs:
+            source_task_id = (
+                "publication-public-transfer-icom-"
+                f"{origin.lower()}-{destination.lower()}-"
+                f"{travel_date.isoformat()}"
+            )
+            query_task_id = f"{pair_id}|{source_task_id}"
+            identity = {
+                "pair_id": pair_id,
+                "source_task_id": source_task_id,
+                "query_task_id": query_task_id,
+                "direction": direction,
+                "travel_date": travel_date.isoformat(),
+                "departure_date": departure,
+                "return_date": returning,
+                "origin": origin,
+                "destination": destination,
+                "adults": party_size,
+            }
+            publication_icom_queries.append(
+                {**identity, "query_identity_sha256": _sha256(identity)}
+            )
+    graph: dict[str, object] = {
+        "schema_version": "tripchord-formal-job-graph-v1",
+        "terminal_job_id": job_id,
+        "request_sha256": request_digest,
+        "adults": party_size,
+        "pairs": pairs,
+        "ordered_pair_ids_sha256": _sha256([item["date_pair_id"] for item in pairs]),
+        "query_task_membership_sha256": _sha256(
+            [
+                {
+                    "date_pair_id": item["date_pair_id"],
+                    "query_task_ids": item["query_task_ids"],
+                }
+                for item in pairs
+            ]
+        ),
+        "publication_query_task_membership_sha256": _sha256(
+            [
+                {
+                    "date_pair_id": item["date_pair_id"],
+                    "query_task_ids": item["publication_query_task_ids"],
+                }
+                for item in pairs
+            ]
+        ),
+        "icom_queries": icom_queries,
+        "icom_query_membership_sha256": _sha256(icom_queries),
+        "publication_icom_queries": publication_icom_queries,
+        "publication_icom_query_membership_sha256": _sha256(
+            publication_icom_queries
+        ),
+    }
+    graph["job_graph_sha256"] = _sha256(graph)
+    return graph
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -109,6 +328,99 @@ def _require_aware_time(value: object, label: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def formal_source_trust_root(path: Path | None = None) -> Path:
+    configured = os.environ.get(_TRUST_ROOT_ENV)
+    return path or (Path(configured) if configured else _DEFAULT_TRUST_ROOT)
+
+
+def _protected_directory(path: Path, label: str) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError(f"{label} is unavailable") from exc
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o700
+            or info.st_uid != os.getuid()
+        ):
+            raise RuntimeError(f"{label} must be an owner-only mode 0700 directory")
+    finally:
+        os.close(descriptor)
+
+
+def _current_generation(root: Path | None = None) -> tuple[Path, str]:
+    trust_root = formal_source_trust_root(root)
+    _protected_directory(trust_root, "formal source trust root")
+    generation = read_owner_only_text(
+        trust_root / "current", "formal source current generation", minimum_length=1
+    )
+    if _GENERATION_PATTERN.fullmatch(generation) is None:
+        raise RuntimeError("formal source current generation is invalid")
+    generation_root = trust_root / generation
+    _protected_directory(generation_root, "formal source generation root")
+    return generation_root, generation
+
+
+def _load_verification_anchor(root: Path | None = None) -> dict[str, object]:
+    generation_root, generation = _current_generation(root)
+    raw = _protected_regular_file(
+        generation_root / "public-anchor.json",
+        "formal source public verification anchor",
+    )
+    if raw is None:  # pragma: no cover - missing is not allowed
+        raise RuntimeError("formal source public verification anchor is unavailable")
+    try:
+        anchor = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("formal source public verification anchor is corrupt") from exc
+    fields = {
+        "schema_version",
+        "anchor_version",
+        "generation",
+        "authority_key_id",
+        "public_key_der_base64",
+        "created_at",
+    }
+    if not isinstance(anchor, dict) or set(anchor) != fields:
+        raise RuntimeError("formal source public verification anchor shape is invalid")
+    if (
+        anchor["schema_version"] != "tripchord-formal-source-anchor-v2"
+        or anchor["generation"] != generation
+    ):
+        raise RuntimeError("formal source public verification anchor identity is invalid")
+    _nonempty_string(anchor["anchor_version"], "formal source anchor version")
+    _require_aware_time(anchor["created_at"], "formal source anchor created_at")
+    try:
+        public_der = base64.b64decode(
+            _nonempty_string(
+                anchor["public_key_der_base64"], "formal source public key"
+            ),
+            validate=True,
+        )
+        public_key = serialization.load_der_public_key(public_der)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("formal source public verification anchor is invalid") from exc
+    if not isinstance(public_key, Ed25519PublicKey):
+        raise RuntimeError("formal source public verification anchor is not Ed25519")
+    key_id = hashlib.sha256(public_der).hexdigest()
+    if anchor["authority_key_id"] != key_id:
+        raise RuntimeError("formal source public verification anchor key id is invalid")
+    return {**anchor, "public_key_der": public_der, "public_key": public_key}
+
+
+def _anchor_version() -> str:
+    return str(_load_verification_anchor()["anchor_version"])
+
+
+def _authority_key_id() -> str:
+    return str(_load_verification_anchor()["authority_key_id"])
+
+
 def _sign(private_key: Ed25519PrivateKey, value: object) -> str:
     return base64.b64encode(private_key.sign(_canonical_bytes(value))).decode("ascii")
 
@@ -118,9 +430,9 @@ def _verify_signature(value: object, signature: object, label: str) -> None:
         raise ValueError(f"{label} has no authority signature")
     try:
         raw = base64.b64decode(signature, validate=True)
-        public_key = serialization.load_der_public_key(_PUBLIC_KEY_DER)
-        if not isinstance(public_key, Ed25519PublicKey):
-            raise ValueError("fixed formal source anchor is not Ed25519")
+        public_key = _load_verification_anchor()["public_key"]
+        if not isinstance(public_key, Ed25519PublicKey):  # pragma: no cover
+            raise ValueError("formal source anchor is not Ed25519")
         public_key.verify(raw, _canonical_bytes(value))
     except (ValueError, InvalidSignature) as exc:
         raise ValueError(f"{label} lacks the fixed production authority proof") from exc
@@ -145,6 +457,7 @@ def _challenge_proof_payload(challenge: Mapping[str, object]) -> dict[str, objec
         "request_sha256": challenge["request_sha256"],
         "candidate_set_sha256": challenge["candidate_set_sha256"],
         "scenario_sha256": challenge["scenario_sha256"],
+        "job_graph_sha256": challenge["job_graph"]["job_graph_sha256"],
         "issued_at": challenge["issued_at"],
         "expires_at": challenge["expires_at"],
     }
@@ -166,6 +479,9 @@ def _receipt_proof_payload(receipt: Mapping[str, object]) -> dict[str, object]:
         "pre_event_count": receipt["pre_event_count"],
         "post_event_count": receipt["post_event_count"],
         "delta_digest": receipt["delta_digest"],
+        "terminal_job_graph_sha256": receipt["job_member_summary"][
+            "terminal_job_graph_sha256"
+        ],
         "issued_at": receipt["issued_at"],
         "verified_at": receipt["verified_at"],
     }
@@ -267,6 +583,235 @@ def read_owner_only_text(path: Path, label: str, *, minimum_length: int) -> str:
     return value
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _exclusive_owner_write(path: Path, data: bytes, label: str) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+        ):
+            raise RuntimeError(f"{label} was not created owner-only")
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RuntimeError(f"{label} write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        if after.st_ino != info.st_ino or after.st_nlink != 1:
+            raise RuntimeError(f"{label} inode changed during creation")
+    finally:
+        os.close(descriptor)
+    _protected_regular_file(path, label)
+
+
+def _atomic_owner_replace(path: Path, data: bytes, label: str) -> None:
+    _protected_regular_file(path, label)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    try:
+        _exclusive_owner_write(temporary, data, f"{label} temporary")
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+        _protected_regular_file(path, label)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_generation(
+    root: Path,
+    *,
+    generation_number: int,
+    now: datetime,
+) -> tuple[str, str]:
+    private_key = Ed25519PrivateKey.generate()
+    public_der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    key_id = hashlib.sha256(public_der).hexdigest()
+    generation = f"generation-{generation_number}-{key_id[:12]}"
+    generation_root = root / generation
+    os.mkdir(generation_root, 0o700)
+    _protected_directory(generation_root, "formal source generation root")
+    private_pem = private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    anchor = {
+        "schema_version": "tripchord-formal-source-anchor-v2",
+        "anchor_version": f"tripchord-formal-source-anchor-v2:g{generation_number}",
+        "generation": generation,
+        "authority_key_id": key_id,
+        "public_key_der_base64": base64.b64encode(public_der).decode("ascii"),
+        "created_at": now.astimezone(UTC).isoformat(),
+    }
+    _exclusive_owner_write(
+        generation_root / "authority-private.pem",
+        private_pem,
+        "formal source authority private key",
+    )
+    _exclusive_owner_write(
+        generation_root / "public-anchor.json",
+        _canonical_bytes(anchor),
+        "formal source public verification anchor",
+    )
+    _fsync_directory(generation_root)
+    return generation, key_id
+
+
+def provision_formal_source_trust_root(
+    root: Path,
+    *,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Create a clean production trust root without any embedded fallback key."""
+
+    target = root.absolute()
+    if target.exists():
+        raise RuntimeError("formal source trust root already exists")
+    parent = target.parent
+    if not parent.exists():
+        os.mkdir(parent, 0o700)
+    _protected_directory(parent, "formal source trust-root parent")
+    os.mkdir(target, 0o700)
+    _protected_directory(target, "formal source trust root")
+    timestamp = (now or datetime.now(UTC)).astimezone(UTC)
+    generation, key_id = _write_generation(
+        target,
+        generation_number=1,
+        now=timestamp,
+    )
+    _exclusive_owner_write(
+        target / "control-token",
+        (base64.urlsafe_b64encode(os.urandom(64)).decode("ascii") + "\n").encode(),
+        "formal source control token",
+    )
+    _exclusive_owner_write(
+        target / "ledger.json",
+        b"{}",
+        "formal source challenge ledger",
+    )
+    _exclusive_owner_write(
+        target / "current",
+        (generation + "\n").encode(),
+        "formal source current generation",
+    )
+    _fsync_directory(target)
+    return {
+        "trust_root": str(target),
+        "generation": generation,
+        "authority_key_id": key_id,
+    }
+
+
+def verify_formal_source_trust_root(root: Path) -> dict[str, object]:
+    target = root.absolute()
+    generation_root, generation = _current_generation(target)
+    anchor = _load_verification_anchor(target)
+    private_raw = _protected_regular_file(
+        generation_root / "authority-private.pem",
+        "formal source authority private key",
+    )
+    if private_raw is None:  # pragma: no cover
+        raise RuntimeError("formal source authority private key is unavailable")
+    private_key = serialization.load_pem_private_key(private_raw, password=None)
+    if not isinstance(private_key, Ed25519PrivateKey):
+        raise RuntimeError("formal source authority private key is not Ed25519")
+    if private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ) != anchor["public_key_der"]:
+        raise RuntimeError("formal source private key does not match current public anchor")
+    read_owner_only_text(
+        target / "control-token", "formal source control token", minimum_length=64
+    )
+    ledger = _protected_regular_file(
+        target / "ledger.json", "formal source challenge ledger"
+    )
+    if ledger is None:  # pragma: no cover
+        raise RuntimeError("formal source challenge ledger is unavailable")
+    try:
+        parsed = json.loads(ledger)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("formal source challenge ledger is corrupt") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("formal source challenge ledger shape is invalid")
+    return {
+        "trust_root": str(target),
+        "generation": generation,
+        "anchor_version": anchor["anchor_version"],
+        "authority_key_id": anchor["authority_key_id"],
+        "ledger_entry_count": len(parsed),
+    }
+
+
+def rotate_formal_source_trust_root(
+    root: Path,
+    *,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    target = root.absolute()
+    current_root, current = _current_generation(target)
+    del current_root
+    ledger_raw = _protected_regular_file(
+        target / "ledger.json", "formal source challenge ledger"
+    )
+    if ledger_raw is None:  # pragma: no cover
+        raise RuntimeError("formal source challenge ledger is unavailable")
+    try:
+        ledger = json.loads(ledger_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("formal source challenge ledger is corrupt") from exc
+    if not isinstance(ledger, dict) or any(
+        isinstance(row, dict) and row.get("state") == "issued"
+        for row in ledger.values()
+    ):
+        raise RuntimeError("formal source key rotation requires no active challenge")
+    match = _GENERATION_PATTERN.fullmatch(current)
+    if match is None:  # pragma: no cover - current generation already validated
+        raise RuntimeError("formal source current generation is invalid")
+    generation, key_id = _write_generation(
+        target,
+        generation_number=int(match.group(1)) + 1,
+        now=(now or datetime.now(UTC)).astimezone(UTC),
+    )
+    _atomic_owner_replace(
+        target / "current",
+        (generation + "\n").encode(),
+        "formal source current generation",
+    )
+    return {
+        "trust_root": str(target),
+        "previous_generation": current,
+        "generation": generation,
+        "authority_key_id": key_id,
+    }
+
+
 def _exact_int(value: object, label: str, *, minimum: int = 0) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
         raise ValueError(f"{label} is invalid")
@@ -319,6 +864,181 @@ def _runtime_identity(value: object) -> dict[str, object]:
     return dict(value)
 
 
+def _validate_job_graph(value: object) -> dict[str, object]:
+    fields = {
+        "schema_version",
+        "terminal_job_id",
+        "request_sha256",
+        "adults",
+        "pairs",
+        "ordered_pair_ids_sha256",
+        "query_task_membership_sha256",
+        "publication_query_task_membership_sha256",
+        "icom_queries",
+        "icom_query_membership_sha256",
+        "publication_icom_queries",
+        "publication_icom_query_membership_sha256",
+        "job_graph_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("formal job graph has an invalid shape")
+    expected = formal_job_graph_for_frozen_v4(
+        terminal_job_id=_nonempty_string(
+            value["terminal_job_id"], "formal job terminal_job_id"
+        ),
+        request_sha256=_require_sha256(
+            value["request_sha256"], "formal job request_sha256"
+        ),
+        adults=_exact_int(value["adults"], "formal job adults", minimum=1),
+    )
+    if value != expected:
+        raise ValueError(
+            "formal job graph differs from the canonical ordered pair/query/checkpoint graph"
+        )
+    return dict(value)
+
+
+def _validate_terminal_job_contract(
+    value: object,
+    *,
+    job_graph: Mapping[str, object],
+    pair_checkpoint_binding: object,
+) -> dict[str, object]:
+    fields = {
+        "id",
+        "state",
+        "request_sha256",
+        "checkpoint_sha256",
+        "checkpoint_chain_sha256",
+        "result_sha256",
+        "job_graph_sha256",
+        "ordered_pair_ids_sha256",
+        "query_task_membership_sha256",
+        "publication_query_task_membership_sha256",
+        "icom_query_membership_sha256",
+        "publication_icom_query_membership_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("formal terminal job has an invalid shape")
+    if (
+        value["id"] != job_graph["terminal_job_id"]
+        or value["state"] != "succeeded"
+        or value["request_sha256"] != job_graph["request_sha256"]
+    ):
+        raise ValueError("formal terminal job replays a foreign job/request/state")
+    for field in (
+        "job_graph_sha256",
+        "ordered_pair_ids_sha256",
+        "query_task_membership_sha256",
+        "publication_query_task_membership_sha256",
+        "icom_query_membership_sha256",
+        "publication_icom_query_membership_sha256",
+    ):
+        _require_sha256(value[field], f"formal terminal job {field}")
+        if value[field] != job_graph[field]:
+            raise ValueError(
+                f"formal terminal job {field} differs from the frozen job graph"
+            )
+    checkpoints = _exact_string_list(
+        value["checkpoint_sha256"],
+        "formal terminal checkpoint digests",
+        nonempty=True,
+    )
+    for digest in checkpoints:
+        _require_sha256(digest, "formal terminal checkpoint digest")
+    if len(checkpoints) != len(job_graph["pairs"]):
+        raise ValueError("formal terminal checkpoint count differs from job graph")
+    if value["checkpoint_chain_sha256"] != _sha256(checkpoints):
+        raise ValueError("formal terminal checkpoint chain digest is invalid")
+    _require_sha256(value["result_sha256"], "formal terminal result_sha256")
+    if not isinstance(pair_checkpoint_binding, dict):
+        raise ValueError("formal pair checkpoint binding is not an exact object")
+    bindings = pair_checkpoint_binding.get("bindings")
+    if not isinstance(bindings, list) or len(bindings) != len(job_graph["pairs"]):
+        raise ValueError("formal pair checkpoint binding count differs from job graph")
+    expected_pairs = job_graph["pairs"]
+    if not isinstance(expected_pairs, list):  # already guarded by canonical equality
+        raise ValueError("formal job pair graph is invalid")
+    observed_checkpoint_digests: list[str] = []
+    for index, (expected, binding) in enumerate(
+        zip(expected_pairs, bindings, strict=True), start=1
+    ):
+        if not isinstance(expected, dict) or not isinstance(binding, dict):
+            raise ValueError("formal pair checkpoint member is not an exact object")
+        expected_projection = {
+            "sequence": expected["sequence"],
+            "date_pair_id": expected["date_pair_id"],
+            "departure_date": expected["departure_date"],
+            "return_date": expected["return_date"],
+            "request_sha256": expected["request_sha256"],
+            "query_task_ids": expected["query_task_ids"],
+            "query_task_ids_sha256": expected["query_task_ids_sha256"],
+        }
+        if any(binding.get(key) != item for key, item in expected_projection.items()):
+            raise ValueError(
+                f"formal pair checkpoint {index} differs from its canonical job member"
+            )
+        checkpoint_digest = _require_sha256(
+            binding.get("checkpoint_sha256"),
+            f"formal pair checkpoint {index} digest",
+        )
+        observed_checkpoint_digests.append(checkpoint_digest)
+    if observed_checkpoint_digests != checkpoints:
+        raise ValueError("formal terminal checkpoint digests differ from top-level binding")
+    return dict(value)
+
+
+def _job_member_summary(
+    job_graph: Mapping[str, object],
+    terminal_job: Mapping[str, object],
+) -> dict[str, object]:
+    pairs = job_graph["pairs"]
+    if not isinstance(pairs, list):
+        raise ValueError("formal job graph pairs are invalid")
+    pair_members = [
+        {
+            "sequence": item["sequence"],
+            "date_pair_id": item["date_pair_id"],
+            "query_task_count": len(item["query_task_ids"]),
+            "query_task_ids_sha256": item["query_task_ids_sha256"],
+            "publication_query_task_count": len(
+                item["publication_query_task_ids"]
+            ),
+            "publication_query_task_ids_sha256": item[
+                "publication_query_task_ids_sha256"
+            ],
+            "checkpoint_identity_sha256": item["checkpoint_identity_sha256"],
+            "checkpoint_sha256": terminal_job["checkpoint_sha256"][index],
+        }
+        for index, item in enumerate(pairs)
+        if isinstance(item, dict) and isinstance(item.get("query_task_ids"), list)
+    ]
+    if len(pair_members) != len(pairs):
+        raise ValueError("formal job graph pair members are invalid")
+    summary: dict[str, object] = {
+        "terminal_job_id": job_graph["terminal_job_id"],
+        "ordered_pair_ids_sha256": job_graph["ordered_pair_ids_sha256"],
+        "pair_members": pair_members,
+        "query_task_membership_sha256": job_graph["query_task_membership_sha256"],
+        "publication_query_task_membership_sha256": job_graph[
+            "publication_query_task_membership_sha256"
+        ],
+        "icom_query_count": len(job_graph["icom_queries"]),
+        "icom_query_membership_sha256": job_graph["icom_query_membership_sha256"],
+        "publication_icom_query_count": len(
+            job_graph["publication_icom_queries"]
+        ),
+        "publication_icom_query_membership_sha256": job_graph[
+            "publication_icom_query_membership_sha256"
+        ],
+        "checkpoint_chain_sha256": terminal_job["checkpoint_chain_sha256"],
+        "terminal_result_sha256": terminal_job["result_sha256"],
+        "job_graph_sha256": job_graph["job_graph_sha256"],
+    }
+    summary["terminal_job_graph_sha256"] = _sha256(summary)
+    return summary
+
+
 def _validate_challenge(challenge: object) -> dict[str, object]:
     fields = {
         "schema_version",
@@ -332,6 +1052,7 @@ def _validate_challenge(challenge: object) -> dict[str, object]:
         "request_sha256",
         "candidate_set_sha256",
         "scenario_sha256",
+        "job_graph",
         "issued_at",
         "expires_at",
         "signature",
@@ -341,8 +1062,8 @@ def _validate_challenge(challenge: object) -> dict[str, object]:
     if challenge["schema_version"] != _CHALLENGE_SCHEMA_VERSION:
         raise ValueError("formal source challenge schema is invalid")
     if (
-        challenge["anchor_version"] != _ANCHOR_VERSION
-        or challenge["authority_key_id"] != _AUTHORITY_KEY_ID
+        challenge["anchor_version"] != _anchor_version()
+        or challenge["authority_key_id"] != _authority_key_id()
     ):
         raise ValueError("formal source challenge uses a foreign verification anchor")
     try:
@@ -356,6 +1077,16 @@ def _validate_challenge(challenge: object) -> dict[str, object]:
         "scenario_sha256",
     ):
         _require_sha256(challenge[key], f"formal source challenge {key}")
+    if (
+        challenge["candidate_set_sha256"]
+        != system_stay_plan_candidate_set().candidate_set_sha256
+    ):
+        raise ValueError(
+            "formal source challenge candidate set differs from the frozen contract"
+        )
+    job_graph = _validate_job_graph(challenge["job_graph"])
+    if job_graph["request_sha256"] != challenge["request_sha256"]:
+        raise ValueError("formal source challenge job graph uses a foreign request")
     _require_commit(challenge["tested_commit_sha"], "formal source challenge commit")
     if not isinstance(challenge["run_id"], str) or not challenge["run_id"]:
         raise ValueError("formal source challenge run_id is invalid")
@@ -422,10 +1153,11 @@ def _validate_event(
     ):
         raise ValueError("formal source event is bound to a foreign challenge")
     expected_event_context = {
-        key: challenge[key] for key in _CHALLENGE_CONTEXT_FIELDS
+        key: challenge[key] for key in _CHALLENGE_CONTEXT_FIELDS - {"job_graph"}
     }
     expected_event_context.update(
         {
+            "job_graph_sha256": challenge["job_graph"]["job_graph_sha256"],
             "challenge_id": challenge["challenge_id"],
             "nonce_digest": challenge["nonce_digest"],
             "install_id": install_id,
@@ -501,8 +1233,8 @@ def _validate_snapshot(
         raise ValueError("formal source snapshot has an invalid shape")
     if (
         snapshot["schema_version"] != _SCHEMA_VERSION
-        or snapshot["anchor_version"] != _ANCHOR_VERSION
-        or snapshot["authority_key_id"] != _AUTHORITY_KEY_ID
+        or snapshot["anchor_version"] != _anchor_version()
+        or snapshot["authority_key_id"] != _authority_key_id()
     ):
         raise ValueError("formal source snapshot verification anchor is invalid")
     install_id = _nonempty_string(snapshot["install_id"], "formal source install_id")
@@ -566,12 +1298,20 @@ def _validate_snapshot(
     return dict(snapshot)
 
 
-def _validate_business_event_details(events: Sequence[Mapping[str, object]]) -> None:
+def _validate_business_event_details(
+    events: Sequence[Mapping[str, object]],
+    *,
+    job_graph: Mapping[str, object],
+    candidate_set_sha256: str,
+    require_complete: bool = True,
+) -> None:
     """Cross-check transport receipts with their exact business identities."""
     claimed: dict[str, dict[str, object]] = {}
     completed: set[str] = set()
     heartbeat_identity: dict[str, object] | None = None
     icom_by_query: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+    claimed_query_members: list[str] = []
+    publication_query_members: list[str] = []
 
     def exact_object(value: object, fields: set[str], label: str) -> dict[str, object]:
         if not isinstance(value, dict) or set(value) != fields:
@@ -596,16 +1336,18 @@ def _validate_business_event_details(events: Sequence[Mapping[str, object]]) -> 
             },
             label,
         )
-        if query["origin"] is not None:
-            _nonempty_string(query["origin"], f"{label} origin")
+        _nonempty_string(query["origin"], f"{label} origin")
         _nonempty_string(query["destination"], f"{label} destination")
         for field in ("start_date", "end_date"):
-            value = query[field]
-            if value is not None:
-                try:
-                    datetime.strptime(_nonempty_string(value, f"{label} {field}"), "%Y-%m-%d")
-                except ValueError as exc:
-                    raise ValueError(f"{label} {field} is invalid") from exc
+            try:
+                datetime.strptime(
+                    _nonempty_string(query[field], f"{label} {field}"),
+                    "%Y-%m-%d",
+                )
+            except ValueError as exc:
+                raise ValueError(f"{label} {field} is invalid") from exc
+        if str(query["end_date"]) < str(query["start_date"]):
+            raise ValueError(f"{label} date range is invalid")
         _exact_int(query["adults"], f"{label} adults", minimum=1)
         _exact_int(query["rooms"], f"{label} rooms", minimum=1)
         if query["currency"] not in {"CNY", "USD"}:
@@ -623,11 +1365,172 @@ def _validate_business_event_details(events: Sequence[Mapping[str, object]]) -> 
         search_url = query["search_url"]
         if search_url is not None:
             parsed = urlsplit(_nonempty_string(search_url, f"{label} search_url"))
-            if parsed.scheme != "https" or not parsed.hostname or parsed.username is not None:
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+            ):
                 raise ValueError(f"{label} search_url is invalid")
         if not isinstance(query["options"], dict):
             raise ValueError(f"{label} options are invalid")
+        options = query["options"]
+        base_option_fields = {
+            "__tripchord_allow_recent_quote_reuse",
+            "gateway_destination",
+            "stay_area_search_profile",
+            "stay_plan_candidate_set",
+        }
+        lodging_option_fields = {
+            "segment",
+            "expected_lodging_place_key",
+            "expected_package_area",
+        }
+        segment = options.get("segment")
+        expected_option_fields = (
+            base_option_fields | lodging_option_fields
+            if segment is not None
+            else base_option_fields
+        )
+        if set(options) != expected_option_fields:
+            raise ValueError(f"{label} options have an invalid shape")
+        reuse = options["__tripchord_allow_recent_quote_reuse"]
+        if type(reuse) is not bool:
+            raise ValueError(f"{label} reuse flag is not an exact bool")
+        try:
+            profile = StayAreaSearchProfile.model_validate(
+                options["stay_area_search_profile"]
+            )
+            candidate_set = StayPlanCandidateSet.model_validate(
+                options["stay_plan_candidate_set"]
+            )
+        except ValueError as exc:
+            raise ValueError(f"{label} nested frozen query contract is invalid") from exc
+        if (
+            _canonical_bytes(profile.model_dump(mode="json"))
+            != _canonical_bytes(options["stay_area_search_profile"])
+            or _canonical_bytes(candidate_set.model_dump(mode="json"))
+            != _canonical_bytes(options["stay_plan_candidate_set"])
+        ):
+            raise ValueError(f"{label} nested frozen query types are not exact")
+        expected_profile = system_stay_area_search_profile("马累")
+        expected_candidate_set = system_stay_plan_candidate_set()
+        if expected_profile is None or (
+            _canonical_bytes(profile.model_dump(mode="json"))
+            != _canonical_bytes(expected_profile.model_dump(mode="json"))
+            or _canonical_bytes(candidate_set.model_dump(mode="json"))
+            != _canonical_bytes(expected_candidate_set.model_dump(mode="json"))
+        ):
+            raise ValueError(f"{label} nested query differs from the frozen contract")
+        if (
+            candidate_set.candidate_set_sha256 != candidate_set_sha256
+            or options["gateway_destination"] != profile.gateway_destination
+            or candidate_set.gateway_destination != profile.gateway_destination
+        ):
+            raise ValueError(f"{label} nested frozen query identity is foreign")
+        if query["origin"] != "杭州" or query["origin_code"] != "HGH":
+            raise ValueError(f"{label} origin identity is not frozen")
+        if segment is None:
+            if (
+                query["destination"] != profile.gateway_destination
+                or query["destination_code"] != "MLE"
+            ):
+                raise ValueError(f"{label} flight destination is not frozen")
+        else:
+            segment_identity = {
+                "full": ("maafushi", "destination_island", "Maafushi"),
+                "middle": ("maafushi", "destination_island", "Maafushi"),
+                "first": ("hulhumale", "airport_island", "Hulhumalé"),
+                "last": ("hulhumale", "airport_island", "Hulhumalé"),
+                "hulhumale-full": (
+                    "hulhumale",
+                    "airport_island",
+                    "Hulhumalé",
+                ),
+            }.get(segment)
+            if segment_identity is None or (
+                options["expected_lodging_place_key"],
+                options["expected_package_area"],
+                query["destination"],
+            ) != segment_identity or query["destination_code"] is not None:
+                raise ValueError(f"{label} lodging segment identity is not frozen")
+        if (
+            query["rooms"] != 1
+            or query["currency"] != "CNY"
+        ):
+            raise ValueError(f"{label} scalar query contract is not frozen")
         return query
+
+    def formal_query_contract(
+        value: object,
+        *,
+        task_id: str,
+        provider: object,
+        kind: object,
+        query: Mapping[str, object],
+        label: str,
+    ) -> dict[str, object]:
+        fields = {
+            "terminal_job_id",
+            "pair_id",
+            "task_id",
+            "query_task_id",
+            "provider",
+            "kind",
+            "query_kind",
+            "direction",
+            "start_date",
+            "end_date",
+            "query_sha256",
+            "query_identity",
+            "execution_phase",
+        }
+        formal = exact_object(value, fields, label)
+        if (
+            formal["terminal_job_id"] != job_graph["terminal_job_id"]
+            or formal["task_id"] != task_id
+            or formal["provider"] != provider
+            or formal["kind"] != kind
+            or formal["start_date"] != query["start_date"]
+            or formal["end_date"] != query["end_date"]
+            or formal["query_sha256"] != _sha256(query)
+        ):
+            raise ValueError(f"{label} is cross-task/provider/query")
+        if formal["execution_phase"] not in {
+            "checkpoint_exploration",
+            "publication_refresh",
+        }:
+            raise ValueError(f"{label} execution phase is invalid")
+        reuse = query["options"]["__tripchord_allow_recent_quote_reuse"]
+        expected_phase = (
+            "checkpoint_exploration" if reuse is True else "publication_refresh"
+        )
+        if formal["execution_phase"] != expected_phase:
+            raise ValueError(f"{label} execution phase differs from query reuse policy")
+        identity = {
+            key: item for key, item in formal.items() if key != "query_identity"
+        }
+        if formal["query_identity"] != _sha256(identity):
+            raise ValueError(f"{label} query identity digest is invalid")
+        pairs = job_graph["pairs"]
+        if not isinstance(pairs, list):
+            raise ValueError("formal job graph pair list is invalid")
+        membership_field = (
+            "query_task_ids"
+            if formal["execution_phase"] == "checkpoint_exploration"
+            else "publication_query_task_ids"
+        )
+        owners = [
+            pair
+            for pair in pairs
+            if isinstance(pair, dict)
+            and pair["date_pair_id"] == formal["pair_id"]
+            and formal["query_task_id"] in pair[membership_field]
+        ]
+        if len(owners) != 1:
+            raise ValueError(f"{label} is outside/cross-pair in the formal job graph")
+        return formal
 
     for event in events:
         kind = event["kind"]
@@ -774,6 +1677,7 @@ def _validate_business_event_details(events: Sequence[Mapping[str, object]]) -> 
                         "timeout_seconds",
                         "claimed_at",
                         "lease_expires_at",
+                        "formal_query",
                     },
                     "formal claim lease",
                 )
@@ -784,7 +1688,26 @@ def _validate_business_event_details(events: Sequence[Mapping[str, object]]) -> 
                     raise ValueError("formal claim lease provider is invalid")
                 if lease["kind"] not in {"flight", "lodging"}:
                     raise ValueError("formal claim lease kind is invalid")
-                query_contract(lease["query"], "formal claim lease query")
+                checked_query = query_contract(
+                    lease["query"], "formal claim lease query"
+                )
+                formal_query = formal_query_contract(
+                    lease["formal_query"],
+                    task_id=task_id,
+                    provider=lease["provider"],
+                    kind=lease["kind"],
+                    query=checked_query,
+                    label="formal claim lease formal_query",
+                )
+                query_member = str(formal_query["query_task_id"])
+                member_list = (
+                    publication_query_members
+                    if formal_query["execution_phase"] == "publication_refresh"
+                    else claimed_query_members
+                )
+                if query_member in member_list:
+                    raise ValueError("formal claim reuses a query member in one phase")
+                member_list.append(query_member)
                 _exact_int(lease["timeout_seconds"], "formal claim timeout", minimum=1)
                 claimed_at = _require_aware_time(lease["claimed_at"], "formal claim claimed_at")
                 expires_at = _require_aware_time(
@@ -801,7 +1724,13 @@ def _validate_business_event_details(events: Sequence[Mapping[str, object]]) -> 
             if ids != event["subject_ids"]:
                 raise ValueError("formal claim subjects differ from signed leases")
         elif kind == "browser_complete":
-            if set(details) != {"task_id", "completion", "snapshot", "result_sha256"}:
+            if set(details) != {
+                "task_id",
+                "completion",
+                "snapshot",
+                "formal_query",
+                "result_sha256",
+            }:
                 raise ValueError("formal completion details have an invalid shape")
             task_id = details["task_id"]
             completion = exact_object(
@@ -838,6 +1767,19 @@ def _validate_business_event_details(events: Sequence[Mapping[str, object]]) -> 
             ):
                 raise ValueError("formal completion has a foreign/duplicate task")
             lease = claimed[task_id]
+            checked_snapshot_query = query_contract(
+                snapshot["query"], "formal completion snapshot.query"
+            )
+            completion_formal_query = formal_query_contract(
+                details["formal_query"],
+                task_id=task_id,
+                provider=snapshot["provider"],
+                kind=snapshot["kind"],
+                query=checked_snapshot_query,
+                label="formal completion formal_query",
+            )
+            if completion_formal_query != lease["formal_query"]:
+                raise ValueError("formal completion query differs from independently checked claim")
             for left, right in (
                 ("id", "task_id"),
                 ("provider", "provider"),
@@ -884,8 +1826,12 @@ def _validate_business_event_details(events: Sequence[Mapping[str, object]]) -> 
             completed.add(task_id)
         elif kind == "icom_public_get":
             if set(details) != {
+                "source_task_id",
                 "query_task_id",
+                "call_id",
+                "call_identity_sha256",
                 "query_identity",
+                "query_identity_sha256",
                 "url",
                 "path",
                 "query",
@@ -902,9 +1848,66 @@ def _validate_business_event_details(events: Sequence[Mapping[str, object]]) -> 
             )
             query_identity = exact_object(
                 details["query_identity"],
-                {"travel_date", "origin", "destination", "adults"},
+                {
+                    "pair_id",
+                    "source_task_id",
+                    "query_task_id",
+                    "direction",
+                    "travel_date",
+                    "departure_date",
+                    "return_date",
+                    "origin",
+                    "destination",
+                    "adults",
+                },
                 "formal iCom query identity",
             )
+            expected_queries = [
+                item
+                for item in (
+                    *job_graph["icom_queries"],
+                    *job_graph["publication_icom_queries"],
+                )
+                if isinstance(item, dict) and item["query_task_id"] == task_id
+            ]
+            if len(expected_queries) != 1:
+                raise ValueError("formal iCom query task is outside the signed job graph")
+            expected_query = expected_queries[0]
+            expected_identity = {
+                key: expected_query[key]
+                for key in (
+                    "pair_id",
+                    "source_task_id",
+                    "query_task_id",
+                    "direction",
+                    "travel_date",
+                    "departure_date",
+                    "return_date",
+                    "origin",
+                    "destination",
+                    "adults",
+                )
+            }
+            if (
+                query_identity != expected_identity
+                or details["source_task_id"] != expected_query["source_task_id"]
+                or details["query_identity_sha256"]
+                != expected_query["query_identity_sha256"]
+            ):
+                raise ValueError("formal iCom query identity is cross-pair/date/direction")
+            call_identity = {
+                "query_task_id": task_id,
+                "query_identity_sha256": details["query_identity_sha256"],
+                "method": "GET",
+                "path": event["path"],
+            }
+            expected_call_id = f"{task_id}|{event['path']}"
+            if (
+                details["call_id"] != expected_call_id
+                or event["subject_ids"] != [expected_call_id]
+                or details["call_identity_sha256"] != _sha256(call_identity)
+            ):
+                raise ValueError("formal iCom call identity/path is not exact")
             if not isinstance(url, str) or not isinstance(query, dict):
                 raise ValueError("formal iCom URL/query identity is invalid")
             parsed = urlsplit(url)
@@ -957,17 +1960,65 @@ def _validate_business_event_details(events: Sequence[Mapping[str, object]]) -> 
                 details["normalized_evidence_sha256"],
                 "formal iCom normalized evidence",
             )
-            key = (task_id, _sha256(query_identity))
+            key = (task_id, str(details["query_identity_sha256"]))
             icom_by_query.setdefault(key, []).append(event)
-    if not claimed or completed != set(claimed):
+    if not completed.issubset(claimed):
+        raise ValueError("formal task completion precedes its exact claim")
+    if require_complete and (not claimed or completed != set(claimed)):
         raise ValueError("formal task claim/complete membership is not exact")
-    if not icom_by_query:
+    expected_members = [
+        task_id
+        for pair in job_graph["pairs"]
+        if isinstance(pair, dict)
+        for task_id in pair["query_task_ids"]
+    ]
+    if (
+        len(claimed_query_members) != len(set(claimed_query_members))
+        or not set(claimed_query_members).issubset(expected_members)
+    ):
+        raise ValueError("formal Browser claim membership is duplicate or foreign")
+    if require_complete and set(claimed_query_members) != set(expected_members):
+        raise ValueError(
+            "formal Browser claim order/membership differs from the canonical job graph"
+        )
+    expected_publication_members = [
+        task_id
+        for pair in job_graph["pairs"]
+        if isinstance(pair, dict)
+        for task_id in pair["publication_query_task_ids"]
+    ]
+    if (
+        len(publication_query_members) != len(set(publication_query_members))
+        or not set(publication_query_members).issubset(expected_publication_members)
+    ):
+        raise ValueError("formal publication claim membership is duplicate or foreign")
+    if require_complete and set(publication_query_members) != set(
+        expected_publication_members
+    ):
+        raise ValueError(
+            "formal publication claim membership differs from the signed job graph"
+        )
+    if require_complete and not icom_by_query:
         raise ValueError("formal run contains no iCom query graph")
+    expected_icom_keys = [
+        (str(item["query_task_id"]), str(item["query_identity_sha256"]))
+        for item in (
+            *job_graph["icom_queries"],
+            *job_graph["publication_icom_queries"],
+        )
+        if isinstance(item, dict)
+    ]
+    observed_icom_keys = list(icom_by_query)
+    if observed_icom_keys != expected_icom_keys[: len(observed_icom_keys)] or (
+        require_complete and observed_icom_keys != expected_icom_keys
+    ):
+        raise ValueError("formal iCom query group order/membership differs from job graph")
     for (task_id, _query_digest), query_events in icom_by_query.items():
         paths = [str(item["path"]) for item in query_events]
         sequences = [int(item["sequence"]) for item in query_events]
         if (
-            paths != list(_ICOM_PATH_ORDER)
+            paths != list(_ICOM_PATH_ORDER[: len(paths)])
+            or (require_complete and paths != list(_ICOM_PATH_ORDER))
             or sequences != list(range(sequences[0], sequences[0] + len(sequences)))
         ):
             raise ValueError(
@@ -989,6 +2040,7 @@ def validate_formal_source_evidence(
     if challenge is None:
         challenge = binding.get("challenge")
     checked_challenge = _validate_challenge(challenge)
+    graph = _validate_job_graph(checked_challenge["job_graph"])
     fields = {
         "schema_version",
         "anchor_version",
@@ -1011,8 +2063,8 @@ def validate_formal_source_evidence(
         raise ValueError("formal source binding has an invalid shape")
     if (
         binding["schema_version"] != _BINDING_SCHEMA_VERSION
-        or binding["anchor_version"] != _ANCHOR_VERSION
-        or binding["authority_key_id"] != _AUTHORITY_KEY_ID
+        or binding["anchor_version"] != _anchor_version()
+        or binding["authority_key_id"] != _authority_key_id()
     ):
         raise ValueError("formal source binding verification anchor is invalid")
     if binding["challenge"] != checked_challenge:
@@ -1096,7 +2148,11 @@ def validate_formal_source_evidence(
         or len(claimed) != len(set(claimed))
     ):
         raise ValueError("formal source claim/complete task transition is not exact")
-    _validate_business_event_details(checked_events)
+    _validate_business_event_details(
+        checked_events,
+        job_graph=graph,
+        candidate_set_sha256=str(checked_challenge["candidate_set_sha256"]),
+    )
     unsigned_binding = {
         key: item
         for key, item in binding.items()
@@ -1117,6 +2173,7 @@ def validate_formal_source_evidence(
         "pre_event_count",
         "post_event_count",
         "delta_digest",
+        "job_member_summary",
         "issued_at",
         "verified_at",
         "signature",
@@ -1127,8 +2184,8 @@ def validate_formal_source_evidence(
         raise ValueError("formal source authority receipt differs from binding")
     expected_receipt = {
         "schema_version": _RECEIPT_SCHEMA_VERSION,
-        "anchor_version": _ANCHOR_VERSION,
-        "authority_key_id": _AUTHORITY_KEY_ID,
+        "anchor_version": _anchor_version(),
+        "authority_key_id": _authority_key_id(),
         "challenge_id": checked_challenge["challenge_id"],
         "nonce_digest": checked_challenge["nonce_digest"],
         "binding_digest": binding["binding_digest"],
@@ -1138,11 +2195,107 @@ def validate_formal_source_evidence(
         "pre_event_count": pre,
         "post_event_count": post,
         "delta_digest": _sha256(receipts),
+        "job_member_summary": authority_receipt.get("job_member_summary"),
         "issued_at": checked_challenge["issued_at"],
         "verified_at": authority_receipt.get("verified_at"),
     }
     if _signed_payload(authority_receipt) != expected_receipt:
         raise ValueError("formal source authority receipt fields are not bound")
+    job_member_summary = authority_receipt["job_member_summary"]
+    if not isinstance(job_member_summary, dict):
+        raise ValueError("formal source authority receipt job summary is invalid")
+    summary_fields = {
+        "terminal_job_id",
+        "ordered_pair_ids_sha256",
+        "pair_members",
+        "query_task_membership_sha256",
+        "publication_query_task_membership_sha256",
+        "icom_query_count",
+        "icom_query_membership_sha256",
+        "publication_icom_query_count",
+        "publication_icom_query_membership_sha256",
+        "checkpoint_chain_sha256",
+        "terminal_result_sha256",
+        "job_graph_sha256",
+        "terminal_job_graph_sha256",
+    }
+    if set(job_member_summary) != summary_fields:
+        raise ValueError("formal source authority receipt job summary shape is invalid")
+    for key in (
+        "terminal_job_id",
+        "ordered_pair_ids_sha256",
+        "query_task_membership_sha256",
+        "publication_query_task_membership_sha256",
+        "icom_query_membership_sha256",
+        "publication_icom_query_membership_sha256",
+        "job_graph_sha256",
+    ):
+        if job_member_summary[key] != graph[key]:
+            raise ValueError("formal source authority receipt job graph is cross-swapped")
+    if job_member_summary["icom_query_count"] != len(graph["icom_queries"]):
+        raise ValueError("formal source authority receipt iCom membership is incomplete")
+    if job_member_summary["publication_icom_query_count"] != len(
+        graph["publication_icom_queries"]
+    ):
+        raise ValueError(
+            "formal source authority receipt publication iCom membership is incomplete"
+        )
+    pair_members = job_member_summary["pair_members"]
+    graph_pairs = graph["pairs"]
+    if not isinstance(pair_members, list) or not isinstance(graph_pairs, list):
+        raise ValueError("formal source authority receipt pair summary is invalid")
+    if len(pair_members) != len(graph_pairs):
+        raise ValueError("formal source authority receipt pair summary is incomplete")
+    for index, (member, graph_pair) in enumerate(
+        zip(pair_members, graph_pairs, strict=True), start=1
+    ):
+        if not isinstance(member, dict) or not isinstance(graph_pair, dict):
+            raise ValueError("formal source authority receipt pair member is invalid")
+        expected_member_fields = {
+            "sequence",
+            "date_pair_id",
+            "query_task_count",
+            "query_task_ids_sha256",
+            "publication_query_task_count",
+            "publication_query_task_ids_sha256",
+            "checkpoint_identity_sha256",
+            "checkpoint_sha256",
+        }
+        if set(member) != expected_member_fields:
+            raise ValueError("formal source authority receipt pair member shape is invalid")
+        if (
+            member["sequence"] != graph_pair["sequence"]
+            or member["date_pair_id"] != graph_pair["date_pair_id"]
+            or member["query_task_count"] != len(graph_pair["query_task_ids"])
+            or member["query_task_ids_sha256"]
+            != graph_pair["query_task_ids_sha256"]
+            or member["publication_query_task_count"]
+            != len(graph_pair["publication_query_task_ids"])
+            or member["publication_query_task_ids_sha256"]
+            != graph_pair["publication_query_task_ids_sha256"]
+            or member["checkpoint_identity_sha256"]
+            != graph_pair["checkpoint_identity_sha256"]
+        ):
+            raise ValueError(
+                f"formal source authority receipt pair {index} is cross-swapped"
+            )
+        _require_sha256(member["checkpoint_sha256"], "formal receipt checkpoint")
+    checkpoint_digests = [item["checkpoint_sha256"] for item in pair_members]
+    if job_member_summary["checkpoint_chain_sha256"] != _sha256(checkpoint_digests):
+        raise ValueError("formal source authority receipt checkpoint chain is invalid")
+    _require_sha256(
+        job_member_summary["terminal_result_sha256"],
+        "formal receipt terminal result",
+    )
+    expected_terminal_summary_digest = _sha256(
+        {
+            key: item
+            for key, item in job_member_summary.items()
+            if key != "terminal_job_graph_sha256"
+        }
+    )
+    if job_member_summary["terminal_job_graph_sha256"] != expected_terminal_summary_digest:
+        raise ValueError("formal source authority receipt terminal graph digest is invalid")
     verified_at = _require_aware_time(
         authority_receipt["verified_at"], "receipt verified_at"
     )
@@ -1168,6 +2321,16 @@ def validate_formal_source_evidence(
         for key in _CHALLENGE_CONTEXT_FIELDS:
             if checked_challenge[key] != expected_context[key]:
                 raise ValueError(f"formal source evidence replays a foreign {key}")
+        if set(expected_context) >= _FINALIZE_CONTEXT_FIELDS:
+            terminal = _validate_terminal_job_contract(
+                expected_context["terminal_job"],
+                job_graph=graph,
+                pair_checkpoint_binding=expected_context["pair_checkpoint_binding"],
+            )
+            if _job_member_summary(graph, terminal) != job_member_summary:
+                raise ValueError(
+                    "formal source evidence differs from terminal job/checkpoint binding"
+                )
     return dict(binding)
 
 
@@ -1206,6 +2369,7 @@ def formal_source_evidence_summary(
         "candidate_set_sha256": checked_challenge["candidate_set_sha256"],
         "scenario_sha256": checked_challenge["scenario_sha256"],
         "composition_sha256": checked["composition_sha256"],
+        "job_member_summary": authority_receipt["job_member_summary"],
         "pre_event_count": checked["pre_event_count"],
         "post_event_count": checked["post_event_count"],
         "issued_at": checked_challenge["issued_at"],
@@ -1238,6 +2402,7 @@ def validate_formal_source_summary(
         "candidate_set_sha256",
         "scenario_sha256",
         "composition_sha256",
+        "job_member_summary",
         "pre_event_count",
         "post_event_count",
         "issued_at",
@@ -1250,7 +2415,7 @@ def validate_formal_source_summary(
         raise ValueError("formal source summary has an invalid shape")
     if summary["schema_version"] != "tripchord-formal-live-source-summary-v1":
         raise ValueError("formal source summary schema is invalid")
-    required = _CHALLENGE_CONTEXT_FIELDS - {"runtime_identity"}
+    required = _CHALLENGE_CONTEXT_FIELDS - {"runtime_identity", "job_graph"}
     if required - set(expected_context):
         raise ValueError("formal source summary expected context is incomplete")
     if "runtime_identity" in expected_context:
@@ -1263,8 +2428,8 @@ def validate_formal_source_summary(
             "formal source summary expected runtime digest",
         )
     expected_projection = {
-        "anchor_version": _ANCHOR_VERSION,
-        "authority_key_id": _AUTHORITY_KEY_ID,
+        "anchor_version": _anchor_version(),
+        "authority_key_id": _authority_key_id(),
         "run_id": expected_context["run_id"],
         "tested_commit_sha": expected_context["tested_commit_sha"],
         "runtime_identity_sha256": runtime_digest,
@@ -1276,6 +2441,34 @@ def validate_formal_source_summary(
         raise ValueError("formal source summary challenge projection is inconsistent")
     for key in ("binding_digest", "delta_digest", "composition_sha256"):
         _require_sha256(summary[key], f"formal source summary {key}")
+    job_member_summary = summary["job_member_summary"]
+    if not isinstance(job_member_summary, dict):
+        raise ValueError("formal source summary job membership is invalid")
+    if "job_graph" in expected_context:
+        graph = _validate_job_graph(expected_context["job_graph"])
+        if (
+            job_member_summary.get("job_graph_sha256") != graph["job_graph_sha256"]
+            or job_member_summary.get("terminal_job_id") != graph["terminal_job_id"]
+            or job_member_summary.get("query_task_membership_sha256")
+            != graph["query_task_membership_sha256"]
+            or job_member_summary.get(
+                "publication_query_task_membership_sha256"
+            )
+            != graph["publication_query_task_membership_sha256"]
+            or job_member_summary.get("icom_query_membership_sha256")
+            != graph["icom_query_membership_sha256"]
+            or job_member_summary.get(
+                "publication_icom_query_membership_sha256"
+            )
+            != graph["publication_icom_query_membership_sha256"]
+        ):
+            raise ValueError("formal source summary job membership is cross-swapped")
+        job_graph_digest = graph["job_graph_sha256"]
+    else:
+        job_graph_digest = _require_sha256(
+            job_member_summary.get("job_graph_sha256"),
+            "formal source summary job graph",
+        )
     _nonempty_string(summary["challenge_id"], "formal source summary challenge_id")
     try:
         UUID(str(summary["challenge_id"]))
@@ -1299,6 +2492,7 @@ def validate_formal_source_summary(
         "request_sha256": summary["request_sha256"],
         "candidate_set_sha256": summary["candidate_set_sha256"],
         "scenario_sha256": summary["scenario_sha256"],
+        "job_graph_sha256": job_graph_digest,
         "issued_at": summary["issued_at"],
         "expires_at": summary["expires_at"],
     }
@@ -1321,6 +2515,9 @@ def validate_formal_source_summary(
         "pre_event_count": pre,
         "post_event_count": post,
         "delta_digest": summary["delta_digest"],
+        "terminal_job_graph_sha256": job_member_summary[
+            "terminal_job_graph_sha256"
+        ],
         "issued_at": summary["issued_at"],
         "verified_at": summary["verified_at"],
     }
@@ -1375,7 +2572,10 @@ class FormalLiveSourceAuthority:
         self._ledger_path = ledger_path
         self._runtime_identity = _runtime_identity(dict(runtime_identity))
         self._composition = formal_composition_contract(commit_sha)
-        stable = hashlib.sha256(_PUBLIC_KEY_DER + str(_REPO_ROOT).encode()).digest()
+        stable = hashlib.sha256(
+            bytes(_load_verification_anchor()["public_key_der"])
+            + str(_REPO_ROOT).encode()
+        ).digest()
         self._install_id = str(UUID(bytes=stable[:16]))
         self._composition_sha256 = _composition_sha256(
             self._install_id, self._composition
@@ -1388,6 +2588,76 @@ class FormalLiveSourceAuthority:
         self._events: list[dict[str, object]] = []
         self._chain_sha256 = self._composition_sha256
         self._last_heartbeat: dict[str, object] | None = None
+        self._restore_active_state()
+
+    def _active_state_payload(self) -> dict[str, object]:
+        if self._active_challenge is None or self._baseline is None:
+            raise RuntimeError("formal source active state is incomplete")
+        return {
+            "challenge": self._active_challenge,
+            "baseline": self._baseline,
+            "events": list(self._events),
+            "chain_sha256": self._chain_sha256,
+            "last_heartbeat": self._last_heartbeat,
+        }
+
+    def _apply_active_state(self, value: object) -> None:
+        fields = {
+            "challenge",
+            "baseline",
+            "events",
+            "chain_sha256",
+            "last_heartbeat",
+        }
+        if not isinstance(value, dict) or set(value) != fields:
+            raise RuntimeError("formal source persisted active state is invalid")
+        challenge = _validate_challenge(value["challenge"])
+        if challenge["tested_commit_sha"] != self._composition["commit_sha"]:
+            raise RuntimeError("formal source active state belongs to another build")
+        baseline = _validate_snapshot(value["baseline"], challenge)
+        if baseline["event_count"] != 0 or baseline["events"] != []:
+            raise RuntimeError("formal source persisted baseline is not pre-event")
+        events = value["events"]
+        if not isinstance(events, list):
+            raise RuntimeError("formal source persisted event chain is invalid")
+        replay_snapshot = {
+            **baseline,
+            "event_count": len(events),
+            "events": events,
+            "chain_sha256": value["chain_sha256"],
+            "last_heartbeat": value["last_heartbeat"],
+        }
+        replay_snapshot["signature"] = _sign(
+            self._private_key, _signed_payload(replay_snapshot)
+        )
+        checked = _validate_snapshot(replay_snapshot, challenge)
+        self._active_challenge = challenge
+        self._baseline = baseline
+        self._events = list(checked["events"])
+        self._chain_sha256 = str(checked["chain_sha256"])
+        heartbeat = checked["last_heartbeat"]
+        self._last_heartbeat = dict(heartbeat) if isinstance(heartbeat, dict) else None
+
+    def _restore_active_state(self) -> None:
+        with self._ledger_lock():
+            ledger = self._read_ledger()
+            active = [row for row in ledger.values() if row.get("state") == "issued"]
+            if len(active) > 1:
+                raise RuntimeError("formal source ledger has multiple active challenges")
+            if not active:
+                return
+            row = active[0]
+            expires = _require_aware_time(
+                row["expires_at"], "formal source ledger expires_at"
+            )
+            if self._utc_now() > expires:
+                row["state"] = "expired"
+                row["expired_at"] = self._utc_now().isoformat()
+                row["terminal_reason"] = "expired_during_cold_start"
+                row.pop("active_state", None)
+                self._write_ledger(ledger)
+                return
+            self._apply_active_state(row["active_state"])
 
     def bind(
         self,
@@ -1463,6 +2733,16 @@ class FormalLiveSourceAuthority:
             raise ValueError("formal source challenge runtime/commit is not this API process")
         for key in ("request_sha256", "candidate_set_sha256", "scenario_sha256"):
             _require_sha256(context[key], f"formal source challenge {key}")
+        if (
+            context["candidate_set_sha256"]
+            != system_stay_plan_candidate_set().candidate_set_sha256
+        ):
+            raise ValueError(
+                "formal source challenge candidate set differs from the frozen contract"
+            )
+        job_graph = _validate_job_graph(context["job_graph"])
+        if job_graph["request_sha256"] != context["request_sha256"]:
+            raise ValueError("formal source challenge job graph uses a foreign request")
         if not isinstance(context["run_id"], str) or not context["run_id"]:
             raise ValueError("formal source challenge run_id is invalid")
         with self._ledger_lock():
@@ -1474,6 +2754,8 @@ class FormalLiveSourceAuthority:
                 ):
                     row["state"] = "expired"
                     row["expired_at"] = now.isoformat()
+                    row["terminal_reason"] = "expired_before_new_challenge"
+                    row.pop("active_state", None)
             if any(row.get("state") == "issued" for row in ledger.values()):
                 raise ValueError("formal source authority already has an active challenge")
             if any(row.get("run_id") == context["run_id"] for row in ledger.values()):
@@ -1481,8 +2763,8 @@ class FormalLiveSourceAuthority:
             issued = now
             challenge: dict[str, object] = {
                 "schema_version": _CHALLENGE_SCHEMA_VERSION,
-                "anchor_version": _ANCHOR_VERSION,
-                "authority_key_id": _AUTHORITY_KEY_ID,
+                "anchor_version": _anchor_version(),
+                "authority_key_id": _authority_key_id(),
                 "challenge_id": str(uuid4()),
                 "nonce_digest": hashlib.sha256(os.urandom(32)).hexdigest(),
                 **context,
@@ -1495,19 +2777,28 @@ class FormalLiveSourceAuthority:
                 self._private_key,
                 _challenge_proof_payload(challenge),
             )
+            self._active_challenge = challenge
+            self._events = []
+            self._chain_sha256 = self._composition_sha256
+            self._last_heartbeat = None
+            self._baseline = self._snapshot_locked()
             ledger[str(challenge["challenge_id"])] = {
                 "run_id": context["run_id"],
                 "state": "issued",
                 "challenge_digest": _sha256(challenge),
                 "issued_at": challenge["issued_at"],
                 "expires_at": challenge["expires_at"],
+                "active_state": self._active_state_payload(),
             }
-            self._write_ledger(ledger)
-        self._active_challenge = challenge
-        self._events = []
-        self._chain_sha256 = self._composition_sha256
-        self._last_heartbeat = None
-        self._baseline = self.snapshot()
+            try:
+                self._write_ledger(ledger)
+            except Exception:
+                self._active_challenge = None
+                self._baseline = None
+                self._events = []
+                self._chain_sha256 = self._composition_sha256
+                self._last_heartbeat = None
+                raise
         return {"challenge": dict(challenge), "before": dict(self._baseline)}
 
     def record_browser_http(
@@ -1532,6 +2823,7 @@ class FormalLiveSourceAuthority:
         self,
         path: str,
         *,
+        subject_ids: Sequence[str],
         response_sha256: str,
         details: Mapping[str, object] | None = None,
     ) -> None:
@@ -1541,14 +2833,171 @@ class FormalLiveSourceAuthority:
             kind="icom_public_get",
             method="GET",
             path=path,
-            subject_ids=(),
+            subject_ids=subject_ids,
             details=details or {},
             response_sha256=response_sha256,
         )
 
+    def formal_icom_call(
+        self,
+        *,
+        source_task_id: object,
+        query_identity: object,
+        path: object,
+    ) -> dict[str, object]:
+        """Resolve one runtime iCom call against the signed frozen job graph."""
+
+        with self._state_lock:
+            if self._active_challenge is None:
+                raise ValueError("formal iCom call has no active challenge")
+            graph = _validate_job_graph(self._active_challenge["job_graph"])
+            source_id = _nonempty_string(source_task_id, "formal iCom source task")
+            endpoint = _nonempty_string(path, "formal iCom endpoint")
+            if endpoint not in _ICOM_PATHS:
+                raise ValueError("formal iCom endpoint is not canonical")
+            query = query_identity
+            if not isinstance(query, dict) or set(query) != {
+                "travel_date",
+                "origin",
+                "destination",
+                "adults",
+            }:
+                raise ValueError("formal iCom runtime query has an invalid shape")
+            _exact_int(query["adults"], "formal iCom runtime adults", minimum=1)
+            matches = [
+                item
+                for item in (
+                    *graph["icom_queries"],
+                    *graph["publication_icom_queries"],
+                )
+                if isinstance(item, dict)
+                and item["source_task_id"] == source_id
+                and item["travel_date"] == query["travel_date"]
+                and item["origin"] == query["origin"]
+                and item["destination"] == query["destination"]
+                and item["adults"] == query["adults"]
+            ]
+            if len(matches) != 1:
+                raise ValueError("formal iCom runtime query is outside the frozen job graph")
+            expected = matches[0]
+            call_identity = {
+                "query_task_id": expected["query_task_id"],
+                "query_identity_sha256": expected["query_identity_sha256"],
+                "method": "GET",
+                "path": endpoint,
+            }
+            return {
+                **expected,
+                "call_id": f"{expected['query_task_id']}|{endpoint}",
+                "call_identity_sha256": _sha256(call_identity),
+            }
+
+    def formal_browser_query(
+        self,
+        *,
+        task_id: object,
+        provider: object,
+        kind: object,
+        query: object,
+    ) -> dict[str, object]:
+        """Resolve one Browser lease/snapshot independently to a job member."""
+
+        with self._state_lock:
+            if self._active_challenge is None:
+                raise ValueError("formal Browser query has no active challenge")
+            graph = _validate_job_graph(self._active_challenge["job_graph"])
+            runtime_task_id = _nonempty_string(task_id, "formal Browser task_id")
+            provider_name = _nonempty_string(provider, "formal Browser provider")
+            vertical = _nonempty_string(kind, "formal Browser kind")
+            if provider_name not in {"ctrip", "qunar", "tongcheng"}:
+                raise ValueError("formal Browser provider is outside the frozen graph")
+            if vertical not in {"flight", "lodging"}:
+                raise ValueError("formal Browser kind is outside the frozen graph")
+            if not isinstance(query, dict):
+                raise ValueError("formal Browser query is not an exact object")
+            start_date = _nonempty_string(
+                query.get("start_date"), "formal Browser start_date"
+            )
+            end_date = _nonempty_string(
+                query.get("end_date"), "formal Browser end_date"
+            )
+            options = query.get("options")
+            if not isinstance(options, dict):
+                raise ValueError("formal Browser query options are invalid")
+            pair_matches = [
+                item
+                for item in graph["pairs"]
+                if isinstance(item, dict)
+                and (
+                    (vertical == "flight"
+                    and item["departure_date"] == start_date
+                    and item["return_date"] == end_date)
+                    or (
+                        vertical == "lodging"
+                        and start_date >= item["departure_date"]
+                        and end_date <= item["return_date"]
+                    )
+                )
+            ]
+            if len(pair_matches) != 1:
+                raise ValueError("formal Browser query does not identify one frozen pair")
+            pair = pair_matches[0]
+            segment = options.get("segment")
+            if vertical == "flight":
+                if segment is not None:
+                    raise ValueError("formal Browser flight carries a lodging segment")
+                query_kind = "flight"
+                direction = "round_trip"
+            else:
+                segment_kinds = {
+                    "full": "lodging_full_stay",
+                    "first": "lodging_first_night",
+                    "middle": "lodging_middle_stay",
+                    "last": "lodging_last_night",
+                    "hulhumale-full": "lodging_hulhumale_full_stay",
+                }
+                if segment not in segment_kinds:
+                    raise ValueError("formal Browser lodging segment is not canonical")
+                query_kind = segment_kinds[str(segment)]
+                direction = "stay"
+            prefix = f"query:{provider_name}:{query_kind}:"
+            member_ids = [
+                item
+                for item in pair["query_task_ids"]
+                if isinstance(item, str) and item.startswith(prefix)
+            ]
+            if len(member_ids) != 1:
+                raise ValueError("formal Browser query does not map to one job member")
+            identity: dict[str, object] = {
+                "terminal_job_id": graph["terminal_job_id"],
+                "pair_id": pair["date_pair_id"],
+                "task_id": runtime_task_id,
+                "query_task_id": member_ids[0],
+                "provider": provider_name,
+                "kind": vertical,
+                "query_kind": query_kind,
+                "direction": direction,
+                "start_date": start_date,
+                "end_date": end_date,
+                "query_sha256": _sha256(query),
+                "execution_phase": (
+                    "publication_refresh"
+                    if options.get("__tripchord_allow_recent_quote_reuse") is False
+                    else "checkpoint_exploration"
+                ),
+            }
+            identity["query_identity"] = _sha256(identity)
+            return identity
+
     def snapshot(self) -> dict[str, object]:
         with self._state_lock:
             return self._snapshot_locked()
+
+    def is_active(self) -> bool:
+        """Whether this process currently has one recoverable formal flow."""
+
+        with self._state_lock:
+            return self._active_challenge is not None
 
     def _snapshot_locked(self) -> dict[str, object]:
         if not self._bound or self._active_challenge is None:
@@ -1556,8 +3005,8 @@ class FormalLiveSourceAuthority:
         challenge = self._active_challenge
         snapshot: dict[str, object] = {
             "schema_version": _SCHEMA_VERSION,
-            "anchor_version": _ANCHOR_VERSION,
-            "authority_key_id": _AUTHORITY_KEY_ID,
+            "anchor_version": _anchor_version(),
+            "authority_key_id": _authority_key_id(),
             "install_id": self._install_id,
             "composition": self._composition,
             "composition_sha256": self._composition_sha256,
@@ -1577,8 +3026,8 @@ class FormalLiveSourceAuthority:
         """Non-signing status safe for the ordinary authenticated runtime route."""
         return {
             "schema_version": _SCHEMA_VERSION,
-            "anchor_version": _ANCHOR_VERSION,
-            "authority_key_id": _AUTHORITY_KEY_ID,
+            "anchor_version": _anchor_version(),
+            "authority_key_id": _authority_key_id(),
             "install_id": self._install_id,
             "composition": self._composition,
             "composition_sha256": self._composition_sha256,
@@ -1586,32 +3035,122 @@ class FormalLiveSourceAuthority:
             "challenge_active": self._active_challenge is not None,
         }
 
+    def require_active_job(self, job_id: object) -> None:
+        """Control-plane guard used immediately before a prepared job starts."""
+
+        with self._state_lock:
+            if self._active_challenge is None:
+                raise ValueError("formal source activation has no active challenge")
+            graph = _validate_job_graph(self._active_challenge["job_graph"])
+            if job_id != graph["terminal_job_id"]:
+                raise ValueError("formal source activation targets a foreign job")
+
+    def abort(self, context: object) -> dict[str, object]:
+        return self._terminal_transition(context, target="aborted", require_expired=False)
+
+    def expire(self, context: object) -> dict[str, object]:
+        return self._terminal_transition(context, target="expired", require_expired=True)
+
+    def _terminal_transition(
+        self,
+        context: object,
+        *,
+        target: str,
+        require_expired: bool,
+    ) -> dict[str, object]:
+        fields = {"challenge_id", "run_id", "reason_code"}
+        if not isinstance(context, dict) or set(context) != fields:
+            raise ValueError("formal source terminal transition context is invalid")
+        reason = _nonempty_string(
+            context["reason_code"], "formal source terminal reason"
+        )
+        if len(reason) > 80 or any(
+            not (character.isascii() and (character.isalnum() or character in "_-"))
+            for character in reason
+        ):
+            raise ValueError("formal source terminal reason is invalid")
+        with self._state_lock, self._ledger_lock():
+            ledger = self._read_ledger()
+            row = ledger.get(str(context["challenge_id"]))
+            if (
+                not isinstance(row, dict)
+                or row.get("state") != "issued"
+                or row.get("run_id") != context["run_id"]
+            ):
+                raise ValueError("formal source challenge is not active for transition")
+            active_state = row.get("active_state")
+            if not isinstance(active_state, dict):
+                raise RuntimeError("formal source active state is unavailable")
+            challenge = _validate_challenge(active_state.get("challenge"))
+            is_expired = self._utc_now() > _require_aware_time(
+                challenge["expires_at"], "challenge expires_at"
+            )
+            if require_expired and not is_expired:
+                raise ValueError("formal source challenge is not yet expired")
+            transitioned_at = self._utc_now().isoformat()
+            row["state"] = target
+            row[f"{target}_at"] = transitioned_at
+            row["terminal_reason"] = reason
+            row.pop("active_state", None)
+            self._write_ledger(ledger)
+            if (
+                self._active_challenge is not None
+                and self._active_challenge.get("challenge_id")
+                == context["challenge_id"]
+            ):
+                self._clear_active_state()
+            return {
+                "challenge_id": context["challenge_id"],
+                "run_id": context["run_id"],
+                "state": target,
+                "transitioned_at": transitioned_at,
+            }
+
     def finalize(self, context: object) -> dict[str, object]:
         with self._state_lock:
             return self._finalize_locked(context)
 
     def _finalize_locked(self, context: object) -> dict[str, object]:
+        with self._ledger_lock():
+            ledger = self._read_ledger()
+            active_rows = [
+                row for row in ledger.values() if row.get("state") == "issued"
+            ]
+            if len(active_rows) != 1:
+                raise ValueError("formal source finalize has no unique active challenge")
+            self._apply_active_state(active_rows[0]["active_state"])
+            return self._finalize_under_ledger_lock(context, ledger)
+
+    def _finalize_under_ledger_lock(
+        self,
+        context: object,
+        ledger: dict[str, dict[str, object]],
+    ) -> dict[str, object]:
         if self._active_challenge is None or self._baseline is None:
             raise ValueError("formal source finalize has no active challenge")
         challenge = _validate_challenge(self._active_challenge)
-        if (
-            not isinstance(context, dict)
-            or set(context) != _CHALLENGE_CONTEXT_FIELDS
-            or any(context[key] != challenge[key] for key in _CHALLENGE_CONTEXT_FIELDS)
-        ):
+        if not isinstance(context, dict) or set(context) != _FINALIZE_CONTEXT_FIELDS:
+            raise ValueError("formal source finalize context has an invalid shape")
+        if any(context[key] != challenge[key] for key in _CHALLENGE_CONTEXT_FIELDS):
             raise ValueError("formal source finalize context differs from challenge")
+        job_graph = _validate_job_graph(challenge["job_graph"])
+        terminal_job = _validate_terminal_job_contract(
+            context["terminal_job"],
+            job_graph=job_graph,
+            pair_checkpoint_binding=context["pair_checkpoint_binding"],
+        )
+        job_member_summary = _job_member_summary(job_graph, terminal_job)
         if self._utc_now() > _require_aware_time(
             challenge["expires_at"], "challenge expires_at"
         ):
-            with self._ledger_lock():
-                ledger = self._read_ledger()
-                row = ledger.get(str(challenge["challenge_id"]))
-                if isinstance(row, dict) and row.get("state") == "issued":
-                    row["state"] = "expired"
-                    row["expired_at"] = self._utc_now().isoformat()
-                    self._write_ledger(ledger)
-            self._active_challenge = None
-            self._baseline = None
+            row = ledger.get(str(challenge["challenge_id"]))
+            if isinstance(row, dict) and row.get("state") == "issued":
+                row["state"] = "expired"
+                row["expired_at"] = self._utc_now().isoformat()
+                row["terminal_reason"] = "expired_before_finalize"
+                row.pop("active_state", None)
+                self._write_ledger(ledger)
+            self._clear_active_state()
             raise ValueError("formal source challenge expired before consumption")
         after = self._snapshot_locked()
         pre = _validate_snapshot(self._baseline, challenge)
@@ -1619,8 +3158,8 @@ class FormalLiveSourceAuthority:
         receipts = post["events"][int(pre["event_count"]) :]
         binding: dict[str, object] = {
             "schema_version": _BINDING_SCHEMA_VERSION,
-            "anchor_version": _ANCHOR_VERSION,
-            "authority_key_id": _AUTHORITY_KEY_ID,
+            "anchor_version": _anchor_version(),
+            "authority_key_id": _authority_key_id(),
             "install_id": self._install_id,
             "composition": self._composition,
             "composition_sha256": self._composition_sha256,
@@ -1637,8 +3176,8 @@ class FormalLiveSourceAuthority:
         verified_at = self._utc_now().isoformat()
         receipt: dict[str, object] = {
             "schema_version": _RECEIPT_SCHEMA_VERSION,
-            "anchor_version": _ANCHOR_VERSION,
-            "authority_key_id": _AUTHORITY_KEY_ID,
+            "anchor_version": _anchor_version(),
+            "authority_key_id": _authority_key_id(),
             "challenge_id": challenge["challenge_id"],
             "nonce_digest": challenge["nonce_digest"],
             "binding_digest": binding["binding_digest"],
@@ -1648,6 +3187,7 @@ class FormalLiveSourceAuthority:
             "pre_event_count": pre["event_count"],
             "post_event_count": post["event_count"],
             "delta_digest": _sha256(receipts),
+            "job_member_summary": job_member_summary,
             "issued_at": challenge["issued_at"],
             "verified_at": verified_at,
         }
@@ -1656,29 +3196,28 @@ class FormalLiveSourceAuthority:
             _receipt_proof_payload(receipt),
         )
         binding["authority_receipt"] = receipt
-        validate_formal_source_evidence(
-            binding, receipt, challenge, expected_context=context
+        validate_formal_source_evidence(binding, receipt, challenge)
+        row = ledger.get(str(challenge["challenge_id"]))
+        if (
+            not isinstance(row, dict)
+            or row.get("state") != "issued"
+            or row.get("challenge_digest") != _sha256(challenge)
+            or row.get("run_id") != challenge["run_id"]
+        ):
+            raise ValueError("formal source challenge was already consumed")
+        row.update(
+            {
+                "state": "consumed",
+                "binding_digest": binding["binding_digest"],
+                "verified_at": verified_at,
+                "terminal_job_graph_sha256": job_member_summary[
+                    "terminal_job_graph_sha256"
+                ],
+            }
         )
-        with self._ledger_lock():
-            ledger = self._read_ledger()
-            row = ledger.get(str(challenge["challenge_id"]))
-            if (
-                not isinstance(row, dict)
-                or row.get("state") != "issued"
-                or row.get("challenge_digest") != _sha256(challenge)
-                or row.get("run_id") != challenge["run_id"]
-            ):
-                raise ValueError("formal source challenge was already consumed")
-            row.update(
-                {
-                    "state": "consumed",
-                    "binding_digest": binding["binding_digest"],
-                    "verified_at": verified_at,
-                }
-            )
-            self._write_ledger(ledger)
-        self._active_challenge = None
-        self._baseline = None
+        row.pop("active_state", None)
+        self._write_ledger(ledger)
+        self._clear_active_state()
         return {
             "challenge": challenge,
             "binding": binding,
@@ -1696,14 +3235,50 @@ class FormalLiveSourceAuthority:
         response_sha256: str | None,
     ) -> None:
         with self._state_lock:
-            self._record_locked(
-                kind=kind,
-                method=method,
-                path=path,
-                subject_ids=subject_ids,
-                details=details,
-                response_sha256=response_sha256,
-            )
+            if self._active_challenge is None:
+                return
+            with self._ledger_lock():
+                ledger = self._read_ledger()
+                challenge_id = str(self._active_challenge["challenge_id"])
+                row = ledger.get(challenge_id)
+                if not isinstance(row, dict) or row.get("state") != "issued":
+                    raise RuntimeError("formal source active challenge is not ledger-active")
+                self._apply_active_state(row["active_state"])
+                challenge = self._active_challenge
+                if challenge is None:  # pragma: no cover - apply enforces this
+                    raise RuntimeError("formal source active state disappeared")
+                if self._utc_now() > _require_aware_time(
+                    challenge["expires_at"], "challenge expires_at"
+                ):
+                    row["state"] = "expired"
+                    row["expired_at"] = self._utc_now().isoformat()
+                    row["terminal_reason"] = "expired_before_event_record"
+                    row.pop("active_state", None)
+                    self._write_ledger(ledger)
+                    self._clear_active_state()
+                    raise RuntimeError("formal live event occurred after challenge expiry")
+                before = self._active_state_payload()
+                try:
+                    self._record_locked(
+                        kind=kind,
+                        method=method,
+                        path=path,
+                        subject_ids=subject_ids,
+                        details=details,
+                        response_sha256=response_sha256,
+                    )
+                    row["active_state"] = self._active_state_payload()
+                    self._write_ledger(ledger)
+                except Exception:
+                    self._apply_active_state(before)
+                    raise
+
+    def _clear_active_state(self) -> None:
+        self._active_challenge = None
+        self._baseline = None
+        self._events = []
+        self._chain_sha256 = self._composition_sha256
+        self._last_heartbeat = None
 
     def _record_locked(
         self,
@@ -1737,7 +3312,11 @@ class FormalLiveSourceAuthority:
             "challenge_id": challenge["challenge_id"],
             "nonce_digest": challenge["nonce_digest"],
             "context": {
-                **{key: challenge[key] for key in _CHALLENGE_CONTEXT_FIELDS},
+                **{
+                    key: challenge[key]
+                    for key in _CHALLENGE_CONTEXT_FIELDS - {"job_graph"}
+                },
+                "job_graph_sha256": challenge["job_graph"]["job_graph_sha256"],
                 "challenge_id": challenge["challenge_id"],
                 "nonce_digest": challenge["nonce_digest"],
                 "install_id": self._install_id,
@@ -1760,6 +3339,12 @@ class FormalLiveSourceAuthority:
             challenge=challenge,
             install_id=self._install_id,
             composition_sha256=self._composition_sha256,
+        )
+        _validate_business_event_details(
+            (*self._events, event),
+            job_graph=_validate_job_graph(challenge["job_graph"]),
+            candidate_set_sha256=str(challenge["candidate_set_sha256"]),
+            require_complete=False,
         )
         self._events.append(event)
         self._chain_sha256 = str(event["receipt_sha256"])
@@ -1791,8 +3376,14 @@ class FormalLiveSourceAuthority:
             "issued_at",
             "expires_at",
         }
-        consumed_fields = ledger_fields | {"binding_digest", "verified_at"}
-        expired_fields = ledger_fields | {"expired_at"}
+        issued_fields = ledger_fields | {"active_state"}
+        consumed_fields = ledger_fields | {
+            "binding_digest",
+            "verified_at",
+            "terminal_job_graph_sha256",
+        }
+        expired_fields = ledger_fields | {"expired_at", "terminal_reason"}
+        aborted_fields = ledger_fields | {"aborted_at", "terminal_reason"}
         if not isinstance(parsed, dict):
             raise RuntimeError("formal source challenge ledger has an invalid shape")
         for key, value in parsed.items():
@@ -1804,9 +3395,16 @@ class FormalLiveSourceAuthority:
                 if state == "consumed"
                 else expired_fields
                 if state == "expired"
-                else ledger_fields
+                else aborted_fields
+                if state == "aborted"
+                else issued_fields
             )
-            if set(value) != expected or state not in {"issued", "consumed", "expired"}:
+            if set(value) != expected or state not in {
+                "issued",
+                "consumed",
+                "expired",
+                "aborted",
+            }:
                 raise RuntimeError("formal source challenge ledger row is invalid")
             _nonempty_string(value["run_id"], "formal source ledger run_id")
             _require_sha256(value["challenge_digest"], "formal source ledger challenge")
@@ -1815,22 +3413,42 @@ class FormalLiveSourceAuthority:
             if value["state"] == "consumed":
                 _require_sha256(value["binding_digest"], "formal source ledger binding")
                 _require_aware_time(value["verified_at"], "formal source ledger verified_at")
+                _require_sha256(
+                    value["terminal_job_graph_sha256"],
+                    "formal source ledger terminal job graph",
+                )
             elif value["state"] == "expired":
                 _require_aware_time(value["expired_at"], "formal source ledger expired_at")
+                _nonempty_string(
+                    value["terminal_reason"], "formal source ledger terminal reason"
+                )
+            elif value["state"] == "aborted":
+                _require_aware_time(value["aborted_at"], "formal source ledger aborted_at")
+                _nonempty_string(
+                    value["terminal_reason"], "formal source ledger terminal reason"
+                )
+            elif not isinstance(value["active_state"], dict):
+                raise RuntimeError("formal source ledger active state is invalid")
         return parsed
 
     @contextmanager
     def _ledger_lock(self) -> Iterator[None]:
         lock_path = self._ledger_path.with_suffix(self._ledger_path.suffix + ".lock")
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(
-            lock_path,
+        _protected_directory(lock_path.parent, "formal source ledger parent")
+        common_flags = (
             os.O_RDWR
-            | os.O_CREAT
             | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
+            | getattr(os, "O_NOFOLLOW", 0)
         )
+        try:
+            descriptor = os.open(
+                lock_path,
+                common_flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            _fsync_directory(lock_path.parent)
+        except FileExistsError:
+            descriptor = os.open(lock_path, common_flags)
         try:
             info = os.fstat(descriptor)
             if (
@@ -1847,7 +3465,9 @@ class FormalLiveSourceAuthority:
             os.close(descriptor)
 
     def _write_ledger(self, ledger: Mapping[str, object]) -> None:
-        self._ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        _protected_directory(
+            self._ledger_path.parent, "formal source ledger parent"
+        )
         current = _protected_regular_file(
             self._ledger_path,
             "formal source challenge ledger",
@@ -1857,15 +3477,19 @@ class FormalLiveSourceAuthority:
         temporary = self._ledger_path.with_name(
             f".{self._ledger_path.name}.{os.getpid()}.{uuid4().hex}.tmp"
         )
-        descriptor = os.open(
-            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-        )
         try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(_canonical_bytes(ledger))
-                handle.flush()
-                os.fsync(handle.fileno())
+            expected = _canonical_bytes(ledger)
+            _exclusive_owner_write(
+                temporary,
+                expected,
+                "formal source challenge ledger temporary",
+            )
             os.replace(temporary, self._ledger_path)
+            replaced = _protected_regular_file(
+                self._ledger_path, "formal source challenge ledger"
+            )
+            if replaced != expected:
+                raise RuntimeError("formal source challenge ledger replace is inconsistent")
             directory = os.open(
                 self._ledger_path.parent,
                 os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
@@ -1882,8 +3506,9 @@ def load_formal_live_source_authority(
     *,
     commit_sha: str,
     runtime_identity: Mapping[str, object],
-    private_key_path: Path = _DEFAULT_PRIVATE_KEY,
-    ledger_path: Path = _DEFAULT_LEDGER,
+    private_key_path: Path | None = None,
+    ledger_path: Path | None = None,
+    trust_root: Path | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> FormalLiveSourceAuthority:
     """Load the protected signer and prove it matches the fixed public anchor.
@@ -1892,8 +3517,11 @@ def load_formal_live_source_authority(
     signer trust boundary.  Ordinary API principals and Browser credentials do
     not gain this constructor capability.
     """
+    generation_root, _generation = _current_generation(trust_root)
+    resolved_private_key = private_key_path or generation_root / "authority-private.pem"
+    resolved_ledger = ledger_path or formal_source_trust_root(trust_root) / "ledger.json"
     raw = _protected_regular_file(
-        private_key_path, "formal source authority private key"
+        resolved_private_key, "formal source authority private key"
     )
     if raw is None:  # pragma: no cover - missing_ok is false above
         raise RuntimeError("formal source authority private key is unavailable")
@@ -1907,14 +3535,15 @@ def load_formal_live_source_authority(
         serialization.Encoding.DER,
         serialization.PublicFormat.SubjectPublicKeyInfo,
     )
-    if public_der != _PUBLIC_KEY_DER:
+    anchor = _load_verification_anchor(trust_root)
+    if public_der != anchor["public_key_der"]:
         raise RuntimeError(
             "formal source authority private key does not match the fixed anchor"
         )
     return FormalLiveSourceAuthority(
         commit_sha=commit_sha,
         private_key=loaded,
-        ledger_path=ledger_path,
+        ledger_path=resolved_ledger,
         runtime_identity=runtime_identity,
         now=now,
         _startup_capability=_STARTUP_CAPABILITY,

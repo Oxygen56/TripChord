@@ -44,6 +44,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -80,6 +81,7 @@ from tripchord._secret_redact import (
 from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
 from tripchord.formal_live_source import (
     formal_source_evidence_summary,
+    validate_formal_source_challenge,
     validate_formal_source_evidence,
     validate_formal_source_summary,
 )
@@ -1068,6 +1070,79 @@ _DIGEST_BINDING_PATHS: frozenset[tuple[str | None, ...]] = frozenset(
         ("formal_live_source_summary", "scenario_sha256"),
         ("formal_live_source_summary", "composition_sha256"),
         (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "ordered_pair_ids_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "query_task_membership_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "publication_query_task_membership_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "icom_query_membership_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "publication_icom_query_membership_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "checkpoint_chain_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "terminal_result_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "job_graph_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "terminal_job_graph_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "pair_members",
+            _ARRAY_MARKER,
+            "query_task_ids_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "pair_members",
+            _ARRAY_MARKER,
+            "publication_query_task_ids_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "pair_members",
+            _ARRAY_MARKER,
+            "checkpoint_identity_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "pair_members",
+            _ARRAY_MARKER,
+            "checkpoint_sha256",
+        ),
+        (
             "runtime_before_run",
             "runtime_provenance",
             "dependency_lock_sha256",
@@ -1506,7 +1581,12 @@ def _reject_credential_field_names(data: bytes, label: str, name: str) -> None:
 
 
 def _reject_unbound_registered_base_values(
-    data: bytes, label: str, name: str
+    data: bytes,
+    label: str,
+    name: str,
+    *,
+    max_nodes: int = _MAX_JSON_SCAN_NODES,
+    max_chars: int = _MAX_JSON_SCAN_CHARS,
 ) -> None:
     """Fail closed when a JSON evidence artifact carries an EXACT registered
     business-identifier base as a string VALUE at a member path the documented
@@ -1590,10 +1670,10 @@ def _reject_unbound_registered_base_values(
         if depth > _MAX_JSON_SCAN_DEPTH:
             raise RecursiveJsonBudgetError("JSON scan depth budget exceeded")
         budget_nodes += 1
-        if budget_nodes > _MAX_JSON_SCAN_NODES:
+        if budget_nodes > max_nodes:
             raise RecursiveJsonBudgetError("JSON scan node budget exceeded")
         budget_chars += len(level_text)
-        if budget_chars > _MAX_JSON_SCAN_CHARS:
+        if budget_chars > max_chars:
             raise RecursiveJsonBudgetError("JSON scan size budget exceeded")
         if not looks_like_json(level_text):
             return  # not JSON text at this level; the pattern scan applies
@@ -1674,7 +1754,7 @@ def _reject_unbound_registered_base_values(
                     # The object MEMBER KEY counts as a node, matching the
                     # shared scan walker's counting.
                     budget_nodes += 1
-                    if budget_nodes > _MAX_JSON_SCAN_NODES:
+                    if budget_nodes > max_nodes:
                         raise RecursiveJsonBudgetError(
                             "JSON scan node budget exceeded"
                         )
@@ -1683,7 +1763,7 @@ def _reject_unbound_registered_base_values(
                     child_path = (*node_path, key)
                     if isinstance(value, str):
                         budget_nodes += 1
-                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                        if budget_nodes > max_nodes:
                             raise RecursiveJsonBudgetError(
                                 "JSON scan node budget exceeded"
                             )
@@ -1706,7 +1786,7 @@ def _reject_unbound_registered_base_values(
                         stack.append((value, child_path))
                     else:
                         budget_nodes += 1
-                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                        if budget_nodes > max_nodes:
                             raise RecursiveJsonBudgetError(
                                 "JSON scan node budget exceeded"
                             )
@@ -1714,7 +1794,7 @@ def _reject_unbound_registered_base_values(
                 for item in node:
                     if isinstance(item, str):
                         budget_nodes += 1
-                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                        if budget_nodes > max_nodes:
                             raise RecursiveJsonBudgetError(
                                 "JSON scan node budget exceeded"
                             )
@@ -1741,7 +1821,7 @@ def _reject_unbound_registered_base_values(
                         )
                     else:
                         budget_nodes += 1
-                        if budget_nodes > _MAX_JSON_SCAN_NODES:
+                        if budget_nodes > max_nodes:
                             raise RecursiveJsonBudgetError(
                                 "JSON scan node budget exceeded"
                             )
@@ -2078,7 +2158,22 @@ def _is_tracking_url_leak(url: str) -> bool:
 # ``(?i)`` (C-122 supervision 08:30+08:31 补充 B): an uppercase ``HTTPS://`` URL
 # is the same tracking URL as lowercase — the pattern must match it so the
 # ``_is_tracking_url_leak`` semantics decide (a plain URL is never rejected).
-_TRACKING_URL_PATTERN = re.compile(r"(?i)https?://[^\s\"'<>)\[\]{}]+")
+# Backslash is a JSON-string escape boundary, never part of an HTTP URL.  If it
+# is consumed, an otherwise exact percent-encoded ``[REDACTED]`` query value is
+# misread as having a trailing character when the URL sits in nested JSON.
+_TRACKING_URL_PATTERN = re.compile(r"(?i)https?://[^\s\\\"'<>)\[\]{}]+")
+
+
+def _blank_nonleaking_tracking_urls(text: str) -> str:
+    """Preserve raw case-exact redaction decisions before casefold scanning."""
+    return _TRACKING_URL_PATTERN.sub(
+        lambda match: (
+            match.group(0)
+            if _is_tracking_url_leak(match.group(0))
+            else "[SAFE-URL]"
+        ),
+        text,
+    )
 
 
 class _SecretNeedles:
@@ -2150,24 +2245,25 @@ def _scan_decoded_string_value(
     full-width run, never the run itself (the decoded value is where the real
     characters surface).
     """
+    value_for_shapes = _mask_formal_public_proofs(value, public_proofs)
     # R20 Block 20a: the ``Digest`` auth ``response`` hex credential is scanned
     # on the RAW decoded value BEFORE ``_mask_hex_hash_spans`` (the 32-128 hex
     # run is otherwise replaced by the recomputable-digest placeholder).
-    if _SHAPE_PATTERN_DIGEST_AUTH_RE.search(value):
+    if _SHAPE_PATTERN_DIGEST_AUTH_RE.search(value_for_shapes):
         raise GateStateChangedError(
             f"secret leak: Digest-auth response in decoded value in "
             f"{label} file {name}"
         )
-    value_masked = _mask_hex_hash_spans(value)
-    value_norm = _normalize_for_scan(value_masked)
+    value_masked = _mask_hex_hash_spans(value_for_shapes)
+    value_norm = _normalize_for_scan(
+        _blank_nonleaking_tracking_urls(value_masked)
+    )
     for needle in tuple(needles):
         if needle in value.encode("utf-8"):
             raise GateStateChangedError(
                 f"secret leak: secret value found in decoded value in "
                 f"{label} file {name}"
             )
-    if value in public_proofs:
-        return
     for pattern, kind in (
         (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
         (_ACCOUNT_ID_PATTERN, "account identifier"),
@@ -2245,6 +2341,70 @@ def _make_decoded_value_scanner(
     return scan
 
 
+@lru_cache(maxsize=8)
+def _formal_public_proof_pattern(
+    public_proofs: frozenset[str],
+) -> re.Pattern[str] | None:
+    encoded_forms: set[str] = set()
+    for proof in public_proofs:
+        if not proof:
+            continue
+        encoded_forms.add(proof)
+        ascii_form = proof
+        unicode_form = proof
+        # Raw, decoded, and up to four nested JSON string encodings are the
+        # bounded evidence forms used by this gate.  Compile them once: rebuilding
+        # and replacing hundreds of proofs for every string value is quadratic.
+        for _depth in range(4):
+            ascii_form = json.dumps(ascii_form, ensure_ascii=True)[1:-1]
+            unicode_form = json.dumps(unicode_form, ensure_ascii=False)[1:-1]
+            encoded_forms.update({ascii_form, unicode_form})
+    if not encoded_forms:
+        return None
+    return re.compile(
+        "|".join(re.escape(item) for item in sorted(encoded_forms, key=len, reverse=True))
+    )
+
+
+def _mask_formal_public_proofs(
+    text: str,
+    public_proofs: frozenset[str],
+) -> str:
+    """Blank exact fixed-anchor-authenticated public evidence identifiers.
+
+    Formal signatures and the terminal job id are public evidence, not bearer
+    credentials, but their random bytes can contain a credential-shaped run.
+    ``public_proofs`` is populated only after the complete artifact validates
+    against the fixed production anchor.  Longest-first replacement also
+    covers a terminal job id embedded in its signed status/events URLs.
+    """
+    pattern = _formal_public_proof_pattern(public_proofs)
+    return text if pattern is None else pattern.sub("[FORMAL-PROOF]", text)
+
+
+def _signed_formal_public_values(checked: dict[str, Any]) -> set[str]:
+    """Return exact non-secret values from a fully validated formal contract."""
+    values = {
+        str(checked["challenge"]["signature"]),
+        str(checked["authority_receipt"]["signature"]),
+        str(checked["challenge"]["job_graph"]["terminal_job_id"]),
+    }
+    for event in checked["receipts"]:
+        values.add(str(event["signature"]))
+        stack: list[object] = [event["details"]]
+        while stack:
+            node = stack.pop()
+            if type(node) is dict:
+                for key, item in node.items():
+                    if key in {"search_url", "url"} and type(item) is str:
+                        values.add(item)
+                    elif type(item) in {dict, list}:
+                        stack.append(item)
+            elif type(node) is list:
+                stack.extend(item for item in node if type(item) in {dict, list})
+    return values
+
+
 def _formal_public_proofs(data: bytes, name: str) -> frozenset[str]:
     if name not in {_COMPACT_E2E_STAGED_NAME, "live-done-gate-v4.json"}:
         return frozenset()
@@ -2273,7 +2433,20 @@ def _formal_public_proofs(data: bytes, name: str) -> frozenset[str]:
                 "api_payload_candidate_set_sha256"
             ),
             "scenario_sha256": payload.get("scenario_sha256"),
+            "job_graph": payload.get("formal_job_graph"),
         }
+        if {
+            "formal_terminal_job",
+            "pair_checkpoint_binding",
+        } <= set(payload):
+            expected_context.update(
+                {
+                    "terminal_job": payload.get("formal_terminal_job"),
+                    "pair_checkpoint_binding": payload.get(
+                        "pair_checkpoint_binding"
+                    ),
+                }
+            )
         try:
             checked = validate_formal_source_evidence(
                 binding,
@@ -2282,13 +2455,35 @@ def _formal_public_proofs(data: bytes, name: str) -> frozenset[str]:
                 expected_context=expected_context,
             )
         except ValueError:
-            return frozenset()
-        proofs = {
-            str(checked["challenge"]["signature"]),
-            str(checked["authority_receipt"]["signature"]),
-        }
-        proofs.update(str(event["signature"]) for event in checked["receipts"])
-        return frozenset(proofs)
+            # A failed/aborted runner legitimately has no final binding or
+            # authority receipt, but its pre-run challenge is independently
+            # fixed-anchor signed.  Treat only the challenge's public signature
+            # and terminal job id as proofs, and only after every signed context
+            # field exactly matches the outer failure artifact.
+            try:
+                checked_challenge = validate_formal_source_challenge(challenge)
+            except ValueError:
+                return frozenset()
+            expected_challenge = {
+                "run_id": expected_context["run_id"],
+                "tested_commit_sha": expected_context["tested_commit_sha"],
+                "runtime_identity": expected_context["runtime_identity"],
+                "request_sha256": expected_context["request_sha256"],
+                "candidate_set_sha256": expected_context["candidate_set_sha256"],
+                "scenario_sha256": expected_context["scenario_sha256"],
+                "job_graph": expected_context["job_graph"],
+            }
+            if any(
+                checked_challenge.get(key) != expected
+                for key, expected in expected_challenge.items()
+            ):
+                return frozenset()
+            proofs = {
+                str(checked_challenge["signature"]),
+                str(checked_challenge["job_graph"]["terminal_job_id"]),
+            }
+            return frozenset(proofs)
+        return frozenset(_signed_formal_public_values(checked))
     summary = payload.get("formal_live_source_summary")
     expected_context = {
         "run_id": payload.get("gate_run_id"),
@@ -2309,6 +2504,60 @@ def _formal_public_proofs(data: bytes, name: str) -> frozenset[str]:
         str(checked[key])
         for key in ("challenge_signature", "authority_receipt_signature")
     )
+
+
+def _authenticated_formal_scan_limits(
+    data: bytes,
+    name: str,
+    public_proofs: frozenset[str],
+) -> tuple[int, int, int]:
+    """Return a bounded scan capacity for an authenticated formal raw graph.
+
+    The generic 10k-node budget intentionally rejects arbitrary fan-out JSON.
+    A formal raw artifact, however, repeats the independently strict-validated
+    canonical query snapshot in every signed claim/completion receipt.  Its
+    legitimate size therefore grows with the authenticated receipt count.  We
+    raise *capacity*, never schema acceptance, only after
+    :func:`_formal_public_proofs` has verified the fixed production anchor and
+    the complete challenge/binding/receipt chain.  Unknown/malformed/forged
+    documents retain the generic budget.  Both derived limits also have hard
+    ceilings, so even authenticated input cannot request unbounded work.
+    """
+    if name != "live-done-gate-v4.json" or not public_proofs:
+        return (
+            _MAX_JSON_SCAN_NODES,
+            _MAX_JSON_SCAN_CHARS,
+            _MAX_JSON_SCAN_DEPTH,
+        )
+    try:
+        payload = json_loads_no_dupes(data.decode("utf-8"))
+        binding = payload["formal_live_source_binding"]
+        receipts = binding["receipts"]
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError):
+        return (
+            _MAX_JSON_SCAN_NODES,
+            _MAX_JSON_SCAN_CHARS,
+            _MAX_JSON_SCAN_DEPTH,
+        )
+    if type(receipts) is not list:
+        return (
+            _MAX_JSON_SCAN_NODES,
+            _MAX_JSON_SCAN_CHARS,
+            _MAX_JSON_SCAN_DEPTH,
+        )
+    receipt_count = len(receipts)
+    max_nodes = min(
+        1_000_000,
+        max(_MAX_JSON_SCAN_NODES, 8_192 + receipt_count * 8_192),
+    )
+    max_chars = min(
+        32_000_000,
+        max(_MAX_JSON_SCAN_CHARS, len(data) * (_MAX_JSON_SCAN_DEPTH + 1)),
+    )
+    # The exact BrowserSearchQuery candidate snapshot is deeper than the
+    # generic free-form JSON shape.  Its strict validator has already walked
+    # every nested member before this capacity is granted.
+    return max_nodes, max_chars, 32
 
 
 def _secret_scan_bytes(
@@ -2338,6 +2587,16 @@ def _secret_scan_bytes(
             "secret scan needles must be _SecretNeedles, not a plaintext tuple "
             "(C-122 round-18 security contract)"
         )
+    public_proofs = _formal_public_proofs(data, name)
+    (
+        max_json_nodes,
+        max_json_chars,
+        max_json_depth,
+    ) = _authenticated_formal_scan_limits(
+        data,
+        name,
+        public_proofs,
+    )
     for needle in tuple(needles):
         if needle in data:
             raise GateStateChangedError(
@@ -2353,7 +2612,13 @@ def _secret_scan_bytes(
         # non-documented JSON member path fails closed on BOTH finals — the
         # ``.failure.json`` (cfc=False) producer artifact and the structured
         # evidence file (cfc=True) alike.
-        _reject_unbound_registered_base_values(data, label, name)
+        _reject_unbound_registered_base_values(
+            data,
+            label,
+            name,
+            max_nodes=max_json_nodes,
+            max_chars=max_json_chars,
+        )
     if credential_field_check:
         _reject_credential_field_names(data, label, name)
         _reject_unknown_64hex_values(data, label, name)
@@ -2363,14 +2628,25 @@ def _secret_scan_bytes(
     # is otherwise replaced by the recomputable-digest placeholder and the
     # token-run shape never sees it.  A server challenge (``WWW-Authenticate:
     # Digest realm=…, nonce=…``) carries no ``response=`` and stays allowed.
-    if _SHAPE_PATTERN_DIGEST_AUTH_RE.search(text):
+    # A fixed-anchor-authenticated formal raw artifact is guaranteed to be
+    # strict JSON and the bounded walker below applies this same Digest check
+    # to every decoded string value.  Avoid running the context-classifying
+    # whole-document matcher over its 100+ repeated query snapshots: that
+    # matcher intentionally examines prefixes and becomes quadratic on the
+    # million-byte signed graph.  Unauthenticated/free-form input retains the
+    # original raw-text guard.
+    if not public_proofs and _SHAPE_PATTERN_DIGEST_AUTH_RE.search(text):
         raise GateStateChangedError(
             f"secret leak: Digest-auth response in {label} file {name}"
         )
     # Mask recomputable hex digests (git SHAs, sha256) before the pattern
     # scan: a hash that happens to contain a phone-shaped run of digits is
     # not a leak, and a bare phone number is always decimal (never hex).
-    masked_text = _mask_hex_hash_spans(text)
+    # Replace authenticated URLs before digest masking: their query can contain
+    # a signed SHA value, and altering that SHA first would prevent the exact
+    # public URL from matching its verified proof.
+    masked_text = _mask_formal_public_proofs(text, public_proofs)
+    masked_text = _mask_hex_hash_spans(masked_text)
     # Ed25519 signatures are public fixed-shape proofs, not bearer secrets.
     # Their exact objects were verified before this generic text-shape scan.
     masked_text = _FORMAL_SIGNATURE_VALUE_RE.sub(
@@ -2389,7 +2665,9 @@ def _secret_scan_bytes(
     # NORMALIZED copy (NFKC + casefold, Cf/U+200B dropped) — a full-width /
     # zero-width-obfuscated value the ASCII regexes stop seeing is still a leak.
     # Only a COPY is normalized; the artifact bytes are never rewritten.
-    norm_masked = _normalize_for_scan(masked_text)
+    norm_masked = _normalize_for_scan(
+        _blank_nonleaking_tracking_urls(masked_text)
+    )
     for pattern, kind in (
         (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
         (_ACCOUNT_ID_PATTERN, "account identifier"),
@@ -2487,13 +2765,18 @@ def _secret_scan_bytes(
             f"secret leak: registered business base as header/field name "
             f"in {label} file {name}"
         )
-    if is_utf8_text:
+    # A fixed-anchor-authenticated formal JSON graph is walked below and every
+    # decoded string value is scanned independently.  Re-running the
+    # context-sensitive bare-token matcher over the multi-megabyte aggregate is
+    # redundant and quadratic; untrusted/free-form artifacts retain this raw
+    # whole-text backstop.
+    if is_utf8_text and not public_proofs:
         for pattern, kind in _BARE_CREDENTIAL_PAIRS:
             if pattern.search(masked_text) or pattern.search(norm_masked):
                 raise GateStateChangedError(
                     f"secret leak: {kind} in {label} file {name}"
                 )
-    for match in _TRACKING_URL_PATTERN.finditer(text):
+    for match in _TRACKING_URL_PATTERN.finditer(masked_text):
         if _is_tracking_url_leak(match.group(0)):
             raise GateStateChangedError(
                 f"secret leak: tracking URL in {label} file {name}"
@@ -2522,11 +2805,15 @@ def _secret_scan_bytes(
         needles,
         label,
         name,
-        _formal_public_proofs(data, name),
+        public_proofs,
     )
     try:
         for level_text, depth, malformed in iter_json_levels(
-            text, on_string_value=decoded_value_scanner
+            text,
+            on_string_value=decoded_value_scanner,
+            max_nodes=max_json_nodes,
+            max_chars=max_json_chars,
+            max_depth=max_json_depth,
         ):
             if depth == 0:
                 # The raw + normalized TOP-LEVEL text scans above covered the raw
@@ -2537,7 +2824,8 @@ def _secret_scan_bytes(
                 raise GateStateChangedError(
                     f"secret leak: malformed nested JSON in {label} file {name}"
                 )
-            level_masked = _mask_hex_hash_spans(level_text)
+            level_masked = _mask_formal_public_proofs(level_text, public_proofs)
+            level_masked = _mask_hex_hash_spans(level_masked)
             for pattern, kind in (
                 (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
                 (_ACCOUNT_ID_PATTERN, "account identifier"),
@@ -2550,7 +2838,9 @@ def _secret_scan_bytes(
             # 00:06 (要求 B): the same nested-level value scan on the NORMALIZED
             # copy — a full-width / zero-width credential inside a decoded level
             # is still a leak.
-            level_norm = _normalize_for_scan(level_masked)
+            level_norm = _normalize_for_scan(
+                _blank_nonleaking_tracking_urls(level_masked)
+            )
             for pattern, kind in (
                 (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
                 (_ACCOUNT_ID_PATTERN, "account identifier"),
@@ -2567,7 +2857,9 @@ def _secret_scan_bytes(
                 level_shapes = _blank_diagnostic_schema_version(
                     _blank_exact_marker_assignments(level_masked)
                 )
-                level_shapes_norm = _normalize_for_scan(level_shapes)
+                level_shapes_norm = _normalize_for_scan(
+                    _blank_nonleaking_tracking_urls(level_shapes)
+                )
                 for pattern, kind in _FINAL_TEXT_SHAPE_PAIRS:
                     if pattern.search(level_shapes):
                         raise GateStateChangedError(
@@ -2580,7 +2872,7 @@ def _secret_scan_bytes(
                         raise GateStateChangedError(
                             f"secret leak: {kind} in nested JSON in {label} file {name}"
                         )
-            for match in _TRACKING_URL_PATTERN.finditer(level_text):
+            for match in _TRACKING_URL_PATTERN.finditer(level_masked):
                 if _is_tracking_url_leak(match.group(0)):
                     raise GateStateChangedError(
                         f"secret leak: tracking URL in nested JSON in {label} file {name}"
@@ -5552,6 +5844,24 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
             )
     formal_source_receipt = payload["formal_live_source_authority_receipt"]
     formal_source_challenge = payload["formal_live_source_challenge"]
+    # Each raw-layer context object is mandatory and exact at this boundary;
+    # do not let a present null/list fall through to a later generic formal
+    # validation error or a legacy-context fallback.
+    if "pair_checkpoint_binding" not in payload or not isinstance(
+        payload.get("pair_checkpoint_binding"), dict
+    ):
+        raise GateStateChangedError(
+            "layer-6 raw evidence top-level pair_checkpoint_binding is missing "
+            "or not an exact object"
+        )
+    for raw_contract_field in ("formal_job_graph", "formal_terminal_job"):
+        if raw_contract_field not in payload or not isinstance(
+            payload[raw_contract_field], dict
+        ):
+            raise GateStateChangedError(
+                f"layer-6 raw evidence {raw_contract_field} is missing or not "
+                "an exact object"
+            )
     raw_runtime_identity = (payload.get("runtime_before_run") or {}).get(
         "runtime_provenance"
     )
@@ -5564,6 +5874,9 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
         ),
         "candidate_set_sha256": payload.get("api_payload_candidate_set_sha256"),
         "scenario_sha256": payload.get("scenario_sha256"),
+        "job_graph": payload.get("formal_job_graph"),
+        "terminal_job": payload.get("formal_terminal_job"),
+        "pair_checkpoint_binding": payload.get("pair_checkpoint_binding"),
     }
     try:
         formal_source_binding = validate_formal_source_evidence(
@@ -5613,13 +5926,6 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
         if isinstance(legacy_context, dict)
         else None
     )
-    if formal_checkpoint_binding_present and not isinstance(
-        formal_checkpoint_binding, dict
-    ):
-        raise GateStateChangedError(
-            "layer-6 raw evidence top-level pair_checkpoint_binding is present "
-            "but is not an object"
-        )
     if (
         isinstance(formal_checkpoint_binding, dict)
         and isinstance(legacy_checkpoint_binding, dict)
@@ -7763,10 +8069,32 @@ def _verify_layer6_compact_contract(
         raise GateStateChangedError(
             f"evidence commit E layer-6 compact {tracked_rel} replays a foreign run_id"
         )
+    # Validate the local identity syntax before feeding it into the signed
+    # projection.  A malformed value is a local schema error (and should not be
+    # laundered into a generic signature mismatch); a well-formed foreign SHA
+    # continues into the formal cross-binding check below and is rejected there.
+    early_repo_revision = compact.get("repo_revision")
+    early_repo_sha = (
+        early_repo_revision.get("commit_sha")
+        if isinstance(early_repo_revision, dict)
+        else None
+    )
+    if (
+        not isinstance(early_repo_sha, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", early_repo_sha) is None
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} repo_revision."
+            "commit_sha is not a valid 40-hex git SHA"
+        )
     expected_formal_context = {
         "run_id": gate_run_id,
-        "tested_commit_sha": tested_commit_sha
-        or (compact.get("repo_revision") or {}).get("commit_sha"),
+        # Cross-bind the signed summary to the compact's own repository
+        # identity first.  The independent ``tested_commit_sha`` comparison
+        # below then binds that repository identity to S.  Using S directly
+        # here would let a compact swap repo_revision/runtime together while
+        # the formal summary remained tied only to the external argument.
+        "tested_commit_sha": early_repo_sha,
         "runtime_identity_sha256": compact.get("runtime_identity_sha256"),
         "request_sha256": compact.get("api_payload_sha256"),
         "candidate_set_sha256": compact.get("api_payload_candidate_set_sha256"),

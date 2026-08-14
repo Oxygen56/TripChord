@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Annotated, Protocol
 from urllib.parse import ParseResult, parse_qsl, urlencode, urlparse
 from urllib.parse import quote as url_quote
+from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -2137,7 +2138,7 @@ class BrowserTaskBridge:
             snapshots: list[BrowserTaskSnapshot] = []
             for submission in values:
                 now = self._utc_now()
-                task_id = f"browser-task-{secrets.token_urlsafe(16)}"
+                task_id = f"browser-task-{uuid4()}"
                 reusable = self._recent_reusable_record(submission, now)
                 if reusable is not None:
                     oldest_quote_age = max(
@@ -3579,7 +3580,25 @@ def create_browser_bridge_app(
                 runtime_instance_id=payload.runtime_instance_id,
                 reload_receipt=payload.reload_receipt,
             )
-            if source_authority is not None and response.leases:
+            if (
+                source_authority is not None
+                and source_authority.is_active()
+                and response.leases
+            ):
+                formal_leases: list[dict[str, object]] = []
+                for lease in response.leases:
+                    lease_payload = lease.model_dump(
+                        mode="json", exclude={"claim_token"}
+                    )
+                    lease_payload["formal_query"] = (
+                        source_authority.formal_browser_query(
+                            task_id=lease.task_id,
+                            provider=lease.provider.value,
+                            kind=lease.kind.value,
+                            query=lease.query.model_dump(mode="json"),
+                        )
+                    )
+                    formal_leases.append(lease_payload)
                 source_authority.record_browser_http(
                     "browser_claim",
                     subject_ids=tuple(lease.task_id for lease in response.leases),
@@ -3588,10 +3607,7 @@ def create_browser_bridge_app(
                             mode="json",
                             exclude={"reload_receipt"},
                         ),
-                        "leases": [
-                            lease.model_dump(mode="json", exclude={"claim_token"})
-                            for lease in response.leases
-                        ],
+                        "leases": formal_leases,
                     },
                 )
             return response
@@ -3629,7 +3645,7 @@ def create_browser_bridge_app(
             contract_version=payload.contract_version,
             runtime_instance_id=payload.runtime_instance_id,
         )
-        if source_authority is not None:
+        if source_authority is not None and source_authority.is_active():
             source_authority.record_browser_http(
                 "browser_heartbeat",
                 subject_ids=(heartbeat.companion_id,),
@@ -3747,17 +3763,24 @@ def create_browser_bridge_app(
                 payload.claim_token,
                 payload.completion,
             )
-            if source_authority is not None:
+            if source_authority is not None and source_authority.is_active():
+                snapshot_payload = snapshot.model_dump(mode="json")
                 source_authority.record_browser_http(
                     "browser_complete",
                     subject_ids=(task_id,),
                     details={
                         "task_id": task_id,
                         "completion": payload.completion.model_dump(mode="json"),
-                        "snapshot": snapshot.model_dump(mode="json"),
+                        "snapshot": snapshot_payload,
+                        "formal_query": source_authority.formal_browser_query(
+                            task_id=snapshot.id,
+                            provider=snapshot.provider.value,
+                            kind=snapshot.kind.value,
+                            query=snapshot.query.model_dump(mode="json"),
+                        ),
                         "result_sha256": hashlib.sha256(
                             json.dumps(
-                                snapshot.model_dump(mode="json"),
+                                snapshot_payload,
                                 ensure_ascii=False,
                                 separators=(",", ":"),
                                 sort_keys=True,

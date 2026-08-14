@@ -6467,12 +6467,23 @@ class LivePackageAgentSystem:
                 state.decision = state.package.final_decision
             if (
                 state.stay_plan_candidate_set is not None
-                and state.stay_plan_repair_handoff is not None
+                and state.package is None
+                and state.publication_target_candidate is not None
             ):
-                if state.package is None or state.repair_handoff is None:
+                publication_stay_plan_id = stay_plan_for_candidate(
+                    state.stay_plan_candidate_set,
+                    intent,
+                    state.publication_target_candidate,
+                )
+                if publication_stay_plan_id is None:
                     raise ValueError(
-                        "stay-plan terminal binding requires a master package and Repair handoff"
+                        "publication target is outside the frozen stay-plan set"
                     )
+                state.selected_stay_plan_id = publication_stay_plan_id
+            if (
+                state.stay_plan_candidate_set is not None
+                and state.package is not None
+            ):
                 terminal_stay_plan_id = stay_plan_for_candidate(
                     state.stay_plan_candidate_set,
                     intent,
@@ -6480,13 +6491,20 @@ class LivePackageAgentSystem:
                 )
                 if terminal_stay_plan_id is None:
                     raise ValueError("master terminal package is outside the frozen stay-plan set")
-                expected_terminal_stay_plan_id = (
-                    state.stay_plan_repair_handoff.repaired_stay_plan_id
-                    if state.repair_handoff.outcome.candidate is not None
-                    else state.stay_plan_repair_handoff.rejected_stay_plan_id
-                )
-                if terminal_stay_plan_id != expected_terminal_stay_plan_id:
-                    raise ValueError("master terminal stay plan does not match Repair provenance")
+                if state.stay_plan_repair_handoff is not None:
+                    if state.repair_handoff is None:
+                        raise ValueError(
+                            "stay-plan Repair provenance requires a master Repair handoff"
+                        )
+                    expected_terminal_stay_plan_id = (
+                        state.stay_plan_repair_handoff.repaired_stay_plan_id
+                        if state.repair_handoff.outcome.candidate is not None
+                        else state.stay_plan_repair_handoff.rejected_stay_plan_id
+                    )
+                    if terminal_stay_plan_id != expected_terminal_stay_plan_id:
+                        raise ValueError(
+                            "master terminal stay plan does not match Repair provenance"
+                        )
                 state.selected_stay_plan_id = terminal_stay_plan_id
                 if state.publication_target_candidate is None:
                     state.coverage = self._coverage(

@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -23,8 +24,8 @@ from tripchord.planning.frozen_graph import (
     _FROZEN_V4_TRAVEL_WINDOW,
     _frozen_candidate_set,
     frozen_v4_canonical_pair_ids,
+    frozen_v4_ordered_per_pair_query_task_ids,
     frozen_v4_pair_id_digest,
-    frozen_v4_per_pair_query_task_ids,
     frozen_v4_query_task_id,
 )
 
@@ -47,45 +48,32 @@ def isolated_formal_source_trust_root(
 ) -> Any:
     """Every formal-source test uses a fresh tmp trust root and ledger."""
     import tripchord.formal_live_source as formal_source
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
     global _TEST_FORMAL_CONTROL_TOKEN_PATH
     global _TEST_FORMAL_LEDGER_PATH
     global _TEST_FORMAL_PRIVATE_KEY_PATH
     global _TEST_FORMAL_PUBLIC_KEY_DER
 
-    root = tmp_path_factory.mktemp("formal-source-trust")
-    private_key = Ed25519PrivateKey.generate()
-    private_path = root / "authority-private.pem"
-    private_path.write_bytes(
-        private_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
-    )
-    private_path.chmod(0o600)
+    root = tmp_path_factory.mktemp("formal-source-trust-parent") / "trust"
+    original_root = os.environ.get("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT")
+    provisioned = formal_source.provision_formal_source_trust_root(root)
+    os.environ["TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"] = str(root)
+    generation = str(provisioned["generation"])
+    private_path = root / generation / "authority-private.pem"
     control_path = root / "control-token"
-    control_path.write_text("T" * 64 + "\n", encoding="utf-8")
-    control_path.chmod(0o600)
-    public_der = private_key.public_key().public_bytes(
-        serialization.Encoding.DER,
-        serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-    original_der = formal_source._PUBLIC_KEY_DER
-    original_key_id = formal_source._AUTHORITY_KEY_ID
-    formal_source._PUBLIC_KEY_DER = public_der
-    formal_source._AUTHORITY_KEY_ID = hashlib.sha256(public_der).hexdigest()
+    public_der = formal_source._load_verification_anchor(root)["public_key_der"]
+    assert isinstance(public_der, bytes)
     _TEST_FORMAL_PRIVATE_KEY_PATH = private_path
-    _TEST_FORMAL_LEDGER_PATH = root / "challenge-ledger.json"
+    _TEST_FORMAL_LEDGER_PATH = root / "ledger.json"
     _TEST_FORMAL_CONTROL_TOKEN_PATH = control_path
     _TEST_FORMAL_PUBLIC_KEY_DER = public_der
     try:
         yield
     finally:
-        formal_source._PUBLIC_KEY_DER = original_der
-        formal_source._AUTHORITY_KEY_ID = original_key_id
+        if original_root is None:
+            os.environ.pop("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT", None)
+        else:
+            os.environ["TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"] = original_root
 
 
 def _init_git_repo(root: Path) -> None:
@@ -251,16 +239,25 @@ def _fixture_formal_source_binding(
     The formal end-to-end positive never uses this synthetic helper; it reads
     the binding emitted by the production composition and transport boundaries.
     """
+    return _strict_fixture_formal_source_binding(
+        commit_sha=commit_sha,
+        run_id=run_id,
+        install_id=install_id,
+        authority_secret=authority_secret,
+        trust=trust,
+    )
+
+    # Historical pre-v3 fixture remains below for forensic comparison only.
     import base64
 
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from tripchord.formal_live_source import (
-        _ANCHOR_VERSION,
-        _AUTHORITY_KEY_ID,
         _BINDING_SCHEMA_VERSION,
         _CHALLENGE_SCHEMA_VERSION,
         _RECEIPT_SCHEMA_VERSION,
+        _anchor_version,
+        _authority_key_id,
         _challenge_proof_payload,
         _receipt_proof_payload,
         formal_composition_contract,
@@ -317,8 +314,8 @@ def _fixture_formal_source_binding(
     }
     challenge: dict[str, object] = {
         "schema_version": _CHALLENGE_SCHEMA_VERSION,
-        "anchor_version": _ANCHOR_VERSION,
-        "authority_key_id": _AUTHORITY_KEY_ID,
+        "anchor_version": _anchor_version(),
+        "authority_key_id": _authority_key_id(),
         "challenge_id": "10000000-0000-4000-8000-000000000001",
         "nonce_digest": "f" * 64,
         "run_id": run_id,
@@ -550,11 +547,11 @@ def _fixture_formal_source_binding(
         events.append(event)
     binding = {
         "schema_version": _BINDING_SCHEMA_VERSION,
-        "anchor_version": _ANCHOR_VERSION,
+        "anchor_version": _anchor_version(),
         "install_id": install_id,
         "composition": composition,
         "composition_sha256": composition_sha256,
-        "authority_key_id": _AUTHORITY_KEY_ID,
+        "authority_key_id": _authority_key_id(),
         "runtime_identity": runtime_identity,
         "challenge": challenge,
         "pre_event_count": 0,
@@ -567,8 +564,8 @@ def _fixture_formal_source_binding(
     binding["binding_digest"] = digest(binding)
     authority_receipt: dict[str, object] = {
         "schema_version": _RECEIPT_SCHEMA_VERSION,
-        "anchor_version": _ANCHOR_VERSION,
-        "authority_key_id": _AUTHORITY_KEY_ID,
+        "anchor_version": _anchor_version(),
+        "authority_key_id": _authority_key_id(),
         "challenge_id": challenge["challenge_id"],
         "nonce_digest": challenge["nonce_digest"],
         "binding_digest": binding["binding_digest"],
@@ -590,6 +587,487 @@ def _fixture_formal_source_binding(
     return validate_formal_source_binding(binding)
 
 
+def _strict_fixture_formal_source_binding(
+    *,
+    commit_sha: str,
+    run_id: str,
+    install_id: str,
+    authority_secret: str | None,
+    trust: bool,
+) -> dict[str, object]:
+    import base64
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from tripchord.agents.stay_area import system_stay_area_search_profile
+    from tripchord.formal_live_source import (
+        _BINDING_SCHEMA_VERSION,
+        _CHALLENGE_CONTEXT_FIELDS,
+        _CHALLENGE_SCHEMA_VERSION,
+        _RECEIPT_SCHEMA_VERSION,
+        _anchor_version,
+        _authority_key_id,
+        _challenge_proof_payload,
+        _job_member_summary,
+        _receipt_proof_payload,
+        formal_composition_contract,
+        formal_job_graph_for_frozen_v4,
+    )
+    from tripchord.planning.stay_plans import system_stay_plan_candidate_set
+
+    def digest(value: object) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+
+    assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
+    if trust:
+        loaded = serialization.load_pem_private_key(
+            _TEST_FORMAL_PRIVATE_KEY_PATH.read_bytes(), password=None
+        )
+        assert isinstance(loaded, Ed25519PrivateKey)
+        private_key = loaded
+        anchor_version = _anchor_version()
+        authority_key_id = _authority_key_id()
+    else:
+        private_key = Ed25519PrivateKey.from_private_bytes(
+            hashlib.sha256(
+                (authority_secret or "foreign-formal-source-authority").encode()
+            ).digest()
+        )
+        public_der = private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        anchor_version = "tripchord-formal-source-anchor-v2:foreign"
+        authority_key_id = hashlib.sha256(public_der).hexdigest()
+
+    def sign(value: object) -> str:
+        return base64.b64encode(
+            private_key.sign(
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode()
+            )
+        ).decode()
+
+    composition = formal_composition_contract(commit_sha)
+    composition_sha256 = digest(
+        {"install_id": install_id, "composition": composition}
+    )
+    runtime_identity = {
+        "pid": 1,
+        "started_at": "2026-08-10T00:00:00+00:00",
+        "repo_toplevel": "/repo",
+        "commit_sha": commit_sha,
+        "dependency_lock_sha256": "d" * 64,
+        "live_system_source_sha256": "e" * 64,
+        "python_version": "3.12.0",
+        "python_executable": "/usr/bin/python3",
+    }
+    job_graph = formal_job_graph_for_frozen_v4(
+        terminal_job_id="live-job-fixture",
+        request_sha256="f" * 64,
+        adults=2,
+    )
+    stay_plan_candidate_set = system_stay_plan_candidate_set().model_dump(
+        mode="json"
+    )
+    stay_area_search_profile = system_stay_area_search_profile("马累")
+    assert stay_area_search_profile is not None
+    stay_area_payload = stay_area_search_profile.model_dump(mode="json")
+    challenge: dict[str, object] = {
+        "schema_version": _CHALLENGE_SCHEMA_VERSION,
+        "anchor_version": anchor_version,
+        "authority_key_id": authority_key_id,
+        "challenge_id": "10000000-0000-4000-8000-000000000001",
+        "nonce_digest": "f" * 64,
+        "run_id": run_id,
+        "tested_commit_sha": commit_sha,
+        "runtime_identity": runtime_identity,
+        "request_sha256": "f" * 64,
+        "candidate_set_sha256": stay_plan_candidate_set[
+            "candidate_set_sha256"
+        ],
+        "scenario_sha256": "a" * 64,
+        "job_graph": job_graph,
+        "issued_at": "2026-08-10T00:00:00+00:00",
+        "expires_at": "2026-08-10T01:00:00+00:00",
+    }
+    challenge["signature"] = sign(_challenge_proof_payload(challenge))
+    previous = composition_sha256
+    events: list[dict[str, object]] = []
+    base_time = datetime(2026, 8, 10, tzinfo=UTC)
+
+    def add_event(
+        kind: str,
+        method: str,
+        path: str,
+        subject_ids: list[str],
+        details: dict[str, object],
+        response_sha256: str | None = None,
+    ) -> None:
+        nonlocal previous
+        sequence = len(events) + 1
+        event: dict[str, object] = {
+            "sequence": sequence,
+            "kind": kind,
+            "method": method,
+            "path": path,
+            "subject_ids": subject_ids,
+            "details": details,
+            "response_sha256": response_sha256,
+            "observed_at": (base_time + timedelta(seconds=sequence)).isoformat(),
+            "challenge_id": challenge["challenge_id"],
+            "nonce_digest": challenge["nonce_digest"],
+            "context": {
+                **{
+                    key: challenge[key]
+                    for key in _CHALLENGE_CONTEXT_FIELDS - {"job_graph"}
+                },
+                "job_graph_sha256": job_graph["job_graph_sha256"],
+                "challenge_id": challenge["challenge_id"],
+                "nonce_digest": challenge["nonce_digest"],
+                "install_id": install_id,
+                "composition_sha256": composition_sha256,
+            },
+            "previous_receipt_sha256": previous,
+        }
+        event["receipt_sha256"] = digest(event)
+        event["signature"] = sign(
+            {
+                "purpose": "tripchord-formal-live-source-event-v3",
+                "receipt_sha256": event["receipt_sha256"],
+            }
+        )
+        previous = str(event["receipt_sha256"])
+        events.append(event)
+
+    build_identity = {
+        "protocol_version": "tripchord-companion-control-v1",
+        "manifest_version": "1.0.0",
+        "build_sha256": "9" * 64,
+        "content_runtime_version": "1.0.0",
+    }
+    companion = {
+        "companion_id": "comp-1",
+        "providers": ["ctrip", "qunar", "tongcheng"],
+        "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
+        "adapter_version": "fixture-adapter",
+        "contract_version": "tripchord-browser-companion-v1",
+        "runtime_instance_id": "fixture-runtime-instance-0001",
+    }
+    add_event(
+        "browser_heartbeat",
+        "POST",
+        "/browser-bridge/v1/companions/heartbeat",
+        ["comp-1"],
+        {
+            "request": companion,
+            "heartbeat": {
+                **companion,
+                "last_seen": (base_time + timedelta(seconds=1)).isoformat(),
+                "age_seconds": 0.0,
+                "is_fresh": True,
+                "build_identity": build_identity,
+            },
+        },
+    )
+
+    query_sequence = 0
+    for pair in job_graph["pairs"]:
+        assert isinstance(pair, dict)
+        departure = date.fromisoformat(str(pair["departure_date"]))
+        returning = date.fromisoformat(str(pair["return_date"]))
+        phase_members = [
+            (query_task_id, "checkpoint_exploration")
+            for query_task_id in pair["query_task_ids"]
+        ] + [
+            (query_task_id, "publication_refresh")
+            for query_task_id in pair["publication_query_task_ids"]
+        ]
+        for query_task_id, execution_phase in phase_members:
+            assert isinstance(query_task_id, str)
+            query_sequence += 1
+            _prefix, provider, query_kind, _task_digest = query_task_id.split(":")
+            runtime_task_id = f"task-{query_sequence:02d}"
+            if query_kind == "flight":
+                kind, segment = "flight", None
+                start, end, direction = departure, returning, "round_trip"
+            else:
+                kind, direction = "lodging", "stay"
+                segment, start, end = {
+                    "lodging_full_stay": ("full", departure, returning),
+                    "lodging_first_night": (
+                        "first",
+                        departure,
+                        departure + timedelta(days=1),
+                    ),
+                    "lodging_middle_stay": (
+                        "middle",
+                        departure + timedelta(days=1),
+                        returning - timedelta(days=1),
+                    ),
+                    "lodging_last_night": (
+                        "last",
+                        returning - timedelta(days=1),
+                        returning,
+                    ),
+                    "lodging_hulhumale_full_stay": (
+                        "hulhumale-full",
+                        departure,
+                        returning,
+                    ),
+                }[query_kind]
+            options: dict[str, object] = {
+                "__tripchord_allow_recent_quote_reuse": (
+                    execution_phase == "checkpoint_exploration"
+                ),
+                "gateway_destination": "马累",
+                "stay_area_search_profile": stay_area_payload,
+                "stay_plan_candidate_set": stay_plan_candidate_set,
+            }
+            if segment is not None:
+                lodging_identity = {
+                    "full": ("maafushi", "destination_island", "Maafushi"),
+                    "middle": ("maafushi", "destination_island", "Maafushi"),
+                    "first": ("hulhumale", "airport_island", "Hulhumalé"),
+                    "last": ("hulhumale", "airport_island", "Hulhumalé"),
+                    "hulhumale-full": (
+                        "hulhumale",
+                        "airport_island",
+                        "Hulhumalé",
+                    ),
+                }[segment]
+                options.update(
+                    {
+                        "segment": segment,
+                        "expected_lodging_place_key": lodging_identity[0],
+                        "expected_package_area": lodging_identity[1],
+                    }
+                )
+                destination = lodging_identity[2]
+                destination_code = None
+            else:
+                destination = "马累"
+                destination_code = "MLE"
+            query = {
+                "origin": "杭州",
+                "destination": destination,
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "adults": 2,
+                "rooms": 1,
+                "currency": "CNY",
+                "origin_code": "HGH",
+                "destination_code": destination_code,
+                "search_url": None,
+                "options": options,
+            }
+            formal_query: dict[str, object] = {
+                "terminal_job_id": job_graph["terminal_job_id"],
+                "pair_id": pair["date_pair_id"],
+                "task_id": runtime_task_id,
+                "query_task_id": query_task_id,
+                "provider": provider,
+                "kind": kind,
+                "query_kind": query_kind,
+                "direction": direction,
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "query_sha256": digest(query),
+                "execution_phase": execution_phase,
+            }
+            formal_query["query_identity"] = digest(formal_query)
+            claimed_at = (
+                base_time + timedelta(seconds=len(events) + 1)
+            ).isoformat()
+            add_event(
+                "browser_claim",
+                "POST",
+                "/browser-bridge/v1/tasks/claim",
+                [runtime_task_id],
+                {
+                    "request": {
+                        **companion,
+                        "limit": 1,
+                        "build_identity": build_identity,
+                    },
+                    "leases": [
+                        {
+                            "task_id": runtime_task_id,
+                            "provider": provider,
+                            "kind": kind,
+                            "query": query,
+                            "timeout_seconds": 120,
+                            "claimed_at": claimed_at,
+                            "lease_expires_at": (
+                                base_time + timedelta(seconds=len(events) + 121)
+                            ).isoformat(),
+                            "formal_query": formal_query,
+                        }
+                    ],
+                },
+            )
+            quotes = [{"fixture": query_task_id}]
+            snapshot = {
+                "id": runtime_task_id,
+                "provider": provider,
+                "kind": kind,
+                "query": query,
+                "state": "succeeded",
+                "created_at": claimed_at,
+                "updated_at": (
+                    base_time + timedelta(seconds=len(events) + 1)
+                ).isoformat(),
+                "attempt_count": 1,
+                "claimed_by": "comp-1",
+                "claimed_at": claimed_at,
+                "quotes": quotes,
+                "failure": None,
+                "reused_from_task_id": None,
+                "reuse_age_seconds": None,
+                "inflight_coalesced": False,
+            }
+            add_event(
+                "browser_complete",
+                "POST",
+                "/browser-bridge/v1/tasks/{task_id}/complete",
+                [runtime_task_id],
+                {
+                    "task_id": runtime_task_id,
+                    "completion": {
+                        "state": "succeeded",
+                        "quotes": quotes,
+                        "failure": None,
+                    },
+                    "snapshot": snapshot,
+                    "formal_query": formal_query,
+                    "result_sha256": digest(snapshot),
+                },
+            )
+
+    for expected_query in (
+        *job_graph["icom_queries"],
+        *job_graph["publication_icom_queries"],
+    ):
+        assert isinstance(expected_query, dict)
+        identity = {
+            key: expected_query[key]
+            for key in (
+                "pair_id",
+                "source_task_id",
+                "query_task_id",
+                "direction",
+                "travel_date",
+                "departure_date",
+                "return_date",
+                "origin",
+                "destination",
+                "adults",
+            )
+        }
+        for endpoint_index, path in enumerate(
+            (
+                "/api/v1/public/trips/schedules",
+                "/api/v1/public/ferry-fares/schedule-base-price",
+                "/api/v1/public/policy-sections",
+            ),
+            start=1,
+        ):
+            query = {"date": expected_query["travel_date"]} if endpoint_index == 1 else {}
+            suffix = f"?date={expected_query['travel_date']}" if query else ""
+            call_id = f"{expected_query['query_task_id']}|{path}"
+            response_sha = digest({"call_id": call_id})
+            call_identity = {
+                "query_task_id": expected_query["query_task_id"],
+                "query_identity_sha256": expected_query["query_identity_sha256"],
+                "method": "GET",
+                "path": path,
+            }
+            observed_at = (
+                base_time + timedelta(seconds=len(events) + 1)
+            ).isoformat()
+            add_event(
+                "icom_public_get",
+                "GET",
+                path,
+                [call_id],
+                {
+                    "source_task_id": expected_query["source_task_id"],
+                    "query_task_id": expected_query["query_task_id"],
+                    "call_id": call_id,
+                    "call_identity_sha256": digest(call_identity),
+                    "query_identity": identity,
+                    "query_identity_sha256": expected_query["query_identity_sha256"],
+                    "url": f"https://sfs-api.icomtours.com{path}{suffix}",
+                    "path": path,
+                    "query": query,
+                    "travel_date": query.get("date"),
+                    "captured_at": observed_at,
+                    "raw_response_sha256": response_sha,
+                    "normalized_evidence_sha256": digest({"normalized": call_id}),
+                },
+                response_sha,
+            )
+
+    binding: dict[str, object] = {
+        "schema_version": _BINDING_SCHEMA_VERSION,
+        "anchor_version": anchor_version,
+        "authority_key_id": authority_key_id,
+        "install_id": install_id,
+        "composition": composition,
+        "composition_sha256": composition_sha256,
+        "runtime_identity": runtime_identity,
+        "challenge": challenge,
+        "pre_event_count": 0,
+        "pre_chain_sha256": composition_sha256,
+        "post_event_count": len(events),
+        "post_chain_sha256": events[-1]["receipt_sha256"],
+        "companion_heartbeat_receipt": events[0],
+        "receipts": events,
+    }
+    binding["binding_digest"] = digest(binding)
+    checkpoint_binding = _fixture_checkpoint_binding()
+    checkpoint_sha256 = list(checkpoint_binding["ordered_checkpoint_sha256"])
+    terminal_job = {
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_chain_sha256": digest(checkpoint_sha256),
+        "result_sha256": digest({"terminal": "result"}),
+    }
+    job_member_summary = _job_member_summary(job_graph, terminal_job)
+    receipt: dict[str, object] = {
+        "schema_version": _RECEIPT_SCHEMA_VERSION,
+        "anchor_version": anchor_version,
+        "authority_key_id": authority_key_id,
+        "challenge_id": challenge["challenge_id"],
+        "nonce_digest": challenge["nonce_digest"],
+        "binding_digest": binding["binding_digest"],
+        "run_id": challenge["run_id"],
+        "tested_commit_sha": commit_sha,
+        "runtime_identity": runtime_identity,
+        "pre_event_count": 0,
+        "post_event_count": len(events),
+        "delta_digest": digest(events),
+        "job_member_summary": job_member_summary,
+        "issued_at": challenge["issued_at"],
+        "verified_at": (
+            base_time + timedelta(seconds=len(events) + 1)
+        ).isoformat(),
+    }
+    receipt["signature"] = sign(_receipt_proof_payload(receipt))
+    binding["authority_receipt"] = receipt
+    return binding
+
+
 def _realistic_e2e_evidence(
     *, run_id: str = "fixture-formal-run"
 ) -> dict[str, object]:
@@ -598,6 +1076,7 @@ def _realistic_e2e_evidence(
     passed, and the repo / runtime / Companion identity plus the
     event-injection / timeout / runner contracts the committed layer-6 compact
     must preserve.  Values are synthetic and secret-free."""
+    source = _fixture_formal_source_binding()
     evidence: dict[str, object] = {
         "schema_version": "tripchord-live-v4-done-gate-report",
         "run_status": "completed",
@@ -624,7 +1103,7 @@ def _realistic_e2e_evidence(
                 "started_at": "2026-08-10T00:00:00+00:00",
             },
         },
-        "formal_live_source_binding": _fixture_formal_source_binding(),
+        "formal_live_source_binding": source,
         "companion_preflight": {
             "status": "connected",
             "stale_after_seconds": 45,
@@ -640,7 +1119,9 @@ def _realistic_e2e_evidence(
             ],
         },
         "done_gate": _matching_done_gate(),
-        "api_payload_candidate_set_sha256": "a" * 64,
+        "api_payload_candidate_set_sha256": source["challenge"][  # type: ignore[index]
+            "candidate_set_sha256"
+        ],
         # C-122 round-19 (gap 4): the raw request identity the compact builder
         # lifts into the layer-6 compact — the checkpoint binding's request SHA
         # is bound to this api_payload_sha256, so a foreign request-payload
@@ -683,8 +1164,7 @@ def _realistic_e2e_evidence(
     }
     source = evidence["formal_live_source_binding"]
     assert isinstance(source, dict)
-    evidence["formal_live_source_authority_receipt"] = source["authority_receipt"]
-    evidence["formal_live_source_challenge"] = source["challenge"]
+    _attach_fixture_formal_context(evidence, source)
     return evidence
 
 
@@ -728,11 +1208,7 @@ def _populate_required_evidence(
         raw_e2e["repo_revision"]["commit_sha"] = head  # type: ignore[index]
         raw_e2e["runtime_before_run"]["runtime_provenance"]["commit_sha"] = head  # type: ignore[index]
         source = _fixture_formal_source_binding(head, run_id=run_id)
-        raw_e2e["formal_live_source_binding"] = source
-        raw_e2e["formal_live_source_authority_receipt"] = source[
-            "authority_receipt"
-        ]
-        raw_e2e["formal_live_source_challenge"] = source["challenge"]
+        _attach_fixture_formal_context(raw_e2e, source)
     (staging_dir / "live-done-gate-v4.json").write_text(
         json.dumps(raw_e2e), encoding="utf-8"
     )
@@ -1028,9 +1504,9 @@ def _frozen_query_task_ids(
         QueryPlanPolicy,
     )
 
-    for per_pair in frozen_v4_per_pair_query_task_ids():
+    for per_pair in frozen_v4_ordered_per_pair_query_task_ids():
         if pair_id in per_pair:
-            return tuple(sorted(per_pair[pair_id]))
+            return tuple(per_pair[pair_id])
     candidate_set = _frozen_candidate_set()
     window = _FROZEN_V4_TRAVEL_WINDOW
     builder = FlexibleQueryPlanBuilder(platforms=LIVE_V5_PLATFORMS)
@@ -1198,11 +1674,66 @@ def _fixture_checkpoint_binding() -> dict[str, object]:
     return _checkpoint_binding_for_pair_ids(_FIXTURE_PAIR_IDS, _FIXTURE_PAIR_DATES)
 
 
+def _attach_fixture_formal_context(
+    evidence: dict[str, object],
+    source: dict[str, object],
+) -> None:
+    challenge = source["challenge"]
+    receipt = source["authority_receipt"]
+    assert isinstance(challenge, dict) and isinstance(receipt, dict)
+    graph = challenge["job_graph"]
+    member_summary = receipt["job_member_summary"]
+    assert isinstance(graph, dict) and isinstance(member_summary, dict)
+    pair_binding = _fixture_checkpoint_binding()
+    terminal_job = {
+        "id": graph["terminal_job_id"],
+        "state": "succeeded",
+        "request_sha256": graph["request_sha256"],
+        "checkpoint_sha256": pair_binding["ordered_checkpoint_sha256"],
+        "checkpoint_chain_sha256": pair_binding["checkpoint_chain_sha256"],
+        "result_sha256": member_summary["terminal_result_sha256"],
+        "job_graph_sha256": graph["job_graph_sha256"],
+        "ordered_pair_ids_sha256": graph["ordered_pair_ids_sha256"],
+        "query_task_membership_sha256": graph[
+            "query_task_membership_sha256"
+        ],
+        "publication_query_task_membership_sha256": graph[
+            "publication_query_task_membership_sha256"
+        ],
+        "icom_query_membership_sha256": graph[
+            "icom_query_membership_sha256"
+        ],
+        "publication_icom_query_membership_sha256": graph[
+            "publication_icom_query_membership_sha256"
+        ],
+    }
+    evidence.update(
+        {
+            "formal_live_source_binding": source,
+            "formal_live_source_authority_receipt": receipt,
+            "formal_live_source_challenge": challenge,
+            "formal_job_graph": graph,
+            "formal_terminal_job": terminal_job,
+            "pair_checkpoint_binding": pair_binding,
+            "context": {"pair_checkpoint_binding": pair_binding},
+            "api_payload_candidate_set_sha256": challenge[
+                "candidate_set_sha256"
+            ],
+            "scenario_sha256": challenge["scenario_sha256"],
+            "request_identity": {
+                "scenario_sha256": challenge["scenario_sha256"],
+                "api_payload_sha256": challenge["request_sha256"],
+                "digests_are_distinct_contracts": True,
+            },
+        }
+    )
+
+
 def _per_check_evidence(name: str) -> dict[str, object]:
     """The structured, recomputable binding evidence each passing layer-6 check
     carries — field names match the live-v4 runner's evidence dicts (C-122
     Fix 3).  Values are synthetic and secret-free."""
-    candidate_sha = "a" * 64
+    candidate_sha = _frozen_candidate_set().candidate_set_sha256
     return {
         "prefrozen_stay_plan_candidate_set": {
             "candidate_set_sha256": candidate_sha,
@@ -11329,6 +11860,7 @@ def _layer6_compact_fixture() -> dict[str, object]:
                 "request_sha256",
                 "candidate_set_sha256",
                 "scenario_sha256",
+                "job_graph",
             )
         },
     )
@@ -11366,7 +11898,9 @@ def _layer6_compact_fixture() -> dict[str, object]:
                 }
             ],
         },
-        "api_payload_candidate_set_sha256": "a" * 64,
+        "api_payload_candidate_set_sha256": source["challenge"][  # type: ignore[index]
+            "candidate_set_sha256"
+        ],
         # C-122 round-19 (gap 4): the raw request payload SHA the checkpoint
         # binding's request identity must bind to (matches the fixture's
         # checkpoint request_sha256).
@@ -14227,6 +14761,15 @@ def test_verify_layer6_compact_contract_accepts_real_production_chain(
     assert artifacts.raw_payload["done_gate"]["passed"] is True
     assert artifacts.raw_payload["flexible_run"]["pair_runs"]
     assert artifacts.raw_payload["event_run"]["source_task_ids"]
+    # A fixed-anchor-authenticated job id/signature is public evidence.  Its
+    # random bytes may contain a credential-shaped substring, including while
+    # embedded in the signed status/events URL, without being a bearer secret.
+    gate._secret_scan_bytes(
+        artifacts.raw_output.read_bytes(),
+        gate._SecretNeedles(()),
+        "evidence",
+        "live-done-gate-v4.json",
+    )
 
     # (3) The formal runner artifact has 3 real per-pair runs and 3 matching
     # control-plane checkpoints, proving pair expansion and reporting occurred.
@@ -14378,8 +14921,8 @@ def test_c4_complete_self_consistent_binding_requires_production_capability(
     This is the faithful bypass from independent comment
     3d5717e4-913b-446a-ae7a-f92008bca8ea: the attacker supplies every field,
     exact event order/path/status and recomputes every public digest plus an
-    internally consistent MAC using its own key.  It still lacks the bridge
-    token capability held by the production installation.
+    internally consistent signature using its own key.  It still lacks the
+    fixed production verification anchor loaded by the API installation.
     """
 
     from tripchord.formal_live_source import validate_formal_source_binding
@@ -14392,7 +14935,7 @@ def test_c4_complete_self_consistent_binding_requires_production_capability(
         trust=False,
     )
 
-    with pytest.raises(ValueError, match="fixed production authority proof"):
+    with pytest.raises(ValueError, match="foreign verification anchor"):
         validate_formal_source_binding(forged)
     with pytest.raises(AssertionError, match="production source binding"):
         _c4_validate_formal_transport_receipts(
@@ -14478,7 +15021,7 @@ def test_c4_complete_binding_cannot_be_retrusted_with_bridge_token() -> None:
         trust=False,
     )
 
-    with pytest.raises(ValueError, match="production authority"):
+    with pytest.raises(ValueError, match="foreign verification anchor"):
         validate_formal_source_binding(forged)
 
 
@@ -14512,10 +15055,13 @@ def _fresh_installed_formal_authority(
     tmp_path: Path,
     *,
     ledger_name: str = "ledger.json",
+    now: Any = None,
 ) -> tuple[Any, dict[str, object]]:
     import httpx
     import tripchord.main as api_main
     from fastapi import FastAPI
+    from tripchord.formal_live_source import formal_job_graph_for_frozen_v4
+    from tripchord.planning.stay_plans import system_stay_plan_candidate_set
 
     assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
     target = FastAPI()
@@ -14534,7 +15080,7 @@ def _fresh_installed_formal_authority(
         target,
         configured,
         icom_http_client=client,
-        now=lambda: NOW,
+        now=now or (lambda: NOW),
         sleep=_c4_noop_sleep,
         formal_source_private_key_path=_TEST_FORMAL_PRIVATE_KEY_PATH,
         formal_source_ledger_path=tmp_path / ledger_name,
@@ -14546,8 +15092,15 @@ def _fresh_installed_formal_authority(
         "tested_commit_sha": runtime["commit_sha"],
         "runtime_identity": runtime,
         "request_sha256": "1" * 64,
-        "candidate_set_sha256": "2" * 64,
+        "candidate_set_sha256": (
+            system_stay_plan_candidate_set().candidate_set_sha256
+        ),
         "scenario_sha256": "3" * 64,
+        "job_graph": formal_job_graph_for_frozen_v4(
+            terminal_job_id="live-job-isolated-formal",
+            request_sha256="1" * 64,
+            adults=2,
+        ),
     }
     return authority, context
 
@@ -14570,6 +15123,251 @@ def test_formal_challenge_single_active_is_atomic_across_restart(tmp_path: Path)
         restarted.issue_challenge({**context, "run_id": "restart-foreign-run"})
     assert ledger.read_bytes() == before
     assert issued["challenge"]["run_id"] == context["run_id"]
+
+
+def test_formal_challenge_rejects_foreign_candidate_contract(tmp_path: Path) -> None:
+    authority, context = _fresh_installed_formal_authority(tmp_path)
+    ledger = tmp_path / "ledger.json"
+    assert not ledger.exists()
+
+    with pytest.raises(ValueError, match="candidate set differs"):
+        authority.issue_challenge(
+            {**context, "candidate_set_sha256": "4" * 64}
+        )
+
+    assert not ledger.exists()
+    assert authority.public_status()["challenge_active"] is False
+
+
+def test_formal_challenge_concurrent_cold_instances_issue_exactly_once(
+    tmp_path: Path,
+) -> None:
+    first, context = _fresh_installed_formal_authority(tmp_path)
+    second, _ = _fresh_installed_formal_authority(tmp_path)
+
+    def issue(authority: Any, run_id: str) -> tuple[str, str]:
+        try:
+            result = authority.issue_challenge({**context, "run_id": run_id})
+        except ValueError as exc:
+            return "rejected", str(exc)
+        challenge = result["challenge"]
+        assert isinstance(challenge, dict)
+        return "issued", str(challenge["challenge_id"])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda item: issue(*item),
+                (
+                    (first, "concurrent-formal-run-one"),
+                    (second, "concurrent-formal-run-two"),
+                ),
+            )
+        )
+    assert [status for status, _detail in results].count("issued") == 1
+    assert [status for status, _detail in results].count("rejected") == 1
+    assert "active challenge" in next(
+        detail for status, detail in results if status == "rejected"
+    )
+    ledger = json.loads((tmp_path / "ledger.json").read_text(encoding="utf-8"))
+    assert sum(row["state"] == "issued" for row in ledger.values()) == 1
+
+
+def test_formal_challenge_cold_restart_continues_and_finalizes_once(
+    tmp_path: Path,
+) -> None:
+    from tripchord.formal_live_source import validate_formal_source_binding
+
+    fixture = _fixture_formal_source_binding()
+    fixture_challenge = fixture["challenge"]
+    assert isinstance(fixture_challenge, dict)
+    base = datetime(2026, 8, 10, tzinfo=UTC)
+    clock = [base]
+    authority, context = _fresh_installed_formal_authority(
+        tmp_path, now=lambda: clock[0]
+    )
+    context = {
+        **context,
+        "request_sha256": fixture_challenge["request_sha256"],
+        "candidate_set_sha256": fixture_challenge["candidate_set_sha256"],
+        "scenario_sha256": fixture_challenge["scenario_sha256"],
+        "job_graph": fixture_challenge["job_graph"],
+    }
+    issued = authority.issue_challenge(context)
+    receipts = fixture["receipts"]
+    assert isinstance(receipts, list)
+
+    def replay(target: Any, event: dict[str, object]) -> None:
+        clock[0] = datetime.fromisoformat(str(event["observed_at"]))
+        if event["kind"] == "icom_public_get":
+            target.record_icom_http(
+                str(event["path"]),
+                subject_ids=tuple(event["subject_ids"]),
+                response_sha256=str(event["response_sha256"]),
+                details=event["details"],
+            )
+        else:
+            target.record_browser_http(
+                str(event["kind"]),
+                subject_ids=tuple(event["subject_ids"]),
+                details=event["details"],
+            )
+
+    split = len(receipts) // 2
+    for raw_event in receipts[:split]:
+        assert isinstance(raw_event, dict)
+        replay(authority, raw_event)
+    before_restart = authority.snapshot()
+    restarted, _ = _fresh_installed_formal_authority(
+        tmp_path, now=lambda: clock[0]
+    )
+    assert restarted.snapshot()["event_count"] == before_restart["event_count"]
+    for raw_event in receipts[split:]:
+        assert isinstance(raw_event, dict)
+        replay(restarted, raw_event)
+
+    graph = context["job_graph"]
+    assert isinstance(graph, dict)
+    checkpoint_sha256 = [
+        hashlib.sha256(f"checkpoint-{index}".encode()).hexdigest()
+        for index in range(1, 4)
+    ]
+    terminal_job = {
+        "id": graph["terminal_job_id"],
+        "state": "succeeded",
+        "request_sha256": graph["request_sha256"],
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_chain_sha256": gate._canonical_sha256(checkpoint_sha256),
+        "result_sha256": hashlib.sha256(b"terminal-result").hexdigest(),
+        "job_graph_sha256": graph["job_graph_sha256"],
+        "ordered_pair_ids_sha256": graph["ordered_pair_ids_sha256"],
+        "query_task_membership_sha256": graph[
+            "query_task_membership_sha256"
+        ],
+        "publication_query_task_membership_sha256": graph[
+            "publication_query_task_membership_sha256"
+        ],
+        "icom_query_membership_sha256": graph[
+            "icom_query_membership_sha256"
+        ],
+        "publication_icom_query_membership_sha256": graph[
+            "publication_icom_query_membership_sha256"
+        ],
+    }
+    pair_binding = {
+        "bindings": [
+            {
+                "sequence": pair["sequence"],
+                "date_pair_id": pair["date_pair_id"],
+                "departure_date": pair["departure_date"],
+                "return_date": pair["return_date"],
+                "request_sha256": pair["request_sha256"],
+                "query_task_ids": pair["query_task_ids"],
+                "query_task_ids_sha256": pair["query_task_ids_sha256"],
+                "checkpoint_sha256": checkpoint_sha256[index],
+            }
+            for index, pair in enumerate(graph["pairs"])
+        ]
+    }
+    clock[0] = datetime.fromisoformat(str(receipts[-1]["observed_at"])) + timedelta(
+        seconds=1
+    )
+    finalized = restarted.finalize(
+        {
+            **context,
+            "terminal_job": terminal_job,
+            "pair_checkpoint_binding": pair_binding,
+        }
+    )
+    validate_formal_source_binding(finalized["binding"])
+    with pytest.raises(ValueError, match="no unique active challenge"):
+        restarted.finalize(
+            {
+                **context,
+                "terminal_job": terminal_job,
+                "pair_checkpoint_binding": pair_binding,
+            }
+        )
+    cold_after_consume, _ = _fresh_installed_formal_authority(
+        tmp_path, now=lambda: clock[0]
+    )
+    assert cold_after_consume.public_status()["challenge_active"] is False
+    assert finalized["challenge"]["challenge_id"] == issued["challenge"][
+        "challenge_id"
+    ]
+
+
+def test_formal_challenge_write_failure_abort_and_expiry_are_atomic(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    base = datetime(2026, 8, 10, tzinfo=UTC)
+    clock = [base]
+    authority, context = _fresh_installed_formal_authority(
+        tmp_path, now=lambda: clock[0]
+    )
+    issued = authority.issue_challenge(context)
+    ledger_path = tmp_path / "ledger.json"
+    ledger_before = ledger_path.read_bytes()
+    snapshot_before = authority.snapshot()
+    write_ledger = authority._write_ledger
+    first_event = _fixture_formal_source_binding()["receipts"][0]
+    assert isinstance(first_event, dict)
+
+    with pytest.raises(ValueError, match="heartbeat details"):
+        authority.record_browser_http(
+            "browser_heartbeat",
+            subject_ids=("malformed-companion",),
+            details={},
+        )
+    assert authority.snapshot() == snapshot_before
+    assert ledger_path.read_bytes() == ledger_before
+
+    def fail_write(_ledger: object) -> None:
+        raise OSError("injected-ledger-write-failure")
+
+    clock[0] = datetime.fromisoformat(str(first_event["observed_at"]))
+    monkeypatch.setattr(authority, "_write_ledger", fail_write)
+    with pytest.raises(OSError, match="injected-ledger-write-failure"):
+        authority.record_browser_http(
+            "browser_heartbeat",
+            subject_ids=tuple(first_event["subject_ids"]),
+            details=first_event["details"],
+        )
+    assert authority.snapshot() == snapshot_before
+    assert ledger_path.read_bytes() == ledger_before
+    monkeypatch.setattr(authority, "_write_ledger", write_ledger)
+
+    challenge = issued["challenge"]
+    aborted = authority.abort(
+        {
+            "challenge_id": challenge["challenge_id"],
+            "run_id": challenge["run_id"],
+            "reason_code": "controlled_test_abort",
+        }
+    )
+    assert aborted["state"] == "aborted"
+    with pytest.raises(ValueError, match="not active"):
+        authority.abort(
+            {
+                "challenge_id": challenge["challenge_id"],
+                "run_id": challenge["run_id"],
+                "reason_code": "duplicate_abort",
+            }
+        )
+
+    next_context = {**context, "run_id": "isolated-expiry-run"}
+    expiring = authority.issue_challenge(next_context, lifetime_seconds=1)
+    clock[0] = base + timedelta(seconds=3)
+    expired = authority.expire(
+        {
+            "challenge_id": expiring["challenge"]["challenge_id"],
+            "run_id": next_context["run_id"],
+            "reason_code": "controlled_test_expiry",
+        }
+    )
+    assert expired["state"] == "expired"
+    assert authority.public_status()["challenge_active"] is False
 
 
 def test_formal_source_owner_only_files_reject_links_and_wide_modes(
@@ -14605,6 +15403,136 @@ def test_formal_source_owner_only_files_reject_links_and_wide_modes(
         read_owner_only_text(symlink, "test control token", minimum_length=64)
 
 
+def test_formal_source_clean_root_cli_rotation_and_old_key_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tripchord.formal_live_source as formal_source
+    import tripchord.main as api_main
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from tripchord.planning.stay_plans import system_stay_plan_candidate_set
+
+    assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
+    live_root = _TEST_FORMAL_PRIVATE_KEY_PATH.parents[1]
+
+    def tree_fingerprint(root: Path) -> dict[str, tuple[int, int, str]]:
+        return {
+            str(path.relative_to(root)): (
+                path.stat().st_mode,
+                path.stat().st_mtime_ns,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+            for path in sorted(root.rglob("*"))
+            if path.is_file() and not path.is_symlink()
+        }
+
+    live_before = tree_fingerprint(live_root)
+    parent = tmp_path / "clean-formal-runtime"
+    parent.mkdir(mode=0o700)
+    trust_root = parent / "trust"
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(gate.ROOT / "apps" / "api" / "src"),
+        "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT": str(trust_root),
+    }
+
+    def cli(operation: str) -> dict[str, object]:
+        completed = subprocess.run(
+            [
+                "uv",
+                "run",
+                "python",
+                "scripts/formal_source_trust.py",
+                operation,
+            ],
+            cwd=gate.ROOT,
+            env=env,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        return json.loads(completed.stdout)
+
+    initialized = cli("init")
+    verified = cli("verify")
+    assert initialized["authority_key_id"] == verified["authority_key_id"]
+    assert stat.S_IMODE(trust_root.stat().st_mode) == 0o700
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o600
+        for path in trust_root.rglob("*")
+        if path.is_file()
+    )
+
+    original_env = os.environ.get("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT")
+    monkeypatch.setenv("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT", str(trust_root))
+
+    def signed_challenge(run_id: str) -> dict[str, object]:
+        generation_root, _generation = formal_source._current_generation(trust_root)
+        loaded = serialization.load_pem_private_key(
+            (generation_root / "authority-private.pem").read_bytes(),
+            password=None,
+        )
+        assert isinstance(loaded, Ed25519PrivateKey)
+        runtime = api_main.PROVENANCE.to_dict()
+        graph = formal_source.formal_job_graph_for_frozen_v4(
+            terminal_job_id=f"live-job-{run_id}",
+            request_sha256="1" * 64,
+            adults=2,
+        )
+        challenge: dict[str, object] = {
+            "schema_version": formal_source._CHALLENGE_SCHEMA_VERSION,
+            "anchor_version": formal_source._anchor_version(),
+            "authority_key_id": formal_source._authority_key_id(),
+            "challenge_id": "20000000-0000-4000-8000-000000000001",
+            "nonce_digest": "2" * 64,
+            "run_id": run_id,
+            "tested_commit_sha": runtime["commit_sha"],
+            "runtime_identity": runtime,
+            "request_sha256": "1" * 64,
+            "candidate_set_sha256": (
+                system_stay_plan_candidate_set().candidate_set_sha256
+            ),
+            "scenario_sha256": "4" * 64,
+            "job_graph": graph,
+            "issued_at": "2026-08-14T00:00:00+00:00",
+            "expires_at": "2026-08-14T01:00:00+00:00",
+        }
+        challenge["signature"] = formal_source._sign(
+            loaded,
+            formal_source._challenge_proof_payload(challenge),
+        )
+        return challenge
+
+    old_challenge = signed_challenge("old-key-proof")
+    formal_source._validate_challenge(old_challenge)
+    rotated = cli("rotate")
+    after_rotation = cli("verify")
+    assert rotated["authority_key_id"] == after_rotation["authority_key_id"]
+    assert rotated["authority_key_id"] != initialized["authority_key_id"]
+    with pytest.raises(ValueError, match="foreign verification anchor"):
+        formal_source._validate_challenge(old_challenge)
+    formal_source._validate_challenge(signed_challenge("new-key-proof"))
+
+    if original_env is None:
+        monkeypatch.delenv("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT", raising=False)
+    else:
+        monkeypatch.setenv("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT", original_env)
+    assert tree_fingerprint(live_root) == live_before
+
+    wide_parent = tmp_path / "wide-parent"
+    wide_parent.mkdir(mode=0o755)
+    wide_parent.chmod(0o755)
+    with pytest.raises(RuntimeError, match="owner-only"):
+        formal_source.provision_formal_source_trust_root(wide_parent / "trust")
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir(mode=0o700)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        formal_source.provision_formal_source_trust_root(linked_parent / "trust")
+
+
 def test_formal_source_compact_summary_is_minimal_and_cross_swap_safe() -> None:
     from tripchord.formal_live_source import (
         formal_source_evidence_summary,
@@ -14623,6 +15551,7 @@ def test_formal_source_compact_summary_is_minimal_and_cross_swap_safe() -> None:
             "request_sha256",
             "candidate_set_sha256",
             "scenario_sha256",
+            "job_graph",
         )
     }
     summary = formal_source_evidence_summary(
@@ -14757,12 +15686,23 @@ def _reseal_test_formal_binding(binding: dict[str, object]) -> dict[str, object]
         lambda binding: binding["receipts"][2]["details"]["snapshot"].update(
             {"attempt_count": True}
         ),
-        lambda binding: binding["receipts"][3]["details"]["query_identity"].update(
-            {"adults": True}
+        lambda binding: binding["receipts"][2]["details"]["snapshot"][
+            "query"
+        ].update({"rooms": True}),
+        lambda binding: binding["receipts"][2]["details"]["snapshot"][
+            "query"
+        ]["options"]["stay_plan_candidate_set"].update(
+            {"foreign_nested_field": "must-fail-closed"}
         ),
-        lambda binding: binding["receipts"][3]["details"].update(
-            {"foreign": "field"}
-        ),
+        lambda binding: binding["receipts"][2]["details"][
+            "formal_query"
+        ].update({"execution_phase": "publication_refresh"}),
+        lambda binding: next(
+            item for item in binding["receipts"] if item["kind"] == "icom_public_get"
+        )["details"]["query_identity"].update({"adults": True}),
+        lambda binding: next(
+            item for item in binding["receipts"] if item["kind"] == "icom_public_get"
+        )["details"].update({"foreign": "field"}),
         lambda binding: binding["receipts"].pop(),
         lambda binding: binding["receipts"].append(
             {
@@ -14791,6 +15731,7 @@ def test_formal_source_full_reseal_type_matrix_fails_closed(
             "request_sha256",
             "candidate_set_sha256",
             "scenario_sha256",
+            "job_graph",
         )
     }
     with pytest.raises(ValueError):
@@ -14821,6 +15762,7 @@ def test_formal_source_fixed_anchor_is_offline_and_run_specific(
             "request_sha256",
             "candidate_set_sha256",
             "scenario_sha256",
+            "job_graph",
         )
     }
     validate_formal_source_evidence(binding, receipt, challenge, expected_context=expected)
@@ -14848,31 +15790,31 @@ def test_formal_source_fixed_anchor_is_offline_and_run_specific(
         ),
         encoding="utf-8",
     )
-    assert _TEST_FORMAL_PUBLIC_KEY_DER is not None
-    public_anchor = tmp_path / "formal-source-public.der"
-    public_anchor.write_bytes(_TEST_FORMAL_PUBLIC_KEY_DER)
-    public_anchor.chmod(0o600)
+    assert _TEST_FORMAL_CONTROL_TOKEN_PATH is not None
     probe = subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import hashlib,json,sys; "
+                "import json,sys; "
                 "import tripchord.formal_live_source as f; "
-                "f._PUBLIC_KEY_DER=open(sys.argv[2],'rb').read(); "
-                "f._AUTHORITY_KEY_ID=hashlib.sha256(f._PUBLIC_KEY_DER).hexdigest(); "
                 "p=json.load(open(sys.argv[1], encoding='utf-8')); "
                 "f.validate_formal_source_binding(p['binding']); "
                 "f.validate_formal_source_summary("
                 "p['summary'],expected_context=p['expected'])"
             ),
             str(artifact),
-            str(public_anchor),
         ],
         cwd=_C4_REPO_ROOT,
         capture_output=True,
         text=True,
         check=False,
+        env={
+            **os.environ,
+            "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT": str(
+                _TEST_FORMAL_CONTROL_TOKEN_PATH.parent
+            ),
+        },
     )
     assert probe.returncode == 0, probe.stderr
 
@@ -14977,7 +15919,7 @@ def test_layer6_raw_top_level_checkpoint_binding_presence_is_strict(
     monkeypatch: pytest.MonkeyPatch,
     staging_dir: Path,
 ) -> None:
-    """Present-but-invalid formal binding must not fall back to legacy data."""
+    """Missing/present-invalid binding must not fall back to legacy data."""
 
     artifacts = _real_production_chain(staging_dir)
     for invalid in (None, []):
@@ -14986,29 +15928,44 @@ def test_layer6_raw_top_level_checkpoint_binding_presence_is_strict(
         payload["context"] = {
             "pair_checkpoint_binding": copy.deepcopy(artifacts.binding)
         }
-        raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
+        with pytest.raises(
+            RuntimeError,
+            match="formal pair checkpoint binding is not an exact object",
+        ):
+            _persist_c4_raw_variant(artifacts, staging_dir, payload)
+        # Bypass only the writer to exercise the independent compact boundary;
+        # production never takes this path.
+        raw_variant = _persist_c4_raw_variant_unchecked(
+            artifacts,
+            staging_dir,
+            payload,
+        )
         with pytest.raises(
             gate.GateStateChangedError,
             match="top-level pair_checkpoint_binding",
         ):
             _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
 
-    legacy_payload = _c4_raw_variant(artifacts)
-    del legacy_payload["pair_checkpoint_binding"]
-    legacy_payload["context"] = {
+    missing_payload = _c4_raw_variant(artifacts)
+    del missing_payload["pair_checkpoint_binding"]
+    missing_payload["context"] = {
         "pair_checkpoint_binding": copy.deepcopy(artifacts.binding)
     }
-    raw_variant = _persist_c4_raw_variant(
+    with pytest.raises(
+        RuntimeError,
+        match="formal pair checkpoint binding is not an exact object",
+    ):
+        _persist_c4_raw_variant(artifacts, staging_dir, missing_payload)
+    raw_variant = _persist_c4_raw_variant_unchecked(
         artifacts,
         staging_dir,
-        legacy_payload,
+        missing_payload,
     )
-    compact = _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
-    gate._verify_layer6_compact_contract(
-        "done-gate-layer6-compact.json",
-        compact,
-        tested_commit_sha=artifacts.head,
-    )
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="top-level pair_checkpoint_binding",
+    ):
+        _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
 
 
 def test_layer6_formal_source_binding_rejects_missing_mismatch_and_replacement(
@@ -15187,14 +16144,15 @@ def test_verify_layer6_compact_contract_real_production_chain_adversarial_matrix
     }
     for _name, mutated_binding in binding_cases.items():
         payload = _c4_raw_variant(artifacts, binding=mutated_binding)
-        raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
-        compact = _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
+        with pytest.raises(RuntimeError, match="formal production source binding"):
+            _persist_c4_raw_variant(artifacts, staging_dir, payload)
+        raw_variant = _persist_c4_raw_variant_unchecked(
+            artifacts,
+            staging_dir,
+            payload,
+        )
         with pytest.raises(gate.GateStateChangedError):
-            gate._verify_layer6_compact_contract(
-                "done-gate-layer6-compact.json",
-                compact,
-                tested_commit_sha=artifacts.head,
-            )
+            _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
 
     # A legacy test-only context wrapper cannot contradict the formal runner's
     # top-level checkpoint binding and make the compact writer choose whichever
@@ -16055,6 +17013,7 @@ def test_blob_readback_rejects_sha_mismatch(
                     "request_sha256",
                     "candidate_set_sha256",
                     "scenario_sha256",
+                    "job_graph",
                 )
             },
         )
@@ -16064,7 +17023,7 @@ def test_blob_readback_rejects_sha_mismatch(
 
     with pytest.raises(
         gate.GateStateChangedError,
-        match="invalid formal production source binding",
+        match="!= tested_commit_sha",
     ):
         _commit_compact_to_evidence_commit(
             monkeypatch, clean_repo, staging_dir, build
@@ -16522,7 +17481,9 @@ def test_compact_live_e2e_preserves_per_check_evidence(tmp_path: Path) -> None:
     for check in compact["done_gate"]["checks"]:
         assert isinstance(check.get("evidence"), dict) and check["evidence"]
     prefrozen = checks_by_name["prefrozen_stay_plan_candidate_set"]
-    assert prefrozen["evidence"]["candidate_set_sha256"] == "a" * 64
+    assert prefrozen["evidence"]["candidate_set_sha256"] == (
+        _frozen_candidate_set().candidate_set_sha256
+    )
     strict = checks_by_name["strict_selected_plan_platform_coverage"]
     assert strict["evidence"]["providers"] == ["ctrip", "qunar", "tongcheng"]
     # C-122 round-18 HG-E: the whitelist must NOT drop the six new recomputable
