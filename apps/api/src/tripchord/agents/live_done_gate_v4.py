@@ -48,6 +48,7 @@ from tripchord.planning.frozen_graph import (
     frozen_v4_canonical_pair_ids,
     frozen_v4_icom_task_ids,
     frozen_v4_pair_id_is_canonical,
+    frozen_v4_per_pair_query_task_ids,
     frozen_v4_query_shapes,
 )
 from tripchord.planning.package import (
@@ -309,6 +310,17 @@ def _check_v4_source_graph(
     canonical_query_shapes = frozen_v4_query_shapes()
     canonical_browser_source_ids = frozen_v4_browser_source_ids()
     canonical_icom_task_ids = frozen_v4_icom_task_ids()
+    # C-round2 (04:05Z 增量打回): the producer shares the SAME per-pair EXACT
+    # query-task-id authority as the checkpoint / compact / consumer — the full
+    # ``query:<platform>:<kind>:<digest>`` id sets derived from the SAME
+    # production builder (``FlexibleQueryPlanBuilder`` + frozen window + frozen
+    # stay-plan candidate set).  Each id's digest binds the pair id, departure/
+    # return dates, zone and stay-plan id, so the producer cannot seal a run
+    # whose query-task ids carry a wrong digest / wrong pair / no digest — it
+    # fails closed here instead of only at the compact.
+    canonical_per_pair_query_ids: dict[str, frozenset[str]] = {}
+    for _per_pair in frozen_v4_per_pair_query_task_ids():
+        canonical_per_pair_query_ids.update(_per_pair)
     query_shape_strings = {
         f"{getattr(platform, 'value', platform)}:{getattr(kind, 'value', kind)}"
         for platform, kind in expected_query_shapes
@@ -402,6 +414,25 @@ def _check_v4_source_graph(
             or pair_query_shapes != expected_query_shapes
         ):
             errors.append(f"{execution.date_pair.id}: 查询任务未完整覆盖已启用平台能力")
+        # C-round2 (04:05Z 增量打回): the execution's FULL query-task id set must
+        # equal the canonical per-pair exact set — not just the ``platform:kind``
+        # ownership shapes.  A run whose task ids carry a wrong digest, a foreign
+        # pair's dates/zone/stay-plan binding, a duplicate or a cross-pair swap
+        # fails closed here (producer shares the compact/consumer authority).
+        canonical_pair_query_ids = canonical_per_pair_query_ids.get(
+            execution.date_pair.id
+        )
+        if canonical_pair_query_ids is None:
+            errors.append(
+                f"{execution.date_pair.id}: 规范冻结图未覆盖该日期对的精确查询任务集"
+            )
+        elif len(pair_query_ids) != len(canonical_pair_query_ids) or set(
+            pair_query_ids
+        ) != set(canonical_pair_query_ids):
+            errors.append(
+                f"{execution.date_pair.id}: 查询任务完整 ID 集与规范冻结图逐对精确集合不一致"
+                "（缺失/额外/错误摘要/重复/跨对互换）"
+            )
         source_ids = source_run.source_task_ids
         if (
             len(source_ids) != expected_browser_tasks
@@ -471,10 +502,15 @@ def _check_v4_source_graph(
                 {
                     "pair_id": pair_id,
                     "browser_source_task_ids": sorted(expected_browser_source_ids),
+                    # C-round2 (04:05Z 增量打回): the per-pair query-task member
+                    # list carries the FULL canonical per-pair query-task id set
+                    # (the SAME authority the checkpoint / compact / consumer
+                    # use), so the sealed graph's per-pair exact ids are
+                    # independently recomputable — not just the 13 ``platform:kind``
+                    # ownership shapes, which would mask a no-digest / arbitrary-
+                    # suffix / duplicate-digest / cross-pair-swap forgery.
                     "query_task_ids": sorted(
-                        f"{getattr(platform, 'value', platform)}:"
-                        f"{getattr(kind, 'value', kind)}"
-                        for platform, kind in expected_query_shapes
+                        canonical_per_pair_query_ids[pair_id]
                     ),
                     "icom_source_task_ids": sorted(expected_icom_tasks),
                     "browser_source_task_count": expected_browser_tasks,

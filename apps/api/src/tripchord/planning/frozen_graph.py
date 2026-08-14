@@ -35,7 +35,10 @@ from tripchord.planning.adaptive_dates import (
 from tripchord.planning.flexible_dates import (
     LIVE_V5_PLATFORM_QUERY_KINDS,
     LIVE_V5_PLATFORMS,
+    AuditableDatePair,
+    DatePairSource,
     FlexibleDateExplorer,
+    FlexibleQueryPlanBuilder,
     FlexibleTravelWindow,
     QueryTaskKind,
 )
@@ -395,6 +398,122 @@ def frozen_v4_canonical_pair_ids(
             f"{len(trio)}/{FROZEN_V4_PAIR_COUNT} pairs"
         )
     return tuple(trio)
+
+
+# A real ``FlexibleQueryTask.id``: ``query:<platform>:<kind>:<16-hex>`` — the
+# digest is 16 hex chars of ``sha256(pair_id|platform|kind|start_date|end_date|
+# zone|stay_plan_id)`` (``FlexibleQueryPlanBuilder._task``), so the id embeds
+# the pair's departure/return dates, zone and stay-plan identity.
+_QUERY_TASK_ID_RE = re.compile(
+    r"^query:([a-z0-9_]+):([a-z0-9_]+):([0-9a-f]{16})$"
+)
+
+
+def frozen_v4_query_task_id_is_wellformed(task_id: object) -> bool:
+    """True only for a real frozen-scenario ``FlexibleQueryTask.id``.
+
+    The real producer / checkpoint seals FULL ``query:<platform>:<kind>:<digest>``
+    task ids (the ``FlexibleQueryTask.id`` namespace) — a bare ownership id with
+    no digest (``query:ctrip:flight``), an arbitrary suffix that is not the
+    16-hex digest, a foreign owner outside the enabled platform capabilities, or
+    a non-string member is NOT a real frozen query task id and must fail closed.
+    """
+    if not isinstance(task_id, str):
+        return False
+    match = _QUERY_TASK_ID_RE.fullmatch(task_id)
+    if match is None:
+        return False
+    return f"{match.group(1)}:{match.group(2)}" in frozen_v4_query_shapes()
+
+
+def frozen_v4_query_task_id(
+    pair_id: str,
+    platform: object,
+    kind: object,
+    start_date: date,
+    end_date: date,
+    zone: object,
+    stay_plan_id: object,
+) -> str:
+    """Recompute a real ``FlexibleQueryTask.id`` from its production fields.
+
+    Mirrors ``FlexibleQueryPlanBuilder._task`` (``planning/flexible_dates.py``):
+    the digest is ``sha256(pair_id|platform|kind|start_date|end_date|zone|stay_
+    plan_id)[:16]``.  Any id whose digest does not recompute from these fields —
+    a wrong pair id / date / zone / stay-plan — is not the frozen scenario's
+    query task for that pair, regardless of how well-formed the prefix looks.
+    """
+    raw = (
+        f"{pair_id}|{getattr(platform, 'value', platform)}|"
+        f"{getattr(kind, 'value', kind)}|"
+        f"{start_date.isoformat()}|{end_date.isoformat()}|{zone or '-'}|"
+        f"{stay_plan_id or '-'}"
+    )
+    digest = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return (
+        f"query:{getattr(platform, 'value', platform)}:"
+        f"{getattr(kind, 'value', kind)}:{digest}"
+    )
+
+
+@lru_cache(maxsize=1)
+def frozen_v4_per_pair_query_task_ids() -> tuple[dict[str, frozenset[str]], ...]:
+    """The canonical EXACT per-pair FULL query-task id sets, in trio order.
+
+    C-round2 (04:05Z 增量打回): comparing the checkpoint binding's query-task
+    OWNERSHIP projection is not enough — a no-digest id (``query:ctrip:flight``),
+    an arbitrary suffix, a same-owner duplicate digest, or a whole cross-pair
+    swap of full id sets can still look canonical.  This derives, for each of
+    the three canonical frozen pairs, the EXACT set of ``query:<platform>:<kind>:
+    <digest>`` task ids the real producer seals — using the SAME production
+    builder (``FlexibleQueryPlanBuilder``), the SAME frozen window and the SAME
+    frozen stay-plan candidate set.  The digest binds the pair id, departure/
+    return dates, zone and stay-plan id, so a binding whose ids carry the wrong
+    pair's dates/zone/stay-plan, a missing/extra/wrong digest, a bare ownership
+    id, or a whole cross-pair swap fails closed at the consumer against this
+    item-by-item authority.
+    """
+    window = _FROZEN_V4_TRAVEL_WINDOW
+    candidate_set = _frozen_candidate_set()
+    builder = FlexibleQueryPlanBuilder(platforms=LIVE_V5_PLATFORMS)
+    per_pair: list[dict[str, frozenset[str]]] = []
+    for index, pair_id in enumerate(frozen_v4_canonical_pair_ids()):
+        departure_s, return_s = pair_id.split(":")[1], pair_id.split(":")[2]
+        departure = date.fromisoformat(departure_s)
+        return_d = date.fromisoformat(return_s)
+        pair = AuditableDatePair(
+            id=pair_id,
+            rank=index + 1,
+            departure_date=departure,
+            return_date=return_d,
+            night_count=(return_d - departure).days,
+            source=DatePairSource.FUSED_FARE_HINT,
+            audit_reason="frozen canonical pair query-task authority",
+        )
+        task_ids: set[str] = set()
+        for platform in LIVE_V5_PLATFORMS:
+            for kind, start_date, end_date, zone in builder._task_windows(
+                pair, True, candidate_set
+            ):
+                if kind not in LIVE_V5_PLATFORM_QUERY_KINDS.get(
+                    platform, frozenset(QueryTaskKind)
+                ):
+                    continue
+                stay_plan_id = builder._stay_plan_id(kind, candidate_set)
+                task = builder._task(
+                    window,
+                    pair,
+                    platform,
+                    kind,
+                    start_date,
+                    end_date,
+                    zone,
+                    stay_plan_id,
+                    0,
+                )
+                task_ids.add(task.id)
+        per_pair.append({pair_id: frozenset(task_ids)})
+    return tuple(per_pair)
 
 
 def frozen_v4_window_for_run(

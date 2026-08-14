@@ -85,7 +85,9 @@ from tripchord.planning.frozen_graph import (
     frozen_v4_icom_task_ids,
     frozen_v4_pair_id_dates_canonical,
     frozen_v4_pair_id_is_canonical,
+    frozen_v4_per_pair_query_task_ids,
     frozen_v4_query_shapes,
+    frozen_v4_query_task_id_is_wellformed,
     frozen_v4_tasks_per_pair,
 )
 from tripchord.platform.registry import build_default_registry
@@ -3241,28 +3243,20 @@ _V4_FROZEN_BROWSER_SOURCE_IDS = frozen_v4_browser_source_ids()
 _V4_FROZEN_QUERY_SHAPES = frozen_v4_query_shapes()
 _V4_FROZEN_ICOM_TASK_IDS = frozen_v4_icom_task_ids()
 
+# C-round2 (04:05Z 增量打回): the canonical EXACT per-pair FULL query-task id
+# sets (``pair_id -> frozenset[query:<platform>:<kind>:<16-hex-digest>]``),
+# derived from the SAME production builder the runner uses
+# (``FlexibleQueryPlanBuilder`` + the frozen window + the frozen stay-plan
+# candidate set).  The digest binds each id to its pair's departure/return
+# dates, zone and stay-plan id, so a checkpoint binding carrying a no-digest
+# id (``query:ctrip:flight``), an arbitrary suffix, a same-owner duplicate
+# digest, a wrong digest, or a whole cross-pair swap of full id sets fails
+# closed against this per-pair authority instead of the old ownership-only
+# projection.
+_V4_CANONICAL_PER_PAIR_QUERY_TASK_IDS: dict[str, frozenset[str]] = {}
+for _per_pair in frozen_v4_per_pair_query_task_ids():
+    _V4_CANONICAL_PER_PAIR_QUERY_TASK_IDS.update(_per_pair)
 
-# R44 后续 (blocker C): the checkpoint binding's ``query_task_ids`` members are
-# the FULL query-task ids the real producer seals — ``query:<platform>:<kind>:<
-# digest>`` (e.g. ``query:ctrip:flight:…``, the same ``FlexibleQueryTask.id``
-# namespace), NOT the bare ``<platform>:<kind>`` ownership id and NOT the
-# ``source-<platform>-…`` browser Source id.  This helper projects each full
-# task id to its QUERY OWNERSHIP id and fails closed (returns ``None``) when ANY
-# member is not a well-formed ``query:*`` task id, so a foreign / source-owned /
-# non-query member can never be silently dropped to make the canonical-set
-# comparison pass.
-def _checkpoint_query_ownership_set(
-    query_task_ids: list[object],
-) -> frozenset[str] | None:
-    ownership: set[str] = set()
-    for raw in query_task_ids:
-        if not isinstance(raw, str) or not raw.startswith("query:"):
-            return None
-        parts = raw.split(":")
-        if len(parts) < 3 or not parts[1] or not parts[2]:
-            return None
-        ownership.add(f"{parts[1]}:{parts[2]}")
-    return frozenset(ownership)
 
 # C-122 supervision 01:10: pair-id canonical binding.  The SEALED pair-id set of
 # a real run is not a fixed constant — the API applies ``minimum_departure_
@@ -6312,26 +6306,54 @@ def _verify_layer6_checkpoint_binding(
                 f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
                 "query_task_ids_sha256 does not recompute from query_task_ids"
             )
-        # C-122 round-19 (gap 4) + R44 后续 (blocker C): the per-group query-task
-        # set must be EXACTLY the canonical frozen graph's QUERY OWNERSHIP set.
-        # The real producer / checkpoint seals FULL query-task ids —
-        # ``query:<platform>:<kind>:<digest>`` (``query:ctrip:flight:…``, the
-        # ``FlexibleQueryTask.id`` namespace) — whose OWNERSHIP part is
-        # ``<platform>:<kind>`` (``ctrip:flight``), the same
-        # ``frozen_v4_query_shapes()`` set the graph's ``expected_query_shapes``
-        # carries.  Forcing the ``source-<platform>-…`` browser Source-id set
-        # here masks the real contract behind fixtures that coincidentally used
-        # ``source-*`` ids in ``query_task_ids``; a binding with a foreign /
-        # missing / source-owned / swapped query owner is not the frozen
-        # per-pair plan — even when the digest chain is internally consistent.
-        ownership_set = _checkpoint_query_ownership_set(query_ids)
-        if ownership_set is None or ownership_set != _V4_FROZEN_QUERY_SHAPES:
+        # C-122 round-19 (gap 4) + R44 后续 (blocker C) + C-round2 (04:05Z 增量
+        # 打回): the per-group query-task set must be EXACTLY the canonical
+        # frozen per-pair FULL query-task id set, derived from the SAME
+        # production builder (``FlexibleQueryPlanBuilder`` + frozen window +
+        # frozen stay-plan candidate set) the runner seals.  The real producer /
+        # checkpoint seals FULL ``query:<platform>:<kind>:<digest>`` task ids
+        # (the ``FlexibleQueryTask.id`` namespace), and each id's digest binds
+        # its pair id, departure/return dates, zone and stay-plan id.  Projecting
+        # each full id to its ``<platform>:<kind>`` OWNERSHIP part (the round-19
+        # check) lets a no-digest id (``query:ctrip:flight``), an arbitrary
+        # suffix, a same-owner duplicate digest, or a whole cross-pair swap of
+        # full id sets pass — they all collapse to the same 13 ownership shapes.
+        # The exact per-pair comparison fails closed on ALL of them, and keeps
+        # source-owned / foreign / missing / extra members rejected.
+        canonical_query_ids = _V4_CANONICAL_PER_PAIR_QUERY_TASK_IDS.get(
+            entry_pair_id
+        )
+        if canonical_query_ids is None:
             raise GateStateChangedError(
                 f"evidence commit E layer-6 compact {tracked_rel} check "
                 f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
-                "query_task_ids member set != the canonical frozen graph query "
-                "ownership set (foreign, missing, source-owned or swapped "
-                "member)"
+                "is not covered by the canonical per-pair query-task authority"
+            )
+        if len(query_ids) != len(canonical_query_ids):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "query_task_ids member count != the canonical frozen per-pair "
+                "query-task count (missing, extra or duplicate member)"
+            )
+        if any(
+            not frozen_v4_query_task_id_is_wellformed(query_id)
+            for query_id in query_ids
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "query_task_ids member is not a well-formed frozen query task id "
+                "(bare ownership id, arbitrary suffix, foreign owner or "
+                "source-owned member)"
+            )
+        if set(query_ids) != set(canonical_query_ids):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                "query_task_ids member set != the canonical frozen per-pair "
+                "query task id set (missing, extra, wrong digest or cross-pair "
+                "swap)"
             )
         # C-122 round-19 (gap 4): the full business-summary recompute —
         # ``run_summary_sha256`` must RECOMPUTE from the binding's carried
@@ -6813,13 +6835,32 @@ def _verify_layer6_check_semantics(
             # ids / query shapes / iCom task ids contain a foreign member, omit a
             # canonical member or swap in another pair's set fails closed even
             # when every count lines up — this is the wrong-pair-swap gate.
+            # C-round2 (04:05Z 增量打回): the per-pair QUERY TASK IDs are compared
+            # against the canonical per-pair FULL query-task id set (not the 13
+            # ownership shapes) — the producer now seals the full ids, so a
+            # no-digest id, arbitrary suffix, duplicate digest or cross-pair swap
+            # of full id sets fails closed here too, not only at the checkpoint
+            # binding.
+            per_pair_query_ids = _V4_CANONICAL_PER_PAIR_QUERY_TASK_IDS.get(
+                entry_pair_id
+            )
+            if per_pair_query_ids is None:
+                raise GateStateChangedError(
+                    f"evidence commit E layer-6 compact {tracked_rel} check "
+                    f"{check_name!r} pair {entry_pair_id!r} is not covered by "
+                    "the canonical per-pair query-task authority"
+                )
             for list_key, canonical, label in (
                 (
                     "browser_source_task_ids",
                     _V4_FROZEN_BROWSER_SOURCE_IDS,
                     "browser Source id",
                 ),
-                ("query_task_ids", _V4_FROZEN_QUERY_SHAPES, "query shape"),
+                (
+                    "query_task_ids",
+                    per_pair_query_ids,
+                    "query task id",
+                ),
                 (
                     "icom_source_task_ids",
                     _V4_FROZEN_ICOM_TASK_IDS,
