@@ -388,6 +388,7 @@ def _check_v4_source_graph(
         planned_pair_ids.count(pair_id) != expected_browser_tasks for pair_id in pair_ids
     ):
         errors.append("query_plan.tasks 未按每个唯一日期对精确分配启用能力查询")
+    observed_query_ids_by_pair: dict[str, tuple[str, ...]] = {}
     for execution in run.pair_runs:
         source_run = getattr(execution, "exploration_run", None) or execution.run
         if source_run is None:
@@ -397,6 +398,7 @@ def _check_v4_source_graph(
             errors.append(f"{execution.date_pair.id}: 日期对状态不是 completed")
         pair_query_tasks = execution.query_tasks
         pair_query_ids = tuple(task.id for task in pair_query_tasks)
+        observed_query_ids_by_pair[execution.date_pair.id] = pair_query_ids
         planned_pair_tasks = tuple(
             task for task in planned_tasks if task.date_pair_id == execution.date_pair.id
         )
@@ -503,14 +505,18 @@ def _check_v4_source_graph(
                     "pair_id": pair_id,
                     "browser_source_task_ids": sorted(expected_browser_source_ids),
                     # C-round2 (04:05Z 增量打回): the per-pair query-task member
-                    # list carries the FULL canonical per-pair query-task id set
-                    # (the SAME authority the checkpoint / compact / consumer
-                    # use), so the sealed graph's per-pair exact ids are
-                    # independently recomputable — not just the 13 ``platform:kind``
-                    # ownership shapes, which would mask a no-digest / arbitrary-
-                    # suffix / duplicate-digest / cross-pair-swap forgery.
+                    # list carries the FULL query-task id set.  C-round3 (fresh
+                    # review): the producer seals the ACTUAL observed
+                    # ``pair_query_ids`` it verified against the run's
+                    # ``pair_runs[*].query_tasks`` — NOT the canonical set it
+                    # compared against — so the compact records what the run
+                    # REALLY executed and the consumer's canonical per-pair
+                    # exact-set comparison stays an independent fail-closed gate
+                    # (a compact whose per-pair ids were overwritten with the
+                    # authority can no longer mask a swapped / missing-extra /
+                    # wrong-digest run).
                     "query_task_ids": sorted(
-                        canonical_per_pair_query_ids[pair_id]
+                        observed_query_ids_by_pair.get(pair_id, ())
                     ),
                     "icom_source_task_ids": sorted(expected_icom_tasks),
                     "browser_source_task_count": expected_browser_tasks,

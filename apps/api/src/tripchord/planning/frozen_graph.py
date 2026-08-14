@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from functools import lru_cache
 
 from tripchord.planning.adaptive_dates import (
@@ -36,10 +37,16 @@ from tripchord.planning.flexible_dates import (
     LIVE_V5_PLATFORM_QUERY_KINDS,
     LIVE_V5_PLATFORMS,
     AuditableDatePair,
+    DateExplorationMode,
+    DateExplorationResult,
     DatePairSource,
+    DateSearchMetrics,
+    DateSearchMetricStatus,
     FlexibleDateExplorer,
     FlexibleQueryPlanBuilder,
     FlexibleTravelWindow,
+    PlatformRatePolicy,
+    QueryPlanPolicy,
     QueryTaskKind,
 )
 from tripchord.planning.stay_plans import system_stay_plan_candidate_set
@@ -472,10 +479,24 @@ def frozen_v4_per_pair_query_task_ids() -> tuple[dict[str, frozenset[str]], ...]
     pair's dates/zone/stay-plan, a missing/extra/wrong digest, a bare ownership
     id, or a whole cross-pair swap fails closed at the consumer against this
     item-by-item authority.
+
+    C-round3 (fresh review): the authority is derived through the PUBLIC
+    ``FlexibleQueryPlanBuilder.build()`` entry — never the builder's private
+    ``_task_windows`` / ``_stay_plan_id`` / ``_task`` — with the same production
+    per-pair policy the runtime's ``execute_pair`` expansion uses
+    (``max_exact_pairs=1``, one ``PlatformRatePolicy`` per ``LIVE_V5_PLATFORMS``).
+    A private-attribute derivation could drift silently from what a real run
+    seals; this path is byte-for-byte what the runner calls.
     """
     window = _FROZEN_V4_TRAVEL_WINDOW
     candidate_set = _frozen_candidate_set()
     builder = FlexibleQueryPlanBuilder(platforms=LIVE_V5_PLATFORMS)
+    policy = QueryPlanPolicy(
+        max_exact_pairs=1,
+        platform_rates=tuple(
+            PlatformRatePolicy(platform=platform) for platform in LIVE_V5_PLATFORMS
+        ),
+    )
     per_pair: list[dict[str, frozenset[str]]] = []
     for index, pair_id in enumerate(frozen_v4_canonical_pair_ids()):
         departure_s, return_s = pair_id.split(":")[1], pair_id.split(":")[2]
@@ -490,29 +511,31 @@ def frozen_v4_per_pair_query_task_ids() -> tuple[dict[str, frozenset[str]], ...]
             source=DatePairSource.FUSED_FARE_HINT,
             audit_reason="frozen canonical pair query-task authority",
         )
-        task_ids: set[str] = set()
-        for platform in LIVE_V5_PLATFORMS:
-            for kind, start_date, end_date, zone in builder._task_windows(
-                pair, True, candidate_set
-            ):
-                if kind not in LIVE_V5_PLATFORM_QUERY_KINDS.get(
-                    platform, frozenset(QueryTaskKind)
-                ):
-                    continue
-                stay_plan_id = builder._stay_plan_id(kind, candidate_set)
-                task = builder._task(
-                    window,
-                    pair,
-                    platform,
-                    kind,
-                    start_date,
-                    end_date,
-                    zone,
-                    stay_plan_id,
-                    0,
-                )
-                task_ids.add(task.id)
-        per_pair.append({pair_id: frozenset(task_ids)})
+        exploration = DateExplorationResult(
+            mode=DateExplorationMode.FULL_CALENDAR_TOP_K,
+            sampled_not_exhaustive=False,
+            universe_size=window.universe_size,
+            candidates=(pair,),
+            search_metrics=DateSearchMetrics(
+                universe_size=window.universe_size,
+                coarse_window_pair_count=1,
+                prior_observed_pair_count=0,
+                prior_coverage=Decimal(0),
+                shortlist_pair_count=1,
+                shortlist_coverage=Decimal(1),
+                metric_status=DateSearchMetricStatus.FULL_WINDOW_EVALUABLE,
+                evaluation_note="frozen canonical per-pair query-task authority",
+            ),
+        )
+        plan = builder.build(
+            window,
+            exploration,
+            policy,
+            stay_plan_candidate_set=candidate_set,
+        )
+        per_pair.append(
+            {pair_id: frozenset(task.id for task in plan.tasks)}
+        )
     return tuple(per_pair)
 
 

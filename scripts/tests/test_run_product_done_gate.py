@@ -10,11 +10,13 @@ import subprocess
 import sys
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 from tripchord.planning.frozen_graph import (
+    _FROZEN_V4_TRAVEL_WINDOW,
     _frozen_candidate_set,
     frozen_v4_canonical_pair_ids,
     frozen_v4_pair_id_digest,
@@ -586,18 +588,23 @@ def _frozen_query_task_ids(
     self-consistent contract the validator must reject by the per-pair exact
     authority."""
     from tripchord.planning.flexible_dates import (
-        LIVE_V5_PLATFORM_QUERY_KINDS,
         LIVE_V5_PLATFORMS,
         AuditableDatePair,
+        DateExplorationMode,
+        DateExplorationResult,
         DatePairSource,
+        DateSearchMetrics,
+        DateSearchMetricStatus,
         FlexibleQueryPlanBuilder,
-        QueryTaskKind,
+        PlatformRatePolicy,
+        QueryPlanPolicy,
     )
 
     for per_pair in frozen_v4_per_pair_query_task_ids():
         if pair_id in per_pair:
             return tuple(sorted(per_pair[pair_id]))
     candidate_set = _frozen_candidate_set()
+    window = _FROZEN_V4_TRAVEL_WINDOW
     builder = FlexibleQueryPlanBuilder(platforms=LIVE_V5_PLATFORMS)
     departure = date.fromisoformat(departure_s)
     return_d = date.fromisoformat(return_s)
@@ -610,28 +617,35 @@ def _frozen_query_task_ids(
         source=DatePairSource.FUSED_FARE_HINT,
         audit_reason="counter-example foreign pair query-task authority",
     )
-    task_ids: set[str] = set()
-    for platform in LIVE_V5_PLATFORMS:
-        for kind, start_date, end_date, zone in builder._task_windows(
-            pair, True, candidate_set
-        ):
-            if kind not in LIVE_V5_PLATFORM_QUERY_KINDS.get(
-                platform, frozenset(QueryTaskKind)
-            ):
-                continue
-            stay_plan_id = builder._stay_plan_id(kind, candidate_set)
-            task_ids.add(
-                frozen_v4_query_task_id(
-                    pair_id,
-                    platform,
-                    kind,
-                    start_date,
-                    end_date,
-                    zone,
-                    stay_plan_id,
-                )
-            )
-    return tuple(sorted(task_ids))
+    exploration = DateExplorationResult(
+        mode=DateExplorationMode.FULL_CALENDAR_TOP_K,
+        sampled_not_exhaustive=False,
+        universe_size=window.universe_size,
+        candidates=(pair,),
+        search_metrics=DateSearchMetrics(
+            universe_size=window.universe_size,
+            coarse_window_pair_count=1,
+            prior_observed_pair_count=0,
+            prior_coverage=Decimal(0),
+            shortlist_pair_count=1,
+            shortlist_coverage=Decimal(1),
+            metric_status=DateSearchMetricStatus.FULL_WINDOW_EVALUABLE,
+            evaluation_note="counter-example foreign pair query-task authority",
+        ),
+    )
+    policy = QueryPlanPolicy(
+        max_exact_pairs=1,
+        platform_rates=tuple(
+            PlatformRatePolicy(platform=platform) for platform in LIVE_V5_PLATFORMS
+        ),
+    )
+    plan = builder.build(
+        window,
+        exploration,
+        policy,
+        stay_plan_candidate_set=candidate_set,
+    )
+    return tuple(sorted(task.id for task in plan.tasks))
 
 
 # The passing fixture's pair-id set: the CANONICAL frozen ordered trio, DERIVED
@@ -12603,44 +12617,351 @@ def test_verify_layer6_compact_contract_rejects_checkpoint_binding_wrong_field_d
         )
 
 
-def test_verify_layer6_compact_contract_accepts_real_builder_full_chain() -> None:
-    """C-round2 (04:05Z 增量打回, real-builder positive): the FULL
-    producer→checkpoint→runner→compact→consumer chain passes ONLY when every
-    layer derives the per-pair EXACT query-task id set from the SAME production
-    builder.  The producer's sealed v4-source-graph per-pair ``query_task_ids``
-    AND the runner's checkpoint binding both carry the authoritative per-pair
-    full ids (``frozen_v4_per_pair_query_task_ids``) and agree with each other;
-    the consumer accepts the compact.  This is the contract a real frozen run
-    seals — a hand-written digest anywhere in the chain would break the agreement."""
+def _real_v4_flexible_run() -> tuple[Any, Any, dict[str, tuple[str, ...]]]:
+    """Build a REAL ``FlexibleLiveAgentRun`` through the PUBLIC production chain:
+    ``FlexibleQueryPlanBuilder.build()`` (the entry the runtime's ``execute_pair``
+    expansion calls) → per-pair ``FlexiblePairExecution.query_tasks`` → a real
+    ``LivePackageAgentRun`` scheduler covering the frozen browser Source ids +
+    iCom transfer ids + the finalization tail, with a real ``FlexibleQueryPlan``
+    / ranked options / package decision.  Returns ``(run, candidate_set,
+    observed_query_ids_by_pair)`` — the same inputs the real producer
+    ``_check_v4_source_graph`` consumes, plus the ACTUAL per-pair query-task ids
+    the run sealed (C-round3: the compact must be compared against what the run
+    REALLY observed, never a fixture)."""
+    from tripchord.agents.flexible_live_system import (
+        FlexibleLiveAgentRun,
+        FlexiblePairExecution,
+        FlexiblePairState,
+        FlexibleRankedOption,
+    )
+    from tripchord.agents.live_system import (
+        LiveCoverageMode,
+        LivePackageAgentRun,
+        PlatformSearchCoverage,
+    )
+    from tripchord.agents.models import (
+        AgentRole,
+        AgentTask,
+        AgentTaskResult,
+        TaskGraph,
+    )
+    from tripchord.agents.runtime import SchedulerOutcome
+    from tripchord.planning.flexible_dates import (
+        LIVE_V5_PLATFORM_QUERY_KINDS,
+        LIVE_V5_PLATFORMS,
+        AuditableDatePair,
+        DateExplorationMode,
+        DateExplorationResult,
+        DatePairSource,
+        DateSearchMetrics,
+        DateSearchMetricStatus,
+        FlexibleQueryPlan,
+        FlexibleQueryPlanBuilder,
+        PlatformRatePolicy,
+        QueryPlanPolicy,
+        QueryTaskKind,
+    )
+    from tripchord.planning.package import (
+        PackageDecision,
+        PackageDecisionState,
+        PackageIntent,
+        PackageInventory,
+    )
+    from tripchord.providers.browser_bridge import (
+        BrowserProvider,
+        BrowserSearchQuery,
+        BrowserVertical,
+    )
 
+    window = _FROZEN_V4_TRAVEL_WINDOW
+    cs = _frozen_candidate_set()
+    builder = FlexibleQueryPlanBuilder(platforms=LIVE_V5_PLATFORMS)
+    pair_policy = QueryPlanPolicy(
+        max_exact_pairs=1,
+        platform_rates=tuple(
+            PlatformRatePolicy(platform=platform) for platform in LIVE_V5_PLATFORMS
+        ),
+    )
+    pair_ids = frozen_v4_canonical_pair_ids()
+
+    def make_exploration(pair: AuditableDatePair) -> DateExplorationResult:
+        return DateExplorationResult(
+            mode=DateExplorationMode.FULL_CALENDAR_TOP_K,
+            sampled_not_exhaustive=False,
+            universe_size=window.universe_size,
+            candidates=(pair,),
+            search_metrics=DateSearchMetrics(
+                universe_size=window.universe_size,
+                coarse_window_pair_count=1,
+                prior_observed_pair_count=0,
+                prior_coverage=Decimal(0),
+                shortlist_pair_count=1,
+                shortlist_coverage=Decimal(1),
+                metric_status=DateSearchMetricStatus.FULL_WINDOW_EVALUABLE,
+                evaluation_note="real chain query-task authority",
+            ),
+        )
+
+    def make_pair(pair_id: str, rank: int) -> AuditableDatePair:
+        departure_s, return_s = pair_id.split(":")[1], pair_id.split(":")[2]
+        departure = date.fromisoformat(departure_s)
+        return_d = date.fromisoformat(return_s)
+        return AuditableDatePair(
+            id=pair_id,
+            rank=rank,
+            departure_date=departure,
+            return_date=return_d,
+            night_count=(return_d - departure).days,
+            source=DatePairSource.FUSED_FARE_HINT,
+            audit_reason="real chain query-task authority",
+        )
+
+    all_tasks: list[Any] = []
+    executions: list[tuple[str, AuditableDatePair, tuple[Any, ...]]] = []
+    observed_by_pair: dict[str, tuple[str, ...]] = {}
+    for index, pid in enumerate(pair_ids):
+        pair = make_pair(pid, index + 1)
+        plan = builder.build(
+            window,
+            make_exploration(pair),
+            pair_policy,
+            stay_plan_candidate_set=cs,
+        )
+        all_tasks.extend(plan.tasks)
+        executions.append((pid, pair, plan.tasks))
+        observed_by_pair[pid] = tuple(task.id for task in plan.tasks)
+
+    lodging_platforms = {
+        platform
+        for platform in LIVE_V5_PLATFORMS
+        if QueryTaskKind.LODGING_FULL_STAY in LIVE_V5_PLATFORM_QUERY_KINDS[platform]
+    }
+    browser_source_ids = sorted(
+        f"source-{platform.value}-{suffix}"
+        for platform in LIVE_V5_PLATFORMS
+        for suffix in (
+            "flight",
+            *(
+                f"lodging-{segment.query_segment}"
+                for plan in cs.candidates
+                for segment in plan.segments
+                if platform in lodging_platforms
+            ),
+        )
+    )
+    icom_ids = sorted(
+        f"public-transfer-icom-{contract.contract_id.removeprefix('icom-')}"
+        for plan in cs.candidates
+        for contract in plan.required_transfer_contracts
+        if contract.required_provider == "icom-public-transfer"
+    )
+
+    intent = PackageIntent(
+        trip_id="frozen-maldives-live-v4",
+        origin=window.origin,
+        destination=window.destination,
+        destination_place_key=None,
+        start_date=window.earliest_departure,
+        end_date=date(2026, 9, 8),
+        adults=window.adults,
+        rooms=window.rooms,
+    )
+    query = BrowserSearchQuery(
+        origin=window.origin,
+        destination=window.destination,
+        start_date=window.earliest_departure,
+        adults=window.adults,
+        rooms=window.rooms,
+    )
+    coverage = tuple(
+        PlatformSearchCoverage(
+            provider=provider,
+            successful_verticals=(BrowserVertical.FLIGHT, BrowserVertical.LODGING),
+            successful_source_ids=tuple(
+                sid for sid in browser_source_ids if sid.startswith(f"source-{provider.value}-")
+            ),
+            complete=True,
+        )
+        for provider in (BrowserProvider.CTRIP, BrowserProvider.QUNAR, BrowserProvider.TONGCHENG)
+    )
+    final_tasks = (
+        AgentTask(
+            id="orchestrate-travel-package",
+            role=AgentRole.SAFETY_GATE,
+            goal="real chain deterministic decision",
+        ),
+        AgentTask(
+            id="explain-final-decision",
+            role=AgentRole.EXPLANATION,
+            goal="real chain explanation",
+            dependencies=("orchestrate-travel-package",),
+        ),
+        AgentTask(
+            id="curate-run-memory",
+            role=AgentRole.MEMORY_CURATOR,
+            goal="real chain memory curation",
+            dependencies=("explain-final-decision",),
+        ),
+        AgentTask(
+            id="publish-live-run",
+            role=AgentRole.SAFETY_GATE,
+            goal="real chain publication gate",
+            dependencies=("curate-run-memory",),
+        ),
+    )
+    graph_tasks = tuple(
+        AgentTask(id=sid, role=AgentRole.BROWSER_RESEARCH, goal="frozen browser query")
+        for sid in browser_source_ids
+    ) + tuple(
+        AgentTask(id=iid, role=AgentRole.TRANSPORT, goal="frozen icom transfer")
+        for iid in icom_ids
+    ) + final_tasks
+    graph_results = tuple(
+        AgentTaskResult(
+            task_id=task.id,
+            agent_role=task.role,
+            success=True,
+            summary="ok",
+            output={"publication_gate_passed": True}
+            if task.id == "publish-live-run"
+            else {},
+        )
+        for task in graph_tasks
+    )
+    scheduler = SchedulerOutcome(
+        graph=TaskGraph(tasks=graph_tasks),
+        results=graph_results,
+        trace=(),
+        wall_time_seconds=0,
+        max_parallel_tasks=15,
+        succeeded=True,
+    )
+
+    pair_runs = []
+    for _pid, pair, tasks in executions:
+        run = LivePackageAgentRun(
+            mode=LiveCoverageMode.STRICT,
+            intent=intent,
+            search_query=query,
+            decision=PackageDecision(
+                state=PackageDecisionState.ACCEPT,
+                summary="real chain",
+            ),
+            claim_boundary="real chain",
+            all_platforms_complete=True,
+            coverage=coverage,
+            inventory=PackageInventory(),
+            normalization_results=(),
+            scheduler=scheduler,
+            source_task_ids=tuple(browser_source_ids),
+            public_transfer_task_ids=tuple(icom_ids),
+        )
+        pair_runs.append(
+            FlexiblePairExecution(
+                date_pair=pair,
+                query_tasks=tuple(tasks),
+                source_start_delays_ms={},
+                state=FlexiblePairState.COMPLETED,
+                run=run,
+            )
+        )
+
+    query_hash = hashlib.sha256(
+        json.dumps(sorted(task.id for task in all_tasks), ensure_ascii=False).encode()
+    ).hexdigest()
+    full_exploration = DateExplorationResult(
+        mode=DateExplorationMode.FULL_CALENDAR_TOP_K,
+        sampled_not_exhaustive=False,
+        universe_size=window.universe_size,
+        candidates=tuple(make_pair(pid, i + 1) for i, pid in enumerate(pair_ids)),
+        search_metrics=DateSearchMetrics(
+            universe_size=window.universe_size,
+            coarse_window_pair_count=3,
+            prior_observed_pair_count=0,
+            prior_coverage=Decimal(0),
+            shortlist_pair_count=3,
+            shortlist_coverage=Decimal(1),
+            metric_status=DateSearchMetricStatus.FULL_WINDOW_EVALUABLE,
+            evaluation_note="real chain full exploration",
+        ),
+    )
+    qp = FlexibleQueryPlan(
+        tasks=tuple(all_tasks),
+        selected_pair_ids=tuple(pair_ids),
+        omitted_pair_ids=(),
+        total_task_count=len(all_tasks),
+        task_count_by_platform={
+            platform.value: sum(task.platform == platform for task in all_tasks)
+            for platform in LIVE_V5_PLATFORMS
+        },
+        sampled_not_exhaustive=False,
+        search_metrics=full_exploration.search_metrics,
+        query_hash=query_hash,
+        stay_plan_candidate_set_sha256=cs.candidate_set_sha256,
+        frozen_stay_plan_ids=cs.stay_plan_ids,
+    )
+    ranked = FlexibleRankedOption(
+        rank=1,
+        date_pair_id=pair_ids[0],
+        departure_date=make_pair(pair_ids[0], 1).departure_date,
+        return_date=make_pair(pair_ids[0], 1).return_date,
+        decision_state=PackageDecisionState.ACCEPT,
+        recommendable=True,
+        evidence_completeness=Decimal(1),
+        all_platforms_complete=True,
+        option_id=f"option-{pair_ids[0]}",
+    )
+    run_model = FlexibleLiveAgentRun(
+        requested_window=window,
+        effective_window=window,
+        exploration=full_exploration,
+        query_plan=qp,
+        pair_runs=tuple(pair_runs),
+        ranked_options=(ranked,),
+        final_decision=PackageDecision(
+            state=PackageDecisionState.ACCEPT, summary="real chain"
+        ),
+        sampled_not_exhaustive=False,
+        claim_boundary="real chain",
+        stay_plan_candidate_set=cs,
+    )
+    return run_model, cs, observed_by_pair
+
+
+def _real_checkpoint_binding(
+    run: Any, request_sha256: str = _FIXTURE_REQUEST_SHA256
+) -> dict[str, object]:
+    """The desensitized checkpoint binding the REAL runner writes from the run's
+    ACTUAL per-pair query tasks — one ``LivePlanningPairCheckpoint`` per pair,
+    created through the checkpoint model's authoritative ``create`` (which
+    recomputes ``run_summary_sha256`` / ``checkpoint_sha256`` from the carried
+    fields), serialized exactly as the compact writer's ``context
+    pair_checkpoint_binding`` expects (C-round3: no hand-written checkpoint)."""
     from tripchord.agents.live_jobs import (
         LivePlanningPairCheckpoint,
         LivePlanningPairCheckpointState,
     )
 
-    request_sha256 = _FIXTURE_REQUEST_SHA256
-    checkpoints: list[LivePlanningPairCheckpoint] = []
     bindings: list[dict[str, object]] = []
-    for index, pair_id in enumerate(_FIXTURE_PAIR_IDS):
-        departure_s, return_s = _FIXTURE_PAIR_DATES[index]
-        task_ids = _frozen_query_task_ids(pair_id, departure_s, return_s)
+    for index, execution in enumerate(run.pair_runs):
+        pair = execution.date_pair
+        query_ids = tuple(task.id for task in execution.query_tasks)
         checkpoint = LivePlanningPairCheckpoint.create(
             sequence=index + 1,
             request_sha256=request_sha256,
-            date_pair_id=pair_id,
-            departure_date=date.fromisoformat(departure_s),
-            return_date=date.fromisoformat(return_s),
+            date_pair_id=pair.id,
+            departure_date=pair.departure_date,
+            return_date=pair.return_date,
             state=LivePlanningPairCheckpointState.COMPLETED,
-            query_task_ids=task_ids,
+            query_task_ids=query_ids,
             run_purpose="exploration_and_publication",
             finalization_state="finalized",
             decision_state="recommended",
-            source_task_count=len(task_ids),
+            source_task_count=len(query_ids),
             exploration_seal_passed=True,
             all_platforms_complete=True,
             captured_at=datetime.fromisoformat("2026-08-10T00:00:00+00:00"),
         )
-        checkpoints.append(checkpoint)
         bindings.append(
             {
                 "sequence": checkpoint.sequence,
@@ -12665,44 +12986,289 @@ def test_verify_layer6_compact_contract_accepts_real_builder_full_chain() -> Non
                 "request_sha256": checkpoint.request_sha256,
             }
         )
-    real_binding: dict[str, object] = {
+    ordered = [str(b["checkpoint_sha256"]) for b in bindings]
+    return {
         "passed": True,
         "count": len(bindings),
-        "ordered_checkpoint_sha256": [
-            checkpoint.checkpoint_sha256 for checkpoint in checkpoints
-        ],
-        "checkpoint_chain_sha256": gate._canonical_sha256(
-            [checkpoint.checkpoint_sha256 for checkpoint in checkpoints]
-        ),
+        "ordered_checkpoint_sha256": ordered,
+        "checkpoint_chain_sha256": gate._canonical_sha256(ordered),
         "request_sha256": request_sha256,
         "bindings": bindings,
     }
 
-    def patch(checks: Any) -> None:
-        for check in checks:
-            if check["name"] == "v4_source_graph":
-                # The runner checkpoint binding carries the real per-pair ids.
-                check["evidence"]["checkpoint_binding"] = real_binding  # type: ignore[index]
-                # The producer's sealed per-pair breakdown carries the SAME
-                # authoritative full ids (real-builder, per-pair), so the chain
-                # is consistent end to end.
-                for entry in check["evidence"]["per_pair"]:  # type: ignore[index]
-                    canonical = gate._V4_CANONICAL_PER_PAIR_QUERY_TASK_IDS[
-                        entry["pair_id"]
-                    ]
-                    assert set(entry["query_task_ids"]) == set(canonical)
-                    assert set(entry["query_task_ids"]) == set(
-                        real_binding["bindings"][  # type: ignore[index]
-                            _FIXTURE_PAIR_IDS.index(entry["pair_id"])
-                        ]["query_task_ids"]
-                    )
 
-    compact = _layer6_compact_with_evidence_mutated(patch)
+def _real_raw_payload(
+    producer_evidence: dict[str, object],
+    checkpoint_binding: dict[str, object],
+) -> dict[str, object]:
+    """The raw layer-6 runner bundle a real run writes to
+    ``live-done-gate-v4.json``: the 15-check ``done_gate`` report whose
+    v4_source_graph evidence is the REAL producer's evidence, plus the real
+    job-control-plane ``context.pair_checkpoint_binding`` the compact writer
+    merges into the v4_source_graph evidence."""
+    payload = _realistic_e2e_evidence()
+    for check in payload["done_gate"]["checks"]:  # type: ignore[index]
+        if check["name"] == "v4_source_graph":
+            check["evidence"] = dict(producer_evidence)
+    payload["context"] = {"pair_checkpoint_binding": checkpoint_binding}  # type: ignore[index]
+    return payload
+
+
+def _setup_real_bridge_state(
+    monkeypatch: pytest.MonkeyPatch, staging_dir: Path
+) -> None:
+    """Point the real compact writer at a real bridge-state file so the layer-6
+    compact's lease bindings carry a recomputable sha256 (never a None hash)."""
+    bridge_state_path = staging_dir / "done-gate-real-chain-bridge-state.json"
+    bridge_state_path.parent.mkdir(parents=True, exist_ok=True)
+    bridge_state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "tripchord-browser-bridge-state-v2",
+                "saved_at": "2026-08-10T00:00:00+00:00",
+                "tasks": [],
+                "reload_requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(gate._BRIDGE_STATE_ENV, str(bridge_state_path))
+    gate._BRIDGE_STATE_SNAPSHOT = None
+    gate._BRIDGE_STATE_SNAPSHOT_AFTER = None
+
+
+def _compact_via_real_writer(
+    monkeypatch: pytest.MonkeyPatch, staging_dir: Path, payload: dict[str, object]
+) -> dict[str, object]:
+    """Feed a raw payload through the REAL layer-6 compact writer
+    (``_compact_live_e2e``) and return the compact artifact."""
+    _setup_real_bridge_state(monkeypatch, staging_dir)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    (staging_dir / "live-done-gate-v4.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    compact = gate._compact_live_e2e(staging_dir)
+    assert compact is not None, "real compact writer produced no layer-6 compact"
+    return compact
+
+
+def _run_with_cross_pair_swap(run: Any) -> Any:
+    """Swap the FULL per-pair query-task id sets of the first two pairs — each
+    pair keeps its own task objects but seals the OTHER pair's ids, so every id
+    is still well-formed but the exact per-pair canonical set is violated."""
+    execs = list(run.pair_runs)
+    a_ids = tuple(task.id for task in execs[0].query_tasks)
+    b_ids = tuple(task.id for task in execs[1].query_tasks)
+    remap = dict(zip(a_ids, b_ids, strict=True)) | dict(
+        zip(b_ids, a_ids, strict=True)
+    )
+    new_execs = []
+    all_tasks: list[Any] = []
+    for execution in execs:
+        new_tasks = tuple(
+            task.model_copy(update={"id": remap.get(task.id, task.id)})
+            for task in execution.query_tasks
+        )
+        new_execs.append(execution.model_copy(update={"query_tasks": new_tasks}))
+        all_tasks.extend(new_tasks)
+    return run.model_copy(
+        update={
+            "pair_runs": tuple(new_execs),
+            "query_plan": run.query_plan.model_copy(update={"tasks": tuple(all_tasks)}),
+        }
+    )
+
+
+def _run_with_dropped_query_task(run: Any, pair_index: int) -> Any:
+    """Drop one query task from the pair's set (13 → 12) — a missing member."""
+    execs = list(run.pair_runs)
+    drop_id = execs[pair_index].query_tasks[-1].id
+    new_execs = []
+    all_tasks: list[Any] = []
+    for index, execution in enumerate(execs):
+        tasks = execution.query_tasks
+        if index == pair_index:
+            tasks = tuple(task for task in tasks if task.id != drop_id)
+        new_execs.append(execution.model_copy(update={"query_tasks": tasks}))
+        all_tasks.extend(tasks)
+    return run.model_copy(
+        update={
+            "pair_runs": tuple(new_execs),
+            "query_plan": run.query_plan.model_copy(update={"tasks": tuple(all_tasks)}),
+        }
+    )
+
+
+def _run_with_extra_query_task(run: Any, pair_index: int) -> Any:
+    """Add a well-formed FOREIGN query-task id (computed for a non-frozen date)
+    to the pair's set (13 → 14) — an extra member."""
+    execs = list(run.pair_runs)
+    target = execs[pair_index]
+    foreign_id = frozen_v4_query_task_id(
+        target.date_pair.id,
+        "ctrip",
+        "flight",
+        date(2026, 8, 1),
+        date(2026, 8, 6),
+        None,
+        None,
+    )
+    new_execs = []
+    all_tasks: list[Any] = []
+    for index, execution in enumerate(execs):
+        tasks = execution.query_tasks
+        if index == pair_index:
+            tasks = (*tasks, tasks[0].model_copy(update={"id": foreign_id}))
+        new_execs.append(execution.model_copy(update={"query_tasks": tasks}))
+        all_tasks.extend(tasks)
+    return run.model_copy(
+        update={
+            "pair_runs": tuple(new_execs),
+            "query_plan": run.query_plan.model_copy(update={"tasks": tuple(all_tasks)}),
+        }
+    )
+
+
+def _run_with_rewritten_last_query_task(
+    run: Any, pair_index: int, new_id: str
+) -> Any:
+    """Rewrite the LAST query-task id of one pair to ``new_id`` (same count,
+    same task objects, same shapes) — no-digest / arbitrary-suffix / wrong-digest
+    / duplicate all collapse to a per-pair exact-set mismatch."""
+    execs = list(run.pair_runs)
+    new_execs = []
+    all_tasks: list[Any] = []
+    for index, execution in enumerate(execs):
+        tasks = execution.query_tasks
+        if index == pair_index:
+            rewritten = tuple(
+                task.model_copy(update={"id": new_id})
+                if task_index == len(tasks) - 1
+                else task
+                for task_index, task in enumerate(tasks)
+            )
+            tasks = rewritten
+        new_execs.append(execution.model_copy(update={"query_tasks": tasks}))
+        all_tasks.extend(tasks)
+    return run.model_copy(
+        update={
+            "pair_runs": tuple(new_execs),
+            "query_plan": run.query_plan.model_copy(update={"tasks": tuple(all_tasks)}),
+        }
+    )
+
+
+def test_verify_layer6_compact_contract_accepts_real_builder_full_chain(
+    monkeypatch: pytest.MonkeyPatch, staging_dir: Path
+) -> None:
+    """C-round3 (fresh independent review RETURN, gap 3): the POSITIVE goes
+    through the REAL public chain end to end —
+    ``FlexibleQueryPlanBuilder.build()`` → a real ``FlexibleLiveAgentRun`` with
+    real per-pair ``query_tasks`` / real ``LivePackageAgentRun`` scheduler →
+    real ``LivePlanningPairCheckpoint`` writes → real producer
+    ``_check_v4_source_graph`` → real compact writer ``_compact_live_e2e`` →
+    ``_verify_layer6_compact_contract``.  No hand-written checkpoint, no
+    patched fixture compact, no fixture self-declaration.  The compact's
+    per-pair ``query_task_ids`` must equal the run's ACTUAL observed ids, and
+    the checkpoint binding must carry the same real observed ids."""
+
+    from tripchord.agents.live_done_gate_v4 import _check_v4_source_graph
+
+    run, candidate_set, observed_by_pair = _real_v4_flexible_run()
+
+    # Real producer seals the ACTUAL observed per-pair ids.
+    producer = _check_v4_source_graph(run, candidate_set)
+    assert producer.passed, f"real producer must pass: {producer.summary}"
+
+    # Real runner checkpoint writes from the run's ACTUAL observed query tasks.
+    binding = _real_checkpoint_binding(run)
+    assert len(binding["bindings"]) > 0  # real bindings present
+
+    payload = _real_raw_payload(producer.evidence, binding)
+    compact = _compact_via_real_writer(monkeypatch, staging_dir, payload)
+
+    # Real compact writer → real consumer accepts.
     gate._verify_layer6_compact_contract(
         "done-gate-layer6-compact.json",
         compact,
         tested_commit_sha="a" * 40,
     )
+
+    # The compact's per-pair query-task ids equal the run's ACTUAL observed ids.
+    for check in compact["done_gate"]["checks"]:  # type: ignore[index]
+        if check["name"] == "v4_source_graph":
+            for entry in check["evidence"]["per_pair"]:  # type: ignore[index]
+                assert set(entry["query_task_ids"]) == set(  # type: ignore[index]
+                    observed_by_pair[entry["pair_id"]]  # type: ignore[index]
+                )
+            for binding_entry in check["evidence"]["checkpoint_binding"]["bindings"]:  # type: ignore[index]
+                assert set(binding_entry["query_task_ids"]) == set(  # type: ignore[index]
+                    observed_by_pair[binding_entry["date_pair_id"]]  # type: ignore[index]
+                )
+
+
+def test_verify_layer6_compact_contract_real_chain_adversarial_matrix(
+    monkeypatch: pytest.MonkeyPatch, staging_dir: Path
+) -> None:
+    """C-round3 (fresh review, gap 3 adversarial): EVERY per-pair query-task-id
+    forgery — cross-pair swap, missing member, extra member, no-digest id,
+    arbitrary suffix, duplicate digest, wrong digest (date/zone/stay-plan
+    binding) — fails closed at BOTH ends of the REAL chain:
+    (1) the real producer ``_check_v4_source_graph`` on the mutated run returns
+    ``passed=False``, and (2) a FORGED raw payload that claims ``passed=True``
+    while carrying the mutated per-pair ids (real compact writer → real
+    consumer ``_verify_layer6_compact_contract``) is rejected."""
+
+    from tripchord.agents.live_done_gate_v4 import _check_v4_source_graph
+
+    canonical_run, candidate_set, _ = _real_v4_flexible_run()
+    pair_id = canonical_run.pair_runs[0].date_pair.id
+    foreign_digest_id = frozen_v4_query_task_id(
+        pair_id,
+        "ctrip",
+        "flight",
+        date(2026, 8, 1),
+        date(2026, 8, 6),
+        None,
+        None,
+    )
+    first_id = canonical_run.pair_runs[0].query_tasks[0].id
+    cases: dict[str, Any] = {
+        "cross_pair_swap": _run_with_cross_pair_swap(canonical_run),
+        "missing": _run_with_dropped_query_task(canonical_run, 0),
+        "extra": _run_with_extra_query_task(canonical_run, 0),
+        "no_digest": _run_with_rewritten_last_query_task(
+            canonical_run, 0, "query:ctrip:flight"
+        ),
+        "arbitrary_suffix": _run_with_rewritten_last_query_task(
+            canonical_run, 0, "query:ctrip:flight:deadbeef"
+        ),
+        "duplicate": _run_with_rewritten_last_query_task(
+            canonical_run, 0, first_id
+        ),
+        "wrong_digest_date_zone_stay_plan": _run_with_rewritten_last_query_task(
+            canonical_run, 0, foreign_digest_id
+        ),
+    }
+    for name, mutated_run in cases.items():
+        # Producer side: the real producer fails closed on the mutated run.
+        producer = _check_v4_source_graph(mutated_run, candidate_set)
+        assert producer.passed is False, (
+            f"producer must fail closed on per-pair query-task forgery {name!r}"
+        )
+
+        # Consumer side: even a FORGED passed=true payload carrying the mutated
+        # per-pair ids (real compact writer) must be rejected by the consumer.
+        # The checkpoint binding stays the REAL run's binding (real observed
+        # ids), so the ONLY deviation from a passing bundle is the per-pair ids.
+        payload = _real_raw_payload(producer.evidence, _real_checkpoint_binding(canonical_run))
+        compact = _compact_via_real_writer(monkeypatch, staging_dir, payload)
+        with pytest.raises(gate.GateStateChangedError):
+            gate._verify_layer6_compact_contract(
+                "done-gate-layer6-compact.json",
+                compact,
+                tested_commit_sha="a" * 40,
+            )
 
 
 def test_frozen_v4_pair_id_generation_enforces_time_contract() -> None:
