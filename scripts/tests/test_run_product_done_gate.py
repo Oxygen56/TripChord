@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta, timezone
@@ -614,6 +615,12 @@ def _strict_fixture_formal_source_binding(
         formal_job_graph_for_frozen_v4,
     )
     from tripchord.planning.stay_plans import system_stay_plan_candidate_set
+    from tripchord.providers.browser_bridge import (
+        BrowserSearchQuery,
+        ctrip_trusted_flight_search_url,
+        qunar_trusted_flight_search_url,
+        tongcheng_trusted_flight_search_url,
+    )
 
     def digest(value: object) -> str:
         return hashlib.sha256(
@@ -872,6 +879,13 @@ def _strict_fixture_formal_source_binding(
                 "search_url": None,
                 "options": options,
             }
+            if kind == "flight":
+                typed_query = BrowserSearchQuery.model_validate(query)
+                query["search_url"] = {
+                    "ctrip": ctrip_trusted_flight_search_url,
+                    "qunar": qunar_trusted_flight_search_url,
+                    "tongcheng": tongcheng_trusted_flight_search_url,
+                }[provider](typed_query)
             formal_query: dict[str, object] = {
                 "terminal_job_id": job_graph["terminal_job_id"],
                 "pair_id": pair["date_pair_id"],
@@ -7458,7 +7472,7 @@ def test_secret_scan_flags_tracking_url_query(
         ]}}),
         encoding="utf-8",
     )
-    with pytest.raises(gate.GateStateChangedError, match="tracking URL"):
+    with pytest.raises(gate.GateStateChangedError, match="secret leak"):
         gate.run_gate(staging_dir)
 
 
@@ -15297,6 +15311,50 @@ def test_formal_challenge_cold_restart_continues_and_finalizes_once(
     ]
 
 
+def test_formal_challenge_new_runtime_aborts_old_attempt_atomically(
+    tmp_path: Path,
+) -> None:
+    """A real PID/start change selects the explicit non-continuation model."""
+
+    from tripchord.formal_live_source import (
+        load_formal_live_source_authority,
+        validate_formal_source_challenge,
+    )
+
+    assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
+    authority, context = _fresh_installed_formal_authority(tmp_path)
+    issued = authority.issue_challenge(context)
+    old_runtime = context["runtime_identity"]
+    assert isinstance(old_runtime, dict)
+    restarted_runtime = {
+        **old_runtime,
+        "pid": int(old_runtime["pid"]) + 100_000,
+        "started_at": (
+            datetime.fromisoformat(str(old_runtime["started_at"]))
+            + timedelta(seconds=1)
+        ).isoformat(),
+    }
+
+    restarted = load_formal_live_source_authority(
+        commit_sha=str(context["tested_commit_sha"]),
+        runtime_identity=restarted_runtime,
+        private_key_path=_TEST_FORMAL_PRIVATE_KEY_PATH,
+        ledger_path=tmp_path / "ledger.json",
+        now=lambda: NOW,
+    )
+    assert restarted.public_status()["challenge_active"] is False
+    ledger = json.loads((tmp_path / "ledger.json").read_text(encoding="utf-8"))
+    row = ledger[str(issued["challenge"]["challenge_id"])]
+    assert row["state"] == "aborted"
+    assert row["terminal_reason"] == "runtime_restart_requires_new_attempt"
+    assert "active_state" not in row
+    # The old signed challenge remains independently auditable, but the new
+    # process cannot record or finalize it from reconstructed local state.
+    validate_formal_source_challenge(issued["challenge"])
+    with pytest.raises(RuntimeError, match="requires an active signed challenge"):
+        restarted.snapshot()
+
+
 def test_formal_challenge_write_failure_abort_and_expiry_are_atomic(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -15403,7 +15461,7 @@ def test_formal_source_owner_only_files_reject_links_and_wide_modes(
         read_owner_only_text(symlink, "test control token", minimum_length=64)
 
 
-def test_formal_source_clean_root_cli_rotation_and_old_key_rejection(
+def test_formal_source_clean_root_cli_rotation_preserves_old_public_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -15510,8 +15568,9 @@ def test_formal_source_clean_root_cli_rotation_and_old_key_rejection(
     after_rotation = cli("verify")
     assert rotated["authority_key_id"] == after_rotation["authority_key_id"]
     assert rotated["authority_key_id"] != initialized["authority_key_id"]
-    with pytest.raises(ValueError, match="foreign verification anchor"):
-        formal_source._validate_challenge(old_challenge)
+    # Rotation retires the old *signing* generation, but committed evidence
+    # remains independently/offline verifiable by its exact anchor generation.
+    formal_source._validate_challenge(old_challenge)
     formal_source._validate_challenge(signed_challenge("new-key-proof"))
 
     if original_env is None:
@@ -15531,6 +15590,178 @@ def test_formal_source_clean_root_cli_rotation_and_old_key_rejection(
     linked_parent.symlink_to(real_parent, target_is_directory=True)
     with pytest.raises(RuntimeError, match="unavailable"):
         formal_source.provision_formal_source_trust_root(linked_parent / "trust")
+
+
+def test_formal_source_requires_explicit_external_trust_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tripchord.formal_live_source as formal_source
+
+    monkeypatch.delenv("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT", raising=False)
+    with pytest.raises(RuntimeError, match="must be explicitly configured"):
+        formal_source.formal_source_trust_root()
+    monkeypatch.setenv(
+        "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT",
+        str(gate.ROOT / ".runtime" / "formal-source"),
+    )
+    with pytest.raises(RuntimeError, match="outside the repository"):
+        formal_source.formal_source_trust_root()
+
+
+def test_formal_source_browser_query_recomputes_exact_graph_dates_and_adults(
+    tmp_path: Path,
+) -> None:
+    from tripchord.agents.stay_area import system_stay_area_search_profile
+    from tripchord.planning.stay_plans import system_stay_plan_candidate_set
+
+    authority, context = _fresh_installed_formal_authority(tmp_path)
+    authority.issue_challenge(context)
+    graph = context["job_graph"]
+    assert isinstance(graph, dict)
+    pair = graph["pairs"][0]
+    assert isinstance(pair, dict)
+    next(
+        item
+        for item in pair["query_task_ids"]
+        if ":ctrip:lodging_first_night:" in item
+    )
+    query = {
+        "origin": "杭州",
+        "destination": "Hulhumalé",
+        "start_date": pair["departure_date"],
+        "end_date": pair["return_date"],
+        "adults": graph["adults"],
+        "rooms": 1,
+        "currency": "CNY",
+        "origin_code": "HGH",
+        "destination_code": None,
+        "search_url": None,
+        "options": {
+            "segment": "first",
+            "expected_lodging_place_key": "hulhumale",
+            "expected_package_area": "airport_island",
+            "gateway_destination": "马累",
+            "stay_area_search_profile": system_stay_area_search_profile("马累").model_dump(
+                mode="json"
+            ),
+            "stay_plan_candidate_set": system_stay_plan_candidate_set().model_dump(
+                mode="json"
+            ),
+            "__tripchord_allow_recent_quote_reuse": True,
+        },
+    }
+    with pytest.raises(ValueError, match="exact signed job member"):
+        authority.formal_browser_query(
+            task_id="browser-task-wrong-date",
+            provider="ctrip",
+            kind="lodging",
+            query=query,
+        )
+    query["end_date"] = (
+        datetime.strptime(str(pair["departure_date"]), "%Y-%m-%d").date()
+        + timedelta(days=1)
+    ).isoformat()
+    query["adults"] = int(graph["adults"]) + 1
+    with pytest.raises(ValueError, match="exact signed job member"):
+        authority.formal_browser_query(
+            task_id="browser-task-wrong-adults",
+            provider="ctrip",
+            kind="lodging",
+            query=query,
+        )
+
+
+def test_formal_public_proof_mask_is_narrow_and_never_exempts_urls_or_prose() -> None:
+    binding = _fixture_formal_source_binding()
+    checked = gate._formal_public_proofs(
+        json.dumps(
+            {
+                "gate_run_id": binding["challenge"]["run_id"],
+                "repo_revision": {
+                    "commit_sha": binding["challenge"]["tested_commit_sha"]
+                },
+                "runtime_before_run": {
+                    "runtime_provenance": binding["challenge"]["runtime_identity"]
+                },
+                "request_identity": {
+                    "api_payload_sha256": binding["challenge"]["request_sha256"]
+                },
+                "api_payload_candidate_set_sha256": binding["challenge"][
+                    "candidate_set_sha256"
+                ],
+                "scenario_sha256": binding["challenge"]["scenario_sha256"],
+                "formal_job_graph": binding["challenge"]["job_graph"],
+                "formal_live_source_binding": binding,
+                "formal_live_source_authority_receipt": binding[
+                    "authority_receipt"
+                ],
+                "formal_live_source_challenge": binding["challenge"],
+            }
+        ).encode(),
+        "live-done-gate-v4.json",
+    )
+    signature = str(binding["challenge"]["signature"])
+    assert signature in checked
+    url = next(
+        str(event["details"]["url"])
+        for event in binding["receipts"]
+        if event["kind"] == "icom_public_get"
+    )
+    assert url not in checked
+    assert gate._mask_formal_public_proofs(f'proof in prose {signature}', checked) == (
+        f'proof in prose {signature}'
+    )
+    masked = gate._mask_formal_public_proofs(
+        json.dumps({"signature": signature}, separators=(",", ":")), checked
+    )
+    assert signature not in masked
+
+
+def test_formal_secret_scan_28_5mb_is_bounded_and_linear() -> None:
+    binding = _fixture_formal_source_binding()
+    challenge = binding["challenge"]
+    payload = {
+        "gate_run_id": challenge["run_id"],
+        "repo_revision": {"commit_sha": challenge["tested_commit_sha"]},
+        "runtime_before_run": {
+            "runtime_provenance": challenge["runtime_identity"]
+        },
+        "request_identity": {"api_payload_sha256": challenge["request_sha256"]},
+        "api_payload_candidate_set_sha256": challenge["candidate_set_sha256"],
+        "scenario_sha256": challenge["scenario_sha256"],
+        "formal_job_graph": challenge["job_graph"],
+        "formal_live_source_binding": binding,
+        "formal_live_source_authority_receipt": binding["authority_receipt"],
+        "formal_live_source_challenge": challenge,
+        "performance_padding": "",
+    }
+    base = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    remaining = 28_500_000 - len(base)
+    # JSON whitespace is the production-neutral repeated span: the complete
+    # signed graph/proof matrix remains real, while the size amplifier cannot
+    # itself introduce a token that changes the scanner's semantic result.
+    payload["performance_padding"] = " " * remaining
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    assert 28_499_900 <= len(raw) <= 28_500_100
+    started = time.monotonic()
+    gate._secret_scan_bytes(
+        raw,
+        gate._SecretNeedles(()),
+        "evidence",
+        "live-done-gate-v4.json",
+    )
+    assert time.monotonic() - started <= gate._FORMAL_SECRET_SCAN_WALL_SECONDS
+
+
+def test_formal_secret_scan_rejects_input_over_frozen_budget() -> None:
+    raw = b'{"padding":"' + b"x" * gate._FORMAL_SECRET_SCAN_MAX_INPUT_BYTES + b'"}'
+    with pytest.raises(gate.GateStateChangedError, match="scan budget exceeded"):
+        gate._secret_scan_bytes(
+            raw,
+            gate._SecretNeedles(()),
+            "evidence",
+            "live-done-gate-v4.json",
+        )
 
 
 def test_formal_source_compact_summary_is_minimal_and_cross_swap_safe() -> None:
@@ -15668,6 +15899,56 @@ def _reseal_test_formal_binding(binding: dict[str, object]) -> dict[str, object]
     receipt["delta_digest"] = digest(events)
     receipt["signature"] = sign(_receipt_proof_payload(receipt))
     return candidate
+
+
+def test_formal_source_full_reseal_rejects_sensitive_search_url() -> None:
+    from tripchord.formal_live_source import validate_formal_source_evidence
+
+    binding = copy.deepcopy(_fixture_formal_source_binding())
+    receipts = binding["receipts"]
+    assert isinstance(receipts, list)
+    claim = next(event for event in receipts if event["kind"] == "browser_claim")
+    lease = next(
+        item
+        for item in claim["details"]["leases"]
+        if item["kind"] == "flight"
+    )
+    task_id = lease["task_id"]
+    malicious = "https://flights.ctrip.com/international/search/round-hgh-mle?token=secret"
+    lease["query"]["search_url"] = malicious
+    formal = lease["formal_query"]
+    formal["query_sha256"] = _c4_canonical_sha256(lease["query"])
+    formal["query_identity"] = _c4_canonical_sha256(
+        {key: value for key, value in formal.items() if key != "query_identity"}
+    )
+    completion = next(
+        event
+        for event in receipts
+        if event["kind"] == "browser_complete"
+        and event["details"]["task_id"] == task_id
+    )
+    completion["details"]["snapshot"]["query"] = copy.deepcopy(lease["query"])
+    completion["details"]["formal_query"] = copy.deepcopy(formal)
+    completion["details"]["result_sha256"] = _c4_canonical_sha256(
+        completion["details"]["snapshot"]
+    )
+    resealed = _reseal_test_formal_binding(binding)
+    with pytest.raises(ValueError, match="exact public search URL"):
+        validate_formal_source_evidence(resealed)
+    raw = json.dumps(
+        {
+            "formal_live_source_binding": resealed,
+            "formal_live_source_authority_receipt": resealed["authority_receipt"],
+            "formal_live_source_challenge": resealed["challenge"],
+        }
+    ).encode()
+    with pytest.raises(gate.GateStateChangedError, match="secret leak"):
+        gate._secret_scan_bytes(
+            raw,
+            gate._SecretNeedles(()),
+            "evidence",
+            "full-reseal.failure.json",
+        )
 
 
 @pytest.mark.parametrize(

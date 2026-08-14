@@ -1145,15 +1145,17 @@ async def _submit_flexible_live_job(
 ) -> StartLiveFlexibleFromTextJobResponse:
     idempotency = TypeAdapter(dict[str, Any]).validate_python(control["idempotency"])
     idempotency_key = TypeAdapter(str).validate_python(idempotency["key"])
+    headers = {"Idempotency-Key": idempotency_key}
+    if control_token_path is not None or os.environ.get(
+        "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"
+    ):
+        headers["X-TripChord-Formal-Source-Control"] = (
+            _formal_source_control_token(control_token_path)
+        )
     response = await client.post(
         f"{base}{_FROM_TEXT_JOBS_ENDPOINT}",
         json=payload,
-        headers={
-            "Idempotency-Key": idempotency_key,
-            "X-TripChord-Formal-Source-Control": _formal_source_control_token(
-                control_token_path
-            ),
-        },
+        headers=headers,
     )
     response_payload = _safe_response_json(response, "live-v4 async job submission")
     if response.status_code != 202:

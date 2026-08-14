@@ -695,17 +695,24 @@ def _install_browser_bridge(
     commit_sha = PROVENANCE.commit_sha
     if commit_sha is None:
         raise RuntimeError("formal browser composition requires a git commit identity")
-    authority_kwargs: dict[str, Any] = {}
-    if formal_source_private_key_path is not None:
-        authority_kwargs["private_key_path"] = formal_source_private_key_path
-    if formal_source_ledger_path is not None:
-        authority_kwargs["ledger_path"] = formal_source_ledger_path
-    source_authority = load_formal_live_source_authority(
-        commit_sha=commit_sha,
-        runtime_identity=PROVENANCE.to_dict(),
-        now=now,
-        **authority_kwargs,
+    formal_source_requested = (
+        formal_source_private_key_path is not None
+        or formal_source_ledger_path is not None
+        or bool(os.environ.get("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"))
     )
+    source_authority: FormalLiveSourceAuthority | None = None
+    if formal_source_requested:
+        authority_kwargs: dict[str, Any] = {}
+        if formal_source_private_key_path is not None:
+            authority_kwargs["private_key_path"] = formal_source_private_key_path
+        if formal_source_ledger_path is not None:
+            authority_kwargs["ledger_path"] = formal_source_ledger_path
+        source_authority = load_formal_live_source_authority(
+            commit_sha=commit_sha,
+            runtime_identity=PROVENANCE.to_dict(),
+            now=now,
+            **authority_kwargs,
+        )
     bridge = BrowserTaskBridge(now=now)
     icom_provider = IComTransferProvider(
         client=icom_http_client,
@@ -775,13 +782,14 @@ def _install_browser_bridge(
         if auto_reload_enabled and runtime_agent is not None
         else None
     )
-    source_authority.bind(
-        target_app=target_app,
-        bridge=bridge,
-        icom_provider=icom_provider,
-        live_system=live_system,
-        flexible_system=flexible_system,
-    )
+    if source_authority is not None:
+        source_authority.bind(
+            target_app=target_app,
+            bridge=bridge,
+            icom_provider=icom_provider,
+            live_system=live_system,
+            flexible_system=flexible_system,
+        )
     return bridge, live_system
 
 
@@ -1348,14 +1356,15 @@ async def agent_runtime_status_endpoint(
 
 
 _FORMAL_SOURCE_CONTROL_HEADER = "X-TripChord-Formal-Source-Control"
-_FORMAL_SOURCE_CONTROL_PATH = (
-    formal_source_trust_root() / "control-token"
-)
+_FORMAL_SOURCE_CONTROL_PATH: Path | None = None
 
 
 def _formal_source_control_token() -> str:
+    configured_path = _FORMAL_SOURCE_CONTROL_PATH
+    if configured_path is None:
+        configured_path = formal_source_trust_root() / "control-token"
     return read_owner_only_text(
-        _FORMAL_SOURCE_CONTROL_PATH,
+        configured_path,
         "formal source control token",
         minimum_length=64,
     )

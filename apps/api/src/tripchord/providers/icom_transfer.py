@@ -428,11 +428,11 @@ class IComTransferProvider:
         *,
         query_task_id: str | None = None,
     ) -> IComTransferSearchResult:
-        if (
-            not query_task_id
-            and self._source_authority is not None
-            and self._source_authority.public_status()["challenge_active"] is True
-        ):
+        formal_active = (
+            self._source_authority is not None
+            and self._source_authority.is_active()
+        )
+        if not query_task_id and formal_active:
             raise ValueError("iCom query_task_id is required")
         recorded_task_id = query_task_id or "non-formal-query"
         query_identity = query.model_dump(mode="json")
@@ -467,7 +467,11 @@ class IComTransferProvider:
                 ) from result
             fetched_by_endpoint[endpoint] = result
 
-        if self._source_authority is not None:
+        # The authority is observational outside a formal operation.  Ordinary
+        # read-only traffic before issuance or after finalize/abort/expire must
+        # remain usable and must never mutate the formal ledger.  Once active,
+        # however, any graph/HTTP mismatch remains fail-closed below.
+        if formal_active and self._source_authority is not None:
             for endpoint in _ENDPOINTS:
                 fetched = fetched_by_endpoint[endpoint]
                 parsed_query = dict(

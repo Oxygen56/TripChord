@@ -251,6 +251,74 @@ async def test_success_normalizes_official_public_transfer_with_field_evidence()
 
 
 @pytest.mark.asyncio
+async def test_formal_recording_is_observational_outside_active_challenge() -> None:
+    class InactiveAuthority:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def is_active(self) -> bool:
+            return False
+
+        def formal_icom_call(self, **_kwargs: object) -> dict[str, object]:
+            self.calls += 1
+            raise AssertionError("inactive traffic must not enter the formal ledger")
+
+        def record_icom_http(self, *_args: object, **_kwargs: object) -> None:
+            self.calls += 1
+            raise AssertionError("inactive traffic must not append a formal event")
+
+    authority = InactiveAuthority()
+    requests: list[httpx.Request] = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler(requests=requests))
+    ) as client:
+        provider = IComTransferProvider(
+            client=client,
+            source_authority=authority,  # type: ignore[arg-type]
+        )
+        before = await provider.search(_query())
+        after = await provider.search(_query(), query_task_id="ordinary-task")
+
+    assert before.options and after.options
+    assert len(requests) == 6
+    assert authority.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_active_formal_icom_graph_mismatch_fails_after_real_transport() -> None:
+    class ActiveRejectingAuthority:
+        def __init__(self) -> None:
+            self.formal_calls = 0
+            self.record_calls = 0
+
+        def is_active(self) -> bool:
+            return True
+
+        def formal_icom_call(self, **_kwargs: object) -> dict[str, object]:
+            self.formal_calls += 1
+            raise ValueError("formal iCom task differs from signed job graph")
+
+        def record_icom_http(self, *_args: object, **_kwargs: object) -> None:
+            self.record_calls += 1
+
+    authority = ActiveRejectingAuthority()
+    requests: list[httpx.Request] = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler(requests=requests))
+    ) as client:
+        provider = IComTransferProvider(
+            client=client,
+            source_authority=authority,  # type: ignore[arg-type]
+        )
+        with pytest.raises(ValueError, match="differs from signed job graph"):
+            await provider.search(_query(), query_task_id="foreign-task")
+
+    assert len(requests) == 3
+    assert authority.formal_calls == 1
+    assert authority.record_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_cancelled_schedule_is_retained_but_not_eligible() -> None:
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_handler(schedules=_schedule_payload(cancelled=True)))

@@ -881,7 +881,10 @@ class _DigestAuthScan:
         (line/value start or a structural delimiter ``,;{}[]"'\\``), ``descriptor``
         (a word character — the previous token is a noun), or ``none`` (a plain
         colon/dot — business prose, never a header)."""
-        prefix = text[:start].rstrip()
+        # Classification depends only on the immediate field/structural
+        # context.  Never copy and rescan the entire prefix for every ordinary
+        # ``digest`` member in a production-sized JSON artifact.
+        prefix = text[max(0, start - 256) : start].rstrip()
         if not prefix:
             return "standalone"
         if self._FIELD_RE.search(prefix):
@@ -1616,16 +1619,21 @@ class _BareCredentialScan:
     passcode was plannerV2``) fails the registered token closed."""
 
     def search(self, text: str) -> re.Match[str] | None:
-        narration = _credential_narration_binds(text)
+        # Compute the structural narration result once.  The production-sized
+        # authenticated formal artifact uses the separate single-pass scanner;
+        # this richer free-text recognizer must retain whole-document JSON and
+        # sentence-envelope semantics for diagnostics.
+        narration_binds = _credential_narration_binds(text)
+
         for m in _BARE_CREDENTIAL_TOKEN_RE.finditer(text):
             if _is_bare_credential_token(m.group(0)):
                 return m
-            if narration:
+            if narration_binds:
                 return m
         for m in _REGISTERED_LOWER_BASE_RE.finditer(text):
             if _is_bare_credential_token(m.group(0)):
                 return m
-            if narration:
+            if narration_binds:
                 return m
         return None
 
@@ -3231,8 +3239,32 @@ def _normalize_with_offsets(text: str) -> tuple[str, list[int]]:
 
 
 def _normalize_for_scan(text: str) -> str:
-    """Normalize ``text`` for sensitive-pattern detection (no offset map)."""
-    return _normalize_with_offsets(text)[0]
+    """Normalize ``text`` for scanning without allocating an offset per char.
+
+    The offset-producing routine is required only when a normalized match must
+    be mapped back for redaction.  Final scans need no map; using it on a
+    production 28.5MB artifact allocated tens of millions of Python integers
+    and violated the fixed memory/time budget.  Exact safe markers retain their
+    case while every other segment receives the same NFKC + casefold + Cf-drop
+    semantics.
+    """
+
+    def normalize_segment(segment: str) -> str:
+        if any(
+            unicodedata.category(character) == "Cf" or character == "\u200b"
+            for character in segment
+        ):
+            segment = "".join(
+                character
+                for character in segment
+                if unicodedata.category(character) != "Cf"
+                and character != "\u200b"
+            )
+        return unicodedata.normalize("NFKC", segment).casefold()
+
+    return "[REDACTED]".join(
+        normalize_segment(segment) for segment in text.split("[REDACTED]")
+    )
 
 
 def mask_normalized_spans(

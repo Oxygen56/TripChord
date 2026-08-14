@@ -34,17 +34,21 @@ import hashlib
 import json
 import os
 import re
+import resource
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+import unicodedata
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -63,6 +67,7 @@ from tripchord._secret_redact import (
     PatternScope,
     RecursiveJsonBudgetError,
     _ArrayPathMarker,
+    _is_bare_credential_token,
     _is_registered_base_key_token,
     _is_whole_header_prose,
     _mask_bare_credential_text,
@@ -1578,8 +1583,6 @@ def _reject_credential_field_names(data: bytes, label: str, name: str) -> None:
         raise GateStateChangedError(
             f"secret leak: nested JSON budget exceeded in {label} file {name}"
         ) from None
-
-
 def _reject_unbound_registered_base_values(
     data: bytes,
     label: str,
@@ -1587,6 +1590,7 @@ def _reject_unbound_registered_base_values(
     *,
     max_nodes: int = _MAX_JSON_SCAN_NODES,
     max_chars: int = _MAX_JSON_SCAN_CHARS,
+    on_string_value: Callable[[str], None] | None = None,
 ) -> None:
     """Fail closed when a JSON evidence artifact carries an EXACT registered
     business-identifier base as a string VALUE at a member path the documented
@@ -1708,6 +1712,8 @@ def _reject_unbound_registered_base_values(
                 ) from None
             return
         if isinstance(parsed, str):
+            if on_string_value is not None:
+                on_string_value(parsed)
             # R42 Block 84 (打回六): a decoded scalar string is judged at the
             # path of the string VALUE that carried it (never a RESET path) — a
             # multi-layer ``json.dumps`` top-level scalar keeps landing at
@@ -1761,12 +1767,39 @@ def _reject_unbound_registered_base_values(
                     if not isinstance(key, str):
                         continue
                     child_path = (*node_path, key)
+                    norm_key = _normalize_for_scan(key)
+                    if (
+                        _CREDENTIAL_FIELD_RE.search(key)
+                        or key.strip().lower() in _BARE_CREDENTIAL_FIELD_NAMES
+                        or _CREDENTIAL_FIELD_RE.search(norm_key)
+                        or norm_key.strip() in _BARE_CREDENTIAL_FIELD_NAMES
+                    ) and not (
+                        (isinstance(value, str) and value == "[REDACTED]")
+                        # Formal source diagnostics expose this exact boolean
+                        # assertion; it is neither a credential carrier nor a
+                        # free-form value.  Every other value/type stays closed.
+                        or (key == "credential_inputs" and value is False)
+                    ):
+                        raise GateStateChangedError(
+                            f"secret leak: Authorization/Cookie or credential "
+                            f"field name {key!r} in "
+                            f"{label} file {name}"
+                        )
+                    if _is_registered_base_key_token(key) or (
+                        _is_registered_base_key_token(norm_key)
+                    ):
+                        raise GateStateChangedError(
+                            f"secret leak: registered business base as JSON key "
+                            f"{key!r} in {label} file {name}"
+                        )
                     if isinstance(value, str):
                         budget_nodes += 1
                         if budget_nodes > max_nodes:
                             raise RecursiveJsonBudgetError(
                                 "JSON scan node budget exceeded"
                             )
+                        if on_string_value is not None:
+                            on_string_value(value)
                         # R42 Block 85 (打回七): recurse-first — a JSON-text
                         # value is a serialization envelope, judged at the
                         # REAL inner value's carried path (a legal phrase
@@ -1798,6 +1831,8 @@ def _reject_unbound_registered_base_values(
                             raise RecursiveJsonBudgetError(
                                 "JSON scan node budget exceeded"
                             )
+                        if on_string_value is not None:
+                            on_string_value(item)
                         # R42 Block 87 (打回八): the array element sits at the
                         # typed sentinel, never the string ``"[]"``.
                         item_path = (*node_path, _ARRAY_PATH_ELEMENT)
@@ -2127,11 +2162,24 @@ def _is_tracking_url_leak(url: str) -> bool:
     """
     try:
         parsed = urlsplit(url)
+        port = parsed.port
     except ValueError:
-        return False
+        return True
     if not parsed.query:
         return False
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    if len(pairs) == len(dict(pairs)) and _is_exact_public_evidence_url(
+        parsed.scheme,
+        parsed.hostname,
+        port,
+        parsed.username,
+        parsed.password,
+        parsed.path,
+        parsed.fragment,
+        pairs,
+    ):
+        return False
+    for key, value in pairs:
         key_lower = key.lower()
         value = value.strip()
         if not value or value == "[REDACTED]":
@@ -2152,6 +2200,105 @@ def _is_tracking_url_leak(url: str) -> bool:
         # Default deny: any query key outside the safe allowlist with a
         # non-blank, non-redacted value reads as a session/account leak.
         return True
+    return False
+
+
+def _is_exact_public_evidence_url(
+    scheme: str,
+    hostname: str | None,
+    port: int | None,
+    username: str | None,
+    password: str | None,
+    path: str,
+    fragment: str,
+    pairs: list[tuple[str, str]],
+) -> bool:
+    """Byte-shape allowlist for public Browser/iCom evidence URLs.
+
+    This is structural validation, not an authentication exemption.  Exact
+    host/path/order/key/value contracts mean credentials, tracking ids,
+    duplicate/unknown keys, encoded smuggling, fragments and host confusion
+    remain leaks before any formal signature is considered.
+    """
+
+    if (
+        scheme != "https"
+        or port is not None
+        or username is not None
+        or password is not None
+        or fragment
+    ):
+        return False
+    iso = r"20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
+    if hostname == "sfs-api.icomtours.com":
+        if path == "/api/v1/public/trips/schedules":
+            return len(pairs) == 1 and pairs[0][0] == "date" and re.fullmatch(
+                iso, pairs[0][1]
+            ) is not None
+        return not pairs and path in {
+            "/api/v1/public/ferry-fares/schedule-base-price",
+            "/api/v1/public/policy-sections",
+        }
+    if hostname == "flights.ctrip.com" and path == (
+        "/international/search/round-hgh-mle"
+    ):
+        if [key for key, _value in pairs] != [
+            "depdate",
+            "cabin",
+            "adult",
+            "child",
+            "infant",
+        ]:
+            return False
+        values = dict(pairs)
+        return (
+            re.fullmatch(f"{iso}_{iso}", values["depdate"]) is not None
+            and values["cabin"] == "y_s"
+            and re.fullmatch(r"[1-9]", values["adult"]) is not None
+            and values["child"] == values["infant"] == "0"
+        )
+    if hostname == "flight.qunar.com" and path == "/twell/flight/Search.jsp":
+        if [key for key, _value in pairs] != [
+            "from",
+            "showTotalPr",
+            "searchType",
+            "fromCity",
+            "toCity",
+            "adultNum",
+            "childNum",
+            "fromDate",
+            "toDate",
+        ]:
+            return False
+        values = dict(pairs)
+        return (
+            values["from"] == "flight_int_search"
+            and values["showTotalPr"] == "0"
+            and values["searchType"] == "RoundTripFlight"
+            and values["fromCity"] == "杭州"
+            and values["toCity"] == "马累"
+            and re.fullmatch(r"[1-9]", values["adultNum"]) is not None
+            and values["childNum"] == "0"
+            and re.fullmatch(iso, values["fromDate"]) is not None
+            and re.fullmatch(iso, values["toDate"]) is not None
+        )
+    if hostname == "www.ly.com" and path == "/eliflight/book1.html":
+        if [key for key, _value in pairs] != [
+            "para",
+            "departureCity",
+            "arrivalCity",
+        ]:
+            return False
+        values = dict(pairs)
+        return (
+            re.fullmatch(
+                f"HGH\\*MLE\\*{iso}\\*{iso}\\*RT\\*[1-9]_0_0\\*Y\\|S\\|C\\|F",
+                values["para"],
+            )
+            is not None
+            and values["departureCity"] == "杭州"
+            and values["arrivalCity"] == "马累"
+        )
     return False
 
 
@@ -2245,6 +2392,19 @@ def _scan_decoded_string_value(
     full-width run, never the run itself (the decoded value is where the real
     characters surface).
     """
+    encoded_value = value.encode("utf-8")
+    for needle in tuple(needles):
+        if needle in encoded_value:
+            raise GateStateChangedError(
+                f"secret leak: secret value found in decoded value in "
+                f"{label} file {name}"
+            )
+    # A punctuation/whitespace-only scalar cannot contain a header name, URL,
+    # credential token, phone/account id, or normalized alphanumeric smuggle.
+    # This C-level prefilter prevents a large benign repeated span from being
+    # fed through every structural scanner while preserving exact-needle checks.
+    if re.search(r"[^\W_]", value, re.UNICODE) is None:
+        return
     value_for_shapes = _mask_formal_public_proofs(value, public_proofs)
     # R20 Block 20a: the ``Digest`` auth ``response`` hex credential is scanned
     # on the RAW decoded value BEFORE ``_mask_hex_hash_spans`` (the 32-128 hex
@@ -2255,15 +2415,12 @@ def _scan_decoded_string_value(
             f"{label} file {name}"
         )
     value_masked = _mask_hex_hash_spans(value_for_shapes)
-    value_norm = _normalize_for_scan(
-        _blank_nonleaking_tracking_urls(value_masked)
+    normalized_input = _blank_nonleaking_tracking_urls(value_masked)
+    value_norm = (
+        _normalize_for_scan(normalized_input)
+        if _requires_distinct_normalized_scan(normalized_input)
+        else normalized_input
     )
-    for needle in tuple(needles):
-        if needle in value.encode("utf-8"):
-            raise GateStateChangedError(
-                f"secret leak: secret value found in decoded value in "
-                f"{label} file {name}"
-            )
     for pattern, kind in (
         (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
         (_ACCOUNT_ID_PATTERN, "account identifier"),
@@ -2283,12 +2440,23 @@ def _scan_decoded_string_value(
     # (``{"summary": "{\"secret\": \"[REDACTED]\"}"}``) decodes to an exact
     # marker assignment here and must not be a shape false positive.  Only the
     # RAW case-exact complete marker is blanked; an impersonation stays a leak.
-    value_shapes = _blank_diagnostic_schema_version(
-        _blank_exact_marker_assignments(value_masked)
+    value_shapes = _blank_exact_marker_assignments(value_masked)
+    if name.endswith(".failure.json"):
+        value_shapes = _blank_diagnostic_schema_version(value_shapes)
+    value_shapes_norm = (
+        _normalize_for_scan(value_shapes)
+        if _requires_distinct_normalized_scan(value_shapes)
+        else value_shapes
     )
-    value_shapes_norm = _normalize_for_scan(value_shapes)
     for pattern, kind in shape_pairs:
-        if pattern.search(value_shapes) or pattern.search(value_shapes_norm):
+        if public_proofs and pattern is _BARE_CREDENTIAL_PAIRS[0][0]:
+            leaked = _linear_bare_credential_match(value_shapes)
+        else:
+            leaked = pattern.search(value_shapes)
+        if leaked or (
+            value_shapes_norm is not value_shapes
+            and pattern.search(value_shapes_norm)
+        ):
             raise GateStateChangedError(
                 f"secret leak: {kind} in decoded value in {label} file {name}"
             )
@@ -2341,45 +2509,69 @@ def _make_decoded_value_scanner(
     return scan
 
 
-@lru_cache(maxsize=8)
-def _formal_public_proof_pattern(
-    public_proofs: frozenset[str],
-) -> re.Pattern[str] | None:
-    encoded_forms: set[str] = set()
-    for proof in public_proofs:
-        if not proof:
-            continue
-        encoded_forms.add(proof)
-        ascii_form = proof
-        unicode_form = proof
-        # Raw, decoded, and up to four nested JSON string encodings are the
-        # bounded evidence forms used by this gate.  Compile them once: rebuilding
-        # and replacing hundreds of proofs for every string value is quadratic.
-        for _depth in range(4):
-            ascii_form = json.dumps(ascii_form, ensure_ascii=True)[1:-1]
-            unicode_form = json.dumps(unicode_form, ensure_ascii=False)[1:-1]
-            encoded_forms.update({ascii_form, unicode_form})
-    if not encoded_forms:
-        return None
-    return re.compile(
-        "|".join(re.escape(item) for item in sorted(encoded_forms, key=len, reverse=True))
-    )
-
-
 def _mask_formal_public_proofs(
     text: str,
     public_proofs: frozenset[str],
 ) -> str:
-    """Blank exact fixed-anchor-authenticated public evidence identifiers.
+    """Mask only the exact JSON value span of a verified public signature.
 
-    Formal signatures and the terminal job id are public evidence, not bearer
-    credentials, but their random bytes can contain a credential-shaped run.
-    ``public_proofs`` is populated only after the complete artifact validates
-    against the fixed production anchor.  Longest-first replacement also
-    covers a terminal job id embedded in its signed status/events URLs.
+    This is a single bounded pass independent of proof count.  It deliberately
+    does not replace the same bytes in prose, another field, a URL, or a nested
+    encoding: signature provenance authenticates one structural span, never
+    every occurrence of those bytes in the artifact.
     """
-    pattern = _formal_public_proof_pattern(public_proofs)
-    return text if pattern is None else pattern.sub("[FORMAL-PROOF]", text)
+    if text in public_proofs:
+        return "[FORMAL-PROOF]"
+    if not public_proofs:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        value = match.group(2)
+        if value not in public_proofs:
+            return match.group(0)
+        return f"{match.group(1)}[FORMAL-PROOF]{match.group(3)}"
+
+    return _FORMAL_SIGNATURE_VALUE_RE.sub(replace, text)
+
+
+_FORMAL_OR_HEX_VALUE_RE = re.compile(
+    r'("(?:signature|challenge_signature|authority_receipt_signature)"\s*:\s*")'
+    r"([A-Za-z0-9+/]{86}==)(\")|[0-9a-fA-F]{32,128}"
+)
+_LINEAR_BARE_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"[a-z]+[A-Z][A-Za-z0-9_]*[0-9]+[A-Za-z0-9_]*"
+    r"|(?i:refreshTokenCount|bookingReference|hotelAmenity|tokenization|"
+    r"secretariat|flightOption|provider|planner|day)(?:V[0-9]+|[0-9]+)"
+    r")(?![A-Za-z0-9_])"
+)
+
+
+def _linear_bare_credential_match(text: str) -> re.Match[str] | None:
+    """Single-pass whole-text credential token backstop for formal JSON."""
+
+    for match in _LINEAR_BARE_TOKEN_RE.finditer(text):
+        token = match.group(0)
+        if _is_bare_credential_token(token):
+            return match
+    return None
+
+
+def _mask_formal_proofs_and_hex_spans(
+    text: str,
+    public_proofs: frozenset[str],
+) -> str:
+    """One-pass mask for exact verified signature fields and recomputable hex."""
+
+    def replace(match: re.Match[str]) -> str:
+        signature = match.group(2)
+        if signature is not None:
+            if signature not in public_proofs:
+                return match.group(0)
+            return f"{match.group(1)}[FORMAL-PROOF]{match.group(3)}"
+        return "~" * (match.end() - match.start())
+
+    return _FORMAL_OR_HEX_VALUE_RE.sub(replace, text)
 
 
 def _signed_formal_public_values(checked: dict[str, Any]) -> set[str]:
@@ -2387,21 +2579,9 @@ def _signed_formal_public_values(checked: dict[str, Any]) -> set[str]:
     values = {
         str(checked["challenge"]["signature"]),
         str(checked["authority_receipt"]["signature"]),
-        str(checked["challenge"]["job_graph"]["terminal_job_id"]),
     }
     for event in checked["receipts"]:
         values.add(str(event["signature"]))
-        stack: list[object] = [event["details"]]
-        while stack:
-            node = stack.pop()
-            if type(node) is dict:
-                for key, item in node.items():
-                    if key in {"search_url", "url"} and type(item) is str:
-                        values.add(item)
-                    elif type(item) in {dict, list}:
-                        stack.append(item)
-            elif type(node) is list:
-                stack.extend(item for item in node if type(item) in {dict, list})
     return values
 
 
@@ -2560,7 +2740,35 @@ def _authenticated_formal_scan_limits(
     return max_nodes, max_chars, 32
 
 
-def _secret_scan_bytes(
+_FORMAL_SECRET_SCAN_MAX_INPUT_BYTES = 30_000_000
+_FORMAL_SECRET_SCAN_WALL_SECONDS = 15.0
+_FORMAL_SECRET_SCAN_EXTRA_RSS_BYTES = 512 * 1024 * 1024
+
+
+def _process_peak_rss_bytes() -> int:
+    peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return peak if sys.platform == "darwin" else peak * 1024
+
+
+def _requires_distinct_normalized_scan(text: str) -> bool:
+    """Whether NFKC/Cf normalization can change more than letter case.
+
+    All final patterns are already case-insensitive.  Returning the original
+    buffer when it contains no compatibility or format character avoids a
+    duplicate 28.5MB copy and a duplicate full-text regex pass.
+    """
+
+    if text.isascii():
+        return False
+    return any(
+        unicodedata.category(character) == "Cf"
+        or character == "\u200b"
+        or unicodedata.normalize("NFKC", character) != character
+        for character in text
+    )
+
+
+def _secret_scan_bytes_impl(
     data: bytes,
     needles: _SecretNeedles,
     label: str,
@@ -2587,7 +2795,30 @@ def _secret_scan_bytes(
             "secret scan needles must be _SecretNeedles, not a plaintext tuple "
             "(C-122 round-18 security contract)"
         )
+    started = time.monotonic()
+    baseline_rss = _process_peak_rss_bytes()
+    formal_sized = name == "live-done-gate-v4.json"
+    if formal_sized and len(data) > _FORMAL_SECRET_SCAN_MAX_INPUT_BYTES:
+        raise GateStateChangedError(
+            f"secret scan budget exceeded in {label} file {name}"
+        )
+
+    def check_resource_budget(stage: str) -> None:
+        if not formal_sized:
+            return
+        elapsed = time.monotonic() - started
+        extra_rss = _process_peak_rss_bytes() - baseline_rss
+        if (
+            elapsed > _FORMAL_SECRET_SCAN_WALL_SECONDS
+            or extra_rss > _FORMAL_SECRET_SCAN_EXTRA_RSS_BYTES
+        ):
+            raise GateStateChangedError(
+                f"secret scan budget exceeded at {stage} in {label} file {name} "
+                f"(elapsed_ms={int(elapsed * 1000)}, extra_rss_bytes={extra_rss})"
+            )
+
     public_proofs = _formal_public_proofs(data, name)
+    check_resource_budget("formal verification")
     (
         max_json_nodes,
         max_json_chars,
@@ -2596,6 +2827,16 @@ def _secret_scan_bytes(
         data,
         name,
         public_proofs,
+    )
+    authenticated_value_scanner = (
+        _make_decoded_value_scanner(
+            needles,
+            label,
+            name,
+            public_proofs,
+        )
+        if public_proofs
+        else None
     )
     for needle in tuple(needles):
         if needle in data:
@@ -2618,40 +2859,29 @@ def _secret_scan_bytes(
             name,
             max_nodes=max_json_nodes,
             max_chars=max_json_chars,
+            on_string_value=authenticated_value_scanner,
         )
     if credential_field_check:
         _reject_credential_field_names(data, label, name)
         _reject_unknown_64hex_values(data, label, name)
     text = data.decode("utf-8", errors="ignore")
+    check_resource_budget("UTF-8 decode")
     # R20 Block 20a: the ``Digest`` auth ``response`` hex credential is scanned
     # on the RAW text BEFORE ``_mask_hex_hash_spans`` — a 32-128 pure-hex run
     # is otherwise replaced by the recomputable-digest placeholder and the
     # token-run shape never sees it.  A server challenge (``WWW-Authenticate:
     # Digest realm=…, nonce=…``) carries no ``response=`` and stays allowed.
-    # A fixed-anchor-authenticated formal raw artifact is guaranteed to be
-    # strict JSON and the bounded walker below applies this same Digest check
-    # to every decoded string value.  Avoid running the context-classifying
-    # whole-document matcher over its 100+ repeated query snapshots: that
-    # matcher intentionally examines prefixes and becomes quadratic on the
-    # million-byte signed graph.  Unauthenticated/free-form input retains the
-    # original raw-text guard.
-    if not public_proofs and _SHAPE_PATTERN_DIGEST_AUTH_RE.search(text):
+    # Authentication never suppresses the whole-text backstop.  The matcher is
+    # linear and verified signature spans are masked narrowly below.
+    if _SHAPE_PATTERN_DIGEST_AUTH_RE.search(text):
         raise GateStateChangedError(
             f"secret leak: Digest-auth response in {label} file {name}"
         )
     # Mask recomputable hex digests (git SHAs, sha256) before the pattern
     # scan: a hash that happens to contain a phone-shaped run of digits is
     # not a leak, and a bare phone number is always decimal (never hex).
-    # Replace authenticated URLs before digest masking: their query can contain
-    # a signed SHA value, and altering that SHA first would prevent the exact
-    # public URL from matching its verified proof.
-    masked_text = _mask_formal_public_proofs(text, public_proofs)
-    masked_text = _mask_hex_hash_spans(masked_text)
-    # Ed25519 signatures are public fixed-shape proofs, not bearer secrets.
-    # Their exact objects were verified before this generic text-shape scan.
-    masked_text = _FORMAL_SIGNATURE_VALUE_RE.sub(
-        r"\1[FORMAL-SIGNED]\2", masked_text
-    )
+    masked_text = _mask_formal_proofs_and_hex_spans(text, public_proofs)
+    check_resource_budget("proof and digest masking")
     for pattern, kind in (
         (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
         (_ACCOUNT_ID_PATTERN, "account identifier"),
@@ -2665,18 +2895,22 @@ def _secret_scan_bytes(
     # NORMALIZED copy (NFKC + casefold, Cf/U+200B dropped) — a full-width /
     # zero-width-obfuscated value the ASCII regexes stop seeing is still a leak.
     # Only a COPY is normalized; the artifact bytes are never rewritten.
-    norm_masked = _normalize_for_scan(
-        _blank_nonleaking_tracking_urls(masked_text)
+    norm_masked = (
+        _normalize_for_scan(masked_text)
+        if not public_proofs and _requires_distinct_normalized_scan(masked_text)
+        else masked_text
     )
-    for pattern, kind in (
-        (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
-        (_ACCOUNT_ID_PATTERN, "account identifier"),
-        (_PHONE_PATTERN, "phone number"),
-    ):
-        if pattern.search(norm_masked):
-            raise GateStateChangedError(
-                f"secret leak: {kind} in {label} file {name}"
-            )
+    check_resource_budget("normalized copy")
+    if norm_masked is not masked_text:
+        for pattern, kind in (
+            (_AUTH_COOKIE_LEAK_SCAN, "Authorization/Cookie"),
+            (_ACCOUNT_ID_PATTERN, "account identifier"),
+            (_PHONE_PATTERN, "phone number"),
+        ):
+            if pattern.search(norm_masked):
+                raise GateStateChangedError(
+                    f"secret leak: {kind} in {label} file {name}"
+                )
     # C-122 supervision 02:56 (Block 2): short / structured credential SHAPES
     # are leaks even when no KNOWN secret value is present and the value is
     # under the 32-char run threshold — AKIA-style AWS keys, well-known token
@@ -2744,13 +2978,26 @@ def _secret_scan_bytes(
     # complete marker is not a false positive.  The blanking is RAW, case-exact
     # and same-length (positions preserved); an obfuscated / residue marker is
     # not blanked and still fails closed on the raw AND normalized copies.
-    anchored_text = _blank_exact_marker_assignments(masked_text)
-    anchored_norm = _normalize_for_scan(anchored_text)
-    for pattern, kind in _CREDENTIAL_FIELD_ANCHORED_PAIRS:
-        if pattern.search(anchored_text) or pattern.search(anchored_norm):
-            raise GateStateChangedError(
-                f"secret leak: {kind} in {label} file {name}"
-            )
+    if public_proofs:
+        # Strict formal JSON has already passed the token-aware structural key
+        # walker.  Do not run the large free-text marker-assignment regex over
+        # the entire production artifact merely to discard its result below.
+        anchored_text = masked_text
+        anchored_norm = norm_masked
+    else:
+        anchored_text = _blank_exact_marker_assignments(masked_text)
+        anchored_norm = (
+            norm_masked
+            if anchored_text is masked_text
+            else _normalize_for_scan(anchored_text)
+        )
+        for pattern, kind in _CREDENTIAL_FIELD_ANCHORED_PAIRS:
+            if pattern.search(anchored_text) or (
+                anchored_norm is not anchored_text and pattern.search(anchored_norm)
+            ):
+                raise GateStateChangedError(
+                    f"secret leak: {kind} in {label} file {name}"
+                )
     # R27 Block 43: a REGISTERED business-identifier BASE used as a HEADER /
     # free-form field NAME (``day1: …`` / ``X-Day1: …`` / ``plannerV2: …`` /
     # ``my_day1: …``) is a credential-shaped field with no schema/field-path
@@ -2758,24 +3005,34 @@ def _secret_scan_bytes(
     # artifact — the same field-name-signal class as the anchored shapes above.
     # A plain prose value (``day2`` / ``flightOption1 day2 plannerV2
     # providerV4``) has no ``:``/``=`` after the base and stays positive.
-    if _REGISTERED_BASE_HEADER_FIELD_RE.search(
-        anchored_text
-    ) or _REGISTERED_BASE_HEADER_FIELD_RE.search(anchored_norm):
+    if not public_proofs and (
+        _REGISTERED_BASE_HEADER_FIELD_RE.search(anchored_text)
+        or (
+            anchored_norm is not anchored_text
+            and _REGISTERED_BASE_HEADER_FIELD_RE.search(anchored_norm)
+        )
+    ):
         raise GateStateChangedError(
             f"secret leak: registered business base as header/field name "
             f"in {label} file {name}"
         )
-    # A fixed-anchor-authenticated formal JSON graph is walked below and every
-    # decoded string value is scanned independently.  Re-running the
-    # context-sensitive bare-token matcher over the multi-megabyte aggregate is
-    # redundant and quadratic; untrusted/free-form artifacts retain this raw
-    # whole-text backstop.
-    if is_utf8_text and not public_proofs:
-        for pattern, kind in _BARE_CREDENTIAL_PAIRS:
-            if pattern.search(masked_text) or pattern.search(norm_masked):
+    # Authentication never bypasses the aggregate backstop.  All matchers here
+    # are bounded linear scans over one already-decoded buffer.
+    if is_utf8_text:
+        if public_proofs:
+            if _linear_bare_credential_match(masked_text):
                 raise GateStateChangedError(
-                    f"secret leak: {kind} in {label} file {name}"
+                    f"secret leak: bare credential-shaped value in {label} file {name}"
                 )
+        else:
+            for pattern, kind in _BARE_CREDENTIAL_PAIRS:
+                if pattern.search(masked_text) or (
+                    norm_masked is not masked_text and pattern.search(norm_masked)
+                ):
+                    raise GateStateChangedError(
+                        f"secret leak: {kind} in {label} file {name}"
+                    )
+    check_resource_budget("whole-text credential backstop")
     for match in _TRACKING_URL_PATTERN.finditer(masked_text):
         if _is_tracking_url_leak(match.group(0)):
             raise GateStateChangedError(
@@ -2784,11 +3041,13 @@ def _secret_scan_bytes(
     # 补充 B: the same tracking-URL semantics on the NORMALIZED copy — an
     # uppercase ``HTTPS://`` / full-width / Cf-obfuscated URL is the same leak
     # once NFKC + casefold + Cf-drop runs, decided by ``_is_tracking_url_leak``.
-    for match in _TRACKING_URL_PATTERN.finditer(norm_masked):
-        if _is_tracking_url_leak(match.group(0)):
-            raise GateStateChangedError(
-                f"secret leak: tracking URL in {label} file {name}"
-            )
+    if norm_masked is not masked_text:
+        for match in _TRACKING_URL_PATTERN.finditer(norm_masked):
+            if _is_tracking_url_leak(match.group(0)):
+                raise GateStateChangedError(
+                    f"secret leak: tracking URL in {label} file {name}"
+                )
+    check_resource_budget("URL backstop")
     # C-122 supervision 06:58: BOUNDED-RECURSIVE JSON scan.  A credential
     # smuggled through multiple ``json.dumps`` layers gains one backslash layer
     # per dump, so the raw-byte patterns above stop seeing it after the first
@@ -2801,20 +3060,26 @@ def _secret_scan_bytes(
     # per-value scan (known-needle + shapes + tracking URL, both paths) runs
     # INSIDE the one walker, so a 20k-string document fails closed at node
     # 10001 before any separate traversal could scan all 20k.
-    decoded_value_scanner = _make_decoded_value_scanner(
+    decoded_value_scanner = authenticated_value_scanner or _make_decoded_value_scanner(
         needles,
         label,
         name,
         public_proofs,
     )
     try:
-        for level_text, depth, malformed in iter_json_levels(
-            text,
-            on_string_value=decoded_value_scanner,
-            max_nodes=max_json_nodes,
-            max_chars=max_json_chars,
-            max_depth=max_json_depth,
-        ):
+        decoded_levels = (
+            ()
+            if public_proofs
+            else iter_json_levels(
+                text,
+                on_string_value=decoded_value_scanner,
+                max_nodes=max_json_nodes,
+                max_chars=max_json_chars,
+                max_depth=max_json_depth,
+            )
+        )
+        for level_text, depth, malformed in decoded_levels:
+            check_resource_budget("nested JSON walk")
             if depth == 0:
                 # The raw + normalized TOP-LEVEL text scans above covered the raw
                 # form; the DECODED top-level string values are scanned one-by-one
@@ -2900,6 +3165,48 @@ def _secret_scan_bytes(
     # ``Authorization``-value rejection (``Authorization/Cookie``) fires first.
     if name.endswith(".failure.json"):
         _reject_credential_field_names(data, label, name)
+    check_resource_budget("final field scan")
+
+
+def _secret_scan_bytes(
+    data: bytes,
+    needles: _SecretNeedles,
+    label: str,
+    name: str,
+    *,
+    credential_field_check: bool = False,
+) -> None:
+    """Run the scanner under an interrupting wall deadline on the main thread."""
+
+    use_alarm = (
+        name == "live-done-gate-v4.json"
+        and threading.current_thread() is threading.main_thread()
+        and hasattr(signal, "setitimer")
+        and signal.getitimer(signal.ITIMER_REAL)[0] == 0
+    )
+    previous_handler: Any = None
+    if use_alarm:
+        previous_handler = signal.getsignal(signal.SIGALRM)
+
+        def deadline_exceeded(_signum: int, _frame: object) -> None:
+            raise GateStateChangedError(
+                f"secret scan budget exceeded at wall deadline in {label} file {name}"
+            )
+
+        signal.signal(signal.SIGALRM, deadline_exceeded)
+        signal.setitimer(signal.ITIMER_REAL, _FORMAL_SECRET_SCAN_WALL_SECONDS)
+    try:
+        _secret_scan_bytes_impl(
+            data,
+            needles,
+            label,
+            name,
+            credential_field_check=credential_field_check,
+        )
+    finally:
+        if use_alarm:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _secret_scan_paths(
@@ -3118,7 +3425,7 @@ def _blank_exact_marker_assignments(text: str) -> str:
     the gate's own clean redacted report as a leak (R21 Block 26).  Only the
     RAW, case-exact, complete ``[REDACTED]`` value is blanked; an obfuscated /
     residue marker stays intact and fails the scan closed."""
-    if not text:
+    if "[REDACTED]" not in text:
         return text
     spans = [m.span() for m in _EXACT_MARKER_FIELD_RE.finditer(text)]
     if not spans:
@@ -5414,7 +5721,7 @@ _HEX_HASH_RE = re.compile(r"^[0-9a-fA-F]{32,128}$")
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _FORMAL_SIGNATURE_VALUE_RE = re.compile(
     r'("(?:signature|challenge_signature|authority_receipt_signature)"\s*:\s*")'
-    r"[A-Za-z0-9+/]{86}==(\")"
+    r"([A-Za-z0-9+/]{86}==)(\")"
 )
 # The EXACT sub-field set a compact's raw_evidence may carry: the raw origin
 # name + tracked path (the fixed mapping), the committed=false flag, and the

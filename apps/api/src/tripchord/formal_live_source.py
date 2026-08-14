@@ -12,7 +12,8 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
+from urllib.parse import quote as url_quote
 from uuid import UUID, uuid4
 
 from cryptography.exceptions import InvalidSignature
@@ -43,7 +44,6 @@ _RECEIPT_SCHEMA_VERSION = "tripchord-formal-live-source-authority-receipt-v3"
 _STARTUP_CAPABILITY = object()
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _TRUST_ROOT_ENV = "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"
-_DEFAULT_TRUST_ROOT = _REPO_ROOT / ".runtime" / "formal-source"
 _GENERATION_PATTERN = re.compile(r"^generation-([1-9][0-9]*)-([0-9a-f]{12})$")
 
 _BROWSER_MOUNT = "/browser-bridge"
@@ -58,6 +58,7 @@ _ICOM_PATH_ORDER = (
     "/api/v1/public/policy-sections",
 )
 _ICOM_PATHS = frozenset(_ICOM_PATH_ORDER)
+_ICOM_PUBLIC_HOST = "sfs-api.icomtours.com"
 _COMPOSITION_TYPES = {
     "bridge": "tripchord.providers.browser_bridge.BrowserTaskBridge",
     "icom_provider": "tripchord.providers.icom_transfer.IComTransferProvider",
@@ -92,6 +93,190 @@ def _frozen_per_pair_tasks() -> dict[str, tuple[str, ...]]:
     if tuple(result) != frozen_v4_canonical_pair_ids():
         raise RuntimeError("frozen query-task authority order differs from pair authority")
     return result
+
+
+def _validate_formal_browser_search_url(
+    query: Mapping[str, object],
+    *,
+    provider: object,
+    kind: object,
+) -> None:
+    """Require the byte-exact internally generated public search URL.
+
+    No signed/authenticated wrapper can widen this contract.  Exact equality
+    rejects userinfo, alternate hosts/paths, duplicate or unknown parameters,
+    encoded smuggling, fragments, tracking identifiers, and reordered fields.
+    """
+
+    provider_name = _nonempty_string(provider, "formal Browser provider")
+    vertical = _nonempty_string(kind, "formal Browser kind")
+    search_url = query.get("search_url")
+    if vertical == "lodging":
+        if search_url is not None:
+            raise ValueError("formal Browser query URL is outside the signed graph")
+        return
+    if vertical != "flight" or provider_name not in {"ctrip", "qunar", "tongcheng"}:
+        raise ValueError("formal Browser query URL is outside the signed graph")
+    origin_code = query.get("origin_code")
+    destination_code = query.get("destination_code")
+    start_date = _nonempty_string(query.get("start_date"), "formal Browser start_date")
+    end_date = _nonempty_string(query.get("end_date"), "formal Browser end_date")
+    adults = _exact_int(query.get("adults"), "formal Browser adults", minimum=1)
+    if (
+        origin_code != "HGH"
+        or destination_code != "MLE"
+        or query.get("origin") != "杭州"
+        or query.get("destination") != "马累"
+    ):
+        raise ValueError("formal Browser query URL identity is not frozen")
+    if provider_name == "ctrip":
+        expected_url = (
+            "https://flights.ctrip.com/international/search/round-hgh-mle"
+            f"?depdate={start_date}_{end_date}&cabin=y_s"
+            f"&adult={adults}&child=0&infant=0"
+        )
+    elif provider_name == "qunar":
+        parameters = (
+            ("from", "flight_int_search"),
+            ("showTotalPr", "0"),
+            ("searchType", "RoundTripFlight"),
+            ("fromCity", "杭州"),
+            ("toCity", "马累"),
+            ("adultNum", str(adults)),
+            ("childNum", "0"),
+            ("fromDate", start_date),
+            ("toDate", end_date),
+        )
+        expected_url = (
+            "https://flight.qunar.com/twell/flight/Search.jsp?"
+            + urlencode(parameters, quote_via=url_quote, safe="")
+        )
+    else:
+        para = "*".join(
+            (
+                "HGH",
+                "MLE",
+                start_date,
+                end_date,
+                "RT",
+                f"{adults}_0_0",
+                "Y|S|C|F",
+            )
+        )
+        expected_url = (
+            "https://www.ly.com/eliflight/book1.html"
+            f"?para={url_quote(para, safe='*')}"
+            f"&departureCity={url_quote('杭州', safe='')}"
+            f"&arrivalCity={url_quote('马累', safe='')}"
+        )
+    if search_url != expected_url:
+        raise ValueError("formal Browser query URL is not the exact public search URL")
+
+
+def _resolve_formal_browser_job_member(
+    job_graph: Mapping[str, object],
+    *,
+    provider: object,
+    kind: object,
+    query: Mapping[str, object],
+) -> dict[str, object]:
+    """Resolve actual query fields to exactly one canonical signed graph member."""
+
+    graph = _validate_job_graph(job_graph)
+    provider_name = _nonempty_string(provider, "formal Browser provider")
+    vertical = _nonempty_string(kind, "formal Browser kind")
+    if provider_name not in {"ctrip", "qunar", "tongcheng"}:
+        raise ValueError("formal Browser provider is outside the frozen graph")
+    if vertical not in {"flight", "lodging"}:
+        raise ValueError("formal Browser kind is outside the frozen graph")
+    adults = _exact_int(query.get("adults"), "formal Browser adults", minimum=1)
+    if adults != graph["adults"]:
+        raise ValueError("formal Browser query is not an exact signed job member")
+    start = _nonempty_string(query.get("start_date"), "formal Browser start_date")
+    end = _nonempty_string(query.get("end_date"), "formal Browser end_date")
+    options = query.get("options")
+    if not isinstance(options, dict):
+        raise ValueError("formal Browser query options are invalid")
+    _validate_formal_browser_search_url(query, provider=provider_name, kind=vertical)
+    segment = options.get("segment")
+    pairs = graph["pairs"]
+    if not isinstance(pairs, list):  # canonical graph validation guards this
+        raise ValueError("formal Browser job graph pairs are invalid")
+    resolved: list[dict[str, object]] = []
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        departure = datetime.strptime(str(pair["departure_date"]), "%Y-%m-%d").date()
+        returning = datetime.strptime(str(pair["return_date"]), "%Y-%m-%d").date()
+        if vertical == "flight":
+            if segment is not None or (start, end) != (
+                departure.isoformat(),
+                returning.isoformat(),
+            ):
+                continue
+            query_kind = "flight"
+            direction = "round_trip"
+        else:
+            segment_contract = {
+                "full": ("lodging_full_stay", departure, returning),
+                "first": (
+                    "lodging_first_night",
+                    departure,
+                    departure + timedelta(days=1),
+                ),
+                "middle": (
+                    "lodging_middle_stay",
+                    departure + timedelta(days=1),
+                    returning - timedelta(days=1),
+                ),
+                "last": (
+                    "lodging_last_night",
+                    returning - timedelta(days=1),
+                    returning,
+                ),
+                "hulhumale-full": (
+                    "lodging_hulhumale_full_stay",
+                    departure,
+                    returning,
+                ),
+            }.get(segment)
+            if segment_contract is None:
+                continue
+            query_kind, expected_start, expected_end = segment_contract
+            if (start, end) != (expected_start.isoformat(), expected_end.isoformat()):
+                continue
+            direction = "stay"
+        prefix = f"query:{provider_name}:{query_kind}:"
+        members = [
+            item
+            for item in pair["query_task_ids"]
+            if isinstance(item, str) and item.startswith(prefix)
+        ]
+        if len(members) != 1:
+            continue
+        phase = (
+            "publication_refresh"
+            if options.get("__tripchord_allow_recent_quote_reuse") is False
+            else "checkpoint_exploration"
+        )
+        if phase == "publication_refresh" and members[0] not in pair[
+            "publication_query_task_ids"
+        ]:
+            continue
+        resolved.append(
+            {
+                "pair_id": pair["date_pair_id"],
+                "query_task_id": members[0],
+                "query_kind": query_kind,
+                "direction": direction,
+                "start_date": start,
+                "end_date": end,
+                "execution_phase": phase,
+            }
+        )
+    if len(resolved) != 1:
+        raise ValueError("formal Browser query is not an exact signed job member")
+    return resolved[0]
 
 
 def formal_job_graph_for_frozen_v4(
@@ -330,7 +515,22 @@ def _require_aware_time(value: object, label: str) -> datetime:
 
 def formal_source_trust_root(path: Path | None = None) -> Path:
     configured = os.environ.get(_TRUST_ROOT_ENV)
-    return path or (Path(configured) if configured else _DEFAULT_TRUST_ROOT)
+    if path is None:
+        if not configured:
+            raise RuntimeError(
+                f"{_TRUST_ROOT_ENV} must be explicitly configured"
+            )
+        path = Path(configured)
+    if not path.is_absolute():
+        raise RuntimeError("formal source trust root must be an absolute path")
+    resolved = path.resolve(strict=False)
+    try:
+        resolved.relative_to(_REPO_ROOT.resolve())
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("formal source trust root must be outside the repository")
+    return resolved
 
 
 def _protected_directory(path: Path, label: str) -> None:
@@ -366,8 +566,10 @@ def _current_generation(root: Path | None = None) -> tuple[Path, str]:
     return generation_root, generation
 
 
-def _load_verification_anchor(root: Path | None = None) -> dict[str, object]:
-    generation_root, generation = _current_generation(root)
+def _read_verification_anchor(
+    generation_root: Path,
+    generation: str,
+) -> dict[str, object]:
     raw = _protected_regular_file(
         generation_root / "public-anchor.json",
         "formal source public verification anchor",
@@ -413,6 +615,51 @@ def _load_verification_anchor(root: Path | None = None) -> dict[str, object]:
     return {**anchor, "public_key_der": public_der, "public_key": public_key}
 
 
+def _load_verification_anchor(
+    root: Path | None = None,
+    *,
+    anchor_version: object | None = None,
+    authority_key_id: object | None = None,
+) -> dict[str, object]:
+    """Load the exact persistent public anchor named by signed evidence.
+
+    Rotation changes the current *signing* generation but deliberately retains
+    prior public anchors for offline verification.  A caller cannot install an
+    arbitrary anchor: every candidate must be an owner-only generation under
+    the externally configured production trust root and must validate its own
+    generation/key identity before it can be selected.
+    """
+
+    trust_root = formal_source_trust_root(root)
+    if anchor_version is None and authority_key_id is None:
+        generation_root, generation = _current_generation(trust_root)
+        return _read_verification_anchor(generation_root, generation)
+    expected_version = _nonempty_string(
+        anchor_version, "formal source anchor version"
+    )
+    expected_key = _require_sha256(
+        authority_key_id, "formal source authority key id"
+    )
+    _protected_directory(trust_root, "formal source trust root")
+    matches: list[dict[str, object]] = []
+    for candidate in sorted(trust_root.iterdir(), key=lambda item: item.name):
+        if _GENERATION_PATTERN.fullmatch(candidate.name) is None:
+            continue
+        try:
+            _protected_directory(candidate, "formal source generation root")
+            anchor = _read_verification_anchor(candidate, candidate.name)
+        except RuntimeError:
+            continue
+        if (
+            anchor["anchor_version"] == expected_version
+            and anchor["authority_key_id"] == expected_key
+        ):
+            matches.append(anchor)
+    if len(matches) != 1:
+        raise RuntimeError("formal source verification anchor is unavailable")
+    return matches[0]
+
+
 def _anchor_version() -> str:
     return str(_load_verification_anchor()["anchor_version"])
 
@@ -425,16 +672,29 @@ def _sign(private_key: Ed25519PrivateKey, value: object) -> str:
     return base64.b64encode(private_key.sign(_canonical_bytes(value))).decode("ascii")
 
 
-def _verify_signature(value: object, signature: object, label: str) -> None:
+def _verify_signature(
+    value: object,
+    signature: object,
+    label: str,
+    *,
+    anchor_version: object | None = None,
+    authority_key_id: object | None = None,
+) -> None:
     if not isinstance(signature, str):
         raise ValueError(f"{label} has no authority signature")
     try:
         raw = base64.b64decode(signature, validate=True)
-        public_key = _load_verification_anchor()["public_key"]
+        if isinstance(value, Mapping):
+            anchor_version = value.get("anchor_version", anchor_version)
+            authority_key_id = value.get("authority_key_id", authority_key_id)
+        public_key = _load_verification_anchor(
+            anchor_version=anchor_version,
+            authority_key_id=authority_key_id,
+        )["public_key"]
         if not isinstance(public_key, Ed25519PublicKey):  # pragma: no cover
             raise ValueError("formal source anchor is not Ed25519")
         public_key.verify(raw, _canonical_bytes(value))
-    except (ValueError, InvalidSignature) as exc:
+    except (RuntimeError, ValueError, InvalidSignature) as exc:
         raise ValueError(f"{label} lacks the fixed production authority proof") from exc
 
 
@@ -1061,11 +1321,15 @@ def _validate_challenge(challenge: object) -> dict[str, object]:
         raise ValueError("formal source challenge has an invalid shape")
     if challenge["schema_version"] != _CHALLENGE_SCHEMA_VERSION:
         raise ValueError("formal source challenge schema is invalid")
-    if (
-        challenge["anchor_version"] != _anchor_version()
-        or challenge["authority_key_id"] != _authority_key_id()
-    ):
-        raise ValueError("formal source challenge uses a foreign verification anchor")
+    try:
+        _load_verification_anchor(
+            anchor_version=challenge["anchor_version"],
+            authority_key_id=challenge["authority_key_id"],
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise ValueError(
+            "formal source challenge uses a foreign verification anchor"
+        ) from exc
     try:
         UUID(str(challenge["challenge_id"]))
     except (ValueError, TypeError) as exc:
@@ -1205,6 +1469,8 @@ def _validate_event(
         },
         event["signature"],
         "formal source event",
+        anchor_version=challenge["anchor_version"],
+        authority_key_id=challenge["authority_key_id"],
     )
     return dict(event)
 
@@ -1233,8 +1499,8 @@ def _validate_snapshot(
         raise ValueError("formal source snapshot has an invalid shape")
     if (
         snapshot["schema_version"] != _SCHEMA_VERSION
-        or snapshot["anchor_version"] != _anchor_version()
-        or snapshot["authority_key_id"] != _authority_key_id()
+        or snapshot["anchor_version"] != challenge["anchor_version"]
+        or snapshot["authority_key_id"] != challenge["authority_key_id"]
     ):
         raise ValueError("formal source snapshot verification anchor is invalid")
     install_id = _nonempty_string(snapshot["install_id"], "formal source install_id")
@@ -1513,6 +1779,23 @@ def _validate_business_event_details(
         }
         if formal["query_identity"] != _sha256(identity):
             raise ValueError(f"{label} query identity digest is invalid")
+        expected_member = _resolve_formal_browser_job_member(
+            job_graph,
+            provider=provider,
+            kind=kind,
+            query=query,
+        )
+        for field in (
+            "pair_id",
+            "query_task_id",
+            "query_kind",
+            "direction",
+            "start_date",
+            "end_date",
+            "execution_phase",
+        ):
+            if formal[field] != expected_member[field]:
+                raise ValueError(f"{label} differs from the exact signed job member")
         pairs = job_graph["pairs"]
         if not isinstance(pairs, list):
             raise ValueError("formal job graph pair list is invalid")
@@ -1691,6 +1974,11 @@ def _validate_business_event_details(
                 checked_query = query_contract(
                     lease["query"], "formal claim lease query"
                 )
+                _validate_formal_browser_search_url(
+                    checked_query,
+                    provider=lease["provider"],
+                    kind=lease["kind"],
+                )
                 formal_query = formal_query_contract(
                     lease["formal_query"],
                     task_id=task_id,
@@ -1769,6 +2057,11 @@ def _validate_business_event_details(
             lease = claimed[task_id]
             checked_snapshot_query = query_contract(
                 snapshot["query"], "formal completion snapshot.query"
+            )
+            _validate_formal_browser_search_url(
+                checked_snapshot_query,
+                provider=snapshot["provider"],
+                kind=snapshot["kind"],
             )
             completion_formal_query = formal_query_contract(
                 details["formal_query"],
@@ -1917,8 +2210,10 @@ def _validate_business_event_details(
             parsed_query = dict(pairs)
             if (
                 parsed.scheme != "https"
-                or not parsed.hostname
+                or parsed.hostname != _ICOM_PUBLIC_HOST
+                or parsed.port is not None
                 or parsed.username is not None
+                or parsed.password is not None
                 or parsed.fragment
                 or parsed.path != event["path"]
                 or parsed.path != details["path"]
@@ -2063,8 +2358,8 @@ def validate_formal_source_evidence(
         raise ValueError("formal source binding has an invalid shape")
     if (
         binding["schema_version"] != _BINDING_SCHEMA_VERSION
-        or binding["anchor_version"] != _anchor_version()
-        or binding["authority_key_id"] != _authority_key_id()
+        or binding["anchor_version"] != checked_challenge["anchor_version"]
+        or binding["authority_key_id"] != checked_challenge["authority_key_id"]
     ):
         raise ValueError("formal source binding verification anchor is invalid")
     if binding["challenge"] != checked_challenge:
@@ -2657,7 +2952,27 @@ class FormalLiveSourceAuthority:
                 row.pop("active_state", None)
                 self._write_ledger(ledger)
                 return
-            self._apply_active_state(row["active_state"])
+            active_state = row.get("active_state")
+            challenge = (
+                active_state.get("challenge")
+                if isinstance(active_state, dict)
+                else None
+            )
+            if (
+                not isinstance(challenge, dict)
+                or challenge.get("runtime_identity") != self._runtime_identity
+            ):
+                # Explicit non-continuation model: a PID/started_at/runtime
+                # change atomically closes the old attempt.  It may be audited
+                # offline, but it can never record/finalize in the new process;
+                # the caller must prepare a fresh job/challenge attempt.
+                row["state"] = "aborted"
+                row["aborted_at"] = self._utc_now().isoformat()
+                row["terminal_reason"] = "runtime_restart_requires_new_attempt"
+                row.pop("active_state", None)
+                self._write_ledger(ledger)
+                return
+            self._apply_active_state(active_state)
 
     def bind(
         self,
@@ -2758,7 +3073,11 @@ class FormalLiveSourceAuthority:
                     row.pop("active_state", None)
             if any(row.get("state") == "issued" for row in ledger.values()):
                 raise ValueError("formal source authority already has an active challenge")
-            if any(row.get("run_id") == context["run_id"] for row in ledger.values()):
+            if any(
+                row.get("run_id") == context["run_id"]
+                and row.get("state") in {"issued", "consumed"}
+                for row in ledger.values()
+            ):
                 raise ValueError("formal source run_id already has a challenge")
             issued = now
             challenge: dict[str, object] = {
@@ -2915,6 +3234,13 @@ class FormalLiveSourceAuthority:
                 raise ValueError("formal Browser kind is outside the frozen graph")
             if not isinstance(query, dict):
                 raise ValueError("formal Browser query is not an exact object")
+            adults = _exact_int(
+                query.get("adults"), "formal Browser adults", minimum=1
+            )
+            if adults != graph["adults"]:
+                raise ValueError(
+                    "formal Browser query is not an exact signed job member"
+                )
             start_date = _nonempty_string(
                 query.get("start_date"), "formal Browser start_date"
             )
@@ -2924,6 +3250,11 @@ class FormalLiveSourceAuthority:
             options = query.get("options")
             if not isinstance(options, dict):
                 raise ValueError("formal Browser query options are invalid")
+            _validate_formal_browser_search_url(
+                query,
+                provider=provider_name,
+                kind=vertical,
+            )
             pair_matches = [
                 item
                 for item in graph["pairs"]
@@ -2960,6 +3291,30 @@ class FormalLiveSourceAuthority:
                     raise ValueError("formal Browser lodging segment is not canonical")
                 query_kind = segment_kinds[str(segment)]
                 direction = "stay"
+                departure = datetime.strptime(
+                    str(pair["departure_date"]), "%Y-%m-%d"
+                ).date()
+                returning = datetime.strptime(
+                    str(pair["return_date"]), "%Y-%m-%d"
+                ).date()
+                exact_dates = {
+                    "full": (departure, returning),
+                    "first": (departure, departure + timedelta(days=1)),
+                    "middle": (
+                        departure + timedelta(days=1),
+                        returning - timedelta(days=1),
+                    ),
+                    "last": (returning - timedelta(days=1), returning),
+                    "hulhumale-full": (departure, returning),
+                }
+                expected_start, expected_end = exact_dates[str(segment)]
+                if (start_date, end_date) != (
+                    expected_start.isoformat(),
+                    expected_end.isoformat(),
+                ):
+                    raise ValueError(
+                        "formal Browser query is not an exact signed job member"
+                    )
             prefix = f"query:{provider_name}:{query_kind}:"
             member_ids = [
                 item
