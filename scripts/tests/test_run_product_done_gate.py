@@ -9547,6 +9547,26 @@ def test_secret_scan_still_flags_real_phone_number(
         gate._secret_scan_paths([file], gate._SecretNeedles(()), "test")
 
 
+def test_secret_scan_does_not_extract_phone_from_generated_uuid_identifier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An 11-digit suffix inside a hex UUID segment is not a bare phone span."""
+
+    _patch_root(monkeypatch, tmp_path)
+    file = tmp_path / "evidence.json"
+    file.write_text(
+        json.dumps(
+            {
+                "raw_snapshot_id": (
+                    "browser-task-8d7393c5-2f8e-4628-af55-a16743673795"
+                )
+            }
+        ),
+        encoding="utf-8",
+    )
+    gate._secret_scan_paths([file], gate._SecretNeedles(()), "test")
+
+
 def test_secret_needles_repr_never_exposes_values() -> None:
     """C-122 round-18 security contract: the scan needle container's repr must
     never expand the secret bytes, so a failing traceback cannot leak them."""

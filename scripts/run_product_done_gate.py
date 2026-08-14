@@ -995,7 +995,7 @@ _ACCOUNT_ID_PATTERN = re.compile(
 )
 
 # Chinese mobile number as a bare account identifier.
-_PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_PHONE_PATTERN = re.compile(r"(?<![A-Za-z0-9])1[3-9]\d{9}(?![A-Za-z0-9])")
 
 # Credential-looking FIELD NAMES that must never appear in a committed evidence
 # artifact — even when their VALUE is hash-shaped or already redacted
