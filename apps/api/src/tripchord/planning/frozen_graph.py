@@ -25,12 +25,17 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 
+from tripchord.planning.adaptive_dates import (
+    ExactDatePairObservation,
+    RankedTopKDateRefiner,
+)
 from tripchord.planning.flexible_dates import (
     LIVE_V5_PLATFORM_QUERY_KINDS,
     LIVE_V5_PLATFORMS,
+    FlexibleDateExplorer,
     FlexibleTravelWindow,
     QueryTaskKind,
 )
@@ -129,14 +134,17 @@ def frozen_v4_tasks_per_pair() -> int:
 # a swapped pair or a missing/extra pair all fail closed even when every count
 # and member list lines up.
 #
-# The actual sealed pair-id SET of a real run is not a fixed constant: the API
-# applies ``minimum_departure_lead_days=7`` to the frozen window at run time and
-# the pair execution refines the exploration anchors, so the run's three
-# ``date-pair:`` ids depend on when it runs.  The layer-6 compact therefore
-# carries the run's own sealed pair ids from the job control plane
-# (``checkpoint_bound_pair_ids``) and the validator requires the compact's
-# ``pair_ids`` to equal that set EXACTLY — a compact with foreign / swapped /
-# missing / extra ids rejects even when every id is well-formed.
+# R44 (canonical pair-set authority): the exact ORDERED trio a frozen run must
+# seal is NOT a self-declared run-time constant.  Producer, compact and consumer
+# all derive it from the SAME committed inputs — this frozen window, the frozen
+# scenario's committed ``reference_date`` (``FROZEN_V4_REFERENCE_DATE``, from
+# ``benchmarks/scenarios/live-hgh-mle-aug-2026-v4.json``) and the production
+# date-selection algorithm (``FlexibleDateExplorer.explore`` +
+# ``RankedTopKDateRefiner``) — via ``frozen_v4_canonical_pair_ids``.  The
+# consumer independently recomputes that ordered trio and requires the compact's
+# ``pair_ids`` / ``checkpoint_bound_pair_ids`` / per-pair / checkpoint bindings
+# to match item by item, so a joint self-consistent replacement, a wrong order,
+# a missing/extra pair or any other individually-valid foreign set fails closed.
 _FROZEN_V4_TRAVEL_WINDOW = FlexibleTravelWindow(
     origin="杭州",
     destination="马累",
@@ -313,3 +321,106 @@ def frozen_v4_pair_id_is_canonical(pair_id: object) -> bool:
     if not frozen_v4_pair_id_dates_canonical(departure, return_date):
         return False
     return match.group(3) == frozen_v4_pair_id_digest(departure, return_date)
+
+
+# The frozen live-v4 scenario's committed ``reference_date``
+# (``benchmarks/scenarios/live-hgh-mle-aug-2026-v4.json``).  The canonical
+# ordered trio is derived from THIS date (not a self-declared run-time value),
+# so producer, compact and consumer each recompute the identical trio from
+# committed inputs alone.
+FROZEN_V4_REFERENCE_DATE = date(2026, 7, 30)
+
+
+@lru_cache(maxsize=8)
+def frozen_v4_canonical_pair_ids(
+    reference_date: date | None = None,
+) -> tuple[str, str, str]:
+    """The canonical ORDERED trio of frozen pair ids the scenario must seal.
+
+    R44 (canonical pair-set authority): the exact trio a frozen run seals is NOT
+    a self-declared run-time constant.  This replays the production date
+    selection — the SAME ``FlexibleDateExplorer.explore`` +
+    ``RankedTopKDateRefiner`` chain ``FlexibleLiveAgentSystem.run`` uses, over
+    the frozen window with the run-time ``minimum_departure_lead_days=7`` applied
+    to the committed ``FROZEN_V4_REFERENCE_DATE`` — so producer, compact and
+    consumer each independently recompute the identical ordered trio from
+    committed inputs alone, and a joint self-consistent replacement, a wrong
+    order, a missing/extra pair or any other individually-valid foreign set fails
+    closed against the item-by-item comparison.
+
+    The default reference date reproduces the exact trio the frozen request
+    seals; a caller may pass a different reference date only to replay what the
+    same run would have sealed at that time (mirror of the producer's run clock).
+    """
+    reference = reference_date or FROZEN_V4_REFERENCE_DATE
+    frozen = _FROZEN_V4_TRAVEL_WINDOW
+    minimum_departure = reference + timedelta(days=7)
+    effective_earliest = max(frozen.earliest_departure, minimum_departure)
+    effective_window = frozen.model_copy(
+        update={"earliest_departure": effective_earliest}
+    )
+    coarse_pair_budget = min(effective_window.universe_size, 400)
+    exploration_window = effective_window.model_copy(
+        update={"max_pairs": coarse_pair_budget}
+    )
+    exploration = FlexibleDateExplorer(platforms=LIVE_V5_PLATFORMS).explore(
+        exploration_window,
+        (),
+        now=datetime(
+            reference.year, reference.month, reference.day, tzinfo=UTC
+        ),
+    )
+    refiner = RankedTopKDateRefiner()
+    observations: list[ExactDatePairObservation] = []
+    trio: list[str] = []
+    for _round in range(FROZEN_V4_PAIR_COUNT):
+        decision = refiner.next_pair(
+            exploration.candidates,
+            tuple(observations),
+            exact_pair_budget=FROZEN_V4_PAIR_COUNT,
+        )
+        if decision.selected_pair_id is None:
+            break
+        trio.append(decision.selected_pair_id)
+        observations.append(
+            ExactDatePairObservation(
+                date_pair_id=decision.selected_pair_id,
+                total_budget_cents=None,
+                recommendable=False,
+            )
+        )
+    if len(trio) != FROZEN_V4_PAIR_COUNT:
+        raise RuntimeError(
+            "frozen canonical pair-set derivation produced "
+            f"{len(trio)}/{FROZEN_V4_PAIR_COUNT} pairs"
+        )
+    return tuple(trio)
+
+
+def frozen_v4_window_for_run(
+    window: object, stay_plan_candidate_set: object
+) -> FlexibleTravelWindow | None:
+    """The canonical frozen window when the run is the frozen gateway scenario.
+
+    The scenario's requirement text ("玩5-8天") is interpreted by the requirement
+    agent as a 4-7-night window, so the API would otherwise explore a NON-frozen
+    window and seal generic (non-frozen) pair ids.  When the client EXPLICITLY
+    supplies the system-frozen candidate set AND the interpretation still carries
+    the frozen city identity, this returns the frozen window so the run seals the
+    canonical frozen trio; otherwise ``None`` (the run keeps its own window).
+    """
+    frozen = _FROZEN_V4_TRAVEL_WINDOW
+    if stay_plan_candidate_set is None:
+        return None
+    if stay_plan_candidate_set != _frozen_candidate_set():
+        return None
+    if not isinstance(window, FlexibleTravelWindow):
+        return None
+    if (
+        window.origin != frozen.origin
+        or window.destination != frozen.destination
+        or window.origin_code != frozen.origin_code
+        or window.destination_code != frozen.destination_code
+    ):
+        return None
+    return frozen

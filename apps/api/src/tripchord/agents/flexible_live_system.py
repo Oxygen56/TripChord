@@ -689,6 +689,7 @@ class FlexibleLiveAgentSystem:
         pair_checkpoint_reporter: PairCheckpointReporter | None = None,
         checkpoint_request_sha256: str | None = None,
         search_run_recorder: SearchRunRecorder | None = None,
+        reference_date: date | None = None,
     ) -> FlexibleLiveAgentRun:
         budget_ledger = current_agent_budget()
         if budget_ledger is None:  # pragma: no cover - decorator invariant
@@ -708,7 +709,18 @@ class FlexibleLiveAgentSystem:
             raise ValueError("flexible live split-stay planning requires at least three nights")
         if policy is not None and not policy.include_split_stays:
             raise ValueError("flexible live planning requires split-stay query tasks")
-        reference = self._utc_now()
+        if reference_date is not None:
+            # C-122 R44 (canonical pair-set authority): a frozen scenario carries
+            # its committed ``reference_date``; pinning the run clock to it makes
+            # the sealed ordered trio independently reproducible (the SAME
+            # derivation as ``frozen_v4_canonical_pair_ids``), so the producer's
+            # exact-trio check and the layer-6 consumer's item-by-item binding
+            # cannot be broken by wall-clock drift.
+            reference = datetime(
+                reference_date.year, reference_date.month, reference_date.day, tzinfo=UTC
+            )
+        else:
+            reference = self._utc_now()
         minimum_departure = reference.date() + timedelta(days=self._minimum_departure_lead_days)
         if window.latest_departure < minimum_departure:
             raise ValueError(

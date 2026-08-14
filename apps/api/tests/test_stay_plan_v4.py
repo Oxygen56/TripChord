@@ -36,6 +36,10 @@ from tripchord.planning.flexible_dates import (
     FlexibleTravelWindow,
     QueryTaskKind,
 )
+from tripchord.planning.frozen_graph import (
+    _FROZEN_V4_TRAVEL_WINDOW,
+    FROZEN_V4_REFERENCE_DATE,
+)
 from tripchord.planning.package import (
     NormalizedFlightQuote,
     NormalizedLodgingQuote,
@@ -362,21 +366,27 @@ def test_v4_default_query_plan_freezes_each_provider_lane_at_40_seconds() -> Non
 
 
 def _v4_source_graph_fixture() -> tuple[SimpleNamespace, StayPlanCandidateSet]:
-    window = FlexibleTravelWindow(
-        origin="杭州",
-        destination="马累",
-        origin_code="HGH",
-        destination_code="MLE",
-        earliest_departure=date(2026, 8, 12),
-        latest_departure=date(2026, 8, 14),
-        min_nights=6,
-        max_nights=6,
-        max_pairs=3,
-        adults=2,
-        rooms=1,
+    # C-122 R44 (canonical pair-set authority): the producer check now requires
+    # the run to seal the CANONICAL frozen ordered trio (derived from the frozen
+    # window + committed reference_date + selection algorithm), so the passing
+    # fixture must explore the FROZEN window exactly as the API does — not an
+    # arbitrary synthetic window whose pair ids would be rejected as foreign.
+    frozen = _FROZEN_V4_TRAVEL_WINDOW
+    effective_earliest = max(
+        frozen.earliest_departure,
+        FROZEN_V4_REFERENCE_DATE + timedelta(days=7),
+    )
+    window = frozen.model_copy(
+        update={"earliest_departure": effective_earliest, "max_pairs": 3}
+    )
+    reference = datetime(
+        FROZEN_V4_REFERENCE_DATE.year,
+        FROZEN_V4_REFERENCE_DATE.month,
+        FROZEN_V4_REFERENCE_DATE.day,
+        tzinfo=UTC,
     )
     candidate_set = system_stay_plan_candidate_set()
-    exploration = FlexibleDateExplorer().explore(window, now=NOW)
+    exploration = FlexibleDateExplorer().explore(window, now=reference)
     plan = FlexibleQueryPlanBuilder(platforms=LIVE_V5_PLATFORMS).build(
         window,
         exploration,

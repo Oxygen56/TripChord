@@ -14,7 +14,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from tripchord.planning.frozen_graph import frozen_v4_pair_id_digest
+from tripchord.planning.frozen_graph import (
+    frozen_v4_canonical_pair_ids,
+    frozen_v4_pair_id_digest,
+)
 
 from scripts import run_product_done_gate as gate
 
@@ -551,10 +554,11 @@ def _expected_snapshot(root: Path) -> gate.GitSnapshot:
 
 def _frozen_v4_fixture_pair_id(departure: str, return_date: str) -> str:
     """Build a well-formed canonical frozen-scenario ``date-pair:`` id via the
-    canonical digest function, so the fixture always matches what the real
-    producer seals for the frozen maldives scenario (C-122 supervision 01:10
-    Block 1).  The three dates mirror a real run's effective-window seal (run
-    date 2026-08-04 + 7-day lead): 08-11→08-16, 08-21→08-26, 08-31→09-07.
+    canonical digest function, so a counter-example fixture always matches what
+    the real producer seals for the frozen maldives scenario (C-122 supervision
+    01:10 Block 1).  This helper is used ONLY for counter-example (foreign /
+    swapped / extra) ids; the PASSING fixture pair set is NOT hardcoded here —
+    it is derived from ``frozen_v4_canonical_pair_ids`` (R44).
     """
     digest = frozen_v4_pair_id_digest(
         date.fromisoformat(departure), date.fromisoformat(return_date)
@@ -562,44 +566,47 @@ def _frozen_v4_fixture_pair_id(departure: str, return_date: str) -> str:
     return f"date-pair:{departure}:{return_date}:{digest}"
 
 
-# The passing fixture's pair-id set: the run's own checkpoint-bound sealed set.
-# Ordered deterministically so per_pair indexes line up with ``pair_ids``.
-_FIXTURE_PAIR_IDS = (
-    _frozen_v4_fixture_pair_id("2026-08-11", "2026-08-16"),
-    _frozen_v4_fixture_pair_id("2026-08-21", "2026-08-26"),
-    _frozen_v4_fixture_pair_id("2026-08-31", "2026-09-07"),
-)
+# The passing fixture's pair-id set: the CANONICAL frozen ordered trio, DERIVED
+# (not hardcoded — C-122 R44 forbids a hand-written fixture trio as production
+# truth) from the same committed inputs producer / compact / consumer share
+# (frozen window + committed reference_date + selection algorithm), so the
+# fixture always matches the exact ordered trio a real frozen run seals.
+_FIXTURE_PAIR_IDS = frozen_v4_canonical_pair_ids()
 
 # The shared fixture request identity every checkpoint binding must carry (the
 # run's request SHA — C-122 supervision 18:13 wrong-request counter-example).
 _FIXTURE_REQUEST_SHA256 = "f" * 64
 # The per-pair dates mirror ``_FIXTURE_PAIR_IDS`` (in the same order), so each
 # binding's dates agree with its pair id's own embedded dates.
-_FIXTURE_PAIR_DATES = (
-    ("2026-08-11", "2026-08-16"),
-    ("2026-08-21", "2026-08-26"),
-    ("2026-08-31", "2026-09-07"),
+_FIXTURE_PAIR_DATES = tuple(
+    (pair_id.split(":")[1], pair_id.split(":")[2]) for pair_id in _FIXTURE_PAIR_IDS
 )
 
 
-def _fixture_checkpoint_binding() -> dict[str, object]:
-    """A self-consistent desensitized checkpoint binding for the passing
-    fixture: three bindings (one per frozen pair), each carrying the checkpoint
-    model's authoritative recomputable ``checkpoint_sha256`` over its OWN carried
-    fields, an ordered digest chain with a recomputable chain digest, and ONE
-    request identity shared by every binding (C-122 supervision 18:13 Fix 4).
+def _checkpoint_binding_for_pair_ids(
+    pair_ids: tuple[str, ...],
+    pair_dates: tuple[tuple[str, str], ...],
+    request_sha256: str = _FIXTURE_REQUEST_SHA256,
+) -> dict[str, object]:
+    """A self-consistent desensitized checkpoint binding for an arbitrary ordered
+    pair-id set: one binding per pair, each carrying the checkpoint model's
+    authoritative recomputable ``checkpoint_sha256`` over its OWN carried fields,
+    an ordered digest chain with a recomputable chain digest, and ONE request
+    identity shared by every binding (C-122 supervision 18:13 Fix 4).
     C-122 round-19 (gap 4): each binding is a ``completed`` checkpoint whose
     per-group query-task set is EXACTLY the canonical frozen graph's browser
     Source-id set, and whose ``run_summary_sha256`` recomputes from the carried
     business-summary fields via the checkpoint model's authoritative ``_run_summary``
     digest.  The validator recomputes every digest from these carried fields, so
     the fixture must be genuinely self-consistent — a copied / doctored digest
-    fails the same-raw counter-example."""
+    fails the same-raw counter-example.  Parameterizing the pair set lets an R44
+    counter-example rebuild a FULLY self-consistent chain for a foreign trio
+    (joint replacement + recomputed chain)."""
     from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
 
     bindings: list[dict[str, object]] = []
-    for index, pair_id in enumerate(_FIXTURE_PAIR_IDS):
-        departure_s, return_s = _FIXTURE_PAIR_DATES[index]
+    for index, pair_id in enumerate(pair_ids):
+        departure_s, return_s = pair_dates[index]
         query_task_ids = sorted(gate._V4_FROZEN_BROWSER_SOURCE_IDS)
         captured_at = "2026-08-10T00:00:00+00:00"
         # C-122 round-19 (gap 4): the full business-summary fields for a
@@ -622,7 +629,7 @@ def _fixture_checkpoint_binding() -> dict[str, object]:
         summary = LivePlanningPairCheckpoint._checkpoint_summary(
             {
                 "schema_version": "live-pair-checkpoint-v1",
-                "request_sha256": _FIXTURE_REQUEST_SHA256,
+                "request_sha256": request_sha256,
                 "sequence": index + 1,
                 "date_pair_id": pair_id,
                 "departure_date": departure_s,
@@ -653,7 +660,7 @@ def _fixture_checkpoint_binding() -> dict[str, object]:
                 "run_summary_sha256": run_summary_sha256,
                 "captured_at": captured_at,
                 "checkpoint_sha256": checkpoint_sha256,
-                "request_sha256": _FIXTURE_REQUEST_SHA256,
+                "request_sha256": request_sha256,
             }
         )
     ordered = [str(b["checkpoint_sha256"]) for b in bindings]
@@ -662,9 +669,15 @@ def _fixture_checkpoint_binding() -> dict[str, object]:
         "count": len(bindings),
         "ordered_checkpoint_sha256": ordered,
         "checkpoint_chain_sha256": gate._canonical_sha256(ordered),
-        "request_sha256": _FIXTURE_REQUEST_SHA256,
+        "request_sha256": request_sha256,
         "bindings": bindings,
     }
+
+
+def _fixture_checkpoint_binding() -> dict[str, object]:
+    """A self-consistent desensitized checkpoint binding for the passing
+    fixture (see ``_checkpoint_binding_for_pair_ids`` for the full contract)."""
+    return _checkpoint_binding_for_pair_ids(_FIXTURE_PAIR_IDS, _FIXTURE_PAIR_DATES)
 
 
 def _per_check_evidence(name: str) -> dict[str, object]:
@@ -11695,6 +11708,156 @@ def test_verify_layer6_compact_contract_rejects_extra_pair_id() -> None:
     with pytest.raises(
         gate.GateStateChangedError,
         match="pair_ids != the frozen scenario's exact 3 date pairs",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_joint_self_consistent_replacement() -> None:
+    """C-122 R44 counter-example (canonical pair-set authority — the exact gap):
+    a v4 source graph whose ALL THREE pair ids are replaced with ANOTHER
+    individually-canonical trio (each digest recomputes from the frozen constants
+    and every pair satisfies the frozen time contract — here the exact
+    ``2026-08-01→08-06 / 08-12→08-17 / 08-22→08-27`` trio from the R44 return),
+    with ``checkpoint_bound_pair_ids`` / per-pair ids / checkpoint binding dates
+    ALL synced AND every ``checkpoint_sha256`` / ``ordered_checkpoint_sha256`` /
+    ``checkpoint_chain_sha256`` RECOMPUTED per ``LivePlanningPairCheckpoint``,
+    must REJECT.  The compact is internally consistent in every field the OLD
+    verifier checked — but the exact ordered trio is NOT the independently
+    derived canonical trio, so the item-by-item comparison fails closed."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                foreign = tuple(
+                    _frozen_v4_fixture_pair_id(dep, ret)
+                    for dep, ret in [
+                        ("2026-08-01", "2026-08-06"),
+                        ("2026-08-12", "2026-08-17"),
+                        ("2026-08-22", "2026-08-27"),
+                    ]
+                )
+                foreign_dates = tuple(
+                    (pair_id.split(":")[1], pair_id.split(":")[2])
+                    for pair_id in foreign
+                )
+                binding = _checkpoint_binding_for_pair_ids(foreign, foreign_dates)
+                check["evidence"]["pair_ids"] = list(foreign)  # type: ignore[index]
+                check["evidence"]["checkpoint_bound_pair_ids"] = list(foreign)  # type: ignore[index]
+                check["evidence"]["checkpoint_binding"] = binding  # type: ignore[index]
+                check["evidence"]["per_pair"] = [  # type: ignore[index]
+                    {
+                        "pair_id": pair_id,
+                        "browser_source_task_ids": sorted(
+                            gate._V4_FROZEN_BROWSER_SOURCE_IDS
+                        ),
+                        "query_task_ids": sorted(gate._V4_FROZEN_QUERY_SHAPES),
+                        "icom_source_task_ids": sorted(gate._V4_FROZEN_ICOM_TASK_IDS),
+                        "browser_source_task_count": gate._V4_FROZEN_TASKS_PER_PAIR,
+                        "query_task_count": gate._V4_FROZEN_TASKS_PER_PAIR,
+                        "icom_source_task_count": len(gate._V4_FROZEN_ICOM_TASK_IDS),
+                    }
+                    for pair_id in foreign
+                ]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="pair_ids != the canonical frozen ordered trio",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_wrong_pair_order() -> None:
+    """C-122 R44 counter-example (wrong order): a v4 source graph whose
+    ``pair_ids`` carry EXACTLY the canonical trio but in the wrong ORDER (the
+    checkpoint-bound set still matches as a SET, and every id is canonical) must
+    REJECT — the exact ordered trio must equal the canonical derivation position
+    by position, not just as an unordered set."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                reordered = [
+                    _FIXTURE_PAIR_IDS[2],
+                    _FIXTURE_PAIR_IDS[0],
+                    _FIXTURE_PAIR_IDS[1],
+                ]
+                check["evidence"]["pair_ids"] = reordered  # type: ignore[index]
+                check["evidence"]["checkpoint_bound_pair_ids"] = reordered  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="pair_ids != the canonical frozen ordered trio",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_missing_pair_id() -> None:
+    """C-122 R44 counter-example (missing pair): a v4 source graph whose
+    ``pair_ids`` carry only TWO of the canonical trio (checkpoint-bound record
+    synced to the same two) must REJECT — the frozen scenario seals EXACTLY
+    three date pairs, so a missing pair is a forged graph."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                check["evidence"]["pair_ids"] = list(_FIXTURE_PAIR_IDS[:2])  # type: ignore[index]
+                check["evidence"]["checkpoint_bound_pair_ids"] = list(  # type: ignore[index]
+                    _FIXTURE_PAIR_IDS[:2]
+                )
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="pair_ids != the frozen scenario's exact 3 date pairs",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_contract_rejects_another_individually_valid_set() -> None:
+    """C-122 R44 counter-example (another individually-valid set): a v4 source
+    graph whose ``pair_ids`` are replaced with THREE other well-formed canonical
+    frozen pair ids (each digest recomputes, each satisfies the frozen time
+    contract) and whose ``checkpoint_bound_pair_ids`` is synced to that same set
+    must REJECT — every id is individually valid and the sets agree, but the
+    exact trio is not the canonical derivation (independent of whether the chain
+    is re-synced)."""
+
+    def mutate(checks: Any) -> None:
+        for check in checks:
+            if check["name"] == "v4_source_graph":
+                other = tuple(
+                    _frozen_v4_fixture_pair_id(dep, ret)
+                    for dep, ret in [
+                        ("2026-08-03", "2026-08-08"),
+                        ("2026-08-13", "2026-08-18"),
+                        ("2026-08-23", "2026-08-28"),
+                    ]
+                )
+                check["evidence"]["pair_ids"] = list(other)  # type: ignore[index]
+                check["evidence"]["checkpoint_bound_pair_ids"] = list(other)  # type: ignore[index]
+
+    compact = _layer6_compact_with_evidence_mutated(mutate)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="pair_ids != the canonical frozen ordered trio",
     ):
         gate._verify_layer6_compact_contract(
             "done-gate-layer6-compact.json",

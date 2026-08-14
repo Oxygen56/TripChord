@@ -174,6 +174,7 @@ from tripchord.planning.flexible_dates import (
     FlexibleDateExplorer,
     FlexibleQueryPlanBuilder,
 )
+from tripchord.planning.frozen_graph import frozen_v4_window_for_run
 from tripchord.planning.package import PackageDecisionState, PackageEventKind
 from tripchord.planning.policy import ReplanPolicySelector
 from tripchord.planning.problem import PlanningInfeasible
@@ -1997,6 +1998,16 @@ async def _execute_live_flexible_from_text_body(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="ready requirement interpretation did not provide executable constraints",
         )
+    # C-122 R44 (canonical pair-set authority): the frozen gateway scenario must
+    # explore the FROZEN window — the interpreter reads "玩5-8天" as a 4-7-night
+    # window, which would seal non-canonical (generic) pair ids and break the
+    # canonical ordered trio shared by producer, compact and consumer.  Only when
+    # the client EXPLICITLY supplies the system-frozen candidate set AND the
+    # interpretation keeps the frozen city identity is the window pinned to the
+    # frozen one; every other run keeps its own interpreted window.
+    frozen_window = frozen_v4_window_for_run(window, payload.stay_plan_candidate_set)
+    if frozen_window is not None:
+        window = frozen_window
     flexible_system = _flexible_live_agent_system_from_app(target_app)
     constraints = FlexiblePackageConstraints(
         budget_cents=intent_template.budget_cents,
@@ -2024,6 +2035,15 @@ async def _execute_live_flexible_from_text_body(
     try:
         async with asyncio.timeout(total_timeout_seconds):
             if isinstance(flexible_system, FlexibleLiveAgentSystem):
+                # C-122 R44: a frozen scenario carries its committed
+                # reference_date; pin the run clock to it when the client
+                # explicitly set it so the sealed ordered trio is independently
+                # reproducible (same derivation as the producer/consumer checks).
+                pinned_reference_date = (
+                    payload.requirement.reference_date
+                    if "reference_date" in payload.requirement.model_fields_set
+                    else None
+                )
                 run = await flexible_system.run(
                     window,
                     payload.calendars,
@@ -2043,6 +2063,7 @@ async def _execute_live_flexible_from_text_body(
                     ),
                     pair_checkpoint_reporter=report_pair_checkpoint,
                     checkpoint_request_sha256=checkpoint_request_sha256,
+                    reference_date=pinned_reference_date,
                 )
             else:
                 run = await flexible_system.run(

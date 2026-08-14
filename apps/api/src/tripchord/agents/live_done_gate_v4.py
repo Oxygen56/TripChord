@@ -45,6 +45,7 @@ from tripchord.planning.flexible_dates import (
 )
 from tripchord.planning.frozen_graph import (
     frozen_v4_browser_source_ids,
+    frozen_v4_canonical_pair_ids,
     frozen_v4_icom_task_ids,
     frozen_v4_pair_id_is_canonical,
     frozen_v4_query_shapes,
@@ -338,15 +339,22 @@ def _check_v4_source_graph(
     # ``frozen_v4_pair_id_is_canonical`` is the same single derivation the
     # layer-6 validator uses on the compact's ``pair_ids``, so a run that
     # produced a foreign / malformed / wrong-digest pair id fails closed here.
-    # (The SEALED pair-id SET is not a fixed constant — it depends on the run's
-    # effective window after ``minimum_departure_lead_days`` — so the exact-set
-    # binding is done at the compact level against the job-control-plane record,
-    # not against a nominal fixed list.)
     for pair_id in pair_ids:
         if not frozen_v4_pair_id_is_canonical(pair_id):
             errors.append(
                 f"pair id {pair_id!r} 不是冻结场景的规范 date-pair id（格式或摘要不符）"
             )
+    # C-122 R44 (canonical pair-set authority): the exact ORDERED trio is NOT a
+    # self-declared run-time constant.  The producer, the compact and the
+    # layer-6 consumer all derive it from the SAME committed inputs — the frozen
+    # window, the frozen scenario's committed ``reference_date`` and the
+    # production date-selection algorithm (``frozen_v4_canonical_pair_ids``) —
+    # so a run that sealed a joint self-consistent replacement, a wrong order, a
+    # missing/extra pair or any other individually-valid foreign set fails
+    # closed HERE (not only at the compact), independent of the job-control-plane
+    # record.
+    if pair_ids != frozen_v4_canonical_pair_ids():
+        errors.append("pair_runs 未按冻结请求推导出规范有序三对（联合自洽替换/乱序/缺失/额外）")
     if len(pair_dates) != len(set(pair_dates)):
         errors.append("pair_runs 存在重复出发/返程日期")
     if (

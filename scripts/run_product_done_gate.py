@@ -81,6 +81,7 @@ from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
 from tripchord.planning.frozen_graph import (
     FROZEN_V4_PAIR_COUNT,
     frozen_v4_browser_source_ids,
+    frozen_v4_canonical_pair_ids,
     frozen_v4_icom_task_ids,
     frozen_v4_pair_id_dates_canonical,
     frozen_v4_pair_id_is_canonical,
@@ -5978,6 +5979,19 @@ def _verify_layer6_checkpoint_binding(
                 f"at position {index} does not equal the binding's own "
                 f"checkpoint_sha256 (reordered chain)"
             )
+        # C-122 R44 (canonical pair-set authority): each binding position must
+        # equal the CANONICAL frozen ordered trio's position, item by item — a
+        # joint self-consistent trio replacement or a missing/extra pair fails
+        # closed here even when every digest recomputes and the chain is
+        # internally ordered.
+        canonical_trio = frozen_v4_canonical_pair_ids()
+        if entry_pair_id != canonical_trio[index]:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} checkpoint_binding entry {entry_pair_id!r} "
+                f"!= the canonical frozen trio position {index + 1} "
+                f"({canonical_trio[index]!r})"
+            )
         # Date window + pair-id/date agreement (C-122 supervision 18:13 wrong
         # date): the binding's dates must satisfy the canonical frozen time
         # contract AND agree with the dates embedded in the pair id itself.
@@ -6497,6 +6511,24 @@ def _verify_layer6_check_semantics(
                 f"evidence commit E layer-6 compact {tracked_rel} check "
                 f"{check_name!r} pair_ids set != the run's checkpoint-bound "
                 "sealed pair set (foreign, swapped, missing or extra pair)"
+            )
+        # C-122 R44 (canonical pair-set authority): the exact ORDERED trio is NOT
+        # self-declared — the consumer INDEPENDENTLY recomputes the canonical
+        # trio from the frozen request + effective window + selection algorithm
+        # (``frozen_v4_canonical_pair_ids``, shared with the producer and the
+        # checkpoint binding) and requires the compact's ``pair_ids`` to equal it
+        # EXACTLY in order.  A joint self-consistent replacement of all three ids
+        # (every id individually canonical, every digest and chain recomputed),
+        # a wrong order, a missing/extra pair or any other individually-valid
+        # foreign set fails closed here even when every id is canonical, the set
+        # is internally consistent and the checkpoint-bound set matches.
+        canonical_trio = frozen_v4_canonical_pair_ids()
+        if tuple(pair_ids) != canonical_trio:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} check "
+                f"{check_name!r} pair_ids != the canonical frozen ordered trio "
+                f"({canonical_trio!r}) (joint self-consistent replacement, "
+                "wrong order, missing/extra pair or foreign set)"
             )
         # C-122 supervision 18:13 (Fix 4): the compact must also carry the full
         # desensitized checkpoint binding, and the validator must independently
