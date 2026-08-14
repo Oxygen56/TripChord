@@ -177,6 +177,10 @@ def _canonical_sha256(payload: object) -> str:
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
 # Environment variables that redirect ``git -C <root>`` to a different
 # repository.  Stripped before any git call so the evidence names the repo that
 # actually ran, never one injected through the caller's environment
@@ -1502,7 +1506,12 @@ async def _request_event_replan(
     return LiveEventReplanRun.model_validate(payload["run"])
 
 
-async def _run(args: argparse.Namespace) -> int:
+async def _run(
+    args: argparse.Namespace,
+    *,
+    client_factory: Callable[..., httpx.AsyncClient] | None = None,
+    now_factory: Callable[[], datetime] = _utc_now,
+) -> int:
     request: dict[str, Any] | None = None
     publication_run: LivePackageAgentRun | None = None
     event: LiveEventReplanRun | None = None
@@ -1555,7 +1564,7 @@ async def _run(args: argparse.Namespace) -> int:
         context["event_injection_contract"] = _synthetic_fault_contract()
         candidate_set = system_stay_plan_candidate_set()
         context["api_payload_candidate_set_sha256"] = candidate_set.candidate_set_sha256
-        async with httpx.AsyncClient(
+        async with (client_factory or httpx.AsyncClient)(
             timeout=httpx.Timeout(request_timeout_seconds),
             headers=_headers(args.api_token),
         ) as client:
@@ -1696,7 +1705,11 @@ async def _run(args: argparse.Namespace) -> int:
                 context["initial_run"] = context["selected_publication_run"]
                 stage = "event_replan"
                 target_id, provider = _event_target(publication_run)
-                event_body = _synthetic_sold_out_event_body(target_id, provider)
+                event_body = _synthetic_sold_out_event_body(
+                    target_id,
+                    provider,
+                    injected_at=now_factory(),
+                )
                 context["injected_event"] = event_body
                 context["event_execution"] = {
                     "status": "injected_pending_validation",
@@ -1730,7 +1743,7 @@ async def _run(args: argparse.Namespace) -> int:
                 cancellation_receipt,
                 _runner_secrets(args),
             )
-        captured_at = datetime.now(UTC)
+        captured_at = now_factory()
         bundle = _failure_evidence_bundle(
             request=request,
             stage=stage,
@@ -1767,7 +1780,7 @@ async def _run(args: argparse.Namespace) -> int:
         return 2
 
     stage = "evaluate_done_gate"
-    captured_at = datetime.now(UTC)
+    captured_at = now_factory()
     assert request is not None
     try:
         report = evaluate_live_v4_done_gate(

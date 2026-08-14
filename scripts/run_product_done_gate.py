@@ -5259,8 +5259,32 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
     # wrong-request / same-raw-copied digest forgery fails closed).
     checkpoint_pairs: list[str] = []
     checkpoint_binding_dict: dict[str, Any] = {}
+    # The formal v4 runner expands ``context`` into the completed bundle, so
+    # ``pair_checkpoint_binding`` is a TOP-LEVEL raw field.  Older fixtures used
+    # a literal ``context`` wrapper; keep that read-only compatibility path, but
+    # reject two self-consistent copies that disagree instead of choosing one.
+    formal_checkpoint_binding = payload.get("pair_checkpoint_binding")
+    legacy_context = payload.get("context")
+    legacy_checkpoint_binding = (
+        legacy_context.get("pair_checkpoint_binding")
+        if isinstance(legacy_context, dict)
+        else None
+    )
+    if (
+        isinstance(formal_checkpoint_binding, dict)
+        and isinstance(legacy_checkpoint_binding, dict)
+        and formal_checkpoint_binding != legacy_checkpoint_binding
+    ):
+        raise GateStateChangedError(
+            "layer-6 raw evidence carries conflicting top-level and legacy "
+            "context pair_checkpoint_binding values"
+        )
     raw_checkpoint_binding = (
-        (payload.get("context") or {}).get("pair_checkpoint_binding") or {}
+        formal_checkpoint_binding
+        if isinstance(formal_checkpoint_binding, dict)
+        else legacy_checkpoint_binding
+        if isinstance(legacy_checkpoint_binding, dict)
+        else {}
     )
     if isinstance(raw_checkpoint_binding, dict):
         desensitized_bindings: list[dict[str, Any]] = []

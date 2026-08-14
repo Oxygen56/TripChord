@@ -142,6 +142,8 @@
 
 | C-122 R42 Block 90 最终 HEAD 受控重启（final HEAD=本提交，代码+文档同提交） | `/api/v1/agents/runtime` provenance（`commit_sha`/`dependency_lock_sha256`/`live_system_source_sha256` 三哈希与本地树严格匹配，`verify_api_runtime_provenance.py` passed=true、pid 存活、mismatches 空；机器证据见最终结果评论） | 代码（Block 90 修复+测试）+ 账本文档全部提交后冻结**唯一最终 HEAD（本提交）**，API 受控重启绑定该最终 HEAD，provenance 硬校验 passed=true；六层门在同一最终 HEAD 上从头重跑（最新 evidence 目录，tested_commit_sha=该最终 HEAD，passed=false 如实、退出码 2）。按监督打回十一要求一次性收口：最终绑定与六层运行后不再新增任何提交（无尾部记录提交）；`passed=false` 期间 C-122 保持 in_progress、不提前审查/终验 C-125/C-124 | 只证明运行代码=最终 HEAD；不证明六层门通过 |
 
+| C-122 R46 正式 runner 自产 raw 链 | `benchmarks/run_live_done_gate_v4.py`、`apps/api/src/tripchord/main.py`、`apps/api/src/tripchord/providers/icom_transfer.py`、`scripts/run_product_done_gate.py`、`scripts/tests/test_run_product_done_gate.py`、`docs/phase-reviews/product-v1.0-c122-formal-run.md` | C-round4 正向由正式 `_install_browser_bridge` composition + mounted Companion HTTP 入口 + 精确 `IComTransferProvider` public HTTP reads 进入正式 `_run` 自产 raw；测试只注入 Browser/iCom transport、clock、output。真实 API job、3 pair/checkpoint、15 项 producer、completed bundle、0600 writer、compact 与 consumer 串联；正式顶层 checkpoint binding 被消费，顶层/legacy 冲突 fail-closed；领域 provider 桩/手工 composition/直接 heartbeat 与 query/checkpoint/request/check/evidence 原始反例均不能洗白 | 代码级正式链 15/15 只证明冻结场景合同；不等于机器六层通过、真实 OTA 可用或 Companion 已授权。最终 API/六层 SHA 与结果只认 C-122 同 HEAD 交付证据；独立 C-125 复审前不启动终验 |
+
 ## 后训练与全栈工程
 
 | 声明 | 可复现证据 | 允许表述 | 边界 |

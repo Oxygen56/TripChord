@@ -6,13 +6,13 @@
 
 ## 当前状态
 
-- **当前版本**：v1.0 Done-Gate C-122 R42（Block 89/90 已测试实现收口，R42 实现基线 `dc075ef`）——Block 89 修复合法 JSON 误拒（escaped documented 成员键与数组括号间合法 JSON 空白 SPACE/TAB/CR/LF 按结构一致处理）；Block 90 修复**首字符转义** documented 成员键误拒——free-text 赋值 regex 的 field 以 word 字符开头、键首字符为反斜杠时捕获从反斜杠后开始、真实键首字符上下文丢失；新增 `_json_member_key_at` 从**真实已解析 JSON 的 quoted span** 取 RFC-8259 解码后的真实成员键（闭引号后为 `:` 才视为成员 KEY，value 位置 span 返回 None 走原 regex field 回退），`_documented_version_field_exempt` 与 `_is_documented_json_array_element_assign` 均改为从真实 span 取键，不再依赖截断 regex field、全局替换或字符表修补。正式矩阵升级为**可审计生成式覆盖**（数量断言 + `len(set(...))` 唯一性断言，缺维度/重复 padding 即失败）：主矩阵 2 转义样式×3 documented 键×6 value 形式×depth 0/2/3/4 = **144**；空白矩阵 JSON 空白 {SPACE,TAB,CR,LF} 四型独立×2×3×6×4 = **576**（scalar 在 member colon/value 边界实际注入空白、`len(set)==576` 全唯一）；转义 `plan` 父×转义子（`planner_version`/`provider_version`）×depth = **32**；共 **752 例全五路正例 + 24 负例全部通过**（raw committed/failure 双 final→producer 不动→真实 0600 seal→consumer 双 final）；Block87–89 负例全部保留、不回归。聚焦 10 passed、全量 gate 491 collected、全量 1526 passed、clean-env 1526 passed、ruff 全绿、`git diff --check` exit 0。以上全部在 **R42 已测试实现基线 `dc075ef`**（Block90 代码+测试+账本/进度文档同提交）上验证。
-- **当前分支**：`productization/v1.0`（未 push；**R43 文档收尾为本 docs-only 提交，产生新 HEAD（当前提交），已越过 R42 实现基线 `dc075ef`**。API 与旧六层门 `f83b` 证据只绑定 **R42 已测试实现基线 `dc075ef`**（provenance 三哈希匹配、`passed=true`、pid 与三哈希见 provenance 机器证据与最终结果评论、mismatches 空），**不绑定 R43 文档新 HEAD**。待用户完成 Companion 只读连接配对后必须先受控重启 API 绑定届时当前 clean HEAD，再从头重跑六层门，证据 `tested_commit` 与届时 HEAD 一致后才可终验。）
+- **当前版本**：v1.0 Done-Gate C-122 R46（正式 runner 自产 raw 收口）——C-round4 正向不再手工构造 run/checkpoint/raw，而是以 `benchmarks.run_live_done_gate_v4._run` 为唯一入口，并由正式 `_install_browser_bridge` composition 创建/绑定 Browser bridge、真实 `IComTransferProvider`、pair runner 与 flexible runner；Companion 经 mounted HTTP heartbeat/claim/complete 入口上报，iCom 只在 `httpx` transport 返回原始官方形状 JSON，schema/normalize/evidence/领域结果均由真实 provider 产生。随后真实走 API job、三 pair checkpoint、15 项 producer、completed bundle、0600 writer、compact/consumer。compact 同时修复正式顶层 `pair_checkpoint_binding` 断链；顶层与 legacy 双副本不一致时 fail-closed。
+- **当前分支**：`productization/v1.0`（未 push；本轮代码、测试、账本与独立阶段评审同一交付提交。API 必须在该 clean HEAD 上受控重启并由 provenance 三哈希验证；六层门结果只按同 HEAD 新报告认定，旧报告不用于收口。）
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
-- **最后完成的最小任务**：C-122 R42 Block 90（监督打回十一）——`_json_member_key_at` 真实 quoted span 成员键解析修复首字符转义 documented 键误拒；生成式矩阵 144 main + 576 ws{SPACE,TAB,CR,LF} 全唯一 + 32 plan{planner/provider_version} 子键 = **752 例全五路正例 + 24 负例**全通过（聚焦 10 passed、全量 gate 491 collected、全量 1526 passed、clean-env 1526 passed、ruff 全绿）。**该项为 R42 已测试实现/旧证据基线 `dc075ef`**；R43 文档收尾（本提交）仅改本进度账本文档，未触碰代码/测试/gate。
-- **最新六层门**（**R42 已测试实现基线 `dc075ef`**，run_id `f83b165a`）：层 1/2/3/4 PASS（层 4 required-model smoke 实际运行通过）；层 5 real_canary FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）；层 6 full_e2e FAIL（executor 在 done-gate 前于 `companion_preflight` 失败：未发现同时声明携程/去哪儿/同程且仍新鲜的已连接 Companion，心跳过期 >45s，实时搜索未提交）；`passed=false` 退出码 2、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）、gate_ref=null、`tested_commit_sha=dc075ef`。**该门绑定 `dc075ef` 而非 R43 文档新 HEAD，不得把 pending authorization / companion_preflight 包装成完成，不声称六层 passed=true，不得用旧 f83b 收口**。
-- **审查/终验状态**：C-125 独立架构师审查已 **done**——PASS comment `e23f359a-3358-44b4-86cf-03406764607d` 仅批准 **Block90@`dc075ef`**（R42 已测试实现基线）的代码审查范围（无新增绕过/删测/gate 放松），**不是当前 docs HEAD 的 Done-Gate 批准**；C-124 终验尚未启动（保持 backlog）。C-122 保持 in_progress，直至用户完成 Companion 只读连接配对后先受控重启 API 绑定届时当前 clean HEAD、同该 HEAD 六层 `passed=true` 且证据 `tested_commit` 与 HEAD 一致后最终收口。
+- **最后完成的最小任务**：C-122 R46——正式 `_run` 自产 raw、正式 app composition + Companion HTTP 入口 + 真实 iCom Provider HTTP 边界、正式顶层 checkpoint binding 被 compact 正确消费、正式 raw 派生的 query/checkpoint/request/check/evidence 反例矩阵 fail-closed；provider/composition/heartbeat 旁路反例不能满足正向回执。全局类/函数身份与 FastAPI routes/state 在测试后保持原样，测试持久化由 session 临时 DB/bridge-state 隔离。
+- **最新六层门**：交付前的权威六层仍为 `passed=false`（L5/L6 未过、`evidence_commit=null`、`gate_ref=null`）；本轮最终提交后必须重启 API 并从头运行，精确 run_id/tested SHA/各层结果写入 C-122 交付评论。无论结果如何，不复用旧门、不把代码级 15/15 当作机器六层通过。
+- **审查/终验状态**：旧 C-125 PASS 已撤销；C-125/C-124 均保持 backlog。本轮 C-122 完成后只转 `in_review`，先由不同 Agent 复审正式 raw 链；复审通过前暂停 Companion 配对与终验，不请求用户动作。
 
 ## 版本状态
 
@@ -355,6 +355,17 @@
 | API 重启 + `uv run python scripts/verify_api_runtime_provenance.py` | API 受控重启绑定最终 HEAD（本提交）；provenance `passed=true`、`commit_sha`/`dependency_lock_sha256`/`live_system_source_sha256` 三哈希匹配、pid 存活、mismatches 空（精确值见最终结果评论） |
 | `TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit <最终 HEAD 全 SHA> --commit-evidence` | 同 HEAD 从头重跑严格六层门（最新 evidence 目录，run_id 与 tested_commit_sha 见最终结果评论）：层 1/2/3/4 PASS（层 4 required-model smoke 实际运行通过）、层 5 FAIL（pending user authorization：非全部 certified canary scope 有 fresh authorised 只读 canary）、层 6 FAIL——executor 在 done-gate 前于 `companion_preflight` 失败（未发现同时声明携程/去哪儿/同程且仍新鲜的已连接 Companion，心跳过期 >45s，实时搜索未提交）；`passed=false` 退出码 2、`worktree_dirty=false`、evidence 未提交（evidence_commit=null）、gate_ref=null。`passed=false` 如实记录、不得收口：C-122 保持 in_progress，C-125/C-124 保持 backlog 不提前审查/终验 |
 
+### 第四十六轮（C-122 R46 正式 runner 自产 raw）验证结果
+
+| 命令/证据 | 结果 |
+|---|---|
+| 正式 C-round4 正向链 | 正式 `_install_browser_bridge` composition → mounted Companion HTTP heartbeat/claim/complete → `_run` → 真实 API job → 3 pair/控制面 checkpoints → 15/15 producer → completed bundle → 0600 writer → compact → consumer；raw 从正式输出文件回读，不再由测试拼装业务对象或生产状态 |
+| 真实 iCom provider | composition 实例化精确 `IComTransferProvider`；测试只在 `httpx.MockTransport` 返回 schedules/base-fare/policy 原始 JSON，三条官方 public GET path 均有调用回执；provider 自行做 URL/schema/字段标准化、证据 SHA 与领域结果。领域 provider 桩、空 HTTP 回执、直接 heartbeat/手工 composition 均不能满足正向回执 |
+| 正式 raw 对抗矩阵 | foreign/cross-pair/missing/extra query，missing/extra/cross-pair checkpoint，foreign request identity，extra check，empty evidence 均从同一正式 raw 深拷贝并由正式 writer 落盘；producer/compact/consumer 按责任边界拒绝 |
+| compact 顶层绑定 | 正式顶层 `pair_checkpoint_binding` 被消费；legacy `context` 仅作旧证据兼容；两份同时存在且不同立即拒绝 |
+| 进程与持久化隔离 | 不替换生产类/函数；运行后方法/函数 identity、FastAPI routes/state、模块 globals 均保持原值；pytest session 使用临时 DB 与 bridge-state，不读写 live 数据库/桥接状态 |
+| 最终验证与机器门 | 聚焦、全量、clean-env、ruff、API provenance 与同 HEAD 六层门的精确结果以 C-122 唯一交付评论为准；`passed=false` 时仍如实保留空 evidence/ref，不触发 C-125/C-124 |
+
 ## 当前可对外声明
 
 
@@ -375,13 +386,13 @@
 ## 下一条可直接执行的命令
 
 ```bash
-# 0) 用户侧唯一动作：Companion 只读连接——Chrome Profile 3 已安装 TripChord Read-only Browser Companion（ctrip/qunar/ly/elong 权限 active）；打开已安装扩展 popup，安全复制当前 .runtime/browser-bridge-token 并粘贴（不得读取/回显 token），保留默认 http://127.0.0.1:8000/browser-bridge，点击“连接只读查询”，确认“已连接，只读轮询中”；仅登录失效/CAPTCHA 时在官方域名处理；不执行下单/支付/优惠券/账号修改
-# 1) 配对完成后先跑 canary，再从头跑六层门：
+# 本轮交付后只启动不同 Agent 的 C-125 独立只读复审；先复跑正式 raw
+# 正向链与完整对抗矩阵，并核对最终 HEAD、API provenance、六层报告。
 cd /Users/oxygen/Documents/个人项目/tripchord
-uv run python benchmarks/live_canary_certified.py --bridge-token "$(cat .runtime/browser-bridge-token)"
-TRIPCHORD_ACK_MODEL_COST=1 uv run python scripts/run_product_done_gate.py --commit-evidence
+TRIPCHORD_ACK_MODEL_COST=1 .venv/bin/python -m pytest \
+  scripts/tests/test_run_product_done_gate.py -k 'real_production_chain' -q
 ```
-（层 4 需 `TRIPCHORD_ACK_MODEL_COST=1` 授权模型成本后才会实际运行；层 5 需已连接 Companion 且 `ctrip/qunar/ly/elong` 官方域名处于 fresh authorised 只读状态后才会逐 scope 真正 PASS——扩展已安装、权限 active，用户仅需按上方步骤完成只读连接配对，登录失效/CAPTCHA 时在官方域名处理；层 6 在上述条件满足后由 `benchmarks/run_live_done_gate_v4.py` 真实执行——当前无已连接 Companion 时，层 6 如实报告 executor 在 `companion_preflight` 阶段失败（failed_before_done_gate），不包装为授权问题。**当前仓库 HEAD 是本次 R43 docs-only 纠偏提交**；已测试实现/API/旧六层门 `f83b` evidence 基线**仍仅为 `dc075ef`**，绝不声称与当前 docs HEAD 同 SHA。C-125 已 **done**：PASS comment `e23f359a-3358-44b4-86cf-03406764607d` 仅批准 **Block90@`dc075ef`**，不是当前 HEAD 的 Done-Gate 批准；C-124 终验尚未启动（保持 backlog）。`passed=false` 期间 C-122 保持 in_progress；用户配对后须**先受控重启 API 绑定届时当前 clean HEAD**，再**从头重跑六层门**，证据 `tested_commit` 与届时 HEAD 一致后才可终验。）
+（当前无需用户配对、授权或费用动作。C-125 复审通过前不启动 C-124；只有独立复审确认正式 raw 链与原始反例全部闭环后，流程负责人才能按阶段状态机决定后续动作。）
 
 ## 基线记录（业务代码修改前）
 

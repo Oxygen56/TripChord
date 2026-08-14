@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Annotated, Any, Final, cast
 from uuid import uuid4
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
@@ -664,6 +665,9 @@ def _install_browser_bridge(
     model_router: ModelRouter | None = None,
     context_builder: BudgetedAgentContextBuilder | None = None,
     memory_store: MemoryStore | None = None,
+    icom_http_client: httpx.AsyncClient | None = None,
+    now: Callable[[], datetime] | None = None,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
 ) -> tuple[BrowserTaskBridge | None, LivePackageAgentSystem | None]:
     token = configured_settings.browser_bridge_token
     if not configured_settings.browser_bridge_enabled or token is None or len(token) < 32:
@@ -678,8 +682,8 @@ def _install_browser_bridge(
         target_app.state.browser_companion_runtime_agent = None
         target_app.state.browser_companion_runtime_supervisor = None
         return None, None
-    bridge = BrowserTaskBridge()
-    icom_provider = IComTransferProvider()
+    bridge = BrowserTaskBridge(now=now)
+    icom_provider = IComTransferProvider(client=icom_http_client, now=now)
     selected_memory_store = memory_store or MemoryStore()
     selected_context_builder = context_builder or BudgetedAgentContextBuilder(
         EvidenceRagRetriever(selected_memory_store)
@@ -691,6 +695,8 @@ def _install_browser_bridge(
         model_agents_required=configured_settings.model_agents_required,
         context_builder=selected_context_builder,
         memory_store=selected_memory_store,
+        now=now,
+        sleep=sleep,
         providers=default_browser_providers_from_registry(),
     )
     flexible_system = FlexibleLiveAgentSystem(
@@ -702,6 +708,7 @@ def _install_browser_bridge(
         model_agents_required=configured_settings.model_agents_required,
         context_builder=selected_context_builder,
         memory_store=selected_memory_store,
+        now=now,
         adaptive_agent_scaling_enabled=(
             configured_settings.adaptive_agent_scaling_enabled and model_router is not None
         ),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -403,6 +404,7 @@ class IComTransferProvider:
         config: IComTransferConfig | None = None,
         *,
         client: httpx.AsyncClient | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self._config = config or IComTransferConfig()
         self._client = client or httpx.AsyncClient(
@@ -411,6 +413,7 @@ class IComTransferProvider:
             headers={"user-agent": self._config.user_agent},
         )
         self._owns_client = client is None
+        self._now = now or (lambda: datetime.now(UTC))
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -462,7 +465,7 @@ class IComTransferProvider:
         )
         return IComTransferSearchResult(
             query=query,
-            searched_at=datetime.now(UTC),
+            searched_at=self._now(),
             options=options,
             source_urls=tuple(fetched_by_endpoint[endpoint].source_url for endpoint in _ENDPOINTS),
         )
@@ -509,7 +512,7 @@ class IComTransferProvider:
             return _FetchedPayload(
                 endpoint=endpoint,
                 source_url=str(response.url),
-                captured_at=datetime.now(UTC),
+                captured_at=self._now(),
                 response_sha256=hashlib.sha256(raw).hexdigest(),
                 payload=payload,
             )

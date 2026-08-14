@@ -15,6 +15,7 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -12622,19 +12623,18 @@ def test_verify_layer6_compact_contract_rejects_checkpoint_binding_wrong_field_d
 
 
 # =====================================================================
-# C-round4 (fresh independent RETURN, real-chain gate): the POSITIVE and every
-# counterexample run on ONE REAL production chain —
-#   FlexibleLiveAgentSystem.run() production entry
+# C-round4 (fresh independent RETURN, formal-runner gate): the POSITIVE and every
+# counterexample run on ONE formal production chain —
+#   run_live_done_gate_v4._run() unique production entry
+#   → FlexibleLiveAgentSystem.run() production entry
 #   → execute_pair() per-pair expansion (real LivePackageAgentSystem.run())
 #   → JobControlPlane.report_pair_checkpoint() forming the checkpoints
-#   → the real runner artifact (the real FlexibleLiveAgentRun)
 #   → the official 15-check evaluate_live_v4_done_gate producer
+#   → _completed_evidence_bundle() + atomic 0600 _write_evidence_bundle()
 #   → the real compact writer _compact_live_e2e
 #   → _verify_layer6_compact_contract.
-# The raw payload is assembled ONLY from real artifacts (the real producer
-# report, the real control-plane checkpoint binding, real HEAD, the real
-# candidate-set / request SHA) — no hand-built run / checkpoint / raw payload
-# and no _realistic_e2e_evidence reuse.
+# The raw payload is read back from the formal runner's actual output file — no
+# hand-built run / checkpoint / raw payload and no _realistic_e2e_evidence reuse.
 # =====================================================================
 
 _C4_REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -12646,14 +12646,11 @@ from test_live_agent_system import (  # noqa: E402
     MALDIVES_OFFSET,
     NOW,
     _domain,
-    _FakeIComProvider,
     _flight_quote,
     _lodging_quote,
     _lodging_segment,
     _sealed_quote,
-    _serve,
 )
-from tripchord.agents.live_system import LivePackageEvent  # noqa: E402
 from tripchord.providers.browser_bridge import (  # noqa: E402
     BrowserTaskCompletion,
     BrowserTaskState,
@@ -12789,175 +12786,192 @@ def _c4_event_source_replacement(lease: Any) -> BrowserTaskCompletion:
     )
 
 
-class _C4FrozenIComProvider(_FakeIComProvider):
-    """Date-adaptive icom public-transfer provider for the frozen scenario.
+class _C4IComHTTPHarness:
+    """Exact public-read HTTP boundary for the REAL iCom provider.
 
-    The stock ``_FakeIComProvider`` anchors ferry times to the v3 fixture dates
-    (21:00 outbound on 08-23, 06:00 return on 08-30); every other date gets
-    10:00/12:00, which misses the fixed 18:35 arrival / 10:45 departure of the
-    frozen date-adaptive flight quotes and trips the ERROR-severity
-    ``late_arrival_boat_risk`` / ``early_departure_buffer`` violations.  Keep the
-    full contract shape (evidence, fares, source urls) identical and only anchor
-    every outbound date to 21:00 and every return date to 06:00.
+    The harness returns raw upstream JSON only.  Schema validation,
+    normalization, evidence hashing, option construction, and public-transfer
+    conversion remain owned by ``IComTransferProvider``.
     """
 
-    async def search(self, query: Any) -> Any:
-        from tripchord.providers.icom_transfer import (
-            IComAvailabilityStatus,
-            IComCurrencyPolicyEvidence,
-            IComFieldEvidence,
-            IComLocation,
-            IComPublishedBaseFare,
-            IComTransferOption,
-            IComTransferSearchResult,
-        )
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+        self.schedule_calls: dict[str, int] = {}
 
-        self.queries.append(query)
-        query_key = (query.travel_date, query.origin, query.destination)
-        query_count = self.query_counts.get(query_key, 0) + 1
-        self.query_counts[query_key] = query_count
-        hour = 21 if query.origin == IComLocation.AIRPORT else 6
-        hour += query_count - 1
-        departure = datetime.fromisoformat(
-            f"{query.travel_date.isoformat()}T{hour:02d}:00:00+05:00"
-        )
-        arrival = departure + timedelta(minutes=45)
-        source_url = (
-            "https://sfs-api.icomtours.com/api/v1/public/trips/schedules"
-            f"?date={query.travel_date.isoformat()}"
-        )
-        fare_source_url = (
-            "https://sfs-api.icomtours.com/api/v1/public/ferry-fares/schedule-base-price"
-        )
-        policy_source_url = "https://sfs-api.icomtours.com/api/v1/public/policy-sections"
-        trip_id = 10_000 + query.travel_date.toordinal() + query_count * 100_000
-        schedule_id = 20_000 + query.travel_date.toordinal() + query_count * 100_000
-        route = f"{query.origin.value} -> {query.destination.value}"
-        schedule_response_sha = hashlib.sha256(
-            f"schedule|{query.model_dump_json()}|{query_count}".encode()
-        ).hexdigest()
-        fare_response_sha = hashlib.sha256(b"official-fare-response").hexdigest()
-        policy_response_sha = hashlib.sha256(b"official-policy-response").hexdigest()
+    def __call__(self, request: Any) -> Any:
+        import httpx
 
-        def value_sha(value: object) -> str:
-            if isinstance(value, datetime):
-                normalized: object = value.isoformat()
-            elif isinstance(value, Decimal):
-                normalized = str(value)
-            elif isinstance(value, IComAvailabilityStatus):
-                normalized = value.value
-            else:
-                normalized = value
-            return hashlib.sha256(
-                json.dumps(
-                    normalized,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode()
-            ).hexdigest()
+        assert request.method == "GET"
+        assert request.url.host == "sfs-api.icomtours.com"
+        self.paths.append(request.url.path)
+        meta = {
+            "timestamp": NOW.isoformat(),
+            "apiVersion": "v1",
+            "status": "success",
+            "message": "Success",
+        }
+        if request.url.path == "/api/v1/public/trips/schedules":
+            travel_date = str(request.url.params["date"])
+            call = self.schedule_calls.get(travel_date, 0) + 1
+            self.schedule_calls[travel_date] = call
+            ordinal = date.fromisoformat(travel_date).toordinal()
 
-        def evidence(
-            field: str,
-            value: object,
-            *,
-            source: str = source_url,
-            response_sha: str = schedule_response_sha,
-            derivation: str = "direct",
-        ) -> IComFieldEvidence:
-            return IComFieldEvidence(
-                normalized_field=field,
-                source_url=source,
-                json_paths=(f"$.data[0].{field}",) if value is not None else (),
-                derivation=derivation,  # type: ignore[arg-type]
-                value_sha256=value_sha(value),
-                response_sha256=response_sha,
-                captured_at=NOW,
+            def row(
+                *,
+                suffix: int,
+                origin_id: int,
+                origin: str,
+                destination_id: int,
+                destination: str,
+                hour: int,
+            ) -> dict[str, object]:
+                departure_hour = hour + call - 1
+                return {
+                    "id": ordinal * 10 + suffix + call * 1_000_000,
+                    "tripDate": travel_date,
+                    "departureTime": f"{departure_hour:02d}:00",
+                    "arrivalTime": f"{departure_hour:02d}:45",
+                    "capacity": 45,
+                    "remainingCapacity": 45,
+                    "cancelledAt": None,
+                    "isCancelled": False,
+                    "scheduleId": ordinal * 10 + suffix + call * 2_000_000,
+                    "stops": 0,
+                    "ferryName": f"iCom formal HTTP fixture {suffix}",
+                    "vessel": {
+                        "id": suffix,
+                        "name": f"iCom Vessel {suffix}",
+                        "totalCapacity": 45,
+                    },
+                    "origin": {"id": origin_id, "name": origin},
+                    "destination": {
+                        "id": destination_id,
+                        "name": destination,
+                    },
+                }
+
+            return httpx.Response(
+                200,
+                json={
+                    "meta": meta,
+                    "data": [
+                        row(
+                            suffix=1,
+                            origin_id=3,
+                            origin="Airport",
+                            destination_id=1,
+                            destination="Maafushi",
+                            hour=21,
+                        ),
+                        row(
+                            suffix=2,
+                            origin_id=1,
+                            origin="Maafushi",
+                            destination_id=3,
+                            destination="Airport",
+                            hour=6,
+                        ),
+                    ],
+                },
             )
-
-        schedule_evidence = tuple(
-            evidence(field, value)
-            for field, value in (
-                ("trip_id", trip_id),
-                ("schedule_id", schedule_id),
-                ("route", route),
-                ("departure_at", departure),
-                ("arrival_at", arrival),
-                ("remaining_capacity", 45),
-                ("is_cancelled", False),
-                ("availability_status", IComAvailabilityStatus.AVAILABLE),
+        if request.url.path == (
+            "/api/v1/public/ferry-fares/schedule-base-price"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "meta": meta,
+                    "data": {"amount": 30, "currencyCode": "USD"},
+                },
             )
-        )
-        fare_evidence = (
-            evidence(
-                "fare.amount",
-                Decimal("30"),
-                source=fare_source_url,
-                response_sha=fare_response_sha,
-            ),
-            evidence(
-                "fare.currency",
-                "USD",
-                source=fare_source_url,
-                response_sha=fare_response_sha,
-            ),
-            evidence(
-                "fare.basis",
-                "per_person",
-                source=fare_source_url,
-                response_sha=fare_response_sha,
-                derivation="provider_contract",
-            ),
-            evidence(
-                "fare.taxes_included",
-                None,
-                source=fare_source_url,
-                response_sha=fare_response_sha,
-                derivation="not_asserted",
-            ),
-        )
-        policy_statement = "Prices are displayed and charged in USD."
-        option = IComTransferOption(
-            trip_id=trip_id,
-            schedule_id=schedule_id,
-            service_name="Airport Maafushi",
-            vessel_name="iCom Test",
-            origin=query.origin,
-            destination=query.destination,
-            route=route,
-            departure_at=departure,
-            arrival_at=arrival,
-            capacity=45,
-            remaining_capacity=45,
-            stops=0,
-            is_cancelled=False,
-            availability_status=IComAvailabilityStatus.AVAILABLE,
-            eligible_for_party=True,
-            fare=IComPublishedBaseFare(
-                amount=Decimal("30"),
-                evidence=fare_evidence,
-            ),
-            currency_policy_evidence=IComCurrencyPolicyEvidence(
-                statement=policy_statement,
-                source_url=policy_source_url,
-                json_path="$.data[0].richtext",
-                evidence_sha256=value_sha(policy_statement),
-                response_sha256=policy_response_sha,
-                captured_at=NOW,
-            ),
-            source_url=source_url,
-            captured_at=NOW,
-            evidence=schedule_evidence,
-        )
-        return IComTransferSearchResult(
-            query=query,
-            searched_at=NOW,
-            options=(option,),
-            source_urls=(
-                source_url,
-                fare_source_url,
-                policy_source_url,
-            ),
-        )
+        if request.url.path == "/api/v1/public/policy-sections":
+            return httpx.Response(
+                200,
+                json={
+                    "meta": meta,
+                    "data": [
+                        {
+                            "id": 1,
+                            "title": "Payments",
+                            "richtext": {
+                                "blocks": [
+                                    {
+                                        "type": "paragraph",
+                                        "data": {
+                                            "text": (
+                                                "All prices are displayed and charged "
+                                                "in US Dollars (USD)."
+                                            )
+                                        },
+                                    }
+                                ]
+                            },
+                            "isActive": True,
+                        }
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected iCom URL: {request.url}")
+
+
+def _c4_validate_formal_composition(
+    bridge: object,
+    live_system: object,
+    flexible_system: object,
+    icom_provider: object,
+) -> dict[str, str]:
+    """Fail if C-round4 bypasses the production composition graph."""
+    from tripchord.agents.flexible_live_system import FlexibleLiveAgentSystem
+    from tripchord.agents.live_system import LivePackageAgentSystem
+    from tripchord.providers.browser_bridge import BrowserTaskBridge
+    from tripchord.providers.icom_transfer import IComTransferProvider
+
+    expected = (
+        (bridge, BrowserTaskBridge, "browser bridge"),
+        (live_system, LivePackageAgentSystem, "live package system"),
+        (flexible_system, FlexibleLiveAgentSystem, "flexible live system"),
+        (icom_provider, IComTransferProvider, "iCom provider"),
+    )
+    for value, expected_type, label in expected:
+        if type(value) is not expected_type:
+            raise AssertionError(f"formal composition did not create the real {label}")
+    if getattr(live_system, "_bridge", None) is not bridge:
+        raise AssertionError("formal live system is not bound to its composed bridge")
+    if getattr(live_system, "_icom_provider", None) is not icom_provider:
+        raise AssertionError("formal live system bypassed its composed iCom provider")
+    if getattr(flexible_system, "_live", None) is not live_system:
+        raise AssertionError("formal flexible system bypassed its composed pair runner")
+    return {
+        "bridge": type(bridge).__name__,
+        "live_system": type(live_system).__name__,
+        "flexible_system": type(flexible_system).__name__,
+        "icom_provider": type(icom_provider).__name__,
+    }
+
+
+def _c4_validate_formal_transport_receipts(
+    *,
+    composition_types: dict[str, str],
+    icom_http_paths: tuple[str, ...],
+    companion_heartbeat_status: int,
+) -> None:
+    expected_types = {
+        "bridge": "BrowserTaskBridge",
+        "live_system": "LivePackageAgentSystem",
+        "flexible_system": "FlexibleLiveAgentSystem",
+        "icom_provider": "IComTransferProvider",
+    }
+    if composition_types != expected_types:
+        raise AssertionError("formal app composition receipt is missing or foreign")
+    required_icom_paths = {
+        "/api/v1/public/trips/schedules",
+        "/api/v1/public/ferry-fares/schedule-base-price",
+        "/api/v1/public/policy-sections",
+    }
+    if not required_icom_paths.issubset(icom_http_paths):
+        raise AssertionError("real iCom provider did not cross every public HTTP boundary")
+    if companion_heartbeat_status != 200:
+        raise AssertionError("Companion was not registered through the mounted HTTP entry")
 
 
 class _RealChainArtifacts:
@@ -12969,7 +12983,6 @@ class _RealChainArtifacts:
         *,
         run: Any,
         cs: Any,
-        snap: Any,
         request_sha256: str,
         report: Any,
         publication_run: Any,
@@ -12977,11 +12990,15 @@ class _RealChainArtifacts:
         head: str,
         binding: dict[str, object],
         observed_by_pair: dict[str, tuple[str, ...]],
-        recorded: dict[str, int],
+        raw_output: Path,
+        raw_payload: dict[str, Any],
+        restored: dict[str, bool],
+        composition_types: dict[str, str],
+        icom_http_paths: tuple[str, ...],
+        companion_heartbeat_status: int,
     ) -> None:
         self.run = run
         self.cs = cs
-        self.snap = snap
         self.request_sha256 = request_sha256
         self.report = report
         self.publication_run = publication_run
@@ -12989,371 +13006,320 @@ class _RealChainArtifacts:
         self.head = head
         self.binding = binding
         self.observed_by_pair = observed_by_pair
-        self.recorded = recorded
+        self.raw_output = raw_output
+        self.raw_payload = raw_payload
+        self.restored = restored
+        self.composition_types = composition_types
+        self.icom_http_paths = icom_http_paths
+        self.companion_heartbeat_status = companion_heartbeat_status
 
 
-async def _drive_real_production_chain() -> _RealChainArtifacts:
-    """Drive the REAL production chain once and return every artifact it seals.
+async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts:
+    """Run the formal runner against the real in-process production API.
 
-    No fixture / monkeypatch replaces any production entry: the flexible run,
-    the per-pair executions, the control-plane checkpoints, the event replan
-    and the official producer all run on the real in-process runtime (a
-    read-only, controlled BrowserTaskBridge serves the frozen scenario only).
+    Only transport, clocks, and the output path are bounded.  The formal
+    ``run_live_done_gate_v4._run`` owns request loading, runtime/Companion
+    preflight, async job submission, checkpoint validation, event replan,
+    producer evaluation, completed-bundle construction, and the atomic 0600
+    evidence write.  No production class/function is replaced: black-box
+    persisted evidence proves every required stage, and the enclosing
+    ``try/finally`` restores the bounded in-process API transport state.
     """
-    from tripchord.agents.agent_budget import AgentBudgetLedger, bind_agent_budget
-    from tripchord.agents.context_budget import BudgetedAgentContextBuilder
+    import httpx
+    import tripchord.main as api_main
     from tripchord.agents.flexible_live_system import FlexibleLiveAgentSystem
-    from tripchord.agents.live_done_gate_v4 import evaluate_live_v4_done_gate
-    from tripchord.agents.live_jobs import (
-        LivePlanningJobRegistry,
-        LivePlanningJobState,
-        _RegistryProgressReporter,
-    )
+    from tripchord.agents.live_done_gate_v4 import LiveV4DoneGateReport
     from tripchord.agents.live_system import (
-        LiveCoverageMode,
+        LiveEventReplanRun,
+        LivePackageAgentRun,
         LivePackageAgentSystem,
     )
-    from tripchord.agents.memory import MemoryStore
-    from tripchord.agents.rag import EvidenceRagRetriever
-    from tripchord.planning.flexible_dates import (
-        LIVE_V5_PLATFORMS,
-        FlexibleDateExplorer,
-        FlexibleQueryPlanBuilder,
-    )
-    from tripchord.providers.browser_bridge import BrowserTaskBridge
-
-    from benchmarks.run_live_done_gate_v4 import (
-        _event_target,
-        _selected_option,
-        _synthetic_sold_out_event_body,
-        _validate_synthetic_sold_out_replan,
-        _validate_terminal_pair_checkpoints,
+    from tripchord.main import app
+    from tripchord.providers.browser_bridge import (
+        BRIDGE_TOKEN_HEADER,
+        BrowserProvider,
+        BrowserTaskLease,
     )
 
-    recorded: dict[str, int] = {
-        "run_entry_calls": 0,
-        "live_run_calls": 0,
-        "checkpoint_calls": 0,
-    }
+    from benchmarks import run_live_done_gate_v4
 
-    bridge = BrowserTaskBridge(now=lambda: NOW)
-    memory_store = MemoryStore()
-    context_builder = BudgetedAgentContextBuilder(EvidenceRagRetriever(memory_store))
-    live_system = LivePackageAgentSystem(
-        bridge,
-        icom_provider=_C4FrozenIComProvider(),
-        model_router=None,
-        model_agents_required=False,
-        context_builder=context_builder,
-        memory_store=memory_store,
-        now=lambda: NOW,
-        sleep=_c4_noop_sleep,
-    )
-    flexible_system = FlexibleLiveAgentSystem(
-        live_system,  # type: ignore[arg-type]
-        explorer=FlexibleDateExplorer(platforms=LIVE_V5_PLATFORMS),
-        query_planner=FlexibleQueryPlanBuilder(platforms=LIVE_V5_PLATFORMS),
-        minimum_departure_lead_days=7,
-        model_router=None,
-        model_agents_required=False,
-        context_builder=context_builder,
-        memory_store=memory_store,
-        now=lambda: NOW,
-        adaptive_agent_scaling_enabled=False,
-    )
-
-    # Instrument the REAL runtime entry points — wrap-and-delegate only, so the
-    # assertions prove the production path ACTUALLY fired without replacing it:
-    # (1) FlexibleLiveAgentSystem.run() production entry,
-    # (2) the per-pair LivePackageAgentSystem.run() that execute_pair() calls,
-    # (3) the JobControlPlane report_pair_checkpoint() that forms checkpoints.
+    # These identities are never patched.  Retaining and checking them makes
+    # process-isolation regressions explicit without global instrumentation.
     _orig_run = FlexibleLiveAgentSystem.run
-
-    async def _record_run(self: Any, *args: Any, **kwargs: Any) -> Any:
-        recorded["run_entry_calls"] += 1
-        return await _orig_run(self, *args, **kwargs)
-
-    FlexibleLiveAgentSystem.run = _record_run  # type: ignore[method-assign]
-
     _orig_live_run = LivePackageAgentSystem.run
+    _orig_completed = run_live_done_gate_v4._completed_evidence_bundle
+    _orig_write = run_live_done_gate_v4._write_evidence_bundle
 
-    async def _record_live_run(self: Any, *args: Any, **kwargs: Any) -> Any:
-        recorded["live_run_calls"] += 1
-        return await _orig_live_run(self, *args, **kwargs)
-
-    LivePackageAgentSystem.run = _record_live_run  # type: ignore[method-assign]
-
-    _orig_ckpt = _RegistryProgressReporter.report_pair_checkpoint
-
-    async def _record_ckpt(self: Any, checkpoint: Any, *args: Any, **kwargs: Any) -> Any:
-        recorded["checkpoint_calls"] += 1
-        return await _orig_ckpt(self, checkpoint, *args, **kwargs)
-
-    _RegistryProgressReporter.report_pair_checkpoint = _record_ckpt  # type: ignore[method-assign]
-
-    registry = LivePlanningJobRegistry(now=lambda: datetime.now(UTC))
-    cs = _frozen_candidate_set()
-    budget = AgentBudgetLedger()
-    budget_ctx = bind_agent_budget(budget)
-
-    window = _FROZEN_V4_TRAVEL_WINDOW
-    request = json.loads(
-        (_C4_REPO_ROOT / "benchmarks/scenarios/live-hgh-mle-aug-2026-v4.json").read_text()
+    original_routes = tuple(app.router.routes)
+    state_names = (
+        "browser_task_bridge",
+        "live_package_agent_system",
+        "flexible_live_agent_system",
+        "icom_transfer_provider",
+        "browser_bridge_token",
+        "browser_bridge_control_token",
+        "browser_bridge_control_enabled",
+        "browser_companion_auto_reload_enabled",
+        "browser_companion_runtime_agent",
+        "browser_companion_runtime_supervisor",
     )
-    request["requirement"]["reference_date"] = "2026-07-30"
-    api_payload = {
-        "requirement": request["requirement"],
-        "calendars": request.get("calendars", []),
-        "coverage_mode": request["coverage_mode"],
-        "max_pairs": request["max_pairs"],
-        "timeout_seconds": request["timeout_seconds"],
-        "total_timeout_seconds": request["total_timeout_seconds"],
-        "publication_refresh_minimum_options": 2,
-        "stay_plan_candidate_set": cs.model_dump(mode="json"),
+    missing = object()
+    original_state = {
+        name: getattr(app.state, name, missing)
+        for name in state_names
     }
-    request_sha256 = _c4_canonical_sha256(api_payload)
+    original_model_router = api_main.model_router
+    original_model_trace_sink = api_main.model_trace_sink
+    restored: dict[str, bool] = {}
 
-    captured: dict[str, Any] = {}
+    bridge_token = "c4-formal-run-local-bridge-token-000000000000"
+    companion_id = "c4-formal-run-companion"
+    raw_output = staging_dir.parent / "formal-run" / "live-done-gate-v4.json"
+    icom_harness = _C4IComHTTPHarness()
+    icom_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(icom_harness),
+    )
+    composition_types: dict[str, str] = {}
+    companion_heartbeat_status = 0
 
-    async def operation(report: Any) -> dict[str, Any]:
-        run = await flexible_system.run(
-            window,
-            (),
-            mode=LiveCoverageMode.STRICT,
-            max_pairs=3,
-            timeout_seconds=60,
-            stay_plan_candidate_set=cs,
-            publication_refresh_minimum_options=2,
-            memory_access=None,
-            pair_checkpoint_reporter=report.report_pair_checkpoint,
-            checkpoint_request_sha256=request_sha256,
-            reference_date=date(2026, 7, 30),
-        )
-        captured["run"] = run
-        return run.model_dump(mode="json")
-
-    terminal_states = {
-        LivePlanningJobState.SUCCEEDED,
-        LivePlanningJobState.FAILED,
-        LivePlanningJobState.CANCELLED,
-    }
-    budget_ctx.__enter__()
-    try:
-        job, _replayed = await registry.start_idempotent(
-            tenant_id="c4-test-tenant",
-            operation=operation,
-            request_digest=request_sha256,
-            deadline_seconds=600,
-        )
-        serve_task = asyncio.create_task(_serve(bridge, 200, _c4_frozen_success))
-        try:
+    async def serve_browser_transport() -> None:
+        headers = {BRIDGE_TOKEN_HEADER: bridge_token}
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=app,
+                client=("127.0.0.1", 51343),
+            ),
+            base_url="http://tripchord.test",
+            headers=headers,
+        ) as companion_client:
             while True:
-                snap = await registry.get(job.id, "c4-test-tenant")
-                if snap is None:
-                    break
-                if snap.state in terminal_states:
-                    break
-                await registry.wait_for_change(
-                    job.id,
-                    "c4-test-tenant",
-                    after_revision=snap.revision,
-                    timeout_seconds=30,
+                response = await companion_client.post(
+                    "/browser-bridge/v1/tasks/claim",
+                    json={
+                        "companion_id": companion_id,
+                        "providers": ["ctrip", "qunar", "tongcheng"],
+                        "authorized_scope_keys": sorted(
+                            gate._CERTIFIED_OTA_SCOPES
+                        ),
+                        "adapter_version": "c4-formal-http-transport",
+                        "contract_version": "tripchord-browser-companion-v1",
+                        "limit": 6,
+                    },
                 )
-        finally:
+                response.raise_for_status()
+                leases = tuple(
+                    BrowserTaskLease.model_validate(item)
+                    for item in response.json()["leases"]
+                )
+                if not leases:
+                    await asyncio.sleep(0)
+                    continue
+                for lease in leases:
+                    is_event_recheck = (
+                        lease.kind == BrowserVertical.LODGING
+                        and lease.query.options.get(
+                            "__tripchord_allow_recent_quote_reuse"
+                        )
+                        is False
+                    )
+                    completion = (
+                        _c4_event_source_replacement(lease)
+                        if is_event_recheck
+                        else _c4_frozen_success(lease)
+                    )
+                    completed = await companion_client.post(
+                        f"/browser-bridge/v1/tasks/{lease.task_id}/complete",
+                        json={
+                            "claim_token": lease.claim_token,
+                            "completion": completion.model_dump(mode="json"),
+                        },
+                    )
+                    completed.raise_for_status()
+
+    def client_factory(**kwargs: Any) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=app,
+                client=("127.0.0.1", 51342),
+            ),
+            **kwargs,
+        )
+
+    serve_task: asyncio.Task[None] | None = None
+    try:
+        # The production composition entry creates and binds the real bridge,
+        # provider, pair runner, flexible runner, and mounted bridge API.  The
+        # test never assembles those objects or writes their app.state slots.
+        configured = api_main.settings.model_copy(
+            update={
+                "browser_bridge_enabled": True,
+                "browser_bridge_token": bridge_token,
+                "browser_bridge_control_token": None,
+                "browser_companion_auto_reload_enabled": False,
+                "model_agents_required": False,
+                "adaptive_agent_scaling_enabled": False,
+            }
+        )
+        bridge, live_system = api_main._install_browser_bridge(
+            app,
+            configured,
+            icom_http_client=icom_client,
+            now=lambda: NOW,
+            sleep=_c4_noop_sleep,
+        )
+        assert bridge is not None and live_system is not None
+        flexible_system = app.state.flexible_live_agent_system
+        icom_provider = app.state.icom_transfer_provider
+        composition_types = _c4_validate_formal_composition(
+            bridge,
+            live_system,
+            flexible_system,
+            icom_provider,
+        )
+        await api_main.database.create_schema()
+
+        # Companion presence is reported through the mounted production HTTP
+        # endpoint, exactly as the real extension does; no direct heartbeat
+        # mutation is allowed in the positive chain.
+        async with client_factory(base_url="http://tripchord.test") as setup_client:
+            heartbeat = await setup_client.post(
+                "/browser-bridge/v1/companions/heartbeat",
+                headers={BRIDGE_TOKEN_HEADER: bridge_token},
+                json={
+                    "companion_id": companion_id,
+                    "providers": [
+                        BrowserProvider.CTRIP.value,
+                        BrowserProvider.QUNAR.value,
+                        BrowserProvider.TONGCHENG.value,
+                    ],
+                    "authorized_scope_keys": sorted(
+                        gate._CERTIFIED_OTA_SCOPES
+                    ),
+                    "adapter_version": "c4-formal-http-transport",
+                    "contract_version": "tripchord-browser-companion-v1",
+                },
+            )
+            companion_heartbeat_status = heartbeat.status_code
+            heartbeat.raise_for_status()
+
+        serve_task = asyncio.create_task(serve_browser_transport())
+        args = SimpleNamespace(
+            request=(
+                _C4_REPO_ROOT
+                / "benchmarks/scenarios/live-hgh-mle-aug-2026-v4.json"
+            ),
+            output=raw_output,
+            api_base="http://tripchord.test",
+            api_token="",
+            bridge_token=bridge_token,
+            request_timeout_seconds=3900.0,
+            maximum_quote_age_minutes=15,
+            minimum_recommendable_options=2,
+            require_model_enhancement=False,
+        )
+        code = await run_live_done_gate_v4._run(
+            args,
+            client_factory=client_factory,
+            now_factory=lambda: NOW,
+        )
+        assert code == 0, "formal live-v4 runner must complete and pass"
+    finally:
+        if serve_task is not None:
             serve_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await serve_task
-
-        snap = await registry.get(job.id, "c4-test-tenant")
-        assert snap is not None, "real job produced no terminal snapshot"
-        assert snap.state == LivePlanningJobState.SUCCEEDED, (
-            f"real job did not succeed: failure={snap.safe_failure} error={snap.error}"
-        )
-        run = captured.get("run")
-        assert run is not None, "real runtime captured no run"
-        assert len(run.pair_runs) == 3, "real run must seal exactly 3 pair runs"
-
-        observed_by_pair = {
-            execution.date_pair.id: tuple(task.id for task in execution.query_tasks)
-            for execution in run.pair_runs
+        await icom_client.aclose()
+        app.router.routes[:] = original_routes
+        for name, value in original_state.items():
+            if value is missing:
+                delattr(app.state, name)
+            else:
+                setattr(app.state, name, value)
+        restored = {
+            "flexible_run": FlexibleLiveAgentSystem.run is _orig_run,
+            "live_run": LivePackageAgentSystem.run is _orig_live_run,
+            "completed_bundle": (
+                run_live_done_gate_v4._completed_evidence_bundle
+                is _orig_completed
+            ),
+            "write_bundle": (
+                run_live_done_gate_v4._write_evidence_bundle is _orig_write
+            ),
+            "app_routes": tuple(app.router.routes) == original_routes,
+            "app_state": all(
+                (
+                    not hasattr(app.state, name)
+                    if value is missing
+                    else getattr(app.state, name) is value
+                )
+                for name, value in original_state.items()
+            ),
+            "main_globals": (
+                api_main.model_router is original_model_router
+                and api_main.model_trace_sink is original_model_trace_sink
+            ),
         }
 
-        _sel_id, _sel_pair, _exploration_run, publication_run = _selected_option(run)
-        target_id, provider = _event_target(publication_run)
-        event_body = _synthetic_sold_out_event_body(
-            target_id,
-            provider,
-            injected_at=NOW,
-        )
-        event_lease = LivePackageEvent.model_validate(event_body["event"])
-        event_serve = asyncio.create_task(_serve(bridge, 1, _c4_event_source_replacement))
-        try:
-            event = await live_system.replan_after_event(
-                publication_run,
-                event_lease,
-                timeout_seconds=120,
-                memory_access=None,
-            )
-        finally:
-            event_serve.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await event_serve
-        validation = _validate_synthetic_sold_out_replan(
-            publication_run,
-            event,
-            target_component_id=target_id,
-            affected_provider=provider,
-        )
-        assert validation["passed"], f"real event replan failed: {validation}"
-
-        report = evaluate_live_v4_done_gate(
-            run,
-            expected_candidate_set=cs,
-            selected_initial=publication_run,
-            event=event,
-            evaluated_at=NOW,
-            maximum_quote_age_minutes=15,
-            minimum_recommendable_options=2,
-            minimum_exact_providers_per_selected_segment=2,
-        )
-        assert report.passed, (
-            "real producer must pass 15/15, failed: "
-            + ", ".join(c.name for c in report.checks if not c.passed)
-        )
-        assert sum(1 for c in report.checks if c.passed) == 15
-
-        binding = _validate_terminal_pair_checkpoints(snap, run)
-        assert binding["passed"] is True and binding["count"] == 3
-
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=str(_C4_REPO_ROOT),
-        ).stdout.strip()
-        assert len(head) == 40
-
-        return _RealChainArtifacts(
-            run=run,
-            cs=cs,
-            snap=snap,
-            request_sha256=request_sha256,
-            report=report,
-            publication_run=publication_run,
-            event=event,
-            head=head,
-            binding=binding,
-            observed_by_pair=observed_by_pair,
-            recorded=recorded,
-        )
-    finally:
-        budget_ctx.__exit__(None, None, None)
+    actual_output = raw_output
+    raw_payload = json.loads(actual_output.read_text(encoding="utf-8"))
+    run = run_live_done_gate_v4.FlexibleLiveAgentRun.model_validate(
+        raw_payload["flexible_run"]
+    )
+    report = LiveV4DoneGateReport.model_validate(raw_payload["done_gate"])
+    publication_run = LivePackageAgentRun.model_validate(
+        raw_payload["selected_publication_run"]
+    )
+    event = LiveEventReplanRun.model_validate(raw_payload["event_run"])
+    binding = dict(raw_payload["pair_checkpoint_binding"])
+    request_sha256 = str(raw_payload["request_identity"]["api_payload_sha256"])
+    observed_by_pair = {
+        execution.date_pair.id: tuple(task.id for task in execution.query_tasks)
+        for execution in run.pair_runs
+    }
+    return _RealChainArtifacts(
+        run=run,
+        cs=_frozen_candidate_set(),
+        request_sha256=request_sha256,
+        report=report,
+        publication_run=publication_run,
+        event=event,
+        head=str(raw_payload["repo_revision"]["commit_sha"]),
+        binding=binding,
+        observed_by_pair=observed_by_pair,
+        raw_output=actual_output,
+        raw_payload=raw_payload,
+        restored=restored,
+        composition_types=composition_types,
+        icom_http_paths=tuple(icom_harness.paths),
+        companion_heartbeat_status=companion_heartbeat_status,
+    )
 
 
 _c4_chain_cache: dict[str, _RealChainArtifacts] = {}
 
 
-def _real_production_chain() -> _RealChainArtifacts:
-    """Run the real production chain exactly once per test session and share the
-    frozen artifacts between the positive and the counterexample matrix."""
+def _real_production_chain(staging_dir: Path) -> _RealChainArtifacts:
+    """Run the formal production chain once and share its persisted raw file."""
     if "artifacts" not in _c4_chain_cache:
-        _c4_chain_cache["artifacts"] = asyncio.run(_drive_real_production_chain())
+        _c4_chain_cache["artifacts"] = asyncio.run(
+            _drive_real_production_chain(staging_dir)
+        )
     return _c4_chain_cache["artifacts"]
 
 
-def _c4_raw_payload(
+def _c4_raw_variant(
     artifacts: _RealChainArtifacts,
     *,
     done_gate: dict[str, object] | None = None,
     binding: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """The raw layer-6 runner bundle built ONLY from real artifacts — the real
-    producer report, the real control-plane checkpoint binding, real HEAD and
-    the real candidate-set / request SHA.  ``done_gate`` / ``binding`` may be
-    replaced by a counterexample mutation; the base is always the real bundle."""
-    cs = artifacts.cs
-    head = artifacts.head
-    request_sha256 = artifacts.request_sha256
-    binding = binding if binding is not None else artifacts.binding
-    done_gate = (
-        done_gate
-        if done_gate is not None
-        else artifacts.report.model_dump(mode="json")
-    )
-    return {
-        "schema_version": "tripchord-live-v4-done-gate-report",
-        "run_status": "completed",
-        "captured_at": NOW.isoformat(),
-        "repo_revision": {
-            "toplevel": str(_C4_REPO_ROOT),
-            "branch": "main",
-            "commit_sha": head,
-            "worktree_dirty": False,
-        },
-        "start_revision": {
-            "toplevel": str(_C4_REPO_ROOT),
-            "branch": "main",
-            "commit_sha": head,
-            "worktree_dirty": False,
-        },
-        "runtime_before_run": {
-            "model_provider": "frozen-in-process",
-            "primary_model": "deterministic-fixture",
-            "model_enabled": False,
-            "model_required": False,
-            "runtime_provenance": {
-                "repo_toplevel": str(_C4_REPO_ROOT),
-                "commit_sha": head,
-                "dependency_lock_sha256": None,
-                "live_system_source_sha256": None,
-                "python_version": "3.12",
-                "started_at": "2026-08-10T00:00:00+00:00",
-            },
-        },
-        "companion_preflight": {
-            "status": "connected",
-            "stale_after_seconds": 45,
-            "companions": [
-                {
-                    "companion_id": "c4-test-companion",
-                    "providers": ["ctrip", "qunar", "tongcheng"],
-                    "is_fresh": True,
-                    "age_seconds": 3,
-                    "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
-                }
-            ],
-        },
-        "done_gate": done_gate,
-        "api_payload_candidate_set_sha256": cs.candidate_set_sha256,
-        "request_identity": {
-            "scenario_sha256": request_sha256,
-            "api_payload_sha256": request_sha256,
-            "digests_are_distinct_contracts": True,
-        },
-        "scenario_sha256": request_sha256,
-        "event_injection_contract": {
-            "mode": "synthetic_sold_out_fault_injection",
-            "source": "tripchord-synthetic-done-gate-fault-injection",
-            "platform_sold_out_observed": False,
-            "platform_price_change_observed": False,
-            "verified_change_scope": (
-                "different_available_replacement_identity_not_platform_sold_out"
-            ),
-            "claim_boundary": "only_affected_component_recheck",
-        },
-        "timeout_contract": {
-            "server_execution_timeout_seconds": 3600,
-            "client_wait_timeout_seconds": 3600,
-            "minimum_client_margin_seconds": 30,
-        },
-        "runner_contract": {
-            "require_model_enhancement": False,
-            "maximum_quote_age_minutes": 15,
-            "minimum_recommendable_options": 2,
-        },
-        "context": {"pair_checkpoint_binding": binding},
-    }
+    """Mutate a deep copy of the formal runner's persisted raw payload."""
+    payload = copy.deepcopy(artifacts.raw_payload)
+    if done_gate is not None:
+        payload["done_gate"] = done_gate
+    if binding is not None:
+        payload["pair_checkpoint_binding"] = binding
+    return payload
 
 
 def _c4_rebuild_checkpoint(
@@ -13525,18 +13491,34 @@ def _setup_real_bridge_state(
 
 
 def _compact_via_real_writer(
-    monkeypatch: pytest.MonkeyPatch, staging_dir: Path, payload: dict[str, object]
+    monkeypatch: pytest.MonkeyPatch, staging_dir: Path, raw_source: Path
 ) -> dict[str, object]:
-    """Feed a raw payload through the REAL layer-6 compact writer
-    (``_compact_live_e2e``) and return the compact artifact."""
+    """Read a persisted formal raw file through the real compact writer."""
     _setup_real_bridge_state(monkeypatch, staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
-    (staging_dir / "live-done-gate-v4.json").write_text(
-        json.dumps(payload), encoding="utf-8"
-    )
+    raw_target = staging_dir / "live-done-gate-v4.json"
+    raw_target.write_bytes(raw_source.read_bytes())
+    raw_target.chmod(0o600)
     compact = gate._compact_live_e2e(staging_dir)
     assert compact is not None, "real compact writer produced no layer-6 compact"
     return compact
+
+
+def _persist_c4_raw_variant(
+    artifacts: _RealChainArtifacts,
+    staging_dir: Path,
+    payload: dict[str, object],
+) -> Path:
+    """Persist one adversarial derivative with the formal atomic 0600 writer."""
+    from benchmarks import run_live_done_gate_v4
+
+    captured_at = datetime.fromisoformat(str(artifacts.raw_payload["captured_at"]))
+    return run_live_done_gate_v4._write_evidence_bundle(
+        staging_dir.parent / "formal-run-variants" / "live-done-gate-v4.json",
+        payload,
+        passed=bool(payload.get("done_gate", {}).get("passed")),
+        captured_at=captured_at,
+    )
 
 
 def _run_with_cross_pair_swap(run: Any) -> Any:
@@ -13648,50 +13630,78 @@ def _run_with_rewritten_last_query_task(
 def test_verify_layer6_compact_contract_accepts_real_production_chain(
     monkeypatch: pytest.MonkeyPatch, staging_dir: Path
 ) -> None:
-    """C-round4 (fresh RETURN): the POSITIVE goes through the REAL production
-    runtime chain end to end —
-    ``FlexibleLiveAgentSystem.run()`` entry → ``execute_pair()`` (real per-pair
-    ``LivePackageAgentSystem.run()``) → ``JobControlPlane.report_pair_checkpoint()``
-    forming the checkpoints → the real runner artifact → the official 15-check
-    ``evaluate_live_v4_done_gate`` → the real compact writer ``_compact_live_e2e``
-    → ``_verify_layer6_compact_contract``.  Every segment is asserted to have
-    ACTUALLY fired, and the checkpoint binding / compact / run all carry the SAME
-    run / pair / query identity."""
+    """The formal runner self-produces the positive raw evidence end to end.
 
-    artifacts = _real_production_chain()
+    Only transport, time, and the output path are injected.  The persisted
+    completed bundle is the black-box proof that the production run, per-pair
+    execution/checkpoints, 15-check producer, bundle builder, and 0600 writer
+    all completed with one run / pair / query identity.
+    """
 
-    # (1) Production entry, execute_pair per-pair expansion and the
-    # control-plane checkpoint reporter all ACTUALLY fired on the real runtime.
-    assert artifacts.recorded["run_entry_calls"] >= 1, (
-        "FlexibleLiveAgentSystem.run() production entry never fired"
+    artifacts = _real_production_chain(staging_dir)
+
+    # (1) The formal composition graph and the two permitted transport
+    # boundaries were actually exercised.  A provider stub, manually assembled
+    # system graph, or direct bridge heartbeat cannot produce these receipts.
+    _c4_validate_formal_transport_receipts(
+        composition_types=artifacts.composition_types,
+        icom_http_paths=artifacts.icom_http_paths,
+        companion_heartbeat_status=artifacts.companion_heartbeat_status,
     )
-    assert artifacts.recorded["live_run_calls"] >= 3, (
-        "execute_pair() per-pair LivePackageAgentSystem.run() never fired"
-    )
-    assert artifacts.recorded["checkpoint_calls"] >= 3, (
-        "JobControlPlane.report_pair_checkpoint() never fired"
+    assert all(
+        execution.run is not None
+        and execution.run.public_transfer_coverage.complete
+        and execution.run.public_transfer_coverage.usable_option_count > 0
+        for execution in artifacts.run.pair_runs
     )
 
-    # (2) The real runner artifact: 3 real per-pair runs + 3 real control-plane
-    # checkpoints.
+    # (2) A formal completed bundle exists.  `_run` has no other success path:
+    # these fields are supplied by `_completed_evidence_bundle` only after the
+    # live run, checkpoint validation, event run, and 15-check evaluation.
+    assert artifacts.raw_payload["schema_version"] == "tripchord-live-evidence-v4"
+    assert artifacts.raw_payload["run_status"] == "completed"
+    assert artifacts.raw_payload["done_gate"]["passed"] is True
+    assert artifacts.raw_payload["flexible_run"]["pair_runs"]
+    assert artifacts.raw_payload["event_run"]["source_task_ids"]
+
+    # (3) The formal runner artifact has 3 real per-pair runs and 3 matching
+    # control-plane checkpoints, proving pair expansion and reporting occurred.
     assert len(artifacts.run.pair_runs) == 3
-    assert len(artifacts.snap.pair_checkpoints) == 3
+    assert artifacts.binding["count"] == 3
+    assert len(artifacts.binding["bindings"]) == 3
 
-    # (3) The official full producer passes 15/15.
+    # (4) The official full producer passes 15/15.
     assert artifacts.report.passed
     assert sum(1 for c in artifacts.report.checks if c.passed) == 15
 
-    # (4) Real compact writer → real consumer accepts, verified against the same
+    # (5) The formal atomic writer produced a private raw file, and no shared
+    # production function/class identity or in-process API state was changed.
+    assert stat.S_IMODE(artifacts.raw_output.stat().st_mode) == 0o600
+    assert artifacts.raw_payload["repo_revision"]["branch"] == (
+        subprocess.run(
+            ["git", "branch", "--show-current"],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=str(_C4_REPO_ROOT),
+        ).stdout.strip()
+    )
+    assert all(artifacts.restored.values()), artifacts.restored
+
+    # (6) Real compact writer → real consumer accepts, verified against the same
     # real HEAD the runner artifact names.
-    payload = _c4_raw_payload(artifacts)
-    compact = _compact_via_real_writer(monkeypatch, staging_dir, payload)
+    compact = _compact_via_real_writer(
+        monkeypatch,
+        staging_dir,
+        artifacts.raw_output,
+    )
     gate._verify_layer6_compact_contract(
         "done-gate-layer6-compact.json",
         compact,
         tested_commit_sha=artifacts.head,
     )
 
-    # (5) Identity binding: the checkpoint binding, the compact's per-pair ids
+    # (7) Identity binding: the checkpoint binding, the compact's per-pair ids
     # and the run's ACTUAL observed query-task ids are the SAME per pair, and
     # the request identity binds checkpoint → compact api_payload → run.
     for check in compact["done_gate"]["checks"]:
@@ -13714,6 +13724,58 @@ def test_verify_layer6_compact_contract_accepts_real_production_chain(
         assert entry["request_sha256"] == artifacts.request_sha256
 
 
+def test_c4_formal_entry_rejects_provider_and_companion_bypasses() -> None:
+    """A domain provider stub or direct-heartbeat/manual-composition bypass
+    cannot satisfy the C-round4 positive's entry receipts."""
+    from tripchord.agents.flexible_live_system import FlexibleLiveAgentSystem
+    from tripchord.agents.live_system import LivePackageAgentSystem
+    from tripchord.providers.browser_bridge import BrowserTaskBridge
+
+    class _BypassProvider:
+        async def search(self, _query: Any) -> Any:  # pragma: no cover - rejected first
+            raise AssertionError("must never execute")
+
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    live_system = LivePackageAgentSystem(
+        bridge,
+        icom_provider=_BypassProvider(),
+        now=lambda: NOW,
+        sleep=_c4_noop_sleep,
+    )
+    flexible_system = FlexibleLiveAgentSystem(
+        live_system,
+        now=lambda: NOW,
+    )
+    with pytest.raises(AssertionError, match="real iCom provider"):
+        _c4_validate_formal_composition(
+            bridge,
+            live_system,
+            flexible_system,
+            live_system._icom_provider,
+        )
+    with pytest.raises(AssertionError, match="formal app composition receipt"):
+        _c4_validate_formal_transport_receipts(
+            composition_types={},
+            icom_http_paths=(),
+            companion_heartbeat_status=200,
+        )
+    with pytest.raises(AssertionError, match="mounted HTTP entry"):
+        _c4_validate_formal_transport_receipts(
+            composition_types={
+                "bridge": "BrowserTaskBridge",
+                "live_system": "LivePackageAgentSystem",
+                "flexible_system": "FlexibleLiveAgentSystem",
+                "icom_provider": "IComTransferProvider",
+            },
+            icom_http_paths=(
+                "/api/v1/public/trips/schedules",
+                "/api/v1/public/ferry-fares/schedule-base-price",
+                "/api/v1/public/policy-sections",
+            ),
+            companion_heartbeat_status=0,
+        )
+
+
 def test_verify_layer6_compact_contract_real_production_chain_adversarial_matrix(
     monkeypatch: pytest.MonkeyPatch, staging_dir: Path
 ) -> None:
@@ -13727,7 +13789,7 @@ def test_verify_layer6_compact_contract_real_production_chain_adversarial_matrix
         evaluate_live_v4_done_gate,
     )
 
-    artifacts = _real_production_chain()
+    artifacts = _real_production_chain(staging_dir)
     canonical_run = artifacts.run
     cs = artifacts.cs
 
@@ -13782,8 +13844,9 @@ def test_verify_layer6_compact_contract_real_production_chain_adversarial_matrix
         for check in forged_done_gate["checks"]:
             if check["name"] == "v4_source_graph":
                 check["evidence"] = dict(mutated_evidence)
-        payload = _c4_raw_payload(artifacts, done_gate=forged_done_gate)
-        compact = _compact_via_real_writer(monkeypatch, staging_dir, payload)
+        payload = _c4_raw_variant(artifacts, done_gate=forged_done_gate)
+        raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
+        compact = _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
         with pytest.raises(gate.GateStateChangedError):
             gate._verify_layer6_compact_contract(
                 "done-gate-layer6-compact.json",
@@ -13806,14 +13869,29 @@ def test_verify_layer6_compact_contract_real_production_chain_adversarial_matrix
         ),
     }
     for _name, mutated_binding in binding_cases.items():
-        payload = _c4_raw_payload(artifacts, binding=mutated_binding)
-        compact = _compact_via_real_writer(monkeypatch, staging_dir, payload)
+        payload = _c4_raw_variant(artifacts, binding=mutated_binding)
+        raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
+        compact = _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
         with pytest.raises(gate.GateStateChangedError):
             gate._verify_layer6_compact_contract(
                 "done-gate-layer6-compact.json",
                 compact,
                 tested_commit_sha=artifacts.head,
             )
+
+    # A legacy test-only context wrapper cannot contradict the formal runner's
+    # top-level checkpoint binding and make the compact writer choose whichever
+    # copy helps an attacker.
+    payload = _c4_raw_variant(artifacts)
+    payload["context"] = {
+        "pair_checkpoint_binding": _c4_binding_drop(artifacts.binding)
+    }
+    raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="conflicting top-level and legacy context",
+    ):
+        _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
 
     # --- raw/compact injection: an injected foreign check (present-set
     # mismatch) and a passed=true check with injected empty evidence both fail
@@ -13830,8 +13908,9 @@ def test_verify_layer6_compact_contract_real_production_chain_adversarial_matrix
     )
     injected_done_gate["check_count"] = len(injected_done_gate["checks"])
     injected_done_gate["passed_check_count"] = len(injected_done_gate["checks"])
-    payload = _c4_raw_payload(artifacts, done_gate=injected_done_gate)
-    compact = _compact_via_real_writer(monkeypatch, staging_dir, payload)
+    payload = _c4_raw_variant(artifacts, done_gate=injected_done_gate)
+    raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
+    compact = _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
     with pytest.raises(gate.GateStateChangedError, match="check_count != 15"):
         gate._verify_layer6_compact_contract(
             "done-gate-layer6-compact.json",
@@ -13845,8 +13924,9 @@ def test_verify_layer6_compact_contract_real_production_chain_adversarial_matrix
     for check in empty_evidence_done_gate["checks"]:
         check["passed"] = True
         check["evidence"] = {}
-    payload = _c4_raw_payload(artifacts, done_gate=empty_evidence_done_gate)
-    compact = _compact_via_real_writer(monkeypatch, staging_dir, payload)
+    payload = _c4_raw_variant(artifacts, done_gate=empty_evidence_done_gate)
+    raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
+    compact = _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
     with pytest.raises(gate.GateStateChangedError):
         gate._verify_layer6_compact_contract(
             "done-gate-layer6-compact.json",
