@@ -36,7 +36,10 @@ from tripchord.api import (
     LiveFlexibleFromTextPlanningRequest,
     StartLiveFlexibleFromTextJobResponse,
 )
-from tripchord.formal_live_source import build_formal_source_binding
+from tripchord.formal_live_source import (
+    build_formal_source_binding,
+    validate_formal_source_binding,
+)
 from tripchord.planning.event_contracts import EventDisposition
 from tripchord.planning.offer_semantics import (
     OfferIdentityConfidence,
@@ -354,7 +357,20 @@ def _write_evidence_bundle(
     *,
     passed: bool,
     captured_at: datetime,
+    formal_source_validator: Callable[[object], dict[str, object]] | None = None,
 ) -> Path:
+    if passed and bundle.get("run_status") == "completed":
+        binding = bundle.get("formal_live_source_binding")
+        if not isinstance(binding, dict):
+            raise RuntimeError(
+                "completed raw evidence formal_live_source_binding is missing or not an object"
+            )
+        try:
+            (formal_source_validator or validate_formal_source_binding)(binding)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"completed raw evidence has invalid formal production source binding: {exc}"
+            ) from exc
     output = _evidence_output_path(
         requested,
         passed=passed,
@@ -424,8 +440,22 @@ def _completed_evidence_bundle(
     captured_at: datetime,
     context: dict[str, Any],
     repo_revision: dict[str, Any] | None = None,
+    formal_source_validator: Callable[[object], dict[str, object]] | None = None,
 ) -> dict[str, Any]:
     """Materialize a completed run without dropping pre-run evidence context."""
+
+    if report.passed:
+        binding = context.get("formal_live_source_binding")
+        if not isinstance(binding, dict):
+            raise RuntimeError(
+                "completed bundle formal_live_source_binding is missing or not an object"
+            )
+        try:
+            (formal_source_validator or validate_formal_source_binding)(binding)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"completed bundle has invalid formal production source binding: {exc}"
+            ) from exc
 
     return {
         "schema_version": _EVIDENCE_SCHEMA_VERSION,
@@ -521,6 +551,63 @@ async def _runtime_evidence(
         for field in _RUNTIME_EVIDENCE_FIELDS
         if field != "formal_live_source" or payload.get(field) is not None
     }
+
+
+async def _build_formal_source_binding_remote(
+    client: httpx.AsyncClient,
+    base: str,
+    before: object,
+    after: object,
+) -> dict[str, object]:
+    try:
+        return build_formal_source_binding(before, after)
+    except ValueError:
+        pass
+    response = await client.post(
+        f"{base}/api/v1/agents/runtime/formal-live-source/bind",
+        json={"before": before, "after": after},
+    )
+    payload = _safe_response_json(response, "formal live source bind")
+    try:
+        return TypeAdapter(dict[str, object]).validate_python(payload.get("binding"))
+    except ValueError as exc:
+        raise RuntimeError("formal live source bind returned no binding") from exc
+
+
+async def _validate_formal_source_binding_remote(
+    client: httpx.AsyncClient,
+    base: str,
+    binding: object,
+) -> None:
+    try:
+        validate_formal_source_binding(binding)
+        return
+    except ValueError:
+        pass
+    response = await client.post(
+        f"{base}/api/v1/agents/runtime/formal-live-source/validate",
+        json={"binding": binding},
+    )
+    payload = _safe_response_json(response, "formal live source validation")
+    if payload.get("valid") is not True:
+        raise RuntimeError("formal live source authority did not validate the binding")
+
+
+def _validated_binding_guard(
+    validated: dict[str, object],
+) -> Callable[[object], dict[str, object]]:
+    """Keep the remotely validated object as a process-local writer capability."""
+
+    expected_sha256 = _canonical_sha256(validated)
+
+    def guard(candidate: object) -> dict[str, object]:
+        if not isinstance(candidate, dict) or _canonical_sha256(candidate) != expected_sha256:
+            raise ValueError(
+                "formal source binding differs from the API-authority validated binding"
+            )
+        return dict(candidate)
+
+    return guard
 
 
 def _validate_required_model_runtime(
@@ -1523,6 +1610,7 @@ async def _run(
     event: LiveEventReplanRun | None = None
     stage = "load_request"
     context: dict[str, Any] = {}
+    formal_source_validator: Callable[[object], dict[str, object]] | None = None
     base = args.api_base.rstrip("/")
     # Capture the repo revision BEFORE any work: every evidence bundle is later
     # checked against this marker, so a HEAD move or tracked-tree change during
@@ -1657,10 +1745,19 @@ async def _run(
             context["runtime_after_run"] = runtime_after
             stage = "validate_formal_live_source_binding"
             if formal_source_before is not None or formal_source_after is not None:
-                formal_source_binding = build_formal_source_binding(
+                formal_source_binding = await _build_formal_source_binding_remote(
+                    client,
+                    base,
                     formal_source_before,
                     formal_source_after,
-                    authority_secret=args.bridge_token,
+                )
+                await _validate_formal_source_binding_remote(
+                    client,
+                    base,
+                    formal_source_binding,
+                )
+                formal_source_validator = _validated_binding_guard(
+                    formal_source_binding
                 )
                 runtime_commit_sha = (
                     runtime_before.get("runtime_provenance") or {}
@@ -1889,6 +1986,7 @@ async def _run(
         captured_at=captured_at,
         context=context,
         repo_revision=repo_revision,
+        formal_source_validator=formal_source_validator,
     )
     bundle = TypeAdapter(dict[str, Any]).validate_python(
         _redact_explicit_secrets(bundle, _runner_secrets(args))
@@ -1898,6 +1996,7 @@ async def _run(
         bundle,
         passed=report.passed,
         captured_at=captured_at,
+        formal_source_validator=formal_source_validator,
     )
     print(
         json.dumps(

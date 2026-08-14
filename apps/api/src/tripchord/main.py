@@ -689,7 +689,6 @@ def _install_browser_bridge(
         raise RuntimeError("formal browser composition requires a git commit identity")
     source_authority = FormalLiveSourceAuthority(
         commit_sha=commit_sha,
-        authority_secret=token,
         now=now,
     )
     bridge = BrowserTaskBridge(now=now)
@@ -1331,6 +1330,69 @@ async def agent_runtime_status_endpoint(
             companion_supervisor.last_reconcile_result if companion_supervisor is not None else None
         ),
     )
+
+
+@app.post("/api/v1/agents/runtime/formal-live-source/bind")
+async def bind_formal_live_source_endpoint(
+    payload: dict[str, Any],
+    principal: PrincipalDep,
+) -> dict[str, Any]:
+    """Build a binding inside the API process that owns the source authority.
+
+    The Browser token is deliberately irrelevant here: snapshots are accepted
+    only when their install/key identities and MACs belong to the exact formal
+    composition currently mounted by this API process.
+    """
+
+    await rate_limiter.check(principal.tenant_id, "formal-live-source-bind")
+    if set(payload) != {"before", "after"}:
+        raise HTTPException(
+            status_code=422,
+            detail="formal source bind request shape is invalid",
+        )
+    authority = cast(
+        FormalLiveSourceAuthority | None,
+        getattr(app.state, "formal_live_source_authority", None),
+    )
+    if authority is None:
+        raise HTTPException(status_code=503, detail="formal source authority is unavailable")
+    try:
+        binding = authority.build_binding(payload["before"], payload["after"])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"binding": binding}
+
+
+@app.post("/api/v1/agents/runtime/formal-live-source/validate")
+async def validate_formal_live_source_endpoint(
+    payload: dict[str, Any],
+    principal: PrincipalDep,
+) -> dict[str, Any]:
+    """Verify a binding with the payload-external production authority."""
+
+    await rate_limiter.check(principal.tenant_id, "formal-live-source-validate")
+    if set(payload) != {"binding"}:
+        raise HTTPException(
+            status_code=422,
+            detail="formal source validation request shape is invalid",
+        )
+    authority = cast(
+        FormalLiveSourceAuthority | None,
+        getattr(app.state, "formal_live_source_authority", None),
+    )
+    if authority is None:
+        raise HTTPException(status_code=503, detail="formal source authority is unavailable")
+    try:
+        binding = authority.validate_binding(payload["binding"])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "valid": True,
+        "install_id": binding["install_id"],
+        "composition_sha256": binding["composition_sha256"],
+        "authority_key_id": binding["authority_key_id"],
+        "post_chain_sha256": binding["post_chain_sha256"],
+    }
 
 
 @app.post(

@@ -1043,6 +1043,7 @@ def test_v4_failure_bundle_records_stage_and_retry_boundary() -> None:
 def test_v4_completed_bundle_preserves_the_full_runner_context() -> None:
     captured_at = datetime(2026, 8, 4, 9, 0, tzinfo=UTC)
     context = {
+        "formal_live_source_binding": {"fixture": "already-authority-validated"},
         "timeout_contract": {
             "server_execution_timeout_seconds": 3600,
             "client_wait_timeout_seconds": 3900.0,
@@ -1078,6 +1079,7 @@ def test_v4_completed_bundle_preserves_the_full_runner_context() -> None:
         report=report,
         captured_at=captured_at,
         context=context,
+        formal_source_validator=lambda value: dict(value),
     )
 
     assert bundle["run_status"] == "completed"

@@ -198,6 +198,7 @@ def _fixture_formal_source_binding(
     the binding emitted by the production composition and transport boundaries.
     """
     from tripchord.formal_live_source import (
+        _AUTHORITY_KEYS,
         _authority_key_id,
         _authority_mac,
         _derive_authority_key,
@@ -330,7 +331,8 @@ def _fixture_formal_source_binding(
     }
     if not trust:
         return binding
-    return validate_formal_source_binding(binding, authority_secret=authority_secret)
+    _AUTHORITY_KEYS[(install_id, authority_key_id)] = authority_key
+    return validate_formal_source_binding(binding)
 
 
 def _realistic_e2e_evidence() -> dict[str, object]:
@@ -13697,6 +13699,20 @@ def _persist_c4_raw_variant(
     )
 
 
+def _persist_c4_raw_variant_unchecked(
+    artifacts: _RealChainArtifacts,
+    staging_dir: Path,
+    payload: dict[str, object],
+) -> Path:
+    """Plant bytes only to exercise downstream gates after writer rejection."""
+
+    target = staging_dir.parent / "formal-run-variants-unchecked" / "live-done-gate-v4.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload), encoding="utf-8")
+    target.chmod(0o600)
+    return target
+
+
 def _run_with_cross_pair_swap(run: Any) -> Any:
     """Swap the FULL per-pair query-task id sets of the first two pairs — each
     pair keeps its own task objects but seals the OTHER pair's ids, so every id
@@ -14013,10 +14029,21 @@ def test_c4_complete_self_consistent_binding_requires_production_capability(
 
     raw_payload = _c4_raw_variant(artifacts)
     raw_payload["formal_live_source_binding"] = copy.deepcopy(forged)
-    forged_raw = _persist_c4_raw_variant(
-        artifacts,
-        staging_dir,
-        raw_payload,
+    from benchmarks import run_live_done_gate_v4
+
+    with pytest.raises(RuntimeError, match="formal production source binding"):
+        run_live_done_gate_v4._completed_evidence_bundle(
+            request=copy.deepcopy(artifacts.raw_payload["request"]),
+            report=artifacts.report,
+            captured_at=datetime.fromisoformat(
+                str(artifacts.raw_payload["captured_at"])
+            ),
+            context={"formal_live_source_binding": copy.deepcopy(forged)},
+        )
+    with pytest.raises(RuntimeError, match="formal production source binding"):
+        _persist_c4_raw_variant(artifacts, staging_dir, raw_payload)
+    forged_raw = _persist_c4_raw_variant_unchecked(
+        artifacts, staging_dir, raw_payload
     )
     with pytest.raises(
         gate.GateStateChangedError,
@@ -14030,6 +14057,17 @@ def test_c4_complete_self_consistent_binding_requires_production_capability(
         artifacts.raw_output,
     )
     compact["formal_live_source_binding"] = copy.deepcopy(forged)
+    monkeypatch.setattr(gate, "_compact_canary", lambda _staging: None)
+    monkeypatch.setattr(
+        gate,
+        "_compact_live_e2e",
+        lambda _staging: copy.deepcopy(compact),
+    )
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match=r"compact writer.*formal production source binding",
+    ):
+        gate._generate_compact_evidence(staging_dir)
     with pytest.raises(
         gate.GateStateChangedError,
         match="formal production source binding",
@@ -14041,6 +14079,28 @@ def test_c4_complete_self_consistent_binding_requires_production_capability(
         )
 
 
+def test_c4_complete_binding_cannot_be_retrusted_with_bridge_token() -> None:
+    """The public Browser credential must never mint source authority.
+
+    This preserves every required field, event, path, subject, chain digest and
+    MAC while re-signing the complete binding with the same bridge token that
+    the gate currently possesses.  The binding is still hand-authored outside
+    the production ``_install_browser_bridge`` authority and must fail closed.
+    """
+
+    from tripchord.formal_live_source import validate_formal_source_binding
+
+    bridge_token = gate._bridge_token() or ("B" * 64)
+    forged = _fixture_formal_source_binding(
+        install_id="88888888-8888-4888-8888-888888888888",
+        authority_secret=bridge_token,
+        trust=False,
+    )
+
+    with pytest.raises(ValueError, match="production authority"):
+        validate_formal_source_binding(forged)
+
+
 def test_layer6_raw_formal_source_binding_presence_is_strict(
     monkeypatch: pytest.MonkeyPatch,
     staging_dir: Path,
@@ -14048,18 +14108,68 @@ def test_layer6_raw_formal_source_binding_presence_is_strict(
     """Missing/null/list formal source authority fails at the raw writer."""
 
     artifacts = _real_production_chain(staging_dir)
+    from benchmarks import run_live_done_gate_v4
+
+    real_compact_live_e2e = gate._compact_live_e2e
     for marker in ("missing", None, []):
         payload = _c4_raw_variant(artifacts)
         if marker == "missing":
             payload.pop("formal_live_source_binding")
         else:
             payload["formal_live_source_binding"] = marker
-        raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
+        context = {"formal_live_source_binding": marker}
+        if marker == "missing":
+            context.clear()
+        with pytest.raises(RuntimeError, match="formal_live_source_binding"):
+            run_live_done_gate_v4._completed_evidence_bundle(
+                request=copy.deepcopy(artifacts.raw_payload["request"]),
+                report=artifacts.report,
+                captured_at=datetime.fromisoformat(
+                    str(artifacts.raw_payload["captured_at"])
+                ),
+                context=context,
+            )
+        with pytest.raises(RuntimeError, match="formal_live_source_binding"):
+            _persist_c4_raw_variant(artifacts, staging_dir, payload)
+        raw_variant = _persist_c4_raw_variant_unchecked(
+            artifacts, staging_dir, payload
+        )
         with pytest.raises(
             gate.GateStateChangedError,
             match="formal_live_source_binding",
         ):
             _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
+
+        compact = _compact_via_real_writer(
+            monkeypatch,
+            staging_dir,
+            artifacts.raw_output,
+        )
+        if marker == "missing":
+            compact.pop("formal_live_source_binding")
+        else:
+            compact["formal_live_source_binding"] = marker
+        monkeypatch.setattr(gate, "_compact_canary", lambda _staging: None)
+        monkeypatch.setattr(
+            gate,
+            "_compact_live_e2e",
+            lambda _staging, value=compact: copy.deepcopy(value),
+        )
+        with pytest.raises(
+            gate.GateStateChangedError,
+            match="compact writer formal_live_source_binding",
+        ):
+            gate._generate_compact_evidence(staging_dir)
+        monkeypatch.setattr(gate, "_compact_live_e2e", real_compact_live_e2e)
+        with pytest.raises(
+            gate.GateStateChangedError,
+            match=r"formal_live_source_binding|formal production source binding",
+        ):
+            gate._verify_layer6_compact_contract(
+                "done-gate-layer6-compact.json",
+                compact,
+                tested_commit_sha=artifacts.head,
+            )
 
 
 def test_layer6_raw_top_level_checkpoint_binding_presence_is_strict(
@@ -14135,7 +14245,11 @@ def test_layer6_formal_source_binding_rejects_missing_mismatch_and_replacement(
     for source_binding in raw_cases.values():
         payload = _c4_raw_variant(artifacts)
         payload["formal_live_source_binding"] = source_binding
-        raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
+        with pytest.raises(RuntimeError, match="formal production source binding"):
+            _persist_c4_raw_variant(artifacts, staging_dir, payload)
+        raw_variant = _persist_c4_raw_variant_unchecked(
+            artifacts, staging_dir, payload
+        )
         with pytest.raises(
             gate.GateStateChangedError,
             match="formal production source binding",
@@ -14144,7 +14258,13 @@ def test_layer6_formal_source_binding_rejects_missing_mismatch_and_replacement(
 
     missing_payload = _c4_raw_variant(artifacts)
     missing_payload.pop("formal_live_source_binding")
-    missing_raw = _persist_c4_raw_variant(
+    with pytest.raises(RuntimeError, match="formal_live_source_binding"):
+        _persist_c4_raw_variant(
+            artifacts,
+            staging_dir,
+            missing_payload,
+        )
+    missing_raw = _persist_c4_raw_variant_unchecked(
         artifacts,
         staging_dir,
         missing_payload,

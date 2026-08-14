@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
+import httpx
 from tripchord._secret_redact import (
     _ARRAY_PATH_ELEMENT,
     _CREDENTIAL_FIELD_STRONG_NAME_ALT,
@@ -683,6 +684,55 @@ def _bridge_token() -> str:
     except OSError:
         return ""
     return candidate if candidate else ""
+
+
+def _validate_formal_source_with_production_authority(
+    binding: object,
+) -> dict[str, Any]:
+    """Validate locally or ask the exact running API authority.
+
+    Unit/in-process production chains resolve the random authority capability
+    from the process registry.  The real Done-Gate runs in a separate process,
+    so it uses the running API as a verification oracle.  No caller credential
+    can derive or register an authority key and the endpoint never returns one.
+    """
+
+    if not isinstance(binding, dict):
+        raise ValueError("formal source binding is not an object")
+    try:
+        return validate_formal_source_binding(binding)
+    except ValueError as local_error:
+        api_base = os.environ.get(
+            "TRIPCHORD_API_BASE",
+            "http://127.0.0.1:8000",
+        ).rstrip("/")
+        try:
+            response = httpx.post(
+                f"{api_base}/api/v1/agents/runtime/formal-live-source/validate",
+                json={"binding": binding},
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            receipt = response.json()
+        except (httpx.HTTPError, ValueError):
+            raise ValueError(
+                "formal source binding has no validating production authority"
+            ) from local_error
+        if not isinstance(receipt, dict) or receipt.get("valid") is not True:
+            raise ValueError(
+                "formal source binding production authority rejected it"
+            ) from local_error
+        for key in (
+            "install_id",
+            "composition_sha256",
+            "authority_key_id",
+            "post_chain_sha256",
+        ):
+            if receipt.get(key) != binding.get(key):
+                raise ValueError(
+                    "formal source binding production authority identity mismatch"
+                ) from local_error
+        return dict(binding)
 
 
 def _bridge_env(bridge_token: str) -> dict[str, str]:
@@ -5303,9 +5353,8 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
             "layer-6 raw evidence formal_live_source_binding is present but is not an object"
         )
     try:
-        formal_source_binding = validate_formal_source_binding(
-            formal_source_binding,
-            authority_secret=_bridge_token(),
+        formal_source_binding = _validate_formal_source_with_production_authority(
+            formal_source_binding
         )
     except ValueError as exc:
         raise GateStateChangedError(
@@ -5533,6 +5582,18 @@ def _generate_compact_evidence(staging_dir: Path) -> None:
     ):
         if payload is None:
             continue
+        if staged_name == _COMPACT_E2E_STAGED_NAME:
+            binding = payload.get("formal_live_source_binding")
+            if not isinstance(binding, dict):
+                raise GateStateChangedError(
+                    "layer-6 compact writer formal_live_source_binding is missing or not an object"
+                )
+            try:
+                _validate_formal_source_with_production_authority(binding)
+            except ValueError as exc:
+                raise GateStateChangedError(
+                    f"layer-6 compact writer has invalid formal production source binding: {exc}"
+                ) from exc
         # Atomic + owner-only from the start (C-118): the tmp is sealed to 0600
         # before the rename, so no window exposes a partially-written compact
         # artifact with looser permissions than the final file.
@@ -7427,9 +7488,8 @@ def _verify_layer6_compact_contract(
                 f"evidence commit E layer-6 compact {tracked_rel} missing {key!r}"
             )
     try:
-        formal_source_binding = validate_formal_source_binding(
-            compact.get("formal_live_source_binding"),
-            authority_secret=_bridge_token(),
+        formal_source_binding = _validate_formal_source_with_production_authority(
+            compact.get("formal_live_source_binding")
         )
     except ValueError as exc:
         raise GateStateChangedError(

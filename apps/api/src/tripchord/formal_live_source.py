@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import secrets
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -133,21 +134,10 @@ def _resolve_authority_key(
     install_id: str,
     composition_sha256: str,
     key_id: str,
-    authority_secret: str | bytes | None,
 ) -> bytes:
     registered = _AUTHORITY_KEYS.get((install_id, key_id))
     if registered is not None:
         return registered
-    if authority_secret is not None:
-        key = _derive_authority_key(
-            authority_secret,
-            install_id=install_id,
-            composition_sha256=composition_sha256,
-        )
-        if not hmac.compare_digest(_authority_key_id(key), key_id):
-            raise ValueError("formal source authority key identity is invalid")
-        _AUTHORITY_KEYS[(install_id, key_id)] = key
-        return key
     raise ValueError(
         "formal source binding has no trusted production authority capability"
     )
@@ -233,7 +223,6 @@ class FormalLiveSourceAuthority:
         self,
         *,
         commit_sha: str,
-        authority_secret: str | bytes,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._install_id = str(uuid4())
@@ -242,11 +231,14 @@ class FormalLiveSourceAuthority:
             self._install_id,
             self._composition,
         )
-        self._authority_key = _derive_authority_key(
-            authority_secret,
-            install_id=self._install_id,
-            composition_sha256=self._composition_sha256,
-        )
+        # This key is intentionally independent of every caller credential.
+        # In particular, the Browser bridge token is presented by the Companion
+        # and by the gate runner, so deriving authority from it lets either side
+        # mint a complete, self-consistent fake receipt chain.  Only the API
+        # process that executed the formal composition entry holds this random
+        # capability; other processes can ask that authority to verify a binding
+        # but cannot derive or register a replacement key from payload bytes.
+        self._authority_key = secrets.token_bytes(32)
         self._authority_key_id = _authority_key_id(self._authority_key)
         _AUTHORITY_KEYS[(self._install_id, self._authority_key_id)] = self._authority_key
         self._now = now or (lambda: datetime.now(UTC))
@@ -347,6 +339,35 @@ class FormalLiveSourceAuthority:
             "events": list(self._events),
         }
 
+    def validate_snapshot(self, snapshot: object) -> dict[str, object]:
+        """Validate against this exact installed production authority."""
+
+        self._require_own_identity(snapshot)
+        return validate_formal_source_snapshot(snapshot)
+
+    def build_binding(self, before: object, after: object) -> dict[str, object]:
+        """Issue a run binding only for snapshots owned by this installation."""
+
+        self._require_own_identity(before)
+        self._require_own_identity(after)
+        return build_formal_source_binding(before, after)
+
+    def validate_binding(self, binding: object) -> dict[str, object]:
+        """Validate a binding against this exact installed production authority."""
+
+        self._require_own_identity(binding)
+        return validate_formal_source_binding(binding)
+
+    def _require_own_identity(self, value: object) -> None:
+        if not isinstance(value, dict):
+            raise ValueError("formal source authority input is not an object")
+        if (
+            value.get("install_id") != self._install_id
+            or value.get("composition_sha256") != self._composition_sha256
+            or value.get("authority_key_id") != self._authority_key_id
+        ):
+            raise ValueError("formal source authority input is not owned by this installation")
+
     def _record(
         self,
         *,
@@ -387,8 +408,6 @@ class FormalLiveSourceAuthority:
 
 def validate_formal_source_snapshot(
     snapshot: object,
-    *,
-    authority_secret: str | bytes | None = None,
 ) -> dict[str, object]:
     if not isinstance(snapshot, dict) or set(snapshot) != {
         "schema_version",
@@ -424,7 +443,6 @@ def validate_formal_source_snapshot(
         install_id=install_id,
         composition_sha256=composition_sha256,
         key_id=key_id,
-        authority_secret=authority_secret,
     )
     events = snapshot["events"]
     if not isinstance(events, list) or snapshot["event_count"] != len(events):
@@ -468,11 +486,9 @@ def validate_formal_source_snapshot(
 def build_formal_source_binding(
     before: object,
     after: object,
-    *,
-    authority_secret: str | bytes | None = None,
 ) -> dict[str, object]:
-    pre = validate_formal_source_snapshot(before, authority_secret=authority_secret)
-    post = validate_formal_source_snapshot(after, authority_secret=authority_secret)
+    pre = validate_formal_source_snapshot(before)
+    post = validate_formal_source_snapshot(after)
     for key in ("install_id", "composition", "composition_sha256", "authority_key_id"):
         if pre[key] != post[key]:
             raise ValueError("formal source authority changed during the live run")
@@ -498,14 +514,12 @@ def build_formal_source_binding(
         "companion_heartbeat_receipt": heartbeat,
         "receipts": post["events"][pre_count:],
     }
-    validate_formal_source_binding(binding, authority_secret=authority_secret)
+    validate_formal_source_binding(binding)
     return binding
 
 
 def validate_formal_source_binding(
     binding: object,
-    *,
-    authority_secret: str | bytes | None = None,
 ) -> dict[str, object]:
     if not isinstance(binding, dict) or set(binding) != {
         "schema_version",
@@ -548,7 +562,6 @@ def validate_formal_source_binding(
         install_id=install_id,
         composition_sha256=composition_sha256,
         key_id=key_id,
-        authority_secret=authority_secret,
     )
     pre_count = binding["pre_event_count"]
     post_count = binding["post_event_count"]
