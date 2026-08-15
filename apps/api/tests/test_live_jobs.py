@@ -1693,6 +1693,294 @@ async def test_terminalize_post_commit_persist_failure_keeps_committed_state(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failpoint",
+    ("post_replace_dir_fsync", "post_replace_validation"),
+)
+async def test_cancel_post_commit_persist_failure_physically_cancels_active_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failpoint: str,
+) -> None:
+    """C-143 P0 RETURN 22fb1f9c gap A: when a persist fails AFTER ``os.replace``
+    has committed a cancellation, cancel must still physically cancel and await the
+    running operation_task / real task before surfacing the post-commit error. The
+    committed terminal label must be real — the task is stopped and no further
+    side effects occur — and memory/disk agree for a retry and a cold restart."""
+
+    state_path = tmp_path / "live-jobs.json"
+    started = asyncio.Event()
+    side_effects = 0
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal side_effects
+        started.set()
+        while True:
+            side_effects += 1
+            await asyncio.sleep(0.001)
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path)
+    job, reused = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key=f"cancel-active-{failpoint}",
+        request_digest=REQUEST_SHA256,
+        defer_start=False,
+    )
+    assert reused is False
+    await started.wait()
+    runtime = registry._records[job.id]
+    for _ in range(100):
+        if runtime.operation_task is not None and not runtime.operation_task.done():
+            break
+        await asyncio.sleep(0.001)
+    assert runtime.operation_task is not None and not runtime.operation_task.done()
+    assert not runtime.task.done()
+
+    monkeypatch.setenv("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT", failpoint)
+    with pytest.raises(LivePlanningJobRegistryPostCommitError):
+        await registry.cancel(job.id, "tenant-a")
+    monkeypatch.delenv("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT")
+
+    # The post-commit error surfaces only after the running work was physically
+    # cancelled and awaited — the committed terminal state is real.
+    assert runtime.task.done()
+    assert runtime.operation_task.done()
+    snapshot = await registry.get(job.id, "tenant-a")
+    assert snapshot is not None
+    assert snapshot.state == LivePlanningJobState.CANCELLED
+    assert snapshot.stage == "cancelled"
+    assert snapshot.cancellation_requested is True
+    frozen_side_effects = side_effects
+    await asyncio.sleep(0.02)
+    assert side_effects == frozen_side_effects
+
+    disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
+    disk_record = next(
+        record
+        for record in disk_payload["records"]
+        if record["snapshot"]["id"] == job.id
+    )
+    assert disk_record["snapshot"] == snapshot.model_dump(mode="json")
+    assert disk_record["snapshot"]["state"] == "cancelled"
+
+    # A retry observes the committed terminal state without re-terminalizing.
+    retried = await registry.cancel(job.id, "tenant-a")
+    assert retried is not None and retried.state == LivePlanningJobState.CANCELLED
+    assert retried.revision == snapshot.revision
+
+    # A brand-new instance reads the same committed facts from disk.
+    reloaded = LivePlanningJobRegistry(state_path=state_path)
+    reloaded_snapshot = await reloaded.get(job.id, "tenant-a")
+    assert reloaded_snapshot is not None
+    assert reloaded_snapshot.state == LivePlanningJobState.CANCELLED
+    assert reloaded_snapshot.stage == "cancelled"
+
+    await reloaded.close()
+    await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failpoint",
+    ("post_replace_dir_fsync", "post_replace_validation"),
+)
+async def test_activate_post_commit_persist_failure_completes_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failpoint: str,
+) -> None:
+    """C-143 P0 RETURN 22fb1f9c gap B: when activate's persist fails AFTER
+    ``os.replace`` has committed ``phase=dispatched``, the dispatch must be
+    completed with a real executor before surfacing the post-commit error — never a
+    fake dispatched record with no runner. Memory/disk agree, a same-operation
+    retry returns the same running job, a foreign operation is rejected, and a cold
+    restart fail-closes the still-nonterminal record."""
+
+    state_path = tmp_path / "live-jobs.json"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def operation(_: Any) -> dict[str, Any]:
+        started.set()
+        await release.wait()
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path)
+    prepared, _ = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key=f"activate-dispatch-{failpoint}-prepare",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    queued_result = {"job": prepared.model_dump(mode="json")}
+    intent = {
+        "schema_version": "tripchord-live-activation-operation-v1",
+        "operation_id": "b4" * 32,
+        "idempotency_key": f"activate-dispatch-{failpoint}",
+        "request_digest": "c4" * 32,
+        "job_id": prepared.id,
+        "challenge_id": f"activate-dispatch-{failpoint}-challenge",
+        "attempt_digest": "d4" * 32,
+        "capability_sha256": "e4" * 32,
+        "companion_identity_sha256": "f4" * 32,
+        "queued_result": queued_result,
+    }
+    stored = await registry.prepare_activation_intent(
+        prepared.id,
+        "tenant-a",
+        intent=intent,
+    )
+    assert stored["phase"] == "intent"
+    assert stored["dispatch_count"] == 0
+
+    runtime = registry._records[prepared.id]
+    assert runtime.prepared is True
+
+    monkeypatch.setenv("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT", failpoint)
+    with pytest.raises(LivePlanningJobRegistryPostCommitError):
+        await registry.activate(prepared.id, "tenant-a", operation_id=intent["operation_id"])
+    monkeypatch.delenv("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT")
+
+    # The committed dispatched record now has a real executor, and memory and disk
+    # agree on every persisted field (checked before the created task runs).
+    assert runtime.task is not None and not runtime.task.done()
+    assert runtime.prepared is False
+    operation = await registry.activation_operation(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert operation["phase"] == "dispatched"
+    assert operation["dispatch_count"] == 1
+    assert operation["queued_result"] == queued_result
+    snapshot = await registry.get(prepared.id, "tenant-a")
+    assert snapshot is not None
+    assert snapshot.state == LivePlanningJobState.QUEUED
+    disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
+    disk_record = next(
+        record
+        for record in disk_payload["records"]
+        if record["snapshot"]["id"] == prepared.id
+    )
+    assert disk_record["snapshot"] == snapshot.model_dump(mode="json")
+    assert disk_record["activation_operation"] == operation
+    assert disk_record["prepared"] is runtime.prepared
+
+    # The operation actually runs under the real executor.
+    await started.wait()
+    assert runtime.operation_task is not None and not runtime.operation_task.done()
+
+    # A same-operation retry returns the same running job — no second dispatch.
+    retried = await registry.activate(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert retried is not None and retried.id == prepared.id
+    assert registry._records[prepared.id].task is runtime.task
+
+    # A foreign operation identity is rejected.
+    with pytest.raises(LivePlanningJobInactiveError):
+        await registry.activate(prepared.id, "tenant-a", operation_id="ff" * 32)
+
+    # A cold restart fail-closes the still-nonterminal dispatched record.
+    reloaded = LivePlanningJobRegistry(state_path=state_path)
+    reloaded_snapshot = await reloaded.get(prepared.id, "tenant-a")
+    assert reloaded_snapshot is not None
+    assert reloaded_snapshot.state == LivePlanningJobState.CANCELLED
+    assert reloaded_snapshot.stage == "restart_cancelled"
+
+    await reloaded.close()
+    await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failpoint",
+    ("post_replace_dir_fsync", "post_replace_validation"),
+)
+async def test_start_post_commit_persist_failure_completes_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failpoint: str,
+) -> None:
+    """C-143 P0 RETURN 22fb1f9c gap C: when start_idempotent(defer_start=False)
+    fails AFTER ``os.replace`` committed the record, the job must still get a real
+    executor before surfacing the post-commit error — never a committed
+    ``queued/prepared=false/task=None`` record whose same-key retry returns
+    ``reused=true`` without running. Memory/disk agree, the same-key retry returns
+    the same running job, and a cold restart fail-closes."""
+
+    state_path = tmp_path / "live-jobs.json"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def operation(_: Any) -> dict[str, Any]:
+        started.set()
+        await release.wait()
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path)
+    monkeypatch.setenv("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT", failpoint)
+    with pytest.raises(LivePlanningJobRegistryPostCommitError):
+        await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key=f"start-execute-{failpoint}",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+        )
+    monkeypatch.delenv("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT")
+
+    (runtime,) = tuple(registry._records.values())
+    job_id = runtime.snapshot.id
+    # The committed non-prepared record has a real executor; memory and disk agree
+    # on every persisted field (checked before the created task runs).
+    assert runtime.task is not None and not runtime.task.done()
+    assert runtime.prepared is False
+    snapshot = await registry.get(job_id, "tenant-a")
+    assert snapshot is not None
+    assert snapshot.state == LivePlanningJobState.QUEUED
+    disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
+    disk_record = next(
+        record
+        for record in disk_payload["records"]
+        if record["snapshot"]["id"] == job_id
+    )
+    assert disk_record["snapshot"] == snapshot.model_dump(mode="json")
+    assert disk_record["prepared"] is runtime.prepared
+
+    # The operation actually runs under the real executor.
+    await started.wait()
+    assert runtime.operation_task is not None and not runtime.operation_task.done()
+
+    # A same-key retry returns the same running job — no second dispatch.
+    retried, reused = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key=f"start-execute-{failpoint}",
+        request_digest=REQUEST_SHA256,
+        defer_start=False,
+    )
+    assert reused is True
+    assert retried.id == job_id
+    assert registry._records[job_id].task is runtime.task
+
+    # A cold restart fail-closes the still-nonterminal record.
+    reloaded = LivePlanningJobRegistry(state_path=state_path)
+    reloaded_snapshot = await reloaded.get(job_id, "tenant-a")
+    assert reloaded_snapshot is not None
+    assert reloaded_snapshot.state == LivePlanningJobState.CANCELLED
+    assert reloaded_snapshot.stage == "restart_cancelled"
+
+    await reloaded.close()
+    await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_activation_intent_conflict_is_rejected_before_dispatch(
     tmp_path: Path,
 ) -> None:

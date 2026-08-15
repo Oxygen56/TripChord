@@ -1078,9 +1078,18 @@ class LivePlanningJobRegistry:
             try:
                 self._persist_locked()
             except LivePlanningJobRegistryPostCommitError:
-                # The new record was already committed to disk; keep the in-memory
-                # record (it matches the disk) and surface the indeterminate create
-                # so the caller can recover the committed record by idempotency.
+                # The new record was already committed to disk. A committed
+                # non-prepared record promises an executor, so create it now (durable
+                # start) before surfacing the indeterminate create; a prepared record
+                # stays prepared for a later activation. Never leave a committed
+                # "queued, prepared=false, task=None" job that a same-key retry
+                # reports as reused but that never executes.
+                if not defer_start:
+                    runtime.task = asyncio.create_task(
+                        self._run(runtime, operation),
+                        name=f"tripchord:{job_id}",
+                    )
+                self._changed.notify_all()
                 raise
             except Exception:
                 self._remove_locked(job_id)
@@ -1160,6 +1169,15 @@ class LivePlanningJobRegistry:
             try:
                 self._persist_locked()
             except LivePlanningJobRegistryPostCommitError:
+                # The dispatched state was already committed to disk; a committed
+                # "dispatched" operation must have a real executor, so complete the
+                # dispatch by creating the task before surfacing the indeterminate
+                # outcome. Never keep a fake dispatched record with no runner.
+                runtime.task = asyncio.create_task(
+                    self._run(runtime, runtime.operation),
+                    name=f"tripchord:{job_id}",
+                )
+                self._changed.notify_all()
                 raise
             except Exception:
                 runtime.prepared = True
@@ -1421,13 +1439,16 @@ class LivePlanningJobRegistry:
                 stage="cancelled",
                 cancellation_requested=True,
             )
+            post_commit_error: LivePlanningJobRegistryPostCommitError | None = None
             try:
                 self._persist_locked()
-            except LivePlanningJobRegistryPostCommitError:
-                # The terminalized state was already committed to disk; the
-                # in-memory record matches it, so keep it and surface the
-                # indeterminate terminal outcome to the caller.
-                raise
+            except LivePlanningJobRegistryPostCommitError as exc:
+                # The terminalized state was already committed to disk and the
+                # in-memory record matches it. Defer re-raising until the running
+                # work has been physically cancelled and awaited, so the committed
+                # terminal label is real rather than a cancelled record over a
+                # still-running job.
+                post_commit_error = exc
             except Exception:
                 # A pre-commit persist failure must leave the whole mutable record —
                 # snapshot, generation, the prepared flag and the full
@@ -1447,6 +1468,8 @@ class LivePlanningJobRegistry:
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
             await asyncio.wait((task,), timeout=self._cancel_wait_seconds + 0.1)
+        if post_commit_error is not None:
+            raise post_commit_error
         async with self._lock:
             current = self._owned_locked(job_id, tenant_id)
             return current.snapshot if current is not None else None
