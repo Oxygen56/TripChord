@@ -10,6 +10,7 @@ import re
 import secrets
 import subprocess
 import sys
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -83,6 +84,8 @@ _FROZEN_MINIMUM_RECOMMENDABLE_OPTIONS = 2
 _MINIMUM_CLIENT_TIMEOUT_MARGIN_SECONDS = 300.0
 _JOB_POLL_INTERVAL_SECONDS = 5.0
 _CANCELLATION_TIMEOUT_SECONDS = 15.0
+_FORMAL_CONTROL_TOTAL_ATTEMPTS = 7
+_FORMAL_CONTROL_WALL_SECONDS = 30.0
 _ATTEMPT_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _URL_WITH_QUERY_PATTERN = re.compile(r"(?:https?://|/)[^\s\"'<>]*\?[^\s\"'<>]*")
 _SENSITIVE_FIELD_NAMES = frozenset(
@@ -106,6 +109,78 @@ _SENSITIVE_FIELD_NAMES = frozenset(
         "secret",
     }
 )
+
+
+class _FormalControlRetryBudget:
+    """One finite retry budget shared by all formal control-plane phases."""
+
+    def __init__(
+        self,
+        *,
+        total_attempts: int,
+        wall_seconds: float,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if total_attempts < 1 or not math.isfinite(wall_seconds) or wall_seconds <= 0:
+            raise ValueError("formal control retry budget is invalid")
+        self.remaining_attempts = total_attempts
+        self._now = now
+        self._deadline = now() + wall_seconds
+        self._failure_count = 0
+
+    def consume(self) -> None:
+        if self.remaining_attempts <= 0 or self._now() >= self._deadline:
+            raise RuntimeError("formal control retry budget was exhausted")
+        self.remaining_attempts -= 1
+
+    def retry_delay(self) -> float:
+        remaining = self._deadline - self._now()
+        if self.remaining_attempts <= 0 or remaining <= 0:
+            raise RuntimeError("formal control retry budget was exhausted")
+        delay = min(0.1 * (2**self._failure_count), 1.0, remaining)
+        self._failure_count += 1
+        return delay
+
+
+def _formal_control_retry_budget(
+    client: object,
+    explicit: _FormalControlRetryBudget | None,
+) -> _FormalControlRetryBudget:
+    shared = getattr(client, "_tripchord_formal_control_retry_budget", None)
+    return (
+        explicit
+        or (
+            shared
+            if isinstance(shared, _FormalControlRetryBudget)
+            else None
+        )
+        or _FormalControlRetryBudget(
+            total_attempts=_FORMAL_CONTROL_TOTAL_ATTEMPTS,
+            wall_seconds=_FORMAL_CONTROL_WALL_SECONDS,
+        )
+    )
+
+
+async def _post_formal_control_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    payload: Mapping[str, object],
+    headers: Mapping[str, str],
+    budget: _FormalControlRetryBudget,
+) -> httpx.Response:
+    """Retry only transport/temporary failures with byte-stable identity."""
+
+    while True:
+        budget.consume()
+        try:
+            response = await client.post(url, json=dict(payload), headers=dict(headers))
+        except httpx.TransportError:
+            await asyncio.sleep(budget.retry_delay())
+            continue
+        if response.status_code not in {500, 502, 503, 504}:
+            return response
+        await asyncio.sleep(budget.retry_delay())
 _SIGNED_FORMAL_SOURCE_FIELDS = frozenset(
     {
         "formal_live_source_binding",
@@ -653,16 +728,20 @@ async def _issue_formal_source_challenge_remote(
     context: dict[str, object],
     idempotency_key: str,
     control_token_path: Path | None = None,
+    retry_budget: _FormalControlRetryBudget | None = None,
 ) -> dict[str, object]:
-    response = await client.post(
+    budget = _formal_control_retry_budget(client, retry_budget)
+    response = await _post_formal_control_with_retry(
+        client,
         f"{base}/api/v1/internal/formal-live-source/challenge",
-        json=context,
+        payload=context,
         headers={
             "X-TripChord-Formal-Source-Control": _formal_source_control_token(
                 control_token_path
             ),
             "Idempotency-Key": idempotency_key,
         },
+        budget=budget,
     )
     payload = _safe_response_json(response, "formal live source challenge")
     challenge = TypeAdapter(dict[str, object]).validate_python(payload.get("challenge"))
@@ -681,10 +760,13 @@ async def _finalize_formal_source_binding_remote(
     execution_capability: dict[str, object],
     idempotency_key: str,
     control_token_path: Path | None = None,
+    retry_budget: _FormalControlRetryBudget | None = None,
 ) -> dict[str, object]:
-    response = await client.post(
+    budget = _formal_control_retry_budget(client, retry_budget)
+    response = await _post_formal_control_with_retry(
+        client,
         f"{base}/api/v1/internal/formal-live-source/finalize",
-        json={
+        payload={
             "context": context,
             "execution_capability": execution_capability,
         },
@@ -694,6 +776,7 @@ async def _finalize_formal_source_binding_remote(
             ),
             "Idempotency-Key": idempotency_key,
         },
+        budget=budget,
     )
     payload = _safe_response_json(response, "formal live source finalize")
     binding = TypeAdapter(dict[str, object]).validate_python(payload.get("binding"))
@@ -1213,17 +1296,21 @@ async def _activate_prepared_flexible_live_job(
     execution_capability: dict[str, object],
     idempotency_key: str,
     control_token_path: Path | None = None,
+    retry_budget: _FormalControlRetryBudget | None = None,
 ) -> None:
     job_id = TypeAdapter(str).validate_python(control.get("job_id"))
-    response = await client.post(
+    budget = _formal_control_retry_budget(client, retry_budget)
+    response = await _post_formal_control_with_retry(
+        client,
         f"{base}/api/v1/internal/formal-live-source/jobs/{job_id}/activate",
-        json={"execution_capability": execution_capability},
+        payload={"execution_capability": execution_capability},
         headers={
             "X-TripChord-Formal-Source-Control": _formal_source_control_token(
                 control_token_path
             ),
             "Idempotency-Key": idempotency_key,
         },
+        budget=budget,
     )
     payload = _safe_response_json(response, "formal prepared live job activation")
     if response.status_code != 200:
@@ -1902,6 +1989,13 @@ async def _run(
                 "candidate_set_sha256": candidate_set.candidate_set_sha256,
                 "scenario_sha256": scenario_sha256,
             }
+            formal_control_retry_budget = _FormalControlRetryBudget(
+                total_attempts=_FORMAL_CONTROL_TOTAL_ATTEMPTS,
+                wall_seconds=_FORMAL_CONTROL_WALL_SECONDS,
+            )
+            client._tripchord_formal_control_retry_budget = (  # type: ignore[attr-defined]
+                formal_control_retry_budget
+            )
             context["gate_run_id"] = args.gate_run_id
             live_job_control = _new_live_job_control(
                 request,

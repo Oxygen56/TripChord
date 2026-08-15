@@ -1106,6 +1106,60 @@ def test_v4_failure_bundle_records_stage_and_retry_boundary() -> None:
     assert bundle["flexible_run"]["final_decision"]["state"] == "human_block"
 
 
+@pytest.mark.asyncio
+async def test_formal_control_retries_share_one_bounded_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """92a0db1a: challenge/activate/finalize cannot each reset retries."""
+
+    calls: list[tuple[str, str]] = []
+
+    class FlakyClient:
+        async def post(self, url: str, **kwargs: object) -> object:
+            key = str(kwargs["headers"]["Idempotency-Key"])  # type: ignore[index]
+            calls.append((url, key))
+            if len(calls) in {1, 3}:
+                raise httpx.ReadError("committed response was lost")
+            return httpx.Response(200, json={"ok": True})
+
+    delays: list[float] = []
+
+    async def record_delay(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr(run_live_done_gate_v4.asyncio, "sleep", record_delay)
+    budget = run_live_done_gate_v4._FormalControlRetryBudget(
+        total_attempts=5,
+        wall_seconds=10,
+        now=lambda: 0.0,
+    )
+    client = FlakyClient()
+    first = await run_live_done_gate_v4._post_formal_control_with_retry(
+        client,  # type: ignore[arg-type]
+        "http://tripchord.test/challenge",
+        payload={"phase": "challenge"},
+        headers={"Idempotency-Key": "same-challenge-key"},
+        budget=budget,
+    )
+    second = await run_live_done_gate_v4._post_formal_control_with_retry(
+        client,  # type: ignore[arg-type]
+        "http://tripchord.test/activate",
+        payload={"phase": "activate"},
+        headers={"Idempotency-Key": "same-activate-key"},
+        budget=budget,
+    )
+    assert first.json() == {"ok": True}
+    assert second.json() == {"ok": True}
+    assert calls == [
+        ("http://tripchord.test/challenge", "same-challenge-key"),
+        ("http://tripchord.test/challenge", "same-challenge-key"),
+        ("http://tripchord.test/activate", "same-activate-key"),
+        ("http://tripchord.test/activate", "same-activate-key"),
+    ]
+    assert budget.remaining_attempts == 1
+    assert delays == [0.1, 0.2]
+
+
 def test_v4_completed_bundle_rejects_context_without_formal_receipt() -> None:
     captured_at = datetime(2026, 8, 4, 9, 0, tzinfo=UTC)
     context = {

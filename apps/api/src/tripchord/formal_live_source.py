@@ -3641,6 +3641,265 @@ class FormalLiveSourceAuthority:
             if job_id != graph["terminal_job_id"]:
                 raise ValueError("formal source activation targets a foreign job")
 
+    @staticmethod
+    def _activation_request_digest(
+        job_id: object,
+        capability: Mapping[str, object],
+    ) -> str:
+        return _sha256({"job_id": job_id, "execution_capability": capability})
+
+    def _activation_row_locked(
+        self,
+        ledger: Mapping[str, dict[str, object]],
+        *,
+        job_id: object,
+        capability: object,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        for candidate in ledger.values():
+            issued = candidate.get("issue_result")
+            if not isinstance(issued, dict):
+                continue
+            try:
+                challenge = _validate_challenge(issued.get("challenge"))
+                checked = _validate_execution_capability(
+                    capability,
+                    challenge=challenge,
+                )
+            except (RuntimeError, ValueError):
+                continue
+            if job_id != checked["terminal_job_id"]:
+                raise ValueError("formal source activation targets a foreign job")
+            return candidate, checked
+        raise ValueError("formal source activation capability is unknown")
+
+    @staticmethod
+    def _activation_state_copy(record: Mapping[str, object]) -> dict[str, object]:
+        return json.loads(_canonical_bytes(record))
+
+    def begin_activation(
+        self,
+        *,
+        job_id: object,
+        capability: object,
+        idempotency_key: object,
+    ) -> dict[str, object]:
+        """Persist the first phase before a Companion or job side effect.
+
+        The durable phase record is the recovery authority after a response is
+        lost.  It deliberately contains the complete exact request identity;
+        the signed capability remains in the issued result and is never
+        reconstructed from client fields.
+        """
+
+        key = _nonempty_string(
+            idempotency_key,
+            "formal source activation idempotency key",
+        )
+        if len(key) > 200:
+            raise ValueError("formal source activation idempotency key is invalid")
+        with self._state_lock, self._ledger_lock():
+            ledger = self._read_ledger()
+            row, checked = self._activation_row_locked(
+                ledger,
+                job_id=job_id,
+                capability=capability,
+            )
+            request_digest = self._activation_request_digest(job_id, checked)
+            existing = row.get("activation_record")
+            if existing is not None:
+                if not isinstance(existing, dict):
+                    raise RuntimeError("formal source activation result is invalid")
+                if (
+                    existing.get("idempotency_key") != key
+                    or existing.get("request_digest") != request_digest
+                ):
+                    raise ValueError(
+                        "formal source activation idempotency key was used with a different request"
+                    )
+                return self._activation_state_copy(existing)
+            if row.get("state") != "issued":
+                raise ValueError("formal source activation challenge is not active")
+            self._require_execution_capability(capability)
+            prepared_at = self._utc_now().isoformat()
+            record: dict[str, object] = {
+                "idempotency_key": key,
+                "request_digest": request_digest,
+                "job_id": job_id,
+                "phase": "awaiting_heartbeat",
+                "prepared_at": prepared_at,
+                "heartbeat_request_digest": None,
+                "heartbeat_result": None,
+                "started_result": None,
+                "result": None,
+            }
+            row["activation_record"] = record
+            self._write_ledger(ledger)
+            return self._activation_state_copy(record)
+
+    def activation_state(
+        self,
+        *,
+        job_id: object,
+        capability: object,
+        idempotency_key: object,
+    ) -> dict[str, object]:
+        key = _nonempty_string(
+            idempotency_key,
+            "formal source activation idempotency key",
+        )
+        with self._state_lock, self._ledger_lock():
+            ledger = self._read_ledger()
+            row, checked = self._activation_row_locked(
+                ledger,
+                job_id=job_id,
+                capability=capability,
+            )
+            record = row.get("activation_record")
+            request_digest = self._activation_request_digest(job_id, checked)
+            if (
+                not isinstance(record, dict)
+                or record.get("idempotency_key") != key
+                or record.get("request_digest") != request_digest
+            ):
+                raise ValueError("formal source activation state is unavailable")
+            return self._activation_state_copy(record)
+
+    def pending_activation_request(self) -> dict[str, object] | None:
+        """Return the one signed request an ordinary heartbeat may acknowledge."""
+
+        with self._state_lock, self._ledger_lock():
+            if self._active_challenge is None or self._execution_capability is None:
+                return None
+            ledger = self._read_ledger()
+            row = ledger.get(str(self._active_challenge["challenge_id"]))
+            record = row.get("activation_record") if isinstance(row, dict) else None
+            if not isinstance(record, dict) or record.get("phase") != "awaiting_heartbeat":
+                return None
+            return {
+                "job_id": record["job_id"],
+                "challenge_id": self._active_challenge["challenge_id"],
+                "execution_capability": dict(self._execution_capability),
+            }
+
+    def record_activation_heartbeat(
+        self,
+        *,
+        acknowledgment: object,
+        request_details: object,
+        heartbeat: object,
+    ) -> dict[str, object]:
+        """Atomically bind a real mounted heartbeat request to activation."""
+
+        if not isinstance(acknowledgment, dict) or set(acknowledgment) != {
+            "job_id",
+            "challenge_id",
+            "execution_capability",
+        }:
+            raise ValueError("formal activation heartbeat acknowledgment is invalid")
+        if not isinstance(request_details, dict) or not isinstance(heartbeat, dict):
+            raise ValueError("formal activation heartbeat payload is invalid")
+        with self._state_lock, self._ledger_lock():
+            if self._active_challenge is None:
+                raise ValueError("formal activation heartbeat has no active challenge")
+            if acknowledgment["challenge_id"] != self._active_challenge["challenge_id"]:
+                raise ValueError("formal activation heartbeat targets a foreign challenge")
+            checked = self._require_execution_capability(
+                acknowledgment["execution_capability"]
+            )
+            if acknowledgment["job_id"] != checked["terminal_job_id"]:
+                raise ValueError("formal activation heartbeat targets a foreign job")
+            ledger = self._read_ledger()
+            row = ledger.get(str(checked["challenge_id"]))
+            if not isinstance(row, dict) or row.get("state") != "issued":
+                raise ValueError("formal activation heartbeat challenge is not active")
+            record = row.get("activation_record")
+            if not isinstance(record, dict) or record.get("job_id") != checked[
+                "terminal_job_id"
+            ]:
+                raise ValueError("formal activation heartbeat was not prepared")
+            heartbeat_digest = _sha256(
+                {
+                    "acknowledgment": acknowledgment,
+                    "request": request_details,
+                    "heartbeat": heartbeat,
+                }
+            )
+            phase = record.get("phase")
+            if phase in {"heartbeat_recorded", "started", "completed"}:
+                if record.get("heartbeat_request_digest") != heartbeat_digest:
+                    raise ValueError(
+                        "formal activation heartbeat differs from the recorded request"
+                    )
+                stored = record.get("heartbeat_result")
+                if not isinstance(stored, dict):
+                    raise RuntimeError("formal activation heartbeat result is unavailable")
+                return json.loads(_canonical_bytes(stored))
+            if phase != "awaiting_heartbeat":
+                raise ValueError("formal activation heartbeat phase is invalid")
+            before = self._active_state_payload()
+            try:
+                self._record_locked(
+                    kind="browser_heartbeat",
+                    method="POST",
+                    path=_BROWSER_PATHS["browser_heartbeat"],
+                    subject_ids=(str(heartbeat.get("companion_id")),),
+                    details={"request": request_details, "heartbeat": heartbeat},
+                    response_sha256=None,
+                )
+                result = {
+                    "receipt_sha256": self._events[-1]["receipt_sha256"],
+                    "companion_id": heartbeat["companion_id"],
+                }
+                record.update(
+                    {
+                        "phase": "heartbeat_recorded",
+                        "heartbeat_request_digest": heartbeat_digest,
+                        "heartbeat_result": result,
+                    }
+                )
+                row["active_state"] = self._active_state_payload()
+                self._write_ledger(ledger)
+            except Exception:
+                self._apply_active_state(before)
+                raise
+            return json.loads(_canonical_bytes(result))
+
+    def mark_activation_started(
+        self,
+        *,
+        job_id: object,
+        capability: object,
+        idempotency_key: object,
+        result: object,
+    ) -> dict[str, object]:
+        if not isinstance(result, dict):
+            raise ValueError("formal source activation started result is invalid")
+        key = _nonempty_string(idempotency_key, "formal source activation idempotency key")
+        with self._state_lock, self._ledger_lock():
+            ledger = self._read_ledger()
+            row, checked = self._activation_row_locked(
+                ledger, job_id=job_id, capability=capability
+            )
+            record = row.get("activation_record")
+            request_digest = self._activation_request_digest(job_id, checked)
+            if (
+                not isinstance(record, dict)
+                or record.get("idempotency_key") != key
+                or record.get("request_digest") != request_digest
+            ):
+                raise ValueError("formal source activation state is unavailable")
+            if record.get("phase") in {"started", "completed"}:
+                stored = record.get("started_result")
+                if stored != result:
+                    raise ValueError("formal source activation started result differs")
+                return self._activation_state_copy(record)
+            if record.get("phase") != "heartbeat_recorded":
+                raise ValueError("formal source activation has no real heartbeat")
+            record["phase"] = "started"
+            record["started_result"] = result
+            self._write_ledger(ledger)
+            return self._activation_state_copy(record)
+
     def activation_replay(
         self,
         *,
@@ -3658,30 +3917,10 @@ class FormalLiveSourceAuthority:
             raise ValueError("formal source activation idempotency key is invalid")
         with self._state_lock, self._ledger_lock():
             ledger = self._read_ledger()
-            row: dict[str, object] | None = None
-            checked: dict[str, object] | None = None
-            for candidate in ledger.values():
-                issued = candidate.get("issue_result")
-                if not isinstance(issued, dict):
-                    continue
-                challenge = issued.get("challenge")
-                try:
-                    candidate_capability = _validate_execution_capability(
-                        capability,
-                        challenge=_validate_challenge(challenge),
-                    )
-                except (RuntimeError, ValueError):
-                    continue
-                row = candidate
-                checked = candidate_capability
-                break
-            if row is None or checked is None:
-                raise ValueError("formal source activation capability is unknown")
-            if job_id != checked["terminal_job_id"]:
-                raise ValueError("formal source activation targets a foreign job")
-            request_digest = _sha256(
-                {"job_id": job_id, "execution_capability": checked}
+            row, checked = self._activation_row_locked(
+                ledger, job_id=job_id, capability=capability
             )
+            request_digest = self._activation_request_digest(job_id, checked)
             record = row.get("activation_record")
             if record is None:
                 if row.get("state") != "issued":
@@ -3698,6 +3937,8 @@ class FormalLiveSourceAuthority:
                     "formal source activation idempotency key was used with a different request"
                 )
             result = record.get("result")
+            if result is None:
+                return None
             if not isinstance(result, dict):
                 raise RuntimeError("formal source activation result is unavailable")
             return json.loads(_canonical_bytes(result))
@@ -3726,9 +3967,7 @@ class FormalLiveSourceAuthority:
             row = ledger.get(str(checked["challenge_id"]))
             if not isinstance(row, dict) or row.get("state") != "issued":
                 raise ValueError("formal source activation challenge is not active")
-            request_digest = _sha256(
-                {"job_id": job_id, "execution_capability": checked}
-            )
+            request_digest = self._activation_request_digest(job_id, checked)
             existing = row.get("activation_record")
             if existing is not None:
                 if not isinstance(existing, dict):
@@ -3741,14 +3980,23 @@ class FormalLiveSourceAuthority:
                         "formal source activation idempotency key was used with a different request"
                     )
                 stored = existing.get("result")
-                if not isinstance(stored, dict):
-                    raise RuntimeError("formal source activation result is unavailable")
-                return json.loads(_canonical_bytes(stored))
-            row["activation_record"] = {
-                "idempotency_key": key,
-                "request_digest": request_digest,
-                "result": result,
-            }
+                if isinstance(stored, dict):
+                    return json.loads(_canonical_bytes(stored))
+                if existing.get("phase") != "started":
+                    raise ValueError("formal source activation has not started")
+            if existing is None:
+                # Preserve the pre-two-phase durable replay record for callers
+                # that only store an already-completed activation response.  The
+                # mounted production endpoint always calls ``begin_activation``
+                # first, so live activation cannot use this compatibility path.
+                row["activation_record"] = {
+                    "idempotency_key": key,
+                    "request_digest": request_digest,
+                    "result": result,
+                }
+            else:
+                existing["phase"] = "completed"
+                existing["result"] = result
             self._write_ledger(ledger)
             return json.loads(_canonical_bytes(result))
 
@@ -4233,11 +4481,24 @@ class FormalLiveSourceAuthority:
                     raise RuntimeError("formal source ledger finalize result is invalid")
             if present_activation_fields:
                 activation = value["activation_record"]
-                if not isinstance(activation, dict) or set(activation) != {
+                legacy_activation_fields = {
                     "idempotency_key",
                     "request_digest",
                     "result",
-                }:
+                }
+                phased_activation_fields = legacy_activation_fields | {
+                    "job_id",
+                    "phase",
+                    "prepared_at",
+                    "heartbeat_request_digest",
+                    "heartbeat_result",
+                    "started_result",
+                }
+                if (
+                    not isinstance(activation, dict)
+                    or set(activation)
+                    not in (legacy_activation_fields, phased_activation_fields)
+                ):
                     raise RuntimeError("formal source ledger activation result is invalid")
                 _nonempty_string(
                     activation["idempotency_key"],
@@ -4247,8 +4508,66 @@ class FormalLiveSourceAuthority:
                     activation["request_digest"],
                     "formal source ledger activation request",
                 )
-                if not isinstance(activation["result"], dict):
-                    raise RuntimeError("formal source ledger activation result is invalid")
+                if set(activation) == legacy_activation_fields:
+                    if not isinstance(activation["result"], dict):
+                        raise RuntimeError("formal source ledger activation result is invalid")
+                else:
+                    _nonempty_string(
+                        activation["job_id"],
+                        "formal source ledger activation job",
+                    )
+                    phase = activation["phase"]
+                    if phase not in {
+                        "awaiting_heartbeat",
+                        "heartbeat_recorded",
+                        "started",
+                        "completed",
+                    }:
+                        raise RuntimeError("formal source ledger activation phase is invalid")
+                    _require_aware_time(
+                        activation["prepared_at"],
+                        "formal source ledger activation prepared_at",
+                    )
+                    heartbeat_digest = activation["heartbeat_request_digest"]
+                    heartbeat_result = activation["heartbeat_result"]
+                    started_result = activation["started_result"]
+                    result = activation["result"]
+                    if phase == "awaiting_heartbeat":
+                        if any(
+                            item is not None
+                            for item in (
+                                heartbeat_digest,
+                                heartbeat_result,
+                                started_result,
+                                result,
+                            )
+                        ):
+                            raise RuntimeError(
+                                "formal source ledger activation phase is inconsistent"
+                            )
+                    else:
+                        _require_sha256(
+                            heartbeat_digest,
+                            "formal source ledger activation heartbeat request",
+                        )
+                        if not isinstance(heartbeat_result, dict):
+                            raise RuntimeError(
+                                "formal source ledger activation heartbeat is invalid"
+                            )
+                    if phase in {"started", "completed"} and not isinstance(
+                        started_result, dict
+                    ):
+                        raise RuntimeError(
+                            "formal source ledger activation started result is invalid"
+                        )
+                    if phase == "completed" and not isinstance(result, dict):
+                        raise RuntimeError(
+                            "formal source ledger activation result is invalid"
+                        )
+                    if phase != "completed" and result is not None:
+                        raise RuntimeError(
+                            "formal source ledger activation result is premature"
+                        )
             if value["state"] == "consumed":
                 _require_sha256(value["binding_digest"], "formal source ledger binding")
                 _require_aware_time(value["verified_at"], "formal source ledger verified_at")

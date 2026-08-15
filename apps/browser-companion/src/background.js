@@ -11420,6 +11420,11 @@ async function pollOnce() {
         storage.remove(LAST_RELOAD_RECEIPT_STORAGE_KEY),
       );
     }
+    if (claimed.formal_activation_request !== null &&
+        claimed.formal_activation_request !== undefined) {
+      await heartbeatOnce(claimed.formal_activation_request);
+      return;
+    }
     const leases = Array.isArray(claimed.leases) ? claimed.leases : [];
     if (claimed.control !== null && claimed.control !== undefined) {
       const control = validateReloadControl(claimed.control, leases);
@@ -11455,21 +11460,55 @@ async function pollOnce() {
   }
 }
 
-async function heartbeatOnce() {
+async function heartbeatOnce(formalActivationAck = null) {
   assertChromeExecutionRuntime();
   const config = await sessionConfig();
   if (!config.connected) return null;
   const authorized = await authorizedScopeKeys();
   const providers = [...new Set(authorized.map((scope) => scope.split(":")[0]))];
+  const body = {
+    companion_id: COMPANION_ID,
+    providers,
+    authorized_scope_keys: authorized,
+    adapter_version: "0.2.0",
+    contract_version: "tripchord-capability-v1",
+    runtime_instance_id: RUNTIME_INSTANCE_ID,
+  };
+  const requestBody = formalActivationAck === null
+    ? body
+    : { ...body, formal_activation_ack: formalActivationAck };
+  const heartbeat = await bridgeFetch("/v1/companions/heartbeat", {
+    method: "POST",
+    body: JSON.stringify(requestBody),
+    timeoutMs: 5000,
+  });
+  if (formalActivationAck !== null) {
+    return heartbeat;
+  }
+  const pending = heartbeat && heartbeat.formal_activation_request;
+  if (pending === null || pending === undefined) {
+    return heartbeat;
+  }
+  if (
+    typeof pending !== "object" ||
+    Array.isArray(pending) ||
+    typeof pending.job_id !== "string" ||
+    !pending.job_id ||
+    typeof pending.challenge_id !== "string" ||
+    !pending.challenge_id ||
+    typeof pending.execution_capability !== "object" ||
+    pending.execution_capability === null ||
+    Array.isArray(pending.execution_capability) ||
+    pending.execution_capability.terminal_job_id !== pending.job_id ||
+    pending.execution_capability.challenge_id !== pending.challenge_id
+  ) {
+    throw new Error("formal activation request has an invalid signed identity");
+  }
   return bridgeFetch("/v1/companions/heartbeat", {
     method: "POST",
     body: JSON.stringify({
-      companion_id: COMPANION_ID,
-      providers,
-      authorized_scope_keys: authorized,
-      adapter_version: "0.2.0",
-      contract_version: "tripchord-capability-v1",
-      runtime_instance_id: RUNTIME_INSTANCE_ID,
+      ...body,
+      formal_activation_ack: pending,
     }),
     timeoutMs: 5000,
   });

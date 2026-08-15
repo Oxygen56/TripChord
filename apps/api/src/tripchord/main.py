@@ -1357,6 +1357,8 @@ async def agent_runtime_status_endpoint(
 
 _FORMAL_SOURCE_CONTROL_HEADER = "X-TripChord-Formal-Source-Control"
 _FORMAL_SOURCE_CONTROL_PATH: Path | None = None
+_FORMAL_ACTIVATION_HEARTBEAT_TIMEOUT_SECONDS = 15.0
+_FORMAL_ACTIVATION_HEARTBEAT_POLL_SECONDS = 0.05
 
 
 def _formal_source_control_token() -> str:
@@ -1482,42 +1484,55 @@ async def activate_formal_live_source_job_endpoint(
             bridge = getattr(request.app.state, "browser_task_bridge", None)
             if bridge is None:
                 raise ValueError("formal source activation has no mounted Browser bridge")
-            companion_status = await bridge.companion_status()
-            fresh_companions = [
-                companion
-                for companion in companion_status.companions
-                if companion.is_fresh
-            ]
-            if len(fresh_companions) != 1:
-                raise ValueError(
-                    "formal source activation requires one exact fresh Companion"
-                )
-            companion = fresh_companions[0]
-            with authority.execution_scope(capability):
-                snapshot = await registry.activate(job_id, principal.tenant_id)
-                if snapshot is not None:
-                    heartbeat = companion.model_dump(mode="json")
-                    authority.record_browser_http(
-                        "browser_heartbeat",
-                        subject_ids=(companion.companion_id,),
-                        details={
-                            "request": {
-                                key: heartbeat[key]
-                                for key in (
-                                    "companion_id",
-                                    "providers",
-                                    "authorized_scope_keys",
-                                    "adapter_version",
-                                    "contract_version",
-                                    "runtime_instance_id",
-                                )
-                            },
-                            "heartbeat": heartbeat,
-                        },
+            activation = authority.begin_activation(
+                job_id=job_id,
+                capability=capability,
+                idempotency_key=idempotency_key,
+            )
+            deadline = (
+                asyncio.get_running_loop().time()
+                + _FORMAL_ACTIVATION_HEARTBEAT_TIMEOUT_SECONDS
+            )
+            while activation.get("phase") == "awaiting_heartbeat":
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise ValueError(
+                        "formal source activation timed out awaiting a real Companion heartbeat"
                     )
-            if snapshot is None:
-                raise ValueError("formal source prepared job is unavailable")
-            result = {"job": snapshot.model_dump(mode="json")}
+                await asyncio.sleep(_FORMAL_ACTIVATION_HEARTBEAT_POLL_SECONDS)
+                activation = authority.activation_state(
+                    job_id=job_id,
+                    capability=capability,
+                    idempotency_key=idempotency_key,
+                )
+
+            started_result = activation.get("started_result")
+            if activation.get("phase") == "heartbeat_recorded":
+                try:
+                    with authority.execution_scope(capability):
+                        snapshot = await registry.activate(job_id, principal.tenant_id)
+                except LivePlanningJobInactiveError:
+                    # The job side effect may have committed immediately before
+                    # the response or activation ledger write was lost.
+                    snapshot = await registry.get(job_id, principal.tenant_id)
+                if snapshot is None:
+                    raise ValueError("formal source prepared job is unavailable")
+                started_result = {"job": snapshot.model_dump(mode="json")}
+                activation = authority.mark_activation_started(
+                    job_id=job_id,
+                    capability=capability,
+                    idempotency_key=idempotency_key,
+                    result=started_result,
+                )
+            if activation.get("phase") == "completed":
+                completed = activation.get("result")
+                if not isinstance(completed, dict):
+                    raise RuntimeError("formal source activation result is unavailable")
+                return cast(dict[str, Any], completed)
+            if activation.get("phase") != "started" or not isinstance(
+                started_result, dict
+            ):
+                raise ValueError("formal source activation state is not recoverable")
+            result = started_result
             return cast(
                 dict[str, Any],
                 authority.store_activation_result(

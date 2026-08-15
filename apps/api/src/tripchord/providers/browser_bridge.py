@@ -1821,9 +1821,16 @@ class ClaimBrowserTasksRequest(DomainModel):
         return self
 
 
+class FormalBrowserActivationRequest(DomainModel):
+    job_id: str = Field(min_length=1, max_length=200)
+    challenge_id: str = Field(min_length=1, max_length=200)
+    execution_capability: dict[str, object]
+
+
 class ClaimBrowserTasksResponse(DomainModel):
     leases: tuple[BrowserTaskLease, ...]
     control: BrowserCompanionReloadControl | None = None
+    formal_activation_request: FormalBrowserActivationRequest | None = None
 
 
 class BrowserCompanionHeartbeatRequest(DomainModel):
@@ -1833,6 +1840,7 @@ class BrowserCompanionHeartbeatRequest(DomainModel):
     adapter_version: str | None = None
     contract_version: str | None = None
     runtime_instance_id: str | None = None
+    formal_activation_ack: FormalBrowserActivationRequest | None = None
 
 
 class BrowserCompanionHeartbeat(DomainModel):
@@ -1848,6 +1856,10 @@ class BrowserCompanionHeartbeat(DomainModel):
     runtime_instance_id: str | None = None
 
     _validate_last_seen = field_validator("last_seen")(_require_timezone)
+
+
+class BrowserCompanionHeartbeatResponse(BrowserCompanionHeartbeat):
+    formal_activation_request: FormalBrowserActivationRequest | None = None
 
 
 class BrowserCompanionStatusResponse(DomainModel):
@@ -1951,6 +1963,7 @@ class PersistedBrowserTaskRecord(DomainModel):
     failure: BrowserFailure | None = None
     reused_from_task_id: str | None = None
     reuse_age_seconds: float | None = Field(default=None, ge=0)
+    formal_execution_capability: dict[str, object] | None = None
 
     _validate_created_at = field_validator("created_at")(_require_timezone)
     _validate_updated_at = field_validator("updated_at")(_require_timezone)
@@ -3326,6 +3339,11 @@ class BrowserTaskBridge:
                 failure=persisted.failure,
                 reused_from_task_id=persisted.reused_from_task_id,
                 reuse_age_seconds=persisted.reuse_age_seconds,
+                formal_execution_capability=(
+                    dict(persisted.formal_execution_capability)
+                    if persisted.formal_execution_capability is not None
+                    else None
+                ),
             )
             if record.state == BrowserTaskState.CLAIMED:
                 record.claimed_by = None
@@ -3399,6 +3417,7 @@ class BrowserTaskBridge:
                 failure=record.failure,
                 reused_from_task_id=record.reused_from_task_id,
                 reuse_age_seconds=record.reuse_age_seconds,
+                formal_execution_capability=record.formal_execution_capability,
             )
             for record in sorted(
                 self._records.values(),
@@ -3636,14 +3655,6 @@ def create_browser_bridge_app(
                 reload_receipt=payload.reload_receipt,
             )
             if source_authority is not None and response.leases:
-                companion = next(
-                    (
-                        item
-                        for item in (await task_bridge.companion_status()).companions
-                        if item.companion_id == payload.companion_id
-                    ),
-                    None,
-                )
                 scoped_leases: list[
                     tuple[BrowserTaskLease, dict[str, object]]
                 ] = []
@@ -3670,29 +3681,8 @@ def create_browser_bridge_app(
                     formal_leases: list[dict[str, object]] = []
                     with source_authority.execution_scope(capability):
                         if source_authority.snapshot()["last_heartbeat"] is None:
-                            if companion is None:
-                                raise ValueError(
-                                    "formal browser claim has no fresh Companion heartbeat"
-                                )
-                            source_authority.record_browser_http(
-                                "browser_heartbeat",
-                                subject_ids=(payload.companion_id,),
-                                details={
-                                    "request": {
-                                        "companion_id": payload.companion_id,
-                                        "providers": [
-                                            provider.value
-                                            for provider in payload.providers
-                                        ],
-                                        "authorized_scope_keys": list(
-                                            payload.authorized_scope_keys
-                                        ),
-                                        "adapter_version": payload.adapter_version,
-                                        "contract_version": payload.contract_version,
-                                        "runtime_instance_id": payload.runtime_instance_id,
-                                    },
-                                    "heartbeat": companion.model_dump(mode="json"),
-                                },
+                            raise ValueError(
+                                "formal browser claim has no acknowledged Companion heartbeat"
                             )
                         for lease in group:
                             lease_payload = lease.model_dump(
@@ -3718,7 +3708,22 @@ def create_browser_bridge_app(
                                 "leases": formal_leases,
                             },
                         )
-            return response
+            pending_activation = (
+                source_authority.pending_activation_request()
+                if source_authority is not None
+                else None
+            )
+            return response.model_copy(
+                update={
+                    "formal_activation_request": (
+                        FormalBrowserActivationRequest.model_validate(
+                            pending_activation
+                        )
+                        if pending_activation is not None
+                        else None
+                    )
+                }
+            )
         except BrowserCompanionReloadNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except BrowserCompanionControlError as exc:
@@ -3737,23 +3742,57 @@ def create_browser_bridge_app(
 
     @app.post(
         "/v1/companions/heartbeat",
-        response_model=BrowserCompanionHeartbeat,
+        response_model=BrowserCompanionHeartbeatResponse,
     )
     async def companion_heartbeat(
         payload: BrowserCompanionHeartbeatRequest,
         request: Request,
         token: Annotated[str | None, Header(alias=BRIDGE_TOKEN_HEADER)] = None,
-    ) -> BrowserCompanionHeartbeat:
+    ) -> BrowserCompanionHeartbeatResponse:
         await authorize(request, token)
-        heartbeat = await task_bridge.heartbeat(
-            payload.companion_id,
-            providers=payload.providers,
-            authorized_scope_keys=payload.authorized_scope_keys,
-            adapter_version=payload.adapter_version,
-            contract_version=payload.contract_version,
-            runtime_instance_id=payload.runtime_instance_id,
-        )
-        return heartbeat
+        try:
+            acknowledgment = (
+                payload.formal_activation_ack.model_dump(mode="json")
+                if payload.formal_activation_ack is not None
+                else None
+            )
+            pending_before = (
+                source_authority.pending_activation_request()
+                if source_authority is not None
+                else None
+            )
+            if acknowledgment is not None and acknowledgment != pending_before:
+                raise ValueError(
+                    "formal activation heartbeat acknowledgment is not the pending job"
+                )
+            heartbeat = await task_bridge.heartbeat(
+                payload.companion_id,
+                providers=payload.providers,
+                authorized_scope_keys=payload.authorized_scope_keys,
+                adapter_version=payload.adapter_version,
+                contract_version=payload.contract_version,
+                runtime_instance_id=payload.runtime_instance_id,
+            )
+            if source_authority is not None and acknowledgment is not None:
+                source_authority.record_activation_heartbeat(
+                    acknowledgment=acknowledgment,
+                    request_details=payload.model_dump(
+                        mode="json",
+                        exclude={"formal_activation_ack"},
+                    ),
+                    heartbeat=heartbeat.model_dump(mode="json"),
+                )
+            pending = (
+                source_authority.pending_activation_request()
+                if source_authority is not None
+                else None
+            )
+            return BrowserCompanionHeartbeatResponse(
+                **heartbeat.model_dump(mode="python"),
+                formal_activation_request=pending,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post(
         "/v1/companions/{companion_id}/reload-requests",
