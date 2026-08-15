@@ -3740,6 +3740,7 @@ class FormalLiveSourceAuthority:
                 "job_id": job_id,
                 "execution_capability": capability,
                 "companion_binding": companion_binding,
+                "phase_version": "tripchord-formal-activation-v2",
             }
         )
 
@@ -3823,6 +3824,7 @@ class FormalLiveSourceAuthority:
             self._require_execution_capability(capability)
             prepared_at = self._utc_now().isoformat()
             record: dict[str, object] = {
+                "phase_version": "tripchord-formal-activation-v2",
                 "idempotency_key": key,
                 "request_digest": request_digest,
                 "job_id": job_id,
@@ -4079,16 +4081,22 @@ class FormalLiveSourceAuthority:
                 raise ValueError("formal source activation state is unavailable")
             if record.get("phase") in {"started", "completed"}:
                 stored = record.get("started_result")
-                if not isinstance(stored, dict) or _canonical_bytes(stored) != (
-                    _canonical_bytes(result)
+                durable_result = record.get("result")
+                if (
+                    not isinstance(stored, dict)
+                    or not isinstance(durable_result, dict)
+                    or _canonical_bytes(stored) != _canonical_bytes(result)
+                    or _canonical_bytes(durable_result) != _canonical_bytes(result)
                 ):
                     raise ValueError("formal source activation started result differs")
                 return self._activation_state_copy(record)
             if record.get("phase") != "activation_ready":
                 raise ValueError("formal source activation has no durable queued receipt")
-            if record.get("started_result") != result:
+            if not isinstance(record.get("started_result"), dict) or _canonical_bytes(
+                record["started_result"]
+            ) != _canonical_bytes(result):
                 raise ValueError("formal source activation queued receipt differs")
-            record["phase"] = "started"
+            record.update({"phase": "started", "result": result})
             self._write_ledger(ledger)
             return self._activation_state_copy(record)
 
@@ -4727,6 +4735,7 @@ class FormalLiveSourceAuthority:
             if present_activation_fields:
                 activation = value["activation_record"]
                 phased_activation_fields = {
+                    "phase_version",
                     "idempotency_key",
                     "request_digest",
                     "result",
@@ -4747,6 +4756,10 @@ class FormalLiveSourceAuthority:
                     activation["idempotency_key"],
                     "formal source ledger activation idempotency key",
                 )
+                if activation["phase_version"] != "tripchord-formal-activation-v2":
+                    raise RuntimeError(
+                        "formal source ledger activation phase version is invalid"
+                    )
                 _require_sha256(
                     activation["request_digest"],
                     "formal source ledger activation request",
@@ -4801,17 +4814,17 @@ class FormalLiveSourceAuthority:
                     raise RuntimeError(
                         "formal source ledger activation started result is invalid"
                     )
-                if phase == "completed" and not isinstance(result, dict):
+                if phase in {"started", "completed"} and not isinstance(result, dict):
                     raise RuntimeError(
                         "formal source ledger activation result is invalid"
                     )
-                if phase == "completed" and _canonical_bytes(result) != (
+                if phase in {"started", "completed"} and _canonical_bytes(result) != (
                     _canonical_bytes(started_result)
                 ):
                     raise RuntimeError(
                         "formal source ledger activation result differs from started result"
                     )
-                if phase != "completed" and result is not None:
+                if phase not in {"started", "completed"} and result is not None:
                     raise RuntimeError(
                         "formal source ledger activation result is premature"
                     )

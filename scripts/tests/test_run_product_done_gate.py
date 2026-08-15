@@ -15581,8 +15581,14 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
         restarted.begin_activation(
             job_id=job_id,
             capability=capability,
-            idempotency_key="two-phase-activate-foreign",
-            companion_binding=binding,
+            idempotency_key="two-phase-activate-v1",
+            companion_binding=_formal_companion_binding(
+                companion_id="two-phase-foreign-companion",
+                runtime_instance_id="two-phase-runtime-v1",
+                manifest_version="two-phase-build-v1",
+                build_sha256="8" * 64,
+                adapter_version="two-phase-adapter-v1",
+            ),
         )
 
     heartbeat_request = {
@@ -15652,20 +15658,14 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
         idempotency_key="two-phase-activate-v1",
         result=started_result,
     )
-    monkeypatch.setattr(restarted, "_write_ledger", fail_write)
-    with pytest.raises(OSError, match="activation phase"):
-        restarted.store_activation_result(
-            job_id=job_id,
-            capability=capability,
-            idempotency_key="two-phase-activate-v1",
-            result=started_result,
-        )
-    monkeypatch.setattr(restarted, "_write_ledger", original_write)
-    assert restarted.activation_state(
+    durable_started = restarted.activation_state(
         job_id=job_id,
         capability=capability,
         idempotency_key="two-phase-activate-v1",
-    )["phase"] == "started"
+    )
+    assert durable_started["phase"] == "started"
+    assert durable_started["started_result"] == started_result
+    assert durable_started["result"] == started_result
     mismatched_first_result = copy.deepcopy(started_result)
     mismatched_first_result["job"]["state"] = "running"
     with pytest.raises(ValueError, match="queued receipt"):
@@ -15684,11 +15684,6 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
             idempotency_key="two-phase-activate-v1",
             result=type_mismatched_first_result,
         )
-    assert restarted.activation_state(
-        job_id=job_id,
-        capability=capability,
-        idempotency_key="two-phase-activate-v1",
-    )["result"] is None
     completed = restarted.store_activation_result(
         job_id=job_id,
         capability=capability,
@@ -15696,6 +15691,11 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
         result=started_result,
     )
     assert completed == started_result
+    assert restarted.activation_state(
+        job_id=job_id,
+        capability=capability,
+        idempotency_key="two-phase-activate-v1",
+    )["phase"] == "started"
     with pytest.raises(ValueError, match="queued receipt"):
         restarted.store_activation_result(
             job_id=job_id,
@@ -15727,6 +15727,101 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
     with pytest.raises(RuntimeError, match="activation result differs"):
         _fresh_installed_formal_authority(tmp_path)
     cold._write_ledger(good_ledger)
+
+
+def test_formal_activation_started_atomically_persists_exact_queued_receipt(
+    tmp_path: Path,
+) -> None:
+    """cb53dfb8: ``started`` is never durable without its exact first receipt."""
+
+    authority, context = _fresh_installed_formal_authority(tmp_path)
+    issued = authority.issue_challenge(
+        context,
+        idempotency_key="atomic-started-issue-v1",
+    )
+    capability = issued["execution_capability"]
+    job_id = capability["terminal_job_id"]
+    binding = _formal_companion_binding(companion_id="atomic-started-companion")
+    authority.begin_activation(
+        job_id=job_id,
+        capability=capability,
+        idempotency_key="atomic-started-activate-v1",
+        companion_binding=binding,
+    )
+    request_details = {
+        key: value for key, value in binding.items() if key != "identity_sha256"
+    }
+    authority.record_activation_heartbeat(
+        acknowledgment={
+            "job_id": job_id,
+            "challenge_id": capability["challenge_id"],
+            "execution_capability": capability,
+            "companion_binding": binding,
+        },
+        request_details=request_details,
+        heartbeat={
+            **request_details,
+            "last_seen": NOW.isoformat(),
+            "age_seconds": 0.0,
+            "is_fresh": True,
+        },
+    )
+    queued = {
+        "job": {"id": job_id, "state": "queued", "attempt": 1},
+        "activation_receipt": {"capability_id": capability["capability_id"]},
+    }
+    authority.prepare_activation_result(
+        job_id=job_id,
+        capability=capability,
+        idempotency_key="atomic-started-activate-v1",
+        result=queued,
+    )
+
+    started = authority.mark_activation_started(
+        job_id=job_id,
+        capability=capability,
+        idempotency_key="atomic-started-activate-v1",
+        result=queued,
+    )
+    assert started["phase"] == "started"
+    assert started["started_result"] == queued
+    assert started["result"] == queued
+    assert authority.activation_replay(
+        job_id=job_id,
+        capability=capability,
+        idempotency_key="atomic-started-activate-v1",
+        companion_binding=binding,
+    ) == queued
+    wrong_type = copy.deepcopy(queued)
+    wrong_type["job"]["attempt"] = True
+    with pytest.raises(ValueError, match="started result differs"):
+        authority.mark_activation_started(
+            job_id=job_id,
+            capability=capability,
+            idempotency_key="atomic-started-activate-v1",
+            result=wrong_type,
+        )
+
+    ledger = authority._read_ledger()
+    corruptions = []
+    started_null = copy.deepcopy(ledger)
+    started_null[capability["challenge_id"]]["activation_record"]["result"] = None
+    corruptions.append(started_null)
+    missing_started = copy.deepcopy(ledger)
+    del missing_started[capability["challenge_id"]]["activation_record"][
+        "started_result"
+    ]
+    corruptions.append(missing_started)
+    mismatched = copy.deepcopy(ledger)
+    mismatched[capability["challenge_id"]]["activation_record"]["result"]["job"][
+        "attempt"
+    ] = True
+    corruptions.append(mismatched)
+    for broken in corruptions:
+        authority._write_ledger(broken)
+        with pytest.raises(RuntimeError, match=r"activation (?:result|phase)"):
+            _fresh_installed_formal_authority(tmp_path)
+    authority._write_ledger(ledger)
 
 
 def test_formal_query_requires_job_bound_execution_capability(tmp_path: Path) -> None:
@@ -16463,8 +16558,34 @@ def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
             assert old_row["state"] == "aborted"
             assert old_row["terminal_reason"] == "runtime_restart_requires_new_attempt"
             assert len(fresh_row["active_state"]["events"]) == 1
-            assert fresh_row["activation_record"]["phase"] == "completed"
-        stop_server(second_process)
+            assert fresh_row["activation_record"]["phase"] == "started"
+            assert fresh_row["activation_record"]["result"] == first_receipt
+            assert fresh_row["activation_record"]["started_result"] == first_receipt
+        second_process.kill()
+        second_process.wait(timeout=10)
+
+        third_process = await start_server(3)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            cold_replay = await client.post(
+                f"{base}/api/v1/internal/formal-live-source/jobs/{fresh_job_id}/activate",
+                headers=activation_headers,
+                json=activation_payload,
+            )
+            assert cold_replay.status_code == 200, cold_replay.text
+            assert cold_replay.json() == first_receipt
+            cold_mismatch = await client.post(
+                f"{base}/api/v1/internal/formal-live-source/jobs/{fresh_job_id}/activate",
+                headers=activation_headers,
+                json={
+                    **activation_payload,
+                    "companion_binding": {
+                        **companion_binding,
+                        "runtime_instance_id": "foreign-runtime-after-restart",
+                    },
+                },
+            )
+            assert cold_mismatch.status_code == 409
+        stop_server(third_process)
 
     try:
         asyncio.run(exercise_restart())
