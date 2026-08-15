@@ -553,6 +553,15 @@ class LivePlanningJobInactiveError(RuntimeError):
     pass
 
 
+class LivePlanningJobCancellationPendingError(RuntimeError):
+    """Raised when an idempotent retry hits a cancel_pending job whose real
+    operation has not yet stopped. The cancellation is still in flight, so the
+    retry must fail closed instead of reusing a running executor as an active
+    job or terminalizing cancelled over live work."""
+
+    pass
+
+
 class LivePlanningJobRegistryPostCommitError(RuntimeError):
     """Raised when a registry persist fails after ``os.replace`` has committed.
 
@@ -942,9 +951,12 @@ class LivePlanningJobRegistry:
         """Derive the provable execution mode for a legacy (v1/v2) idempotency
         binding, or return None when the legacy facts are insufficient.
 
-        Returns True for a prepared (defer_start=True) job, False for an
-        immediate (defer_start=False) job, and None to fail closed into a
-        legacy-isolated binding that is never replayed under any mode.
+        Returns True only for a job with a durable activation operation or a
+        prepared flag. Returns None (never False) for every shape that lacks an
+        unforgeable proof of being immediate — a formal prepared job could have
+        activated with operation_id=None, so "missing activation" is not
+        evidence of immediate execution. None fails closed into a legacy-isolated
+        binding that is never replayed under any mode.
         """
         if schema_version == "tripchord-live-job-registry-v1":
             # v1 predates the activation_operation field entirely, so only an
@@ -962,7 +974,15 @@ class LivePlanningJobRegistry:
             # an immediate job cancelled mid-flight OR a prepared job cancelled
             # before any intent was persisted — indistinguishable, so fail closed.
             return None
-        return False
+        # 硬门 A: a non-cancelled record without an activation operation and
+        # without a prepared flag is NOT provably immediate. The old v2 API
+        # allowed a formal defer_start=true prepared job to activate successfully
+        # with operation_id=None, leaving exactly this shape (RUNNING,
+        # prepared=false, activation_operation=None). Only unforgeable,
+        # durably-recheckable facts prove the execution mode; this shape proves
+        # none, so it fails closed into a legacy-isolated binding that is never
+        # replayed under any mode.
+        return None
 
     @staticmethod
     def _validate_state_parent(parent: Path) -> None:
@@ -1190,21 +1210,29 @@ class LivePlanningJobRegistry:
                             "idempotency key was already used with a different execution mode"
                         )
                     else:
-                        # P0-1: a cancel_pending record whose executor has already
-                        # stopped can be terminalized idempotently here, so a
-                        # same-key retry never reuses a dead running executor as an
-                        # active job.
-                        if existing_runtime.snapshot.cancel_pending and (
-                            existing_runtime.task is None
-                            or existing_runtime.task.done()
-                        ):
-                            try:
-                                self._complete_cancel_terminalize_locked(
-                                    existing_runtime
+                        # P0-1 / 硬门 B: a cancel_pending record may be
+                        # terminalized idempotently here only when BOTH the
+                        # registry task AND the real operation task are truly
+                        # stopped — never while the operation could still be
+                        # writing side effects. If the operation is still running,
+                        # the retry fails closed: it must not report reused
+                        # success over a live executor nor terminalize CANCELLED
+                        # over live work.
+                        if existing_runtime.snapshot.cancel_pending:
+                            if self._executors_stopped(existing_runtime):
+                                try:
+                                    self._complete_cancel_terminalize_locked(
+                                        existing_runtime
+                                    )
+                                except LivePlanningJobRegistryPostCommitError as exc:
+                                    exc.job_id = existing_runtime.snapshot.id
+                                    raise
+                            else:
+                                raise LivePlanningJobCancellationPendingError(
+                                    "idempotency key is bound to a cancellation "
+                                    "still in progress; retry after the "
+                                    "operation stops"
                                 )
-                            except LivePlanningJobRegistryPostCommitError as exc:
-                                exc.job_id = existing_runtime.snapshot.id
-                                raise
                         return existing_runtime.snapshot, True
             self._make_capacity_locked()
             self._records[job_id] = runtime
@@ -1685,10 +1713,10 @@ class LivePlanningJobRegistry:
                 # rather than publish a terminal label over running work.
                 drained = False
             else:
-                drained = current.cancel_drain_succeeded
-                if drained is None:
-                    # No runner existed (e.g. a prepared job): nothing to drain.
-                    drained = True
+                # 硬门 B: the shared terminalize predicate — BOTH the registry
+                # task and the real operation task must be confirmed done before
+                # a final CANCELLED is published.
+                drained = self._executors_stopped(current)
         if current is None:
             outcome = None
         else:
@@ -1755,38 +1783,97 @@ class LivePlanningJobRegistry:
             return await self.get(job_id, tenant_id)
 
     async def close(self) -> None:
+        """Close the registry, reusing the exact durable drain state machine as a
+        single-job cancel (P0-4).
+
+        The final CANCELLED label is NEVER published before both the real
+        ``operation_task`` and the registry ``task`` of every still-active record
+        are confirmed stopped. The cancel intent is persisted durably FIRST;
+        then both executors are physically cancelled and truly awaited within the
+        bounded budget. If an operation swallows CancelledError and keeps running
+        past the budget, the job fails closed into a non-terminal
+        ``cancel_pending`` state (``closing``/``cancel_timed_out``) and the
+        cleanup stays owned — a repeated ``close()`` joins the same cleanup and
+        a cold restart fail-closes the record to ``restart_cancelled``. The
+        ``operation_task`` reference is never dropped while the operation lives.
+        """
         async with self._changed:
-            if self._closed:
-                return
+            first_close = not self._closed
             self._closed = True
             active = tuple(
                 runtime
                 for runtime in self._records.values()
                 if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
             )
-            tasks = tuple(runtime.task for runtime in active if runtime.task is not None)
-            operation_tasks = tuple(
-                runtime.operation_task
-                for runtime in active
-                if runtime.operation_task is not None
+            if not active:
+                return
+            if first_close:
+                # P0-4: persist the cancellation intent durably BEFORE stopping
+                # any real executor. A pre-commit failure leaves every executor
+                # untouched and rolls the in-memory markers back; a post-commit
+                # failure means the intent is already on disk, so proceed to stop
+                # the executors.
+                previous_snapshots = [runtime.snapshot for runtime in active]
+                for runtime in active:
+                    if not runtime.snapshot.cancel_pending:
+                        runtime.snapshot = runtime.snapshot.model_copy(
+                            update={
+                                "cancel_pending": True,
+                                "cancellation_requested": True,
+                                "stage": "closing",
+                                "updated_at": self._utc_now(),
+                            }
+                        )
+                try:
+                    self._persist_locked()
+                except LivePlanningJobRegistryPostCommitError:
+                    pass
+                except Exception:
+                    for runtime, previous in zip(active, previous_snapshots, strict=True):
+                        runtime.snapshot = previous
+                    raise
+                self._changed.notify_all()
+        # Physically cancel BOTH executors of every still-active record FIRST —
+        # before any settle releases a slot — so a queued job can never start
+        # running mid-close and trip the cancellation_requested gate. Then truly
+        # await all of them within the bounded budget, and settle each one:
+        # publish CANCELLED only when both executors are confirmed stopped,
+        # otherwise fail closed into the non-terminal cancel_pending isolation.
+        for runtime in active:
+            if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                continue
+            operation_task = runtime.operation_task
+            if operation_task is not None and not operation_task.done():
+                operation_task.cancel()
+            task = runtime.task
+            if task is not None and not task.done() and task is not asyncio.current_task():
+                task.cancel()
+        pending_tasks = tuple(
+            runtime.task
+            for runtime in active
+            if runtime.task is not None and not runtime.task.done()
+        )
+        if pending_tasks:
+            await asyncio.wait(
+                pending_tasks,
+                timeout=self._cancel_wait_seconds + 0.1,
             )
-            for runtime in active:
-                self._terminalize_locked(
-                    runtime,
+        for runtime in active:
+            if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                continue
+            async with self._lock:
+                current = self._records.get(runtime.snapshot.id)
+            if current is None:
+                continue
+            if self._executors_stopped(current):
+                await self._finish(
+                    current,
                     LivePlanningJobState.CANCELLED,
                     stage="cancelled",
                     cancellation_requested=True,
                 )
-            self._persist_locked()
-            self._changed.notify_all()
-        for operation_task in operation_tasks:
-            if not operation_task.done():
-                operation_task.cancel()
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.wait(tasks, timeout=self._cancel_wait_seconds + 0.1)
+            else:
+                await self._mark_cancel_stuck(current)
 
     async def _run(self, runtime: _RuntimeJob, operation: LiveJobOperation) -> None:
         acquired_slot = False
@@ -1826,10 +1913,11 @@ class LivePlanningJobRegistry:
         except asyncio.CancelledError:
             # P0-1 bounded cleanup: request the operation to stop and wait within
             # the budget BEFORE any terminal label is published. The final
-            # CANCELLED is owned by cancel(), which reads `cancel_drain_succeeded`
-            # and only then terminalizes (or fails closed). Recording the drain
-            # result here and re-raising keeps this task genuinely cancelled so
-            # the real work and the registry record never disagree.
+            # CANCELLED is owned by cancel()/close(), which use the shared
+            # _executors_stopped predicate (registry task AND operation task both
+            # done) and only then terminalize (or fail closed). Recording the
+            # drain result here and re-raising keeps this task genuinely
+            # cancelled so the real work and the registry record never disagree.
             runtime.cancel_drain_succeeded = await self._cancel_and_drain_operation(
                 operation_task
             )
@@ -1839,15 +1927,57 @@ class LivePlanningJobRegistry:
                 exc,
                 code_override=LivePlanningSafeFailureCode.DEADLINE_EXCEEDED,
             )
-            await self._finish(
-                runtime,
-                LivePlanningJobState.FAILED,
-                stage="deadline_exceeded",
-                error="TimeoutError: live planning job deadline exceeded",
-                safe_failure=failure,
-                expected_generation=generation,
-            )
-            await self._cancel_and_drain_operation(operation_task)
+            # 硬门 C: the final FAILED label is NEVER published before the real
+            # operation is confirmed stopped. Persist a durable
+            # timeout/cancel-pending isolation FIRST, then cancel + drain the
+            # operation; publish FAILED only when it is truly stopped. If the
+            # operation swallows CancelledError past the budget, fail closed into
+            # a non-terminal timeout/cancel-pending state and keep cleanup
+            # ownership (a retry or close joins it).
+            pre_timeout_snapshot = runtime.snapshot
+            async with self._lock:
+                if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                    runtime.snapshot = runtime.snapshot.model_copy(
+                        update={
+                            "cancel_pending": True,
+                            "cancellation_requested": True,
+                            "stage": "timeout_pending",
+                            "updated_at": self._utc_now(),
+                        }
+                    )
+                    try:
+                        self._persist_locked()
+                    except LivePlanningJobRegistryPostCommitError:
+                        # The isolation is already committed; proceed to drain.
+                        pass
+                    except Exception:
+                        # Pre-commit: the intent never reached disk, so the
+                        # executor is still untouched — restore the truthful
+                        # pre-timeout snapshot and surface the write failure
+                        # rather than drain under an active record.
+                        runtime.snapshot = pre_timeout_snapshot
+                        raise
+            drained = await self._cancel_and_drain_operation(operation_task)
+            operation_stopped = operation_task is None or operation_task.done()
+            if drained and operation_stopped:
+                await self._finish(
+                    runtime,
+                    LivePlanningJobState.FAILED,
+                    stage="deadline_exceeded",
+                    error="TimeoutError: live planning job deadline exceeded",
+                    safe_failure=failure,
+                    expected_generation=generation,
+                )
+            else:
+                await self._mark_cancel_stuck(
+                    runtime,
+                    stage="timeout_pending",
+                    error=(
+                        "live planning operation did not stop within the deadline "
+                        "cleanup budget; the job stays non-terminal and the "
+                        "operation is isolated"
+                    ),
+                )
         except Exception as exc:
             # Exception messages may contain a raw user prompt, URL, quote or provider
             # payload. Expose only the class and a stable generic description.
@@ -1871,6 +2001,18 @@ class LivePlanningJobRegistry:
         finally:
             if acquired_slot:
                 self._slots.release()
+
+    def _executors_stopped(self, runtime: _RuntimeJob) -> bool:
+        """Shared terminalize predicate (硬门 B / P0-4).
+
+        True only when BOTH the registry runner task AND the real operation task
+        are confirmed done (or never existed). A final CANCELLED / FAILED /
+        close-completed label may be published only when this holds — never while
+        an executor could still be writing side effects."""
+        return (
+            (runtime.task is None or runtime.task.done())
+            and (runtime.operation_task is None or runtime.operation_task.done())
+        )
 
     async def _cancel_and_drain_operation(
         self,
@@ -2102,15 +2244,22 @@ class LivePlanningJobRegistry:
                 raise
             self._changed.notify_all()
 
-    async def _mark_cancel_stuck(self, runtime: _RuntimeJob) -> None:
+    async def _mark_cancel_stuck(
+        self,
+        runtime: _RuntimeJob,
+        *,
+        stage: str = "cancel_timed_out",
+        error: str | None = None,
+    ) -> None:
         """P0-1 fail-closed outcome when the operation did not stop within the
         bounded cancellation budget.
 
         The job stays NON-terminal with an externally visible ``cancel_pending``
-        state and an explicit ``cancel_timed_out`` stage, so a caller is never
-        told the job is cleanly cancelled while the operation may still be
-        running. The generation bump isolates the still-alive operation from any
-        further registry writes, and a cold restart fail-closes the record to
+        state and an explicit stuck stage (``cancel_timed_out`` for a cancellation,
+        ``timeout_pending`` for a deadline cleanup), so a caller is never told the
+        job is cleanly cancelled/failed while the operation may still be running.
+        The generation bump isolates the still-alive operation from any further
+        registry writes, and a cold restart fail-closes the record to
         ``restart_cancelled`` — the only terminal state that is guaranteed to
         appear after the operation's process is actually gone.
         """
@@ -2124,11 +2273,14 @@ class LivePlanningJobRegistry:
             runtime.snapshot = runtime.snapshot.model_copy(
                 update={
                     "cancel_pending": True,
-                    "stage": "cancel_timed_out",
+                    "stage": stage,
                     "error": (
-                        "live planning operation did not stop within the bounded "
-                        "cancellation budget; the job stays non-terminal and the "
-                        "operation is isolated"
+                        error
+                        or (
+                            "live planning operation did not stop within the bounded "
+                            "cancellation budget; the job stays non-terminal and the "
+                            "operation is isolated"
+                        )
                     ),
                     "revision": runtime.snapshot.revision + 1,
                     "updated_at": self._utc_now(),

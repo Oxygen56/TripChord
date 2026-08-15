@@ -11,6 +11,7 @@ import pytest
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, ValidationError
 from tripchord.agents.live_jobs import (
+    LivePlanningJobCancellationPendingError,
     LivePlanningJobCapacityError,
     LivePlanningJobIdempotencyConflictError,
     LivePlanningJobInactiveError,
@@ -2389,7 +2390,15 @@ async def test_v2_to_v3_migration_derives_execution_mode_and_survives_consecutiv
     migration and after another cold start, prepared<->immediate same-key mode
     conflicts fail closed in both directions, while the matching derived mode
     idempotently replays; an ambiguous legacy binding fails closed under both
-    modes; job/task/operation/dispatch state never drifts."""
+    modes.
+
+    硬门 A: the "immediate" job_a shape (activation_operation=None, prepared=false,
+    state=RUNNING) is NOT provably immediate — the old v2 API allowed a formal
+    defer_start=true prepared job to activate successfully with operation_id=None,
+    leaving exactly this shape. Its mode is therefore isolated (legacy_isolated)
+    and a same-key immediate request fails closed instead of replaying. job_b is
+    provably prepared (activation intent present) and replays under defer_start=True
+    only; job_c is terminal and ambiguous under both modes. No dispatches ever run."""
 
     state_path = tmp_path / "live-jobs.json"
     tenant_partition = LivePlanningJobRegistry._tenant_partition("tenant-a")
@@ -2497,7 +2506,10 @@ async def test_v2_to_v3_migration_derives_execution_mode_and_survives_consecutiv
         disk = json.loads(state_path.read_text(encoding="utf-8"))
         assert disk["schema_version"] == "tripchord-live-job-registry-v3"
         entries = {entry["job_id"]: entry for entry in disk["idempotency"]}
+        # 硬门 A: the immediate-shaped job_a is NOT provably immediate — its mode
+        # is isolated (placeholder defer_start=False gated by legacy_isolated).
         assert entries[job_a]["defer_start"] is False
+        assert entries[job_a]["legacy_isolated"] is True
         assert entries[job_b]["defer_start"] is True
         assert entries[job_c]["defer_start"] is False  # placeholder, gated by isolation
         assert entries[job_c]["legacy_isolated"] is True
@@ -2520,23 +2532,17 @@ async def test_v2_to_v3_migration_derives_execution_mode_and_survives_consecutiv
         assert operation_b["phase"] == "cancelled"
         assert operation_b["dispatch_count"] == 0
 
-        # Derived immediate mode replays idempotently; the reverse conflicts.
-        replay_a, replay_a_flag = await registry.start_idempotent(
-            tenant_id="tenant-a",
-            operation=operation,
-            idempotency_key="v2-immediate",
-            request_digest=REQUEST_SHA256,
-            defer_start=False,
-        )
-        assert replay_a_flag is True and replay_a.id == job_a
-        with pytest.raises(LivePlanningJobIdempotencyConflictError):
-            await registry.start_idempotent(
-                tenant_id="tenant-a",
-                operation=operation,
-                idempotency_key="v2-immediate",
-                request_digest=REQUEST_SHA256,
-                defer_start=True,
-            )
+        # 硬门 A: the immediate-shaped legacy binding is isolated — a same-key
+        # request under EITHER mode fails closed, never replays.
+        for mode in (True, False):
+            with pytest.raises(LivePlanningJobIdempotencyConflictError):
+                await registry.start_idempotent(
+                    tenant_id="tenant-a",
+                    operation=operation,
+                    idempotency_key="v2-immediate",
+                    request_digest=REQUEST_SHA256,
+                    defer_start=mode,
+                )
 
         # Derived prepared mode replays idempotently; the reverse conflicts.
         replay_b, replay_b_flag = await registry.start_idempotent(
@@ -2581,3 +2587,294 @@ async def test_v2_to_v3_migration_derives_execution_mode_and_survives_consecutiv
     # No operation was ever dispatched by the migration, the replays, or the
     # conflicts — job/task/operation state never drifted.
     assert dispatches == 0
+
+
+@pytest.mark.asyncio
+async def test_close_fails_closed_over_swallowed_cancel_operation(tmp_path: Path) -> None:
+    """C-143 P0 close() counter-example: an active job whose real operation
+    swallows CancelledError and keeps writing side effects must NEVER be
+    terminalized CANCELLED by close(). The externally visible state stays a
+    recoverable non-terminal cancel_pending isolation; memory and disk agree;
+    the operation_task is still alive and its side-effect count keeps growing
+    after close() returns. Only once the operation truly stops does a repeated
+    close() join the same cleanup and publish the final CANCELLED."""
+
+    state_path = tmp_path / "live-jobs.json"
+    stop = asyncio.Event()
+    swallowed = asyncio.Event()
+    side_effects = 0
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal side_effects
+        # Faithful swallow-cancel: the operation swallows EVERY CancelledError
+        # delivered during the drain window and keeps writing side effects until
+        # `stop` is set, so close() can never observe it as stopped.
+        while not stop.is_set():
+            try:
+                side_effects += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                swallowed.set()
+        return {"stopped": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path, cancel_wait_seconds=0.15)
+    snapshot, replayed = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="close-swallow",
+        request_digest=REQUEST_SHA256,
+        defer_start=False,
+    )
+    assert replayed is False
+    runtime = registry._records[snapshot.id]
+    await _wait_for_state(
+        registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
+    )
+    assert runtime.operation_task is not None and not runtime.operation_task.done()
+
+    await registry.close()
+
+    # close() returned, but the operation swallowed the cancel and is still
+    # alive — the record must NEVER claim CANCELLED over live work.
+    assert swallowed.is_set()
+    assert runtime.snapshot.state != LivePlanningJobState.CANCELLED
+    assert runtime.snapshot.cancel_pending is True
+    assert runtime.operation_task is not None and not runtime.operation_task.done()
+    # Disk agrees with memory.
+    disk = json.loads(state_path.read_text(encoding="utf-8"))
+    disk_record = next(
+        record
+        for record in disk["records"]
+        if record["snapshot"]["id"] == snapshot.id
+    )
+    assert disk_record["snapshot"]["state"] != "cancelled"
+    assert disk_record["snapshot"]["cancel_pending"] is True
+    # Side effects keep growing after close() returned.
+    before = side_effects
+    await asyncio.sleep(0.05)
+    assert side_effects > before
+
+    # Now the operation truly stops; a repeated close() joins the same cleanup
+    # and only then publishes the final CANCELLED.
+    stop.set()
+    await asyncio.sleep(0.05)
+    await registry.close()
+    assert runtime.operation_task.done()
+    final = await registry.get(snapshot.id, "tenant-a")
+    assert final is not None and final.state == LivePlanningJobState.CANCELLED
+    assert final.stage == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_same_key_retry_cancel_pending_with_live_operation_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """C-143 硬门 B counter-example: after cancel() fails closed over a
+    swallow-cancel operation, a same-key retry must NOT terminalize the record
+    CANCELLED or report reused success while the real operation is still
+    running. It fails closed with LivePlanningJobCancellationPendingError and
+    leaves the identical non-terminal cancel_pending isolation. Once the
+    operation truly stops, the retry completes the terminalization."""
+
+    state_path = tmp_path / "live-jobs.json"
+    stop = asyncio.Event()
+    swallowed = asyncio.Event()
+    side_effects = 0
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal side_effects
+        while not stop.is_set():
+            try:
+                side_effects += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                swallowed.set()
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path, cancel_wait_seconds=0.15)
+    snapshot, replayed = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="retry-live",
+        request_digest=REQUEST_SHA256,
+        defer_start=False,
+    )
+    assert replayed is False
+    runtime = registry._records[snapshot.id]
+    await _wait_for_state(
+        registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
+    )
+
+    await registry.cancel(snapshot.id, "tenant-a")
+    assert swallowed.is_set()
+    assert runtime.snapshot.cancel_pending is True
+    assert runtime.snapshot.state != LivePlanningJobState.CANCELLED
+    assert runtime.operation_task is not None and not runtime.operation_task.done()
+
+    # Red: the retry must fail closed, never terminalize or report reused
+    # success while the operation is still running.
+    with pytest.raises(LivePlanningJobCancellationPendingError):
+        await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="retry-live",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+        )
+    assert runtime.snapshot.cancel_pending is True
+    assert runtime.snapshot.state != LivePlanningJobState.CANCELLED
+
+    # Once the operation truly stops, the same retry completes the cancel.
+    stop.set()
+    await asyncio.sleep(0.05)
+    snapshot_again, replayed_again = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="retry-live",
+        request_digest=REQUEST_SHA256,
+        defer_start=False,
+    )
+    assert replayed_again is True
+    assert snapshot_again.id == snapshot.id
+    final = await registry.get(snapshot.id, "tenant-a")
+    assert final is not None and final.state == LivePlanningJobState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_deadline_timeout_publishes_pending_not_failed_over_live_operation(
+    tmp_path: Path,
+) -> None:
+    """C-143 硬门 C counter-example: when the deadline expires and the real
+    operation swallows CancelledError and keeps writing side effects, the job
+    must NEVER publish FAILED/deadline_exceeded. It first persists a durable
+    timeout/cancel-pending isolation, drains within the budget, and only
+    publishes FAILED when the operation is confirmed stopped; otherwise it stays
+    in a non-terminal cancel_pending isolation that a retry or close joins."""
+
+    state_path = tmp_path / "live-jobs.json"
+    stop = asyncio.Event()
+    swallowed = asyncio.Event()
+    side_effects = 0
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal side_effects
+        while not stop.is_set():
+            try:
+                side_effects += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                swallowed.set()
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path, cancel_wait_seconds=0.15)
+    snapshot, replayed = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="deadline-live",
+        request_digest=REQUEST_SHA256,
+        defer_start=False,
+        deadline_seconds=0.3,
+    )
+    assert replayed is False
+    runtime = registry._records[snapshot.id]
+    await _wait_for_state(
+        registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
+    )
+    # Wait for the deadline to fire and the timeout handler to finish draining.
+    await asyncio.sleep(0.6)
+
+    # Red: FAILED must never be published while the operation is still alive.
+    assert swallowed.is_set()
+    assert runtime.snapshot.state != LivePlanningJobState.FAILED
+    assert runtime.snapshot.cancel_pending is True
+    assert runtime.operation_task is not None and not runtime.operation_task.done()
+    disk = json.loads(state_path.read_text(encoding="utf-8"))
+    disk_record = next(
+        record
+        for record in disk["records"]
+        if record["snapshot"]["id"] == snapshot.id
+    )
+    assert disk_record["snapshot"]["state"] != "failed"
+    assert disk_record["snapshot"]["cancel_pending"] is True
+    before = side_effects
+    await asyncio.sleep(0.05)
+    assert side_effects > before
+
+    # Once the operation truly stops, a close() joins the cleanup and settles.
+    stop.set()
+    await asyncio.sleep(0.05)
+    await registry.close()
+    assert runtime.operation_task.done()
+    final = await registry.get(snapshot.id, "tenant-a")
+    assert final is not None and final.state == LivePlanningJobState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_legacy_immediate_derivation_fails_closed_for_formal_prepared_shape(
+    tmp_path: Path,
+) -> None:
+    """C-143 硬门 A counter-example: a v2 record shaped like a formal prepared
+    job that activated successfully with operation_id=None (activation_operation
+    =None, prepared=false, state=RUNNING) is NOT provably immediate. The old v2
+    API allowed exactly this: a defer_start=true prepared job activated with no
+    intent/operation_id and ran. Its mode must migrate to an explicit
+    legacy_isolated binding, and a same-key immediate request must fail closed —
+    never replay."""
+
+    state_path = tmp_path / "live-jobs.json"
+    tenant_partition = LivePlanningJobRegistry._tenant_partition("tenant-a")
+    job_id = "live-job-formal-prepared-activated"
+
+    snap = _v2_snapshot_model(
+        job_id, LivePlanningJobState.RUNNING, "interpreting_requirement", 5, 1
+    ).model_dump(mode="json")
+    payload = {
+        "schema_version": "tripchord-live-job-registry-v2",
+        "records": [
+            {
+                "tenant_partition": tenant_partition,
+                "snapshot": snap,
+                "prepared": False,
+                "activation_operation": None,
+            }
+        ],
+        "idempotency": [
+            {
+                "partition": LivePlanningJobRegistry._idempotency_partition(
+                    "tenant-a", "formal-prepared-key"
+                ),
+                "job_id": job_id,
+                "request_digest": REQUEST_SHA256,
+            }
+        ],
+    }
+    state_path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    state_path.chmod(0o600)
+
+    registry = LivePlanningJobRegistry(state_path=state_path, capacity=4, max_running=2)
+    disk = json.loads(state_path.read_text(encoding="utf-8"))
+    entries = {entry["job_id"]: entry for entry in disk["idempotency"]}
+    # Red: the legacy mode is NOT provably immediate — it must be isolated.
+    assert entries[job_id]["legacy_isolated"] is True
+
+    async def operation(_: Any) -> dict[str, Any]:
+        return {"ok": True}
+
+    for mode in (True, False):
+        with pytest.raises(LivePlanningJobIdempotencyConflictError):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=operation,
+                idempotency_key="formal-prepared-key",
+                request_digest=REQUEST_SHA256,
+                defer_start=mode,
+            )
+    await registry.close()
