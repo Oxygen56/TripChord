@@ -557,9 +557,13 @@ class LivePlanningJobCancellationPendingError(RuntimeError):
     """Raised when an idempotent retry hits a cancel_pending job whose real
     operation has not yet stopped. The cancellation is still in flight, so the
     retry must fail closed instead of reusing a running executor as an active
-    job or terminalizing cancelled over live work."""
+    job or terminalizing cancelled over live work. Carries the original
+    ``job_id`` so the HTTP layer can return a queryable/retryable conflict
+    instead of a bare 500 (P0-2)."""
 
-    pass
+    def __init__(self, message: str = "") -> None:
+        super().__init__(message)
+        self.job_id: str | None = None
 
 
 class LivePlanningJobRegistryPostCommitError(RuntimeError):
@@ -716,6 +720,12 @@ class _RuntimeJob:
         self.cancel_pending = False
         self.cancel_future: asyncio.Future[LivePlanningJobSnapshot | None] | None = None
         self.cancel_drain_succeeded: bool | None = None
+        # P0-1 admission binding: whether THIS runtime currently owns an
+        # admission permit. True from the moment the runner acquires the
+        # semaphore until the REAL operation task is confirmed done (or the
+        # runner never handed the permit to an operation). This is what ties
+        # capacity to the live operation lifecycle instead of the runner's exit.
+        self.slot_held = False
 
 
 class _IdempotencyEntry:
@@ -1232,11 +1242,20 @@ class LivePlanningJobRegistry:
                                     exc.job_id = existing_runtime.snapshot.id
                                     raise
                             else:
-                                raise LivePlanningJobCancellationPendingError(
-                                    "idempotency key is bound to a cancellation "
-                                    "still in progress; retry after the "
-                                    "operation stops"
+                                cancellation_pending_error = (
+                                    LivePlanningJobCancellationPendingError(
+                                        "idempotency key is bound to a cancellation "
+                                        "still in progress; retry after the "
+                                        "operation stops"
+                                    )
                                 )
+                                # P0-2: the HTTP layer must be able to surface
+                                # the original identity and a status query
+                                # location instead of a bare 500.
+                                cancellation_pending_error.job_id = (
+                                    existing_runtime.snapshot.id
+                                )
+                                raise cancellation_pending_error
                         return existing_runtime.snapshot, True
             self._make_capacity_locked()
             self._records[job_id] = runtime
@@ -1884,7 +1903,6 @@ class LivePlanningJobRegistry:
                 await self._mark_cancel_stuck(current)
 
     async def _run(self, runtime: _RuntimeJob, operation: LiveJobOperation) -> None:
-        acquired_slot = False
         operation_task: asyncio.Task[dict[str, Any]] | None = None
         generation = runtime.generation
         try:
@@ -1893,7 +1911,10 @@ class LivePlanningJobRegistry:
                 raise TimeoutError
             async with asyncio.timeout(remaining):
                 await self._slots.acquire()
-            acquired_slot = True
+            # P0-1: the admission permit now belongs to THIS runtime until the
+            # REAL operation task is done — never released while a stubborn
+            # operation could still be writing side effects.
+            runtime.slot_held = True
             await self._update_running(
                 runtime,
                 "interpreting_requirement",
@@ -1910,7 +1931,18 @@ class LivePlanningJobRegistry:
                 name=f"tripchord:{runtime.snapshot.id}:operation",
             )
             runtime.operation_task = operation_task
-            operation_task.add_done_callback(self._consume_task_result)
+
+            def _on_operation_done(task: asyncio.Task[dict[str, Any]]) -> None:
+                # Consume any un-retrieved exception, then release the admission
+                # permit only now that the real operation is confirmed done.
+                # This is the NORMAL release path: a stubborn operation that
+                # swallows CancelledError and later stops (via a bounded
+                # cancel/close or its own natural end) releases here, never from
+                # the runner's finally.
+                self._consume_task_result(task)
+                self._maybe_release_slot(runtime)
+
+            operation_task.add_done_callback(_on_operation_done)
             remaining = runtime.deadline_monotonic - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise TimeoutError
@@ -2013,8 +2045,29 @@ class LivePlanningJobRegistry:
                 expected_generation=generation,
             )
         finally:
-            if acquired_slot:
-                self._slots.release()
+            # P0-1: never release while the real operation may still be alive.
+            # The finally is only the safety net for paths where the permit was
+            # acquired but no operation was ever started (e.g. _update_running
+            # failed pre-start); the operation done-callback owns the release
+            # once the real executor is confirmed done.
+            self._maybe_release_slot(runtime)
+
+    def _maybe_release_slot(self, runtime: _RuntimeJob) -> None:
+        """Release the admission permit only once the REAL operation task is done.
+
+        P0-1: capacity must bind to the live operation lifecycle, never to the
+        runner's exit. A stubborn operation that swallowed CancelledError keeps
+        holding its permit, so a new-key request can never start over it; the
+        permit is released here only after ``operation_task`` is confirmed done
+        (or never existed). Safe to call from the runner's ``finally`` AND from
+        the operation done-callback: the ``slot_held`` flag makes a
+        double-release impossible."""
+        if not runtime.slot_held:
+            return
+        if runtime.operation_task is not None and not runtime.operation_task.done():
+            return
+        runtime.slot_held = False
+        self._slots.release()
 
     def _executors_stopped(self, runtime: _RuntimeJob) -> bool:
         """Shared terminalize predicate (硬门 B / P0-4).

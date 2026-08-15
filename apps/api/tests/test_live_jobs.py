@@ -3266,3 +3266,391 @@ async def test_deadline_timeout_isolation_permanent_persist_failure_keeps_owner(
         await registry.close()
     finally:
         await _settle_leaked_runtime(stop, runtime)
+
+
+@pytest.mark.asyncio
+async def test_capacity_slot_held_until_real_operation_stops_after_deadline() -> None:
+    """C-143 P0-1: the admission permit must be released only when the REAL
+    operation task is done — never by the runner's finally while a stubborn
+    operation is still alive and writing side effects. max_running=1: the first
+    job dies by deadline (parent done, operation alive) and a NEW key request
+    must NOT start until the first operation truly stops and the permit is
+    confirmed released."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    first_stop = asyncio.Event()
+    second_stop = asyncio.Event()
+    first_started = asyncio.Event()
+    first_side_effects = 0
+    second_started = asyncio.Event()
+    second_side_effects = 0
+
+    async def first_operation(_: Any) -> dict[str, Any]:
+        nonlocal first_side_effects
+        first_started.set()
+        while not first_stop.is_set():
+            try:
+                first_side_effects += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                pass
+        return {"stopped": True}
+
+    async def second_operation(_: Any) -> dict[str, Any]:
+        nonlocal second_side_effects
+        second_started.set()
+        while not second_stop.is_set():
+            try:
+                second_side_effects += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                pass
+        return {"stopped": True}
+
+    first_runtime: Any = None
+    second_runtime: Any = None
+    try:
+        first, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=first_operation,
+            idempotency_key="deadline-first-key",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=0.05,
+        )
+        first_runtime = registry._records[first.id]
+        for _ in range(1000):
+            if first_started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert first_started.is_set()
+        assert first_side_effects > 0
+        # The runner dies by deadline; the real operation stays alive.
+        await asyncio.wait_for(first_runtime.task, timeout=5)
+        assert first_runtime.task.done()
+        assert (
+            first_runtime.operation_task is not None
+            and not first_runtime.operation_task.done()
+        )
+        assert first_runtime.snapshot.cancel_pending is True
+        assert first_runtime.snapshot.stage == "timeout_pending"
+
+        # A NEW key must NOT start while the first operation is alive.
+        second, _replayed2 = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=second_operation,
+            idempotency_key="deadline-second-key",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        second_runtime = registry._records[second.id]
+        # RED on HEAD: the first runner's finally already released the permit,
+        # so the second operation starts immediately (real concurrency 2).
+        for _ in range(100):
+            if second_started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert not second_started.is_set()
+        assert second_side_effects == 0
+
+        alive = [
+            r
+            for r in registry._records.values()
+            if r.operation_task is not None and not r.operation_task.done()
+        ]
+        assert len(alive) == 1
+
+        # Once the first operation truly stops, the permit is released and the
+        # second operation may start (its own stop signal is separate, so it
+        # keeps running until the test settles it).
+        first_stop.set()
+        await asyncio.wait_for(first_runtime.operation_task, timeout=3)
+        for _ in range(2000):
+            if second_started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert second_started.is_set()
+        assert second_side_effects > 0
+    finally:
+        first_stop.set()
+        second_stop.set()
+        await _settle_leaked_runtime(first_stop, first_runtime)
+        await _settle_leaked_runtime(second_stop, second_runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_capacity_slot_held_until_real_operation_stops_after_cancel() -> None:
+    """C-143 P0-1 cancel variant: same admission binding after a cancel() that
+    leaves the operation alive (runner done, cancel_pending). A NEW key request
+    must NOT start until the first operation truly stops."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    first_stop = asyncio.Event()
+    second_stop = asyncio.Event()
+    first_started = asyncio.Event()
+    first_side_effects = 0
+    second_started = asyncio.Event()
+    second_side_effects = 0
+
+    async def first_operation(_: Any) -> dict[str, Any]:
+        nonlocal first_side_effects
+        first_started.set()
+        while not first_stop.is_set():
+            try:
+                first_side_effects += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                pass
+        return {"stopped": True}
+
+    async def second_operation(_: Any) -> dict[str, Any]:
+        nonlocal second_side_effects
+        second_started.set()
+        while not second_stop.is_set():
+            try:
+                second_side_effects += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                pass
+        return {"stopped": True}
+
+    first_runtime: Any = None
+    second_runtime: Any = None
+    try:
+        first, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=first_operation,
+            idempotency_key="cancel-first-key",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        first_runtime = registry._records[first.id]
+        for _ in range(1000):
+            if first_started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert first_started.is_set()
+
+        cancelled = await registry.cancel(first.id, "tenant-a")
+        assert cancelled is not None and cancelled.cancel_pending is True
+        # cancel() stops the runner; the stubborn operation stays alive.
+        assert first_runtime.task.done()
+        assert (
+            first_runtime.operation_task is not None
+            and not first_runtime.operation_task.done()
+        )
+
+        # A NEW key must NOT start while the first operation is alive.
+        second, _replayed2 = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=second_operation,
+            idempotency_key="cancel-second-key",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        second_runtime = registry._records[second.id]
+        # RED on HEAD: the cancelled runner's finally already released the
+        # permit, so the second operation starts immediately (real concurrency 2).
+        for _ in range(100):
+            if second_started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert not second_started.is_set()
+        assert second_side_effects == 0
+
+        alive = [
+            r
+            for r in registry._records.values()
+            if r.operation_task is not None and not r.operation_task.done()
+        ]
+        assert len(alive) == 1
+
+        first_stop.set()
+        await asyncio.wait_for(first_runtime.operation_task, timeout=3)
+        for _ in range(2000):
+            if second_started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert second_started.is_set()
+        assert second_side_effects > 0
+    finally:
+        first_stop.set()
+        second_stop.set()
+        await _settle_leaked_runtime(first_stop, first_runtime)
+        await _settle_leaked_runtime(second_stop, second_runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_deadline_attacks_never_exceed_capacity() -> None:
+    """C-143 P0-1 repeated-attack proof: a burst of deadline deaths must never
+    let the number of simultaneously-alive real operations exceed max_running,
+    and the admission permit must be conserved (held by the cleanup owner until
+    the operation truly stops) — no orphan permit leak that accumulates 1..N."""
+    registry = LivePlanningJobRegistry(
+        capacity=32,
+        max_running=1,
+        cancel_wait_seconds=0.02,
+    )
+    stop = asyncio.Event()
+
+    async def stubborn_operation(_: Any) -> dict[str, Any]:
+        while not stop.is_set():
+            with suppress(asyncio.CancelledError):
+                await asyncio.sleep(0.001)
+        return {"stopped": True}
+
+    runtimes: list[Any] = []
+    try:
+        alive_counts: list[int] = []
+        for attack in range(5):
+            snap, _replayed = await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=stubborn_operation,
+                idempotency_key=f"attack-{attack}",
+                request_digest=REQUEST_SHA256,
+                deadline_seconds=0.02,
+            )
+            runtime = registry._records[snap.id]
+            runtimes.append(runtime)
+            await asyncio.wait_for(runtime.task, timeout=5)
+            alive = [
+                r
+                for r in registry._records.values()
+                if r.operation_task is not None and not r.operation_task.done()
+            ]
+            alive_counts.append(len(alive))
+        # RED on HEAD: every runner's finally frees the permit, so each attack
+        # starts another live operation and the count grows 1..N. After the fix
+        # only the first operation holds the permit; later runners die queued.
+        assert max(alive_counts) == 1
+    finally:
+        for runtime in runtimes:
+            await _settle_leaked_runtime(stop, runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_same_key_retry_while_operation_alive_raises_pending_with_job_id() -> None:
+    """C-143 P0-2: the same-key retry while the operation swallows the cancel
+    must fail closed with a stable error that carries the original job identity
+    (so the HTTP layer can map it to a queryable/retryable conflict instead of a
+    bare 500)."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+
+    async def operation(_: Any) -> dict[str, Any]:
+        started.set()
+        while not stop.is_set():
+            with suppress(asyncio.CancelledError):
+                await asyncio.sleep(0.001)
+        return {"stopped": True}
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="retry-while-pending",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        runtime = registry._records[snap.id]
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+        cancelled = await registry.cancel(snap.id, "tenant-a")
+        assert cancelled is not None and cancelled.cancel_pending is True
+        assert (
+            runtime.operation_task is not None
+            and not runtime.operation_task.done()
+        )
+
+        with pytest.raises(LivePlanningJobCancellationPendingError) as excinfo:
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=operation,
+                idempotency_key="retry-while-pending",
+                request_digest=REQUEST_SHA256,
+                deadline_seconds=30,
+            )
+        # RED on HEAD: the raised error carries no job_id (the HTTP layer cannot
+        # map it, so the same-key retry surfaces as a bare 500).
+        assert excinfo.value.job_id == snap.id
+    finally:
+        await _settle_leaked_runtime(stop, runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_capacity_slot_held_until_real_operation_stops_after_close() -> None:
+    """C-143 P0-1 close path: close() must never release the admission permit
+    while the real operation is still alive — the permit is held by the cleanup
+    owner until the operation truly stops, so a later new-key start (after a
+    clean restart) never finds a leaked permit."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.02,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    side_effects = 0
+
+    async def stubborn_operation(_: Any) -> dict[str, Any]:
+        nonlocal side_effects
+        started.set()
+        while not stop.is_set():
+            with suppress(asyncio.CancelledError):
+                side_effects += 1
+                await asyncio.sleep(0.001)
+        return {"stopped": True}
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn_operation,
+            idempotency_key="close-slot-key",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        runtime = registry._records[snap.id]
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+
+        # close() with a stubborn operation: the permit must remain held
+        # (slot_held stays True) because the operation is still alive after the
+        # bounded drain — no close entry may release early.
+        await registry.close()
+        assert runtime.slot_held is True
+        assert (
+            runtime.operation_task is not None
+            and not runtime.operation_task.done()
+        )
+        assert runtime.snapshot.cancel_pending is True
+
+        # Once the operation truly stops, the done-callback releases the permit.
+        stop.set()
+        await asyncio.wait_for(runtime.operation_task, timeout=3)
+        assert runtime.slot_held is False
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await registry.close()

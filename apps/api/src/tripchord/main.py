@@ -46,6 +46,7 @@ from tripchord.agents.live_advisory import AgenticRunSummary
 from tripchord.agents.live_jobs import (
     TERMINAL_LIVE_PLANNING_JOB_STATES,
     LiveJobProgressReporter,
+    LivePlanningJobCancellationPendingError,
     LivePlanningJobCapacityError,
     LivePlanningJobIdempotencyConflictError,
     LivePlanningJobInactiveError,
@@ -2726,6 +2727,42 @@ async def start_live_flexible_from_text_job_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="live planning job capacity is currently exhausted",
             headers={"Retry-After": "30"},
+        ) from exc
+    except LivePlanningJobCancellationPendingError as exc:
+        # P0-2: a same-key retry while the real operation is still stopping must
+        # return a stable, machine-decidable, retryable 409 with the original
+        # job identity and a status query location — never a bare 500 that hides
+        # an in-flight cancellation, never a new job, never a false success. The
+        # terminal state is returned only once the operation truly stops.
+        if exc.job_id is not None:
+            pending = await registry.get(exc.job_id, principal.tenant_id)
+            if pending is not None:
+                status_url = (
+                    f"/api/v1/agents/live-flexible-plan-from-text/jobs/{pending.id}"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": "cancellation_pending",
+                        "status_code": status.HTTP_409_CONFLICT,
+                        "job_id": pending.id,
+                        "state": "cancellation_pending",
+                        "cancel_pending": pending.cancel_pending,
+                        "stage": pending.stage,
+                        "retryable": True,
+                        "status_url": status_url,
+                    },
+                ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "cancellation_pending",
+                "status_code": status.HTTP_409_CONFLICT,
+                "job_id": exc.job_id,
+                "state": "cancellation_pending",
+                "cancel_pending": True,
+                "retryable": True,
+            },
         ) from exc
     except LivePlanningJobRegistryPostCommitError as exc:
         # P0-2: the persistent task entry was already committed to disk and the

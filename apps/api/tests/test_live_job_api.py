@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Iterable
+from contextlib import suppress
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,9 +28,11 @@ from tripchord.agents.model_gateway import (
     OpenAICompatibleChatClient,
 )
 from tripchord.agents.models import AgentRole
+from tripchord.api import LiveFlexibleFromTextPlanningRequest
 from tripchord.main import (
     LiveRunCache,
     _cache_flexible_pair_runs,
+    _live_flexible_from_text_request_sha256,
     app,
     package_requirement_agent,
     settings,
@@ -836,3 +839,136 @@ async def test_start_post_commit_persist_failure_returns_recoverable_identity(
         terminal = await _terminal_job(client, job_id)
         assert terminal["state"] == "cancelled"
     await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_pending_same_key_retry_returns_conflict_not_500(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-143 P0-2: a same-key retry while the real operation swallows the cancel
+    must return a stable, machine-decidable 409 (never a bare 500), keep the
+    original job identity unchanged and queryable, and only expose the terminal
+    state after the operation truly stops — never a new job, never a false
+    success. A full cold start reads the same terminal facts."""
+    state_path = tmp_path / "live-jobs.json"
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    monkeypatch.setattr(app.state, "live_planning_job_registry", registry)
+    monkeypatch.setattr(app.state, "package_requirement_agent", package_requirement_agent)
+    monkeypatch.setattr(app.state, "flexible_live_agent_system", None)
+    monkeypatch.setattr(app.state, "live_run_cache", LiveRunCache())
+    monkeypatch.setattr(settings, "browser_bridge_require_all_providers", True)
+    monkeypatch.setattr(settings, "auth_tokens", {"token-a": "tenant-a"})
+
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    side_effects = 0
+
+    async def stubborn(_: Any) -> dict[str, Any]:
+        nonlocal side_effects
+        started.set()
+        while not stop.is_set():
+            try:
+                side_effects += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                pass
+        return {"ok": True}
+
+    payload = _payload(ready=True)
+    request_digest = _live_flexible_from_text_request_sha256(
+        LiveFlexibleFromTextPlanningRequest(**payload)
+    )
+    snap, _replayed = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=stubborn,
+        idempotency_key="api-retry-while-pending",
+        request_digest=request_digest,
+        deadline_seconds=30,
+    )
+    runtime = registry._records[snap.id]
+    for _ in range(1000):
+        if started.is_set():
+            break
+        await asyncio.sleep(0)
+    assert started.is_set()
+
+    path = "/api/v1/agents/live-flexible-plan-from-text/jobs"
+    key_header = {
+        "Authorization": "Bearer token-a",
+        "Idempotency-Key": "api-retry-while-pending",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+            base_url="http://test",
+        ) as client:
+            # Drive the cancellation through the real DELETE endpoint; the
+            # operation swallows it and stays alive (cancel_pending).
+            cancelled = await client.delete(
+                f"{path}/{snap.id}",
+                headers={"Authorization": "Bearer token-a"},
+            )
+            assert cancelled.status_code == 200
+            assert cancelled.json()["cancel_pending"] is True
+            assert (
+                runtime.operation_task is not None
+                and not runtime.operation_task.done()
+            )
+
+            retry = await client.post(path, json=payload, headers=key_header)
+            # RED on HEAD: the unmapped RuntimeError surfaces as a bare 500 (or
+            # propagates through ASGITransport). After the fix: a stable 409
+            # with the original identity.
+            assert retry.status_code != 500
+            assert retry.status_code == 409
+            body = retry.json()["detail"]
+            assert body["job_id"] == snap.id
+            assert body["state"] == "cancellation_pending"
+            assert body["retryable"] is True
+            assert body["status_url"].endswith(f"/jobs/{snap.id}")
+            # The retry must NOT create a new job.
+            assert len(registry._records) == 1
+
+            # Identity unchanged and queryable while the operation is alive.
+            query = await client.get(
+                f"{path}/{snap.id}",
+                headers={"Authorization": "Bearer token-a"},
+            )
+            assert query.status_code == 200
+            assert query.json()["id"] == snap.id
+            assert query.json()["cancel_pending"] is True
+
+            # Once the operation truly stops, the same-key retry returns the
+            # terminal state idempotently.
+            stop.set()
+            await asyncio.wait_for(runtime.operation_task, timeout=3)
+            final = await client.post(path, json=payload, headers=key_header)
+            assert final.status_code == 202
+            final_body = final.json()
+            assert final_body["replayed"] is True
+            assert final_body["job"]["id"] == snap.id
+            assert final_body["job"]["state"] == "cancelled"
+
+        # A full cold start reads the same terminal facts.
+        reloaded = LivePlanningJobRegistry(state_path=state_path)
+        cold = await reloaded.get(snap.id, "tenant-a")
+        assert cold is not None and cold.state == "cancelled"
+        await reloaded.close()
+    finally:
+        # On the native-red path the assertion fails before stop.set(); the
+        # stubborn operation would otherwise survive close()'s bounded drain and
+        # hang pytest-asyncio's teardown. Settle it boundedly before closing.
+        stop.set()
+        if runtime is not None:
+            operation_task = runtime.operation_task
+            if operation_task is not None and not operation_task.done():
+                operation_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(operation_task, timeout=3)
+        await registry.close()
