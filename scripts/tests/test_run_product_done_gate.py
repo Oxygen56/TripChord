@@ -16344,6 +16344,21 @@ def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
                 await asyncio.sleep(0.05)
         pytest.fail("production API did not become ready before the bounded deadline")
 
+    async def wait_for_port_release() -> None:
+        # C-143: a cold restart must prove the previous listener is truly gone.
+        # The port is only considered released once a connection is refused;
+        # a still-responding old process is a false green and must fail the test.
+        async with httpx.AsyncClient(timeout=0.5) as client:
+            for _ in range(100):
+                try:
+                    await client.get(f"{base}/ready")
+                except httpx.RequestError:
+                    return
+                await asyncio.sleep(0.05)
+        pytest.fail(
+            "old production API port was not released before the next cold start"
+        )
+
     async def start_server(sequence: int) -> subprocess.Popen[bytes]:
         log_path = tmp_path / f"api-{sequence}.log"
         with log_path.open("wb") as log:
@@ -16435,7 +16450,9 @@ def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
             ).json()
             second_runtime = second_runtime_payload["runtime_provenance"]
             assert second_runtime["pid"] != first_runtime["pid"]
-            assert second_runtime["started_at"] != first_runtime["started_at"]
+            assert datetime.fromisoformat(
+                second_runtime["started_at"]
+            ) > datetime.fromisoformat(first_runtime["started_at"])
 
             heartbeat = await client.post(
                 f"{base}/browser-bridge/v1/companions/heartbeat",
@@ -16567,9 +16584,26 @@ def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
             assert fresh_row["activation_record"]["started_result"] == first_receipt
         second_process.kill()
         second_process.wait(timeout=10)
+        # C-143: the second cold start must prove server2 truly exited and its
+        # port is released before server3 is allowed to start. A still-alive
+        # process or a still-responding port is a false green and fails closed.
+        assert second_process.poll() is not None
+        await wait_for_port_release()
 
         third_process = await start_server(3)
         async with httpx.AsyncClient(timeout=30.0) as client:
+            # server3 must be a genuinely new runtime with strictly later
+            # provenance — never the old process answering on the same port.
+            third_runtime_payload = (
+                await client.get(f"{base}/api/v1/agents/runtime")
+            ).json()
+            third_runtime = third_runtime_payload["runtime_provenance"]
+            assert third_runtime["pid"] != second_runtime["pid"]
+            assert datetime.fromisoformat(
+                third_runtime["started_at"]
+            ) > datetime.fromisoformat(second_runtime["started_at"])
+            assert second_process.poll() is not None
+
             # C-143: the fully-started job was terminalized on cold start, so the
             # same-key retry MUST fail closed (non-200) — never replay the old
             # QUEUED receipt with a 200 while the job is cancelled.
@@ -16597,10 +16631,172 @@ def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
             assert cold_status.status_code == 200
             assert cold_status.json()["state"] == "cancelled"
             assert cold_status.json()["stage"] in {"restart_cancelled", "cancelled"}
+
+            # The on-disk formal ledger must now reflect server3's cold-start
+            # abort (non-continuation model) — proof the ledger state was
+            # produced by the new runtime, not by a lingering old process.
+            ledger_after = json.loads(ledger_path.read_text(encoding="utf-8"))
+            fresh_row_after = next(
+                row
+                for row in ledger_after.values()
+                if row["run_id"] == "os-api-restart-fresh-attempt"
+            )
+            assert fresh_row_after["state"] == "aborted"
+            assert (
+                fresh_row_after["terminal_reason"]
+                == "runtime_restart_requires_new_attempt"
+            )
         stop_server(third_process)
 
     try:
         asyncio.run(exercise_restart())
+    finally:
+        for process in processes:
+            stop_server(process)
+        if original_trust_root is None:
+            os.environ.pop("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT", None)
+        else:
+            os.environ["TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"] = original_trust_root
+
+
+def test_formal_authority_second_cold_start_detects_old_process_still_bound(
+    tmp_path: Path,
+) -> None:
+    """C-143: a 'second cold start' must never mistake a live old listener for a
+    fresh process. When the previous API is still bound to the port, the new
+    process cannot bind, the old process keeps serving its own provenance, and
+    the port-release / fresh-provenance checks fail closed instead of letting a
+    false green through."""
+
+    import httpx
+    from tripchord.formal_live_source import provision_formal_source_trust_root
+
+    trust_root = tmp_path / "trust-root"
+    provision_formal_source_trust_root(trust_root)
+    original_trust_root = os.environ.get("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT")
+    os.environ["TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"] = str(trust_root)
+    bridge_token = "os-api-still-bound-bridge-token-000000000"
+    server_env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(
+            (str(gate.ROOT / "apps" / "api" / "src"), str(gate.ROOT))
+        ),
+        "TRIPCHORD_DATABASE_URL": f"sqlite+aiosqlite:///{tmp_path / 'api.db'}",
+        "TRIPCHORD_BROWSER_BRIDGE_ENABLED": "true",
+        "TRIPCHORD_BROWSER_BRIDGE_TOKEN": bridge_token,
+        "TRIPCHORD_BROWSER_COMPANION_AUTO_RELOAD_ENABLED": "false",
+        "TRIPCHORD_MODEL_AGENTS_REQUIRED": "false",
+        "TRIPCHORD_ADAPTIVE_AGENT_SCALING_ENABLED": "false",
+        "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT": str(trust_root),
+        "TRIPCHORD_MEMORY_STATE_PATH": str(tmp_path / "memory.json"),
+        "TRIPCHORD_LIVE_RUN_CACHE_STATE_PATH": str(tmp_path / "live-cache.json"),
+        "TRIPCHORD_LOG_LEVEL": "WARNING",
+    }
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        port = int(reserved.getsockname()[1])
+    base = f"http://127.0.0.1:{port}"
+    processes: list[subprocess.Popen[bytes]] = []
+
+    def stop_server(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+
+    async def start_and_wait(sequence: int) -> subprocess.Popen[bytes]:
+        log_path = tmp_path / f"api-still-bound-{sequence}.log"
+        with log_path.open("wb") as log:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "tripchord.main:app",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--log-level",
+                    "warning",
+                ],
+                cwd=gate.ROOT,
+                env=server_env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+        processes.append(process)
+        async with httpx.AsyncClient(timeout=0.5) as client:
+            for _ in range(100):
+                if process.poll() is not None:
+                    pytest.fail(
+                        "production API exited before readiness:\n"
+                        + log_path.read_text(encoding="utf-8", errors="replace")
+                    )
+                try:
+                    if (await client.get(f"{base}/ready")).status_code == 200:
+                        return process
+                except httpx.RequestError:
+                    pass
+                await asyncio.sleep(0.05)
+        pytest.fail("production API did not become ready before the bounded deadline")
+
+    async def scenario() -> None:
+        first_process = await start_and_wait(1)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            first_runtime = (
+                await client.get(f"{base}/api/v1/agents/runtime")
+            ).json()["runtime_provenance"]
+
+            # The old process is intentionally left alive: the port still
+            # answers, so a port-release probe would keep seeing a listener and
+            # time out — the false-green condition the harness must detect.
+            ready = await client.get(f"{base}/ready")
+            assert ready.status_code == 200
+            assert first_process.poll() is None
+
+            # A second start on the same port without stopping the old process
+            # cannot bind: the new process exits and the OLD process keeps
+            # serving its own provenance. No fresh takeover occurred.
+            second_log = tmp_path / "api-still-bound-2.log"
+            with second_log.open("wb") as log:
+                second_process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "uvicorn",
+                        "tripchord.main:app",
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        str(port),
+                        "--log-level",
+                        "warning",
+                    ],
+                    cwd=gate.ROOT,
+                    env=server_env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+            processes.append(second_process)
+            second_process.wait(timeout=10)
+            assert second_process.poll() is not None, (
+                "second process unexpectedly bound the still-held port:\n"
+                + second_log.read_text(encoding="utf-8", errors="replace")
+            )
+
+            served = (
+                await client.get(f"{base}/api/v1/agents/runtime")
+            ).json()["runtime_provenance"]
+            assert served["pid"] == first_process.pid
+            assert served["pid"] != second_process.pid
+
+    try:
+        asyncio.run(scenario())
     finally:
         for process in processes:
             stop_server(process)

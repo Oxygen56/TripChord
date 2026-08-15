@@ -1252,6 +1252,218 @@ async def test_activation_operation_is_durable_and_never_redispatched_after_rest
 
 
 @pytest.mark.asyncio
+async def test_cancel_persist_failure_rolls_back_full_activation_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-143: a persist failure inside cancel must restore the whole mutable
+    record (snapshot, generation, activation_operation incl. nested fields) so
+    the surviving in-memory facts agree byte-for-byte with the disk file."""
+
+    state_path = tmp_path / "live-jobs.json"
+
+    async def operation(_: Any) -> dict[str, Any]:
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path)
+    prepared, _ = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="cancel-persist-fault-prepare",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    queued_result = {"job": prepared.model_dump(mode="json")}
+    intent = {
+        "schema_version": "tripchord-live-activation-operation-v1",
+        "operation_id": "c" * 64,
+        "idempotency_key": "cancel-persist-fault-v1",
+        "request_digest": "d" * 64,
+        "job_id": prepared.id,
+        "challenge_id": "cancel-persist-fault-challenge",
+        "attempt_digest": "e" * 64,
+        "capability_sha256": "f" * 64,
+        "companion_identity_sha256": "a1" * 32,
+        "queued_result": queued_result,
+    }
+    stored = await registry.prepare_activation_intent(
+        prepared.id,
+        "tenant-a",
+        intent=intent,
+    )
+    assert stored["phase"] == "intent"
+    assert stored["dispatch_count"] == 0
+
+    runtime = registry._records[prepared.id]
+    before_snapshot = runtime.snapshot
+    before_generation = runtime.generation
+    before_operation_ref = runtime.activation_operation
+    assert before_operation_ref is not None
+    before_bytes = state_path.read_bytes()
+
+    def fail_write() -> None:
+        raise RuntimeError("injected registry write failure")
+
+    monkeypatch.setattr(registry, "_persist_locked", fail_write)
+    with pytest.raises(RuntimeError, match="injected registry write failure"):
+        await registry.cancel(prepared.id, "tenant-a")
+    monkeypatch.undo()
+
+    # The in-memory record must be byte-identical to the pre-call record and to
+    # the untouched disk file: same snapshot object, same generation, same
+    # activation_operation object with every nested field intact.
+    assert runtime.snapshot == before_snapshot
+    assert runtime.generation == before_generation
+    assert runtime.activation_operation is before_operation_ref
+    assert runtime.activation_operation == stored
+    assert runtime.activation_operation["phase"] == "intent"
+    assert runtime.activation_operation["dispatch_count"] == 0
+    assert runtime.activation_operation["queued_result"] == queued_result
+    assert state_path.read_bytes() == before_bytes
+
+    # A fresh cold load reads the untouched disk and applies the registry's own
+    # cold-start rule (terminalize the still-queued prepared job) deterministically
+    # — the disk file is the single source of truth, so there is no memory/disk
+    # split between a same-process retry and a restart.
+    reloaded = LivePlanningJobRegistry(state_path=state_path)
+    reloaded_snapshot = await reloaded.get(prepared.id, "tenant-a")
+    assert reloaded_snapshot is not None
+    assert reloaded_snapshot.state == LivePlanningJobState.CANCELLED
+    assert reloaded_snapshot.stage in {"restart_cancelled", "cancelled"}
+    reloaded_operation = await reloaded.activation_operation(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert reloaded_operation["phase"] == "cancelled"
+    assert reloaded_operation["dispatch_count"] == 0
+    assert reloaded_operation["queued_result"] == queued_result
+
+    # A normal retry performs exactly one legal terminalization.
+    cancelled = await registry.cancel(prepared.id, "tenant-a")
+    assert cancelled is not None
+    assert cancelled.state == LivePlanningJobState.CANCELLED
+    cancelled_operation = await registry.activation_operation(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert cancelled_operation["phase"] == "cancelled"
+    again = await registry.cancel(prepared.id, "tenant-a")
+    assert again is not None and again.state == LivePlanningJobState.CANCELLED
+
+    await reloaded.close()
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_terminalize_persist_failure_rolls_back_full_activation_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-143: a persist failure on the terminalize path (_finish) must restore
+    the whole mutable record so memory and disk agree, and a later retry can
+    only perform one legal terminalization."""
+
+    state_path = tmp_path / "live-jobs.json"
+
+    async def operation(_: Any) -> dict[str, Any]:
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path)
+    prepared, _ = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="terminalize-persist-fault-prepare",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    queued_result = {"job": prepared.model_dump(mode="json")}
+    intent = {
+        "schema_version": "tripchord-live-activation-operation-v1",
+        "operation_id": "c1" * 32,
+        "idempotency_key": "terminalize-persist-fault-v1",
+        "request_digest": "d1" * 32,
+        "job_id": prepared.id,
+        "challenge_id": "terminalize-persist-fault-challenge",
+        "attempt_digest": "e1" * 32,
+        "capability_sha256": "f1" * 32,
+        "companion_identity_sha256": "a2" * 32,
+        "queued_result": queued_result,
+    }
+    stored = await registry.prepare_activation_intent(
+        prepared.id,
+        "tenant-a",
+        intent=intent,
+    )
+    assert stored["phase"] == "intent"
+
+    runtime = registry._records[prepared.id]
+    before_snapshot = runtime.snapshot
+    before_generation = runtime.generation
+    before_operation_ref = runtime.activation_operation
+    assert before_operation_ref is not None
+    before_bytes = state_path.read_bytes()
+
+    def fail_write() -> None:
+        raise RuntimeError("injected registry write failure")
+
+    monkeypatch.setattr(registry, "_persist_locked", fail_write)
+    with pytest.raises(RuntimeError, match="injected registry write failure"):
+        await registry._finish(
+            runtime,
+            LivePlanningJobState.CANCELLED,
+            stage="cancelled",
+            cancellation_requested=True,
+        )
+    monkeypatch.undo()
+
+    assert runtime.snapshot == before_snapshot
+    assert runtime.generation == before_generation
+    assert runtime.activation_operation is before_operation_ref
+    assert runtime.activation_operation["phase"] == "intent"
+    assert runtime.activation_operation["dispatch_count"] == 0
+    assert runtime.activation_operation["queued_result"] == queued_result
+    assert state_path.read_bytes() == before_bytes
+
+    reloaded = LivePlanningJobRegistry(state_path=state_path)
+    reloaded_snapshot = await reloaded.get(prepared.id, "tenant-a")
+    assert reloaded_snapshot is not None
+    assert reloaded_snapshot.state == LivePlanningJobState.CANCELLED
+    assert reloaded_snapshot.stage in {"restart_cancelled", "cancelled"}
+    reloaded_operation = await reloaded.activation_operation(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert reloaded_operation["phase"] == "cancelled"
+    assert reloaded_operation["dispatch_count"] == 0
+    assert reloaded_operation["queued_result"] == queued_result
+
+    # A normal retry performs exactly one legal terminalization, then further
+    # terminalization attempts are inert.
+    await registry._finish(
+        runtime,
+        LivePlanningJobState.CANCELLED,
+        stage="cancelled",
+        cancellation_requested=True,
+    )
+    final_snapshot = await registry.get(prepared.id, "tenant-a")
+    assert final_snapshot is not None
+    assert final_snapshot.state == LivePlanningJobState.CANCELLED
+    assert runtime.activation_operation["phase"] == "cancelled"
+    await registry._finish(
+        runtime,
+        LivePlanningJobState.CANCELLED,
+        stage="cancelled",
+        cancellation_requested=True,
+    )
+
+    await reloaded.close()
+    await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_activation_intent_conflict_is_rejected_before_dispatch(
     tmp_path: Path,
 ) -> None:

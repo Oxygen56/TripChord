@@ -1104,15 +1104,19 @@ class LivePlanningJobRegistry:
                 )
             runtime.prepared = False
             if activation is not None:
-                activation["phase"] = "dispatched"
-                activation["dispatch_count"] = 1
+                # Reassign a fresh operation object instead of mutating in place so
+                # the original body stays intact for a rollback on persist failure.
+                runtime.activation_operation = {
+                    **activation,
+                    "phase": "dispatched",
+                    "dispatch_count": 1,
+                }
             try:
                 self._persist_locked()
             except Exception:
                 runtime.prepared = True
                 if activation is not None:
-                    activation["phase"] = "intent"
-                    activation["dispatch_count"] = 0
+                    runtime.activation_operation = activation
                 raise
             if (
                 os.environ.get("TRIPCHORD_TEST_FORMAL_ACTIVATION_FAILPOINT")
@@ -1300,9 +1304,17 @@ class LivePlanningJobRegistry:
                     "live planning activation operation was not dispatched"
                 )
             if operation["phase"] == "dispatched":
-                operation["phase"] = "committed"
-                self._persist_locked()
+                committed_operation = {**operation, "phase": "committed"}
+                runtime.activation_operation = committed_operation
+                try:
+                    self._persist_locked()
+                except Exception:
+                    # A failed persist must restore the pre-commit operation body
+                    # (including every nested field) so memory and disk agree.
+                    runtime.activation_operation = operation
+                    raise
                 self._changed.notify_all()
+                return json.loads(json.dumps(committed_operation, sort_keys=True))
             return json.loads(json.dumps(operation, sort_keys=True))
 
     async def is_prepared(
@@ -1347,6 +1359,7 @@ class LivePlanningJobRegistry:
                 return runtime.snapshot
             previous_snapshot = runtime.snapshot
             previous_generation = runtime.generation
+            previous_activation_operation = runtime.activation_operation
             self._terminalize_locked(
                 runtime,
                 LivePlanningJobState.CANCELLED,
@@ -1356,8 +1369,13 @@ class LivePlanningJobRegistry:
             try:
                 self._persist_locked()
             except Exception:
+                # A failed persist must leave the whole mutable record — snapshot,
+                # generation and the full activation_operation body including every
+                # nested field — byte-identical to the untouched disk file, so a
+                # same-process retry and a cold restart observe the same facts.
                 runtime.snapshot = previous_snapshot
                 runtime.generation = previous_generation
+                runtime.activation_operation = previous_activation_operation
                 raise
             task = runtime.task
             operation_task = runtime.operation_task
@@ -1704,6 +1722,9 @@ class LivePlanningJobRegistry:
                 state = LivePlanningJobState.CANCELLED
                 stage = "cancelled"
                 result = None
+            previous_snapshot = runtime.snapshot
+            previous_generation = runtime.generation
+            previous_activation_operation = runtime.activation_operation
             self._terminalize_locked(
                 runtime,
                 state,
@@ -1713,7 +1734,15 @@ class LivePlanningJobRegistry:
                 safe_failure=safe_failure,
                 cancellation_requested=cancellation_requested,
             )
-            self._persist_locked()
+            try:
+                self._persist_locked()
+            except Exception:
+                # A failed persist on the terminalize path must restore the whole
+                # mutable record so memory and disk never diverge.
+                runtime.snapshot = previous_snapshot
+                runtime.generation = previous_generation
+                runtime.activation_operation = previous_activation_operation
+                raise
             self._changed.notify_all()
 
     async def _ensure_active(self, runtime: _RuntimeJob, generation: int) -> None:
@@ -1778,7 +1807,13 @@ class LivePlanningJobRegistry:
             and runtime.activation_operation.get("phase")
             not in {"committed", "cancelled"}
         ):
-            runtime.activation_operation["phase"] = "cancelled"
+            # Reassign a fresh operation object instead of mutating the existing
+            # dict in place so a caller that snapshots the mutable record before
+            # this call can restore the original body on a failed persist.
+            runtime.activation_operation = {
+                **runtime.activation_operation,
+                "phase": "cancelled",
+            }
 
     def _make_capacity_locked(self) -> None:
         if len(self._records) < self._capacity:
