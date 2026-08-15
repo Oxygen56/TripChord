@@ -16890,6 +16890,21 @@ def test_formal_activation_interrupt_windows_fail_closed_over_real_http(
             process.kill()
             process.wait(timeout=10)
 
+    async def wait_for_port_release() -> None:
+        # C-143: a cold restart must prove the previous listener is truly gone.
+        # The port is only considered released once a connection is refused; a
+        # still-responding old process is a false green and must fail the test.
+        async with httpx.AsyncClient(timeout=0.5) as client:
+            for _ in range(100):
+                try:
+                    await client.get(f"{base}/ready")
+                except httpx.RequestError:
+                    return
+                await asyncio.sleep(0.05)
+        pytest.fail(
+            "old production API port was not released before the next cold start"
+        )
+
     async def start_server(sequence: int, *, fault: str | None) -> subprocess.Popen[bytes]:
         log_path = tmp_path / f"fault-api-{sequence}.log"
         env = dict(base_env)
@@ -17054,8 +17069,12 @@ def test_formal_activation_interrupt_windows_fail_closed_over_real_http(
         assert formal_before["result"] is None
         stop_server(first_process)
 
-        await start_server(2, fault=None)
+        second_process = await start_server(2, fault=None)
         async with httpx.AsyncClient(timeout=30.0) as client:
+            second_runtime_payload = (
+                await client.get(f"{base}/api/v1/agents/runtime")
+            ).json()
+            second_runtime = second_runtime_payload["runtime_provenance"]
             # The cold restart terminalized the job and cancelled the dispatched
             # operation / activation record.  The same-key retry MUST fail closed
             # (non-200) instead of replaying the old QUEUED receipt and advancing
@@ -17104,11 +17123,32 @@ def test_formal_activation_interrupt_windows_fail_closed_over_real_http(
         # The queued receipt is preserved but was never delivered as a start.
         assert formal_after["started_result"] == expected_receipt
 
+        # C-143: the second cold start must prove server2 truly exited and its
+        # port is released before server3 is allowed to start. A still-alive
+        # server2 answering on the same port is a false green that would let
+        # server3's assertions pass against the wrong process.
+        stop_server(second_process)
+        assert second_process.poll() is not None, (
+            "server2 must be proven exited before the next cold start"
+        )
+        await wait_for_port_release()
+
         # Deterministic second-crash counter-example: the failure terminal state
         # is stable across another cold start and the retry still fails closed
         # with no additional dispatch.
-        await start_server(3, fault=None)
+        third_process = await start_server(3, fault=None)
         async with httpx.AsyncClient(timeout=30.0) as client:
+            # server3 must be a genuinely new runtime with strictly later
+            # provenance — never the old process answering on the same port.
+            third_runtime_payload = (
+                await client.get(f"{base}/api/v1/agents/runtime")
+            ).json()
+            third_runtime = third_runtime_payload["runtime_provenance"]
+            assert third_runtime["pid"] != second_runtime["pid"]
+            assert datetime.fromisoformat(
+                third_runtime["started_at"]
+            ) > datetime.fromisoformat(second_runtime["started_at"])
+            assert second_process.poll() is not None
             second_crash_replay = await client.post(
                 f"{base}/api/v1/internal/formal-live-source/jobs/{job_id}/activate",
                 headers=activation_headers,

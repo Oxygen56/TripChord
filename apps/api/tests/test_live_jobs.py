@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from tripchord.agents.live_jobs import (
     LivePlanningJobIdempotencyConflictError,
     LivePlanningJobInactiveError,
     LivePlanningJobRegistry,
+    LivePlanningJobRegistryPostCommitError,
     LivePlanningJobSnapshot,
     LivePlanningJobState,
     LivePlanningPairCheckpoint,
@@ -1458,6 +1460,233 @@ async def test_terminalize_persist_failure_rolls_back_full_activation_operation(
         stage="cancelled",
         cancellation_requested=True,
     )
+
+    await reloaded.close()
+    await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failpoint",
+    ("post_replace_dir_fsync", "post_replace_validation"),
+)
+async def test_cancel_post_commit_persist_failure_keeps_committed_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failpoint: str,
+) -> None:
+    """C-143 P0 return: when a persist fails AFTER ``os.replace`` has committed
+    the terminalized state to disk, cancel must NOT roll the in-memory record
+    back. Memory and disk must both keep the committed terminal state, the
+    explicit post-commit error propagates, a fresh instance reads the same facts,
+    and a retry does not re-terminalize."""
+
+    state_path = tmp_path / "live-jobs.json"
+
+    async def operation(_: Any) -> dict[str, Any]:
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path)
+    prepared, _ = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key=f"cancel-post-commit-{failpoint}-prepare",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    queued_result = {"job": prepared.model_dump(mode="json")}
+    intent = {
+        "schema_version": "tripchord-live-activation-operation-v1",
+        "operation_id": "c2" * 32,
+        "idempotency_key": f"cancel-post-commit-{failpoint}",
+        "request_digest": "d2" * 32,
+        "job_id": prepared.id,
+        "challenge_id": f"cancel-post-commit-{failpoint}-challenge",
+        "attempt_digest": "e2" * 32,
+        "capability_sha256": "f2" * 32,
+        "companion_identity_sha256": "a3" * 32,
+        "queued_result": queued_result,
+    }
+    stored = await registry.prepare_activation_intent(
+        prepared.id,
+        "tenant-a",
+        intent=intent,
+    )
+    assert stored["phase"] == "intent"
+    assert stored["dispatch_count"] == 0
+
+    runtime = registry._records[prepared.id]
+
+    monkeypatch.setenv("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT", failpoint)
+    with pytest.raises(LivePlanningJobRegistryPostCommitError):
+        await registry.cancel(prepared.id, "tenant-a")
+    monkeypatch.delenv("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT")
+
+    # The committed terminal state is kept in memory AND on disk — no
+    # memory/disk split, exception not swallowed.
+    snapshot = await registry.get(prepared.id, "tenant-a")
+    assert snapshot is not None
+    assert snapshot.state == LivePlanningJobState.CANCELLED
+    assert snapshot.stage == "cancelled"
+    operation = await registry.activation_operation(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert operation["phase"] == "cancelled"
+    assert operation["dispatch_count"] == 0
+    assert operation["queued_result"] == queued_result
+
+    disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
+    disk_record = next(
+        record
+        for record in disk_payload["records"]
+        if record["snapshot"]["id"] == prepared.id
+    )
+    assert disk_record["snapshot"] == snapshot.model_dump(mode="json")
+    assert disk_record["snapshot"]["state"] == "cancelled"
+    assert disk_record["activation_operation"] == operation
+    assert disk_record["prepared"] is runtime.prepared
+
+    # A brand-new instance reads the same committed facts from disk — restart
+    # consistency without any re-terminalization (the job is already terminal).
+    reloaded = LivePlanningJobRegistry(state_path=state_path)
+    reloaded_snapshot = await reloaded.get(prepared.id, "tenant-a")
+    assert reloaded_snapshot is not None
+    assert reloaded_snapshot.state == LivePlanningJobState.CANCELLED
+    assert reloaded_snapshot.stage == "cancelled"
+    reloaded_operation = await reloaded.activation_operation(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert reloaded_operation["phase"] == "cancelled"
+    assert reloaded_operation == operation
+
+    # A retry observes the terminal state and does not re-terminalize or
+    # re-dispatch.
+    retried = await registry.cancel(prepared.id, "tenant-a")
+    assert retried is not None and retried.state == LivePlanningJobState.CANCELLED
+    assert retried.revision == snapshot.revision
+    retried_operation = await registry.activation_operation(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert retried_operation == operation
+
+    await reloaded.close()
+    await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failpoint",
+    ("post_replace_dir_fsync", "post_replace_validation"),
+)
+async def test_terminalize_post_commit_persist_failure_keeps_committed_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failpoint: str,
+) -> None:
+    """C-143 P0 return: the same post-commit persist-failure semantics applied to
+    the ``_finish`` terminalize path — committed terminal memory and disk are kept,
+    the post-commit error propagates, and a retry is inert."""
+
+    state_path = tmp_path / "live-jobs.json"
+
+    async def operation(_: Any) -> dict[str, Any]:
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path)
+    prepared, _ = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key=f"terminalize-post-commit-{failpoint}-prepare",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    queued_result = {"job": prepared.model_dump(mode="json")}
+    intent = {
+        "schema_version": "tripchord-live-activation-operation-v1",
+        "operation_id": "c3" * 32,
+        "idempotency_key": f"terminalize-post-commit-{failpoint}",
+        "request_digest": "d3" * 32,
+        "job_id": prepared.id,
+        "challenge_id": f"terminalize-post-commit-{failpoint}-challenge",
+        "attempt_digest": "e3" * 32,
+        "capability_sha256": "f3" * 32,
+        "companion_identity_sha256": "a4" * 32,
+        "queued_result": queued_result,
+    }
+    stored = await registry.prepare_activation_intent(
+        prepared.id,
+        "tenant-a",
+        intent=intent,
+    )
+    assert stored["phase"] == "intent"
+
+    runtime = registry._records[prepared.id]
+
+    monkeypatch.setenv("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT", failpoint)
+    with pytest.raises(LivePlanningJobRegistryPostCommitError):
+        await registry._finish(
+            runtime,
+            LivePlanningJobState.CANCELLED,
+            stage="cancelled",
+            cancellation_requested=True,
+        )
+    monkeypatch.delenv("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT")
+
+    snapshot = await registry.get(prepared.id, "tenant-a")
+    assert snapshot is not None
+    assert snapshot.state == LivePlanningJobState.CANCELLED
+    assert snapshot.stage == "cancelled"
+    operation = await registry.activation_operation(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert operation["phase"] == "cancelled"
+    assert operation["dispatch_count"] == 0
+    assert operation["queued_result"] == queued_result
+
+    disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
+    disk_record = next(
+        record
+        for record in disk_payload["records"]
+        if record["snapshot"]["id"] == prepared.id
+    )
+    assert disk_record["snapshot"] == snapshot.model_dump(mode="json")
+    assert disk_record["snapshot"]["state"] == "cancelled"
+    assert disk_record["activation_operation"] == operation
+
+    reloaded = LivePlanningJobRegistry(state_path=state_path)
+    reloaded_snapshot = await reloaded.get(prepared.id, "tenant-a")
+    assert reloaded_snapshot is not None
+    assert reloaded_snapshot.state == LivePlanningJobState.CANCELLED
+    assert reloaded_snapshot.stage == "cancelled"
+    reloaded_operation = await reloaded.activation_operation(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert reloaded_operation["phase"] == "cancelled"
+    assert reloaded_operation == operation
+
+    # A retry observes the committed terminal state; the terminalize guard
+    # returns without any further mutation.
+    before_revision = snapshot.revision
+    await registry._finish(
+        runtime,
+        LivePlanningJobState.CANCELLED,
+        stage="cancelled",
+        cancellation_requested=True,
+    )
+    after_snapshot = await registry.get(prepared.id, "tenant-a")
+    assert after_snapshot is not None
+    assert after_snapshot.state == LivePlanningJobState.CANCELLED
+    assert after_snapshot.revision == before_revision
 
     await reloaded.close()
     await registry.close()

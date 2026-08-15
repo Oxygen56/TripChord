@@ -552,6 +552,17 @@ class LivePlanningJobInactiveError(RuntimeError):
     pass
 
 
+class LivePlanningJobRegistryPostCommitError(RuntimeError):
+    """Raised when a registry persist fails after ``os.replace`` has committed.
+
+    The disk already carries the newly written state, so callers must NOT roll
+    the in-memory record back to its pre-persist value — the memory was mutated
+    before the persist and therefore already matches the committed disk state.
+    The failure is surfaced as an explicit indeterminate terminal outcome."""
+
+    pass
+
+
 class LiveJobProgressReporter(Protocol):
     @property
     def job_id(self) -> str: ...
@@ -920,6 +931,7 @@ class LivePlanningJobRegistry:
         ).encode("utf-8")
         temporary = path.parent / f".{path.name}.{uuid4().hex}.tmp"
         descriptor = -1
+        commit = False
         try:
             descriptor = os.open(
                 temporary,
@@ -933,7 +945,18 @@ class LivePlanningJobRegistry:
                 os.fsync(target.fileno())
             self._validate_state_file(temporary)
             os.replace(temporary, path)
+            commit = True
+            if (
+                os.environ.get("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT")
+                == "post_replace_validation"
+            ):
+                raise RuntimeError("injected post-replace validation failure")
             self._validate_state_file(path)
+            if (
+                os.environ.get("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT")
+                == "post_replace_dir_fsync"
+            ):
+                raise OSError("injected post-replace directory fsync failure")
             parent_descriptor = os.open(
                 path.parent,
                 os.O_RDONLY
@@ -947,9 +970,25 @@ class LivePlanningJobRegistry:
         except OSError as exc:
             if descriptor >= 0:
                 os.close(descriptor)
+            if commit:
+                raise LivePlanningJobRegistryPostCommitError(
+                    "live planning job registry state was committed but could "
+                    "not be finalized; the on-disk record is authoritative"
+                ) from exc
             with suppress(OSError):
                 temporary.unlink()
             raise RuntimeError("live planning job registry state write failed") from exc
+        except Exception as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if commit:
+                raise LivePlanningJobRegistryPostCommitError(
+                    "live planning job registry state was committed but could "
+                    "not be finalized; the on-disk record is authoritative"
+                ) from exc
+            with suppress(OSError):
+                temporary.unlink()
+            raise
 
     async def start(
         self,
@@ -1038,6 +1077,11 @@ class LivePlanningJobRegistry:
                 )
             try:
                 self._persist_locked()
+            except LivePlanningJobRegistryPostCommitError:
+                # The new record was already committed to disk; keep the in-memory
+                # record (it matches the disk) and surface the indeterminate create
+                # so the caller can recover the committed record by idempotency.
+                raise
             except Exception:
                 self._remove_locked(job_id)
                 raise
@@ -1105,7 +1149,9 @@ class LivePlanningJobRegistry:
             runtime.prepared = False
             if activation is not None:
                 # Reassign a fresh operation object instead of mutating in place so
-                # the original body stays intact for a rollback on persist failure.
+                # the original body stays intact for a pre-commit rollback. After the
+                # replace commits, the disk already matches this new memory and must
+                # NOT be rolled back.
                 runtime.activation_operation = {
                     **activation,
                     "phase": "dispatched",
@@ -1113,6 +1159,8 @@ class LivePlanningJobRegistry:
                 }
             try:
                 self._persist_locked()
+            except LivePlanningJobRegistryPostCommitError:
+                raise
             except Exception:
                 runtime.prepared = True
                 if activation is not None:
@@ -1253,6 +1301,8 @@ class LivePlanningJobRegistry:
             }
             try:
                 self._persist_locked()
+            except LivePlanningJobRegistryPostCommitError:
+                raise
             except Exception:
                 runtime.activation_operation = None
                 raise
@@ -1308,9 +1358,13 @@ class LivePlanningJobRegistry:
                 runtime.activation_operation = committed_operation
                 try:
                     self._persist_locked()
+                except LivePlanningJobRegistryPostCommitError:
+                    raise
                 except Exception:
-                    # A failed persist must restore the pre-commit operation body
-                    # (including every nested field) so memory and disk agree.
+                    # A pre-commit persist failure must restore the pre-commit
+                    # operation body (including every nested field) so memory and
+                    # disk agree. Post-commit failures keep the committed memory —
+                    # the disk already carries it.
                     runtime.activation_operation = operation
                     raise
                 self._changed.notify_all()
@@ -1359,6 +1413,7 @@ class LivePlanningJobRegistry:
                 return runtime.snapshot
             previous_snapshot = runtime.snapshot
             previous_generation = runtime.generation
+            previous_prepared = runtime.prepared
             previous_activation_operation = runtime.activation_operation
             self._terminalize_locked(
                 runtime,
@@ -1368,13 +1423,20 @@ class LivePlanningJobRegistry:
             )
             try:
                 self._persist_locked()
+            except LivePlanningJobRegistryPostCommitError:
+                # The terminalized state was already committed to disk; the
+                # in-memory record matches it, so keep it and surface the
+                # indeterminate terminal outcome to the caller.
+                raise
             except Exception:
-                # A failed persist must leave the whole mutable record — snapshot,
-                # generation and the full activation_operation body including every
-                # nested field — byte-identical to the untouched disk file, so a
-                # same-process retry and a cold restart observe the same facts.
+                # A pre-commit persist failure must leave the whole mutable record —
+                # snapshot, generation, the prepared flag and the full
+                # activation_operation body including every nested field —
+                # byte-identical to the untouched disk file, so a same-process
+                # retry and a cold restart observe the same facts.
                 runtime.snapshot = previous_snapshot
                 runtime.generation = previous_generation
+                runtime.prepared = previous_prepared
                 runtime.activation_operation = previous_activation_operation
                 raise
             task = runtime.task
@@ -1724,6 +1786,7 @@ class LivePlanningJobRegistry:
                 result = None
             previous_snapshot = runtime.snapshot
             previous_generation = runtime.generation
+            previous_prepared = runtime.prepared
             previous_activation_operation = runtime.activation_operation
             self._terminalize_locked(
                 runtime,
@@ -1736,11 +1799,20 @@ class LivePlanningJobRegistry:
             )
             try:
                 self._persist_locked()
+            except LivePlanningJobRegistryPostCommitError:
+                # The terminalized state was already committed to disk; the
+                # in-memory record matches it, so keep it and surface the
+                # indeterminate terminal outcome to the caller.
+                raise
             except Exception:
-                # A failed persist on the terminalize path must restore the whole
-                # mutable record so memory and disk never diverge.
+                # A pre-commit persist failure must leave the whole mutable record —
+                # snapshot, generation, the prepared flag and the full
+                # activation_operation body including every nested field —
+                # byte-identical to the untouched disk file, so a same-process
+                # retry and a cold restart observe the same facts.
                 runtime.snapshot = previous_snapshot
                 runtime.generation = previous_generation
+                runtime.prepared = previous_prepared
                 runtime.activation_operation = previous_activation_operation
                 raise
             self._changed.notify_all()
@@ -1801,6 +1873,10 @@ class LivePlanningJobRegistry:
             updates["cancellation_requested"] = cancellation_requested
         runtime.snapshot = runtime.snapshot.model_copy(update=updates)
         runtime.generation += 1
+        # A terminalized job can no longer be an un-activated prepared record; the
+        # on-disk invariant requires a prepared record to be QUEUED, so clearing
+        # this here keeps every persist (cancel / close / restore) loadable.
+        runtime.prepared = False
         if (
             state == LivePlanningJobState.CANCELLED
             and runtime.activation_operation is not None
