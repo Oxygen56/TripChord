@@ -3149,6 +3149,13 @@ class FormalLiveSourceAuthority:
                 # change atomically closes the old attempt.  It may be audited
                 # offline, but it can never record/finalize in the new process;
                 # the caller must prepare a fresh job/challenge attempt.
+                activation_record = row.get("activation_record")
+                if (
+                    isinstance(activation_record, dict)
+                    and activation_record.get("phase")
+                    not in {"started", "completed", "cancelled"}
+                ):
+                    activation_record["phase"] = "cancelled"
                 row["state"] = "aborted"
                 row["aborted_at"] = self._utc_now().isoformat()
                 row["terminal_reason"] = "runtime_restart_requires_new_attempt"
@@ -4828,6 +4835,7 @@ class FormalLiveSourceAuthority:
                     "activation_ready",
                     "started",
                     "completed",
+                    "cancelled",
                 }:
                     raise RuntimeError("formal source ledger activation phase is invalid")
                 _require_aware_time(
@@ -4851,7 +4859,7 @@ class FormalLiveSourceAuthority:
                         raise RuntimeError(
                             "formal source ledger activation phase is inconsistent"
                         )
-                else:
+                elif phase != "cancelled":
                     _require_sha256(
                         heartbeat_digest,
                         "formal source ledger activation heartbeat request",

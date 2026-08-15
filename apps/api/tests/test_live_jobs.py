@@ -1147,7 +1147,7 @@ async def test_persistent_registry_write_failure_rolls_back_without_starting(
 async def test_activation_operation_is_durable_and_never_redispatched_after_restart(
     tmp_path: Path,
 ) -> None:
-    """P0/91648931: a dispatched formal start is an exactly-once durable operation."""
+    """P0/91648931: a dispatched formal start is exactly-once AND fail-closed on restart."""
 
     state_path = tmp_path / "live-jobs.json"
     started = asyncio.Event()
@@ -1208,7 +1208,13 @@ async def test_activation_operation_is_durable_and_never_redispatched_after_rest
     assert durable["dispatch_count"] == 1
     assert durable["queued_result"] == queued_result
 
+    # A cold restart cannot continue the in-flight dispatch: the job is
+    # terminalized and the activation operation fails closed instead of
+    # replaying the old QUEUED receipt, and it is never re-dispatched.
     restarted = LivePlanningJobRegistry(state_path=state_path)
+    restarted_snapshot = await restarted.get(prepared.id, "tenant-a")
+    assert restarted_snapshot is not None
+    assert restarted_snapshot.state == LivePlanningJobState.CANCELLED
     recovered = await restarted.activation_operation(
         prepared.id,
         "tenant-a",
@@ -1216,15 +1222,15 @@ async def test_activation_operation_is_durable_and_never_redispatched_after_rest
     )
     assert recovered == {
         **durable,
-        "phase": "dispatched",
+        "phase": "cancelled",
         "dispatch_count": 1,
     }
-    replayed = await restarted.activate(
-        prepared.id,
-        "tenant-a",
-        operation_id=intent["operation_id"],
-    )
-    assert replayed is not None and replayed.id == prepared.id
+    with pytest.raises(LivePlanningJobInactiveError, match="was cancelled"):
+        await restarted.activate(
+            prepared.id,
+            "tenant-a",
+            operation_id=intent["operation_id"],
+        )
     assert dispatches == 1
     assert (
         await restarted.activation_operation(

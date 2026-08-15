@@ -1074,7 +1074,15 @@ class LivePlanningJobRegistry:
                     raise LivePlanningJobInactiveError(
                         "live planning job uses a foreign activation operation"
                     )
+                if activation["phase"] == "cancelled":
+                    raise LivePlanningJobInactiveError(
+                        "live planning activation operation was cancelled"
+                    )
                 if activation["phase"] in {"dispatched", "committed"}:
+                    if runtime.snapshot.state == LivePlanningJobState.CANCELLED:
+                        raise LivePlanningJobInactiveError(
+                            "live planning job was cancelled"
+                        )
                     return runtime.snapshot
                 if activation["phase"] != "intent" or activation["dispatch_count"] != 0:
                     raise LivePlanningJobInactiveError(
@@ -1106,6 +1114,11 @@ class LivePlanningJobRegistry:
                     activation["phase"] = "intent"
                     activation["dispatch_count"] = 0
                 raise
+            if (
+                os.environ.get("TRIPCHORD_TEST_FORMAL_ACTIVATION_FAILPOINT")
+                == "exit_after_registry_dispatch_persist"
+            ):
+                os._exit(86)
             runtime.task = asyncio.create_task(
                 self._run(runtime, runtime.operation),
                 name=f"tripchord:{job_id}",
@@ -1176,10 +1189,12 @@ class LivePlanningJobRegistry:
         if not allow_intent_shape:
             phase = value["phase"]
             dispatch_count = value["dispatch_count"]
-            if phase not in {"intent", "dispatched", "committed"}:
+            if phase not in {"intent", "dispatched", "committed", "cancelled"}:
                 raise RuntimeError("live planning activation operation phase is invalid")
-            expected_count = 0 if phase == "intent" else 1
-            if type(dispatch_count) is not int or dispatch_count != expected_count:
+            expected_counts = (
+                (0,) if phase == "intent" else (0, 1) if phase == "cancelled" else (1,)
+            )
+            if type(dispatch_count) is not int or dispatch_count not in expected_counts:
                 raise RuntimeError("live planning activation dispatch count is invalid")
         return json.loads(
             json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -1271,6 +1286,14 @@ class LivePlanningJobRegistry:
             if operation is None or operation.get("operation_id") != operation_id:
                 raise LivePlanningJobInactiveError(
                     "live planning job uses a foreign activation operation"
+                )
+            if operation["phase"] == "cancelled":
+                raise LivePlanningJobInactiveError(
+                    "live planning activation operation was cancelled"
+                )
+            if runtime is not None and runtime.snapshot.state == LivePlanningJobState.CANCELLED:
+                raise LivePlanningJobInactiveError(
+                    "live planning job was cancelled"
                 )
             if operation["phase"] == "intent":
                 raise LivePlanningJobInactiveError(
@@ -1749,6 +1772,13 @@ class LivePlanningJobRegistry:
             updates["cancellation_requested"] = cancellation_requested
         runtime.snapshot = runtime.snapshot.model_copy(update=updates)
         runtime.generation += 1
+        if (
+            state == LivePlanningJobState.CANCELLED
+            and runtime.activation_operation is not None
+            and runtime.activation_operation.get("phase")
+            not in {"committed", "cancelled"}
+        ):
+            runtime.activation_operation["phase"] = "cancelled"
 
     def _make_capacity_locked(self) -> None:
         if len(self._records) < self._capacity:

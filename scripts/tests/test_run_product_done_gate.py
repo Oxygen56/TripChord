@@ -16526,6 +16526,10 @@ def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
             first_receipt = activated.json()
             assert first_receipt["job"]["id"] == fresh_job_id
             assert first_receipt["job"]["state"] == "queued"
+            # Deterministic response-loss counter-example: the client never got the
+            # response, but the job is still active in the SAME process, so the
+            # same-key retry MUST return the exact durable receipt (200) — the fix
+            # must not over-reject a legitimate response-loss retry.
             replay = await client.post(
                 f"{base}/api/v1/internal/formal-live-source/jobs/{fresh_job_id}/activate",
                 headers=activation_headers,
@@ -16566,13 +16570,15 @@ def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
 
         third_process = await start_server(3)
         async with httpx.AsyncClient(timeout=30.0) as client:
+            # C-143: the fully-started job was terminalized on cold start, so the
+            # same-key retry MUST fail closed (non-200) — never replay the old
+            # QUEUED receipt with a 200 while the job is cancelled.
             cold_replay = await client.post(
                 f"{base}/api/v1/internal/formal-live-source/jobs/{fresh_job_id}/activate",
                 headers=activation_headers,
                 json=activation_payload,
             )
-            assert cold_replay.status_code == 200, cold_replay.text
-            assert cold_replay.json() == first_receipt
+            assert cold_replay.status_code == 409, cold_replay.text
             cold_mismatch = await client.post(
                 f"{base}/api/v1/internal/formal-live-source/jobs/{fresh_job_id}/activate",
                 headers=activation_headers,
@@ -16585,6 +16591,12 @@ def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
                 },
             )
             assert cold_mismatch.status_code == 409
+            cold_status = await client.get(
+                f"{base}/api/v1/agents/live-flexible-plan-from-text/jobs/{fresh_job_id}"
+            )
+            assert cold_status.status_code == 200
+            assert cold_status.json()["state"] == "cancelled"
+            assert cold_status.json()["stage"] in {"restart_cancelled", "cancelled"}
         stop_server(third_process)
 
     try:
@@ -16601,15 +16613,17 @@ def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
 @pytest.mark.parametrize(
     "fault_mode",
     (
+        "exit_after_registry_dispatch_persist",
         "exit_after_registry_dispatch",
         "ledger_write_failure_after_registry_dispatch",
     ),
 )
-def test_formal_activation_cross_registry_fault_recovers_exact_receipt_over_real_http(
+def test_formal_activation_interrupt_windows_fail_closed_over_real_http(
     tmp_path: Path,
     fault_mode: str,
 ) -> None:
-    """91648931: the registry/formal-ledger double-write window is recoverable."""
+    """91648931/C-143: every interrupted activation window fails closed after a
+    real OS restart — never an HTTP 200 old QUEUED receipt, never committed."""
 
     import httpx
     from tripchord.formal_live_source import (
@@ -16810,7 +16824,10 @@ def test_formal_activation_cross_registry_fault_recovers_exact_receipt_over_real
                 await asyncio.sleep(0.05)
             else:
                 pytest.fail("activation never exposed a real Companion heartbeat request")
-            if fault_mode == "exit_after_registry_dispatch":
+            if fault_mode in {
+                "exit_after_registry_dispatch_persist",
+                "exit_after_registry_dispatch",
+            }:
                 try:
                     unexpected_response = await activation_task
                 except httpx.RequestError:
@@ -16843,13 +16860,16 @@ def test_formal_activation_cross_registry_fault_recovers_exact_receipt_over_real
 
         await start_server(2, fault=None)
         async with httpx.AsyncClient(timeout=30.0) as client:
+            # The cold restart terminalized the job and cancelled the dispatched
+            # operation / activation record.  The same-key retry MUST fail closed
+            # (non-200) instead of replaying the old QUEUED receipt and advancing
+            # the ledgers to committed/started, and must not dispatch again.
             recovered = await client.post(
                 f"{base}/api/v1/internal/formal-live-source/jobs/{job_id}/activate",
                 headers=activation_headers,
                 json=activation_payload,
             )
-            assert recovered.status_code == 200, recovered.text
-            assert recovered.json() == expected_receipt
+            assert recovered.status_code == 409, recovered.text
             mismatch = await client.post(
                 f"{base}/api/v1/internal/formal-live-source/jobs/{job_id}/activate",
                 headers=activation_headers,
@@ -16873,7 +16893,9 @@ def test_formal_activation_cross_registry_fault_recovers_exact_receipt_over_real
         record_after = next(
             item for item in registry_after["records"] if item["snapshot"]["id"] == job_id
         )
-        assert record_after["activation_operation"]["phase"] == "committed"
+        # Three ledgers must share the SAME failure terminal state: job CANCELLED,
+        # operation cancelled, formal activation_record cancelled.
+        assert record_after["activation_operation"]["phase"] == "cancelled"
         assert record_after["activation_operation"]["dispatch_count"] == 1
         ledger_after = json.loads(ledger_path.read_text(encoding="utf-8"))
         formal_after = next(
@@ -16881,9 +16903,38 @@ def test_formal_activation_cross_registry_fault_recovers_exact_receipt_over_real
             for row in ledger_after.values()
             if row["run_id"] == f"cross-registry-{fault_mode}"
         )["activation_record"]
-        assert formal_after["phase"] == "started"
-        assert formal_after["result"] == expected_receipt
+        assert formal_after["phase"] == "cancelled"
+        assert formal_after["result"] is None
+        # The queued receipt is preserved but was never delivered as a start.
         assert formal_after["started_result"] == expected_receipt
+
+        # Deterministic second-crash counter-example: the failure terminal state
+        # is stable across another cold start and the retry still fails closed
+        # with no additional dispatch.
+        await start_server(3, fault=None)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            second_crash_replay = await client.post(
+                f"{base}/api/v1/internal/formal-live-source/jobs/{job_id}/activate",
+                headers=activation_headers,
+                json=activation_payload,
+            )
+            assert second_crash_replay.status_code == 409
+        registry_final = json.loads(registry_path.read_text(encoding="utf-8"))
+        record_final = next(
+            item
+            for item in registry_final["records"]
+            if item["snapshot"]["id"] == job_id
+        )
+        assert record_final["activation_operation"]["phase"] == "cancelled"
+        assert record_final["activation_operation"]["dispatch_count"] == 1
+        ledger_final = json.loads(ledger_path.read_text(encoding="utf-8"))
+        formal_final = next(
+            row
+            for row in ledger_final.values()
+            if row["run_id"] == f"cross-registry-{fault_mode}"
+        )["activation_record"]
+        assert formal_final["phase"] == "cancelled"
+        assert formal_final["result"] is None
 
     try:
         asyncio.run(exercise_fault())

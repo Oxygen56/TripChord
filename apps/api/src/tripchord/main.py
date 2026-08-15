@@ -1502,12 +1502,18 @@ async def activate_formal_live_source_job_endpoint(
                 )
                 operation_id = activation.get("operation_id")
                 if isinstance(operation_id, str):
-                    with suppress(LivePlanningJobInactiveError):
-                        await registry.commit_activation(
-                            job_id,
-                            principal.tenant_id,
-                            operation_id=operation_id,
-                        )
+                    await registry.commit_activation(
+                        job_id,
+                        principal.tenant_id,
+                        operation_id=operation_id,
+                    )
+                snapshot = await registry.get(job_id, principal.tenant_id)
+                if snapshot is None or snapshot.id != job_id:
+                    raise ValueError("formal source prepared job is unavailable")
+                if snapshot.state == LivePlanningJobState.CANCELLED:
+                    raise LivePlanningJobInactiveError(
+                        "live planning job was cancelled"
+                    )
                 return cast(dict[str, Any], replay)
             bridge = getattr(request.app.state, "browser_task_bridge", None)
             if bridge is None:
@@ -1593,11 +1599,19 @@ async def activate_formal_live_source_job_endpoint(
                     snapshot = await registry.get(job_id, principal.tenant_id)
                 if snapshot is None or snapshot.id != job_id:
                     raise ValueError("formal source prepared job is unavailable")
+                if snapshot.state == LivePlanningJobState.CANCELLED:
+                    raise LivePlanningJobInactiveError(
+                        "live planning job was cancelled before its activation completed"
+                    )
                 recovered_operation = await registry.activation_operation(
                     job_id,
                     principal.tenant_id,
                     operation_id=operation_id,
                 )
+                if recovered_operation["phase"] == "cancelled":
+                    raise LivePlanningJobInactiveError(
+                        "live planning activation operation was cancelled"
+                    )
                 if recovered_operation["phase"] not in {"dispatched", "committed"}:
                     raise ValueError("formal source activation operation was not dispatched")
                 if json.dumps(
