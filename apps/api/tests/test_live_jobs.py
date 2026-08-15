@@ -3654,3 +3654,640 @@ async def test_capacity_slot_held_until_real_operation_stops_after_close() -> No
         stop.set()
         await _settle_leaked_runtime(stop, runtime)
         await registry.close()
+
+
+async def _wait_for_terminal_state(
+    registry: LivePlanningJobRegistry,
+    job_id: str,
+    tenant_id: str,
+    state: LivePlanningJobState,
+) -> None:
+    """Poll for an AUTO-COLLECTED terminal state (C-145 P1).
+
+    A longer window than ``_wait_for_state`` because the terminalization is now
+    driven by the async cleanup owner that must wake, re-check the executors and
+    persist, not by a synchronous registry call."""
+    for _ in range(1000):
+        snapshot = await registry.get(job_id, tenant_id)
+        if snapshot is not None and snapshot.state == state:
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError(f"job did not reach terminal {state}")
+
+
+async def _settle_cleanup_owner(runtime: Any) -> None:
+    owner = getattr(runtime, "cleanup_owner", None)
+    if owner is not None and not owner.done():
+        with suppress(BaseException):
+            await asyncio.wait_for(owner, timeout=3)
+
+
+@pytest.mark.asyncio
+async def test_late_stop_cancel_auto_collects_terminal_without_extra_cancel() -> None:
+    """C-145 P1: after cancel() fails closed over a swallow-cancel operation that
+    keeps running past the drain budget, the operation eventually stops on its
+    own. The registry's cleanup owner (joined by the operation done-callback)
+    must AUTO-COLLECT the record to the terminal CANCELLED state — WITHOUT a
+    repeated cancel, same-key retry, close or cold start. RED on HEAD: the
+    snapshot stays running+cancel_pending (stage=cancel_timed_out) forever."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    async def stubborn(_: Any) -> dict[str, Any]:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            swallowed.set()
+            while not stop.is_set():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(0.001)
+        return {"stopped": True}
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn,
+            idempotency_key="late-stop-cancel",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        runtime = registry._records[snap.id]
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+        outcome = await registry.cancel(snap.id, "tenant-a")
+        assert swallowed.is_set()
+        assert outcome is not None and outcome.cancel_pending is True
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
+
+        # The operation stops on its own — no extra cancel / retry / close.
+        stop.set()
+        await asyncio.wait_for(runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, snap.id, "tenant-a", LivePlanningJobState.CANCELLED
+        )
+        final = await registry.get(snap.id, "tenant-a")
+        # RED on HEAD: the snapshot never reaches CANCELLED without another cancel.
+        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+        assert final.stage == "cancelled"
+        assert final.cancel_pending is False
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_late_stop_deadline_auto_collects_terminal_without_extra_close() -> None:
+    """C-145 P1 deadline variant: the deadline fires, the operation swallows the
+    drain cancellation and keeps running (timeout_pending), then stops on its
+    own. The cleanup owner must auto-collect the record to the terminal CANCELLED
+    state without a repeated close / retry. RED on HEAD: the snapshot stays
+    running+cancel_pending (stage=timeout_pending) forever."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    async def stubborn(_: Any) -> dict[str, Any]:
+        while not stop.is_set():
+            try:
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                swallowed.set()
+        return {"stopped": True}
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn,
+            idempotency_key="late-stop-deadline",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=0.05,
+        )
+        runtime = registry._records[snap.id]
+        await asyncio.wait_for(runtime.task, timeout=5)
+        assert runtime.task.done()
+        assert swallowed.is_set()
+        assert runtime.snapshot.cancel_pending is True
+        assert runtime.snapshot.stage == "timeout_pending"
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
+
+        # The operation stops on its own — no repeated close / retry / cold start.
+        stop.set()
+        await asyncio.wait_for(runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, snap.id, "tenant-a", LivePlanningJobState.CANCELLED
+        )
+        final = await registry.get(snap.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+        assert final.cancel_pending is False
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_late_stop_close_auto_collects_terminal_without_extra_close() -> None:
+    """C-145 P1 close variant: close() fails closed over a swallow-cancel
+    operation (non-terminal cancel_pending isolation), then the operation stops
+    on its own. The cleanup owner must auto-collect the record to the terminal
+    CANCELLED state without a repeated close(). RED on HEAD: the snapshot stays
+    running+cancel_pending forever."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    async def stubborn(_: Any) -> dict[str, Any]:
+        started.set()
+        while not stop.is_set():
+            try:
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                swallowed.set()
+        return {"stopped": True}
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn,
+            idempotency_key="late-stop-close",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        runtime = registry._records[snap.id]
+        await _wait_for_state(
+            registry, snap.id, "tenant-a", LivePlanningJobState.RUNNING
+        )
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+        await registry.close()
+        assert swallowed.is_set()
+        assert runtime.snapshot.cancel_pending is True
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
+
+        # The operation stops on its own — no repeated close().
+        stop.set()
+        await asyncio.wait_for(runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, snap.id, "tenant-a", LivePlanningJobState.CANCELLED
+        )
+        final = await registry.get(snap.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+        assert final.cancel_pending is False
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_late_stop_auto_collect_memory_matches_disk(tmp_path: Path) -> None:
+    """C-145 P1: the auto-collected terminal state must be PERSISTED — memory and
+    disk agree byte-for-byte (same committed snapshot), so a same-process reader
+    and a cold restart observe the same terminal facts. RED on HEAD: memory stays
+    running+cancel_pending and the disk keeps the non-terminal isolation."""
+    state_path = tmp_path / "live-jobs.json"
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    async def stubborn(_: Any) -> dict[str, Any]:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            swallowed.set()
+            while not stop.is_set():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(0.001)
+        return {"stopped": True}
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn,
+            idempotency_key="late-stop-disk",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        runtime = registry._records[snap.id]
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+        outcome = await registry.cancel(snap.id, "tenant-a")
+        assert outcome is not None and outcome.cancel_pending is True
+        assert not runtime.operation_task.done()
+
+        stop.set()
+        await asyncio.wait_for(runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, snap.id, "tenant-a", LivePlanningJobState.CANCELLED
+        )
+        final = await registry.get(snap.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+        disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record
+            for record in disk_payload["records"]
+            if record["snapshot"]["id"] == snap.id
+        )
+        # RED on HEAD: memory and disk both stay running+cancel_pending.
+        assert disk_record["snapshot"] == final.model_dump(mode="json")
+        assert disk_record["snapshot"]["state"] == "cancelled"
+        assert disk_record["snapshot"]["cancel_pending"] is False
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_late_stop_capacity_one_new_key_starts_after_operation_stops() -> None:
+    """C-145 P1: with capacity=1, a stuck cancel_pending record must NOT leak
+    capacity forever. Once the operation stops and the record auto-collects to a
+    terminal state, a NEW key request can start (the terminal record is
+    evictable). RED on HEAD: the stuck non-terminal record occupies the only slot
+    and the new key is rejected with LivePlanningJobCapacityError."""
+    registry = LivePlanningJobRegistry(
+        capacity=1,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    first_stop = asyncio.Event()
+    second_stop = asyncio.Event()
+    first_started = asyncio.Event()
+
+    async def first_operation(_: Any) -> dict[str, Any]:
+        first_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            while not first_stop.is_set():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(0.001)
+        return {"stopped": True}
+
+    async def second_operation(_: Any) -> dict[str, Any]:
+        await second_stop.wait()
+        return {"ok": True}
+
+    first_runtime: Any = None
+    second_runtime: Any = None
+    try:
+        first, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=first_operation,
+            idempotency_key="cap-one-first",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        first_runtime = registry._records[first.id]
+        for _ in range(1000):
+            if first_started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert first_started.is_set()
+        outcome = await registry.cancel(first.id, "tenant-a")
+        assert outcome is not None and outcome.cancel_pending is True
+        assert not first_runtime.operation_task.done()
+
+        first_stop.set()
+        await asyncio.wait_for(first_runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, first.id, "tenant-a", LivePlanningJobState.CANCELLED
+        )
+
+        # The terminal record is evictable: a NEW key can start (RED on HEAD: the
+        # stuck non-terminal record makes this raise LivePlanningJobCapacityError).
+        second, _replayed2 = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=second_operation,
+            idempotency_key="cap-one-second",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        second_runtime = registry._records[second.id]
+        assert second.id != first.id
+        assert len(registry._records) == 1
+    finally:
+        first_stop.set()
+        second_stop.set()
+        await _settle_leaked_runtime(first_stop, first_runtime)
+        await _settle_cleanup_owner(first_runtime)
+        await _settle_leaked_runtime(second_stop, second_runtime)
+        await _settle_cleanup_owner(second_runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_late_stop_cumulative_attacks_never_exhaust_capacity() -> None:
+    """C-145 P1: repeated late-stop attacks must never leak capacity. With
+    capacity=1, every attack auto-collects to a terminal state when its operation
+    stops, so the next NEW key can always start — the permanent leak that rejects
+    new keys with LivePlanningJobCapacityError never accumulates. RED on HEAD:
+    each stuck record occupies the only slot forever, so the second attack's new
+    key is rejected."""
+    registry = LivePlanningJobRegistry(
+        capacity=1,
+        max_running=1,
+        cancel_wait_seconds=0.02,
+    )
+    stop_events: list[asyncio.Event] = []
+    started_events: list[asyncio.Event] = []
+    runtimes: list[Any] = []
+
+    def make_operation(stop_event: asyncio.Event, started_event: asyncio.Event) -> Any:
+        async def stubborn(_: Any) -> dict[str, Any]:
+            started_event.set()
+            while not stop_event.is_set():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(0.001)
+            return {"stopped": True}
+        return stubborn
+
+    try:
+        for attack in range(5):
+            stop_event = asyncio.Event()
+            started_event = asyncio.Event()
+            stop_events.append(stop_event)
+            started_events.append(started_event)
+            snap, _replayed = await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=make_operation(stop_event, started_event),
+                idempotency_key=f"late-stop-attack-{attack}",
+                request_digest=REQUEST_SHA256,
+                deadline_seconds=30,
+            )
+            runtime = registry._records[snap.id]
+            runtimes.append(runtime)
+            for _ in range(1000):
+                if started_event.is_set():
+                    break
+                await asyncio.sleep(0)
+            assert started_event.is_set()
+            outcome = await registry.cancel(snap.id, "tenant-a")
+            assert outcome is not None and outcome.cancel_pending is True
+            assert not runtime.operation_task.done()
+            # Release this attack's operation; it auto-collects to terminal.
+            stop_event.set()
+            await asyncio.wait_for(runtime.operation_task, timeout=3)
+            await _wait_for_terminal_state(
+                registry, snap.id, "tenant-a", LivePlanningJobState.CANCELLED
+            )
+        # Every new key across all attacks started successfully — capacity never
+        # leaked a permanent non-terminal record.
+        assert len(runtimes) == 5
+    finally:
+        for stop_event in stop_events:
+            stop_event.set()
+        for runtime in runtimes:
+            await _settle_leaked_runtime(stop_events[-1], runtime)
+            await _settle_cleanup_owner(runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_late_stop_cold_restart_matches_in_process_auto_collect(
+    tmp_path: Path,
+) -> None:
+    """C-145 P1: the auto-collected terminal state must survive a full cold
+    restart identically — the in-process reader and a fresh registry loading the
+    same state file observe the SAME terminal state and stage. RED on HEAD: the
+    in-process snapshot stays running+cancel_pending while a cold restart
+    fail-closes it to restart_cancelled — the two disagree."""
+    state_path = tmp_path / "live-jobs.json"
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+
+    async def stubborn(_: Any) -> dict[str, Any]:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            while not stop.is_set():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(0.001)
+        return {"stopped": True}
+
+    runtime: Any = None
+    reloaded: LivePlanningJobRegistry | None = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn,
+            idempotency_key="late-stop-cold",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        runtime = registry._records[snap.id]
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+        outcome = await registry.cancel(snap.id, "tenant-a")
+        assert outcome is not None and outcome.cancel_pending is True
+        assert not runtime.operation_task.done()
+
+        stop.set()
+        await asyncio.wait_for(runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, snap.id, "tenant-a", LivePlanningJobState.CANCELLED
+        )
+        in_process = await registry.get(snap.id, "tenant-a")
+        assert in_process is not None
+        assert in_process.state == LivePlanningJobState.CANCELLED
+
+        reloaded = LivePlanningJobRegistry(state_path=state_path)
+        cold = await reloaded.get(snap.id, "tenant-a")
+        assert cold is not None
+        # RED on HEAD: the cold restart publishes restart_cancelled while the
+        # in-process record is still running+cancel_pending.
+        assert cold.state == in_process.state
+        assert cold.stage == in_process.stage
+        assert cold.cancel_pending is False
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        if reloaded is not None:
+            await reloaded.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_late_stop_auto_collect_no_duplicate_terminalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-145 P1: the auto-collect must terminalize exactly ONCE — the cleanup
+    owner and the operation done-callback join the same state machine and never
+    double-publish the final label. RED on HEAD: the record never auto-collects
+    at all (the terminal state is never reached)."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    async def stubborn(_: Any) -> dict[str, Any]:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            swallowed.set()
+            while not stop.is_set():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(0.001)
+        return {"stopped": True}
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn,
+            idempotency_key="late-stop-no-dup",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        runtime = registry._records[snap.id]
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+        outcome = await registry.cancel(snap.id, "tenant-a")
+        assert outcome is not None and outcome.cancel_pending is True
+        assert not runtime.operation_task.done()
+
+        terminalize_calls = 0
+        original = registry._terminalize_locked
+
+        def counting(*args: Any, **kwargs: Any) -> None:
+            nonlocal terminalize_calls
+            terminalize_calls += 1
+            original(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "_terminalize_locked", counting)
+
+        stop.set()
+        await asyncio.wait_for(runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, snap.id, "tenant-a", LivePlanningJobState.CANCELLED
+        )
+        # Exactly one terminalize for the auto-collect; the state machine never
+        # double-publishes the final CANCELLED.
+        assert terminalize_calls == 1
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_late_stop_cleanup_owner_is_waitable_and_terminalizes() -> None:
+    """C-145 P1: the registry holds a UNIQUE, waitable cleanup owner per pending
+    runtime. A caller can await it and observe the auto-collected terminal state
+    after the operation stops — no extra cancel / retry / close. RED on HEAD: no
+    cleanup owner exists and the snapshot never reaches CANCELLED."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    async def stubborn(_: Any) -> dict[str, Any]:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            swallowed.set()
+            while not stop.is_set():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(0.001)
+        return {"stopped": True}
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn,
+            idempotency_key="late-stop-owner",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        runtime = registry._records[snap.id]
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+        outcome = await registry.cancel(snap.id, "tenant-a")
+        assert outcome is not None and outcome.cancel_pending is True
+        assert not runtime.operation_task.done()
+        # The unique cleanup owner exists and is waitable (RED on HEAD: None).
+        for _ in range(100):
+            if getattr(runtime, "cleanup_owner", None) is not None:
+                break
+            await asyncio.sleep(0)
+        assert runtime.cleanup_owner is not None
+        stop.set()
+        await asyncio.wait_for(runtime.cleanup_owner, timeout=3)
+        final = await registry.get(snap.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+        assert final.cancel_pending is False
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        await registry.close()

@@ -113,6 +113,23 @@ class _SafeFailureDiagnostic:
     details_digest: str
 
 
+@dataclass(frozen=True)
+class _PendingTerminalOutcome:
+    """C-145 P1: the durable terminal intent of a failed-closed cleanup.
+
+    Recorded BEFORE the stuck isolation is persisted so a pre-commit persist
+    failure still keeps the recoverable owner: once the real operation stops on
+    its own, the cleanup owner terminalizes the record to this outcome without an
+    extra retry/close/cold start."""
+
+    state: LivePlanningJobState
+    stage: str
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    safe_failure: _SafeFailureDiagnostic | None = None
+    cancellation_requested: bool | None = None
+
+
 def _safe_exception_class(exc: BaseException) -> str:
     name = type(exc).__name__
     return name if _SAFE_EXCEPTION_CLASS_PATTERN.fullmatch(name) else "Exception"
@@ -726,6 +743,13 @@ class _RuntimeJob:
         # runner never handed the permit to an operation). This is what ties
         # capacity to the live operation lifecycle instead of the runner's exit.
         self.slot_held = False
+        # C-145 P1: the unique, waitable cleanup owner of this runtime's pending
+        # terminal outcome. Set once a cancel/close/deadline cleanup fails
+        # closed; the owner (joined by the operation done-callback) auto-collects
+        # the record to a terminal state when the real operation stops on its
+        # own — without an extra retry/close/cold start.
+        self.cleanup_owner: asyncio.Task[None] | None = None
+        self.pending_terminal: _PendingTerminalOutcome | None = None
 
 
 class _IdempotencyEntry:
@@ -2061,13 +2085,24 @@ class LivePlanningJobRegistry:
         permit is released here only after ``operation_task`` is confirmed done
         (or never existed). Safe to call from the runner's ``finally`` AND from
         the operation done-callback: the ``slot_held`` flag makes a
-        double-release impossible."""
+        double-release impossible.
+
+        C-145 P1: releasing the permit is NOT the end of the cleanup. A runtime
+        whose cancel/close/deadline cleanup failed closed keeps a pending
+        terminal outcome; the operation done-callback joins that state machine
+        here, so the record auto-collects to its terminal state without an extra
+        retry/close/cold start."""
         if not runtime.slot_held:
+            # Still join the cleanup state machine — a pending terminal outcome
+            # may need a (re)spawned owner even when an earlier call already
+            # released the permit.
+            self._ensure_cleanup_owner(runtime)
             return
         if runtime.operation_task is not None and not runtime.operation_task.done():
             return
         runtime.slot_held = False
         self._slots.release()
+        self._ensure_cleanup_owner(runtime)
 
     def _executors_stopped(self, runtime: _RuntimeJob) -> bool:
         """Shared terminalize predicate (硬门 B / P0-4).
@@ -2080,6 +2115,73 @@ class LivePlanningJobRegistry:
             (runtime.task is None or runtime.task.done())
             and (runtime.operation_task is None or runtime.operation_task.done())
         )
+
+    def _ensure_cleanup_owner(self, runtime: _RuntimeJob) -> None:
+        """Ensure a unique, waitable cleanup owner exists for a pending runtime.
+
+        C-145 P1: a runtime whose cancel/close/deadline cleanup failed closed
+        keeps a pending terminal outcome. The owner task waits for the REAL
+        operation to stop (via a shield, so it outlives the registry runner and
+        survives the operation's own cancellation) and then terminalizes the
+        record — without an extra retry/close/cold start. Safe to call from the
+        operation done-callback and from any cleanup join; re-entrant, so
+        repeated calls never spawn a duplicate owner."""
+        if runtime.pending_terminal is None:
+            return
+        if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+            return
+        owner = runtime.cleanup_owner
+        if owner is not None and not owner.done():
+            return
+        runtime.cleanup_owner = asyncio.create_task(
+            self._cleanup_owner(runtime),
+            name=f"tripchord:{runtime.snapshot.id}:cleanup",
+        )
+
+    async def _cleanup_owner(self, runtime: _RuntimeJob) -> None:
+        """The unique owner of a pending terminal outcome (C-145 P1).
+
+        Awaits the shielded operation task — so the owner outlives the registry
+        runner and survives the operation being cancelled while it waits — then
+        re-checks the shared ``_executors_stopped`` predicate and terminalizes
+        the record to the pending outcome. A pre/post-commit persist failure
+        keeps the recoverable cancel_pending isolation: a post-commit failure is
+        already durable, and a pre-commit failure leaves ``pending_terminal``
+        intact so a later join (done-callback, close, same-key retry) retries the
+        same terminalization."""
+        operation_task = runtime.operation_task
+        if operation_task is not None:
+            with suppress(BaseException):
+                # The operation was cancelled or raised while the owner waited;
+                # either way it is now done, which is all the owner needs to
+                # know to proceed.
+                await asyncio.shield(operation_task)
+        if not self._executors_stopped(runtime):
+            return
+        pending = runtime.pending_terminal
+        if pending is None:
+            return
+        if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+            return
+        try:
+            await self._finish(
+                runtime,
+                pending.state,
+                stage=pending.stage,
+                result=pending.result,
+                error=pending.error,
+                safe_failure=pending.safe_failure,
+                cancellation_requested=pending.cancellation_requested,
+            )
+        except LivePlanningJobRegistryPostCommitError:
+            # The terminal state was already committed on disk; the in-memory
+            # record matches it.
+            pass
+        except Exception:
+            # A pre-commit persist failure keeps the recoverable cancel_pending
+            # isolation (pending_terminal stays set), so a later join retries
+            # the same terminalization.
+            pass
 
     async def _cancel_and_drain_operation(
         self,
@@ -2340,6 +2442,11 @@ class LivePlanningJobRegistry:
                 runtime.prepared = previous_prepared
                 runtime.activation_operation = previous_activation_operation
                 raise
+            # C-145 P1: the terminal state is durably committed — the pending
+            # terminal outcome is consumed and no cleanup owner may re-publish
+            # it. On a pre-commit failure above it survives as the recoverable
+            # owner for a later close / same-key retry / cold start.
+            runtime.pending_terminal = None
             self._changed.notify_all()
 
     async def _mark_cancel_stuck(
@@ -2396,6 +2503,20 @@ class LivePlanningJobRegistry:
                 runtime.activation_operation = previous_activation_operation
                 raise
             self._changed.notify_all()
+        # C-145 P1: ONLY a durably committed stuck isolation owns a terminal
+        # outcome — the cleanup owner auto-collects the record to CANCELLED when
+        # the real operation stops on its own. A pre-commit persist failure here
+        # leaves no pending outcome: the record keeps the durable
+        # cancel_pending isolation as the recoverable owner (a later close,
+        # same-key retry or cold restart completes the terminalization), so the
+        # operation done-callback never auto-collects over an isolation the disk
+        # does not agree with.
+        runtime.pending_terminal = _PendingTerminalOutcome(
+            state=LivePlanningJobState.CANCELLED,
+            stage="cancelled",
+            cancellation_requested=True,
+        )
+        self._ensure_cleanup_owner(runtime)
 
     def _complete_cancel_terminalize_locked(self, runtime: _RuntimeJob) -> None:
         """P0-1: idempotently terminalize a cancel_pending job whose executor has
@@ -2428,6 +2549,9 @@ class LivePlanningJobRegistry:
             runtime.prepared = previous_prepared
             runtime.activation_operation = previous_activation_operation
             raise
+        # C-145 P1: the terminal CANCELLED is durably committed — consume the
+        # pending terminal outcome so no cleanup owner re-publishes it.
+        runtime.pending_terminal = None
 
     async def _ensure_active(self, runtime: _RuntimeJob, generation: int) -> None:
         async with self._lock:
@@ -2486,6 +2610,10 @@ class LivePlanningJobRegistry:
             updates["cancellation_requested"] = cancellation_requested
         runtime.snapshot = runtime.snapshot.model_copy(update=updates)
         runtime.cancel_pending = False
+        # C-145 P1: the pending terminal outcome is consumed ONLY after the
+        # terminal state is durably persisted (in _finish /
+        # _complete_cancel_terminalize_locked), so a pre/post-commit failure
+        # keeps the recoverable owner.
         runtime.generation += 1
         # A terminalized job can no longer be an un-activated prepared record; the
         # on-disk invariant requires a prepared record to be QUEUED, so clearing
