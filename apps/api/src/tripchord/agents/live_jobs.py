@@ -4,13 +4,16 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import re
 import secrets
+import stat
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import Annotated, Any, Protocol, Self
 from uuid import uuid4
 
@@ -682,7 +685,7 @@ class _IdempotencyEntry:
 
 
 class LivePlanningJobRegistry:
-    """Bounded process-local control plane for cancellable live planning calls."""
+    """Bounded control plane with fail-closed restart tombstones when persisted."""
 
     def __init__(
         self,
@@ -692,6 +695,7 @@ class LivePlanningJobRegistry:
         terminal_ttl: timedelta = timedelta(minutes=30),
         cancel_wait_seconds: float = 10,
         now: Callable[[], datetime] | None = None,
+        state_path: Path | None = None,
     ) -> None:
         if capacity < 1:
             raise ValueError("capacity must be positive")
@@ -711,6 +715,224 @@ class LivePlanningJobRegistry:
         self._lock = asyncio.Lock()
         self._changed = asyncio.Condition(self._lock)
         self._closed = False
+        self._state_path = state_path
+        if self._state_path is not None:
+            self._load_state()
+
+    @staticmethod
+    async def _unrecoverable_operation(
+        _report: LiveJobProgressReporter,
+    ) -> dict[str, Any]:
+        raise LivePlanningJobInactiveError(
+            "live planning job operation cannot continue after a process restart"
+        )
+
+    def _load_state(self) -> None:
+        path = self._state_path
+        assert path is not None
+        if not path.is_absolute():
+            raise RuntimeError("live planning job registry state path must be absolute")
+        self._validate_state_parent(path.parent)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise RuntimeError("live planning job registry state is unavailable") from exc
+        self._validate_state_file(path)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("live planning job registry state is unreadable") from exc
+        if not isinstance(payload, dict) or set(payload) != {
+            "schema_version",
+            "records",
+            "idempotency",
+        }:
+            raise RuntimeError("live planning job registry state has an invalid shape")
+        if payload["schema_version"] != "tripchord-live-job-registry-v1":
+            raise RuntimeError("live planning job registry state schema is invalid")
+        records = payload["records"]
+        idempotency = payload["idempotency"]
+        if (
+            not isinstance(records, list)
+            or len(records) > self._capacity
+            or not isinstance(idempotency, list)
+        ):
+            raise RuntimeError("live planning job registry state exceeds its bounds")
+        for item in records:
+            if not isinstance(item, dict) or set(item) != {
+                "tenant_partition",
+                "snapshot",
+                "prepared",
+            }:
+                raise RuntimeError("live planning job registry record is invalid")
+            tenant_partition = item["tenant_partition"]
+            prepared = item["prepared"]
+            if (
+                not isinstance(tenant_partition, str)
+                or re.fullmatch(r"[0-9a-f]{64}", tenant_partition) is None
+                or type(prepared) is not bool
+            ):
+                raise RuntimeError("live planning job registry record identity is invalid")
+            try:
+                snapshot = LivePlanningJobSnapshot.model_validate(item["snapshot"])
+            except ValidationError as exc:
+                raise RuntimeError("live planning job registry snapshot is invalid") from exc
+            if snapshot.id in self._records:
+                raise RuntimeError("live planning job registry record is duplicated")
+            if prepared and snapshot.state != LivePlanningJobState.QUEUED:
+                raise RuntimeError("live planning prepared record is inconsistent")
+            self._records[snapshot.id] = _RuntimeJob(
+                tenant_partition=tenant_partition,
+                snapshot=snapshot,
+                deadline_monotonic=0.0,
+                operation=self._unrecoverable_operation,
+                prepared=prepared,
+            )
+        for item in idempotency:
+            if not isinstance(item, dict) or set(item) != {
+                "partition",
+                "job_id",
+                "request_digest",
+            }:
+                raise RuntimeError("live planning idempotency record is invalid")
+            partition = item["partition"]
+            job_id = item["job_id"]
+            request_digest = item["request_digest"]
+            if (
+                not isinstance(partition, str)
+                or re.fullmatch(r"[0-9a-f]{64}", partition) is None
+                or partition in self._idempotency
+                or not isinstance(job_id, str)
+                or not isinstance(request_digest, str)
+                or not self._valid_request_digest(request_digest)
+            ):
+                raise RuntimeError("live planning idempotency identity is invalid")
+            runtime = self._records.get(job_id)
+            if (
+                runtime is None
+                or runtime.snapshot.request_sha256 != request_digest
+            ):
+                raise RuntimeError("live planning idempotency binding is invalid")
+            self._idempotency[partition] = _IdempotencyEntry(
+                job_id=job_id,
+                request_digest=request_digest,
+            )
+        for runtime in self._records.values():
+            if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                runtime.prepared = False
+                self._terminalize_locked(
+                    runtime,
+                    LivePlanningJobState.CANCELLED,
+                    stage="restart_cancelled",
+                    error="live planning job cannot continue after process restart",
+                    cancellation_requested=True,
+                )
+        self._prune_locked(self._utc_now())
+        self._persist_locked()
+
+    @staticmethod
+    def _validate_state_parent(parent: Path) -> None:
+        try:
+            info = parent.lstat()
+        except OSError as exc:
+            raise RuntimeError("live planning job registry parent is unavailable") from exc
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise RuntimeError("live planning job registry parent is not owner-only")
+
+    @staticmethod
+    def _validate_state_file(path: Path) -> None:
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise RuntimeError("live planning job registry state is unavailable") from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            raise RuntimeError("live planning job registry state is not an owner-only file")
+
+    def _persist_locked(self) -> None:
+        path = self._state_path
+        if path is None:
+            return
+        self._validate_state_parent(path.parent)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise RuntimeError("live planning job registry state is unavailable") from exc
+        else:
+            self._validate_state_file(path)
+        payload = {
+            "schema_version": "tripchord-live-job-registry-v1",
+            "records": [
+                {
+                    "tenant_partition": runtime.tenant_partition,
+                    "snapshot": runtime.snapshot.model_dump(mode="json"),
+                    "prepared": runtime.prepared,
+                }
+                for runtime in sorted(
+                    self._records.values(), key=lambda item: item.snapshot.id
+                )
+            ],
+            "idempotency": [
+                {
+                    "partition": partition,
+                    "job_id": entry.job_id,
+                    "request_digest": entry.request_digest,
+                }
+                for partition, entry in sorted(self._idempotency.items())
+            ],
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        temporary = path.parent / f".{path.name}.{uuid4().hex}.tmp"
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb", closefd=True) as target:
+                descriptor = -1
+                target.write(encoded)
+                target.flush()
+                os.fsync(target.fileno())
+            self._validate_state_file(temporary)
+            os.replace(temporary, path)
+            self._validate_state_file(path)
+            parent_descriptor = os.open(
+                path.parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(parent_descriptor)
+            finally:
+                os.close(parent_descriptor)
+        except OSError as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            with suppress(OSError):
+                temporary.unlink()
+            raise RuntimeError("live planning job registry state write failed") from exc
 
     async def start(
         self,
@@ -797,6 +1019,11 @@ class LivePlanningJobRegistry:
                     job_id=job_id,
                     request_digest=request_digest,
                 )
+            try:
+                self._persist_locked()
+            except Exception:
+                self._remove_locked(job_id)
+                raise
             if not defer_start:
                 runtime.task = asyncio.create_task(
                     self._run(runtime, operation),
@@ -822,6 +1049,8 @@ class LivePlanningJobRegistry:
             runtime = self._owned_locked(job_id, tenant_id)
             if runtime is None:
                 return None
+            if not runtime.prepared and runtime.task is not None:
+                return runtime.snapshot
             if not runtime.prepared or runtime.task is not None:
                 raise LivePlanningJobInactiveError(
                     "live planning job is not an unactivated prepared job"
@@ -831,6 +1060,11 @@ class LivePlanningJobRegistry:
                     "prepared live planning job is no longer queued"
                 )
             runtime.prepared = False
+            try:
+                self._persist_locked()
+            except Exception:
+                runtime.prepared = True
+                raise
             runtime.task = asyncio.create_task(
                 self._run(runtime, runtime.operation),
                 name=f"tripchord:{job_id}",
@@ -878,12 +1112,20 @@ class LivePlanningJobRegistry:
                 return None
             if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
                 return runtime.snapshot
+            previous_snapshot = runtime.snapshot
+            previous_generation = runtime.generation
             self._terminalize_locked(
                 runtime,
                 LivePlanningJobState.CANCELLED,
                 stage="cancelled",
                 cancellation_requested=True,
             )
+            try:
+                self._persist_locked()
+            except Exception:
+                runtime.snapshot = previous_snapshot
+                runtime.generation = previous_generation
+                raise
             task = runtime.task
             operation_task = runtime.operation_task
             self._changed.notify_all()
@@ -949,6 +1191,7 @@ class LivePlanningJobRegistry:
                     stage="cancelled",
                     cancellation_requested=True,
                 )
+            self._persist_locked()
             self._changed.notify_all()
         for operation_task in operation_tasks:
             if not operation_task.done():
@@ -1237,6 +1480,7 @@ class LivePlanningJobRegistry:
                 safe_failure=safe_failure,
                 cancellation_requested=cancellation_requested,
             )
+            self._persist_locked()
             self._changed.notify_all()
 
     async def _ensure_active(self, runtime: _RuntimeJob, generation: int) -> None:
@@ -1326,6 +1570,8 @@ class LivePlanningJobRegistry:
         )
         for job_id in expired:
             self._remove_locked(job_id)
+        if expired:
+            self._persist_locked()
 
     def _remove_locked(self, job_id: str) -> None:
         self._records.pop(job_id, None)

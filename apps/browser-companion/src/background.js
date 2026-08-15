@@ -11472,6 +11472,7 @@ async function heartbeatOnce(formalActivationAck = null) {
     authorized_scope_keys: authorized,
     adapter_version: "0.2.0",
     contract_version: "tripchord-capability-v1",
+    build_identity: currentBuildIdentity(),
     runtime_instance_id: RUNTIME_INSTANCE_ID,
   };
   const requestBody = formalActivationAck === null
@@ -11500,7 +11501,15 @@ async function heartbeatOnce(formalActivationAck = null) {
     pending.execution_capability === null ||
     Array.isArray(pending.execution_capability) ||
     pending.execution_capability.terminal_job_id !== pending.job_id ||
-    pending.execution_capability.challenge_id !== pending.challenge_id
+    pending.execution_capability.challenge_id !== pending.challenge_id ||
+    typeof pending.companion_binding !== "object" ||
+    pending.companion_binding === null ||
+    Array.isArray(pending.companion_binding) ||
+    pending.companion_binding.companion_id !== body.companion_id ||
+    pending.companion_binding.runtime_instance_id !== body.runtime_instance_id ||
+    JSON.stringify(pending.companion_binding.build_identity) !==
+      JSON.stringify(body.build_identity) ||
+    !/^[0-9a-f]{64}$/.test(String(pending.companion_binding.identity_sha256 || ""))
   ) {
     throw new Error("formal activation request has an invalid signed identity");
   }

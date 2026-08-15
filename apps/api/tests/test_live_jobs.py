@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -1023,4 +1024,120 @@ async def test_barrier_release_is_idempotent_and_terminal_events_are_unique() ->
     assert done.barrier_released_at == released_at
     assert len(done.source_terminal_events) == 1
     assert done.source_terminal_events[0].terminal_state == "timed_out"
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_registry_cold_restart_terminalizes_prepared_attempt(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "live-jobs.json"
+    started = False
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal started
+        started = True
+        return {"ok": True}
+
+    first_registry = LivePlanningJobRegistry(state_path=state_path)
+    prepared, replayed = await first_registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="cold-restart-prepared",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    assert replayed is False
+    assert state_path.stat().st_mode & 0o777 == 0o600
+    assert started is False
+
+    # Constructing a new production registry is the cold-start boundary.  No
+    # operation closure is reused; the old attempt becomes a durable tombstone.
+    restarted = LivePlanningJobRegistry(state_path=state_path)
+    recovered = await restarted.get(prepared.id, "tenant-a")
+    assert recovered is not None
+    assert recovered.state == LivePlanningJobState.CANCELLED
+    assert recovered.stage == "restart_cancelled"
+    assert recovered.cancellation_requested is True
+    same, same_replayed = await restarted.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="cold-restart-prepared",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    assert same_replayed is True
+    assert same == recovered
+    fresh, fresh_replayed = await restarted.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="cold-restart-fresh",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    assert fresh_replayed is False
+    assert fresh.id != prepared.id
+    await restarted.cancel(fresh.id, "tenant-a")
+    await restarted.close()
+
+
+def test_persistent_registry_rejects_symlink_state(tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text("{}", encoding="utf-8")
+    target.chmod(0o600)
+    state_path = tmp_path / "live-jobs.json"
+    state_path.symlink_to(target)
+    with pytest.raises(RuntimeError, match="owner-only file"):
+        LivePlanningJobRegistry(state_path=state_path)
+
+
+@pytest.mark.asyncio
+async def test_persistent_registry_write_failure_rolls_back_without_starting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "live-jobs.json"
+    registry = LivePlanningJobRegistry(state_path=state_path)
+    started = False
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal started
+        started = True
+        return {"ok": True}
+
+    def fail_write() -> None:
+        raise RuntimeError("injected registry write failure")
+
+    monkeypatch.setattr(registry, "_persist_locked", fail_write)
+    with pytest.raises(RuntimeError, match="injected registry write failure"):
+        await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="failed-prepare",
+            request_digest=REQUEST_SHA256,
+            defer_start=True,
+        )
+    assert registry._records == {}
+    assert registry._idempotency == {}
+    assert started is False
+
+    monkeypatch.undo()
+    prepared, _ = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="failed-activate",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    monkeypatch.setattr(registry, "_persist_locked", fail_write)
+    with pytest.raises(RuntimeError, match="injected registry write failure"):
+        await registry.activate(prepared.id, "tenant-a")
+    assert await registry.is_prepared(
+        prepared.id,
+        "tenant-a",
+        request_sha256=REQUEST_SHA256,
+    )
+    assert started is False
+    monkeypatch.undo()
+    await registry.cancel(prepared.id, "tenant-a")
     await registry.close()

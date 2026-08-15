@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import os
@@ -58,6 +59,39 @@ def _runtime_payload(*, model_trace_count: int = 7) -> dict[str, Any]:
         "rag_enabled": True,
         "runtime_provenance": _runtime_provenance_payload(),
         "formal_live_source": {"fixture_anchor_available": True},
+    }
+
+
+def _companion_preflight_payload() -> dict[str, Any]:
+    return {
+        "status": "connected",
+        "server_time": "2026-08-15T00:00:00+00:00",
+        "stale_after_seconds": 45,
+        "companions": [
+            {
+                "companion_id": "formal-companion-v1",
+                "providers": ["ctrip", "qunar", "tongcheng"],
+                "authorized_scope_keys": [
+                    "ctrip:flight",
+                    "ctrip:lodging",
+                    "qunar:flight",
+                    "qunar:lodging",
+                    "tongcheng:flight",
+                ],
+                "adapter_version": "0.2.0",
+                "contract_version": "tripchord-capability-v1",
+                "runtime_instance_id": "formal-companion-runtime-v1",
+                "build_identity": {
+                    "protocol_version": "tripchord-companion-control-v1",
+                    "manifest_version": "formal-companion-build-v1",
+                    "build_sha256": "8" * 64,
+                    "content_runtime_version": "formal-companion-runtime-v1",
+                },
+                "last_seen": "2026-08-15T00:00:00+00:00",
+                "age_seconds": 0.0,
+                "is_fresh": True,
+            }
+        ],
     }
 
 
@@ -1160,6 +1194,280 @@ async def test_formal_control_retries_share_one_bounded_budget(
     assert delays == [0.1, 0.2]
 
 
+@pytest.mark.asyncio
+async def test_formal_control_transport_backoff_is_charged_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """e42a7e60: request activity and real backoff are each charged once."""
+
+    clock = [0.0]
+    calls = [0]
+    observed_timeouts: list[float] = []
+    observed_delays: list[float] = []
+
+    class FlakyClient:
+        async def post(self, url: str, **kwargs: object) -> httpx.Response:
+            del url, kwargs
+            calls[0] += 1
+            clock[0] += 0.4 if calls[0] == 1 else 0.3
+            if calls[0] == 1:
+                raise httpx.ReadError("committed response was lost")
+            return httpx.Response(200, json={"ok": True})
+
+    async def advancing_wait_for(awaitable: object, timeout: float) -> object:
+        observed_timeouts.append(timeout)
+        return await awaitable  # type: ignore[misc]
+
+    async def advancing_sleep(seconds: float) -> None:
+        observed_delays.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(run_live_done_gate_v4.asyncio, "wait_for", advancing_wait_for)
+    monkeypatch.setattr(run_live_done_gate_v4.asyncio, "sleep", advancing_sleep)
+    budget = run_live_done_gate_v4._FormalControlRetryBudget(
+        total_attempts=2,
+        wall_seconds=5.0,
+        now=lambda: clock[0],
+    )
+
+    response = await run_live_done_gate_v4._post_formal_control_with_retry(
+        FlakyClient(),  # type: ignore[arg-type]
+        "http://tripchord.test/challenge",
+        payload={"phase": "challenge"},
+        headers={"Idempotency-Key": "linear-budget-v1"},
+        budget=budget,
+    )
+
+    assert response.json() == {"ok": True}
+    assert observed_timeouts == pytest.approx([5.0, 4.5])
+    assert observed_delays == pytest.approx([0.1])
+    assert budget.remaining_seconds == pytest.approx(4.2)
+
+
+@pytest.mark.asyncio
+async def test_formal_control_transport_failures_exhaust_linearly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """e42a7e60: repeated transport failures stop at the exact remaining budget."""
+
+    clock = [0.0]
+    calls = [0]
+    observed_timeouts: list[float] = []
+    observed_delays: list[float] = []
+
+    class FailedClient:
+        async def post(self, url: str, **kwargs: object) -> httpx.Response:
+            del url, kwargs
+            calls[0] += 1
+            clock[0] += 0.2
+            raise httpx.ReadError("response lost")
+
+    async def advancing_wait_for(awaitable: object, timeout: float) -> object:
+        observed_timeouts.append(timeout)
+        return await awaitable  # type: ignore[misc]
+
+    async def advancing_sleep(seconds: float) -> None:
+        observed_delays.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(run_live_done_gate_v4.asyncio, "wait_for", advancing_wait_for)
+    monkeypatch.setattr(run_live_done_gate_v4.asyncio, "sleep", advancing_sleep)
+    budget = run_live_done_gate_v4._FormalControlRetryBudget(
+        total_attempts=5,
+        wall_seconds=0.65,
+        now=lambda: clock[0],
+    )
+
+    with pytest.raises(RuntimeError, match="formal control retry budget was exhausted"):
+        await run_live_done_gate_v4._post_formal_control_with_retry(
+            FailedClient(),  # type: ignore[arg-type]
+            "http://tripchord.test/finalize",
+            payload={"phase": "finalize"},
+            headers={"Idempotency-Key": "linear-exhaustion-v1"},
+            budget=budget,
+        )
+
+    assert calls[0] == 2
+    assert observed_timeouts == pytest.approx([0.65, 0.35])
+    assert observed_delays == pytest.approx([0.1, 0.15])
+    assert budget._remaining_seconds == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_formal_control_budget_excludes_business_execution_time() -> None:
+    """3d7dd448: idle business work cannot expire the control-plane budget."""
+
+    clock = [0.0]
+
+    class StableClient:
+        async def post(self, url: str, **kwargs: object) -> httpx.Response:
+            del url, kwargs
+            return httpx.Response(200, json={"ok": True})
+
+    budget = run_live_done_gate_v4._FormalControlRetryBudget(
+        total_attempts=2,
+        wall_seconds=30,
+        now=lambda: clock[0],
+    )
+    first = await run_live_done_gate_v4._post_formal_control_with_retry(
+        StableClient(),  # type: ignore[arg-type]
+        "http://tripchord.test/challenge",
+        payload={"phase": "challenge"},
+        headers={"Idempotency-Key": "challenge-key"},
+        budget=budget,
+    )
+    clock[0] = 45.0
+    final = await run_live_done_gate_v4._post_formal_control_with_retry(
+        StableClient(),  # type: ignore[arg-type]
+        "http://tripchord.test/finalize",
+        payload={"phase": "finalize"},
+        headers={"Idempotency-Key": "finalize-key"},
+        budget=budget,
+    )
+
+    assert first.json() == final.json() == {"ok": True}
+    assert budget.remaining_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_formal_control_budget_hard_times_out_one_hung_post() -> None:
+    """3d7dd448: each control request is bounded by the remaining active budget."""
+
+    class HungClient:
+        async def post(self, url: str, **kwargs: object) -> httpx.Response:
+            del url, kwargs
+            await asyncio.sleep(60)
+            raise AssertionError("hung post unexpectedly returned")
+
+    budget = run_live_done_gate_v4._FormalControlRetryBudget(
+        total_attempts=1,
+        wall_seconds=0.02,
+    )
+    with pytest.raises(RuntimeError, match="formal control retry budget was exhausted"):
+        await asyncio.wait_for(
+            run_live_done_gate_v4._post_formal_control_with_retry(
+                HungClient(),  # type: ignore[arg-type]
+                "http://tripchord.test/finalize",
+                payload={"phase": "finalize"},
+                headers={"Idempotency-Key": "hung-finalize-key"},
+                budget=budget,
+            ),
+            timeout=0.2,
+        )
+
+
+def test_formal_control_context_budget_isolated_and_reset() -> None:
+    """3d7dd448: one run's ContextVar budget cannot leak into the next run."""
+
+    first = run_live_done_gate_v4._FormalControlRetryBudget(
+        total_attempts=1,
+        wall_seconds=1,
+    )
+    second = run_live_done_gate_v4._FormalControlRetryBudget(
+        total_attempts=2,
+        wall_seconds=1,
+    )
+    with run_live_done_gate_v4._formal_control_retry_scope(first):
+        assert run_live_done_gate_v4._formal_control_retry_budget(None) is first
+    assert run_live_done_gate_v4._FORMAL_CONTROL_RETRY_BUDGET.get() is None
+    with run_live_done_gate_v4._formal_control_retry_scope(second):
+        assert run_live_done_gate_v4._formal_control_retry_budget(None) is second
+    assert run_live_done_gate_v4._FORMAL_CONTROL_RETRY_BUDGET.get() is None
+
+
+def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
+    companion = {
+        "companion_id": "formal-companion-v1",
+        "providers": ["ctrip", "qunar", "tongcheng"],
+        "authorized_scope_keys": [
+            "ctrip:flight",
+            "ctrip:lodging",
+            "qunar:flight",
+            "qunar:lodging",
+            "tongcheng:flight",
+        ],
+        "adapter_version": "0.2.0",
+        "contract_version": "tripchord-capability-v1",
+        "runtime_instance_id": "formal-companion-runtime-v1",
+        "build_identity": {
+            "protocol_version": "tripchord-companion-control-v1",
+            "manifest_version": "formal-companion-build-v1",
+            "build_sha256": "8" * 64,
+            "content_runtime_version": "formal-companion-runtime-v1",
+        },
+        "last_seen": "2026-08-15T00:00:00+00:00",
+        "age_seconds": 0.0,
+        "is_fresh": True,
+    }
+    preflight = {
+        "server_time": "2026-08-15T00:00:00+00:00",
+        "stale_after_seconds": 45,
+        "companions": [companion],
+    }
+    binding = run_live_done_gate_v4._formal_companion_binding_from_preflight(preflight)
+    assert binding["companion_id"] == companion["companion_id"]
+    assert binding["runtime_instance_id"] == companion["runtime_instance_id"]
+    assert binding["build_identity"] == companion["build_identity"]
+    assert binding["identity_sha256"] == run_live_done_gate_v4._canonical_sha256(
+        {key: value for key, value in binding.items() if key != "identity_sha256"}
+    )
+    with pytest.raises(RuntimeError, match="exactly one"):
+        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+            {**preflight, "companions": [companion, copy.deepcopy(companion)]}
+        )
+    with pytest.raises(RuntimeError, match="exactly one"):
+        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+            {**preflight, "companions": [{**companion, "is_fresh": False}]}
+        )
+
+    fresh_foreign = {
+        **copy.deepcopy(companion),
+        "companion_id": "fresh-foreign-companion-v1",
+        "runtime_instance_id": "fresh-foreign-runtime-v1",
+        "build_identity": {
+            **companion["build_identity"],
+            "build_sha256": "7" * 64,
+        },
+    }
+    stale_selected = {**companion, "is_fresh": False, "age_seconds": 46.0}
+    with pytest.raises(RuntimeError, match="exactly one"):
+        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+            {**preflight, "companions": [stale_selected, fresh_foreign]}
+        )
+
+    incomplete_selected = {
+        **companion,
+        "authorized_scope_keys": companion["authorized_scope_keys"][:-1],
+    }
+    with pytest.raises(RuntimeError, match="exactly one"):
+        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+            {**preflight, "companions": [incomplete_selected, fresh_foreign]}
+        )
+
+    impersonating = {
+        **copy.deepcopy(companion),
+        "companion_id": "impersonating-companion-v1",
+    }
+    with pytest.raises(RuntimeError, match="exactly one"):
+        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+            {**preflight, "companions": [companion, impersonating]}
+        )
+
+    with pytest.raises(RuntimeError, match="freshness"):
+        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+            {
+                **preflight,
+                "companions": [
+                    {
+                        **companion,
+                        "last_seen": "2026-08-14T23:59:59+00:00",
+                        "age_seconds": 0.0,
+                    }
+                ],
+            }
+        )
+
+
 def test_v4_completed_bundle_rejects_context_without_formal_receipt() -> None:
     captured_at = datetime(2026, 8, 4, 9, 0, tzinfo=UTC)
     context = {
@@ -1559,7 +1867,7 @@ async def test_v4_run_without_recommendation_emits_gate_failure_and_skips_event(
         *_: object,
         **__: object,
     ) -> dict[str, Any]:
-        return {"status": "connected", "companions": [{"is_fresh": True}]}
+        return _companion_preflight_payload()
 
     failed_run = SimpleNamespace(
         recommended_option_ids=(),
@@ -1766,7 +2074,7 @@ async def test_v4_required_model_gate_rejects_silent_deterministic_fallback(
         *_: object,
         **__: object,
     ) -> dict[str, Any]:
-        return {"status": "connected", "companions": [{"is_fresh": True}]}
+        return _companion_preflight_payload()
 
     monkeypatch.setattr(
         run_live_done_gate_v4.httpx,
@@ -1874,7 +2182,7 @@ async def test_v4_job_bound_trace_receipt_ignores_non_positive_global_delta(
             )
 
     async def companion_preflight(*_: object, **__: object) -> dict[str, Any]:
-        return {"status": "connected", "companions": [{"is_fresh": True}]}
+        return _companion_preflight_payload()
 
     flexible_run = SimpleNamespace(
         recommended_option_ids=(),

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -770,8 +771,10 @@ def _strict_fixture_formal_source_binding(
         "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
         "adapter_version": "fixture-adapter",
         "contract_version": "tripchord-browser-companion-v1",
+        "build_identity": build_identity,
         "runtime_instance_id": "fixture-runtime-instance-0001",
     }
+    companion_identity_sha256 = digest(companion)
     add_event(
         "browser_heartbeat",
         "POST",
@@ -784,8 +787,8 @@ def _strict_fixture_formal_source_binding(
                 "last_seen": (base_time + timedelta(seconds=1)).isoformat(),
                 "age_seconds": 0.0,
                 "is_fresh": True,
-                "build_identity": build_identity,
             },
+            "companion_identity_sha256": companion_identity_sha256,
         },
     )
 
@@ -14148,6 +14151,7 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
                     "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
                     "adapter_version": "c4-formal-http-transport",
                     "contract_version": "tripchord-browser-companion-v1",
+                    "build_identity": companion_build_identity,
                     "runtime_instance_id": companion_runtime_id,
                 }
                 heartbeat = await companion_client.post(
@@ -14279,6 +14283,7 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
                     ),
                     "adapter_version": "c4-formal-http-transport",
                     "contract_version": "tripchord-browser-companion-v1",
+                    "build_identity": companion_build_identity,
                     "runtime_instance_id": companion_runtime_id,
                 },
             )
@@ -15156,6 +15161,39 @@ def _fresh_installed_formal_authority(
     return authority, context
 
 
+def _formal_companion_binding(
+    *,
+    companion_id: str = "formal-heartbeat-companion",
+    runtime_instance_id: str = "formal-heartbeat-runtime-v1",
+    manifest_version: str = "formal-heartbeat-build-v1",
+    build_sha256: str = "9" * 64,
+    adapter_version: str = "formal-heartbeat-test-v1",
+) -> dict[str, object]:
+    identity: dict[str, object] = {
+        "companion_id": companion_id,
+        "providers": ["ctrip", "qunar", "tongcheng"],
+        "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
+        "adapter_version": adapter_version,
+        "contract_version": "tripchord-browser-companion-v1",
+        "runtime_instance_id": runtime_instance_id,
+        "build_identity": {
+            "protocol_version": "tripchord-companion-control-v1",
+            "manifest_version": manifest_version,
+            "build_sha256": build_sha256,
+            "content_runtime_version": runtime_instance_id,
+        },
+    }
+    identity["identity_sha256"] = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return identity
+
+
 def test_formal_challenge_single_active_is_atomic_across_restart(tmp_path: Path) -> None:
     authority, context = _fresh_installed_formal_authority(tmp_path)
     issued = authority.issue_challenge(context)
@@ -15195,7 +15233,44 @@ def test_formal_issue_retry_returns_same_signed_capability_and_challenge(
     assert isinstance(capability, dict)
     assert capability["challenge_id"] == first["challenge"]["challenge_id"]
     assert capability["terminal_job_id"] == context["job_graph"]["terminal_job_id"]
-    activation = {"job": {"id": capability["terminal_job_id"], "state": "running"}}
+    binding = _formal_companion_binding(companion_id="real-heartbeat-companion")
+    authority.begin_activation(
+        job_id=capability["terminal_job_id"],
+        capability=capability,
+        idempotency_key="formal-activate-retry-1",
+        companion_binding=binding,
+    )
+    request_details = {
+        key: value for key, value in binding.items() if key != "identity_sha256"
+    }
+    authority.record_activation_heartbeat(
+        acknowledgment={
+            "job_id": capability["terminal_job_id"],
+            "challenge_id": capability["challenge_id"],
+            "execution_capability": capability,
+            "companion_binding": binding,
+        },
+        request_details=request_details,
+        heartbeat={
+            **request_details,
+            "last_seen": NOW.isoformat(),
+            "age_seconds": 0.0,
+            "is_fresh": True,
+        },
+    )
+    activation = {"job": {"id": capability["terminal_job_id"], "state": "queued"}}
+    authority.prepare_activation_result(
+        job_id=capability["terminal_job_id"],
+        capability=capability,
+        idempotency_key="formal-activate-retry-1",
+        result=activation,
+    )
+    authority.mark_activation_started(
+        job_id=capability["terminal_job_id"],
+        capability=capability,
+        idempotency_key="formal-activate-retry-1",
+        result=activation,
+    )
     assert authority.store_activation_result(
         job_id=capability["terminal_job_id"],
         capability=capability,
@@ -15215,17 +15290,39 @@ def test_formal_issue_retry_returns_same_signed_capability_and_challenge(
         job_id=capability["terminal_job_id"],
         capability=capability,
         idempotency_key="formal-activate-retry-1",
+        companion_binding=binding,
     ) == activation
     with pytest.raises(ValueError, match="different request"):
         restarted.activation_replay(
             job_id=capability["terminal_job_id"],
             capability=capability,
             idempotency_key="foreign-activate-retry",
+            companion_binding=binding,
         )
     with pytest.raises(ValueError, match="different request"):
         restarted.issue_challenge(
             {**context, "scenario_sha256": "4" * 64},
             idempotency_key="formal-issue-retry-1",
+        )
+
+
+def test_formal_activation_result_rejects_orphan_without_begin_and_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """3d7dd448: a result cannot create an unbound activation ledger record."""
+
+    authority, context = _fresh_installed_formal_authority(tmp_path)
+    issued = authority.issue_challenge(
+        context,
+        idempotency_key="orphan-activation-issue-v1",
+    )
+    capability = issued["execution_capability"]
+    with pytest.raises(ValueError, match=r"begin|heartbeat"):
+        authority.store_activation_result(
+            job_id=capability["terminal_job_id"],
+            capability=capability,
+            idempotency_key="orphan-activation-result-v1",
+            result={"job": {"id": capability["terminal_job_id"], "state": "queued"}},
         )
 
 
@@ -15249,10 +15346,12 @@ async def test_formal_activation_heartbeat_requires_real_companion_ack_path(
     )
     capability = issued["execution_capability"]
     job_id = capability["terminal_job_id"]
+    binding = _formal_companion_binding(companion_id="real-heartbeat-companion")
     authority.begin_activation(
         job_id=job_id,
         capability=capability,
         idempotency_key="real-heartbeat-activate-v1",
+        companion_binding=binding,
     )
     bridge = BrowserTaskBridge(source_authority=authority, now=lambda: NOW)
     app = create_browser_bridge_app(
@@ -15267,6 +15366,7 @@ async def test_formal_activation_heartbeat_requires_real_companion_ack_path(
         "adapter_version": "formal-heartbeat-test-v1",
         "contract_version": "tripchord-browser-companion-v1",
         "runtime_instance_id": "formal-heartbeat-runtime-v1",
+        "build_identity": binding["build_identity"],
     }
     headers = {
         BRIDGE_TOKEN_HEADER: "real-heartbeat-bridge-token-000000000000"
@@ -15281,12 +15381,7 @@ async def test_formal_activation_heartbeat_requires_real_companion_ack_path(
             json={
                 **common,
                 "limit": 1,
-                "build_identity": {
-                    "protocol_version": "tripchord-companion-control-v1",
-                    "manifest_version": "formal-heartbeat-build-v1",
-                    "build_sha256": "9" * 64,
-                    "content_runtime_version": "formal-heartbeat-runtime-v1",
-                },
+                "build_identity": binding["build_identity"],
             },
         )
         assert prime.status_code == 200
@@ -15304,6 +15399,7 @@ async def test_formal_activation_heartbeat_requires_real_companion_ack_path(
             "job_id": job_id,
             "challenge_id": capability["challenge_id"],
             "execution_capability": capability,
+            "companion_binding": binding,
         }
         assert authority.snapshot()["event_count"] == 0
 
@@ -15329,6 +15425,35 @@ async def test_formal_activation_heartbeat_requires_real_companion_ack_path(
         assert foreign.status_code == 409
         assert authority.snapshot()["event_count"] == 0
 
+        stale_build = dict(common["build_identity"])
+        stale_build["build_sha256"] = "7" * 64
+        stale = await client.post(
+            "/v1/companions/heartbeat",
+            headers=headers,
+            json={
+                **common,
+                "build_identity": stale_build,
+                "formal_activation_ack": pending,
+            },
+        )
+        assert stale.status_code == 409
+        status_snapshot = await bridge.companion_status()
+        assert status_snapshot.companions[0].build_identity is not None
+        assert status_snapshot.companions[0].build_identity.model_dump(
+            mode="json"
+        ) == common["build_identity"]
+        assert authority.snapshot()["event_count"] == 0
+
+        replaced_digest = copy.deepcopy(pending)
+        replaced_digest["companion_binding"]["identity_sha256"] = "6" * 64
+        digest_swap = await client.post(
+            "/v1/companions/heartbeat",
+            headers=headers,
+            json={**common, "formal_activation_ack": replaced_digest},
+        )
+        assert digest_swap.status_code == 409
+        assert authority.snapshot()["event_count"] == 0
+
         accepted = await client.post(
             "/v1/companions/heartbeat",
             headers=headers,
@@ -15339,6 +15464,82 @@ async def test_formal_activation_heartbeat_requires_real_companion_ack_path(
     snapshot = authority.snapshot()
     assert snapshot["event_count"] == 1
     assert snapshot["events"][0]["kind"] == "browser_heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_formal_activation_heartbeat_binds_exact_preflight_companion(
+    tmp_path: Path,
+) -> None:
+    """3d7dd448: only the selected Companion identity may acknowledge activation."""
+
+    import httpx
+    from tripchord.providers.browser_bridge import (
+        BRIDGE_TOKEN_HEADER,
+        BrowserTaskBridge,
+        create_browser_bridge_app,
+    )
+
+    authority, context = _fresh_installed_formal_authority(tmp_path)
+    issued = authority.issue_challenge(
+        context,
+        idempotency_key="bound-heartbeat-issue-v1",
+    )
+    capability = issued["execution_capability"]
+    job_id = capability["terminal_job_id"]
+    binding = _formal_companion_binding()
+    authority.begin_activation(
+        job_id=job_id,
+        capability=capability,
+        idempotency_key="bound-heartbeat-activate-v1",
+        companion_binding=binding,
+    )
+    bridge = BrowserTaskBridge(source_authority=authority, now=lambda: NOW)
+    app = create_browser_bridge_app(
+        bridge,
+        bridge_token="bound-heartbeat-bridge-token-0000000000",
+        source_authority=authority,
+    )
+    common = {key: value for key, value in binding.items() if key != "identity_sha256"}
+    headers = {
+        BRIDGE_TOKEN_HEADER: "bound-heartbeat-bridge-token-0000000000"
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, client=("127.0.0.1", 51343)),
+        base_url="http://tripchord.test",
+    ) as client:
+        ordinary = await client.post(
+            "/v1/companions/heartbeat",
+            headers=headers,
+            json=common,
+        )
+        assert ordinary.status_code == 200
+        pending = ordinary.json()["formal_activation_request"]
+        assert pending["companion_binding"] == binding
+        assert authority.snapshot()["event_count"] == 0
+
+        foreign = await client.post(
+            "/v1/companions/heartbeat",
+            headers=headers,
+            json={
+                **common,
+                "runtime_instance_id": "foreign-runtime",
+                "formal_activation_ack": pending,
+            },
+        )
+        assert foreign.status_code == 409
+        assert authority.snapshot()["event_count"] == 0
+
+        accepted = await client.post(
+            "/v1/companions/heartbeat",
+            headers=headers,
+            json={**common, "formal_activation_ack": pending},
+        )
+        assert accepted.status_code == 200, accepted.text
+    snapshot = authority.snapshot()
+    assert snapshot["event_count"] == 1
+    assert snapshot["events"][0]["details"]["companion_identity_sha256"] == binding[
+        "identity_sha256"
+    ]
 
 
 def test_formal_activation_two_phase_state_is_durable_and_idempotent(
@@ -15354,10 +15555,18 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
     )
     capability = issued["execution_capability"]
     job_id = capability["terminal_job_id"]
+    binding = _formal_companion_binding(
+        companion_id="two-phase-companion",
+        runtime_instance_id="two-phase-runtime-v1",
+        manifest_version="two-phase-build-v1",
+        build_sha256="8" * 64,
+        adapter_version="two-phase-adapter-v1",
+    )
     prepared = authority.begin_activation(
         job_id=job_id,
         capability=capability,
         idempotency_key="two-phase-activate-v1",
+        companion_binding=binding,
     )
     assert prepared["phase"] == "awaiting_heartbeat"
 
@@ -15366,12 +15575,14 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
         job_id=job_id,
         capability=capability,
         idempotency_key="two-phase-activate-v1",
+        companion_binding=binding,
     ) == prepared
     with pytest.raises(ValueError, match="different request"):
         restarted.begin_activation(
             job_id=job_id,
             capability=capability,
             idempotency_key="two-phase-activate-foreign",
+            companion_binding=binding,
         )
 
     heartbeat_request = {
@@ -15381,12 +15592,14 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
         "adapter_version": "two-phase-adapter-v1",
         "contract_version": "tripchord-browser-companion-v1",
         "runtime_instance_id": "two-phase-runtime-v1",
+        "build_identity": binding["build_identity"],
     }
     restarted.record_activation_heartbeat(
         acknowledgment={
             "job_id": job_id,
             "challenge_id": capability["challenge_id"],
             "execution_capability": capability,
+            "companion_binding": binding,
         },
         request_details=heartbeat_request,
         heartbeat={
@@ -15394,16 +15607,26 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
             "last_seen": NOW.isoformat(),
             "age_seconds": 0.0,
             "is_fresh": True,
-            "build_identity": {
-                "protocol_version": "tripchord-companion-control-v1",
-                "manifest_version": "two-phase-build-v1",
-                "build_sha256": "8" * 64,
-                "content_runtime_version": "two-phase-runtime-v1",
-            },
+            "build_identity": binding["build_identity"],
         },
     )
 
     original_write = restarted._write_ledger
+    started_result = {
+        "job": {
+            "id": job_id,
+            "state": "queued",
+            "attempt": 1,
+            "queued_at": NOW.isoformat(),
+        },
+        "activation_receipt": {"capability_id": capability["capability_id"]},
+    }
+    restarted.prepare_activation_result(
+        job_id=job_id,
+        capability=capability,
+        idempotency_key="two-phase-activate-v1",
+        result=started_result,
+    )
 
     def fail_write(_ledger: object) -> None:
         raise OSError("injected activation phase write failure")
@@ -15414,7 +15637,7 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
             job_id=job_id,
             capability=capability,
             idempotency_key="two-phase-activate-v1",
-            result={"job": {"id": job_id, "state": "queued"}},
+            result=started_result,
         )
     monkeypatch.setattr(restarted, "_write_ledger", original_write)
     after_failure = restarted.activation_state(
@@ -15422,8 +15645,7 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
         capability=capability,
         idempotency_key="two-phase-activate-v1",
     )
-    assert after_failure["phase"] == "heartbeat_recorded"
-    started_result = {"job": {"id": job_id, "state": "queued"}}
+    assert after_failure["phase"] == "activation_ready"
     restarted.mark_activation_started(
         job_id=job_id,
         capability=capability,
@@ -15444,6 +15666,29 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
         capability=capability,
         idempotency_key="two-phase-activate-v1",
     )["phase"] == "started"
+    mismatched_first_result = copy.deepcopy(started_result)
+    mismatched_first_result["job"]["state"] = "running"
+    with pytest.raises(ValueError, match="queued receipt"):
+        restarted.store_activation_result(
+            job_id=job_id,
+            capability=capability,
+            idempotency_key="two-phase-activate-v1",
+            result=mismatched_first_result,
+        )
+    type_mismatched_first_result = copy.deepcopy(started_result)
+    type_mismatched_first_result["job"]["attempt"] = True
+    with pytest.raises(ValueError, match="queued receipt"):
+        restarted.store_activation_result(
+            job_id=job_id,
+            capability=capability,
+            idempotency_key="two-phase-activate-v1",
+            result=type_mismatched_first_result,
+        )
+    assert restarted.activation_state(
+        job_id=job_id,
+        capability=capability,
+        idempotency_key="two-phase-activate-v1",
+    )["result"] is None
     completed = restarted.store_activation_result(
         job_id=job_id,
         capability=capability,
@@ -15451,12 +15696,37 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
         result=started_result,
     )
     assert completed == started_result
+    with pytest.raises(ValueError, match="queued receipt"):
+        restarted.store_activation_result(
+            job_id=job_id,
+            capability=capability,
+            idempotency_key="two-phase-activate-v1",
+            result={"job": {"id": job_id, "state": "succeeded"}},
+        )
     cold, _ = _fresh_installed_formal_authority(tmp_path)
     assert cold.activation_replay(
         job_id=job_id,
         capability=capability,
         idempotency_key="two-phase-activate-v1",
+        companion_binding=binding,
     ) == started_result
+    foreign_binding = dict(binding)
+    foreign_binding["identity_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match=r"digest|different request"):
+        cold.activation_replay(
+            job_id=job_id,
+            capability=capability,
+            idempotency_key="two-phase-activate-v1",
+            companion_binding=foreign_binding,
+        )
+    good_ledger = cold._read_ledger()
+    corrupted_ledger = copy.deepcopy(good_ledger)
+    corrupted = corrupted_ledger[capability["challenge_id"]]["activation_record"]
+    corrupted["result"]["job"]["attempt"] = True
+    cold._write_ledger(corrupted_ledger)
+    with pytest.raises(RuntimeError, match="activation result differs"):
+        _fresh_installed_formal_authority(tmp_path)
+    cold._write_ledger(good_ledger)
 
 
 def test_formal_query_requires_job_bound_execution_capability(tmp_path: Path) -> None:
@@ -15886,6 +16156,325 @@ def test_formal_challenge_new_runtime_aborts_old_attempt_atomically(
     validate_formal_source_challenge(issued["challenge"])
     with pytest.raises(RuntimeError, match="requires an active signed challenge"):
         restarted.snapshot()
+
+
+def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
+    tmp_path: Path,
+) -> None:
+    """e42a7e60: restart crosses the production HTTP entry and creates a fresh attempt."""
+
+    import httpx
+    from tripchord.formal_live_source import (
+        formal_job_graph_for_frozen_v4,
+        provision_formal_source_trust_root,
+    )
+    from tripchord.planning.stay_plans import system_stay_plan_candidate_set
+
+    from benchmarks import run_live_done_gate_v4 as runner
+
+    trust_root = tmp_path / "trust-root"
+    provision_formal_source_trust_root(trust_root)
+    original_trust_root = os.environ.get("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT")
+    os.environ["TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"] = str(trust_root)
+    control_path = trust_root / "control-token"
+    ledger_path = trust_root / "ledger.json"
+    bridge_token = "os-api-restart-bridge-token-000000000000000"
+    companion_payload = {
+        "companion_id": "os-api-restart-companion",
+        "providers": ["ctrip", "qunar", "tongcheng"],
+        "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
+        "adapter_version": "os-api-restart-http-v1",
+        "contract_version": "tripchord-browser-companion-v1",
+        "build_identity": {
+            "protocol_version": "tripchord-companion-control-v1",
+            "manifest_version": "os-api-restart-build-v1",
+            "build_sha256": "8" * 64,
+            "content_runtime_version": "os-api-restart-runtime-v1",
+        },
+        "runtime_instance_id": "os-api-restart-runtime-instance-0001",
+    }
+    scenario_path = gate.ROOT / "benchmarks/scenarios/live-hgh-mle-aug-2026-v4.json"
+    request = runner._load_request(scenario_path)
+    api_payload = runner._api_payload(request)
+    api_payload_sha256 = runner._canonical_sha256(api_payload)
+    scenario_sha256 = runner._canonical_sha256(request)
+    candidate_set_sha256 = system_stay_plan_candidate_set().candidate_set_sha256
+
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        port = int(reserved.getsockname()[1])
+    base = f"http://127.0.0.1:{port}"
+    server_env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(
+            (str(gate.ROOT / "apps" / "api" / "src"), str(gate.ROOT))
+        ),
+        "TRIPCHORD_DATABASE_URL": f"sqlite+aiosqlite:///{tmp_path / 'api.db'}",
+        "TRIPCHORD_BROWSER_BRIDGE_ENABLED": "true",
+        "TRIPCHORD_BROWSER_BRIDGE_TOKEN": bridge_token,
+        "TRIPCHORD_BROWSER_COMPANION_AUTO_RELOAD_ENABLED": "false",
+        "TRIPCHORD_MODEL_AGENTS_REQUIRED": "false",
+        "TRIPCHORD_ADAPTIVE_AGENT_SCALING_ENABLED": "false",
+        "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT": str(trust_root),
+        "TRIPCHORD_MEMORY_STATE_PATH": str(tmp_path / "memory.json"),
+        "TRIPCHORD_LIVE_RUN_CACHE_STATE_PATH": str(tmp_path / "live-cache.json"),
+        "TRIPCHORD_LOG_LEVEL": "WARNING",
+    }
+    processes: list[subprocess.Popen[bytes]] = []
+
+    def stop_server(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+
+    async def wait_until_ready(process: subprocess.Popen[bytes], log_path: Path) -> None:
+        async with httpx.AsyncClient(timeout=0.5) as client:
+            for _ in range(100):
+                if process.poll() is not None:
+                    pytest.fail(
+                        "production API exited before readiness:\n"
+                        + log_path.read_text(encoding="utf-8", errors="replace")
+                    )
+                try:
+                    response = await client.get(f"{base}/ready")
+                    if response.status_code == 200:
+                        return
+                except httpx.RequestError:
+                    pass
+                await asyncio.sleep(0.05)
+        pytest.fail("production API did not become ready before the bounded deadline")
+
+    async def start_server(sequence: int) -> subprocess.Popen[bytes]:
+        log_path = tmp_path / f"api-{sequence}.log"
+        with log_path.open("wb") as log:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "tripchord.main:app",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--log-level",
+                    "warning",
+                ],
+                cwd=gate.ROOT,
+                env=server_env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+        processes.append(process)
+        await wait_until_ready(process, log_path)
+        return process
+
+    async def prepare_and_issue(
+        client: httpx.AsyncClient,
+        runtime: dict[str, Any],
+        *,
+        run_id: str,
+        attempt_id: str,
+    ) -> tuple[dict[str, Any], dict[str, object], dict[str, object]]:
+        control = runner._new_live_job_control(
+            request,
+            api_payload,
+            client_wait_timeout_seconds=3900.0,
+            attempt_id=attempt_id,
+        )
+        await runner._submit_flexible_live_job(
+            client,
+            base,
+            api_payload,
+            control,
+            control_path,
+        )
+        job_id = str(control["job_id"])
+        context: dict[str, object] = {
+            "run_id": run_id,
+            "tested_commit_sha": runtime["commit_sha"],
+            "runtime_identity": runtime,
+            "request_sha256": api_payload_sha256,
+            "candidate_set_sha256": candidate_set_sha256,
+            "scenario_sha256": scenario_sha256,
+            "job_graph": formal_job_graph_for_frozen_v4(
+                terminal_job_id=job_id,
+                request_sha256=api_payload_sha256,
+                adults=2,
+            ),
+        }
+        issued = await runner._issue_formal_source_challenge_remote(
+            client,
+            base,
+            context,
+            runner._formal_control_idempotency_key(control, "challenge"),
+            control_path,
+        )
+        return control, context, issued
+
+    async def exercise_restart() -> None:
+        first_process = await start_server(1)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            first_runtime_payload = (
+                await client.get(f"{base}/api/v1/agents/runtime")
+            ).json()
+            first_runtime = first_runtime_payload["runtime_provenance"]
+            old_control, _old_context, old_issued = await prepare_and_issue(
+                client,
+                first_runtime,
+                run_id="os-api-restart-old-attempt",
+                attempt_id="1" * 32,
+            )
+        first_process.kill()
+        first_process.wait(timeout=10)
+
+        second_process = await start_server(2)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            second_runtime_payload = (
+                await client.get(f"{base}/api/v1/agents/runtime")
+            ).json()
+            second_runtime = second_runtime_payload["runtime_provenance"]
+            assert second_runtime["pid"] != first_runtime["pid"]
+            assert second_runtime["started_at"] != first_runtime["started_at"]
+
+            heartbeat = await client.post(
+                f"{base}/browser-bridge/v1/companions/heartbeat",
+                headers={"X-TripChord-Bridge-Token": bridge_token},
+                json=companion_payload,
+            )
+            heartbeat.raise_for_status()
+            preflight = await runner._preflight_companion(client, base, bridge_token)
+            companion_binding = runner._formal_companion_binding_from_preflight(preflight)
+
+            old_job_id = str(old_control["job_id"])
+            old_status = await client.get(
+                f"{base}/api/v1/agents/live-flexible-plan-from-text/jobs/{old_job_id}"
+            )
+            assert old_status.status_code == 200
+            assert old_status.json()["state"] == "cancelled"
+            assert old_status.json()["stage"] == "restart_cancelled"
+            old_activation = await client.post(
+                f"{base}/api/v1/internal/formal-live-source/jobs/{old_job_id}/activate",
+                headers={
+                    "X-TripChord-Formal-Source-Control": runner._formal_source_control_token(
+                        control_path
+                    ),
+                    "Idempotency-Key": runner._formal_control_idempotency_key(
+                        old_control, "activate"
+                    ),
+                },
+                json={
+                    "execution_capability": old_issued["execution_capability"],
+                    "companion_binding": companion_binding,
+                },
+            )
+            assert old_activation.status_code == 409
+
+            fresh_control, _fresh_context, fresh_issued = await prepare_and_issue(
+                client,
+                second_runtime,
+                run_id="os-api-restart-fresh-attempt",
+                attempt_id="2" * 32,
+            )
+            fresh_job_id = str(fresh_control["job_id"])
+            assert fresh_job_id != old_job_id
+            activation_key = runner._formal_control_idempotency_key(
+                fresh_control, "activate"
+            )
+            activation_headers = {
+                "X-TripChord-Formal-Source-Control": runner._formal_source_control_token(
+                    control_path
+                ),
+                "Idempotency-Key": activation_key,
+            }
+            activation_payload = {
+                "execution_capability": fresh_issued["execution_capability"],
+                "companion_binding": companion_binding,
+            }
+            activation_task = asyncio.create_task(
+                client.post(
+                    f"{base}/api/v1/internal/formal-live-source/jobs/{fresh_job_id}/activate",
+                    headers=activation_headers,
+                    json=activation_payload,
+                )
+            )
+            for _ in range(100):
+                polled = await client.post(
+                    f"{base}/browser-bridge/v1/companions/heartbeat",
+                    headers={"X-TripChord-Bridge-Token": bridge_token},
+                    json=companion_payload,
+                )
+                polled.raise_for_status()
+                pending = polled.json().get("formal_activation_request")
+                if pending is not None:
+                    acknowledged = await client.post(
+                        f"{base}/browser-bridge/v1/companions/heartbeat",
+                        headers={"X-TripChord-Bridge-Token": bridge_token},
+                        json={
+                            **companion_payload,
+                            "formal_activation_ack": pending,
+                        },
+                    )
+                    acknowledged.raise_for_status()
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("activation never exposed a real Companion heartbeat request")
+
+            activated = await asyncio.wait_for(activation_task, timeout=10)
+            assert activated.status_code == 200, activated.text
+            first_receipt = activated.json()
+            assert first_receipt["job"]["id"] == fresh_job_id
+            assert first_receipt["job"]["state"] == "queued"
+            replay = await client.post(
+                f"{base}/api/v1/internal/formal-live-source/jobs/{fresh_job_id}/activate",
+                headers=activation_headers,
+                json=activation_payload,
+            )
+            assert replay.status_code == 200
+            assert replay.json() == first_receipt
+            mismatch = await client.post(
+                f"{base}/api/v1/internal/formal-live-source/jobs/{fresh_job_id}/activate",
+                headers=activation_headers,
+                json={
+                    **activation_payload,
+                    "companion_binding": {
+                        **companion_binding,
+                        "companion_id": "foreign-companion",
+                    },
+                },
+            )
+            assert mismatch.status_code == 409
+
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            old_row = next(
+                row for row in ledger.values() if row["run_id"] == "os-api-restart-old-attempt"
+            )
+            fresh_row = next(
+                row
+                for row in ledger.values()
+                if row["run_id"] == "os-api-restart-fresh-attempt"
+            )
+            assert old_row["state"] == "aborted"
+            assert old_row["terminal_reason"] == "runtime_restart_requires_new_attempt"
+            assert len(fresh_row["active_state"]["events"]) == 1
+            assert fresh_row["activation_record"]["phase"] == "completed"
+        stop_server(second_process)
+
+    try:
+        asyncio.run(exercise_restart())
+    finally:
+        for process in processes:
+            stop_server(process)
+        if original_trust_root is None:
+            os.environ.pop("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT", None)
+        else:
+            os.environ["TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"] = original_trust_root
 
 
 def test_formal_challenge_write_failure_abort_and_expiry_are_atomic(

@@ -161,6 +161,7 @@ class Settings(BaseSettings):
     )
     live_run_cache_state_path: str | None = ".runtime/live-run-cache.json"
     live_run_cache_corruption_policy: str = "fail_closed"
+    live_planning_job_registry_state_path: str | None = None
 
     @model_validator(mode="after")
     def validate_security(self) -> Settings:

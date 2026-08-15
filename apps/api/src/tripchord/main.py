@@ -51,6 +51,7 @@ from tripchord.agents.live_jobs import (
     LivePlanningJobInactiveError,
     LivePlanningJobRegistry,
     LivePlanningJobSnapshot,
+    LivePlanningJobState,
     LiveSourceTerminalEvent,
 )
 from tripchord.agents.live_monitor import (
@@ -898,7 +899,20 @@ planning_assembler = PlanningProblemAssembler(ReplayPlaceCatalog())
 replan_policy = ReplanPolicySelector.from_package_data()
 live_run_cache = _build_live_run_cache(settings)
 package_requirement_agent = HybridPackageRequirementAgent(model_router=model_router)
-live_planning_job_registry = LivePlanningJobRegistry()
+configured_job_registry_path = settings.live_planning_job_registry_state_path
+if configured_job_registry_path is None and os.environ.get(
+    "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"
+):
+    configured_job_registry_path = str(
+        formal_source_trust_root() / "live-planning-jobs.json"
+    )
+live_planning_job_registry = LivePlanningJobRegistry(
+    state_path=(
+        Path(configured_job_registry_path)
+        if configured_job_registry_path is not None
+        else None
+    )
+)
 
 
 async def _close_lifespan_resources(
@@ -1461,9 +1475,10 @@ async def activate_formal_live_source_job_endpoint(
 ) -> dict[str, Any]:
     authority = _authorize_formal_source_control(request, credential)
     try:
-        if set(payload) != {"execution_capability"}:
+        if set(payload) != {"execution_capability", "companion_binding"}:
             raise ValueError("formal source activation payload is invalid")
         capability = payload["execution_capability"]
+        companion_binding = payload["companion_binding"]
         activation_lock = getattr(
             request.app.state,
             "formal_source_activation_lock",
@@ -1477,6 +1492,7 @@ async def activate_formal_live_source_job_endpoint(
                 job_id=job_id,
                 capability=capability,
                 idempotency_key=idempotency_key,
+                companion_binding=companion_binding,
             )
             if replay is not None:
                 return cast(dict[str, Any], replay)
@@ -1488,6 +1504,7 @@ async def activate_formal_live_source_job_endpoint(
                 job_id=job_id,
                 capability=capability,
                 idempotency_key=idempotency_key,
+                companion_binding=companion_binding,
             )
             deadline = (
                 asyncio.get_running_loop().time()
@@ -1507,16 +1524,26 @@ async def activate_formal_live_source_job_endpoint(
 
             started_result = activation.get("started_result")
             if activation.get("phase") == "heartbeat_recorded":
-                try:
-                    with authority.execution_scope(capability):
-                        snapshot = await registry.activate(job_id, principal.tenant_id)
-                except LivePlanningJobInactiveError:
-                    # The job side effect may have committed immediately before
-                    # the response or activation ledger write was lost.
-                    snapshot = await registry.get(job_id, principal.tenant_id)
+                snapshot = await registry.get(job_id, principal.tenant_id)
                 if snapshot is None:
                     raise ValueError("formal source prepared job is unavailable")
+                if snapshot.state != LivePlanningJobState.QUEUED:
+                    raise ValueError("formal source prepared job is not queued")
                 started_result = {"job": snapshot.model_dump(mode="json")}
+                activation = authority.prepare_activation_result(
+                    job_id=job_id,
+                    capability=capability,
+                    idempotency_key=idempotency_key,
+                    result=started_result,
+                )
+            if activation.get("phase") == "activation_ready":
+                started_result = activation.get("started_result")
+                if not isinstance(started_result, dict):
+                    raise ValueError("formal source queued activation receipt is unavailable")
+                with authority.execution_scope(capability):
+                    snapshot = await registry.activate(job_id, principal.tenant_id)
+                if snapshot is None or snapshot.id != job_id:
+                    raise ValueError("formal source prepared job is unavailable")
                 activation = authority.mark_activation_started(
                     job_id=job_id,
                     capability=capability,

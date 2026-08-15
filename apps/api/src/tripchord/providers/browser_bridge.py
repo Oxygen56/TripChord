@@ -1825,6 +1825,7 @@ class FormalBrowserActivationRequest(DomainModel):
     job_id: str = Field(min_length=1, max_length=200)
     challenge_id: str = Field(min_length=1, max_length=200)
     execution_capability: dict[str, object]
+    companion_binding: dict[str, object]
 
 
 class ClaimBrowserTasksResponse(DomainModel):
@@ -1839,8 +1840,17 @@ class BrowserCompanionHeartbeatRequest(DomainModel):
     authorized_scope_keys: tuple[str, ...] = ()
     adapter_version: str | None = None
     contract_version: str | None = None
+    build_identity: BrowserCompanionBuildIdentity | None = None
     runtime_instance_id: str | None = None
     formal_activation_ack: FormalBrowserActivationRequest | None = None
+
+    @model_validator(mode="after")
+    def validate_runtime_identity(self) -> BrowserCompanionHeartbeatRequest:
+        if (self.build_identity is None) != (self.runtime_instance_id is None):
+            raise ValueError(
+                "build_identity and runtime_instance_id must be supplied together"
+            )
+        return self
 
 
 class BrowserCompanionHeartbeat(DomainModel):
@@ -2415,6 +2425,7 @@ class BrowserTaskBridge:
         authorized_scope_keys: tuple[str, ...] = (),
         adapter_version: str | None = None,
         contract_version: str | None = None,
+        build_identity: BrowserCompanionBuildIdentity | None = None,
         runtime_instance_id: str | None = None,
     ) -> BrowserCompanionHeartbeat:
         requested_providers = tuple(dict.fromkeys(providers))
@@ -2429,6 +2440,7 @@ class BrowserTaskBridge:
                 authorized_scope_keys=authorized_scope_keys,
                 adapter_version=adapter_version,
                 contract_version=contract_version,
+                build_identity=build_identity,
                 runtime_instance_id=runtime_instance_id,
             )
             record = self._companion_heartbeats[companion_id]
@@ -3765,21 +3777,28 @@ def create_browser_bridge_app(
                 raise ValueError(
                     "formal activation heartbeat acknowledgment is not the pending job"
                 )
+            request_details = payload.model_dump(
+                mode="json",
+                exclude={"formal_activation_ack"},
+            )
+            if source_authority is not None and acknowledgment is not None:
+                source_authority.validate_activation_heartbeat_request(
+                    acknowledgment=acknowledgment,
+                    request_details=request_details,
+                )
             heartbeat = await task_bridge.heartbeat(
                 payload.companion_id,
                 providers=payload.providers,
                 authorized_scope_keys=payload.authorized_scope_keys,
                 adapter_version=payload.adapter_version,
                 contract_version=payload.contract_version,
+                build_identity=payload.build_identity,
                 runtime_instance_id=payload.runtime_instance_id,
             )
             if source_authority is not None and acknowledgment is not None:
                 source_authority.record_activation_heartbeat(
                     acknowledgment=acknowledgment,
-                    request_details=payload.model_dump(
-                        mode="json",
-                        exclude={"formal_activation_ack"},
-                    ),
+                    request_details=request_details,
                     heartbeat=heartbeat.model_dump(mode="json"),
                 )
             pending = (

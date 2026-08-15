@@ -12,6 +12,8 @@ import subprocess
 import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -125,35 +127,62 @@ class _FormalControlRetryBudget:
             raise ValueError("formal control retry budget is invalid")
         self.remaining_attempts = total_attempts
         self._now = now
-        self._deadline = now() + wall_seconds
+        self._remaining_seconds = wall_seconds
         self._failure_count = 0
 
     def consume(self) -> None:
-        if self.remaining_attempts <= 0 or self._now() >= self._deadline:
+        if self.remaining_attempts <= 0 or self._remaining_seconds <= 0:
             raise RuntimeError("formal control retry budget was exhausted")
         self.remaining_attempts -= 1
 
-    def retry_delay(self) -> float:
-        remaining = self._deadline - self._now()
-        if self.remaining_attempts <= 0 or remaining <= 0:
+    @property
+    def remaining_seconds(self) -> float:
+        if self._remaining_seconds <= 0:
             raise RuntimeError("formal control retry budget was exhausted")
-        delay = min(0.1 * (2**self._failure_count), 1.0, remaining)
+        return self._remaining_seconds
+
+    def charge_activity(self, started_at: float) -> None:
+        elapsed = max(0.0, self._now() - started_at)
+        self._remaining_seconds = max(0.0, self._remaining_seconds - elapsed)
+
+    def exhaust(self) -> None:
+        self._remaining_seconds = 0.0
+
+    def retry_delay(self) -> float:
+        if self.remaining_attempts <= 0 or self._remaining_seconds <= 0:
+            raise RuntimeError("formal control retry budget was exhausted")
+        delay = min(
+            0.1 * (2**self._failure_count),
+            1.0,
+            self._remaining_seconds,
+        )
         self._failure_count += 1
+        self._remaining_seconds -= delay
         return delay
 
 
+_FORMAL_CONTROL_RETRY_BUDGET: ContextVar[_FormalControlRetryBudget | None] = (
+    ContextVar("tripchord_formal_control_retry_budget", default=None)
+)
+
+
+@contextmanager
+def _formal_control_retry_scope(
+    budget: _FormalControlRetryBudget,
+) -> Any:
+    token = _FORMAL_CONTROL_RETRY_BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _FORMAL_CONTROL_RETRY_BUDGET.reset(token)
+
+
 def _formal_control_retry_budget(
-    client: object,
     explicit: _FormalControlRetryBudget | None,
 ) -> _FormalControlRetryBudget:
-    shared = getattr(client, "_tripchord_formal_control_retry_budget", None)
     return (
         explicit
-        or (
-            shared
-            if isinstance(shared, _FormalControlRetryBudget)
-            else None
-        )
+        or _FORMAL_CONTROL_RETRY_BUDGET.get()
         or _FormalControlRetryBudget(
             total_attempts=_FORMAL_CONTROL_TOTAL_ATTEMPTS,
             wall_seconds=_FORMAL_CONTROL_WALL_SECONDS,
@@ -167,20 +196,36 @@ async def _post_formal_control_with_retry(
     *,
     payload: Mapping[str, object],
     headers: Mapping[str, str],
-    budget: _FormalControlRetryBudget,
+    budget: _FormalControlRetryBudget | None = None,
 ) -> httpx.Response:
     """Retry only transport/temporary failures with byte-stable identity."""
 
+    shared_budget = _formal_control_retry_budget(budget)
     while True:
-        budget.consume()
+        shared_budget.consume()
+        started_at = shared_budget._now()
+        transport_failed = False
         try:
-            response = await client.post(url, json=dict(payload), headers=dict(headers))
+            response = await asyncio.wait_for(
+                client.post(url, json=dict(payload), headers=dict(headers)),
+                timeout=shared_budget.remaining_seconds,
+            )
+        except TimeoutError as exc:
+            shared_budget.exhaust()
+            raise RuntimeError("formal control retry budget was exhausted") from exc
         except httpx.TransportError:
-            await asyncio.sleep(budget.retry_delay())
+            transport_failed = True
+        finally:
+            shared_budget.charge_activity(started_at)
+        if transport_failed:
+            # ``retry_delay`` reserves the exact backoff once.  Keep the sleep
+            # outside the request-activity timing window so a monotonic clock
+            # advancing during sleep cannot charge the same delay twice.
+            await asyncio.sleep(shared_budget.retry_delay())
             continue
         if response.status_code not in {500, 502, 503, 504}:
             return response
-        await asyncio.sleep(budget.retry_delay())
+        await asyncio.sleep(shared_budget.retry_delay())
 _SIGNED_FORMAL_SOURCE_FIELDS = frozenset(
     {
         "formal_live_source_binding",
@@ -730,7 +775,7 @@ async def _issue_formal_source_challenge_remote(
     control_token_path: Path | None = None,
     retry_budget: _FormalControlRetryBudget | None = None,
 ) -> dict[str, object]:
-    budget = _formal_control_retry_budget(client, retry_budget)
+    budget = _formal_control_retry_budget(retry_budget)
     response = await _post_formal_control_with_retry(
         client,
         f"{base}/api/v1/internal/formal-live-source/challenge",
@@ -762,7 +807,7 @@ async def _finalize_formal_source_binding_remote(
     control_token_path: Path | None = None,
     retry_budget: _FormalControlRetryBudget | None = None,
 ) -> dict[str, object]:
-    budget = _formal_control_retry_budget(client, retry_budget)
+    budget = _formal_control_retry_budget(retry_budget)
     response = await _post_formal_control_with_retry(
         client,
         f"{base}/api/v1/internal/formal-live-source/finalize",
@@ -1294,16 +1339,20 @@ async def _activate_prepared_flexible_live_job(
     base: str,
     control: dict[str, Any],
     execution_capability: dict[str, object],
+    companion_binding: dict[str, object],
     idempotency_key: str,
     control_token_path: Path | None = None,
     retry_budget: _FormalControlRetryBudget | None = None,
 ) -> None:
     job_id = TypeAdapter(str).validate_python(control.get("job_id"))
-    budget = _formal_control_retry_budget(client, retry_budget)
+    budget = _formal_control_retry_budget(retry_budget)
     response = await _post_formal_control_with_retry(
         client,
         f"{base}/api/v1/internal/formal-live-source/jobs/{job_id}/activate",
-        payload={"execution_capability": execution_capability},
+        payload={
+            "execution_capability": execution_capability,
+            "companion_binding": companion_binding,
+        },
         headers={
             "X-TripChord-Formal-Source-Control": _formal_source_control_token(
                 control_token_path
@@ -1321,6 +1370,119 @@ async def _activate_prepared_flexible_live_job(
     activated = LivePlanningJobSnapshot.model_validate(payload.get("job"))
     if activated.id != job_id or activated.state != LivePlanningJobState.QUEUED:
         raise RuntimeError("formal prepared live job activation identity/state is invalid")
+
+
+def _formal_companion_binding_from_preflight(
+    preflight: object,
+) -> dict[str, object]:
+    if not isinstance(preflight, dict) or not isinstance(
+        preflight.get("companions"), list
+    ):
+        raise RuntimeError("formal Companion preflight has an invalid shape")
+    companions = preflight["companions"]
+    if len(companions) != 1 or not isinstance(companions[0], dict):
+        raise RuntimeError(
+            "formal Companion preflight requires exactly one Companion with valid freshness"
+        )
+    companion = companions[0]
+    stale_after = preflight.get("stale_after_seconds")
+    server_time = preflight.get("server_time")
+    last_seen = companion.get("last_seen")
+    age_seconds = companion.get("age_seconds")
+    try:
+        parsed_server_time = datetime.fromisoformat(
+            str(server_time).replace("Z", "+00:00")
+        )
+        parsed_last_seen = datetime.fromisoformat(
+            str(last_seen).replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "formal Companion preflight requires exactly one Companion with valid freshness"
+        ) from exc
+    observed_age = (parsed_server_time - parsed_last_seen).total_seconds()
+    if (
+        type(stale_after) is not int
+        or stale_after <= 0
+        or parsed_server_time.tzinfo is None
+        or parsed_last_seen.tzinfo is None
+        or not isinstance(age_seconds, int | float)
+        or isinstance(age_seconds, bool)
+        or not math.isfinite(float(age_seconds))
+        or observed_age < 0
+        or observed_age > stale_after
+        or abs(observed_age - float(age_seconds)) > 1e-6
+        or companion.get("is_fresh") is not True
+    ):
+        raise RuntimeError(
+            "formal Companion preflight requires exactly one Companion with valid freshness"
+        )
+    required_providers = {"ctrip", "qunar", "tongcheng"}
+    providers = companion.get("providers")
+    required_scopes = {
+        "ctrip:flight",
+        "ctrip:lodging",
+        "qunar:flight",
+        "qunar:lodging",
+        "tongcheng:flight",
+    }
+    scopes = companion.get("authorized_scope_keys")
+    if (
+        not isinstance(providers, list)
+        or set(providers) != required_providers
+        or len(providers) != len(set(providers))
+        or not isinstance(scopes, list)
+        or set(scopes) != required_scopes
+        or len(scopes) != len(set(scopes))
+    ):
+        raise RuntimeError(
+            "formal Companion preflight requires exactly one Companion with valid freshness"
+        )
+    identity_fields = (
+        "companion_id",
+        "adapter_version",
+        "contract_version",
+        "runtime_instance_id",
+    )
+    if any(
+        not isinstance(companion.get(field), str) or not companion[field]
+        for field in identity_fields
+    ):
+        raise RuntimeError("formal Companion preflight identity is incomplete")
+    providers = companion["providers"]
+    scopes = companion["authorized_scope_keys"]
+    build = companion.get("build_identity")
+    if (
+        not isinstance(providers, list)
+        or any(not isinstance(item, str) or not item for item in providers)
+        or len(providers) != len(set(providers))
+        or not isinstance(scopes, list)
+        or not scopes
+        or any(not isinstance(item, str) or not item for item in scopes)
+        or len(scopes) != len(set(scopes))
+        or not isinstance(build, dict)
+        or set(build)
+        != {
+            "protocol_version",
+            "manifest_version",
+            "build_sha256",
+            "content_runtime_version",
+        }
+        or any(not isinstance(item, str) or not item for item in build.values())
+        or not re.fullmatch(r"[0-9a-f]{64}", str(build.get("build_sha256")))
+    ):
+        raise RuntimeError("formal Companion preflight binding is invalid")
+    identity: dict[str, object] = {
+        "companion_id": companion["companion_id"],
+        "providers": sorted(providers),
+        "authorized_scope_keys": sorted(scopes),
+        "adapter_version": companion["adapter_version"],
+        "contract_version": companion["contract_version"],
+        "runtime_instance_id": companion["runtime_instance_id"],
+        "build_identity": dict(build),
+    }
+    identity["identity_sha256"] = _canonical_sha256(identity)
+    return identity
 
 
 def _formal_terminal_job_contract(
@@ -1915,6 +2077,12 @@ async def _run(
         key: start_revision.get(key)
         for key in ("toplevel", "branch", "commit_sha", "worktree_dirty")
     }
+    formal_control_retry_token = _FORMAL_CONTROL_RETRY_BUDGET.set(
+        _FormalControlRetryBudget(
+            total_attempts=_FORMAL_CONTROL_TOTAL_ATTEMPTS,
+            wall_seconds=_FORMAL_CONTROL_WALL_SECONDS,
+        )
+    )
     try:
         request = _load_request(args.request)
         stage = "validate_frozen_request"
@@ -1989,13 +2157,6 @@ async def _run(
                 "candidate_set_sha256": candidate_set.candidate_set_sha256,
                 "scenario_sha256": scenario_sha256,
             }
-            formal_control_retry_budget = _FormalControlRetryBudget(
-                total_attempts=_FORMAL_CONTROL_TOTAL_ATTEMPTS,
-                wall_seconds=_FORMAL_CONTROL_WALL_SECONDS,
-            )
-            client._tripchord_formal_control_retry_budget = (  # type: ignore[attr-defined]
-                formal_control_retry_budget
-            )
             context["gate_run_id"] = args.gate_run_id
             live_job_control = _new_live_job_control(
                 request,
@@ -2043,12 +2204,15 @@ async def _run(
                 args.bridge_token,
             )
             context["companion_preflight"] = companion
+            companion_binding = _formal_companion_binding_from_preflight(companion)
+            context["formal_companion_binding"] = companion_binding
             stage = "activate_flexible_live_job"
             await _activate_prepared_flexible_live_job(
                 client,
                 base,
                 live_job_control,
                 formal_execution_capability,
+                companion_binding,
                 _formal_control_idempotency_key(
                     live_job_control,
                     "activate",
@@ -2279,6 +2443,8 @@ async def _run(
             file=sys.stderr,
         )
         return 2
+    finally:
+        _FORMAL_CONTROL_RETRY_BUDGET.reset(formal_control_retry_token)
 
     stage = "evaluate_done_gate"
     captured_at = now_factory()
