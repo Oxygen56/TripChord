@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -2878,3 +2879,390 @@ async def test_legacy_immediate_derivation_fails_closed_for_formal_prepared_shap
                 defer_start=mode,
             )
     await registry.close()
+
+
+
+async def _settle_leaked_runtime(
+    stop: asyncio.Event,
+    runtime: Any,
+) -> None:
+    """Boundedly stop any executor a test left running (e.g. when a native-red
+    assertion fails before the happy-path cleanup), so pytest-asyncio's teardown
+    never waits forever on a swallow-cancel operation or a hung runner."""
+    stop.set()
+    if runtime is None:
+        return
+    operation_task = runtime.operation_task
+    if operation_task is not None and not operation_task.done():
+        operation_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(operation_task, timeout=3)
+    task = runtime.task
+    if task is not None and not task.done() and task is not asyncio.current_task():
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(task, timeout=3)
+
+
+@pytest.mark.asyncio
+async def test_close_first_intent_persist_failure_keeps_closed_flag_transactional(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-143 P0: the close() lifecycle flag must be transactional with the
+    durable cancel intent. A pre-commit failure on the FIRST close's intent
+    persist must leave ``self._closed`` False (the registry is NOT closed) and
+    the record still RUNNING with its executor untouched — never ``_closed=True``
+    over a disk that still claims an active record without a durable owner. A
+    second close re-persists the intent durably, and a final-persist failure
+    after the executor stops keeps the recoverable cancel_pending isolation
+    (never a RUNNING record over a dead executor); a same-key retry completes
+    the terminalization and a full cold start reads the same terminal facts."""
+
+    state_path = tmp_path / "live-jobs.json"
+    stop = asyncio.Event()
+    swallowed = asyncio.Event()
+    side_effects = 0
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal side_effects
+        while not stop.is_set():
+            try:
+                side_effects += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                swallowed.set()
+        return {"stopped": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path, cancel_wait_seconds=0.15)
+    runtime: Any = None
+    try:
+        snapshot, replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="close-intent-precommit",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+        )
+        assert replayed is False
+        runtime = registry._records[snapshot.id]
+        await _wait_for_state(
+            registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
+        )
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
+
+        # --- First close: fail the durable-intent persist pre-commit. ---
+        real_persist = registry._persist_locked
+
+        def fail_intent_persist() -> None:
+            raise RuntimeError("injected close intent persist failure")
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_intent_persist)
+        with pytest.raises(RuntimeError, match="injected close intent persist failure"):
+            await registry.close()
+        monkeypatch.undo()
+
+        # RED: the lifecycle flag must NOT claim closed when the durable intent
+        # never committed — the current HEAD leaves _closed=True (divergence).
+        assert registry._closed is False
+        # The record is untouched: still RUNNING in memory, executor alive, and
+        # the failed close wrote NO cancel intent to disk.
+        assert runtime.snapshot.state == LivePlanningJobState.RUNNING
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record
+            for record in disk["records"]
+            if record["snapshot"]["id"] == snapshot.id
+        )
+        assert disk_record["snapshot"]["cancel_pending"] is False
+        assert disk_record["snapshot"]["stage"] != "closing"
+
+        # --- Second close: intent persist succeeds; the FINAL terminalize fails
+        # pre-commit after the executor is stopped. ---
+        def fail_final_terminalize() -> None:
+            if runtime.task is not None and runtime.task.done():
+                raise RuntimeError("injected final close persist failure")
+            real_persist()
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_final_terminalize)
+        with pytest.raises(RuntimeError, match="injected final close persist failure"):
+            await registry.close()
+        monkeypatch.undo()
+
+        # The durable cancel intent was persisted before the executor was
+        # stopped, so the record is NOT an active claim over work without an
+        # owner: memory == disk on the recoverable closing/cancel_pending
+        # isolation — never the plain RUNNING snapshot over a dead executor.
+        assert swallowed.is_set()
+        assert runtime.snapshot.cancel_pending is True
+        assert runtime.snapshot.cancellation_requested is True
+        assert runtime.snapshot.stage == "closing"
+        assert registry._closed is True
+        disk2 = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record2 = next(
+            record
+            for record in disk2["records"]
+            if record["snapshot"]["id"] == snapshot.id
+        )
+        assert disk_record2["snapshot"] == runtime.snapshot.model_dump(mode="json")
+        assert disk_record2["snapshot"]["cancel_pending"] is True
+
+        # The registry is durably closed, so a same-key retry in-process fails
+        # closed — it never reports the RUNNING record as active over the dead
+        # executor (and never reuses it).
+        stop.set()
+        await asyncio.sleep(0.05)
+        with pytest.raises(RuntimeError, match="registry is closed"):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=operation,
+                idempotency_key="close-intent-precommit",
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+            )
+
+        # A full cold start reads the closing/cancel_pending isolation and
+        # fail-closes it to CANCELLED/restart_cancelled; a same-key retry there
+        # returns that terminal fact — never a RUNNING record over a dead
+        # executor.
+        reloaded = LivePlanningJobRegistry(state_path=state_path)
+        cold = await reloaded.get(snapshot.id, "tenant-a")
+        assert cold is not None
+        assert cold.state == LivePlanningJobState.CANCELLED
+        assert cold.stage == "restart_cancelled"
+        cold_retry, cold_retry_replayed = await reloaded.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="close-intent-precommit",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+        )
+        assert cold_retry_replayed is True
+        assert cold_retry.id == snapshot.id
+        assert cold_retry.state == LivePlanningJobState.CANCELLED
+        await reloaded.close()
+        await registry.close()
+    finally:
+        await _settle_leaked_runtime(stop, runtime)
+
+
+@pytest.mark.asyncio
+async def test_deadline_timeout_isolation_persist_failure_never_abandons_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-143 P0: a pre-commit failure on the FIRST timeout/cancel-pending
+    isolation persist must not leave an unowned live operation. The isolation is
+    bounded-retried; the durable timeout_pending isolation is reached, the
+    operation is drained, a same-key retry fails closed while the operation is
+    alive, and a cold start terminalizes truthfully."""
+
+    state_path = tmp_path / "live-jobs.json"
+    stop = asyncio.Event()
+    swallowed = asyncio.Event()
+    side_effects = 0
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal side_effects
+        while not stop.is_set():
+            try:
+                side_effects += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                swallowed.set()
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path, cancel_wait_seconds=0.15)
+    runtime: Any = None
+    try:
+        snapshot, replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="deadline-isolation-fail",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=0.5,
+        )
+        assert replayed is False
+        runtime = registry._records[snapshot.id]
+        await _wait_for_state(
+            registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
+        )
+
+        # Arm a fail-once persist: the FIRST timeout-isolation persist fails
+        # pre-commit, the bounded retry then succeeds.
+        real_persist = registry._persist_locked
+        armed = False
+
+        def fail_first_timeout_isolation() -> None:
+            nonlocal armed
+            loop = asyncio.get_running_loop()
+            if (
+                not armed
+                and runtime.operation_task is not None
+                and not runtime.operation_task.done()
+                and loop.time() >= runtime.deadline_monotonic
+            ):
+                armed = True
+                raise RuntimeError("injected timeout isolation persist failure")
+            real_persist()
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_first_timeout_isolation)
+        await asyncio.sleep(0.9)
+        monkeypatch.undo()
+
+        # The transient isolation failure was bounded-retried: the record reaches
+        # a durable timeout/cancel-pending isolation, and the operation was
+        # drained — never restored to RUNNING over a live operation.
+        assert swallowed.is_set()
+        assert runtime.snapshot.cancel_pending is True
+        assert runtime.snapshot.stage == "timeout_pending"
+        assert runtime.snapshot.state != LivePlanningJobState.FAILED
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record
+            for record in disk["records"]
+            if record["snapshot"]["id"] == snapshot.id
+        )
+        assert disk_record["snapshot"] == runtime.snapshot.model_dump(mode="json")
+        assert disk_record["snapshot"]["cancel_pending"] is True
+        assert disk_record["snapshot"]["stage"] == "timeout_pending"
+
+        # Same-key retry fails closed while the operation is still alive.
+        with pytest.raises(LivePlanningJobCancellationPendingError):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=operation,
+                idempotency_key="deadline-isolation-fail",
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+            )
+
+        # The operation truly stops; a close() joins the cleanup and settles.
+        stop.set()
+        await asyncio.sleep(0.05)
+        await registry.close()
+        assert runtime.operation_task.done()
+        final = await registry.get(snapshot.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+
+        # A full cold start reads the terminal facts.
+        reloaded = LivePlanningJobRegistry(state_path=state_path)
+        cold = await reloaded.get(snapshot.id, "tenant-a")
+        assert cold is not None and cold.state == LivePlanningJobState.CANCELLED
+        await reloaded.close()
+        await registry.close()
+    finally:
+        await _settle_leaked_runtime(stop, runtime)
+
+
+@pytest.mark.asyncio
+async def test_deadline_timeout_isolation_permanent_persist_failure_keeps_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-143 P0: when the timeout/cancel-pending isolation can NEVER be persisted
+    (every bounded attempt fails pre-commit), the runner must not restore the
+    pre-timeout RUNNING snapshot and exit over a live operation. The record keeps
+    the in-memory timeout/cancel-pending isolation as the observable owner, the
+    operation is drained, a same-key retry fails closed, and once the operation
+    stops a close() settles the record — healing the disk."""
+
+    state_path = tmp_path / "live-jobs.json"
+    stop = asyncio.Event()
+    swallowed = asyncio.Event()
+    side_effects = 0
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal side_effects
+        while not stop.is_set():
+            try:
+                side_effects += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                swallowed.set()
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path, cancel_wait_seconds=0.15)
+    runtime: Any = None
+    try:
+        snapshot, replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="deadline-isolation-permanent",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=0.4,
+        )
+        assert replayed is False
+        runtime = registry._records[snapshot.id]
+        await _wait_for_state(
+            registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
+        )
+
+        # Every timeout-isolation persist fails pre-commit (permanent write
+        # failure).
+        real_persist = registry._persist_locked
+
+        def fail_all_timeout_isolation() -> None:
+            loop = asyncio.get_running_loop()
+            if (
+                runtime.operation_task is not None
+                and not runtime.operation_task.done()
+                and loop.time() >= runtime.deadline_monotonic
+            ):
+                raise RuntimeError(
+                    "injected permanent timeout isolation persist failure"
+                )
+            real_persist()
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_all_timeout_isolation)
+        await asyncio.sleep(0.8)
+        monkeypatch.undo()
+
+        # The runner exited (its task is done) but the operation is NOT
+        # abandoned: the record keeps the timeout/cancel-pending isolation in
+        # memory, never the plain pre-timeout RUNNING snapshot.
+        assert runtime.task is not None and runtime.task.done()
+        assert swallowed.is_set()
+        assert runtime.snapshot.cancel_pending is True
+        assert runtime.snapshot.cancellation_requested is True
+        assert runtime.snapshot.stage == "timeout_pending"
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
+
+        # Same-key retry fails closed while the operation is alive.
+        with pytest.raises(LivePlanningJobCancellationPendingError):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=operation,
+                idempotency_key="deadline-isolation-permanent",
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+            )
+
+        # Once the operation truly stops, close() settles the record and heals
+        # the disk to the terminal CANCELLED.
+        stop.set()
+        await asyncio.sleep(0.05)
+        await registry.close()
+        assert runtime.operation_task.done()
+        final = await registry.get(snapshot.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record
+            for record in disk["records"]
+            if record["snapshot"]["id"] == snapshot.id
+        )
+        assert disk_record["snapshot"]["state"] == "cancelled"
+
+        # A full cold start reads the terminal facts.
+        reloaded = LivePlanningJobRegistry(state_path=state_path)
+        cold = await reloaded.get(snapshot.id, "tenant-a")
+        assert cold is not None and cold.state == LivePlanningJobState.CANCELLED
+        await reloaded.close()
+        await registry.close()
+    finally:
+        await _settle_leaked_runtime(stop, runtime)

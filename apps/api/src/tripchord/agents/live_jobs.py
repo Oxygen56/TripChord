@@ -748,6 +748,7 @@ class LivePlanningJobRegistry:
         max_running: int = 1,
         terminal_ttl: timedelta = timedelta(minutes=30),
         cancel_wait_seconds: float = 10,
+        cancel_isolation_persist_attempts: int = 3,
         now: Callable[[], datetime] | None = None,
         state_path: Path | None = None,
     ) -> None:
@@ -759,10 +760,13 @@ class LivePlanningJobRegistry:
             raise ValueError("terminal_ttl must be positive")
         if cancel_wait_seconds <= 0:
             raise ValueError("cancel_wait_seconds must be positive")
+        if cancel_isolation_persist_attempts < 1:
+            raise ValueError("cancel_isolation_persist_attempts must be at least one")
         self._capacity = capacity
         self._terminal_ttl = terminal_ttl
         self._now = now or (lambda: datetime.now(UTC))
         self._cancel_wait_seconds = cancel_wait_seconds
+        self._cancel_isolation_persist_attempts = cancel_isolation_persist_attempts
         self._slots = asyncio.Semaphore(max_running)
         self._records: dict[str, _RuntimeJob] = {}
         self._idempotency: dict[str, _IdempotencyEntry] = {}
@@ -1798,21 +1802,26 @@ class LivePlanningJobRegistry:
         ``operation_task`` reference is never dropped while the operation lives.
         """
         async with self._changed:
-            first_close = not self._closed
-            self._closed = True
             active = tuple(
                 runtime
                 for runtime in self._records.values()
                 if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
             )
             if not active:
+                self._closed = True
                 return
-            if first_close:
+            if not self._closed:
                 # P0-4: persist the cancellation intent durably BEFORE stopping
-                # any real executor. A pre-commit failure leaves every executor
-                # untouched and rolls the in-memory markers back; a post-commit
-                # failure means the intent is already on disk, so proceed to stop
-                # the executors.
+                # any real executor. ``_closed`` is TRANSACTIONAL with that
+                # durable intent: it flips to True only once the isolation has
+                # been committed for every still-active record, so it never means
+                # "close() was called" but always "every record needing cleanup
+                # has a durable owner". A pre-commit failure (even after the
+                # bounded retries) rolls the in-memory markers AND ``_closed``
+                # back and leaves every executor untouched; a post-commit failure
+                # means the intent is already on disk, so proceed to stop the
+                # executors. A later close() then re-persists the intent because
+                # ``_closed`` is still False.
                 previous_snapshots = [runtime.snapshot for runtime in active]
                 for runtime in active:
                     if not runtime.snapshot.cancel_pending:
@@ -1825,13 +1834,12 @@ class LivePlanningJobRegistry:
                             }
                         )
                 try:
-                    self._persist_locked()
-                except LivePlanningJobRegistryPostCommitError:
-                    pass
+                    await self._persist_locked_with_bounded_retry()
                 except Exception:
                     for runtime, previous in zip(active, previous_snapshots, strict=True):
                         runtime.snapshot = previous
                     raise
+                self._closed = True
                 self._changed.notify_all()
         # Physically cancel BOTH executors of every still-active record FIRST —
         # before any settle releases a slot — so a queued job can never start
@@ -1934,7 +1942,6 @@ class LivePlanningJobRegistry:
             # operation swallows CancelledError past the budget, fail closed into
             # a non-terminal timeout/cancel-pending state and keep cleanup
             # ownership (a retry or close joins it).
-            pre_timeout_snapshot = runtime.snapshot
             async with self._lock:
                 if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
                     runtime.snapshot = runtime.snapshot.model_copy(
@@ -1945,39 +1952,46 @@ class LivePlanningJobRegistry:
                             "updated_at": self._utc_now(),
                         }
                     )
-                    try:
-                        self._persist_locked()
-                    except LivePlanningJobRegistryPostCommitError:
-                        # The isolation is already committed; proceed to drain.
-                        pass
-                    except Exception:
-                        # Pre-commit: the intent never reached disk, so the
-                        # executor is still untouched — restore the truthful
-                        # pre-timeout snapshot and surface the write failure
-                        # rather than drain under an active record.
-                        runtime.snapshot = pre_timeout_snapshot
-                        raise
+                    with suppress(Exception):
+                        # Pre-commit write failure that every bounded retry
+                        # exhausted: the timeout/cancel-pending isolation is kept
+                        # IN MEMORY as the observable/recoverable owner and the
+                        # operation is still drained below — the runner NEVER
+                        # restores the pre-timeout RUNNING snapshot and exits
+                        # over a live executor it has abandoned.
+                        await self._persist_locked_with_bounded_retry()
             drained = await self._cancel_and_drain_operation(operation_task)
             operation_stopped = operation_task is None or operation_task.done()
             if drained and operation_stopped:
-                await self._finish(
-                    runtime,
-                    LivePlanningJobState.FAILED,
-                    stage="deadline_exceeded",
-                    error="TimeoutError: live planning job deadline exceeded",
-                    safe_failure=failure,
-                    expected_generation=generation,
-                )
+                with suppress(Exception):
+                    # The terminal persist failed too (same permanent write
+                    # failure). The in-memory timeout/cancel-pending isolation is
+                    # retained as the observable owner and the runner exits
+                    # without restoring a pre-timeout RUNNING snapshot over the
+                    # already-stopped operation.
+                    await self._finish(
+                        runtime,
+                        LivePlanningJobState.FAILED,
+                        stage="deadline_exceeded",
+                        error="TimeoutError: live planning job deadline exceeded",
+                        safe_failure=failure,
+                        expected_generation=generation,
+                    )
             else:
-                await self._mark_cancel_stuck(
-                    runtime,
-                    stage="timeout_pending",
-                    error=(
-                        "live planning operation did not stop within the deadline "
-                        "cleanup budget; the job stays non-terminal and the "
-                        "operation is isolated"
-                    ),
-                )
+                with suppress(Exception):
+                    # Same permanent write failure: keep the in-memory
+                    # timeout/cancel-pending isolation as the recoverable owner;
+                    # the still-alive operation stays drained and the runner
+                    # exits without abandoning it or restoring RUNNING.
+                    await self._mark_cancel_stuck(
+                        runtime,
+                        stage="timeout_pending",
+                        error=(
+                            "live planning operation did not stop within the deadline "
+                            "cleanup budget; the job stays non-terminal and the "
+                            "operation is isolated"
+                        ),
+                    )
         except Exception as exc:
             # Exception messages may contain a raw user prompt, URL, quote or provider
             # payload. Expose only the class and a stable generic description.
@@ -2032,6 +2046,37 @@ class LivePlanningJobRegistry:
             timeout=self._cancel_wait_seconds,
         )
         return operation_task in done
+
+    async def _persist_locked_with_bounded_retry(self) -> None:
+        """Persist the current in-memory isolation with a bounded retry.
+
+        Shared primitive of the durable-intent state machine used by close() and
+        the deadline path: the cancellation/timeout intent is atomically written
+        BEFORE any real executor is stopped, so a failure here never publishes a
+        terminal label over live work and never abandons a runner without a
+        durable owner. A post-commit (indeterminate) failure means the isolation
+        is already durable — return success. A pre-commit failure is retried up
+        to ``_cancel_isolation_persist_attempts`` times with a short backoff. If
+        every attempt fails pre-commit, the last error is raised; the caller
+        keeps its own rollback policy: close() rolls the isolation markers back
+        so the executors stay untouched, while the deadline path KEEPS the
+        in-memory isolation as the observable owner and still drains the live
+        operation. Callers must hold ``self._lock`` (or ``self._changed``)."""
+        last_error: BaseException | None = None
+        for attempt in range(1, self._cancel_isolation_persist_attempts + 1):
+            try:
+                self._persist_locked()
+                return
+            except LivePlanningJobRegistryPostCommitError:
+                # The isolation is already committed; the in-memory record
+                # matches it, so the intent phase is done.
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt < self._cancel_isolation_persist_attempts:
+                    await asyncio.sleep(min(0.02 * attempt, 0.1))
+        assert last_error is not None
+        raise last_error
 
     @staticmethod
     def _consume_task_result(task: asyncio.Task[dict[str, Any]]) -> None:
