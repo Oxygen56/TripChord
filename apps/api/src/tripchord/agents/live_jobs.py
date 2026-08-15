@@ -716,6 +716,7 @@ class _IdempotencyEntry:
         job_id: str,
         request_digest: str,
         defer_start: bool | None = None,
+        legacy_isolated: bool = False,
     ) -> None:
         self.job_id = job_id
         self.request_digest = request_digest
@@ -723,6 +724,9 @@ class _IdempotencyEntry:
         # so a same-key request cannot silently switch between a prepared
         # (defer_start=True) and an immediate execution of the same payload.
         self.defer_start = defer_start
+        # P0-2: a legacy (v1/v2) binding whose execution mode cannot be proven is
+        # isolated — it is never replayed under any mode and always conflicts.
+        self.legacy_isolated = legacy_isolated
 
 
 class LivePlanningJobRegistry:
@@ -859,9 +863,15 @@ class LivePlanningJobRegistry:
                 "job_id",
                 "request_digest",
             }
+            legacy_isolated_field = "legacy_isolated"
             if schema_version == "tripchord-live-job-registry-v3":
                 expected_idempotency_fields.add("defer_start")
-            if not isinstance(item, dict) or set(item) != expected_idempotency_fields:
+            # The v3 loader accepts the optional legacy-isolation marker on top
+            # of the required field set (older v3 files omit it entirely).
+            if not isinstance(item, dict) or set(item) not in {
+                frozenset(expected_idempotency_fields),
+                frozenset(expected_idempotency_fields | {legacy_isolated_field}),
+            }:
                 raise RuntimeError("live planning idempotency record is invalid")
             partition = item["partition"]
             job_id = item["job_id"]
@@ -876,20 +886,39 @@ class LivePlanningJobRegistry:
             ):
                 raise RuntimeError("live planning idempotency identity is invalid")
             defer_start: bool | None = None
+            legacy_isolated = False
             if schema_version == "tripchord-live-job-registry-v3":
                 defer_start = item["defer_start"]
                 if type(defer_start) is not bool:
                     raise RuntimeError("live planning idempotency execution mode is invalid")
+                legacy_isolated = item.get(legacy_isolated_field, False)
+                if type(legacy_isolated) is not bool:
+                    raise RuntimeError("live planning idempotency isolation is invalid")
             runtime = self._records.get(job_id)
             if (
                 runtime is None
                 or runtime.snapshot.request_sha256 != request_digest
             ):
                 raise RuntimeError("live planning idempotency binding is invalid")
+            if defer_start is None:
+                # P0-2: legacy v1/v2 records carry no execution mode. Derive the
+                # provable mode from the surviving durable facts; when the facts
+                # are insufficient, fail closed into an isolated binding that is
+                # never replayed (the derived bool is persisted, never null).
+                derived = self._derive_legacy_execution_mode(
+                    runtime,
+                    schema_version=schema_version,
+                )
+                if derived is None:
+                    legacy_isolated = True
+                    defer_start = False
+                else:
+                    defer_start = derived
             self._idempotency[partition] = _IdempotencyEntry(
                 job_id=job_id,
                 request_digest=request_digest,
                 defer_start=defer_start,
+                legacy_isolated=legacy_isolated,
             )
         for runtime in self._records.values():
             if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
@@ -903,6 +932,37 @@ class LivePlanningJobRegistry:
                 )
         self._prune_locked(self._utc_now())
         self._persist_locked()
+
+    def _derive_legacy_execution_mode(
+        self,
+        runtime: _RuntimeJob,
+        *,
+        schema_version: str,
+    ) -> bool | None:
+        """Derive the provable execution mode for a legacy (v1/v2) idempotency
+        binding, or return None when the legacy facts are insufficient.
+
+        Returns True for a prepared (defer_start=True) job, False for an
+        immediate (defer_start=False) job, and None to fail closed into a
+        legacy-isolated binding that is never replayed under any mode.
+        """
+        if schema_version == "tripchord-live-job-registry-v1":
+            # v1 predates the activation_operation field entirely, so only an
+            # un-activated prepared record (prepared=True, QUEUED) is provably
+            # prepared; every other v1 record is ambiguous.
+            return True if runtime.prepared else None
+        # v2/v3 records carry the activation_operation, which is the durable
+        # proof that a prepared job reached (or passed) activation intent.
+        if runtime.activation_operation is not None:
+            return True
+        if runtime.prepared:
+            return True
+        if runtime.snapshot.state == LivePlanningJobState.CANCELLED:
+            # A terminal cancelled job without an activation operation could be
+            # an immediate job cancelled mid-flight OR a prepared job cancelled
+            # before any intent was persisted — indistinguishable, so fail closed.
+            return None
+        return False
 
     @staticmethod
     def _validate_state_parent(parent: Path) -> None:
@@ -965,6 +1025,7 @@ class LivePlanningJobRegistry:
                     "job_id": entry.job_id,
                     "request_digest": entry.request_digest,
                     "defer_start": entry.defer_start,
+                    "legacy_isolated": entry.legacy_isolated,
                 }
                 for partition, entry in sorted(self._idempotency.items())
             ],
@@ -1111,6 +1172,12 @@ class LivePlanningJobRegistry:
                         raise LivePlanningJobIdempotencyConflictError(
                             "idempotency key was already used with a different request"
                         )
+                    elif existing.legacy_isolated:
+                        # P0-2: an ambiguous legacy v1/v2 binding is isolated —
+                        # never replayed under any execution mode.
+                        raise LivePlanningJobIdempotencyConflictError(
+                            "idempotency key is bound to an isolated legacy record"
+                        )
                     elif (
                         existing.defer_start is not None
                         and existing.defer_start != defer_start
@@ -1123,6 +1190,21 @@ class LivePlanningJobRegistry:
                             "idempotency key was already used with a different execution mode"
                         )
                     else:
+                        # P0-1: a cancel_pending record whose executor has already
+                        # stopped can be terminalized idempotently here, so a
+                        # same-key retry never reuses a dead running executor as an
+                        # active job.
+                        if existing_runtime.snapshot.cancel_pending and (
+                            existing_runtime.task is None
+                            or existing_runtime.task.done()
+                        ):
+                            try:
+                                self._complete_cancel_terminalize_locked(
+                                    existing_runtime
+                                )
+                            except LivePlanningJobRegistryPostCommitError as exc:
+                                exc.job_id = existing_runtime.snapshot.id
+                                raise
                         return existing_runtime.snapshot, True
             self._make_capacity_locked()
             self._records[job_id] = runtime
@@ -1533,6 +1615,30 @@ class LivePlanningJobRegistry:
                 operation_task = runtime.operation_task
                 runtime.cancel_future = asyncio.get_running_loop().create_future()
                 future = runtime.cancel_future
+                # P0-1: persist the cancellation intent durably BEFORE stopping
+                # the real executor, so a later persist failure can never strand
+                # a stopped executor under an active/RUNNING record. Only once the
+                # disk records cancel_pending do we touch the real work; if this
+                # write fails pre-commit the executor is still untouched and the
+                # record rolls back to the truthful RUNNING state.
+                try:
+                    self._persist_locked()
+                except LivePlanningJobRegistryPostCommitError:
+                    # The intent is already committed on disk; proceed to stop
+                    # the executor. The final terminalize below settles (and may
+                    # surface) the indeterminate write.
+                    pass
+                except Exception:
+                    runtime.snapshot = pre_call_snapshot
+                    runtime.generation = pre_call_generation
+                    runtime.prepared = pre_call_prepared
+                    runtime.activation_operation = pre_call_activation_operation
+                    runtime.cancel_pending = pre_call_cancel_pending
+                    runtime.cancel_future = pre_call_cancel_future
+                    runtime.cancel_drain_succeeded = pre_call_cancel_drain_succeeded
+                    if future is not None and not future.done():
+                        future.set_result(pre_call_snapshot)
+                    raise
                 self._changed.notify_all()
         if pending_runtime is not None:
             # A cancellation is already in flight. Join the same bounded cleanup —
@@ -1600,20 +1706,16 @@ class LivePlanningJobRegistry:
                 exc.job_id = job_id
                 post_commit_error = exc
             except Exception:
-                # A pre-commit persist failure leaves the whole mutable record —
-                # including the transient cancel_pending/cancelling marker —
-                # byte-identical to the untouched disk file, so a same-process
-                # retry and a cold restart observe the same facts.
-                async with self._lock:
-                    rolled_back = self._owned_locked(job_id, tenant_id)
-                    if rolled_back is not None:
-                        rolled_back.snapshot = pre_call_snapshot
-                        rolled_back.generation = pre_call_generation
-                        rolled_back.prepared = pre_call_prepared
-                        rolled_back.activation_operation = pre_call_activation_operation
-                        rolled_back.cancel_pending = pre_call_cancel_pending
-                        rolled_back.cancel_future = pre_call_cancel_future
-                        rolled_back.cancel_drain_succeeded = pre_call_cancel_drain_succeeded
+                # P0-1: a pre-commit failure on the final terminalize must NOT
+                # roll back to the pre-call RUNNING state — the real executor is
+                # already stopped, so RUNNING would be a lie over a dead executor.
+                # _finish / _mark_cancel_stuck already restored the durably
+                # persisted cancel_pending snapshot; keep that recoverable
+                # non-active isolation state and surface the write failure so a
+                # same-key retry or cold restart completes the terminalization.
+                outcome = current.snapshot
+                if future is not None and not future.done():
+                    future.set_result(outcome)
                 raise
             outcome = current.snapshot
         if future is not None and not future.done():
@@ -2044,6 +2146,38 @@ class LivePlanningJobRegistry:
                 runtime.activation_operation = previous_activation_operation
                 raise
             self._changed.notify_all()
+
+    def _complete_cancel_terminalize_locked(self, runtime: _RuntimeJob) -> None:
+        """P0-1: idempotently terminalize a cancel_pending job whose executor has
+        already stopped, without re-acquiring the registry lock.
+
+        Called from the idempotent retry path while holding ``self._lock``. A
+        pre-commit persist failure restores the durable cancel_pending snapshot
+        (never the pre-cancel RUNNING state), so a later retry completes the same
+        terminalization and the job is never reported as active over a dead
+        executor."""
+        if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+            return
+        previous_snapshot = runtime.snapshot
+        previous_generation = runtime.generation
+        previous_prepared = runtime.prepared
+        previous_activation_operation = runtime.activation_operation
+        self._terminalize_locked(
+            runtime,
+            LivePlanningJobState.CANCELLED,
+            stage="cancelled",
+            cancellation_requested=True,
+        )
+        try:
+            self._persist_locked()
+        except LivePlanningJobRegistryPostCommitError:
+            raise
+        except Exception:
+            runtime.snapshot = previous_snapshot
+            runtime.generation = previous_generation
+            runtime.prepared = previous_prepared
+            runtime.activation_operation = previous_activation_operation
+            raise
 
     async def _ensure_active(self, runtime: _RuntimeJob, generation: int) -> None:
         async with self._lock:

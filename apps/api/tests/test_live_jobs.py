@@ -2245,3 +2245,339 @@ async def test_idempotency_execution_mode_binding_survives_cold_restart(
     assert replayed is True
     assert same_mode.id == prepared.id
     await second.close()
+
+
+def _v2_snapshot_model(
+    job_id: str,
+    state: LivePlanningJobState,
+    stage: str,
+    progress: int,
+    revision: int,
+    *,
+    cancellation_requested: bool = False,
+    expires_at: datetime | None = None,
+) -> LivePlanningJobSnapshot:
+    # Relative timestamps keep the faithful-v2 fixture valid whenever it runs.
+    created = datetime.now(UTC) - timedelta(minutes=5)
+    return LivePlanningJobSnapshot(
+        id=job_id,
+        state=state,
+        stage=stage,
+        progress=progress,
+        revision=revision,
+        cancellation_requested=cancellation_requested,
+        request_sha256=REQUEST_SHA256,
+        model_trace_scope_sha256=REQUEST_SHA256,
+        created_at=created,
+        updated_at=created,
+        deadline_at=created + timedelta(hours=1),
+        expires_at=expires_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_terminalize_precommit_failure_keeps_cancel_pending_not_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-143 P0 return counter-example: a pre-commit persist failure on the
+    FINAL terminalize of an active cancel must NOT roll the record back to the
+    pre-cancel RUNNING state. The cancellation intent (cancel_pending) is
+    persisted durably BEFORE the real executor is stopped; once the executor is
+    stopped, a failed final persist leaves the recoverable cancel_pending
+    isolation state — never an active/RUNNING record over a dead executor. A
+    same-key retry completes the terminalization idempotently, a cold restart
+    observes the same facts, and foreign identity is still rejected."""
+
+    state_path = tmp_path / "live-jobs.json"
+    release = asyncio.Event()
+    invocations = 0
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal invocations
+        invocations += 1
+        await release.wait()
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path)
+    snapshot, replayed = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="active-cancel-precommit",
+        request_digest=REQUEST_SHA256,
+        defer_start=False,
+    )
+    assert replayed is False
+    runtime = registry._records[snapshot.id]
+    await _wait_for_state(
+        registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
+    )
+    assert runtime.operation_task is not None and not runtime.operation_task.done()
+    assert invocations == 1
+
+    # Fail the FINAL persist of the cancel (the terminalize), but let the
+    # cancel-intent persist succeed. The intent persist happens before the real
+    # executor is stopped; the terminalize persist happens only after.
+    real_persist = registry._persist_locked
+
+    def fail_after_executor_stopped() -> None:
+        if runtime.task is not None and runtime.task.done():
+            raise RuntimeError("injected final cancel persist failure")
+        real_persist()
+
+    monkeypatch.setattr(registry, "_persist_locked", fail_after_executor_stopped)
+    with pytest.raises(RuntimeError, match="injected final cancel persist failure"):
+        await registry.cancel(snapshot.id, "tenant-a")
+    monkeypatch.undo()
+
+    # The real executor really stopped ...
+    assert runtime.task is not None and runtime.task.done()
+    assert runtime.operation_task is not None and runtime.operation_task.done()
+    # ... but the record is NOT an active/RUNNING claim over that dead executor:
+    # the durable cancel_pending isolation state is retained and cancellation was
+    # requested, and memory agrees byte-for-byte with the disk.
+    assert runtime.snapshot.cancel_pending is True
+    assert runtime.snapshot.cancellation_requested is True
+    assert runtime.snapshot.stage == "cancelling"
+    disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
+    disk_record = next(
+        record
+        for record in disk_payload["records"]
+        if record["snapshot"]["id"] == snapshot.id
+    )
+    assert disk_record["snapshot"] == runtime.snapshot.model_dump(mode="json")
+    assert disk_record["snapshot"]["cancel_pending"] is True
+
+    # A same-key retry completes the terminalization idempotently and never
+    # reuses a dead running executor as an active job.
+    retried, retried_replayed = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="active-cancel-precommit",
+        request_digest=REQUEST_SHA256,
+        defer_start=False,
+    )
+    assert retried_replayed is True
+    assert retried.id == snapshot.id
+    assert retried.state == LivePlanningJobState.CANCELLED
+    assert retried.stage == "cancelled"
+    assert retried.cancel_pending is False
+    assert invocations == 1  # no repeated dispatch / side effects
+
+    # A brand-new instance reads the same terminal facts.
+    reloaded = LivePlanningJobRegistry(state_path=state_path)
+    cold = await reloaded.get(snapshot.id, "tenant-a")
+    assert cold is not None
+    assert cold.state == LivePlanningJobState.CANCELLED
+    assert cold.cancel_pending is False
+    # Foreign identity is still rejected.
+    assert await reloaded.get(snapshot.id, "other-tenant") is None
+    assert await reloaded.cancel(snapshot.id, "other-tenant") is None
+
+    await reloaded.close()
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_to_v3_migration_derives_execution_mode_and_survives_consecutive_cold_starts(
+    tmp_path: Path,
+) -> None:
+    """C-143 P0-2 counter-example: a faithful v2 state file must migrate to v3
+    with a PROVABLE bool execution mode for every legacy idempotency binding —
+    never a null the v3 loader itself rejects — so the FIRST cold start (v2->v3
+    migration) AND a SECOND consecutive cold start (v3->v3) both load. After the
+    migration and after another cold start, prepared<->immediate same-key mode
+    conflicts fail closed in both directions, while the matching derived mode
+    idempotently replays; an ambiguous legacy binding fails closed under both
+    modes; job/task/operation/dispatch state never drifts."""
+
+    state_path = tmp_path / "live-jobs.json"
+    tenant_partition = LivePlanningJobRegistry._tenant_partition("tenant-a")
+
+    job_a = "live-job-migrated-immediate"
+    job_b = "live-job-migrated-prepared"
+    job_c = "live-job-migrated-ambiguous"
+
+    snap_a = _v2_snapshot_model(
+        job_a, LivePlanningJobState.RUNNING, "interpreting_requirement", 5, 1
+    ).model_dump(mode="json")
+    snap_b = _v2_snapshot_model(
+        job_b, LivePlanningJobState.QUEUED, "queued", 0, 1
+    ).model_dump(mode="json")
+    snap_c = _v2_snapshot_model(
+        job_c,
+        LivePlanningJobState.CANCELLED,
+        "cancelled",
+        100,
+        2,
+        cancellation_requested=True,
+        expires_at=datetime.now(UTC) + timedelta(minutes=25),
+    ).model_dump(mode="json")
+
+    intent = {
+        "schema_version": "tripchord-live-activation-operation-v1",
+        "operation_id": "c" * 64,
+        "idempotency_key": "v2-prepared",
+        "request_digest": "d" * 64,
+        "job_id": job_b,
+        "challenge_id": "v2-prepared-challenge",
+        "attempt_digest": "e" * 64,
+        "capability_sha256": "f" * 64,
+        "companion_identity_sha256": "a1" * 32,
+        "queued_result": {"job": snap_b},
+        "phase": "intent",
+        "dispatch_count": 0,
+    }
+
+    payload = {
+        "schema_version": "tripchord-live-job-registry-v2",
+        "records": [
+            {
+                "tenant_partition": tenant_partition,
+                "snapshot": snap_a,
+                "prepared": False,
+                "activation_operation": None,
+            },
+            {
+                "tenant_partition": tenant_partition,
+                "snapshot": snap_b,
+                "prepared": True,
+                "activation_operation": intent,
+            },
+            {
+                "tenant_partition": tenant_partition,
+                "snapshot": snap_c,
+                "prepared": False,
+                "activation_operation": None,
+            },
+        ],
+        "idempotency": [
+            {
+                "partition": LivePlanningJobRegistry._idempotency_partition(
+                    "tenant-a", "v2-immediate"
+                ),
+                "job_id": job_a,
+                "request_digest": REQUEST_SHA256,
+            },
+            {
+                "partition": LivePlanningJobRegistry._idempotency_partition(
+                    "tenant-a", "v2-prepared"
+                ),
+                "job_id": job_b,
+                "request_digest": REQUEST_SHA256,
+            },
+            {
+                "partition": LivePlanningJobRegistry._idempotency_partition(
+                    "tenant-a", "v2-ambiguous"
+                ),
+                "job_id": job_c,
+                "request_digest": REQUEST_SHA256,
+            },
+        ],
+    }
+    state_path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    state_path.chmod(0o600)
+
+    dispatches = 0
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal dispatches
+        dispatches += 1
+        return {"ok": True}
+
+    async def assert_replay_and_conflicts(registry: LivePlanningJobRegistry) -> None:
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        assert disk["schema_version"] == "tripchord-live-job-registry-v3"
+        entries = {entry["job_id"]: entry for entry in disk["idempotency"]}
+        assert entries[job_a]["defer_start"] is False
+        assert entries[job_b]["defer_start"] is True
+        assert entries[job_c]["defer_start"] is False  # placeholder, gated by isolation
+        assert entries[job_c]["legacy_isolated"] is True
+
+        cold_a = await registry.get(job_a, "tenant-a")
+        assert cold_a is not None and cold_a.state == LivePlanningJobState.CANCELLED
+        assert cold_a.stage == "restart_cancelled"
+        cold_b = await registry.get(job_b, "tenant-a")
+        assert cold_b is not None and cold_b.state == LivePlanningJobState.CANCELLED
+        assert cold_b.stage == "restart_cancelled"
+        cold_c = await registry.get(job_c, "tenant-a")
+        assert cold_c is not None and cold_c.state == LivePlanningJobState.CANCELLED
+        assert cold_c.stage == "cancelled"
+
+        # The prepared job's activation operation survives with phase=cancelled
+        # and dispatch_count unchanged — no drift on a cold restart.
+        operation_b = await registry.activation_operation(
+            job_b, "tenant-a", operation_id="c" * 64
+        )
+        assert operation_b["phase"] == "cancelled"
+        assert operation_b["dispatch_count"] == 0
+
+        # Derived immediate mode replays idempotently; the reverse conflicts.
+        replay_a, replay_a_flag = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="v2-immediate",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+        )
+        assert replay_a_flag is True and replay_a.id == job_a
+        with pytest.raises(LivePlanningJobIdempotencyConflictError):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=operation,
+                idempotency_key="v2-immediate",
+                request_digest=REQUEST_SHA256,
+                defer_start=True,
+            )
+
+        # Derived prepared mode replays idempotently; the reverse conflicts.
+        replay_b, replay_b_flag = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="v2-prepared",
+            request_digest=REQUEST_SHA256,
+            defer_start=True,
+        )
+        assert replay_b_flag is True and replay_b.id == job_b
+        with pytest.raises(LivePlanningJobIdempotencyConflictError):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=operation,
+                idempotency_key="v2-prepared",
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+            )
+
+        # The ambiguous legacy binding fails closed under BOTH modes — never
+        # replayed, never re-dispatched.
+        for mode in (True, False):
+            with pytest.raises(LivePlanningJobIdempotencyConflictError):
+                await registry.start_idempotent(
+                    tenant_id="tenant-a",
+                    operation=operation,
+                    idempotency_key="v2-ambiguous",
+                    request_digest=REQUEST_SHA256,
+                    defer_start=mode,
+                )
+
+    # First cold start: v2 -> v3 migration must load and persist valid v3.
+    second = LivePlanningJobRegistry(state_path=state_path, capacity=4, max_running=2)
+    await assert_replay_and_conflicts(second)
+    await second.close()  # full stop before the next cold start
+
+    # Second consecutive cold start: the migrated v3 file must load again.
+    third = LivePlanningJobRegistry(state_path=state_path, capacity=4, max_running=2)
+    await assert_replay_and_conflicts(third)
+    await third.close()
+
+    # No operation was ever dispatched by the migration, the replays, or the
+    # conflicts — job/task/operation state never drifted.
+    assert dispatches == 0
