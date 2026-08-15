@@ -425,6 +425,7 @@ class LivePlanningJobSnapshot(DomainModel):
     stage: str = Field(min_length=1, max_length=80)
     progress: int = Field(ge=0, le=100)
     cancellation_requested: bool = False
+    cancel_pending: bool = False
     revision: int = Field(ge=1)
     result: dict[str, Any] | None = None
     error: str | None = Field(default=None, max_length=200)
@@ -558,9 +559,21 @@ class LivePlanningJobRegistryPostCommitError(RuntimeError):
     The disk already carries the newly written state, so callers must NOT roll
     the in-memory record back to its pre-persist value — the memory was mutated
     before the persist and therefore already matches the committed disk state.
-    The failure is surfaced as an explicit indeterminate terminal outcome."""
+    The failure is surfaced as an explicit indeterminate terminal outcome.
 
-    pass
+    ``job_id`` (when set by the raising call site) carries the committed identity
+    so a production entry point can hand the caller a recoverable handle to the
+    real task instead of failing closed without a trace."""
+
+    def __init__(
+        self,
+        message: str = (
+            "live planning job registry state was committed but could not be "
+            "finalized; the on-disk record is authoritative"
+        ),
+    ) -> None:
+        super().__init__(message)
+        self.job_id: str | None = None
 
 
 class LiveJobProgressReporter(Protocol):
@@ -688,12 +701,28 @@ class _RuntimeJob:
         self.task: asyncio.Task[None] | None = None
         self.operation_task: asyncio.Task[dict[str, Any]] | None = None
         self.model_trace_summary_reported = False
+        # P0-1 bounded-cleanup bookkeeping: set once a cancellation is in flight
+        # so repeated cancels join the same cleanup, and records whether the
+        # operation coroutine actually stopped within the budget.
+        self.cancel_pending = False
+        self.cancel_future: asyncio.Future[LivePlanningJobSnapshot | None] | None = None
+        self.cancel_drain_succeeded: bool | None = None
 
 
 class _IdempotencyEntry:
-    def __init__(self, *, job_id: str, request_digest: str) -> None:
+    def __init__(
+        self,
+        *,
+        job_id: str,
+        request_digest: str,
+        defer_start: bool | None = None,
+    ) -> None:
         self.job_id = job_id
         self.request_digest = request_digest
+        # P0-3: the stable execution mode is bound into the idempotency identity
+        # so a same-key request cannot silently switch between a prepared
+        # (defer_start=True) and an immediate execution of the same payload.
+        self.defer_start = defer_start
 
 
 class LivePlanningJobRegistry:
@@ -766,6 +795,7 @@ class LivePlanningJobRegistry:
         if schema_version not in {
             "tripchord-live-job-registry-v1",
             "tripchord-live-job-registry-v2",
+            "tripchord-live-job-registry-v3",
         }:
             raise RuntimeError("live planning job registry state schema is invalid")
         records = payload["records"]
@@ -782,7 +812,10 @@ class LivePlanningJobRegistry:
                 "snapshot",
                 "prepared",
             }
-            if schema_version == "tripchord-live-job-registry-v2":
+            if schema_version in {
+                "tripchord-live-job-registry-v2",
+                "tripchord-live-job-registry-v3",
+            }:
                 expected_record_fields.add("activation_operation")
             if not isinstance(item, dict) or set(item) != expected_record_fields:
                 raise RuntimeError("live planning job registry record is invalid")
@@ -809,7 +842,10 @@ class LivePlanningJobRegistry:
                 operation=self._unrecoverable_operation,
                 prepared=prepared,
             )
-            if schema_version == "tripchord-live-job-registry-v2":
+            if schema_version in {
+                "tripchord-live-job-registry-v2",
+                "tripchord-live-job-registry-v3",
+            }:
                 activation_operation = item["activation_operation"]
                 if activation_operation is not None:
                     runtime.activation_operation = self._validate_activation_operation(
@@ -818,11 +854,14 @@ class LivePlanningJobRegistry:
                     )
             self._records[snapshot.id] = runtime
         for item in idempotency:
-            if not isinstance(item, dict) or set(item) != {
+            expected_idempotency_fields = {
                 "partition",
                 "job_id",
                 "request_digest",
-            }:
+            }
+            if schema_version == "tripchord-live-job-registry-v3":
+                expected_idempotency_fields.add("defer_start")
+            if not isinstance(item, dict) or set(item) != expected_idempotency_fields:
                 raise RuntimeError("live planning idempotency record is invalid")
             partition = item["partition"]
             job_id = item["job_id"]
@@ -836,6 +875,11 @@ class LivePlanningJobRegistry:
                 or not self._valid_request_digest(request_digest)
             ):
                 raise RuntimeError("live planning idempotency identity is invalid")
+            defer_start: bool | None = None
+            if schema_version == "tripchord-live-job-registry-v3":
+                defer_start = item["defer_start"]
+                if type(defer_start) is not bool:
+                    raise RuntimeError("live planning idempotency execution mode is invalid")
             runtime = self._records.get(job_id)
             if (
                 runtime is None
@@ -845,6 +889,7 @@ class LivePlanningJobRegistry:
             self._idempotency[partition] = _IdempotencyEntry(
                 job_id=job_id,
                 request_digest=request_digest,
+                defer_start=defer_start,
             )
         for runtime in self._records.values():
             if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
@@ -902,7 +947,7 @@ class LivePlanningJobRegistry:
         else:
             self._validate_state_file(path)
         payload = {
-            "schema_version": "tripchord-live-job-registry-v2",
+            "schema_version": "tripchord-live-job-registry-v3",
             "records": [
                 {
                     "tenant_partition": runtime.tenant_partition,
@@ -919,6 +964,7 @@ class LivePlanningJobRegistry:
                     "partition": partition,
                     "job_id": entry.job_id,
                     "request_digest": entry.request_digest,
+                    "defer_start": entry.defer_start,
                 }
                 for partition, entry in sorted(self._idempotency.items())
             ],
@@ -1065,6 +1111,17 @@ class LivePlanningJobRegistry:
                         raise LivePlanningJobIdempotencyConflictError(
                             "idempotency key was already used with a different request"
                         )
+                    elif (
+                        existing.defer_start is not None
+                        and existing.defer_start != defer_start
+                    ):
+                        # P0-3: the execution mode is part of the identity. A
+                        # same-key request that switches between a prepared and an
+                        # immediate execution must fail closed — never reuse the
+                        # old receipt under a different executor mode.
+                        raise LivePlanningJobIdempotencyConflictError(
+                            "idempotency key was already used with a different execution mode"
+                        )
                     else:
                         return existing_runtime.snapshot, True
             self._make_capacity_locked()
@@ -1074,16 +1131,18 @@ class LivePlanningJobRegistry:
                 self._idempotency[idempotency_partition] = _IdempotencyEntry(
                     job_id=job_id,
                     request_digest=request_digest,
+                    defer_start=defer_start,
                 )
             try:
                 self._persist_locked()
-            except LivePlanningJobRegistryPostCommitError:
+            except LivePlanningJobRegistryPostCommitError as exc:
                 # The new record was already committed to disk. A committed
                 # non-prepared record promises an executor, so create it now (durable
                 # start) before surfacing the indeterminate create; a prepared record
                 # stays prepared for a later activation. Never leave a committed
                 # "queued, prepared=false, task=None" job that a same-key retry
                 # reports as reused but that never executes.
+                exc.job_id = job_id
                 if not defer_start:
                     runtime.task = asyncio.create_task(
                         self._run(runtime, operation),
@@ -1168,11 +1227,12 @@ class LivePlanningJobRegistry:
                 }
             try:
                 self._persist_locked()
-            except LivePlanningJobRegistryPostCommitError:
+            except LivePlanningJobRegistryPostCommitError as exc:
                 # The dispatched state was already committed to disk; a committed
                 # "dispatched" operation must have a real executor, so complete the
                 # dispatch by creating the task before surfacing the indeterminate
                 # outcome. Never keep a fake dispatched record with no runner.
+                exc.job_id = job_id
                 runtime.task = asyncio.create_task(
                     self._run(runtime, runtime.operation),
                     name=f"tripchord:{job_id}",
@@ -1422,6 +1482,18 @@ class LivePlanningJobRegistry:
         job_id: str,
         tenant_id: str,
     ) -> LivePlanningJobSnapshot | None:
+        """Cancel a live job with a bounded, fail-closed cleanup protocol.
+
+        The final CANCELLED label is NEVER published before both the real
+        ``operation_task`` and the registry ``task`` are confirmed done. A first
+        cancellation flips the externally visible ``cancel_pending`` state, then
+        requests the operation to stop and waits within the bounded
+        ``_cancel_wait_seconds`` budget. If the operation swallows CancelledError
+        and keeps running past the budget, the job FAILS CLOSED into a
+        non-terminal ``cancel_timed_out`` state instead of faking a clean cancel.
+        Repeated cancels idempotently join the same in-flight cleanup and never
+        repeat its side effects.
+        """
         async with self._changed:
             self._prune_locked(self._utc_now())
             runtime = self._owned_locked(job_id, tenant_id)
@@ -1429,50 +1501,126 @@ class LivePlanningJobRegistry:
                 return None
             if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
                 return runtime.snapshot
-            previous_snapshot = runtime.snapshot
-            previous_generation = runtime.generation
-            previous_prepared = runtime.prepared
-            previous_activation_operation = runtime.activation_operation
-            self._terminalize_locked(
-                runtime,
-                LivePlanningJobState.CANCELLED,
-                stage="cancelled",
-                cancellation_requested=True,
-            )
-            post_commit_error: LivePlanningJobRegistryPostCommitError | None = None
-            try:
-                self._persist_locked()
-            except LivePlanningJobRegistryPostCommitError as exc:
-                # The terminalized state was already committed to disk and the
-                # in-memory record matches it. Defer re-raising until the running
-                # work has been physically cancelled and awaited, so the committed
-                # terminal label is real rather than a cancelled record over a
-                # still-running job.
-                post_commit_error = exc
-            except Exception:
-                # A pre-commit persist failure must leave the whole mutable record —
-                # snapshot, generation, the prepared flag and the full
-                # activation_operation body including every nested field —
-                # byte-identical to the untouched disk file, so a same-process
-                # retry and a cold restart observe the same facts.
-                runtime.snapshot = previous_snapshot
-                runtime.generation = previous_generation
-                runtime.prepared = previous_prepared
-                runtime.activation_operation = previous_activation_operation
-                raise
-            task = runtime.task
-            operation_task = runtime.operation_task
-            self._changed.notify_all()
+            if runtime.snapshot.cancel_pending:
+                pending_future = runtime.cancel_future
+                pending_runtime = runtime
+                future: asyncio.Future[LivePlanningJobSnapshot | None] | None = None
+                self._changed.notify_all()
+            else:
+                pending_future = None
+                pending_runtime = None
+                # Capture the full pre-call record so a pre-commit persist
+                # failure can restore it byte-identically to the untouched disk
+                # file — the transient cancel_pending/cancelling marker must never
+                # leak into memory when no durable write succeeded.
+                pre_call_snapshot = runtime.snapshot
+                pre_call_generation = runtime.generation
+                pre_call_prepared = runtime.prepared
+                pre_call_activation_operation = runtime.activation_operation
+                pre_call_cancel_pending = runtime.cancel_pending
+                pre_call_cancel_future = runtime.cancel_future
+                pre_call_cancel_drain_succeeded = runtime.cancel_drain_succeeded
+                runtime.cancel_pending = True
+                runtime.snapshot = runtime.snapshot.model_copy(
+                    update={
+                        "cancel_pending": True,
+                        "cancellation_requested": True,
+                        "stage": "cancelling",
+                        "updated_at": self._utc_now(),
+                    }
+                )
+                task = runtime.task
+                operation_task = runtime.operation_task
+                runtime.cancel_future = asyncio.get_running_loop().create_future()
+                future = runtime.cancel_future
+                self._changed.notify_all()
+        if pending_runtime is not None:
+            # A cancellation is already in flight. Join the same bounded cleanup —
+            # no repeated side effects — and settle the outcome from that run.
+            if pending_future is not None and not pending_future.done():
+                return await pending_future
+            operation_task = pending_runtime.operation_task
+            if operation_task is None or operation_task.done():
+                # The real operation has since stopped, so the pending
+                # cancellation can now complete safely.
+                async with self._lock:
+                    pending_current = self._owned_locked(job_id, tenant_id)
+                if pending_current is not None:
+                    await self._finish(
+                        pending_current,
+                        LivePlanningJobState.CANCELLED,
+                        stage="cancelled",
+                        cancellation_requested=True,
+                    )
+                    return await self.get(job_id, tenant_id)
+                return None
+            return pending_runtime.snapshot
+        # First cancellation: request the real work to stop, then wait for it
+        # within the bounded budget. _run's CancelledError handler drains the
+        # operation_task and records whether it actually stopped.
         if operation_task is not None and not operation_task.done():
             operation_task.cancel()
-        if task is not None and task is not asyncio.current_task() and not task.done():
+        task_done = task is None or task is asyncio.current_task() or task.done()
+        if not task_done:
             task.cancel()
-            await asyncio.wait((task,), timeout=self._cancel_wait_seconds + 0.1)
-        if post_commit_error is not None:
-            raise post_commit_error
+            done_tasks, _ = await asyncio.wait(
+                (task,),
+                timeout=self._cancel_wait_seconds + 0.1,
+            )
+            task_done = task in done_tasks
+        post_commit_error: LivePlanningJobRegistryPostCommitError | None = None
         async with self._lock:
             current = self._owned_locked(job_id, tenant_id)
-            return current.snapshot if current is not None else None
+            if current is None:
+                outcome: LivePlanningJobSnapshot | None = None
+                drained = True
+            elif not task_done:
+                # The runner itself did not stop within the budget — fail closed
+                # rather than publish a terminal label over running work.
+                drained = False
+            else:
+                drained = current.cancel_drain_succeeded
+                if drained is None:
+                    # No runner existed (e.g. a prepared job): nothing to drain.
+                    drained = True
+        if current is None:
+            outcome = None
+        else:
+            try:
+                if drained:
+                    await self._finish(
+                        current,
+                        LivePlanningJobState.CANCELLED,
+                        stage="cancelled",
+                        cancellation_requested=True,
+                    )
+                else:
+                    await self._mark_cancel_stuck(current)
+            except LivePlanningJobRegistryPostCommitError as exc:
+                exc.job_id = job_id
+                post_commit_error = exc
+            except Exception:
+                # A pre-commit persist failure leaves the whole mutable record —
+                # including the transient cancel_pending/cancelling marker —
+                # byte-identical to the untouched disk file, so a same-process
+                # retry and a cold restart observe the same facts.
+                async with self._lock:
+                    rolled_back = self._owned_locked(job_id, tenant_id)
+                    if rolled_back is not None:
+                        rolled_back.snapshot = pre_call_snapshot
+                        rolled_back.generation = pre_call_generation
+                        rolled_back.prepared = pre_call_prepared
+                        rolled_back.activation_operation = pre_call_activation_operation
+                        rolled_back.cancel_pending = pre_call_cancel_pending
+                        rolled_back.cancel_future = pre_call_cancel_future
+                        rolled_back.cancel_drain_succeeded = pre_call_cancel_drain_succeeded
+                raise
+            outcome = current.snapshot
+        if future is not None and not future.done():
+            future.set_result(outcome)
+        if post_commit_error is not None:
+            raise post_commit_error
+        return outcome
 
     async def wait_for_change(
         self,
@@ -1574,14 +1722,16 @@ class LivePlanningJobRegistry:
                 raise TimeoutError
             result = operation_task.result()
         except asyncio.CancelledError:
-            await self._finish(
-                runtime,
-                LivePlanningJobState.CANCELLED,
-                stage="cancelled",
-                expected_generation=generation,
-                cancellation_requested=True,
+            # P0-1 bounded cleanup: request the operation to stop and wait within
+            # the budget BEFORE any terminal label is published. The final
+            # CANCELLED is owned by cancel(), which reads `cancel_drain_succeeded`
+            # and only then terminalizes (or fails closed). Recording the drain
+            # result here and re-raising keeps this task genuinely cancelled so
+            # the real work and the registry record never disagree.
+            runtime.cancel_drain_succeeded = await self._cancel_and_drain_operation(
+                operation_task
             )
-            await self._cancel_and_drain_operation(operation_task)
+            raise
         except TimeoutError as exc:
             failure = _safe_failure_diagnostic(
                 exc,
@@ -1623,11 +1773,21 @@ class LivePlanningJobRegistry:
     async def _cancel_and_drain_operation(
         self,
         operation_task: asyncio.Task[dict[str, Any]] | None,
-    ) -> None:
+    ) -> bool:
+        """Cancel the operation and wait within the bounded budget.
+
+        Returns True when the operation is confirmed stopped (already done, or
+        done within the budget) and False when it swallowed CancelledError and is
+        still alive past the budget — the caller must then fail closed rather than
+        publish a fake terminal label over running work."""
         if operation_task is None or operation_task.done():
-            return
+            return True
         operation_task.cancel()
-        await asyncio.wait((operation_task,), timeout=self._cancel_wait_seconds)
+        done, _ = await asyncio.wait(
+            (operation_task,),
+            timeout=self._cancel_wait_seconds,
+        )
+        return operation_task in done
 
     @staticmethod
     def _consume_task_result(task: asyncio.Task[dict[str, Any]]) -> None:
@@ -1840,6 +2000,51 @@ class LivePlanningJobRegistry:
                 raise
             self._changed.notify_all()
 
+    async def _mark_cancel_stuck(self, runtime: _RuntimeJob) -> None:
+        """P0-1 fail-closed outcome when the operation did not stop within the
+        bounded cancellation budget.
+
+        The job stays NON-terminal with an externally visible ``cancel_pending``
+        state and an explicit ``cancel_timed_out`` stage, so a caller is never
+        told the job is cleanly cancelled while the operation may still be
+        running. The generation bump isolates the still-alive operation from any
+        further registry writes, and a cold restart fail-closes the record to
+        ``restart_cancelled`` — the only terminal state that is guaranteed to
+        appear after the operation's process is actually gone.
+        """
+        async with self._changed:
+            if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                return
+            previous_snapshot = runtime.snapshot
+            previous_generation = runtime.generation
+            previous_prepared = runtime.prepared
+            previous_activation_operation = runtime.activation_operation
+            runtime.snapshot = runtime.snapshot.model_copy(
+                update={
+                    "cancel_pending": True,
+                    "stage": "cancel_timed_out",
+                    "error": (
+                        "live planning operation did not stop within the bounded "
+                        "cancellation budget; the job stays non-terminal and the "
+                        "operation is isolated"
+                    ),
+                    "revision": runtime.snapshot.revision + 1,
+                    "updated_at": self._utc_now(),
+                }
+            )
+            runtime.generation += 1
+            try:
+                self._persist_locked()
+            except LivePlanningJobRegistryPostCommitError:
+                raise
+            except Exception:
+                runtime.snapshot = previous_snapshot
+                runtime.generation = previous_generation
+                runtime.prepared = previous_prepared
+                runtime.activation_operation = previous_activation_operation
+                raise
+            self._changed.notify_all()
+
     async def _ensure_active(self, runtime: _RuntimeJob, generation: int) -> None:
         async with self._lock:
             self._ensure_active_locked(runtime, generation)
@@ -1891,10 +2096,12 @@ class LivePlanningJobRegistry:
             "expires_at": now + self._terminal_ttl,
             "revision": runtime.snapshot.revision + 1,
             "updated_at": now,
+            "cancel_pending": False,
         }
         if cancellation_requested is not None:
             updates["cancellation_requested"] = cancellation_requested
         runtime.snapshot = runtime.snapshot.model_copy(update=updates)
+        runtime.cancel_pending = False
         runtime.generation += 1
         # A terminalized job can no longer be an un-activated prepared record; the
         # on-disk invariant requires a prepared record to be QUEUED, so clearing

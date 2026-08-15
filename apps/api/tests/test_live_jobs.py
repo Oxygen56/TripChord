@@ -2026,3 +2026,222 @@ async def test_activation_intent_conflict_is_rejected_before_dispatch(
     )
     await registry.cancel(prepared.id, "tenant-a")
     await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_fails_closed_when_operation_swallows_cancellation_past_budget(
+    tmp_path: Path,
+) -> None:
+    """C-143 P0-1 counter-example: an operation coroutine that catches and swallows
+    CancelledError can keep running and producing side effects after cancel() is
+    called. cancel() must NOT publish a final CANCELLED while the real
+    operation_task is still alive — it must fail closed with a non-terminal,
+    externally visible cancel_pending state and an explicit cancellation-timeout
+    signal. A final terminal state may appear only once the operation_task is
+    confirmed done, and the returned state, memory, disk, task/operation_task,
+    same-process retry and cold restart must all agree."""
+    state_path = tmp_path / "live-jobs.json"
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        cancel_wait_seconds=0.05,
+    )
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+    release = asyncio.Event()
+    side_effects = 0
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal side_effects
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            swallowed.set()
+            # Swallow every further cancellation while waiting for the release,
+            # then attempt one externally visible side effect and stop. The wait
+            # is bounded by `release` so a failed assertion cannot strand a
+            # forever-looping operation across the pytest event loop.
+            while not release.is_set():
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    pass
+            side_effects += 1
+            raise asyncio.CancelledError
+        return {"ok": True}
+
+    job = await registry.start(tenant_id="tenant-a", operation=operation)
+    await started.wait()
+    try:
+        outcome = await registry.cancel(job.id, "tenant-a")
+        assert swallowed.is_set()
+        runtime = registry._records[job.id]
+        # The real operation is still alive — it swallowed the cancellation and
+        # kept working past the bounded cleanup budget.
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
+        # Fail-closed: never a fake terminal CANCELLED over a running operation.
+        assert outcome is not None
+        assert outcome.state != LivePlanningJobState.CANCELLED
+        assert outcome.cancel_pending is True
+        assert outcome.stage == "cancel_timed_out"
+        assert outcome.cancellation_requested is True
+        frozen = side_effects
+        await asyncio.sleep(0.03)
+        # The operation is still isolated-but-alive; cancel() did not claim it
+        # stopped.
+        assert not runtime.operation_task.done()
+        assert side_effects == frozen
+        release.set()
+        for _ in range(100):
+            if runtime.operation_task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert runtime.operation_task.done()
+        assert side_effects == frozen + 1
+        # Once the real operation finally stopped, a repeated cancel (joining the
+        # same cleanup semantics without repeating side effects) publishes the true
+        # terminal CANCELLED; memory and disk agree.
+        retried = await registry.cancel(job.id, "tenant-a")
+        assert retried is not None and retried.state == LivePlanningJobState.CANCELLED
+        assert retried.stage == "cancelled"
+        assert retried.cancel_pending is False
+        after = await registry.get(job.id, "tenant-a")
+        assert after == retried
+        disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record
+            for record in disk_payload["records"]
+            if record["snapshot"]["id"] == job.id
+        )
+        assert disk_record["snapshot"] == after.model_dump(mode="json")
+        assert disk_record["snapshot"]["cancel_pending"] is False
+        # A brand-new instance reads the same committed facts from disk.
+        reloaded = LivePlanningJobRegistry(state_path=state_path)
+        reloaded_snapshot = await reloaded.get(job.id, "tenant-a")
+        assert reloaded_snapshot is not None
+        assert reloaded_snapshot.state == LivePlanningJobState.CANCELLED
+        assert reloaded_snapshot.stage == "cancelled"
+        await reloaded.close()
+    finally:
+        # Ensure the operation stops and the registry closes even when the cancel
+        # contract was violated (the red run), so the event loop can tear down.
+        release.set()
+        runtime = registry._records[job.id]
+        if runtime.operation_task is not None and not runtime.operation_task.done():
+            runtime.operation_task.cancel()
+            try:
+                await asyncio.wait_for(runtime.operation_task, timeout=2)
+            except (asyncio.CancelledError, TimeoutError):
+                pass
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_idempotency_binds_execution_mode_between_prepared_and_immediate() -> None:
+    """C-143 P0-3 counter-example: the idempotency identity must bind the stable
+    execution mode (defer_start). The same key + same request digest used first as
+    a prepared (defer_start=True) job and then as an immediate job — or the reverse
+    — must fail closed with a conflict instead of silently reusing the old receipt
+    under a different execution mode."""
+    registry = LivePlanningJobRegistry(capacity=4, max_running=2)
+    release = asyncio.Event()
+
+    async def operation(_: Any) -> dict[str, Any]:
+        await release.wait()
+        return {"ok": True}
+
+    prepared, prepared_replayed = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="execution-mode-key",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    assert prepared_replayed is False
+    # prepared -> immediate must fail closed, never reuse the prepared receipt.
+    with pytest.raises(LivePlanningJobIdempotencyConflictError):
+        await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="execution-mode-key",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+        )
+    # Same-mode retry stays idempotent.
+    prepared_again, prepared_again_replayed = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="execution-mode-key",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    assert prepared_again_replayed is True
+    assert prepared_again.id == prepared.id
+    await registry.cancel(prepared.id, "tenant-a")
+
+    # immediate -> prepared must also fail closed.
+    immediate, immediate_replayed = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="reverse-mode-key",
+        request_digest=REQUEST_SHA256,
+        defer_start=False,
+    )
+    assert immediate_replayed is False
+    with pytest.raises(LivePlanningJobIdempotencyConflictError):
+        await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="reverse-mode-key",
+            request_digest=REQUEST_SHA256,
+            defer_start=True,
+        )
+    await registry.cancel(immediate.id, "tenant-a")
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_idempotency_execution_mode_binding_survives_cold_restart(
+    tmp_path: Path,
+) -> None:
+    """C-143 P0-3: the execution mode is part of the persisted idempotency
+    identity, so a real cold restart still rejects a same-key cross-mode request
+    (fail-closed conflict) while same-mode retry stays idempotent."""
+    state_path = tmp_path / "live-jobs.json"
+    release = asyncio.Event()
+
+    async def operation(_: Any) -> dict[str, Any]:
+        await release.wait()
+        return {"ok": True}
+
+    first = LivePlanningJobRegistry(state_path=state_path, capacity=4, max_running=2)
+    prepared, _ = await first.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="cold-mode-key",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    await first.close()
+
+    second = LivePlanningJobRegistry(state_path=state_path, capacity=4, max_running=2)
+    cold = await second.get(prepared.id, "tenant-a")
+    assert cold is not None and cold.state == LivePlanningJobState.CANCELLED
+    with pytest.raises(LivePlanningJobIdempotencyConflictError):
+        await second.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="cold-mode-key",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+        )
+    same_mode, replayed = await second.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="cold-mode-key",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    assert replayed is True
+    assert same_mode.id == prepared.id
+    await second.close()

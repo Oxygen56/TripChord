@@ -50,6 +50,7 @@ from tripchord.agents.live_jobs import (
     LivePlanningJobIdempotencyConflictError,
     LivePlanningJobInactiveError,
     LivePlanningJobRegistry,
+    LivePlanningJobRegistryPostCommitError,
     LivePlanningJobSnapshot,
     LivePlanningJobState,
     LiveSourceTerminalEvent,
@@ -2725,6 +2726,27 @@ async def start_live_flexible_from_text_job_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="live planning job capacity is currently exhausted",
             headers={"Retry-After": "30"},
+        ) from exc
+    except LivePlanningJobRegistryPostCommitError as exc:
+        # P0-2: the persistent task entry was already committed to disk and the
+        # real task is running, but the response envelope was lost to a
+        # post-commit persist exception. Return the recoverable committed job
+        # identity so the caller can query/cancel the same task with only the
+        # original Idempotency-Key or the returned identity — never a bare 500
+        # that leaves a running task unreachable.
+        if exc.job_id is not None:
+            committed = await registry.get(exc.job_id, principal.tenant_id)
+            if committed is not None:
+                status_url = f"/api/v1/agents/live-flexible-plan-from-text/jobs/{committed.id}"
+                return StartLiveFlexibleFromTextJobResponse(
+                    job=committed,
+                    replayed=False,
+                    status_url=status_url,
+                    events_url=f"{status_url}/events",
+                )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="live planning job was committed but its identity could not be recovered",
         ) from exc
     status_url = f"/api/v1/agents/live-flexible-plan-from-text/jobs/{job.id}"
     return StartLiveFlexibleFromTextJobResponse(

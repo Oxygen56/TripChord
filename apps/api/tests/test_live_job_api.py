@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -750,4 +752,87 @@ async def test_sse_stream_gates_result_until_after_barrier_release(
         assert '"source_terminal_events"' in streamed.text
         assert '"done": true' in streamed.text
         assert "event: result" in streamed.text
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_start_post_commit_persist_failure_returns_recoverable_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-143 P0-2 counter-example: when a production persistent task entry's
+    post-commit persist fails (the record was already committed to disk and the
+    real task is running), the start endpoint must return a recoverable committed
+    job identity instead of a bare 500. A same-key retry must retrieve the same
+    job, and query/cancel must act on that same task — no duplicate dispatch."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class BlockingFlexibleSystem:
+        async def run(self, *_: Any, **__: Any) -> Any:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    registry = LivePlanningJobRegistry(
+        state_path=tmp_path / "live-jobs.json",
+        capacity=4,
+    )
+    monkeypatch.setattr(app.state, "live_planning_job_registry", registry)
+    monkeypatch.setattr(app.state, "package_requirement_agent", package_requirement_agent)
+    monkeypatch.setattr(app.state, "flexible_live_agent_system", BlockingFlexibleSystem())
+    monkeypatch.setattr(app.state, "live_run_cache", LiveRunCache())
+    monkeypatch.setattr(settings, "browser_bridge_require_all_providers", True)
+
+    path = "/api/v1/agents/live-flexible-plan-from-text/jobs"
+    key_header = {"Idempotency-Key": "post-commit-recoverable-1"}
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+        base_url="http://test",
+    ) as client:
+        monkeypatch.setenv(
+            "TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT",
+            "post_replace_dir_fsync",
+        )
+        created = await client.post(path, json=_payload(ready=True), headers=key_header)
+        monkeypatch.delenv("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT")
+        # The committed identity is recoverable — not a bare 500.
+        assert created.status_code == 202
+        created_job = created.json()["job"]
+        job_id = created_job["id"]
+        assert created.json()["replayed"] is False
+        assert created.json()["status_url"].endswith(job_id)
+        # The real task is genuinely running behind the lost response envelope.
+        await asyncio.wait_for(started.wait(), timeout=2)
+
+        # The committed record is durably on disk with the same committed state.
+        disk_payload = json.loads(
+            (tmp_path / "live-jobs.json").read_text(encoding="utf-8")
+        )
+        disk_record = next(
+            record
+            for record in disk_payload["records"]
+            if record["snapshot"]["id"] == job_id
+        )
+        assert disk_record["snapshot"]["id"] == job_id
+
+        # Query and same-key retry act on the same committed task.
+        queried = await client.get(f"{path}/{job_id}")
+        assert queried.status_code == 200
+        assert queried.json()["id"] == job_id
+        replay = await client.post(path, json=_payload(ready=True), headers=key_header)
+        assert replay.status_code == 202
+        assert replay.json()["job"]["id"] == job_id
+        assert replay.json()["replayed"] is True
+
+        # Cancel acts on the same task; no duplicate dispatch.
+        stopped = await client.delete(f"{path}/{job_id}")
+        assert stopped.status_code == 200
+        assert stopped.json()["id"] == job_id
+        assert cancelled.is_set()
+        terminal = await _terminal_job(client, job_id)
+        assert terminal["state"] == "cancelled"
     await registry.close()
