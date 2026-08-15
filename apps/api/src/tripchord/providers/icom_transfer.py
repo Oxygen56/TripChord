@@ -430,7 +430,11 @@ class IComTransferProvider:
     ) -> IComTransferSearchResult:
         formal_active = (
             self._source_authority is not None
-            and self._source_authority.is_active()
+            and getattr(
+                self._source_authority,
+                "execution_active",
+                self._source_authority.is_active,
+            )()
         )
         if not query_task_id and formal_active:
             raise ValueError("iCom query_task_id is required")

@@ -10,6 +10,7 @@ import stat
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -41,6 +42,9 @@ _SCHEMA_VERSION = "tripchord-formal-live-source-v3"
 _BINDING_SCHEMA_VERSION = "tripchord-formal-live-source-binding-v3"
 _CHALLENGE_SCHEMA_VERSION = "tripchord-formal-live-source-challenge-v3"
 _RECEIPT_SCHEMA_VERSION = "tripchord-formal-live-source-authority-receipt-v3"
+_EXECUTION_CAPABILITY_SCHEMA_VERSION = (
+    "tripchord-formal-live-source-execution-capability-v1"
+)
 _STARTUP_CAPABILITY = object()
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _TRUST_ROOT_ENV = "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"
@@ -81,6 +85,10 @@ _FINALIZE_CONTEXT_FIELDS = _CHALLENGE_CONTEXT_FIELDS | {
 _EVENT_CONTEXT_FIELDS = (_CHALLENGE_CONTEXT_FIELDS - {"job_graph"}) | {
     "job_graph_sha256"
 }
+_EXECUTION_CAPABILITY_CONTEXT: ContextVar[dict[str, object] | None] = ContextVar(
+    "tripchord_formal_execution_capability",
+    default=None,
+)
 
 
 def _frozen_per_pair_tasks() -> dict[str, tuple[str, ...]]:
@@ -721,6 +729,73 @@ def _challenge_proof_payload(challenge: Mapping[str, object]) -> dict[str, objec
         "issued_at": challenge["issued_at"],
         "expires_at": challenge["expires_at"],
     }
+
+
+def _execution_capability_proof_payload(
+    capability: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "purpose": "tripchord-formal-live-source-execution-capability-proof-v1",
+        **{key: value for key, value in capability.items() if key != "signature"},
+    }
+
+
+def _validate_execution_capability(
+    capability: object,
+    *,
+    challenge: Mapping[str, object],
+) -> dict[str, object]:
+    fields = {
+        "schema_version",
+        "anchor_version",
+        "authority_key_id",
+        "capability_id",
+        "challenge_id",
+        "nonce_digest",
+        "run_id",
+        "tested_commit_sha",
+        "terminal_job_id",
+        "job_graph_sha256",
+        "request_sha256",
+        "attempt_digest",
+        "issued_at",
+        "expires_at",
+        "signature",
+    }
+    if not isinstance(capability, dict) or set(capability) != fields:
+        raise ValueError("formal execution capability has an invalid shape")
+    if capability["schema_version"] != _EXECUTION_CAPABILITY_SCHEMA_VERSION:
+        raise ValueError("formal execution capability schema is invalid")
+    try:
+        UUID(str(capability["capability_id"]))
+    except ValueError as exc:
+        raise ValueError("formal execution capability identity is invalid") from exc
+    graph = _validate_job_graph(challenge["job_graph"])
+    expected = {
+        "anchor_version": challenge["anchor_version"],
+        "authority_key_id": challenge["authority_key_id"],
+        "challenge_id": challenge["challenge_id"],
+        "nonce_digest": challenge["nonce_digest"],
+        "run_id": challenge["run_id"],
+        "tested_commit_sha": challenge["tested_commit_sha"],
+        "terminal_job_id": graph["terminal_job_id"],
+        "job_graph_sha256": graph["job_graph_sha256"],
+        "request_sha256": challenge["request_sha256"],
+        "issued_at": challenge["issued_at"],
+        "expires_at": challenge["expires_at"],
+    }
+    if any(capability[key] != value for key, value in expected.items()):
+        raise ValueError("formal execution capability is bound to a foreign job")
+    _require_sha256(
+        capability["attempt_digest"],
+        "formal execution capability attempt digest",
+    )
+    _verify_signature(
+        _execution_capability_proof_payload(capability),
+        capability["signature"],
+        "formal execution capability",
+    )
+    return dict(capability)
 
 
 def _receipt_proof_payload(receipt: Mapping[str, object]) -> dict[str, object]:
@@ -2839,6 +2914,18 @@ def validate_formal_source_challenge(challenge: object) -> dict[str, object]:
     return _validate_challenge(challenge)
 
 
+def validate_formal_execution_capability(
+    capability: object,
+    challenge: object,
+) -> dict[str, object]:
+    """Verify one job-bound capability offline against its signed challenge."""
+
+    return _validate_execution_capability(
+        capability,
+        challenge=_validate_challenge(challenge),
+    )
+
+
 def validate_formal_source_snapshot(snapshot: object) -> dict[str, object]:
     if not isinstance(snapshot, dict):
         raise ValueError("formal source snapshot is not an object")
@@ -2879,6 +2966,7 @@ class FormalLiveSourceAuthority:
         self._state_lock = threading.RLock()
         self._bound = False
         self._active_challenge: dict[str, object] | None = None
+        self._execution_capability: dict[str, object] | None = None
         self._baseline: dict[str, object] | None = None
         self._events: list[dict[str, object]] = []
         self._chain_sha256 = self._composition_sha256
@@ -2890,6 +2978,7 @@ class FormalLiveSourceAuthority:
             raise RuntimeError("formal source active state is incomplete")
         return {
             "challenge": self._active_challenge,
+            "execution_capability": self._execution_capability,
             "baseline": self._baseline,
             "events": list(self._events),
             "chain_sha256": self._chain_sha256,
@@ -2899,6 +2988,7 @@ class FormalLiveSourceAuthority:
     def _apply_active_state(self, value: object) -> None:
         fields = {
             "challenge",
+            "execution_capability",
             "baseline",
             "events",
             "chain_sha256",
@@ -2907,6 +2997,10 @@ class FormalLiveSourceAuthority:
         if not isinstance(value, dict) or set(value) != fields:
             raise RuntimeError("formal source persisted active state is invalid")
         challenge = _validate_challenge(value["challenge"])
+        capability = _validate_execution_capability(
+            value["execution_capability"],
+            challenge=challenge,
+        )
         if challenge["tested_commit_sha"] != self._composition["commit_sha"]:
             raise RuntimeError("formal source active state belongs to another build")
         baseline = _validate_snapshot(value["baseline"], challenge)
@@ -2927,6 +3021,7 @@ class FormalLiveSourceAuthority:
         )
         checked = _validate_snapshot(replay_snapshot, challenge)
         self._active_challenge = challenge
+        self._execution_capability = capability
         self._baseline = baseline
         self._events = list(checked["events"])
         self._chain_sha256 = str(checked["chain_sha256"])
@@ -3017,21 +3112,61 @@ class FormalLiveSourceAuthority:
         self._bound = True
 
     def issue_challenge(
-        self, context: object, *, lifetime_seconds: int = 3600
+        self,
+        context: object,
+        *,
+        lifetime_seconds: int = 3600,
+        idempotency_key: str | None = None,
     ) -> dict[str, object]:
         with self._state_lock:
             return self._issue_challenge_locked(
                 context,
                 lifetime_seconds=lifetime_seconds,
+                idempotency_key=idempotency_key,
             )
 
+    def issue_replay(
+        self,
+        context: object,
+        *,
+        lifetime_seconds: int = 3600,
+        idempotency_key: object,
+    ) -> dict[str, object] | None:
+        """Retrieve an already committed issue response without live process state."""
+
+        key = _nonempty_string(
+            idempotency_key,
+            "formal source issue idempotency key",
+        )
+        if len(key) > 200:
+            raise ValueError("formal source issue idempotency key is invalid")
+        request_digest = _sha256(
+            {"context": context, "lifetime_seconds": lifetime_seconds}
+        )
+        with self._state_lock, self._ledger_lock():
+            ledger = self._read_ledger()
+            for row in ledger.values():
+                if row.get("issue_idempotency_key") != key:
+                    continue
+                if row.get("issue_request_digest") != request_digest:
+                    raise ValueError(
+                        "formal source issue idempotency key was used with a different request"
+                    )
+                result = row.get("issue_result")
+                if not isinstance(result, dict):
+                    raise RuntimeError("formal source issue result is unavailable")
+                return json.loads(_canonical_bytes(result))
+        return None
+
     def _issue_challenge_locked(
-        self, context: object, *, lifetime_seconds: int
+        self,
+        context: object,
+        *,
+        lifetime_seconds: int,
+        idempotency_key: str | None,
     ) -> dict[str, object]:
         if not self._bound:
             raise RuntimeError("formal source authority is not composition-bound")
-        if self._active_challenge is not None:
-            raise ValueError("formal source authority already has an active challenge")
         if (
             not isinstance(lifetime_seconds, int)
             or isinstance(lifetime_seconds, bool)
@@ -3040,6 +3175,10 @@ class FormalLiveSourceAuthority:
             raise ValueError("formal source challenge lifetime is invalid")
         if not isinstance(context, dict) or set(context) != _CHALLENGE_CONTEXT_FIELDS:
             raise ValueError("formal source challenge context has an invalid shape")
+        if idempotency_key is None:
+            idempotency_key = f"legacy-{_sha256(context)}"
+        elif not idempotency_key.strip() or len(idempotency_key) > 200:
+            raise ValueError("formal source issue idempotency key is invalid")
         runtime = _runtime_identity(context["runtime_identity"])
         if (
             runtime != self._runtime_identity
@@ -3062,6 +3201,22 @@ class FormalLiveSourceAuthority:
             raise ValueError("formal source challenge run_id is invalid")
         with self._ledger_lock():
             ledger = self._read_ledger()
+            request_digest = _sha256(
+                {"context": context, "lifetime_seconds": lifetime_seconds}
+            )
+            for row in ledger.values():
+                if row.get("issue_idempotency_key") != idempotency_key:
+                    continue
+                if row.get("issue_request_digest") != request_digest:
+                    raise ValueError(
+                        "formal source issue idempotency key was used with a different request"
+                    )
+                result = row.get("issue_result")
+                if not isinstance(result, dict):
+                    raise RuntimeError("formal source issue result is unavailable")
+                return json.loads(_canonical_bytes(result))
+            if self._active_challenge is not None:
+                raise ValueError("formal source authority already has an active challenge")
             now = self._utc_now()
             for row in ledger.values():
                 if row.get("state") == "issued" and now > _require_aware_time(
@@ -3096,29 +3251,61 @@ class FormalLiveSourceAuthority:
                 self._private_key,
                 _challenge_proof_payload(challenge),
             )
+            capability: dict[str, object] = {
+                "schema_version": _EXECUTION_CAPABILITY_SCHEMA_VERSION,
+                "anchor_version": challenge["anchor_version"],
+                "authority_key_id": challenge["authority_key_id"],
+                "capability_id": str(uuid4()),
+                "challenge_id": challenge["challenge_id"],
+                "nonce_digest": challenge["nonce_digest"],
+                "run_id": challenge["run_id"],
+                "tested_commit_sha": challenge["tested_commit_sha"],
+                "terminal_job_id": job_graph["terminal_job_id"],
+                "job_graph_sha256": job_graph["job_graph_sha256"],
+                "request_sha256": challenge["request_sha256"],
+                "attempt_digest": hashlib.sha256(
+                    idempotency_key.encode("utf-8")
+                ).hexdigest(),
+                "issued_at": challenge["issued_at"],
+                "expires_at": challenge["expires_at"],
+            }
+            capability["signature"] = _sign(
+                self._private_key,
+                _execution_capability_proof_payload(capability),
+            )
             self._active_challenge = challenge
+            self._execution_capability = capability
             self._events = []
             self._chain_sha256 = self._composition_sha256
             self._last_heartbeat = None
             self._baseline = self._snapshot_locked()
+            result = {
+                "challenge": dict(challenge),
+                "before": dict(self._baseline),
+                "execution_capability": dict(capability),
+            }
             ledger[str(challenge["challenge_id"])] = {
                 "run_id": context["run_id"],
                 "state": "issued",
                 "challenge_digest": _sha256(challenge),
                 "issued_at": challenge["issued_at"],
                 "expires_at": challenge["expires_at"],
+                "issue_idempotency_key": idempotency_key,
+                "issue_request_digest": request_digest,
+                "issue_result": result,
                 "active_state": self._active_state_payload(),
             }
             try:
                 self._write_ledger(ledger)
             except Exception:
                 self._active_challenge = None
+                self._execution_capability = None
                 self._baseline = None
                 self._events = []
                 self._chain_sha256 = self._composition_sha256
                 self._last_heartbeat = None
                 raise
-        return {"challenge": dict(challenge), "before": dict(self._baseline)}
+        return result
 
     def record_browser_http(
         self,
@@ -3169,6 +3356,7 @@ class FormalLiveSourceAuthority:
         with self._state_lock:
             if self._active_challenge is None:
                 raise ValueError("formal iCom call has no active challenge")
+            self._require_execution_capability()
             graph = _validate_job_graph(self._active_challenge["job_graph"])
             source_id = _nonempty_string(source_task_id, "formal iCom source task")
             endpoint = _nonempty_string(path, "formal iCom endpoint")
@@ -3224,6 +3412,7 @@ class FormalLiveSourceAuthority:
         with self._state_lock:
             if self._active_challenge is None:
                 raise ValueError("formal Browser query has no active challenge")
+            self._require_execution_capability()
             graph = _validate_job_graph(self._active_challenge["job_graph"])
             runtime_task_id = _nonempty_string(task_id, "formal Browser task_id")
             provider_name = _nonempty_string(provider, "formal Browser provider")
@@ -3354,6 +3543,58 @@ class FormalLiveSourceAuthority:
         with self._state_lock:
             return self._active_challenge is not None
 
+    def execution_active(self) -> bool:
+        """Whether this async flow carries the signed active job capability."""
+
+        with self._state_lock:
+            try:
+                self._require_execution_capability()
+            except ValueError:
+                return False
+            return True
+
+    def current_execution_capability(self) -> dict[str, object] | None:
+        """Return the verified capability only inside its bound operation flow."""
+
+        with self._state_lock:
+            try:
+                return dict(self._require_execution_capability())
+            except ValueError:
+                return None
+
+    @contextmanager
+    def execution_scope(self, capability: object) -> Iterator[None]:
+        """Bind one verified operation capability to the current async flow."""
+
+        with self._state_lock:
+            checked = self._require_execution_capability(capability)
+        token: Token[dict[str, object] | None] = (
+            _EXECUTION_CAPABILITY_CONTEXT.set(checked)
+        )
+        try:
+            yield
+        finally:
+            _EXECUTION_CAPABILITY_CONTEXT.reset(token)
+
+    def _require_execution_capability(
+        self,
+        capability: object | None = None,
+    ) -> dict[str, object]:
+        if self._active_challenge is None or self._execution_capability is None:
+            raise ValueError("formal execution capability has no active challenge")
+        supplied = (
+            capability
+            if capability is not None
+            else _EXECUTION_CAPABILITY_CONTEXT.get()
+        )
+        checked = _validate_execution_capability(
+            supplied,
+            challenge=self._active_challenge,
+        )
+        if checked != self._execution_capability:
+            raise ValueError("formal execution capability does not match the active job")
+        return checked
+
     def _snapshot_locked(self) -> dict[str, object]:
         if not self._bound or self._active_challenge is None:
             raise RuntimeError("formal source snapshot requires an active signed challenge")
@@ -3399,6 +3640,117 @@ class FormalLiveSourceAuthority:
             graph = _validate_job_graph(self._active_challenge["job_graph"])
             if job_id != graph["terminal_job_id"]:
                 raise ValueError("formal source activation targets a foreign job")
+
+    def activation_replay(
+        self,
+        *,
+        job_id: object,
+        capability: object,
+        idempotency_key: object,
+    ) -> dict[str, object] | None:
+        """Return the durable activation response for one exact retry identity."""
+
+        key = _nonempty_string(
+            idempotency_key,
+            "formal source activation idempotency key",
+        )
+        if len(key) > 200:
+            raise ValueError("formal source activation idempotency key is invalid")
+        with self._state_lock, self._ledger_lock():
+            ledger = self._read_ledger()
+            row: dict[str, object] | None = None
+            checked: dict[str, object] | None = None
+            for candidate in ledger.values():
+                issued = candidate.get("issue_result")
+                if not isinstance(issued, dict):
+                    continue
+                challenge = issued.get("challenge")
+                try:
+                    candidate_capability = _validate_execution_capability(
+                        capability,
+                        challenge=_validate_challenge(challenge),
+                    )
+                except (RuntimeError, ValueError):
+                    continue
+                row = candidate
+                checked = candidate_capability
+                break
+            if row is None or checked is None:
+                raise ValueError("formal source activation capability is unknown")
+            if job_id != checked["terminal_job_id"]:
+                raise ValueError("formal source activation targets a foreign job")
+            request_digest = _sha256(
+                {"job_id": job_id, "execution_capability": checked}
+            )
+            record = row.get("activation_record")
+            if record is None:
+                if row.get("state") != "issued":
+                    raise ValueError("formal source activation challenge is not active")
+                self._require_execution_capability(capability)
+                return None
+            if not isinstance(record, dict):
+                raise RuntimeError("formal source activation result is invalid")
+            if (
+                record.get("idempotency_key") != key
+                or record.get("request_digest") != request_digest
+            ):
+                raise ValueError(
+                    "formal source activation idempotency key was used with a different request"
+                )
+            result = record.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("formal source activation result is unavailable")
+            return json.loads(_canonical_bytes(result))
+
+    def store_activation_result(
+        self,
+        *,
+        job_id: object,
+        capability: object,
+        idempotency_key: object,
+        result: object,
+    ) -> dict[str, object]:
+        """Atomically persist the complete response before it is returned."""
+
+        key = _nonempty_string(
+            idempotency_key,
+            "formal source activation idempotency key",
+        )
+        if len(key) > 200 or not isinstance(result, dict):
+            raise ValueError("formal source activation result is invalid")
+        with self._state_lock, self._ledger_lock():
+            checked = self._require_execution_capability(capability)
+            if job_id != checked["terminal_job_id"]:
+                raise ValueError("formal source activation targets a foreign job")
+            ledger = self._read_ledger()
+            row = ledger.get(str(checked["challenge_id"]))
+            if not isinstance(row, dict) or row.get("state") != "issued":
+                raise ValueError("formal source activation challenge is not active")
+            request_digest = _sha256(
+                {"job_id": job_id, "execution_capability": checked}
+            )
+            existing = row.get("activation_record")
+            if existing is not None:
+                if not isinstance(existing, dict):
+                    raise RuntimeError("formal source activation result is invalid")
+                if (
+                    existing.get("idempotency_key") != key
+                    or existing.get("request_digest") != request_digest
+                ):
+                    raise ValueError(
+                        "formal source activation idempotency key was used with a different request"
+                    )
+                stored = existing.get("result")
+                if not isinstance(stored, dict):
+                    raise RuntimeError("formal source activation result is unavailable")
+                return json.loads(_canonical_bytes(stored))
+            row["activation_record"] = {
+                "idempotency_key": key,
+                "request_digest": request_digest,
+                "result": result,
+            }
+            self._write_ledger(ledger)
+            return json.loads(_canonical_bytes(result))
 
     def abort(self, context: object) -> dict[str, object]:
         return self._terminal_transition(context, target="aborted", require_expired=False)
@@ -3461,25 +3813,78 @@ class FormalLiveSourceAuthority:
                 "transitioned_at": transitioned_at,
             }
 
-    def finalize(self, context: object) -> dict[str, object]:
+    def finalize(
+        self,
+        context: object,
+        *,
+        idempotency_key: str | None = None,
+        execution_capability: object | None = None,
+    ) -> dict[str, object]:
         with self._state_lock:
-            return self._finalize_locked(context)
+            return self._finalize_locked(
+                context,
+                idempotency_key=idempotency_key,
+                execution_capability=execution_capability,
+            )
 
-    def _finalize_locked(self, context: object) -> dict[str, object]:
+    def _finalize_locked(
+        self,
+        context: object,
+        *,
+        idempotency_key: str | None,
+        execution_capability: object | None,
+    ) -> dict[str, object]:
         with self._ledger_lock():
             ledger = self._read_ledger()
+            if idempotency_key is not None:
+                if not idempotency_key.strip() or len(idempotency_key) > 200:
+                    raise ValueError("formal source finalize idempotency key is invalid")
+                for row in ledger.values():
+                    if row.get("finalize_idempotency_key") != idempotency_key:
+                        continue
+                    result = row.get("finalize_result")
+                    if not isinstance(result, dict):
+                        raise RuntimeError("formal source finalize result is unavailable")
+                    challenge = _validate_challenge(result.get("challenge"))
+                    checked = _validate_execution_capability(
+                        execution_capability,
+                        challenge=challenge,
+                    )
+                    request_digest = _sha256(
+                        {
+                            "context": context,
+                            "execution_capability": checked,
+                        }
+                    )
+                    if row.get("finalize_request_digest") != request_digest:
+                        raise ValueError(
+                            "formal source finalize idempotency key was used "
+                            "with a different request"
+                        )
+                    return json.loads(_canonical_bytes(result))
             active_rows = [
                 row for row in ledger.values() if row.get("state") == "issued"
             ]
             if len(active_rows) != 1:
                 raise ValueError("formal source finalize has no unique active challenge")
             self._apply_active_state(active_rows[0]["active_state"])
-            return self._finalize_under_ledger_lock(context, ledger)
+            checked_capability = self._require_execution_capability(
+                execution_capability
+            )
+            return self._finalize_under_ledger_lock(
+                context,
+                ledger,
+                idempotency_key=idempotency_key,
+                execution_capability=checked_capability,
+            )
 
     def _finalize_under_ledger_lock(
         self,
         context: object,
         ledger: dict[str, dict[str, object]],
+        *,
+        idempotency_key: str | None,
+        execution_capability: Mapping[str, object],
     ) -> dict[str, object]:
         if self._active_challenge is None or self._baseline is None:
             raise ValueError("formal source finalize has no active challenge")
@@ -3560,6 +3965,11 @@ class FormalLiveSourceAuthority:
             or row.get("run_id") != challenge["run_id"]
         ):
             raise ValueError("formal source challenge was already consumed")
+        result = {
+            "challenge": challenge,
+            "binding": binding,
+            "authority_receipt": receipt,
+        }
         row.update(
             {
                 "state": "consumed",
@@ -3570,14 +3980,23 @@ class FormalLiveSourceAuthority:
                 ],
             }
         )
+        if idempotency_key is not None:
+            row.update(
+                {
+                    "finalize_idempotency_key": idempotency_key,
+                    "finalize_request_digest": _sha256(
+                        {
+                            "context": context,
+                            "execution_capability": execution_capability,
+                        }
+                    ),
+                    "finalize_result": result,
+                }
+            )
         row.pop("active_state", None)
         self._write_ledger(ledger)
         self._clear_active_state()
-        return {
-            "challenge": challenge,
-            "binding": binding,
-            "authority_receipt": receipt,
-        }
+        return result
 
     def _record(
         self,
@@ -3592,6 +4011,7 @@ class FormalLiveSourceAuthority:
         with self._state_lock:
             if self._active_challenge is None:
                 return
+            self._require_execution_capability()
             with self._ledger_lock():
                 ledger = self._read_ledger()
                 challenge_id = str(self._active_challenge["challenge_id"])
@@ -3630,6 +4050,7 @@ class FormalLiveSourceAuthority:
 
     def _clear_active_state(self) -> None:
         self._active_challenge = None
+        self._execution_capability = None
         self._baseline = None
         self._events = []
         self._chain_sha256 = self._composition_sha256
@@ -3731,11 +4152,22 @@ class FormalLiveSourceAuthority:
             "issued_at",
             "expires_at",
         }
+        issue_idempotency_fields = {
+            "issue_idempotency_key",
+            "issue_request_digest",
+            "issue_result",
+        }
+        activation_fields = {"activation_record"}
         issued_fields = ledger_fields | {"active_state"}
         consumed_fields = ledger_fields | {
             "binding_digest",
             "verified_at",
             "terminal_job_graph_sha256",
+        }
+        finalize_idempotency_fields = {
+            "finalize_idempotency_key",
+            "finalize_request_digest",
+            "finalize_result",
         }
         expired_fields = ledger_fields | {"expired_at", "terminal_reason"}
         aborted_fields = ledger_fields | {"aborted_at", "terminal_reason"}
@@ -3754,6 +4186,18 @@ class FormalLiveSourceAuthority:
                 if state == "aborted"
                 else issued_fields
             )
+            present_idempotency_fields = set(value) & issue_idempotency_fields
+            if present_idempotency_fields not in (set(), issue_idempotency_fields):
+                raise RuntimeError("formal source challenge ledger row is invalid")
+            expected |= present_idempotency_fields
+            present_activation_fields = set(value) & activation_fields
+            expected |= present_activation_fields
+            present_finalize_fields = set(value) & finalize_idempotency_fields
+            if present_finalize_fields not in (set(), finalize_idempotency_fields):
+                raise RuntimeError("formal source challenge ledger row is invalid")
+            if present_finalize_fields and state != "consumed":
+                raise RuntimeError("formal source challenge ledger row is invalid")
+            expected |= present_finalize_fields
             if set(value) != expected or state not in {
                 "issued",
                 "consumed",
@@ -3765,6 +4209,46 @@ class FormalLiveSourceAuthority:
             _require_sha256(value["challenge_digest"], "formal source ledger challenge")
             _require_aware_time(value["issued_at"], "formal source ledger issued_at")
             _require_aware_time(value["expires_at"], "formal source ledger expires_at")
+            if present_idempotency_fields:
+                _nonempty_string(
+                    value["issue_idempotency_key"],
+                    "formal source ledger issue idempotency key",
+                )
+                _require_sha256(
+                    value["issue_request_digest"],
+                    "formal source ledger issue request",
+                )
+                if not isinstance(value["issue_result"], dict):
+                    raise RuntimeError("formal source ledger issue result is invalid")
+            if present_finalize_fields:
+                _nonempty_string(
+                    value["finalize_idempotency_key"],
+                    "formal source ledger finalize idempotency key",
+                )
+                _require_sha256(
+                    value["finalize_request_digest"],
+                    "formal source ledger finalize request",
+                )
+                if not isinstance(value["finalize_result"], dict):
+                    raise RuntimeError("formal source ledger finalize result is invalid")
+            if present_activation_fields:
+                activation = value["activation_record"]
+                if not isinstance(activation, dict) or set(activation) != {
+                    "idempotency_key",
+                    "request_digest",
+                    "result",
+                }:
+                    raise RuntimeError("formal source ledger activation result is invalid")
+                _nonempty_string(
+                    activation["idempotency_key"],
+                    "formal source ledger activation idempotency key",
+                )
+                _require_sha256(
+                    activation["request_digest"],
+                    "formal source ledger activation request",
+                )
+                if not isinstance(activation["result"], dict):
+                    raise RuntimeError("formal source ledger activation result is invalid")
             if value["state"] == "consumed":
                 _require_sha256(value["binding_digest"], "formal source ledger binding")
                 _require_aware_time(value["verified_at"], "formal source ledger verified_at")

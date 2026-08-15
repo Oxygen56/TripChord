@@ -713,7 +713,7 @@ def _install_browser_bridge(
             now=now,
             **authority_kwargs,
         )
-    bridge = BrowserTaskBridge(now=now)
+    bridge = BrowserTaskBridge(now=now, source_authority=source_authority)
     icom_provider = IComTransferProvider(
         client=icom_http_client,
         now=now,
@@ -1398,6 +1398,10 @@ async def issue_formal_live_source_challenge_endpoint(
     request: Request,
     registry: LivePlanningJobRegistryDep,
     principal: PrincipalDep,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ],
     credential: Annotated[
         str | None,
         Header(alias=_FORMAL_SOURCE_CONTROL_HEADER),
@@ -1405,6 +1409,12 @@ async def issue_formal_live_source_challenge_endpoint(
 ) -> dict[str, Any]:
     authority = _authorize_formal_source_control(request, credential)
     try:
+        replay = authority.issue_replay(
+            payload,
+            idempotency_key=idempotency_key,
+        )
+        if replay is not None:
+            return cast(dict[str, Any], replay)
         job_graph = payload.get("job_graph")
         if not isinstance(job_graph, dict):
             raise ValueError("formal source challenge requires an exact job graph")
@@ -1420,7 +1430,13 @@ async def issue_formal_live_source_challenge_endpoint(
             raise ValueError(
                 "formal source challenge job is not a matching unactivated prepared job"
             )
-        return cast(dict[str, Any], authority.issue_challenge(payload))
+        return cast(
+            dict[str, Any],
+            authority.issue_challenge(
+                payload,
+                idempotency_key=idempotency_key,
+            ),
+        )
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -1428,9 +1444,14 @@ async def issue_formal_live_source_challenge_endpoint(
 @app.post("/api/v1/internal/formal-live-source/jobs/{job_id}/activate")
 async def activate_formal_live_source_job_endpoint(
     job_id: str,
+    payload: dict[str, Any],
     request: Request,
     registry: LivePlanningJobRegistryDep,
     principal: PrincipalDep,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ],
     credential: Annotated[
         str | None,
         Header(alias=_FORMAL_SOURCE_CONTROL_HEADER),
@@ -1438,11 +1459,74 @@ async def activate_formal_live_source_job_endpoint(
 ) -> dict[str, Any]:
     authority = _authorize_formal_source_control(request, credential)
     try:
-        authority.require_active_job(job_id)
-        snapshot = await registry.activate(job_id, principal.tenant_id)
-        if snapshot is None:
-            raise ValueError("formal source prepared job is unavailable")
-        return {"job": snapshot.model_dump(mode="json")}
+        if set(payload) != {"execution_capability"}:
+            raise ValueError("formal source activation payload is invalid")
+        capability = payload["execution_capability"]
+        activation_lock = getattr(
+            request.app.state,
+            "formal_source_activation_lock",
+            None,
+        )
+        if not isinstance(activation_lock, asyncio.Lock):
+            activation_lock = asyncio.Lock()
+            request.app.state.formal_source_activation_lock = activation_lock
+        async with activation_lock:
+            replay = authority.activation_replay(
+                job_id=job_id,
+                capability=capability,
+                idempotency_key=idempotency_key,
+            )
+            if replay is not None:
+                return cast(dict[str, Any], replay)
+            authority.require_active_job(job_id)
+            bridge = getattr(request.app.state, "browser_task_bridge", None)
+            if bridge is None:
+                raise ValueError("formal source activation has no mounted Browser bridge")
+            companion_status = await bridge.companion_status()
+            fresh_companions = [
+                companion
+                for companion in companion_status.companions
+                if companion.is_fresh
+            ]
+            if len(fresh_companions) != 1:
+                raise ValueError(
+                    "formal source activation requires one exact fresh Companion"
+                )
+            companion = fresh_companions[0]
+            with authority.execution_scope(capability):
+                snapshot = await registry.activate(job_id, principal.tenant_id)
+                if snapshot is not None:
+                    heartbeat = companion.model_dump(mode="json")
+                    authority.record_browser_http(
+                        "browser_heartbeat",
+                        subject_ids=(companion.companion_id,),
+                        details={
+                            "request": {
+                                key: heartbeat[key]
+                                for key in (
+                                    "companion_id",
+                                    "providers",
+                                    "authorized_scope_keys",
+                                    "adapter_version",
+                                    "contract_version",
+                                    "runtime_instance_id",
+                                )
+                            },
+                            "heartbeat": heartbeat,
+                        },
+                    )
+            if snapshot is None:
+                raise ValueError("formal source prepared job is unavailable")
+            result = {"job": snapshot.model_dump(mode="json")}
+            return cast(
+                dict[str, Any],
+                authority.store_activation_result(
+                    job_id=job_id,
+                    capability=capability,
+                    idempotency_key=idempotency_key,
+                    result=result,
+                ),
+            )
     except (LivePlanningJobInactiveError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -1451,6 +1535,10 @@ async def activate_formal_live_source_job_endpoint(
 async def finalize_formal_live_source_endpoint(
     payload: dict[str, Any],
     request: Request,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ],
     credential: Annotated[
         str | None,
         Header(alias=_FORMAL_SOURCE_CONTROL_HEADER),
@@ -1458,7 +1546,16 @@ async def finalize_formal_live_source_endpoint(
 ) -> dict[str, Any]:
     authority = _authorize_formal_source_control(request, credential)
     try:
-        return cast(dict[str, Any], authority.finalize(payload))
+        if set(payload) != {"context", "execution_capability"}:
+            raise ValueError("formal source finalize payload is invalid")
+        return cast(
+            dict[str, Any],
+            authority.finalize(
+                payload["context"],
+                idempotency_key=idempotency_key,
+                execution_capability=payload["execution_capability"],
+            ),
+        )
     except (RuntimeError, ValueError) as exc:
         logger.warning("formal source finalize rejected: %s", exc)
         raise HTTPException(status_code=409, detail=str(exc)) from exc

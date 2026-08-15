@@ -864,6 +864,79 @@ async def test_capacity_eviction_removes_idempotency_mapping_with_terminal_job()
 
 
 @pytest.mark.asyncio
+async def test_expired_prepared_job_releases_capacity_and_cannot_activate() -> None:
+    """RETURN-8db00bb: prepared capacity follows the frozen execution deadline."""
+
+    current = [datetime(2026, 8, 14, 22, 30, tzinfo=UTC)]
+    registry = LivePlanningJobRegistry(
+        capacity=1,
+        now=lambda: current[0],
+    )
+
+    async def operation(_: Any) -> dict[str, Any]:
+        return {"ok": True}
+
+    expired, replayed = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="prepared-expiry-one",
+        request_digest="1" * 64,
+        deadline_seconds=5,
+        defer_start=True,
+    )
+    assert replayed is False
+    current[0] += timedelta(seconds=6)
+
+    replacement, replayed = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="prepared-expiry-two",
+        request_digest="2" * 64,
+        deadline_seconds=5,
+        defer_start=True,
+    )
+    assert replayed is False
+    assert replacement.id != expired.id
+    assert await registry.get(expired.id, "tenant-a") is None
+    assert await registry.activate(expired.id, "tenant-a") is None
+    await registry.cancel(replacement.id, "tenant-a")
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_prepared_retry_rejects_same_key_with_foreign_payload_after_expiry() -> None:
+    """An expired prepared mapping is pruned atomically, never resurrected."""
+
+    current = [datetime(2026, 8, 14, 22, 30, tzinfo=UTC)]
+    registry = LivePlanningJobRegistry(capacity=1, now=lambda: current[0])
+
+    async def operation(_: Any) -> dict[str, Any]:
+        return {"ok": True}
+
+    first, _ = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="prepared-retry",
+        request_digest="3" * 64,
+        deadline_seconds=1,
+        defer_start=True,
+    )
+    current[0] += timedelta(seconds=2)
+    second, replayed = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="prepared-retry",
+        request_digest="4" * 64,
+        deadline_seconds=1,
+        defer_start=True,
+    )
+    assert replayed is False
+    assert second.id != first.id
+    await registry.cancel(second.id, "tenant-a")
+    await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_source_terminal_events_and_barrier_release_survive_success() -> None:
     registry = LivePlanningJobRegistry()
 

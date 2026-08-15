@@ -40,6 +40,7 @@ from tripchord.formal_live_source import (
     formal_job_graph_for_frozen_v4,
     formal_source_trust_root,
     read_owner_only_text,
+    validate_formal_execution_capability,
     validate_formal_source_binding,
     validate_formal_source_challenge,
     validate_formal_source_evidence,
@@ -650,6 +651,7 @@ async def _issue_formal_source_challenge_remote(
     client: httpx.AsyncClient,
     base: str,
     context: dict[str, object],
+    idempotency_key: str,
     control_token_path: Path | None = None,
 ) -> dict[str, object]:
     response = await client.post(
@@ -659,27 +661,38 @@ async def _issue_formal_source_challenge_remote(
             "X-TripChord-Formal-Source-Control": _formal_source_control_token(
                 control_token_path
             ),
+            "Idempotency-Key": idempotency_key,
         },
     )
     payload = _safe_response_json(response, "formal live source challenge")
     challenge = TypeAdapter(dict[str, object]).validate_python(payload.get("challenge"))
+    capability = TypeAdapter(dict[str, object]).validate_python(
+        payload.get("execution_capability")
+    )
     validate_formal_source_challenge(challenge)
-    return challenge
+    validate_formal_execution_capability(capability, challenge)
+    return {"challenge": challenge, "execution_capability": capability}
 
 
 async def _finalize_formal_source_binding_remote(
     client: httpx.AsyncClient,
     base: str,
     context: dict[str, object],
+    execution_capability: dict[str, object],
+    idempotency_key: str,
     control_token_path: Path | None = None,
 ) -> dict[str, object]:
     response = await client.post(
         f"{base}/api/v1/internal/formal-live-source/finalize",
-        json=context,
+        json={
+            "context": context,
+            "execution_capability": execution_capability,
+        },
         headers={
             "X-TripChord-Formal-Source-Control": _formal_source_control_token(
                 control_token_path
             ),
+            "Idempotency-Key": idempotency_key,
         },
     )
     payload = _safe_response_json(response, "formal live source finalize")
@@ -929,6 +942,17 @@ def _job_idempotency_key(payload: dict[str, Any], attempt_id: str) -> str:
     if _ATTEMPT_ID_PATTERN.fullmatch(attempt_id) is None:
         raise ValueError("attempt_id must be 32 lowercase hexadecimal characters")
     return f"tripchord-live-v4-{_canonical_sha256(payload)}-{attempt_id}"
+
+
+def _formal_control_idempotency_key(
+    control: dict[str, Any],
+    phase: str,
+) -> str:
+    idempotency = TypeAdapter(dict[str, Any]).validate_python(
+        control["idempotency"]
+    )
+    base_key = TypeAdapter(str).validate_python(idempotency["key"])
+    return f"formal-{phase}-{_canonical_sha256({'job_key': base_key, 'phase': phase})}"
 
 
 def _new_live_job_control(
@@ -1186,15 +1210,19 @@ async def _activate_prepared_flexible_live_job(
     client: httpx.AsyncClient,
     base: str,
     control: dict[str, Any],
+    execution_capability: dict[str, object],
+    idempotency_key: str,
     control_token_path: Path | None = None,
 ) -> None:
     job_id = TypeAdapter(str).validate_python(control.get("job_id"))
     response = await client.post(
         f"{base}/api/v1/internal/formal-live-source/jobs/{job_id}/activate",
+        json={"execution_capability": execution_capability},
         headers={
             "X-TripChord-Formal-Source-Control": _formal_source_control_token(
                 control_token_path
             ),
+            "Idempotency-Key": idempotency_key,
         },
     )
     payload = _safe_response_json(response, "formal prepared live job activation")
@@ -1899,12 +1927,20 @@ async def _run(
             formal_source_context["job_graph"] = formal_job_graph
             context["formal_job_graph"] = formal_job_graph
             stage = "issue_formal_live_source_challenge"
-            formal_source_challenge = await _issue_formal_source_challenge_remote(
+            issued_formal_source = await _issue_formal_source_challenge_remote(
                 client,
                 base,
                 formal_source_context,
+                _formal_control_idempotency_key(
+                    live_job_control,
+                    "challenge",
+                ),
                 getattr(args, "formal_source_control_token_file", None),
             )
+            formal_source_challenge = issued_formal_source["challenge"]
+            formal_execution_capability = issued_formal_source[
+                "execution_capability"
+            ]
             context["formal_live_source_challenge"] = formal_source_challenge
             stage = "companion_preflight"
             companion = await _preflight_companion(
@@ -1918,6 +1954,11 @@ async def _run(
                 client,
                 base,
                 live_job_control,
+                formal_execution_capability,
+                _formal_control_idempotency_key(
+                    live_job_control,
+                    "activate",
+                ),
                 getattr(args, "formal_source_control_token_file", None),
             )
             stage = "await_flexible_live_job"
@@ -1997,6 +2038,11 @@ async def _run(
                 client,
                 base,
                 formal_finalize_context,
+                formal_execution_capability,
+                _formal_control_idempotency_key(
+                    live_job_control,
+                    "finalize",
+                ),
                 getattr(args, "formal_source_control_token_file", None),
             )
             formal_source_binding = finalized_source["binding"]

@@ -70,6 +70,7 @@ def _install_failed_run_formal_control_double(
         _client: object,
         _base: str,
         context: dict[str, object],
+        _idempotency_key: str,
         _control_path: Path | None = None,
     ) -> dict[str, object]:
         challenge = {
@@ -78,7 +79,12 @@ def _install_failed_run_formal_control_double(
             "run_id": context["run_id"],
         }
         issued["challenge"] = challenge
-        return challenge
+        return {
+            "challenge": challenge,
+            "execution_capability": {
+                "capability_id": "fixture-formal-execution-capability"
+            },
+        }
 
     async def activate(*_: object, **__: object) -> None:
         return None

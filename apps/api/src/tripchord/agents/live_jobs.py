@@ -1314,7 +1314,15 @@ class LivePlanningJobRegistry:
         expired = tuple(
             job_id
             for job_id, runtime in self._records.items()
-            if runtime.snapshot.expires_at is not None and runtime.snapshot.expires_at <= now
+            if (
+                runtime.snapshot.expires_at is not None
+                and runtime.snapshot.expires_at <= now
+            )
+            or (
+                runtime.prepared
+                and runtime.task is None
+                and runtime.snapshot.deadline_at <= now
+            )
         )
         for job_id in expired:
             self._remove_locked(job_id)

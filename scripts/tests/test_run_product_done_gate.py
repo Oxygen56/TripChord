@@ -14332,9 +14332,13 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
                 headers={
                     "X-TripChord-Formal-Source-Control": (
                         api_main._formal_source_control_token()
-                    )
+                    ),
+                    "Idempotency-Key": "consumed-challenge-replay",
                 },
-                json=replay_context,
+                json={
+                    "context": replay_context,
+                    "execution_capability": {},
+                },
             )
         assert replay.status_code == 409, "a consumed challenge must fail closed"
     finally:
@@ -15159,6 +15163,158 @@ def test_formal_challenge_single_active_is_atomic_across_restart(tmp_path: Path)
     assert issued["challenge"]["run_id"] == context["run_id"]
 
 
+def test_formal_issue_retry_returns_same_signed_capability_and_challenge(
+    tmp_path: Path,
+) -> None:
+    """RETURN-8db00bb: a committed issue response is durably retrievable."""
+
+    authority, context = _fresh_installed_formal_authority(tmp_path)
+    first = authority.issue_challenge(
+        context,
+        idempotency_key="formal-issue-retry-1",
+    )
+    replay = authority.issue_challenge(
+        context,
+        idempotency_key="formal-issue-retry-1",
+    )
+    assert replay == first
+    capability = first["execution_capability"]
+    assert isinstance(capability, dict)
+    assert capability["challenge_id"] == first["challenge"]["challenge_id"]
+    assert capability["terminal_job_id"] == context["job_graph"]["terminal_job_id"]
+    activation = {"job": {"id": capability["terminal_job_id"], "state": "running"}}
+    assert authority.store_activation_result(
+        job_id=capability["terminal_job_id"],
+        capability=capability,
+        idempotency_key="formal-activate-retry-1",
+        result=activation,
+    ) == activation
+
+    restarted, _ = _fresh_installed_formal_authority(tmp_path)
+    assert (
+        restarted.issue_challenge(
+            context,
+            idempotency_key="formal-issue-retry-1",
+        )
+        == first
+    )
+    assert restarted.activation_replay(
+        job_id=capability["terminal_job_id"],
+        capability=capability,
+        idempotency_key="formal-activate-retry-1",
+    ) == activation
+    with pytest.raises(ValueError, match="different request"):
+        restarted.activation_replay(
+            job_id=capability["terminal_job_id"],
+            capability=capability,
+            idempotency_key="foreign-activate-retry",
+        )
+    with pytest.raises(ValueError, match="different request"):
+        restarted.issue_challenge(
+            {**context, "scenario_sha256": "4" * 64},
+            idempotency_key="formal-issue-retry-1",
+        )
+
+
+def test_formal_query_requires_job_bound_execution_capability(tmp_path: Path) -> None:
+    """Ordinary same-shape traffic cannot enter the active formal ledger."""
+
+    from tripchord.providers.browser_bridge import (
+        BrowserProvider,
+        BrowserTaskBridge,
+        BrowserTaskSubmission,
+        BrowserVertical,
+    )
+
+    authority, context = _fresh_installed_formal_authority(tmp_path)
+    issued = authority.issue_challenge(
+        context,
+        idempotency_key="formal-capability-1",
+    )
+    graph = context["job_graph"]
+    assert isinstance(graph, dict)
+    pair = graph["pairs"][0]
+    task_id = next(
+        item
+        for item in pair["query_task_ids"]
+        if item.startswith("query:ctrip:flight:")
+    )
+    query = {
+        "origin": "杭州",
+        "destination": "马累",
+        "start_date": pair["departure_date"],
+        "end_date": pair["return_date"],
+        "adults": graph["adults"],
+        "rooms": 1,
+        "currency": "CNY",
+        "origin_code": "HGH",
+        "destination_code": "MLE",
+        "search_url": (
+            "https://flights.ctrip.com/international/search/round-hgh-mle"
+            f"?depdate={pair['departure_date']}_{pair['return_date']}"
+            f"&cabin=y_s&adult={graph['adults']}&child=0&infant=0"
+        ),
+        "options": {},
+    }
+
+    with pytest.raises(ValueError, match="execution capability"):
+        authority.formal_browser_query(
+            task_id="browser-task-ordinary",
+            provider="ctrip",
+            kind="flight",
+            query=query,
+        )
+
+    with authority.execution_scope(issued["execution_capability"]):
+        formal = authority.formal_browser_query(
+            task_id="browser-task-formal",
+            provider="ctrip",
+            kind="flight",
+            query=query,
+        )
+    assert formal["query_task_id"] == task_id
+
+    foreign = dict(issued["execution_capability"])
+    foreign["terminal_job_id"] = "live-job-foreign"
+    with (
+        pytest.raises(ValueError, match="execution capability"),
+        authority.execution_scope(foreign),
+    ):
+        authority.formal_browser_query(
+            task_id="browser-task-foreign",
+            provider="ctrip",
+            kind="flight",
+            query=query,
+        )
+
+    bridge = BrowserTaskBridge(source_authority=authority)
+    submission = BrowserTaskSubmission.model_validate(
+        {
+            "provider": BrowserProvider.CTRIP,
+            "kind": BrowserVertical.FLIGHT,
+            "query": query,
+            "reuse_partition_sha256": "a" * 64,
+        }
+    )
+    async def submit_interleaved() -> tuple[object, object, object, object]:
+        ordinary = (await bridge.submit_many((submission,)))[0]
+        with authority.execution_scope(issued["execution_capability"]):
+            scoped = (await bridge.submit_many((submission,)))[0]
+        return (
+            ordinary,
+            scoped,
+            await bridge.formal_execution_capability(ordinary.id),
+            await bridge.formal_execution_capability(scoped.id),
+        )
+
+    ordinary, scoped, ordinary_capability, scoped_capability = asyncio.run(
+        submit_interleaved()
+    )
+    assert ordinary.id != scoped.id
+    assert ordinary_capability is None
+    assert scoped_capability == issued["execution_capability"]
+
+
 def test_formal_challenge_rejects_foreign_candidate_contract(tmp_path: Path) -> None:
     authority, context = _fresh_installed_formal_authority(tmp_path)
     ledger = tmp_path / "ledger.json"
@@ -15210,7 +15366,10 @@ def test_formal_challenge_concurrent_cold_instances_issue_exactly_once(
 def test_formal_challenge_cold_restart_continues_and_finalizes_once(
     tmp_path: Path,
 ) -> None:
-    from tripchord.formal_live_source import validate_formal_source_binding
+    from tripchord.formal_live_source import (
+        load_formal_live_source_authority,
+        validate_formal_source_binding,
+    )
 
     fixture = _fixture_formal_source_binding()
     fixture_challenge = fixture["challenge"]
@@ -15233,19 +15392,20 @@ def test_formal_challenge_cold_restart_continues_and_finalizes_once(
 
     def replay(target: Any, event: dict[str, object]) -> None:
         clock[0] = datetime.fromisoformat(str(event["observed_at"]))
-        if event["kind"] == "icom_public_get":
-            target.record_icom_http(
-                str(event["path"]),
-                subject_ids=tuple(event["subject_ids"]),
-                response_sha256=str(event["response_sha256"]),
-                details=event["details"],
-            )
-        else:
-            target.record_browser_http(
-                str(event["kind"]),
-                subject_ids=tuple(event["subject_ids"]),
-                details=event["details"],
-            )
+        with target.execution_scope(issued["execution_capability"]):
+            if event["kind"] == "icom_public_get":
+                target.record_icom_http(
+                    str(event["path"]),
+                    subject_ids=tuple(event["subject_ids"]),
+                    response_sha256=str(event["response_sha256"]),
+                    details=event["details"],
+                )
+            else:
+                target.record_browser_http(
+                    str(event["kind"]),
+                    subject_ids=tuple(event["subject_ids"]),
+                    details=event["details"],
+                )
 
     split = len(receipts) // 2
     for raw_event in receipts[:split]:
@@ -15306,14 +15466,22 @@ def test_formal_challenge_cold_restart_continues_and_finalizes_once(
     clock[0] = datetime.fromisoformat(str(receipts[-1]["observed_at"])) + timedelta(
         seconds=1
     )
+    finalize_context = {
+        **context,
+        "terminal_job": terminal_job,
+        "pair_checkpoint_binding": pair_binding,
+    }
     finalized = restarted.finalize(
-        {
-            **context,
-            "terminal_job": terminal_job,
-            "pair_checkpoint_binding": pair_binding,
-        }
+        finalize_context,
+        idempotency_key="cold-restart-finalize-v1",
+        execution_capability=issued["execution_capability"],
     )
     validate_formal_source_binding(finalized["binding"])
+    assert restarted.finalize(
+        finalize_context,
+        idempotency_key="cold-restart-finalize-v1",
+        execution_capability=issued["execution_capability"],
+    ) == finalized
     with pytest.raises(ValueError, match="no unique active challenge"):
         restarted.finalize(
             {
@@ -15325,6 +15493,40 @@ def test_formal_challenge_cold_restart_continues_and_finalizes_once(
     cold_after_consume, _ = _fresh_installed_formal_authority(
         tmp_path, now=lambda: clock[0]
     )
+    assert cold_after_consume.finalize(
+        finalize_context,
+        idempotency_key="cold-restart-finalize-v1",
+        execution_capability=issued["execution_capability"],
+    ) == finalized
+    assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
+    old_runtime = context["runtime_identity"]
+    assert isinstance(old_runtime, dict)
+    new_runtime = {
+        **old_runtime,
+        "pid": int(old_runtime["pid"]) + 200_000,
+        "started_at": (
+            datetime.fromisoformat(str(old_runtime["started_at"]))
+            + timedelta(seconds=2)
+        ).isoformat(),
+    }
+    new_process = load_formal_live_source_authority(
+        commit_sha=str(context["tested_commit_sha"]),
+        runtime_identity=new_runtime,
+        private_key_path=_TEST_FORMAL_PRIVATE_KEY_PATH,
+        ledger_path=tmp_path / "ledger.json",
+        now=lambda: clock[0],
+    )
+    assert new_process.finalize(
+        finalize_context,
+        idempotency_key="cold-restart-finalize-v1",
+        execution_capability=issued["execution_capability"],
+    ) == finalized
+    with pytest.raises(ValueError, match="different request"):
+        cold_after_consume.finalize(
+            {**finalize_context, "run_id": "foreign-retry-run"},
+            idempotency_key="cold-restart-finalize-v1",
+            execution_capability=issued["execution_capability"],
+        )
     assert cold_after_consume.public_status()["challenge_active"] is False
     assert finalized["challenge"]["challenge_id"] == issued["challenge"][
         "challenge_id"
@@ -15392,7 +15594,10 @@ def test_formal_challenge_write_failure_abort_and_expiry_are_atomic(
     first_event = _fixture_formal_source_binding()["receipts"][0]
     assert isinstance(first_event, dict)
 
-    with pytest.raises(ValueError, match="heartbeat details"):
+    with (
+        authority.execution_scope(issued["execution_capability"]),
+        pytest.raises(ValueError, match="heartbeat details"),
+    ):
         authority.record_browser_http(
             "browser_heartbeat",
             subject_ids=("malformed-companion",),
@@ -15406,7 +15611,10 @@ def test_formal_challenge_write_failure_abort_and_expiry_are_atomic(
 
     clock[0] = datetime.fromisoformat(str(first_event["observed_at"]))
     monkeypatch.setattr(authority, "_write_ledger", fail_write)
-    with pytest.raises(OSError, match="injected-ledger-write-failure"):
+    with (
+        authority.execution_scope(issued["execution_capability"]),
+        pytest.raises(OSError, match="injected-ledger-write-failure"),
+    ):
         authority.record_browser_http(
             "browser_heartbeat",
             subject_ids=tuple(first_event["subject_ids"]),
@@ -15635,7 +15843,7 @@ def test_formal_source_browser_query_recomputes_exact_graph_dates_and_adults(
     from tripchord.planning.stay_plans import system_stay_plan_candidate_set
 
     authority, context = _fresh_installed_formal_authority(tmp_path)
-    authority.issue_challenge(context)
+    issued = authority.issue_challenge(context)
     graph = context["job_graph"]
     assert isinstance(graph, dict)
     pair = graph["pairs"][0]
@@ -15670,7 +15878,10 @@ def test_formal_source_browser_query_recomputes_exact_graph_dates_and_adults(
             "__tripchord_allow_recent_quote_reuse": True,
         },
     }
-    with pytest.raises(ValueError, match="exact signed job member"):
+    with (
+        authority.execution_scope(issued["execution_capability"]),
+        pytest.raises(ValueError, match="exact signed job member"),
+    ):
         authority.formal_browser_query(
             task_id="browser-task-wrong-date",
             provider="ctrip",
@@ -15682,7 +15893,10 @@ def test_formal_source_browser_query_recomputes_exact_graph_dates_and_adults(
         + timedelta(days=1)
     ).isoformat()
     query["adults"] = int(graph["adults"]) + 1
-    with pytest.raises(ValueError, match="exact signed job member"):
+    with (
+        authority.execution_scope(issued["execution_capability"]),
+        pytest.raises(ValueError, match="exact signed job member"),
+    ):
         authority.formal_browser_query(
             task_id="browser-task-wrong-adults",
             provider="ctrip",

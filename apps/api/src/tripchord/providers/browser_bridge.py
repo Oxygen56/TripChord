@@ -1901,6 +1901,7 @@ class _TaskRecord:
     reused_from_task_id: str | None = None
     reuse_age_seconds: float | None = None
     inflight_coalesce_count: int = 0
+    formal_execution_capability: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -2086,6 +2087,7 @@ class BrowserTaskBridge:
         max_terminal_records: int = DEFAULT_MAX_TERMINAL_RECORDS,
         max_companion_control_records: int = DEFAULT_MAX_COMPANION_CONTROL_RECORDS,
         now: Callable[[], datetime] | None = None,
+        source_authority: FormalLiveSourceAuthority | None = None,
     ) -> None:
         if max_pending_tasks < 1:
             raise ValueError("max_pending_tasks must be positive")
@@ -2107,8 +2109,19 @@ class BrowserTaskBridge:
         self._max_companion_control_records = max_companion_control_records
         self._now = now or (lambda: datetime.now(UTC))
         self._state_store = state_store or browser_bridge_state_store_from_env()
+        self._source_authority = source_authority
         self._changed = asyncio.Condition()
         self._restore_persisted_state()
+
+    def bind_source_authority(
+        self,
+        source_authority: FormalLiveSourceAuthority,
+    ) -> None:
+        """Bind the production authority once, including externally built bridges."""
+
+        if self._source_authority is not None and self._source_authority is not source_authority:
+            raise RuntimeError("browser bridge already uses a different source authority")
+        self._source_authority = source_authority
 
     async def submit_many(
         self, submissions: Iterable[BrowserTaskSubmission]
@@ -2116,6 +2129,33 @@ class BrowserTaskBridge:
         values = tuple(submissions)
         if not values:
             raise ValueError("at least one browser task is required")
+        capability = (
+            self._source_authority.current_execution_capability()
+            if self._source_authority is not None
+            else None
+        )
+        if capability is not None:
+            capability_partition = hashlib.sha256(
+                json.dumps(
+                    capability,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            values = tuple(
+                submission.model_copy(
+                    update={
+                        "reuse_partition_sha256": hashlib.sha256(
+                            (
+                                f"{submission.reuse_partition_sha256 or ''}\0"
+                                f"{capability_partition}"
+                            ).encode()
+                        ).hexdigest()
+                    }
+                )
+                for submission in values
+            )
         async with self._changed:
             self._housekeep_and_notify_locked()
             pending = sum(not record.state.terminal for record in self._records.values())
@@ -2157,6 +2197,7 @@ class BrowserTaskBridge:
                         quotes=reusable.quotes,
                         reused_from_task_id=reusable.id,
                         reuse_age_seconds=oldest_quote_age,
+                        formal_execution_capability=capability,
                     )
                     self._records[task_id] = record
                     snapshots.append(self._snapshot(record))
@@ -2175,6 +2216,7 @@ class BrowserTaskBridge:
                     state=BrowserTaskState.QUEUED,
                     created_at=now,
                     updated_at=now,
+                    formal_execution_capability=capability,
                 )
                 self._records[task_id] = record
                 self._active_consumers[task_id] = 1
@@ -2183,6 +2225,17 @@ class BrowserTaskBridge:
             self._persist_state()
             self._changed.notify_all()
             return tuple(snapshots)
+
+    async def formal_execution_capability(
+        self,
+        task_id: str,
+    ) -> dict[str, object] | None:
+        """Return only the signed scope attached at formal task submission."""
+
+        async with self._changed:
+            record = self._record(task_id)
+            capability = record.formal_execution_capability
+            return dict(capability) if capability is not None else None
 
     async def claim(
         self,
@@ -3495,6 +3548,8 @@ def create_browser_bridge_app(
     if control_token is not None and hmac.compare_digest(control_token, bridge_token):
         raise ValueError("control_token must be distinct from bridge_token")
     task_bridge = bridge or BrowserTaskBridge()
+    if source_authority is not None:
+        task_bridge.bind_source_authority(source_authority)
     app = FastAPI(title="TripChord Local Browser Bridge", version="1")
     app.add_middleware(
         CORSMiddleware,
@@ -3580,36 +3635,89 @@ def create_browser_bridge_app(
                 runtime_instance_id=payload.runtime_instance_id,
                 reload_receipt=payload.reload_receipt,
             )
-            if (
-                source_authority is not None
-                and source_authority.is_active()
-                and response.leases
-            ):
-                formal_leases: list[dict[str, object]] = []
-                for lease in response.leases:
-                    lease_payload = lease.model_dump(
-                        mode="json", exclude={"claim_token"}
-                    )
-                    lease_payload["formal_query"] = (
-                        source_authority.formal_browser_query(
-                            task_id=lease.task_id,
-                            provider=lease.provider.value,
-                            kind=lease.kind.value,
-                            query=lease.query.model_dump(mode="json"),
-                        )
-                    )
-                    formal_leases.append(lease_payload)
-                source_authority.record_browser_http(
-                    "browser_claim",
-                    subject_ids=tuple(lease.task_id for lease in response.leases),
-                    details={
-                        "request": payload.model_dump(
-                            mode="json",
-                            exclude={"reload_receipt"},
-                        ),
-                        "leases": formal_leases,
-                    },
+            if source_authority is not None and response.leases:
+                companion = next(
+                    (
+                        item
+                        for item in (await task_bridge.companion_status()).companions
+                        if item.companion_id == payload.companion_id
+                    ),
+                    None,
                 )
+                scoped_leases: list[
+                    tuple[BrowserTaskLease, dict[str, object]]
+                ] = []
+                for lease in response.leases:
+                    capability = await task_bridge.formal_execution_capability(
+                        lease.task_id
+                    )
+                    if capability is not None:
+                        scoped_leases.append((lease, capability))
+                for capability_id in dict.fromkeys(
+                    str(capability["capability_id"])
+                    for _lease, capability in scoped_leases
+                ):
+                    group = [
+                        lease
+                        for lease, capability in scoped_leases
+                        if capability["capability_id"] == capability_id
+                    ]
+                    capability = next(
+                        capability
+                        for _lease, capability in scoped_leases
+                        if capability["capability_id"] == capability_id
+                    )
+                    formal_leases: list[dict[str, object]] = []
+                    with source_authority.execution_scope(capability):
+                        if source_authority.snapshot()["last_heartbeat"] is None:
+                            if companion is None:
+                                raise ValueError(
+                                    "formal browser claim has no fresh Companion heartbeat"
+                                )
+                            source_authority.record_browser_http(
+                                "browser_heartbeat",
+                                subject_ids=(payload.companion_id,),
+                                details={
+                                    "request": {
+                                        "companion_id": payload.companion_id,
+                                        "providers": [
+                                            provider.value
+                                            for provider in payload.providers
+                                        ],
+                                        "authorized_scope_keys": list(
+                                            payload.authorized_scope_keys
+                                        ),
+                                        "adapter_version": payload.adapter_version,
+                                        "contract_version": payload.contract_version,
+                                        "runtime_instance_id": payload.runtime_instance_id,
+                                    },
+                                    "heartbeat": companion.model_dump(mode="json"),
+                                },
+                            )
+                        for lease in group:
+                            lease_payload = lease.model_dump(
+                                mode="json", exclude={"claim_token"}
+                            )
+                            lease_payload["formal_query"] = (
+                                source_authority.formal_browser_query(
+                                    task_id=lease.task_id,
+                                    provider=lease.provider.value,
+                                    kind=lease.kind.value,
+                                    query=lease.query.model_dump(mode="json"),
+                                )
+                            )
+                            formal_leases.append(lease_payload)
+                        source_authority.record_browser_http(
+                            "browser_claim",
+                            subject_ids=tuple(lease.task_id for lease in group),
+                            details={
+                                "request": payload.model_dump(
+                                    mode="json",
+                                    exclude={"reload_receipt"},
+                                ),
+                                "leases": formal_leases,
+                            },
+                        )
             return response
         except BrowserCompanionReloadNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -3645,15 +3753,6 @@ def create_browser_bridge_app(
             contract_version=payload.contract_version,
             runtime_instance_id=payload.runtime_instance_id,
         )
-        if source_authority is not None and source_authority.is_active():
-            source_authority.record_browser_http(
-                "browser_heartbeat",
-                subject_ids=(heartbeat.companion_id,),
-                details={
-                    "request": payload.model_dump(mode="json"),
-                    "heartbeat": heartbeat.model_dump(mode="json"),
-                },
-            )
         return heartbeat
 
     @app.post(
@@ -3763,31 +3862,37 @@ def create_browser_bridge_app(
                 payload.claim_token,
                 payload.completion,
             )
-            if source_authority is not None and source_authority.is_active():
+            capability = (
+                await task_bridge.formal_execution_capability(task_id)
+                if source_authority is not None
+                else None
+            )
+            if source_authority is not None and capability is not None:
                 snapshot_payload = snapshot.model_dump(mode="json")
-                source_authority.record_browser_http(
-                    "browser_complete",
-                    subject_ids=(task_id,),
-                    details={
-                        "task_id": task_id,
-                        "completion": payload.completion.model_dump(mode="json"),
-                        "snapshot": snapshot_payload,
-                        "formal_query": source_authority.formal_browser_query(
-                            task_id=snapshot.id,
-                            provider=snapshot.provider.value,
-                            kind=snapshot.kind.value,
-                            query=snapshot.query.model_dump(mode="json"),
-                        ),
-                        "result_sha256": hashlib.sha256(
-                            json.dumps(
-                                snapshot_payload,
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                                sort_keys=True,
-                            ).encode("utf-8")
-                        ).hexdigest(),
-                    },
-                )
+                with source_authority.execution_scope(capability):
+                    source_authority.record_browser_http(
+                        "browser_complete",
+                        subject_ids=(task_id,),
+                        details={
+                            "task_id": task_id,
+                            "completion": payload.completion.model_dump(mode="json"),
+                            "snapshot": snapshot_payload,
+                            "formal_query": source_authority.formal_browser_query(
+                                task_id=snapshot.id,
+                                provider=snapshot.provider.value,
+                                kind=snapshot.kind.value,
+                                query=snapshot.query.model_dump(mode="json"),
+                            ),
+                            "result_sha256": hashlib.sha256(
+                                json.dumps(
+                                    snapshot_payload,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                    sort_keys=True,
+                                ).encode("utf-8")
+                            ).hexdigest(),
+                        },
+                    )
             return snapshot
         except BrowserTaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
