@@ -3825,9 +3825,19 @@ class FormalLiveSourceAuthority:
             prepared_at = self._utc_now().isoformat()
             record: dict[str, object] = {
                 "phase_version": "tripchord-formal-activation-v2",
+                "operation_id": _sha256(
+                    {
+                        "purpose": "tripchord-formal-activation-operation-v1",
+                        "nonce": str(uuid4()),
+                        "request_digest": request_digest,
+                    }
+                ),
                 "idempotency_key": key,
                 "request_digest": request_digest,
                 "job_id": job_id,
+                "challenge_id": checked["challenge_id"],
+                "attempt_digest": checked["attempt_digest"],
+                "capability_sha256": _sha256(checked),
                 "companion_binding": checked_companion,
                 "phase": "awaiting_heartbeat",
                 "prepared_at": prepared_at,
@@ -4211,13 +4221,10 @@ class FormalLiveSourceAuthority:
         if len(key) > 200 or not isinstance(result, dict):
             raise ValueError("formal source activation result is invalid")
         with self._state_lock, self._ledger_lock():
-            checked = self._require_execution_capability(capability)
-            if job_id != checked["terminal_job_id"]:
-                raise ValueError("formal source activation targets a foreign job")
             ledger = self._read_ledger()
-            row = ledger.get(str(checked["challenge_id"]))
-            if not isinstance(row, dict) or row.get("state") != "issued":
-                raise ValueError("formal source activation challenge is not active")
+            row, checked = self._activation_row_locked(
+                ledger, job_id=job_id, capability=capability
+            )
             existing = row.get("activation_record")
             if not isinstance(existing, dict):
                 raise ValueError("formal source activation has no persisted begin record")
@@ -4678,7 +4685,7 @@ class FormalLiveSourceAuthority:
             if not isinstance(key, str) or not isinstance(value, dict):
                 raise RuntimeError("formal source challenge ledger has an invalid shape")
             state = value.get("state")
-            expected = (
+            expected = set(
                 consumed_fields
                 if state == "consumed"
                 else expired_fields
@@ -4734,7 +4741,7 @@ class FormalLiveSourceAuthority:
                     raise RuntimeError("formal source ledger finalize result is invalid")
             if present_activation_fields:
                 activation = value["activation_record"]
-                phased_activation_fields = {
+                legacy_activation_fields = {
                     "phase_version",
                     "idempotency_key",
                     "request_digest",
@@ -4747,9 +4754,19 @@ class FormalLiveSourceAuthority:
                     "heartbeat_result",
                     "started_result",
                 }
+                phased_activation_fields = legacy_activation_fields | {
+                    "operation_id",
+                    "challenge_id",
+                    "attempt_digest",
+                    "capability_sha256",
+                }
                 if (
                     not isinstance(activation, dict)
-                    or set(activation) != phased_activation_fields
+                    or frozenset(activation)
+                    not in {
+                        frozenset(legacy_activation_fields),
+                        frozenset(phased_activation_fields),
+                    }
                 ):
                     raise RuntimeError("formal source ledger activation result is invalid")
                 _nonempty_string(
@@ -4768,6 +4785,41 @@ class FormalLiveSourceAuthority:
                     activation["job_id"],
                     "formal source ledger activation job",
                 )
+                if set(activation) == phased_activation_fields:
+                    _require_sha256(
+                        activation["operation_id"],
+                        "formal source ledger activation operation",
+                    )
+                    _nonempty_string(
+                        activation["challenge_id"],
+                        "formal source ledger activation challenge",
+                    )
+                    _require_sha256(
+                        activation["attempt_digest"],
+                        "formal source ledger activation attempt",
+                    )
+                    _require_sha256(
+                        activation["capability_sha256"],
+                        "formal source ledger activation capability",
+                    )
+                    issued = value.get("issue_result")
+                    if not isinstance(issued, dict):
+                        raise RuntimeError(
+                            "formal source ledger activation has no issue result"
+                        )
+                    challenge = _validate_challenge(issued.get("challenge"))
+                    capability = _validate_execution_capability(
+                        issued.get("execution_capability"),
+                        challenge=challenge,
+                    )
+                    if (
+                        activation["challenge_id"] != capability["challenge_id"]
+                        or activation["attempt_digest"] != capability["attempt_digest"]
+                        or activation["capability_sha256"] != _sha256(capability)
+                    ):
+                        raise RuntimeError(
+                            "formal source ledger activation identity is invalid"
+                        )
                 _validate_companion_binding(activation["companion_binding"])
                 phase = activation["phase"]
                 if phase not in {

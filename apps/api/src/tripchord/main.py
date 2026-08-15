@@ -1495,8 +1495,20 @@ async def activate_formal_live_source_job_endpoint(
                 companion_binding=companion_binding,
             )
             if replay is not None:
+                activation = authority.activation_state(
+                    job_id=job_id,
+                    capability=capability,
+                    idempotency_key=idempotency_key,
+                )
+                operation_id = activation.get("operation_id")
+                if isinstance(operation_id, str):
+                    with suppress(LivePlanningJobInactiveError):
+                        await registry.commit_activation(
+                            job_id,
+                            principal.tenant_id,
+                            operation_id=operation_id,
+                        )
                 return cast(dict[str, Any], replay)
-            authority.require_active_job(job_id)
             bridge = getattr(request.app.state, "browser_task_bridge", None)
             if bridge is None:
                 raise ValueError("formal source activation has no mounted Browser bridge")
@@ -1506,6 +1518,8 @@ async def activate_formal_live_source_job_endpoint(
                 idempotency_key=idempotency_key,
                 companion_binding=companion_binding,
             )
+            if activation.get("phase") != "activation_ready":
+                authority.require_active_job(job_id)
             deadline = (
                 asyncio.get_running_loop().time()
                 + _FORMAL_ACTIVATION_HEARTBEAT_TIMEOUT_SECONDS
@@ -1540,15 +1554,91 @@ async def activate_formal_live_source_job_endpoint(
                 started_result = activation.get("started_result")
                 if not isinstance(started_result, dict):
                     raise ValueError("formal source queued activation receipt is unavailable")
-                with authority.execution_scope(capability):
-                    snapshot = await registry.activate(job_id, principal.tenant_id)
+                operation_id = activation.get("operation_id")
+                if not isinstance(operation_id, str):
+                    raise ValueError("formal source activation operation is unavailable")
+                if not isinstance(capability, dict) or not isinstance(
+                    companion_binding, dict
+                ):
+                    raise ValueError("formal source activation identity is unavailable")
+                activation_intent = {
+                    "schema_version": "tripchord-live-activation-operation-v1",
+                    "operation_id": operation_id,
+                    "idempotency_key": idempotency_key,
+                    "request_digest": activation.get("request_digest"),
+                    "job_id": job_id,
+                    "challenge_id": activation.get("challenge_id"),
+                    "attempt_digest": activation.get("attempt_digest"),
+                    "capability_sha256": activation.get("capability_sha256"),
+                    "companion_identity_sha256": companion_binding.get(
+                        "identity_sha256"
+                    ),
+                    "queued_result": started_result,
+                }
+                operation = await registry.prepare_activation_intent(
+                    job_id,
+                    principal.tenant_id,
+                    intent=activation_intent,
+                )
+                dispatched_now = operation["phase"] == "intent"
+                if operation["phase"] == "intent":
+                    authority.require_active_job(job_id)
+                    with authority.execution_scope(capability):
+                        snapshot = await registry.activate(
+                            job_id,
+                            principal.tenant_id,
+                            operation_id=operation_id,
+                        )
+                else:
+                    snapshot = await registry.get(job_id, principal.tenant_id)
                 if snapshot is None or snapshot.id != job_id:
                     raise ValueError("formal source prepared job is unavailable")
-                activation = authority.mark_activation_started(
-                    job_id=job_id,
-                    capability=capability,
-                    idempotency_key=idempotency_key,
-                    result=started_result,
+                recovered_operation = await registry.activation_operation(
+                    job_id,
+                    principal.tenant_id,
+                    operation_id=operation_id,
+                )
+                if recovered_operation["phase"] not in {"dispatched", "committed"}:
+                    raise ValueError("formal source activation operation was not dispatched")
+                if json.dumps(
+                    recovered_operation["queued_result"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) != json.dumps(
+                    started_result,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ):
+                    raise ValueError("formal source activation queued receipt differs")
+                failpoint = os.environ.get(
+                    "TRIPCHORD_TEST_FORMAL_ACTIVATION_FAILPOINT"
+                )
+                if dispatched_now and failpoint == "exit_after_registry_dispatch":
+                    os._exit(86)
+                trust_root_mode: int | None = None
+                if (
+                    dispatched_now
+                    and failpoint == "ledger_write_failure_after_registry_dispatch"
+                ):
+                    trust_root = formal_source_trust_root()
+                    trust_root_mode = stat.S_IMODE(trust_root.stat().st_mode)
+                    trust_root.chmod(0o500)
+                try:
+                    activation = authority.mark_activation_started(
+                        job_id=job_id,
+                        capability=capability,
+                        idempotency_key=idempotency_key,
+                        result=started_result,
+                    )
+                finally:
+                    if trust_root_mode is not None:
+                        formal_source_trust_root().chmod(trust_root_mode)
+                await registry.commit_activation(
+                    job_id,
+                    principal.tenant_id,
+                    operation_id=operation_id,
                 )
             if activation.get("phase") == "completed":
                 completed = activation.get("result")

@@ -16598,6 +16598,304 @@ def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
             os.environ["TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"] = original_trust_root
 
 
+@pytest.mark.parametrize(
+    "fault_mode",
+    (
+        "exit_after_registry_dispatch",
+        "ledger_write_failure_after_registry_dispatch",
+    ),
+)
+def test_formal_activation_cross_registry_fault_recovers_exact_receipt_over_real_http(
+    tmp_path: Path,
+    fault_mode: str,
+) -> None:
+    """91648931: the registry/formal-ledger double-write window is recoverable."""
+
+    import httpx
+    from tripchord.formal_live_source import (
+        formal_job_graph_for_frozen_v4,
+        provision_formal_source_trust_root,
+    )
+    from tripchord.planning.stay_plans import system_stay_plan_candidate_set
+
+    from benchmarks import run_live_done_gate_v4 as runner
+
+    trust_root = tmp_path / "trust-root"
+    provision_formal_source_trust_root(trust_root)
+    original_trust_root = os.environ.get("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT")
+    os.environ["TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"] = str(trust_root)
+    control_path = trust_root / "control-token"
+    ledger_path = trust_root / "ledger.json"
+    registry_path = trust_root / "live-planning-jobs.json"
+    bridge_token = "cross-registry-fault-bridge-token-000000000000"
+    companion_payload = {
+        "companion_id": "cross-registry-fault-companion",
+        "providers": ["ctrip", "qunar", "tongcheng"],
+        "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
+        "adapter_version": "cross-registry-fault-http-v1",
+        "contract_version": "tripchord-browser-companion-v1",
+        "build_identity": {
+            "protocol_version": "tripchord-companion-control-v1",
+            "manifest_version": "cross-registry-fault-build-v1",
+            "build_sha256": "7" * 64,
+            "content_runtime_version": "cross-registry-fault-runtime-v1",
+        },
+        "runtime_instance_id": "cross-registry-fault-runtime-instance-0001",
+    }
+    scenario_path = gate.ROOT / "benchmarks/scenarios/live-hgh-mle-aug-2026-v4.json"
+    request = runner._load_request(scenario_path)
+    api_payload = runner._api_payload(request)
+    api_payload_sha256 = runner._canonical_sha256(api_payload)
+    scenario_sha256 = runner._canonical_sha256(request)
+    candidate_set_sha256 = system_stay_plan_candidate_set().candidate_set_sha256
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        port = int(reserved.getsockname()[1])
+    base = f"http://127.0.0.1:{port}"
+    base_env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(
+            (str(gate.ROOT / "apps" / "api" / "src"), str(gate.ROOT))
+        ),
+        "TRIPCHORD_DATABASE_URL": f"sqlite+aiosqlite:///{tmp_path / 'api.db'}",
+        "TRIPCHORD_BROWSER_BRIDGE_ENABLED": "true",
+        "TRIPCHORD_BROWSER_BRIDGE_TOKEN": bridge_token,
+        "TRIPCHORD_BROWSER_COMPANION_AUTO_RELOAD_ENABLED": "false",
+        "TRIPCHORD_MODEL_AGENTS_REQUIRED": "false",
+        "TRIPCHORD_ADAPTIVE_AGENT_SCALING_ENABLED": "false",
+        "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT": str(trust_root),
+        "TRIPCHORD_MEMORY_STATE_PATH": str(tmp_path / "memory.json"),
+        "TRIPCHORD_LIVE_RUN_CACHE_STATE_PATH": str(tmp_path / "live-cache.json"),
+        "TRIPCHORD_LOG_LEVEL": "WARNING",
+    }
+    processes: list[subprocess.Popen[bytes]] = []
+
+    def stop_server(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+
+    async def start_server(sequence: int, *, fault: str | None) -> subprocess.Popen[bytes]:
+        log_path = tmp_path / f"fault-api-{sequence}.log"
+        env = dict(base_env)
+        if fault is not None:
+            env["TRIPCHORD_TEST_FORMAL_ACTIVATION_FAILPOINT"] = fault
+        else:
+            env.pop("TRIPCHORD_TEST_FORMAL_ACTIVATION_FAILPOINT", None)
+        with log_path.open("wb") as log:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "tripchord.main:app",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--log-level",
+                    "warning",
+                ],
+                cwd=gate.ROOT,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+        processes.append(process)
+        async with httpx.AsyncClient(timeout=0.5) as client:
+            for _ in range(100):
+                if process.poll() is not None:
+                    pytest.fail(
+                        "production API exited before readiness:\n"
+                        + log_path.read_text(encoding="utf-8", errors="replace")
+                    )
+                try:
+                    response = await client.get(f"{base}/ready")
+                    if response.status_code == 200:
+                        return process
+                except httpx.RequestError:
+                    pass
+                await asyncio.sleep(0.05)
+        pytest.fail("production API did not become ready before the bounded deadline")
+
+    async def exercise_fault() -> None:
+        first_process = await start_server(1, fault=fault_mode)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            runtime = (await client.get(f"{base}/api/v1/agents/runtime")).json()[
+                "runtime_provenance"
+            ]
+            heartbeat = await client.post(
+                f"{base}/browser-bridge/v1/companions/heartbeat",
+                headers={"X-TripChord-Bridge-Token": bridge_token},
+                json=companion_payload,
+            )
+            heartbeat.raise_for_status()
+            preflight = await runner._preflight_companion(client, base, bridge_token)
+            companion_binding = runner._formal_companion_binding_from_preflight(preflight)
+            control = runner._new_live_job_control(
+                request,
+                api_payload,
+                client_wait_timeout_seconds=3900.0,
+                attempt_id="6" * 32,
+            )
+            await runner._submit_flexible_live_job(
+                client,
+                base,
+                api_payload,
+                control,
+                control_path,
+            )
+            job_id = str(control["job_id"])
+            context: dict[str, object] = {
+                "run_id": f"cross-registry-{fault_mode}",
+                "tested_commit_sha": runtime["commit_sha"],
+                "runtime_identity": runtime,
+                "request_sha256": api_payload_sha256,
+                "candidate_set_sha256": candidate_set_sha256,
+                "scenario_sha256": scenario_sha256,
+                "job_graph": formal_job_graph_for_frozen_v4(
+                    terminal_job_id=job_id,
+                    request_sha256=api_payload_sha256,
+                    adults=2,
+                ),
+            }
+            issued = await runner._issue_formal_source_challenge_remote(
+                client,
+                base,
+                context,
+                runner._formal_control_idempotency_key(control, "challenge"),
+                control_path,
+            )
+            activation_key = runner._formal_control_idempotency_key(control, "activate")
+            activation_headers = {
+                "X-TripChord-Formal-Source-Control": runner._formal_source_control_token(
+                    control_path
+                ),
+                "Idempotency-Key": activation_key,
+            }
+            activation_payload = {
+                "execution_capability": issued["execution_capability"],
+                "companion_binding": companion_binding,
+            }
+            activation_task = asyncio.create_task(
+                client.post(
+                    f"{base}/api/v1/internal/formal-live-source/jobs/{job_id}/activate",
+                    headers=activation_headers,
+                    json=activation_payload,
+                )
+            )
+            for _ in range(100):
+                if first_process.poll() is not None:
+                    break
+                polled = await client.post(
+                    f"{base}/browser-bridge/v1/companions/heartbeat",
+                    headers={"X-TripChord-Bridge-Token": bridge_token},
+                    json=companion_payload,
+                )
+                polled.raise_for_status()
+                pending = polled.json().get("formal_activation_request")
+                if pending is not None:
+                    acknowledged = await client.post(
+                        f"{base}/browser-bridge/v1/companions/heartbeat",
+                        headers={"X-TripChord-Bridge-Token": bridge_token},
+                        json={**companion_payload, "formal_activation_ack": pending},
+                    )
+                    acknowledged.raise_for_status()
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("activation never exposed a real Companion heartbeat request")
+            if fault_mode == "exit_after_registry_dispatch":
+                try:
+                    unexpected_response = await activation_task
+                except httpx.RequestError:
+                    pass
+                else:
+                    assert unexpected_response.status_code >= 500
+                assert first_process.wait(timeout=10) == 86
+            else:
+                failed = await activation_task
+                assert failed.status_code == 409
+                assert "formal source ledger" in failed.text
+
+        registry_before = json.loads(registry_path.read_text(encoding="utf-8"))
+        record_before = next(
+            item for item in registry_before["records"] if item["snapshot"]["id"] == job_id
+        )
+        operation_before = record_before["activation_operation"]
+        assert operation_before["phase"] == "dispatched"
+        assert operation_before["dispatch_count"] == 1
+        expected_receipt = operation_before["queued_result"]
+        ledger_before = json.loads(ledger_path.read_text(encoding="utf-8"))
+        formal_before = next(
+            row
+            for row in ledger_before.values()
+            if row["run_id"] == f"cross-registry-{fault_mode}"
+        )["activation_record"]
+        assert formal_before["phase"] == "activation_ready"
+        assert formal_before["result"] is None
+        stop_server(first_process)
+
+        await start_server(2, fault=None)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            recovered = await client.post(
+                f"{base}/api/v1/internal/formal-live-source/jobs/{job_id}/activate",
+                headers=activation_headers,
+                json=activation_payload,
+            )
+            assert recovered.status_code == 200, recovered.text
+            assert recovered.json() == expected_receipt
+            mismatch = await client.post(
+                f"{base}/api/v1/internal/formal-live-source/jobs/{job_id}/activate",
+                headers=activation_headers,
+                json={
+                    **activation_payload,
+                    "companion_binding": {
+                        **companion_binding,
+                        "runtime_instance_id": "foreign-runtime-after-fault",
+                    },
+                },
+            )
+            assert mismatch.status_code == 409
+            status = await client.get(
+                f"{base}/api/v1/agents/live-flexible-plan-from-text/jobs/{job_id}"
+            )
+            assert status.status_code == 200
+            assert status.json()["state"] == "cancelled"
+            assert status.json()["stage"] in {"restart_cancelled", "cancelled"}
+
+        registry_after = json.loads(registry_path.read_text(encoding="utf-8"))
+        record_after = next(
+            item for item in registry_after["records"] if item["snapshot"]["id"] == job_id
+        )
+        assert record_after["activation_operation"]["phase"] == "committed"
+        assert record_after["activation_operation"]["dispatch_count"] == 1
+        ledger_after = json.loads(ledger_path.read_text(encoding="utf-8"))
+        formal_after = next(
+            row
+            for row in ledger_after.values()
+            if row["run_id"] == f"cross-registry-{fault_mode}"
+        )["activation_record"]
+        assert formal_after["phase"] == "started"
+        assert formal_after["result"] == expected_receipt
+        assert formal_after["started_result"] == expected_receipt
+
+    try:
+        asyncio.run(exercise_fault())
+    finally:
+        for process in processes:
+            stop_server(process)
+        if original_trust_root is None:
+            os.environ.pop("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT", None)
+        else:
+            os.environ["TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"] = original_trust_root
+
+
 def test_formal_challenge_write_failure_abort_and_expiry_are_atomic(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

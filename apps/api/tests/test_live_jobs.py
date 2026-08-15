@@ -1141,3 +1141,153 @@ async def test_persistent_registry_write_failure_rolls_back_without_starting(
     monkeypatch.undo()
     await registry.cancel(prepared.id, "tenant-a")
     await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_activation_operation_is_durable_and_never_redispatched_after_restart(
+    tmp_path: Path,
+) -> None:
+    """P0/91648931: a dispatched formal start is an exactly-once durable operation."""
+
+    state_path = tmp_path / "live-jobs.json"
+    started = asyncio.Event()
+    release = asyncio.Event()
+    dispatches = 0
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal dispatches
+        dispatches += 1
+        started.set()
+        await release.wait()
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path)
+    prepared, _ = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="formal-job-prepare-v1",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    queued_result = {"job": prepared.model_dump(mode="json")}
+    intent = {
+        "schema_version": "tripchord-live-activation-operation-v1",
+        "operation_id": "1" * 64,
+        "idempotency_key": "formal-activation-v1",
+        "request_digest": "2" * 64,
+        "job_id": prepared.id,
+        "challenge_id": "challenge-exactly-once-v1",
+        "attempt_digest": "3" * 64,
+        "capability_sha256": "4" * 64,
+        "companion_identity_sha256": "5" * 64,
+        "queued_result": queued_result,
+    }
+
+    stored = await registry.prepare_activation_intent(
+        prepared.id,
+        "tenant-a",
+        intent=intent,
+    )
+    assert stored["phase"] == "intent"
+    assert stored["dispatch_count"] == 0
+    activated = await registry.activate(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert activated is not None and activated.id == prepared.id
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert dispatches == 1
+
+    durable = await registry.activation_operation(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert durable["phase"] == "dispatched"
+    assert durable["dispatch_count"] == 1
+    assert durable["queued_result"] == queued_result
+
+    restarted = LivePlanningJobRegistry(state_path=state_path)
+    recovered = await restarted.activation_operation(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert recovered == {
+        **durable,
+        "phase": "dispatched",
+        "dispatch_count": 1,
+    }
+    replayed = await restarted.activate(
+        prepared.id,
+        "tenant-a",
+        operation_id=intent["operation_id"],
+    )
+    assert replayed is not None and replayed.id == prepared.id
+    assert dispatches == 1
+    assert (
+        await restarted.activation_operation(
+            prepared.id,
+            "tenant-a",
+            operation_id=intent["operation_id"],
+        )
+    )["dispatch_count"] == 1
+    with pytest.raises(LivePlanningJobInactiveError, match="foreign activation operation"):
+        await restarted.activate(
+            prepared.id,
+            "tenant-a",
+            operation_id="6" * 64,
+        )
+
+    release.set()
+    await registry.close()
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_activation_intent_conflict_is_rejected_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    registry = LivePlanningJobRegistry(state_path=tmp_path / "live-jobs.json")
+    dispatched = False
+
+    async def operation(_: Any) -> dict[str, Any]:
+        nonlocal dispatched
+        dispatched = True
+        return {"ok": True}
+
+    prepared, _ = await registry.start_idempotent(
+        tenant_id="tenant-a",
+        operation=operation,
+        idempotency_key="formal-job-conflict-v1",
+        request_digest=REQUEST_SHA256,
+        defer_start=True,
+    )
+    intent = {
+        "schema_version": "tripchord-live-activation-operation-v1",
+        "operation_id": "7" * 64,
+        "idempotency_key": "formal-activation-conflict-v1",
+        "request_digest": "8" * 64,
+        "job_id": prepared.id,
+        "challenge_id": "challenge-conflict-v1",
+        "attempt_digest": "9" * 64,
+        "capability_sha256": "a" * 64,
+        "companion_identity_sha256": "b" * 64,
+        "queued_result": {"job": prepared.model_dump(mode="json")},
+    }
+    await registry.prepare_activation_intent(prepared.id, "tenant-a", intent=intent)
+    with pytest.raises(LivePlanningJobInactiveError, match="activation intent differs"):
+        await registry.prepare_activation_intent(
+            prepared.id,
+            "tenant-a",
+            intent={**intent, "request_digest": "c" * 64},
+        )
+    assert dispatched is False
+    assert await registry.is_prepared(
+        prepared.id,
+        "tenant-a",
+        request_sha256=REQUEST_SHA256,
+    )
+    await registry.cancel(prepared.id, "tenant-a")
+    await registry.close()

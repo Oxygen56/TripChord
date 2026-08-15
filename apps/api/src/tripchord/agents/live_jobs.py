@@ -672,6 +672,7 @@ class _RuntimeJob:
         self.deadline_monotonic = deadline_monotonic
         self.operation = operation
         self.prepared = prepared
+        self.activation_operation: dict[str, Any] | None = None
         self.generation = 1
         self.task: asyncio.Task[None] | None = None
         self.operation_task: asyncio.Task[dict[str, Any]] | None = None
@@ -750,7 +751,11 @@ class LivePlanningJobRegistry:
             "idempotency",
         }:
             raise RuntimeError("live planning job registry state has an invalid shape")
-        if payload["schema_version"] != "tripchord-live-job-registry-v1":
+        schema_version = payload["schema_version"]
+        if schema_version not in {
+            "tripchord-live-job-registry-v1",
+            "tripchord-live-job-registry-v2",
+        }:
             raise RuntimeError("live planning job registry state schema is invalid")
         records = payload["records"]
         idempotency = payload["idempotency"]
@@ -761,11 +766,14 @@ class LivePlanningJobRegistry:
         ):
             raise RuntimeError("live planning job registry state exceeds its bounds")
         for item in records:
-            if not isinstance(item, dict) or set(item) != {
+            expected_record_fields = {
                 "tenant_partition",
                 "snapshot",
                 "prepared",
-            }:
+            }
+            if schema_version == "tripchord-live-job-registry-v2":
+                expected_record_fields.add("activation_operation")
+            if not isinstance(item, dict) or set(item) != expected_record_fields:
                 raise RuntimeError("live planning job registry record is invalid")
             tenant_partition = item["tenant_partition"]
             prepared = item["prepared"]
@@ -783,13 +791,21 @@ class LivePlanningJobRegistry:
                 raise RuntimeError("live planning job registry record is duplicated")
             if prepared and snapshot.state != LivePlanningJobState.QUEUED:
                 raise RuntimeError("live planning prepared record is inconsistent")
-            self._records[snapshot.id] = _RuntimeJob(
+            runtime = _RuntimeJob(
                 tenant_partition=tenant_partition,
                 snapshot=snapshot,
                 deadline_monotonic=0.0,
                 operation=self._unrecoverable_operation,
                 prepared=prepared,
             )
+            if schema_version == "tripchord-live-job-registry-v2":
+                activation_operation = item["activation_operation"]
+                if activation_operation is not None:
+                    runtime.activation_operation = self._validate_activation_operation(
+                        activation_operation,
+                        expected_job_id=snapshot.id,
+                    )
+            self._records[snapshot.id] = runtime
         for item in idempotency:
             if not isinstance(item, dict) or set(item) != {
                 "partition",
@@ -875,12 +891,13 @@ class LivePlanningJobRegistry:
         else:
             self._validate_state_file(path)
         payload = {
-            "schema_version": "tripchord-live-job-registry-v1",
+            "schema_version": "tripchord-live-job-registry-v2",
             "records": [
                 {
                     "tenant_partition": runtime.tenant_partition,
                     "snapshot": runtime.snapshot.model_dump(mode="json"),
                     "prepared": runtime.prepared,
+                    "activation_operation": runtime.activation_operation,
                 }
                 for runtime in sorted(
                     self._records.values(), key=lambda item: item.snapshot.id
@@ -1036,6 +1053,8 @@ class LivePlanningJobRegistry:
         self,
         job_id: str,
         tenant_id: str,
+        *,
+        operation_id: str | None = None,
     ) -> LivePlanningJobSnapshot | None:
         """Start one explicitly prepared job exactly once.
 
@@ -1049,6 +1068,22 @@ class LivePlanningJobRegistry:
             runtime = self._owned_locked(job_id, tenant_id)
             if runtime is None:
                 return None
+            activation = runtime.activation_operation
+            if activation is not None:
+                if operation_id != activation["operation_id"]:
+                    raise LivePlanningJobInactiveError(
+                        "live planning job uses a foreign activation operation"
+                    )
+                if activation["phase"] in {"dispatched", "committed"}:
+                    return runtime.snapshot
+                if activation["phase"] != "intent" or activation["dispatch_count"] != 0:
+                    raise LivePlanningJobInactiveError(
+                        "live planning activation operation is inconsistent"
+                    )
+            elif operation_id is not None:
+                raise LivePlanningJobInactiveError(
+                    "live planning activation operation has no durable intent"
+                )
             if not runtime.prepared and runtime.task is not None:
                 return runtime.snapshot
             if not runtime.prepared or runtime.task is not None:
@@ -1060,10 +1095,16 @@ class LivePlanningJobRegistry:
                     "prepared live planning job is no longer queued"
                 )
             runtime.prepared = False
+            if activation is not None:
+                activation["phase"] = "dispatched"
+                activation["dispatch_count"] = 1
             try:
                 self._persist_locked()
             except Exception:
                 runtime.prepared = True
+                if activation is not None:
+                    activation["phase"] = "intent"
+                    activation["dispatch_count"] = 0
                 raise
             runtime.task = asyncio.create_task(
                 self._run(runtime, runtime.operation),
@@ -1071,6 +1112,175 @@ class LivePlanningJobRegistry:
             )
             self._changed.notify_all()
             return runtime.snapshot
+
+    @staticmethod
+    def _validate_activation_operation(
+        value: object,
+        *,
+        expected_job_id: str,
+        allow_intent_shape: bool = False,
+    ) -> dict[str, Any]:
+        immutable_fields = {
+            "schema_version",
+            "operation_id",
+            "idempotency_key",
+            "request_digest",
+            "job_id",
+            "challenge_id",
+            "attempt_digest",
+            "capability_sha256",
+            "companion_identity_sha256",
+            "queued_result",
+        }
+        fields = immutable_fields if allow_intent_shape else immutable_fields | {
+            "phase",
+            "dispatch_count",
+        }
+        if not isinstance(value, dict) or set(value) != fields:
+            raise RuntimeError("live planning activation operation has an invalid shape")
+        if value["schema_version"] != "tripchord-live-activation-operation-v1":
+            raise RuntimeError("live planning activation operation schema is invalid")
+        if value["job_id"] != expected_job_id:
+            raise RuntimeError("live planning activation operation targets a foreign job")
+        for field_name in (
+            "operation_id",
+            "request_digest",
+            "attempt_digest",
+            "capability_sha256",
+            "companion_identity_sha256",
+        ):
+            if not isinstance(value[field_name], str) or re.fullmatch(
+                r"[0-9a-f]{64}", value[field_name]
+            ) is None:
+                raise RuntimeError(
+                    f"live planning activation operation {field_name} is invalid"
+                )
+        for field_name in ("idempotency_key", "challenge_id"):
+            if (
+                not isinstance(value[field_name], str)
+                or not value[field_name].strip()
+                or len(value[field_name]) > 200
+            ):
+                raise RuntimeError(
+                    f"live planning activation operation {field_name} is invalid"
+                )
+        queued_result = value["queued_result"]
+        if (
+            not isinstance(queued_result, dict)
+            or set(queued_result) != {"job"}
+            or not isinstance(queued_result["job"], dict)
+            or queued_result["job"].get("id") != expected_job_id
+            or queued_result["job"].get("state") != LivePlanningJobState.QUEUED.value
+        ):
+            raise RuntimeError("live planning activation queued result is invalid")
+        if not allow_intent_shape:
+            phase = value["phase"]
+            dispatch_count = value["dispatch_count"]
+            if phase not in {"intent", "dispatched", "committed"}:
+                raise RuntimeError("live planning activation operation phase is invalid")
+            expected_count = 0 if phase == "intent" else 1
+            if type(dispatch_count) is not int or dispatch_count != expected_count:
+                raise RuntimeError("live planning activation dispatch count is invalid")
+        return json.loads(
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+
+    async def prepare_activation_intent(
+        self,
+        job_id: str,
+        tenant_id: str,
+        *,
+        intent: object,
+    ) -> dict[str, Any]:
+        """Persist one immutable formal activation identity before dispatch."""
+
+        checked = self._validate_activation_operation(
+            intent,
+            expected_job_id=job_id,
+            allow_intent_shape=True,
+        )
+        async with self._changed:
+            self._prune_locked(self._utc_now())
+            runtime = self._owned_locked(job_id, tenant_id)
+            if runtime is None:
+                raise LivePlanningJobInactiveError(
+                    "live planning activation intent targets an unavailable job"
+                )
+            existing = runtime.activation_operation
+            if existing is not None:
+                existing_intent = {
+                    key: existing[key]
+                    for key in checked
+                }
+                if existing_intent != checked:
+                    raise LivePlanningJobInactiveError(
+                        "live planning activation intent differs from the durable intent"
+                    )
+                return json.loads(json.dumps(existing, sort_keys=True))
+            if (
+                not runtime.prepared
+                or runtime.task is not None
+                or runtime.snapshot.state != LivePlanningJobState.QUEUED
+                or checked["queued_result"]["job"]
+                != runtime.snapshot.model_dump(mode="json")
+            ):
+                raise LivePlanningJobInactiveError(
+                    "live planning activation intent requires the exact prepared job"
+                )
+            runtime.activation_operation = {
+                **checked,
+                "phase": "intent",
+                "dispatch_count": 0,
+            }
+            try:
+                self._persist_locked()
+            except Exception:
+                runtime.activation_operation = None
+                raise
+            self._changed.notify_all()
+            return json.loads(json.dumps(runtime.activation_operation, sort_keys=True))
+
+    async def activation_operation(
+        self,
+        job_id: str,
+        tenant_id: str,
+        *,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        async with self._lock:
+            self._prune_locked(self._utc_now())
+            runtime = self._owned_locked(job_id, tenant_id)
+            operation = runtime.activation_operation if runtime is not None else None
+            if operation is None or operation.get("operation_id") != operation_id:
+                raise LivePlanningJobInactiveError(
+                    "live planning job uses a foreign activation operation"
+                )
+            return json.loads(json.dumps(operation, sort_keys=True))
+
+    async def commit_activation(
+        self,
+        job_id: str,
+        tenant_id: str,
+        *,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        async with self._changed:
+            self._prune_locked(self._utc_now())
+            runtime = self._owned_locked(job_id, tenant_id)
+            operation = runtime.activation_operation if runtime is not None else None
+            if operation is None or operation.get("operation_id") != operation_id:
+                raise LivePlanningJobInactiveError(
+                    "live planning job uses a foreign activation operation"
+                )
+            if operation["phase"] == "intent":
+                raise LivePlanningJobInactiveError(
+                    "live planning activation operation was not dispatched"
+                )
+            if operation["phase"] == "dispatched":
+                operation["phase"] = "committed"
+                self._persist_locked()
+                self._changed.notify_all()
+            return json.loads(json.dumps(operation, sort_keys=True))
 
     async def is_prepared(
         self,
