@@ -171,6 +171,12 @@ class _PendingTerminalOutcome:
             state = LivePlanningJobState(state_raw)
         except ValueError as exc:
             raise ValueError("pending terminal outcome has an unknown state") from exc
+        # C-145 P0 supplement: a durable pending outcome can only target an
+        # ALLOWED terminal state — RUNNING/QUEUED (or any other non-terminal
+        # value) would terminalize a live record to a label the caller never
+        # chose, so the loader rejects it fail-closed instead.
+        if state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
+            raise ValueError("pending terminal outcome is not a terminal state")
         result = raw.get("result")
         if result is not None and not isinstance(result, dict):
             raise ValueError("pending terminal outcome has an invalid result")
@@ -203,6 +209,14 @@ class _PendingTerminalOutcome:
                 code=code,
                 details=details,
                 details_digest=digest_raw,
+            )
+        # C-145 P0 supplement: state/stage/safe_failure must be mutually
+        # consistent. A safe-failure diagnostic only ever accompanies a FAILED
+        # outcome — a CANCELLED (or SUCCEEDED) intent carrying a safe failure is
+        # corruption and is rejected fail-closed, never default-patched.
+        if safe_failure is not None and state != LivePlanningJobState.FAILED:
+            raise ValueError(
+                "pending terminal outcome safe failure requires a FAILED state"
             )
         return cls(
             state=state,
@@ -974,7 +988,18 @@ class LivePlanningJobRegistry:
             # null) for every record.
             if schema_version == "tripchord-live-job-registry-v3":
                 expected_record_fields.add("pending_terminal")
-            if not isinstance(item, dict) or set(item) != expected_record_fields:
+            # C-145 P0 supplement: the v3 loader explicitly accepts BOTH the
+            # new-v3 field set (with ``pending_terminal``, possibly null) AND the
+            # old-v3 field set (without the key at all — migrated to a null
+            # intent via ``item.get`` below). Every OTHER missing or unknown
+            # field is still rejected fail-closed; nothing is silently patched.
+            accepted_record_field_sets = {frozenset(expected_record_fields)}
+            if schema_version == "tripchord-live-job-registry-v3":
+                accepted_record_field_sets = {
+                    frozenset(expected_record_fields),
+                    frozenset(expected_record_fields - {"pending_terminal"}),
+                }
+            if not isinstance(item, dict) or set(item) not in accepted_record_field_sets:
                 raise RuntimeError("live planning job registry record is invalid")
             tenant_partition = item["tenant_partition"]
             prepared = item["prepared"]
@@ -1010,7 +1035,8 @@ class LivePlanningJobRegistry:
                         expected_job_id=snapshot.id,
                     )
             if schema_version == "tripchord-live-job-registry-v3":
-                raw_pending = item["pending_terminal"]
+                # ``get`` migrates an old-v3 record (no key) to a null intent.
+                raw_pending = item.get("pending_terminal")
                 if raw_pending is not None:
                     try:
                         runtime.pending_terminal = _PendingTerminalOutcome.from_persisted(
@@ -1104,6 +1130,21 @@ class LivePlanningJobRegistry:
                         safe_failure=pending.safe_failure,
                         cancellation_requested=pending.cancellation_requested,
                     )
+                elif runtime.snapshot.stage == "isolated_ambiguous_cancel":
+                    # C-145 P0 supplement: a record quarantined by an earlier
+                    # cold start stays quarantined — re-isolating is idempotent,
+                    # so two consecutive cold starts never drift it into a
+                    # guessed CANCELLED/FAILED label.
+                    pass
+                elif pending is not None or runtime.snapshot.cancel_pending:
+                    # C-145 P0 supplement: a non-terminal record whose durable
+                    # cancel intent (pending=true) has NO provable terminal
+                    # outcome — or carries an outcome inconsistent with its
+                    # snapshot — gives no unforgeable fact to prove whether the
+                    # intended label was CANCELLED or FAILED. We never guess:
+                    # the record is isolated (never replayed) and the ambiguity
+                    # is surfaced explicitly.
+                    self._isolate_ambiguous_cancel_locked(runtime)
                 else:
                     self._terminalize_locked(
                         runtime,
@@ -1115,6 +1156,37 @@ class LivePlanningJobRegistry:
                 runtime.pending_terminal = None
         self._prune_locked(self._utc_now())
         self._persist_locked()
+
+    def _isolate_ambiguous_cancel_locked(self, runtime: _RuntimeJob) -> None:
+        """Quarantine a non-terminal record whose durable cancel intent has no
+        provable terminal outcome (C-145 P0 supplement).
+
+        A record that was mid-cancel at the crash (``snapshot.cancel_pending``)
+        but carries no durable ``pending_terminal`` gives no unforgeable fact to
+        prove whether the intended outcome was CANCELLED or FAILED. We never
+        guess: the record stays NON-terminal with an explicit
+        ``isolated_ambiguous_cancel`` marker and a clear error, and every
+        idempotency binding to it is marked ``legacy_isolated`` so a same-key
+        request fails closed instead of replaying or re-admitting over an
+        unknown outcome. The clear ``cancel_pending`` flag keeps a later
+        cancel()/close() from joining a phantom in-flight cancel and guessing a
+        label for it."""
+        runtime.snapshot = runtime.snapshot.model_copy(
+            update={
+                "cancel_pending": False,
+                "stage": "isolated_ambiguous_cancel",
+                "error": (
+                    "cancel was pending at restart without a provable terminal "
+                    "outcome; the job is isolated and never replayed"
+                ),
+                "revision": runtime.snapshot.revision + 1,
+                "updated_at": self._utc_now(),
+            }
+        )
+        runtime.cancel_pending = False
+        for entry in self._idempotency.values():
+            if entry.job_id == runtime.snapshot.id:
+                entry.legacy_isolated = True
 
     def _derive_legacy_execution_mode(
         self,
@@ -1818,6 +1890,7 @@ class LivePlanningJobRegistry:
                 pre_call_cancel_pending = runtime.cancel_pending
                 pre_call_cancel_future = runtime.cancel_future
                 pre_call_cancel_drain_succeeded = runtime.cancel_drain_succeeded
+                pre_call_pending_terminal = runtime.pending_terminal
                 runtime.cancel_pending = True
                 runtime.snapshot = runtime.snapshot.model_copy(
                     update={
@@ -1826,6 +1899,16 @@ class LivePlanningJobRegistry:
                         "stage": "cancelling",
                         "updated_at": self._utc_now(),
                     }
+                )
+                # C-145 P0 supplement: a cancel's FIRST durable intent carries
+                # the full CANCELLED/cancelled outcome in the SAME atomic commit
+                # as the cancel_pending isolation — so a crash right after that
+                # commit (before any drain/mark) cold-starts straight to the
+                # unambiguous cancel outcome, never a guessed label.
+                runtime.pending_terminal = _PendingTerminalOutcome(
+                    state=LivePlanningJobState.CANCELLED,
+                    stage="cancelled",
+                    cancellation_requested=True,
                 )
                 task = runtime.task
                 operation_task = runtime.operation_task
@@ -1852,6 +1935,7 @@ class LivePlanningJobRegistry:
                     runtime.cancel_pending = pre_call_cancel_pending
                     runtime.cancel_future = pre_call_cancel_future
                     runtime.cancel_drain_succeeded = pre_call_cancel_drain_succeeded
+                    runtime.pending_terminal = pre_call_pending_terminal
                     if future is not None and not future.done():
                         future.set_result(pre_call_snapshot)
                     raise
@@ -2007,6 +2091,9 @@ class LivePlanningJobRegistry:
                 # executors. A later close() then re-persists the intent because
                 # ``_closed`` is still False.
                 previous_snapshots = [runtime.snapshot for runtime in active]
+                previous_pending_terminals = [
+                    runtime.pending_terminal for runtime in active
+                ]
                 for runtime in active:
                     if not runtime.snapshot.cancel_pending:
                         runtime.snapshot = runtime.snapshot.model_copy(
@@ -2017,11 +2104,29 @@ class LivePlanningJobRegistry:
                                 "updated_at": self._utc_now(),
                             }
                         )
+                    # C-145 P0 supplement: close()'s FIRST durable intent carries
+                    # the full CANCELLED/cancelled outcome in the SAME atomic
+                    # commit as the closing isolation — a crash right after this
+                    # commit cold-starts straight to the cancel outcome. A record
+                    # that already holds a DURABLE intent (e.g. a deadline cleanup)
+                    # keeps it: the first intent wins, never overwritten.
+                    if runtime.pending_terminal is None:
+                        runtime.pending_terminal = _PendingTerminalOutcome(
+                            state=LivePlanningJobState.CANCELLED,
+                            stage="cancelled",
+                            cancellation_requested=True,
+                        )
                 try:
                     await self._persist_locked_with_bounded_retry()
                 except Exception:
-                    for runtime, previous in zip(active, previous_snapshots, strict=True):
-                        runtime.snapshot = previous
+                    for runtime, previous_snapshot in zip(
+                        active, previous_snapshots, strict=True
+                    ):
+                        runtime.snapshot = previous_snapshot
+                    for runtime, previous_pending in zip(
+                        active, previous_pending_terminals, strict=True
+                    ):
+                        runtime.pending_terminal = previous_pending
                     raise
                 self._closed = True
                 self._changed.notify_all()
@@ -2149,13 +2254,28 @@ class LivePlanningJobRegistry:
                             "updated_at": self._utc_now(),
                         }
                     )
+                    # C-145 P0 supplement: the FIRST durable intent of a deadline
+                    # entry carries the full FAILED/deadline_exceeded outcome —
+                    # pending state, stage, error and the safe-failure diagnostic —
+                    # in the SAME atomic commit as the timeout isolation. Only a
+                    # successful commit ever permits the cancel/drain below; a
+                    # pre-commit failure keeps the intent in memory as the
+                    # recoverable owner and still drains the live operation.
+                    runtime.pending_terminal = _PendingTerminalOutcome(
+                        state=LivePlanningJobState.FAILED,
+                        stage="deadline_exceeded",
+                        error="TimeoutError: live planning job deadline exceeded",
+                        safe_failure=failure,
+                        cancellation_requested=True,
+                    )
                     with suppress(Exception):
                         # Pre-commit write failure that every bounded retry
-                        # exhausted: the timeout/cancel-pending isolation is kept
-                        # IN MEMORY as the observable/recoverable owner and the
-                        # operation is still drained below — the runner NEVER
-                        # restores the pre-timeout RUNNING snapshot and exits
-                        # over a live executor it has abandoned.
+                        # exhausted: the timeout/cancel-pending isolation AND the
+                        # pending outcome are kept IN MEMORY as the
+                        # observable/recoverable owner and the operation is still
+                        # drained below — the runner NEVER restores the
+                        # pre-timeout RUNNING snapshot and exits over a live
+                        # executor it has abandoned.
                         await self._persist_locked_with_bounded_retry()
             drained = await self._cancel_and_drain_operation(operation_task)
             operation_stopped = operation_task is None or operation_task.done()
@@ -2241,18 +2361,38 @@ class LivePlanningJobRegistry:
         whose cancel/close/deadline cleanup failed closed keeps a pending
         terminal outcome; the operation done-callback joins that state machine
         here, so the record auto-collects to its terminal state without an extra
-        retry/close/cold start."""
+        retry/close/cold start.
+
+        C-145 P0 supplement: the operation done-callback must NEVER spawn a
+        competing cleanup owner while a cancel()/close() caller is actively
+        settling this record (its cancel future is still live). The settling
+        caller's own join owns the terminalize — and must be the one to surface
+        an indeterminate post-commit write. Once the caller resolves the future
+        (or the operation stops on its own after cancel() returns), this
+        re-enters and spawns the owner as usual."""
         if not runtime.slot_held:
             # Still join the cleanup state machine — a pending terminal outcome
             # may need a (re)spawned owner even when an earlier call already
             # released the permit.
-            self._ensure_cleanup_owner(runtime)
+            if not self._cancel_settler_active(runtime):
+                self._ensure_cleanup_owner(runtime)
             return
         if runtime.operation_task is not None and not runtime.operation_task.done():
             return
         runtime.slot_held = False
         self._slots.release()
-        self._ensure_cleanup_owner(runtime)
+        if not self._cancel_settler_active(runtime):
+            self._ensure_cleanup_owner(runtime)
+
+    def _cancel_settler_active(self, runtime: _RuntimeJob) -> bool:
+        """True while a cancel()/close() caller is actively settling a record.
+
+        C-145 P0 supplement: the settling caller's own join owns the terminalize
+        (and must surface any post-commit write failure). The operation
+        done-callback must not spawn a racing owner mid-settle — once the caller
+        resolves the future, the done-callback re-enters and spawns as usual."""
+        cancel_future = runtime.cancel_future
+        return cancel_future is not None and not cancel_future.done()
 
     def _executors_stopped(self, runtime: _RuntimeJob) -> bool:
         """Shared terminalize predicate (硬门 B / P0-4).
@@ -2348,13 +2488,44 @@ class LivePlanningJobRegistry:
         # Budget exhausted: keep the durable retry intent and arm the single
         # registry reaper to re-spawn this owner after a bounded, growing backoff
         # (never a busy-wait, never a second concurrent owner).
-        runtime.cleanup_retry_round += 1
-        runtime.cleanup_next_retry_monotonic = loop.time() + min(
-            self._cleanup_retry_backoff_seconds
-            * (2 ** (runtime.cleanup_retry_round - 1)),
-            0.5,
+        runtime.cleanup_retry_round = self._bump_cleanup_retry_round(
+            runtime.cleanup_retry_round
+        )
+        runtime.cleanup_next_retry_monotonic = loop.time() + self._cleanup_retry_delay(
+            runtime.cleanup_retry_round
         )
         self._ensure_reaper()
+
+    @staticmethod
+    def _bump_cleanup_retry_round(raw_round: object) -> int:
+        """Safely increment the cleanup owner's retry round.
+
+        C-145 P0 supplement: a persisted round of ≈1025 (or a malicious
+        negative / non-integer / out-of-range value) must never crash the sole
+        cleanup owner. The value is validated and normalized BEFORE the backoff
+        exponentiation below; the normalization is observable through the
+        saturating delay and the surviving owner."""
+        if not isinstance(raw_round, int):
+            return 1
+        if raw_round < 0:
+            return 1
+        return raw_round + 1
+
+    def _cleanup_retry_delay(self, round_number: object) -> float:
+        """Bounded, saturating backoff for an exhausted cleanup owner's retry
+        round (C-145 P0 supplement).
+
+        The exponent is capped BEFORE exponentiation so a huge round can never
+        OverflowError the owner: the delay saturates to the 0.5s ceiling —
+        never a busy-wait, never an unbounded sleep. Malicious values (negative,
+        non-integer, out-of-range) are normalized to round 1, not crashed on."""
+        if not isinstance(round_number, int):
+            round_number = 0
+        if round_number < 0:
+            round_number = 0
+        exponent: int = max(0, min(round_number - 1, 30))
+        backoff: float = self._cleanup_retry_backoff_seconds * (2 ** exponent)
+        return min(backoff, 0.5)
 
     def _ensure_reaper(self) -> None:
         """Ensure the single, bounded cleanup reaper is running (C-145 P0).
