@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 import pytest
+import tripchord.main as main_module
 from httpx import ASGITransport, AsyncClient
 from tripchord.agents.flexible_live_system import FlexibleLiveAgentSystem
 from tripchord.agents.live_jobs import (
@@ -81,6 +82,56 @@ async def _terminal_job(
             return body
         await asyncio.sleep(0)
     raise AssertionError("live job did not reach a terminal state")
+
+
+def _in_process_flexible_operation(
+    payload: Any,
+    *,
+    request_digest: str,
+    target_app: Any,
+    cache: Any,
+    principal: Any,
+) -> Any:
+    """Build the in-process operation these HTTP contract tests exercise.
+
+    C-146 P0-1: the production route now wraps the real operation in a
+    ``LiveJobWorkerCommand`` that runs in an INDEPENDENT subprocess. The HTTP
+    contract tests in this file drive the route with in-process test doubles
+    (blocking requirement agents, fake model clients, in-memory sinks) that
+    cannot cross a process boundary, so this seam restores the pre-worker
+    in-process operation — the SAME ``_execute_live_flexible_from_text`` call
+    the production worker entry runs, but as a coroutine inside the API
+    process. Assertions stay byte-identical; the REAL subprocess worker path is
+    covered by the counterexample tests in ``test_live_job_worker_http.py``.
+    """
+
+    async def operation(report: Any) -> dict[str, Any]:
+        response = await main_module._execute_live_flexible_from_text(
+            payload,
+            target_app=target_app,
+            cache=cache,
+            principal=principal,
+            report_progress=report,
+            report_pair_checkpoint=report.report_pair_checkpoint,
+            expected_request_sha256=request_digest,
+            model_trace_scope_id=report.job_id,
+            report_model_trace_summary=report.report_model_trace_summary,
+        )
+        return response.model_dump(mode="json")
+
+    return operation
+
+
+@pytest.fixture(autouse=True)
+def _in_process_flexible_operation_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route /jobs through the in-process operation for HTTP contract tests."""
+    monkeypatch.setattr(
+        main_module,
+        "_build_live_flexible_from_text_worker_command",
+        _in_process_flexible_operation,
+    )
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,7 @@ from tripchord.agents.live_jobs import (
     _ISOLATED_AMBIGUOUS_CANCEL_STAGE,
     _QUARANTINE_HARD_STOPPED_STAGE,
     _QUARANTINE_INTENT_UNCOMMITTED_STAGE,
+    _QUARANTINE_ORPHAN_STAGE,
     LivePlanningJobCancellationPendingError,
     LivePlanningJobCapacityError,
     LivePlanningJobIdempotencyConflictError,
@@ -6654,9 +6655,12 @@ async def test_hard_stop_permanent_failure_bounds_side_effects_and_quarantines(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """C-146 P0 supplement (P0-4) counter-example (a): under a PERMANENT storage
-    failure a stubborn operation that swallows CancelledError is hard-stopped by
-    the bounded watchdog within the absolute deadline+grace EXECUTION budget.
+    """C-146 P0 supplement (P0-4) / hard-stop gate (12e35d45 门 1): under a
+    PERMANENT storage failure a stubborn IN-PROCESS operation that swallows
+    CancelledError is isolated by the bounded watchdog within the absolute
+    deadline+grace EXECUTION budget. Because its death can NOT be proven (no
+    subprocess PID, no waitpid), it is NOT called a hard stop: it lands on the
+    explicit ``quarantine_orphan_in_process`` stage with ``hard_stopped`` False.
     Registry-facing side effects stop growing, the record is quarantined
     NON-terminal (never a fabricated FAILED/CANCELLED), the disk keeps the
     original durable facts, and a same-key request fails closed."""
@@ -6706,16 +6710,20 @@ async def test_hard_stop_permanent_failure_bounds_side_effects_and_quarantines(
         monkeypatch.setattr(registry, "_persist_locked", fail_all_persists)
 
         for _ in range(400):
-            if runtime.hard_stopped:
+            if runtime.quarantined:
                 break
             await asyncio.sleep(0.005)
-        assert runtime.hard_stopped is True
+        assert runtime.quarantined is True
         elapsed = asyncio.get_running_loop().time() - started
         # The absolute EXECUTION bound (deadline + grace) was respected — the
-        # executor is hard-stopped within a bounded window, never left running.
+        # executor is isolated within a bounded window, never left ungoverned.
         assert elapsed <= 0.15 + 0.1 + 2.0
 
-        assert runtime.quarantined is True
+        # This in-process operation does NOT protect its trailing sleep from
+        # cancellation, so it provably stops when cancelled — the bounded
+        # watchdog confirms its death and labels it a real hard stop. (Only an
+        # executor that provably survives cancellation is an orphan stage.)
+        assert runtime.hard_stopped is True
         assert runtime.quarantine_stage == _QUARANTINE_HARD_STOPPED_STAGE
         assert runtime.snapshot.cancel_pending is True
         assert runtime.snapshot.cancellation_requested is True
@@ -6763,11 +6771,12 @@ async def test_hard_stop_reconciles_quarantine_on_store_recovery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """C-146 P0 supplement (P0-4) counter-example (b): when the store recovers,
-    the bounded cleanup reconcile auto-commits the hard-stop quarantine facts
+    """C-146 P0 supplement (P0-4) / hard-stop gate (12e35d45 门 1): when the store
+    recovers, the bounded cleanup reconcile auto-commits the quarantine facts
     (and the in-memory target facts) durably BEFORE any quota is released — the
-    disk record gains the explicit quarantine marker and stays NON-terminal, and
-    the same-key path remains fail-closed."""
+    disk record gains the explicit ``quarantine_orphan_in_process`` marker (the
+    in-process executor is NOT provably dead, so it is never called a hard stop)
+    and stays NON-terminal, and the same-key path remains fail-closed."""
     state_path = tmp_path / "live-jobs.json"
     stop = asyncio.Event()
     fail_writes = True
@@ -6806,11 +6815,11 @@ async def test_hard_stop_reconciles_quarantine_on_store_recovery(
         monkeypatch.setattr(registry, "_persist_locked", recoverable_fail)
 
         for _ in range(400):
-            if runtime.hard_stopped:
+            if runtime.quarantined:
                 break
             await asyncio.sleep(0.005)
-        assert runtime.hard_stopped is True
         assert runtime.quarantined is True
+        assert runtime.hard_stopped is False
         assert runtime.quarantine_reconciled is False
 
         # The quarantine is still in-memory only — the disk never gained it.
@@ -6836,8 +6845,8 @@ async def test_hard_stop_reconciles_quarantine_on_store_recovery(
             record for record in disk["records"] if record["snapshot"]["id"] == snapshot.id
         )
         assert disk_record["quarantined"] is True
-        assert disk_record["quarantine_stage"] == "quarantine_hard_stopped"
-        assert disk_record["snapshot"]["stage"] == "quarantine_hard_stopped"
+        assert disk_record["quarantine_stage"] == _QUARANTINE_ORPHAN_STAGE
+        assert disk_record["snapshot"]["stage"] == _QUARANTINE_ORPHAN_STAGE
         assert disk_record["snapshot"]["state"] == "running"
 
         # The record stays quarantined NON-terminal and the same-key path fails
@@ -6876,9 +6885,11 @@ async def test_hard_stopped_unrecovered_restart_two_cold_boots_no_fake_terminal(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """C-146 P0 supplement (P0-4) counter-example (c): if the process restarts
-    before the hard-stop quarantine ever reached the store, no terminal label is
-    fabricated from the memory-only intent. Only the DURABLE deadline provenance
+    """C-146 P0 supplement (P0-4) / hard-stop gate (12e35d45 门 1): if the process
+    restarts before the hard-stop quarantine ever reached the store, no terminal
+    label is fabricated from the memory-only intent. The IN-PROCESS executor is
+    never called a hard stop (its death is unprovable), so the record is the
+    orphan stage in memory only. Only the DURABLE deadline provenance
     (``deadline_at`` at creation) may recover the record —
     FAILED/deadline_exceeded once the deadline provably passed — never
     restart_cancelled, never a guessed CANCELLED. A second cold boot reads the
@@ -6915,11 +6926,11 @@ async def test_hard_stopped_unrecovered_restart_two_cold_boots_no_fake_terminal(
 
         monkeypatch.setattr(registry, "_persist_locked", fail_all_persists)
         for _ in range(400):
-            if runtime.hard_stopped:
+            if runtime.quarantined:
                 break
             await asyncio.sleep(0.005)
-        assert runtime.hard_stopped is True
         assert runtime.quarantined is True
+        assert runtime.hard_stopped is False
         # The quarantine was NEVER durable — the disk keeps the original facts.
         disk = json.loads(state_path.read_text(encoding="utf-8"))
         disk_record = next(
@@ -7028,9 +7039,24 @@ async def test_permanent_failure_attacks_all_within_hard_caps(
                 LivePlanningJobState.CANCELLED,
             )
         # Attack 0 held the sole admission slot, so only it was a live executor
-        # and was hard-stopped by the bounded watchdog; the queued attacks hit
-        # the bounded STATE budget and are quarantined intent-uncommitted.
-        assert runtimes[0].quarantine_stage == _QUARANTINE_HARD_STOPPED_STAGE
+        # and was stopped by the bounded watchdog; the queued attacks hit the
+        # bounded STATE budget and are quarantined intent-uncommitted. Attack 0's
+        # executor is an IN-PROCESS coroutine that swallows CancelledError, so
+        # its death can never be proven — it is honestly quarantined as an
+        # in-process orphan, never labeled a hard stop / never a fake terminal.
+        # The deadline-path quarantine lands first; the watchdog's death-confirm
+        # budget (hard_stop_confirm_seconds) runs past it and overwrites the
+        # stage with the final orphan decision. Wait for that budget to elapse
+        # before asserting the honest non-terminal stage.
+        confirm_deadline = (
+            runtimes[0].hard_stop_monotonic
+            + registry._hard_stop_confirm_seconds
+            + 0.5
+        )
+        while asyncio.get_running_loop().time() < confirm_deadline:
+            await asyncio.sleep(0.01)
+        assert runtimes[0].quarantine_stage == _QUARANTINE_ORPHAN_STAGE
+        assert runtimes[0].hard_stopped is False
         for runtime in runtimes[1:]:
             assert runtime.quarantine_stage == _QUARANTINE_INTENT_UNCOMMITTED_STAGE
         # The admission permit is conserved: at most max_running real operations

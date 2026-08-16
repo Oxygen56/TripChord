@@ -23,6 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tripchord import __version__
+from tripchord.agents import live_flexible_from_text_worker
 from tripchord.agents.agent_budget import request_agent_budgeted
 from tripchord.agents.companion_control_tools import (
     BrowserCompanionBuildReconcileRequest,
@@ -46,6 +47,7 @@ from tripchord.agents.live_advisory import AgenticRunSummary
 from tripchord.agents.live_jobs import (
     TERMINAL_LIVE_PLANNING_JOB_STATES,
     LiveJobProgressReporter,
+    LiveJobWorkerCommand,
     LivePlanningJobCancellationPendingError,
     LivePlanningJobCapacityError,
     LivePlanningJobIdempotencyConflictError,
@@ -908,13 +910,22 @@ if configured_job_registry_path is None and os.environ.get(
     configured_job_registry_path = str(
         formal_source_trust_root() / "live-planning-jobs.json"
     )
-live_planning_job_registry = LivePlanningJobRegistry(
-    state_path=(
-        Path(configured_job_registry_path)
-        if configured_job_registry_path is not None
-        else None
+# C-146 P0-1: a live-job WORKER subprocess must never construct the job registry.
+# It only runs the operation; the API process owns the durable registry, and a
+# second instance would load (and under old-v3 migration, rewrite) the same state
+# file — a concurrent second writer. The registry's worker spawner sets
+# ``TRIPCHORD_LIVE_WORKER_SUBPROCESS=1`` so this import-time singleton is skipped.
+_LIVE_WORKER_SUBPROCESS = os.environ.get("TRIPCHORD_LIVE_WORKER_SUBPROCESS") == "1"
+if not _LIVE_WORKER_SUBPROCESS:
+    live_planning_job_registry = LivePlanningJobRegistry(
+        state_path=(
+            Path(configured_job_registry_path)
+            if configured_job_registry_path is not None
+            else None
+        )
     )
-)
+else:
+    live_planning_job_registry = None
 
 
 async def _close_lifespan_resources(
@@ -979,6 +990,21 @@ async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
     await database.create_schema()
     await job_runner.recover()
     await _recover_live_monitors(target_app)
+    # C-146 hard-stop gate (12e35d45 门 2/门 3): actively recover durable live
+    # job state on startup. The registry may have been constructed at import
+    # time (loop-less), so any quarantined + pending_terminal record deferred
+    # its cleanup owner; this restores the unique owner/reaper NOW, and cleans
+    # real orphaned worker process groups left behind by a SIGKILLed parent API
+    # — before any request can reach a durable job. Zero requests: a cold boot
+    # auto-terminates; the second boot is stable with no duplicate terminalize.
+    live_job_registry_startup = cast(
+        LivePlanningJobRegistry | None,
+        getattr(target_app.state, "live_planning_job_registry", None),
+    )
+    if live_job_registry_startup is not None and hasattr(
+        live_job_registry_startup, "restore_after_restart"
+    ):
+        await live_job_registry_startup.restore_after_restart()
     shared_model_http = cast(
         ManagedModelHTTPRuntime | None,
         getattr(target_app.state, "model_http_runtime", None),
@@ -2656,6 +2682,34 @@ async def live_flexible_agent_plan_from_text_endpoint(
     )
 
 
+def _build_live_flexible_from_text_worker_command(
+    payload: LiveFlexibleFromTextPlanningRequest,
+    *,
+    request_digest: str,
+    target_app: FastAPI,
+    cache: LiveRunCache,
+    principal: Principal,
+) -> LiveJobWorkerCommand:
+    """Wrap the real planning operation for execution in an independent worker.
+
+    C-146 P0-1: the production persistent-task entry must reach an independent
+    worker/process — not a coroutine inside the API process. The command's
+    ``module_path`` points at the production worker entry, which reconstructs the
+    durable request and runs the SAME ``_execute_live_flexible_from_text`` path
+    the API uses. Query / cancel / retry / cold-start recovery stay bound to the
+    durable job identity owned by the registry.
+    """
+    return LiveJobWorkerCommand(
+        module_path=str(Path(live_flexible_from_text_worker.__file__)),
+        entry="run_live_flexible_from_text",
+        args={
+            "payload": payload.model_dump(mode="json"),
+            "request_digest": request_digest,
+            "tenant_id": principal.tenant_id,
+        },
+    )
+
+
 @app.post(
     "/api/v1/agents/live-flexible-plan-from-text/jobs",
     response_model=StartLiveFlexibleFromTextJobResponse,
@@ -2689,20 +2743,17 @@ async def start_live_flexible_from_text_job_endpoint(
     if defer_start:
         _authorize_formal_source_control(http_request, formal_prepare_credential)
 
-    async def operation(report: LiveJobProgressReporter) -> dict[str, Any]:
-        response = await _execute_live_flexible_from_text(
-            payload,
-            target_app=target_app,
-            cache=cache,
-            principal=principal,
-            report_progress=report,
-            report_pair_checkpoint=report.report_pair_checkpoint,
-            expected_request_sha256=request_digest,
-            model_trace_scope_id=report.job_id,
-            report_model_trace_summary=report.report_model_trace_summary,
-        )
-        return response.model_dump(mode="json")
-
+    # C-146 P0-1: the real operation is wrapped in a ``LiveJobWorkerCommand`` so
+    # it executes in an INDEPENDENT worker/process, never as a coroutine inside
+    # this API process. Query / cancel / retry / cold-start recovery stay bound
+    # to the durable job identity the registry owns.
+    operation = _build_live_flexible_from_text_worker_command(
+        payload,
+        request_digest=request_digest,
+        target_app=target_app,
+        cache=cache,
+        principal=principal,
+    )
     try:
         job, replayed = await registry.start_idempotent(
             tenant_id=principal.tenant_id,

@@ -1,0 +1,130 @@
+"""Real subprocess execution boundary for live planning job worker commands.
+
+The live planning registry executes a ``LiveJobWorkerCommand`` inside a real OS
+process running this module, so the hard-stop watchdog can PROVE the operation's
+external side effects permanently froze: it SIGKILLs the whole process group and
+confirms every member (leader AND any grandchild the entry forked) is gone via
+``os.killpg(pgid, 0)``, and any probe file the worker was appending stops
+growing. An in-process coroutine that swallows ``CancelledError`` can never be
+proven dead; a worker subprocess can.
+
+Process group / orphan identity:
+- The worker immediately calls ``os.setsid()``, becoming the leader of a fresh
+  session and process group (PGID == PID). Any process the entry spawns (e.g. a
+  stubborn grandchild) inherits that group, so a hard stop can kill the whole
+  tree — a dead parent worker never leaves a live grandchild behind.
+- The registry spawns the worker with ``start_new_session=True`` as well, so the
+  group exists even before this script runs.
+- The worker writes a durable marker file (``--marker-file``) containing its
+  PGID + a unique marker nonce + probe path ATOMICALLY before running the entry,
+  and removes it on clean exit. If the API process is SIGKILLed mid-run the
+  worker is orphaned but its marker file survives; a cold start authenticates
+  the group via the marker (``ps -o command= -g <pgid>`` must contain the nonce)
+  before killing it — a reused PGID owned by an unrelated process is never
+  killed.
+
+The worker loads its entry callable by FILE PATH (``importlib``), so any
+self-contained module-level function — including a test helper — can run here
+without polluting the registry's import path. The entry is called with the
+command's ``args`` (plus ``probe_path`` when provided) and its JSON result is
+written to stdout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import importlib.util
+import inspect
+import json
+import os
+import sys
+from contextlib import suppress
+from datetime import UTC, datetime
+from pathlib import Path
+
+
+def _atomic_write(path: Path, payload: dict[str, object]) -> None:
+    """Atomically write ``payload`` as JSON to ``path`` (temp + fsync + replace)."""
+    temporary = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _load_entry(module_path: str, entry: str):
+    spec = importlib.util.spec_from_file_location("live_job_worker_entry", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load worker module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    target = getattr(module, entry, None)
+    if target is None:
+        raise RuntimeError(f"worker entry not found: {entry!r}")
+    return target
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="live planning job worker")
+    parser.add_argument("--module-path", required=True)
+    parser.add_argument("--entry", required=True)
+    parser.add_argument("--args-json", required=True)
+    parser.add_argument("--probe-path", default="")
+    parser.add_argument("--marker", default="")
+    parser.add_argument("--marker-file", default="")
+    args = parser.parse_args(argv)
+    # Own session + process group: the PGID equals this PID and every process the
+    # entry forks (grandchildren) inherits it, so a hard stop can kill the whole
+    # tree and never leave a live descendant behind after the parent dies.
+    #
+    # The registry spawns this worker with ``start_new_session=True``, so the
+    # process is ALREADY a session/process-group leader (PGID == PID) and a
+    # second ``os.setsid()`` would fail with ``PermissionError: Operation not
+    # permitted``. Only create a fresh session when the worker was launched
+    # without one (direct invocation / older spawn path).
+    if os.getpgrp() != os.getpid():
+        os.setsid()
+    marker_file: Path | None = None
+    if args.marker and args.marker_file:
+        marker_file = Path(args.marker_file)
+        marker_file.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(
+            marker_file,
+            {
+                "pid": os.getpid(),
+                "pgid": os.getpgrp(),
+                "marker": args.marker,
+                "probe_path": args.probe_path,
+                "started_at": datetime.now(UTC).isoformat(),
+            },
+        )
+    exit_code = 0
+    try:
+        kwargs = json.loads(args.args_json)
+        if not isinstance(kwargs, dict):
+            raise RuntimeError("worker args must be a JSON object")
+        if args.probe_path:
+            kwargs["probe_path"] = args.probe_path
+        fn = _load_entry(args.module_path, args.entry)
+        maybe = fn(**kwargs)
+        result = asyncio.run(maybe) if inspect.isawaitable(maybe) else maybe
+        json.dump(result, sys.stdout, ensure_ascii=False)
+        sys.stdout.flush()
+    except BaseException:
+        # The registry reads stderr for diagnostics; a failure is a non-zero exit.
+        sys.stderr.write("live planning job worker failed\n")
+        exit_code = 1
+    finally:
+        # Clean exit removes the durable orphan marker. An abrupt kill leaves it
+        # so a cold start can discover + clean the orphan.
+        if marker_file is not None:
+            with suppress(OSError):
+                marker_file.unlink(missing_ok=True)
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

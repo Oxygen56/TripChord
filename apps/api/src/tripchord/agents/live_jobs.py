@@ -7,10 +7,13 @@ import math
 import os
 import re
 import secrets
+import signal
 import stat
+import subprocess
+import sys
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -97,6 +100,17 @@ _QUARANTINE_INTENT_UNCOMMITTED_STAGE = "quarantine_intent_uncommitted"
 # quota. Never a fabricated FAILED/CANCELLED label.
 _QUARANTINE_HARD_STOPPED_STAGE = "quarantine_hard_stopped"
 
+# C-146 hard-stop gate (12e35d45 门 1): the explicit NON-terminal quarantine
+# stage for an IN-PROCESS operation that cannot be proven dead. A worker
+# subprocess is SIGKILLed and waitpid-confirmed, so its death (and the freeze of
+# any external probe it was writing) is a hard fact and it lands on
+# ``quarantine_hard_stopped``. An in-process coroutine that swallows
+# ``CancelledError`` past the bounded budget can NOT be proven dead — calling
+# that a "hard stop" would be a lie — so it lands here instead, keeps
+# ``hard_stopped`` False, keeps its admission slot, and only ever releases it
+# (or settles) once the real task is confirmed done.
+_QUARANTINE_ORPHAN_STAGE = "quarantine_orphan_in_process"
+
 # Every explicit quarantine stage. Records in these stages are NON-terminal,
 # excluded from executable active capacity, and governed by the bounded
 # quarantine quota + retention.
@@ -105,8 +119,21 @@ _QUARANTINE_STAGES = frozenset(
         _ISOLATED_AMBIGUOUS_CANCEL_STAGE,
         _QUARANTINE_INTENT_UNCOMMITTED_STAGE,
         _QUARANTINE_HARD_STOPPED_STAGE,
+        _QUARANTINE_ORPHAN_STAGE,
     }
 )
+
+
+def _default_worker_module() -> str:
+    """Absolute path of the ``live_job_worker`` script the registry spawns.
+
+    The worker runs by file path (not ``-m``), so it needs no import machinery
+    of its own; it loads the command's entry module by path in turn."""
+    try:
+        import tripchord.agents.live_job_worker as worker_module
+    except ImportError:
+        return "tripchord.agents.live_job_worker"
+    return worker_module.__file__ or "tripchord.agents.live_job_worker"
 
 
 def _aware(value: datetime, field_name: str) -> datetime:
@@ -649,6 +676,23 @@ class LiveSourceTerminalEvent(DomainModel):
         return self
 
 
+def _without_result(snapshot: LivePlanningJobSnapshot) -> dict[str, Any]:
+    """Durable snapshot with a live-process terminal ``result`` excluded.
+
+    See the C-146 P0-6 comment in ``_persist_locked``: the byte cap guards the
+    bounded identity/metadata of a record, never the unbounded user-facing
+    planning payload. Only a NON-None ``result`` (the live-process output) is
+    excluded — a ``None`` result serializes exactly as before, so non-terminal
+    records keep the byte-identical persisted shape. Serializing a copy (rather
+    than mutating the live snapshot in place) keeps the status endpoint's view
+    of ``result`` intact.
+    """
+    payload = snapshot.model_dump(mode="json")
+    if payload.get("result") is not None:
+        payload.pop("result", None)
+    return payload
+
+
 class LivePlanningJobSnapshot(DomainModel):
     id: str = Field(min_length=1)
     state: LivePlanningJobState
@@ -843,6 +887,103 @@ class LiveJobProgressReporter(Protocol):
 LiveJobOperation = Callable[[LiveJobProgressReporter], Awaitable[dict[str, Any]]]
 
 
+@dataclass(frozen=True)
+class LiveJobWorkerCommand:
+    """An operation that must run inside a real subprocess worker.
+
+    The registry executes this in a fresh OS process (``live_job_worker``) so
+    the hard-stop watchdog can PROVE the operation's external side effects
+    permanently froze: SIGKILL + waitpid confirms the real PID is dead, and any
+    external probe the worker was appending stops growing. ``module_path`` is
+    the absolute path of the module defining ``entry`` (loaded by file path, so
+    any self-contained module-level function can run here), ``entry`` is the
+    callable qualname, ``args`` its keyword arguments, and ``probe_path`` — when
+    set — is injected into the call so the worker can append an unobservable,
+    registry-independent side-effect probe. In-process coroutines that swallow
+    cancellation can never be proven dead; a worker subprocess can.
+    """
+
+    module_path: str
+    entry: str
+    args: dict[str, Any] = field(default_factory=dict)
+    probe_path: str | None = None
+
+
+class _SubprocessWorkerHandle:
+    """An owned worker subprocess (real PID / PGID) plus death-confirmation state.
+
+    The worker runs as the leader of its OWN process group (``os.setsid()`` in
+    the script and ``start_new_session=True`` at spawn), so any grandchild it
+    forks shares the group. ``kill_and_confirm`` SIGKILLs the WHOLE GROUP and —
+    after the leader is reaped via ``wait()`` — confirms every group member is
+    gone with ``os.killpg(pgid, 0)`` raising ``ProcessLookupError`` within a
+    bounded budget. A dead parent worker therefore never leaves a live
+    grandchild behind, and the registry PROVES the operation's external side
+    effects froze BEFORE it releases any permit / opens new admission / writes a
+    terminal label.
+
+    Durable identity: the handle also knows the unique marker nonce and the
+    registry-side marker file path, so a cold start can re-discover an orphaned
+    worker (parent API SIGKILLed) and authenticate the PGID before cleaning it.
+    """
+
+    def __init__(
+        self,
+        process: asyncio.subprocess.Process,
+        *,
+        probe_path: str | None = None,
+        marker: str = "",
+        marker_file: Path | None = None,
+    ) -> None:
+        self.process = process
+        self.probe_path = probe_path
+        self.pid = process.pid
+        # ``start_new_session`` makes the worker a session leader: PGID == PID.
+        self.pgid = process.pid
+        self.marker = marker
+        self.marker_file = marker_file
+        self.death_confirmed = False
+
+    def group_alive(self) -> bool:
+        """True while ANY process still exists in the worker's process group."""
+        try:
+            os.killpg(self.pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # A group we cannot signal still exists — treat it as alive.
+            return True
+        return True
+
+    async def kill_and_confirm(self, timeout: float) -> bool:
+        """SIGKILL the whole group and confirm every member is dead in ``timeout``.
+
+        Returns True only when the leader is reaped AND ``os.killpg(pgid, 0)``
+        reports the group is empty — the executor (and any grandchild it forked)
+        is provably gone and its external side effects are permanently frozen."""
+        if self.process.returncode is not None and not self.group_alive():
+            self.death_confirmed = True
+            return True
+        if self.group_alive():
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(self.pgid, signal.SIGKILL)  # whole tree — no grandchild escape
+        deadline = asyncio.get_running_loop().time() + timeout
+        # Reap the leader (waitpid) within the budget.
+        try:
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            await asyncio.wait_for(self.process.wait(), timeout=remaining)
+        except TimeoutError:
+            return False
+        # Confirm EVERY descendant exited: the group is empty only when every
+        # member (including a stubborn grandchild) has been reaped by the kernel.
+        while asyncio.get_running_loop().time() < deadline:
+            if not self.group_alive():
+                self.death_confirmed = True
+                return True
+            await asyncio.sleep(0.01)
+        return False
+
+
 class _RegistryProgressReporter:
     def __init__(
         self,
@@ -992,6 +1133,20 @@ class _RuntimeJob:
         # (hard-stopped / ambiguous-isolated) the reconcile is complete exactly
         # once the quarantine facts are on disk — no terminal settlement exists.
         self.quarantine_reconciled = False
+        # C-146 hard-stop gate (12e35d45 门 1/门 2): the real worker subprocess
+        # this runtime owns when its operation is a ``LiveJobWorkerCommand``.
+        # Death is provable via ``kill_and_confirm`` (SIGKILL + waitpid); an
+        # in-process coroutine has no such proof and is never called a hard
+        # stop.
+        self.worker_handle: _SubprocessWorkerHandle | None = None
+        # C-146 hard-stop gate (12e35d45 门 2): the DURABLE worker identity —
+        # the process-group id, the unique marker nonce and the probe path — is
+        # persisted when the worker starts so a cold start / parent-API crash
+        # can re-discover, authenticate and clean a real orphan even after the
+        # in-memory handle is gone and even after a PID/PGID was reused.
+        self.worker_pgid: int | None = None
+        self.worker_marker: str | None = None
+        self.worker_probe: str | None = None
 
 
 class _IdempotencyEntry:
@@ -1002,6 +1157,7 @@ class _IdempotencyEntry:
         request_digest: str,
         defer_start: bool | None = None,
         legacy_isolated: bool = False,
+        updated_at: datetime | None = None,
     ) -> None:
         self.job_id = job_id
         self.request_digest = request_digest
@@ -1012,6 +1168,13 @@ class _IdempotencyEntry:
         # P0-2: a legacy (v1/v2) binding whose execution mode cannot be proven is
         # isolated — it is never replayed under any mode and always conflicts.
         self.legacy_isolated = legacy_isolated
+        # C-146 hard-stop gate (12e35d45 门 5): the tombstone/identity
+        # ``updated_at``. Set when the binding is created and when a quarantined
+        # record's reclamation promotes it to a durable isolated tombstone. A
+        # missing value (pre-gate legacy file) is preserved as None so the
+        # bounded tombstone-TTL sweep NEVER reclaims it — old tombstones stay
+        # bounded by ``idempotency_capacity`` instead.
+        self.updated_at = updated_at
 
 
 class LivePlanningJobRegistry:
@@ -1044,6 +1207,25 @@ class LivePlanningJobRegistry:
         # durable tombstone so a same-key request still fails closed.
         quarantine_capacity: int = 8,
         quarantine_retention: timedelta = timedelta(hours=6),
+        # C-146 hard-stop gate (12e35d45 门 1/门 2): the bounded budget for
+        # confirming a real executor is dead AFTER SIGKILL / task-cancel. The
+        # watchdog's per-operation hard-stop latency is bounded by this, so one
+        # stubborn operation can never delay another past its own deadline+grace.
+        hard_stop_confirm_seconds: float = 1.0,
+        # C-146 hard-stop gate (12e35d45 门 1): the interpreter and worker module
+        # used to run a ``LiveJobWorkerCommand``. Tests override these to pin the
+        # exact python and the absolute worker script path.
+        worker_python: str = "",
+        worker_module: str = "",
+        # C-146 hard-stop gate (12e35d45 门 5): triple hard caps for the state
+        # file, the idempotency-identity collection and the durable tombstones.
+        # idempotency_capacity bounds the identity/tombstone cardinality;
+        # state_max_bytes bounds the serialized file; tombstone_ttl bounds how
+        # long a dangling isolated tombstone survives before the bounded,
+        # memory=disk reclamation sweep reclaims it.
+        idempotency_capacity: int = 256,
+        state_max_bytes: int = 1_048_576,
+        tombstone_ttl: timedelta = timedelta(days=30),
         now: Callable[[], datetime] | None = None,
         state_path: Path | None = None,
     ) -> None:
@@ -1069,6 +1251,14 @@ class LivePlanningJobRegistry:
             raise ValueError("quarantine_capacity must be positive")
         if quarantine_retention <= timedelta(0):
             raise ValueError("quarantine_retention must be positive")
+        if hard_stop_confirm_seconds <= 0:
+            raise ValueError("hard_stop_confirm_seconds must be positive")
+        if idempotency_capacity < 1:
+            raise ValueError("idempotency_capacity must be positive")
+        if state_max_bytes < 1024:
+            raise ValueError("state_max_bytes must be at least 1024")
+        if tombstone_ttl <= timedelta(0):
+            raise ValueError("tombstone_ttl must be positive")
         self._capacity = capacity
         self._terminal_ttl = terminal_ttl
         self._now = now or (lambda: datetime.now(UTC))
@@ -1080,6 +1270,19 @@ class LivePlanningJobRegistry:
         self._intent_persist_wallclock_budget_seconds = intent_persist_wallclock_budget_seconds
         self._quarantine_capacity = quarantine_capacity
         self._quarantine_retention = quarantine_retention
+        # C-146 hard-stop gate (12e35d45 门 5): set when a DURABLE state file
+        # carries more quarantined records than the CURRENT qcap. The system
+        # still loads every record (own/old-version files are never rejected),
+        # isolates the overflow fail-closed, rejects NEW quarantine conversions
+        # and admissions, and clears the flag once bounded retention reclaims
+        # enough to fit the quota again.
+        self._quarantine_overflow = False
+        self._hard_stop_confirm_seconds = hard_stop_confirm_seconds
+        self._worker_python = worker_python or sys.executable
+        self._worker_module = worker_module or _default_worker_module()
+        self._idempotency_capacity = idempotency_capacity
+        self._state_max_bytes = state_max_bytes
+        self._tombstone_ttl = tombstone_ttl
         self._slots = asyncio.Semaphore(max_running)
         self._records: dict[str, _RuntimeJob] = {}
         self._idempotency: dict[str, _IdempotencyEntry] = {}
@@ -1096,6 +1299,14 @@ class LivePlanningJobRegistry:
         # bound can be reached; it quarantines the executor past the bound and
         # self-terminates when no operation needs it.
         self._hard_stop_watchdog: asyncio.Task[None] | None = None
+        # C-146 hard-stop gate (12e35d45 门 3): runtimes that loaded as
+        # ``quarantined + pending_terminal`` but whose cleanup owner could not be
+        # spawned inside ``__init__`` (no running event loop, e.g. construction
+        # at import time). They are spawned lazily from the first async entry
+        # point / ``close()``, so a cold boot never leaves a durable
+        # quarantined+pending-terminal record as a permanent dangling entry with
+        # no owner or reaper.
+        self._deferred_cleanup_owners: list[_RuntimeJob] = []
         self._state_path = state_path
         if self._state_path is not None:
             self._load_state()
@@ -1121,10 +1332,41 @@ class LivePlanningJobRegistry:
         except OSError as exc:
             raise RuntimeError("live planning job registry state is unavailable") from exc
         self._validate_state_file(path)
+        # C-146 hard-stop gate (12e35d45 门 5): the whole state file has a hard
+        # byte bound, rejected on load so an attacker's inflated file is never
+        # admitted — the same cap is enforced before every persist below.
+        # C-146 P0-6: the read path is FD-bounded (fstat FIRST, then read at most
+        # the verified size) — never an unbounded ``read_text``/``read`` that
+        # slurps an arbitrarily large file before checking the cap.
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("live planning job registry state is unreadable") from exc
+            fd = os.open(path, os.O_RDONLY)
+        except OSError as exc:
+            raise RuntimeError("live planning job registry state is unavailable") from exc
+        try:
+            try:
+                file_size = os.fstat(fd).st_size
+            except OSError as exc:
+                raise RuntimeError("live planning job registry state is unavailable") from exc
+            if file_size > self._state_max_bytes:
+                raise RuntimeError("live planning job registry state exceeds its byte bound")
+            # Read exactly the verified size (never more): a file that grows
+            # between fstat and read would leave unread trailing bytes, which the
+            # strict size check below rejects instead of admitting.
+            try:
+                with os.fdopen(fd, "rb") as handle:
+                    raw = handle.read(file_size)
+            except OSError as exc:
+                raise RuntimeError("live planning job registry state is unreadable") from exc
+            fd = -1
+            if len(raw) != file_size:
+                raise RuntimeError("live planning job registry state is unreadable")
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("live planning job registry state is unreadable") from exc
+        finally:
+            if fd != -1:
+                os.close(fd)
         if not isinstance(payload, dict) or set(payload) != {
             "schema_version",
             "records",
@@ -1169,19 +1411,24 @@ class LivePlanningJobRegistry:
             # old-v3 field set (without the key at all — migrated to a null
             # intent via ``item.get`` below). Every OTHER missing or unknown
             # field is still rejected fail-closed; nothing is silently patched.
-            accepted_record_field_sets = {frozenset(expected_record_fields)}
+            #
+            # C-146 hard-stop gate (12e35d45 门 2): the durable worker identity
+            # fields (worker_pgid/worker_marker/worker_probe) are OPTIONAL new-v3
+            # fields on top of the required set — old files omit them entirely.
+            if not isinstance(item, dict):
+                raise RuntimeError("live planning job registry record is invalid")
             if schema_version == "tripchord-live-job-registry-v3":
-                accepted_record_field_sets = {
-                    frozenset(expected_record_fields),
-                    # old v3 with the intent but without the quarantine marker
-                    frozenset(expected_record_fields - {"quarantined", "quarantine_stage"}),
-                    # old v3 without either the intent or the quarantine marker
-                    frozenset(
-                        expected_record_fields
-                        - {"pending_terminal", "quarantined", "quarantine_stage"}
-                    ),
-                }
-            if not isinstance(item, dict) or set(item) not in accepted_record_field_sets:
+                minimal_v3 = frozenset(
+                    expected_record_fields
+                    - {"pending_terminal", "quarantined", "quarantine_stage"}
+                )
+                full_v3 = frozenset(
+                    expected_record_fields
+                    | {"worker_pgid", "worker_marker", "worker_probe"}
+                )
+                if not minimal_v3.issubset(set(item)) or not set(item).issubset(full_v3):
+                    raise RuntimeError("live planning job registry record is invalid")
+            elif set(item) != expected_record_fields:
                 raise RuntimeError("live planning job registry record is invalid")
             tenant_partition = item["tenant_partition"]
             prepared = item["prepared"]
@@ -1257,6 +1504,23 @@ class LivePlanningJobRegistry:
                     runtime.quarantine_stage = quarantine_stage
                 elif quarantine_stage is not None:
                     raise RuntimeError("live planning job registry quarantine stage is invalid")
+                # C-146 hard-stop gate (12e35d45 门 2): the durable worker
+                # identity (process-group id + marker nonce + probe path). It is
+                # OPTIONAL; when present it must be well-typed and consistent so
+                # a cold start can re-discover and clean a real orphan.
+                raw_pgid = item.get("worker_pgid")
+                raw_marker = item.get("worker_marker")
+                raw_probe = item.get("worker_probe")
+                if raw_pgid is not None:
+                    if type(raw_pgid) is not int or raw_pgid <= 0:
+                        raise RuntimeError("live planning job registry worker pgid is invalid")
+                    if not isinstance(raw_marker, str) or not raw_marker:
+                        raise RuntimeError("live planning job registry worker marker is invalid")
+                    if raw_probe is not None and not isinstance(raw_probe, str):
+                        raise RuntimeError("live planning job registry worker probe is invalid")
+                    runtime.worker_pgid = raw_pgid
+                    runtime.worker_marker = raw_marker
+                    runtime.worker_probe = raw_probe
             self._records[snapshot.id] = runtime
         # C-146 P0 supplement (P0-4) / b119: active record capacity and
         # quarantine capacity are validated INDEPENDENTLY. A legal file may hold
@@ -1270,7 +1534,13 @@ class LivePlanningJobRegistry:
         if active_records > self._capacity:
             raise RuntimeError("live planning job registry state exceeds its bounds")
         if quarantined_records > self._quarantine_capacity:
-            raise RuntimeError("live planning job registry quarantine bounds exceeded")
+            # C-146 P0-5: persistent quarantine may exceed the CURRENT quarantine
+            # capacity (qcap). qcap is a NEW-conversion/admission bound, NOT a
+            # loader reject bound: the loader must load every durable record
+            # (including overflow), flag the registry fail-closed so no new
+            # conversion/admission happens while overflow holds, and only restore
+            # capacity after bounded retention cleanup reclaims quarantine space.
+            self._quarantine_overflow = True
         for item in idempotency:
             expected_idempotency_fields = {
                 "partition",
@@ -1280,12 +1550,17 @@ class LivePlanningJobRegistry:
             legacy_isolated_field = "legacy_isolated"
             if schema_version == "tripchord-live-job-registry-v3":
                 expected_idempotency_fields.add("defer_start")
-            # The v3 loader accepts the optional legacy-isolation marker on top
-            # of the required field set (older v3 files omit it entirely).
-            if not isinstance(item, dict) or set(item) not in {
-                frozenset(expected_idempotency_fields),
-                frozenset(expected_idempotency_fields | {legacy_isolated_field}),
-            }:
+            # The v3 loader accepts the optional legacy-isolation marker AND the
+            # optional ``updated_at`` (12e35d45 门 5 tombstone TTL) on top of the
+            # required field set. Older v3 files omit either or both entirely.
+            if not isinstance(item, dict):
+                raise RuntimeError("live planning idempotency record is invalid")
+            if schema_version == "tripchord-live-job-registry-v3":
+                required = frozenset(expected_idempotency_fields)
+                optional = frozenset({legacy_isolated_field, "updated_at"})
+                if not required.issubset(set(item)) or not set(item).issubset(required | optional):
+                    raise RuntimeError("live planning idempotency record is invalid")
+            elif set(item) != expected_idempotency_fields:
                 raise RuntimeError("live planning idempotency record is invalid")
             partition = item["partition"]
             job_id = item["job_id"]
@@ -1301,6 +1576,7 @@ class LivePlanningJobRegistry:
                 raise RuntimeError("live planning idempotency identity is invalid")
             defer_start: bool | None = None
             legacy_isolated = False
+            updated_at: datetime | None = None
             if schema_version == "tripchord-live-job-registry-v3":
                 defer_start = item["defer_start"]
                 if type(defer_start) is not bool:
@@ -1308,6 +1584,19 @@ class LivePlanningJobRegistry:
                 legacy_isolated = item.get(legacy_isolated_field, False)
                 if type(legacy_isolated) is not bool:
                     raise RuntimeError("live planning idempotency isolation is invalid")
+                raw_updated_at = item.get("updated_at")
+                if raw_updated_at is not None:
+                    if not isinstance(raw_updated_at, str):
+                        raise RuntimeError("live planning idempotency updated_at is invalid")
+                    try:
+                        updated_at = _aware(
+                            datetime.fromisoformat(raw_updated_at),
+                            "updated_at",
+                        )
+                    except (ValueError, TypeError):
+                        raise RuntimeError(
+                            "live planning idempotency updated_at is invalid"
+                        ) from None
             runtime = self._records.get(job_id)
             if runtime is None:
                 # C-146 P0 supplement (P0-4)/b119: a minimal durable tombstone
@@ -1345,7 +1634,14 @@ class LivePlanningJobRegistry:
                 request_digest=request_digest,
                 defer_start=defer_start,
                 legacy_isolated=legacy_isolated,
+                updated_at=updated_at,
             )
+        # C-146 hard-stop gate (12e35d45 门 5): the idempotency identity /
+        # tombstone collection has a hard cardinality bound, enforced on load so
+        # a hand-crafted file cannot admit more identities than the registry can
+        # ever grow to.
+        if len(self._idempotency) > self._idempotency_capacity:
+            raise RuntimeError("live planning job registry idempotency bounds exceeded")
         for runtime in self._records.values():
             if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
                 # C-146 P0 supplement (P0-4): a record that loaded as
@@ -1486,7 +1782,24 @@ class LivePlanningJobRegistry:
         if active_records > self._capacity:
             raise RuntimeError("live planning job registry state exceeds its bounds")
         if len(self._records) - active_records > self._quarantine_capacity:
-            raise RuntimeError("live planning job registry quarantine bounds exceeded")
+            # C-146 P0-5: persistent quarantine above the CURRENT qcap —
+            # including records the resolution loop newly isolated — ALWAYS
+            # loads. qcap is a NEW-conversion/admission bound, NOT a loader
+            # reject bound: the registry goes fail-closed (no new
+            # conversion/admission) while overflow holds, and only bounded
+            # retention cleanup restores capacity.
+            self._quarantine_overflow = True
+        # C-146 hard-stop gate (12e35d45 门 3): a durable ``quarantined +
+        # pending_terminal`` record must NEVER be left as a permanent dangling
+        # entry with no owner/reaper. The process boundary that ran it is
+        # provably gone, so restore its unique cleanup owner; the owner
+        # reconciles the durable quarantine fact, then settles the durable
+        # pending terminal once (memory=disk, idempotent across restarts). When
+        # no event loop is running yet (construction at import time) the spawn
+        # is deferred to the first async entry point / ``close()``.
+        for runtime in self._records.values():
+            if runtime.quarantined and runtime.pending_terminal is not None:
+                self._defer_cleanup_owner_spawn(runtime)
         self._prune_locked(self._utc_now())
         self._persist_locked()
 
@@ -1597,7 +1910,18 @@ class LivePlanningJobRegistry:
         ):
             raise RuntimeError("live planning job registry state is not an owner-only file")
 
-    def _persist_locked(self) -> None:
+    def _persist_locked(
+        self,
+        *,
+        snapshot_overrides: dict[str, LivePlanningJobSnapshot] | None = None,
+    ) -> None:
+        """Persist the state file.
+
+        ``snapshot_overrides`` lets one caller (the worker-identity persist at
+        spawn time) write a record whose serialized snapshot differs from the
+        live in-memory snapshot — used to keep the DURABLE state at QUEUED while
+        the live snapshot has advanced to RUNNING (see ``_run_worker_command``).
+        """
         path = self._state_path
         if path is None:
             return
@@ -1610,12 +1934,37 @@ class LivePlanningJobRegistry:
             raise RuntimeError("live planning job registry state is unavailable") from exc
         else:
             self._validate_state_file(path)
+        # C-146 hard-stop gate (12e35d45 门 6): fail-fast BEFORE serialization.
+        # The cardinality bounds are enforced at admission, so a state that
+        # reaches this point already fits the quotas; this pre-check makes the
+        # byte-boundary failure happen before the full blob is built, never after
+        # an unbounded list was materialized on disk.
+        if len(self._records) > self._capacity + self._quarantine_capacity:
+            raise RuntimeError("live planning job registry record bounds exceeded")
+        if len(self._idempotency) > self._idempotency_capacity:
+            raise RuntimeError("live planning job registry idempotency bounds exceeded")
         payload = {
             "schema_version": "tripchord-live-job-registry-v3",
             "records": [
                 {
                     "tenant_partition": runtime.tenant_partition,
-                    "snapshot": runtime.snapshot.model_dump(mode="json"),
+                    # C-146 P0-6 (supplement): the terminal ``result`` is a
+                    # LIVE-PROCESS payload, not part of the bounded durable
+                    # identity. A successful live planning response (the full run
+                    # + scheduler/exploration traces) can legitimately exceed the
+                    # state-file byte cap; the cap guards the identity/metadata
+                    # (records, idempotency, quarantine, worker ownership), never
+                    # the unbounded user output. Excluding ``result`` here keeps
+                    # the on-disk record within the bound while the live process
+                    # still serves it via the status endpoint; a cold restart
+                    # loads the record with ``result=None`` (the run's durable
+                    # data lives in the search-run store, not in the registry
+                    # state file).
+                    "snapshot": _without_result(
+                        snapshot_overrides.get(runtime.snapshot.id, runtime.snapshot)
+                        if snapshot_overrides is not None
+                        else runtime.snapshot
+                    ),
                     "prepared": runtime.prepared,
                     "activation_operation": runtime.activation_operation,
                     "pending_terminal": (
@@ -1629,6 +1978,12 @@ class LivePlanningJobRegistry:
                     # silently reuses its key.
                     "quarantined": runtime.quarantined,
                     "quarantine_stage": runtime.quarantine_stage,
+                    # C-146 hard-stop gate (12e35d45 门 2): the durable worker
+                    # identity so a cold start can clean a real orphan even after
+                    # a parent-API crash and a PGID/PID reuse.
+                    "worker_pgid": runtime.worker_pgid,
+                    "worker_marker": runtime.worker_marker,
+                    "worker_probe": runtime.worker_probe,
                 }
                 for runtime in sorted(self._records.values(), key=lambda item: item.snapshot.id)
             ],
@@ -1639,6 +1994,9 @@ class LivePlanningJobRegistry:
                     "request_digest": entry.request_digest,
                     "defer_start": entry.defer_start,
                     "legacy_isolated": entry.legacy_isolated,
+                    "updated_at": (
+                        entry.updated_at.isoformat() if entry.updated_at is not None else None
+                    ),
                 }
                 for partition, entry in sorted(self._idempotency.items())
             ],
@@ -1649,6 +2007,12 @@ class LivePlanningJobRegistry:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
+        # C-146 hard-stop gate (12e35d45 门 5): the whole state file has a hard
+        # byte bound, enforced BEFORE any temporary file is written — a state
+        # that cannot serialize within the bound must never reach disk (and the
+        # caller's rollback keeps memory byte-identical to the untouched disk).
+        if len(encoded) > self._state_max_bytes:
+            raise RuntimeError("live planning job registry state exceeds its byte bound")
         temporary = path.parent / f".{path.name}.{uuid4().hex}.tmp"
         descriptor = -1
         commit = False
@@ -1734,6 +2098,7 @@ class LivePlanningJobRegistry:
         deadline_seconds: float = 3600,
         defer_start: bool = False,
     ) -> tuple[LivePlanningJobSnapshot, bool]:
+        self._spawn_deferred_cleanup_owners()
         if not math.isfinite(deadline_seconds) or deadline_seconds <= 0:
             raise ValueError("deadline_seconds must be a finite positive number")
         idempotency_partition: str | None = None
@@ -1844,6 +2209,22 @@ class LivePlanningJobRegistry:
                                 raise cancellation_pending_error
                         return existing_runtime.snapshot, True
             self._make_capacity_locked()
+            # C-146 hard-stop gate (12e35d45 门 5): the idempotency-identity /
+            # tombstone collection has a hard CARDINALITY bound, enforced
+            # ATOMICALLY BEFORE the new record is admitted to ``_records`` or
+            # ``_idempotency``. An attacker issuing many unique keys can never
+            # grow this beyond the configured cap, and an over-cap identity can
+            # never leave a partial record behind. The loader enforces the same
+            # bound on read, so a file this function writes is always
+            # reloadable. Existing recoverable identities are never evicted — a
+            # full collection fails closed.
+            if (
+                idempotency_partition is not None
+                and len(self._idempotency) >= self._idempotency_capacity
+            ):
+                raise LivePlanningJobCapacityError(
+                    "live planning job idempotency capacity exceeded"
+                )
             self._records[job_id] = runtime
             if idempotency_partition is not None:
                 assert request_digest is not None
@@ -1851,6 +2232,7 @@ class LivePlanningJobRegistry:
                     job_id=job_id,
                     request_digest=request_digest,
                     defer_start=defer_start,
+                    updated_at=now,
                 )
             try:
                 self._persist_locked()
@@ -1893,6 +2275,7 @@ class LivePlanningJobRegistry:
         already allocated terminal job id before any provider or Companion
         event is allowed to occur.
         """
+        self._spawn_deferred_cleanup_owners()
 
         async with self._changed:
             self._prune_locked(self._utc_now())
@@ -2183,6 +2566,7 @@ class LivePlanningJobRegistry:
         *,
         request_sha256: str,
     ) -> bool:
+        self._spawn_deferred_cleanup_owners()
         async with self._lock:
             self._prune_locked(self._utc_now())
             runtime = self._owned_locked(job_id, tenant_id)
@@ -2199,6 +2583,7 @@ class LivePlanningJobRegistry:
         job_id: str,
         tenant_id: str,
     ) -> LivePlanningJobSnapshot | None:
+        self._spawn_deferred_cleanup_owners()
         async with self._lock:
             self._prune_locked(self._utc_now())
             runtime = self._owned_locked(job_id, tenant_id)
@@ -2221,6 +2606,7 @@ class LivePlanningJobRegistry:
         Repeated cancels idempotently join the same in-flight cleanup and never
         repeat its side effects.
         """
+        self._spawn_deferred_cleanup_owners()
         async with self._changed:
             self._prune_locked(self._utc_now())
             runtime = self._owned_locked(job_id, tenant_id)
@@ -2335,9 +2721,15 @@ class LivePlanningJobRegistry:
             return pending_runtime.snapshot
         # First cancellation: request the real work to stop, then wait for it
         # within the bounded budget. _run's CancelledError handler drains the
-        # operation_task and records whether it actually stopped.
+        # operation_task and records whether it actually stopped. A worker
+        # subprocess is SIGKILLed (its PID death is the provable stop); an
+        # in-process task is cancelled.
         if operation_task is not None and not operation_task.done():
-            operation_task.cancel()
+            worker = runtime.worker_handle
+            if worker is not None:
+                await worker.kill_and_confirm(self._cancel_wait_seconds)
+            else:
+                operation_task.cancel()
         task_done = task is None or task is asyncio.current_task() or task.done()
         if not task_done:
             task.cancel()
@@ -2404,6 +2796,7 @@ class LivePlanningJobRegistry:
         after_revision: int,
         timeout_seconds: float = 15,
     ) -> LivePlanningJobSnapshot | None:
+        self._spawn_deferred_cleanup_owners()
         if after_revision < 0:
             raise ValueError("after_revision cannot be negative")
         if timeout_seconds <= 0:
@@ -2426,6 +2819,38 @@ class LivePlanningJobRegistry:
         except TimeoutError:
             return await self.get(job_id, tenant_id)
 
+    async def restore_after_restart(self) -> None:
+        """Cold-start / parent-API-crash recovery (C-146 P0-2/P0-4).
+
+        The FastAPI lifespan calls this exactly once on startup, BEFORE any
+        request can reach a durable job:
+
+        1. ``_discover_and_stop_orphan_workers`` — find every real orphaned
+           worker process group (state-file identity + on-disk marker files),
+           AUTHENTICATE each via its unique marker nonce so a reused PGID owned
+           by an unrelated process is never killed, SIGKILL the whole group and
+           confirm every member died, then quarantine the owning record as an
+           orphan so it is isolated, never replayed, and reclaimed only by
+           bounded retention.
+        2. ``_reap_stale_marker_files`` — drop marker files for groups that are
+           already dead (best effort).
+        3. Restore the unique cleanup owner/reaper for every durable
+           quarantined + pending_terminal record (including ones deferred from
+           the loop-less construction in ``__init__``), so a cold boot
+           auto-terminates them without waiting for a key request/query/close.
+
+        Idempotent and safe to call again: a second call only re-scans for
+        workers that (re)appeared after the first boot.
+        """
+        await self._discover_and_stop_orphan_workers()
+        self._reap_stale_marker_files()
+        self._spawn_deferred_cleanup_owners()
+        async with self._lock:
+            runtimes = list(self._records.values())
+        for runtime in runtimes:
+            if runtime.pending_terminal is not None or runtime.quarantined:
+                self._ensure_cleanup_owner(runtime)
+
     async def close(self) -> None:
         """Close the registry, reusing the exact durable drain state machine as a
         single-job cancel (P0-4).
@@ -2441,6 +2866,7 @@ class LivePlanningJobRegistry:
         a cold restart fail-closes the record to ``restart_cancelled``. The
         ``operation_task`` reference is never dropped while the operation lives.
         """
+        self._spawn_deferred_cleanup_owners()
         async with self._changed:
             # C-145 P0 supplement / C-146 P0 supplement (P0-4): a quarantined
             # record has NO provable terminal outcome — close() must never guess
@@ -2517,8 +2943,13 @@ class LivePlanningJobRegistry:
             if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
                 continue
             operation_task = runtime.operation_task
+            worker = runtime.worker_handle
             if operation_task is not None and not operation_task.done():
-                operation_task.cancel()
+                if worker is not None:
+                    # SIGKILL + waitpid — the provable stop for a worker.
+                    await worker.kill_and_confirm(self._cancel_wait_seconds)
+                else:
+                    operation_task.cancel()
             task = runtime.task
             if task is not None and not task.done() and task is not asyncio.current_task():
                 task.cancel()
@@ -2571,6 +3002,13 @@ class LivePlanningJobRegistry:
             report = _RegistryProgressReporter(self, runtime, generation)
 
             async def invoke_operation() -> dict[str, Any]:
+                # C-146 hard-stop gate (12e35d45 门 1): a LiveJobWorkerCommand
+                # runs in a REAL subprocess (owned PID), so the watchdog can
+                # prove its death via SIGKILL + waitpid and the freeze of any
+                # external probe it was writing. A plain callable stays
+                # in-process and can never be proven dead past cancellation.
+                if isinstance(operation, LiveJobWorkerCommand):
+                    return await self._run_worker_command(runtime, operation)
                 return await operation(report)
 
             operation_task = asyncio.create_task(
@@ -2610,7 +3048,7 @@ class LivePlanningJobRegistry:
             # done) and only then terminalize (or fail closed). Recording the
             # drain result here and re-raising keeps this task genuinely
             # cancelled so the real work and the registry record never disagree.
-            runtime.cancel_drain_succeeded = await self._cancel_and_drain_operation(operation_task)
+            runtime.cancel_drain_succeeded = await self._cancel_and_drain_operation(runtime)
             raise
         except TimeoutError as exc:
             failure = _safe_failure_diagnostic(
@@ -2690,7 +3128,7 @@ class LivePlanningJobRegistry:
                 # and never create a second owner.
                 self._ensure_cleanup_owner(runtime)
                 return
-            drained = await self._cancel_and_drain_operation(operation_task)
+            drained = await self._cancel_and_drain_operation(runtime)
             operation_stopped = operation_task is None or operation_task.done()
             if drained and operation_stopped:
                 with suppress(Exception):
@@ -2759,6 +3197,295 @@ class LivePlanningJobRegistry:
             # once the real executor is confirmed done.
             self._maybe_release_slot(runtime)
 
+    def _workers_dir(self) -> Path | None:
+        """The sibling directory holding durable worker-orphan marker files.
+
+        C-146 hard-stop gate (12e35d45 门 2): marker files live next to the
+        state file (``.``<name>``.workers/``) so a cold start can find and
+        authenticate an orphaned worker even when the API process was SIGKILLed
+        before it could persist anything. Returns None when the registry has no
+        durable state path (pure in-memory registry — no orphan tracking)."""
+        if self._state_path is None:
+            return None
+        return self._state_path.parent / f".{self._state_path.name}.workers"
+
+    def _marker_file_for(self, job_id: str) -> Path | None:
+        workers_dir = self._workers_dir()
+        if workers_dir is None:
+            return None
+        return workers_dir / f"{job_id}.json"
+
+    @staticmethod
+    def _group_commands(pgid: int) -> list[str]:
+        """The command lines of every process in group ``pgid`` via ``ps``.
+
+        Used to AUTHENTICATE an orphan worker before killing it: the group is
+        only ever killed when its command line provably contains the unique
+        marker nonce the registry handed that job — a reused PGID owned by an
+        unrelated process is never touched. ``ps`` is POSIX-standard on both
+        Linux and macOS."""
+        try:
+            completed = subprocess.run(
+                ["ps", "-o", "command=", "-g", str(pgid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return []
+        if completed.returncode != 0:
+            return []
+        return [line for line in completed.stdout.splitlines() if line]
+
+    async def _discover_and_stop_orphan_workers(self) -> None:
+        """Cold-start / parent-API-crash recovery: stop real orphaned workers.
+
+        C-146 hard-stop gate (12e35d45 门 2): the API process may be SIGKILLed
+        mid-run, orphaning a live worker process group whose durable record
+        (state file worker identity + on-disk marker file) survives. This scans
+        both sources, AUTHENTICATES each group via its marker nonce (so a reused
+        PGID owned by an unrelated process is never killed), SIGKILLs the whole
+        authenticated group and confirms every member died, then quarantines the
+        owning record as an orphan so it is isolated, never replayed, and
+        reclaimed only by bounded retention. Returns without blocking on any
+        live operation; a group that cannot be confirmed dead stays quarantined
+        and is re-attempted by the next startup."""
+        candidates: list[tuple[int, str, Path | None, _RuntimeJob | None]] = []
+        if self._state_path is not None:
+            workers_dir = self._workers_dir()
+            if workers_dir is not None and workers_dir.is_dir():
+                for marker_path in workers_dir.iterdir():
+                    if not marker_path.is_file() or marker_path.suffix != ".json":
+                        continue
+                    try:
+                        info = json.loads(marker_path.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    pgid = info.get("pgid")
+                    marker = info.get("marker")
+                    if not isinstance(pgid, int) or not isinstance(marker, str) or not marker:
+                        continue
+                    candidates.append((pgid, marker, marker_path, None))
+        async with self._lock:
+            runtimes = list(self._records.values())
+        for runtime in runtimes:
+            if (
+                runtime.worker_pgid is not None
+                and runtime.worker_marker
+                and runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
+            ):
+                candidates.append(
+                    (runtime.worker_pgid, runtime.worker_marker, None, runtime)
+                )
+        # De-duplicate by (pgid, marker). A marker file AND a live registry
+        # record can describe the SAME authenticated orphan group; prefer the
+        # candidate that carries a runtime record so the owning job is
+        # quarantined as an orphan (a marker-file-only candidate has no record
+        # to quarantine), but keep the marker file path for cleanup.
+        seen: dict[tuple[int, str], int] = {}
+        unique: list[tuple[int, str, Path | None, _RuntimeJob | None]] = []
+        for pgid, marker, marker_path, runtime in candidates:
+            key = (pgid, marker)
+            index = seen.get(key)
+            if index is None:
+                seen[key] = len(unique)
+                unique.append((pgid, marker, marker_path, runtime))
+            elif unique[index][3] is None and runtime is not None:
+                unique[index] = (pgid, marker, unique[index][2], runtime)
+        for pgid, marker, marker_path, runtime in unique:
+            commands = self._group_commands(pgid)
+            authenticated = any(marker in line for line in commands)
+            if not authenticated:
+                continue
+            # Kill the whole authenticated group; confirm every member died.
+            confirmed = False
+            with suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(pgid, signal.SIGKILL)
+                deadline = asyncio.get_running_loop().time() + self._hard_stop_confirm_seconds
+                while asyncio.get_running_loop().time() < deadline:
+                    try:
+                        os.killpg(pgid, 0)
+                    except ProcessLookupError:
+                        confirmed = True
+                        break
+                    except PermissionError:
+                        # macOS can briefly answer EPERM for a reparented orphan
+                        # that is dying/being reaped (its group still exists but
+                        # is no longer signalable). That is transient — the group
+                        # becomes ESRCH within the confirm budget — so keep
+                        # polling instead of giving up. The deadline still bounds
+                        # the wait; an EPERM that persists until it expires means
+                        # "cannot prove dead" and the group stays quarantined for
+                        # the next startup.
+                        pass
+                    await asyncio.sleep(0.01)
+            if runtime is not None:
+                async with self._lock:
+                    current = self._records.get(runtime.snapshot.id)
+                    if (
+                        current is not None
+                        and current.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
+                    ):
+                        current.quarantined = True
+                        current.quarantine_stage = _QUARANTINE_ORPHAN_STAGE
+                        current.hard_stopped = confirmed
+                        current.worker_pgid = pgid
+                        current.worker_marker = marker
+                        current.generation += 1
+                        current.snapshot = current.snapshot.model_copy(
+                            update={
+                                "stage": _QUARANTINE_ORPHAN_STAGE,
+                                "error": (
+                                    "live planning job executor was orphaned by a parent crash"
+                                ),
+                                "updated_at": self._utc_now(),
+                            }
+                        )
+                        with suppress(Exception):
+                            self._persist_locked()
+                        self._changed.notify_all()
+            if marker_path is not None:
+                with suppress(OSError):
+                    marker_path.unlink(missing_ok=True)
+
+    def _reap_stale_marker_files(self) -> None:
+        """Remove marker files for groups that are already dead (best effort).
+
+        Called from startup after orphan discovery, so a marker file whose
+        worker exited cleanly between process death and this boot never lingers.
+        Marker files for a LIVE authenticated group are left for the explicit
+        ``_discover_and_stop_orphan_workers`` kill path."""
+        if self._state_path is None:
+            return
+        workers_dir = self._workers_dir()
+        if workers_dir is None or not workers_dir.is_dir():
+            return
+        for marker_path in workers_dir.iterdir():
+            if not marker_path.is_file() or marker_path.suffix != ".json":
+                continue
+            try:
+                info = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                with suppress(OSError):
+                    marker_path.unlink(missing_ok=True)
+                continue
+            pgid = info.get("pgid")
+            if not isinstance(pgid, int):
+                with suppress(OSError):
+                    marker_path.unlink(missing_ok=True)
+                continue
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                with suppress(OSError):
+                    marker_path.unlink(missing_ok=True)
+            except PermissionError:
+                continue
+
+    async def _run_worker_command(
+        self,
+        runtime: _RuntimeJob,
+        command: LiveJobWorkerCommand,
+    ) -> dict[str, Any]:
+        """Execute a ``LiveJobWorkerCommand`` in a real subprocess worker.
+
+        C-146 hard-stop gate (12e35d45 门 1): the operation runs in a fresh OS
+        process with an owned PID/PGID (``runtime.worker_handle``), so the
+        hard-stop watchdog can PROVE its death via SIGKILL of the WHOLE process
+        group + waitpid and the permanent freeze of any external probe it was
+        writing. The worker script is spawned by absolute path; the entry module
+        is loaded by path by the worker itself. ``probe_path`` (when set) is
+        injected into the entry call so a test operation can append to an
+        external, registry-independent side-effect file that only the process
+        death freezes.
+
+        C-146 hard-stop gate (12e35d45 门 2): the worker is spawned with
+        ``start_new_session=True`` so it is the leader of its OWN session /
+        process group (PGID == PID) even before ``os.setsid()`` in the script.
+        A unique marker nonce is passed as an argv flag and durably recorded
+        (best-effort persist under the lock + an on-disk marker file), so a
+        parent-API crash can be recovered by authenticating the group via its
+        command line before cleaning the real orphan."""
+        env = dict(os.environ)
+        pythonpath = [entry for entry in sys.path if entry]
+        existing_pythonpath = env.get("PYTHONPATH")
+        if existing_pythonpath:
+            pythonpath = [existing_pythonpath, *pythonpath]
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+        # C-146 hard-stop gate (12e35d45 门 1): the worker subprocess must never
+        # construct the job registry. It only runs the operation; the API process
+        # owns the durable registry, and a second instance would load (and under
+        # old-v3 migration, rewrite) the same state file — a concurrent second
+        # writer. The flag makes ``tripchord.main`` skip the registry singleton.
+        env["TRIPCHORD_LIVE_WORKER_SUBPROCESS"] = "1"
+        marker = ""
+        marker_file = self._marker_file_for(runtime.snapshot.id)
+        if marker_file is not None:
+            marker = secrets.token_hex(16)
+        argv = [
+            self._worker_python,
+            self._worker_module,
+            "--module-path",
+            command.module_path,
+            "--entry",
+            command.entry,
+            "--args-json",
+            json.dumps(command.args, ensure_ascii=False),
+            "--probe-path",
+            command.probe_path or "",
+            "--marker",
+            marker,
+            "--marker-file",
+            str(marker_file) if marker_file is not None else "",
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+        runtime.worker_handle = _SubprocessWorkerHandle(
+            process,
+            probe_path=command.probe_path,
+            marker=marker,
+            marker_file=marker_file,
+        )
+        # Durable worker identity: persisted best-effort so a cold start can
+        # re-discover + authenticate + clean the real orphan even if this API
+        # process is SIGKILLed mid-run. The marker file on disk is the
+        # authoritative orphan record; a transient persist failure here never
+        # aborts the live operation.
+        runtime.worker_pgid = runtime.worker_handle.pgid
+        runtime.worker_marker = marker
+        runtime.worker_probe = command.probe_path
+        if marker_file is not None:
+            try:
+                async with self._lock:
+                    if self._records.get(runtime.snapshot.id) is runtime:
+                        # C-146 hard-stop gate (12e35d45 门 2): persist the durable
+                        # worker identity WITHOUT advancing the durable snapshot to
+                        # RUNNING. RUNNING is a memory-only live observation; the
+                        # cold-start recovery (``restart_cancelled`` for a formal
+                        # activation) is honest only because a formal job's snapshot
+                        # never durably advanced past QUEUED. A durable RUNNING here
+                        # would turn an interrupted formal job into a quarantine
+                        # orphan instead of its provable restart_cancelled tombstone.
+                        durable_snapshot = runtime.snapshot.model_copy(
+                            update={"state": LivePlanningJobState.QUEUED}
+                        )
+                        self._persist_locked(
+                            snapshot_overrides={runtime.snapshot.id: durable_snapshot}
+                        )
+            except Exception:
+                pass
+        stdout, _stderr = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(f"live planning job worker exited with {process.returncode}")
+        text = stdout.decode("utf-8")
+        return json.loads(text) if text.strip() else {}
+
     def _maybe_release_slot(self, runtime: _RuntimeJob) -> None:
         """Release the admission permit only once the REAL operation task is done.
 
@@ -2815,22 +3542,50 @@ class LivePlanningJobRegistry:
             >= self._intent_persist_wallclock_budget_seconds
         )
 
+    def _quarantine_capacity_available_locked(self) -> bool:
+        """C-146 hard-stop gate (12e35d45 门 4): is a quarantine slot free?
+
+        The quarantine conversion atomically reserves the slot in the SAME lock
+        domain as the conversion (and its persist), so the quota can never be
+        exceeded and a state the loader would reject can never be written.
+        Callers hold ``self._lock``/``self._changed``.
+
+        C-146 P0-5: while persistent quarantine overflow is set (the loader
+        found more durable quarantined records than the current qcap) the
+        registry is fail-closed — NO new conversion or admission is allowed
+        until bounded retention cleanup reclaims quarantine space and clears
+        the overflow flag."""
+        if self._quarantine_overflow:
+            return False
+        return (
+            sum(1 for item in self._records.values() if item.quarantined)
+            < self._quarantine_capacity
+        )
+
     def _quarantine_runtime_locked(
         self,
         runtime: _RuntimeJob,
         stage: str,
         reason: str,
-    ) -> None:
+    ) -> bool:
         """C-146 P0 supplement (P0-4) / b119: quarantine a non-terminal record.
 
-        The record keeps its snapshot (non-terminal) with an explicit quarantine
-        stage and error, is excluded from executable active capacity, and its
-        idempotency binding (if any) is marked ``legacy_isolated`` so a same-key
-        request always fails closed and is never reused or started. The bounded
-        cleanup reconcile re-arms via the single reaper, so store recovery
-        auto-durably reconciles the quarantine + target facts before any quota
-        is released. Never writes or claims a FAILED/CANCELLED label from
+        C-146 hard-stop gate (12e35d45 门 4): the independent quarantine slot is
+        reserved ATOMICALLY in the same lock domain as the conversion — when the
+        quarantine quota is full this returns False WITHOUT mutating anything, so
+        the caller keeps the record non-quarantined, never writes an over-quota
+        state, never guesses a terminal label and never drops a tombstone.
+
+        On success the record keeps its snapshot (non-terminal) with an explicit
+        quarantine stage and error, is excluded from executable active capacity,
+        and its idempotency binding (if any) is marked ``legacy_isolated`` so a
+        same-key request always fails closed and is never reused or started. The
+        bounded cleanup reconcile re-arms via the single reaper, so store
+        recovery auto-durably reconciles the quarantine + target facts before any
+        quota is released. Never writes or claims a FAILED/CANCELLED label from
         memory-only facts."""
+        if not self._quarantine_capacity_available_locked():
+            return False
         runtime.quarantined = True
         runtime.quarantine_stage = stage
         # The generation bump isolates every registry-facing write (progress
@@ -2849,12 +3604,15 @@ class LivePlanningJobRegistry:
         for entry in self._idempotency.values():
             if entry.job_id == runtime.snapshot.id:
                 entry.legacy_isolated = True
+                if entry.updated_at is None:
+                    entry.updated_at = self._utc_now()
         loop = asyncio.get_running_loop()
         runtime.cleanup_retry_round = self._bump_cleanup_retry_round(runtime.cleanup_retry_round)
         runtime.cleanup_next_retry_monotonic = loop.time() + self._cleanup_retry_delay(
             runtime.cleanup_retry_round
         )
         self._ensure_reaper()
+        return True
 
     def _cancel_settler_active(self, runtime: _RuntimeJob) -> bool:
         """True while a cancel()/close() caller is actively settling a record.
@@ -2876,6 +3634,29 @@ class LivePlanningJobRegistry:
         return (runtime.task is None or runtime.task.done()) and (
             runtime.operation_task is None or runtime.operation_task.done()
         )
+
+    def _defer_cleanup_owner_spawn(self, runtime: _RuntimeJob) -> None:
+        """Restore the unique cleanup owner for a cold-booted runtime, or defer.
+
+        C-146 hard-stop gate (12e35d45 门 3): ``__init__`` may run with no event
+        loop (construction at import time in the API process), so a task cannot
+        be created there. When a loop IS running, spawn immediately; otherwise
+        defer to ``_spawn_deferred_cleanup_owners`` at the first async entry
+        point / ``close()`` — the record is never left permanently dangling."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._deferred_cleanup_owners.append(runtime)
+        else:
+            self._ensure_cleanup_owner(runtime)
+
+    def _spawn_deferred_cleanup_owners(self) -> None:
+        """Spawn every cleanup owner deferred from a loop-less cold start."""
+        if not self._deferred_cleanup_owners:
+            return
+        deferred, self._deferred_cleanup_owners = self._deferred_cleanup_owners, []
+        for runtime in deferred:
+            self._ensure_cleanup_owner(runtime)
 
     def _ensure_cleanup_owner(self, runtime: _RuntimeJob) -> None:
         """Ensure a unique, waitable cleanup owner exists for a pending runtime.
@@ -2964,7 +3745,12 @@ class LivePlanningJobRegistry:
                     # non-terminal. The in-memory intent stays recoverable, but
                     # no FAILED/CANCELLED is ever written or claimed from
                     # memory, and the burst never hammers the store again.
-                    self._quarantine_runtime_locked(
+                    # C-146 hard-stop gate (12e35d45 门 4): the quarantine slot
+                    # is reserved atomically; when the independent qcap is full
+                    # the record stays non-quarantined and the bounded retry
+                    # re-arms — never an over-quota write, never a guessed
+                    # terminal label.
+                    if not self._quarantine_runtime_locked(
                         runtime,
                         _QUARANTINE_INTENT_UNCOMMITTED_STAGE,
                         (
@@ -2972,7 +3758,15 @@ class LivePlanningJobRegistry:
                             "the bounded state budget; the job is quarantined "
                             "non-terminal"
                         ),
-                    )
+                    ):
+                        runtime.cleanup_retry_round = self._bump_cleanup_retry_round(
+                            runtime.cleanup_retry_round
+                        )
+                        runtime.cleanup_next_retry_monotonic = (
+                            loop.time()
+                            + self._cleanup_retry_delay(runtime.cleanup_retry_round)
+                        )
+                        self._ensure_reaper()
                     return
                 # Every bounded attempt failed again: keep the recoverable
                 # in-memory intent and re-arm the single reaper — the same
@@ -2998,7 +3792,7 @@ class LivePlanningJobRegistry:
             # CancelledError past the budget fails closed into the observable
             # stuck isolation with the committed FAILED intent intact (first
             # intent wins — never overwritten by a later join).
-            await self._cancel_and_drain_operation(operation_task)
+            await self._cancel_and_drain_operation(runtime)
             if not (operation_task is None or operation_task.done()):
                 if runtime.quarantined:
                     # The reconciled quarantine facts are durable but the
@@ -3272,97 +4066,165 @@ class LivePlanningJobRegistry:
                     self._hard_stop_watchdog = None
                     return
             if due:
-                for runtime in due:
-                    await self._hard_stop_operation(runtime)
+                # C-146 hard-stop gate (12e35d45 门 2): the watchdog CONCURRENTLY
+                # enforces every due operation's own absolute deadline+grace. A
+                # serial ``for`` would let the first stubborn operation's kill /
+                # confirm budget delay the second past ITS deadline+grace; gather
+                # runs each ``_hard_stop_operation`` (SIGKILL+waitpid outside the
+                # shared lock) in parallel, so every operation stops within its
+                # own fixed error budget.
+                await asyncio.gather(*(self._hard_stop_operation(item) for item in due))
             else:
                 await asyncio.sleep(max(0.0, next_due - loop.time()))
 
     async def _hard_stop_operation(self, runtime: _RuntimeJob) -> None:
-        """Quarantine and hard-stop a live operation past the absolute EXECUTION
-        budget (C-146 P0 supplement / P0-4).
+        """Hard-stop a live operation past the absolute EXECUTION budget.
 
-        Under the lock, the record is moved into the explicit NON-terminal
-        ``quarantine_hard_stopped`` quarantine, the generation is bumped so every
-        registry-facing write (progress reporter, checkpoint, trace summary) is
-        rejected, and the quarantine facts are persisted best-effort. Then the
-        operation is cancelled and awaited within the bounded budget; if it truly
-        stops, the slot release follows the normal done-callback. If it swallows
-        CancelledError, it is an ORPHAN — the registry provably stopped driving it,
-        the orphan counts against the bounded quarantine quota, and the admission
-        permit is NEVER released before ``operation_task.done()`` (an in-process
-        coroutine that ignores cancellation is not provably stopped, so only its
-        real completion releases the slot). No terminal label is ever fabricated
-        from the memory-only intent."""
+        C-146 hard-stop gate (12e35d45 门 1): the record is NOT called hard
+        stopped until the real executor's death is PROVEN. For a worker
+        subprocess that is SIGKILL + waitpid (``kill_and_confirm``) — the PID is
+        dead and any external probe it was appending is permanently frozen; the
+        admission permit then releases through the normal operation done-callback
+        (communicate drains on process death) and new admission opens. An
+        in-process coroutine that swallows ``CancelledError`` past the bounded
+        confirm budget can NOT be proven dead: it lands on the explicit
+        ``quarantine_orphan_in_process`` stage with ``hard_stopped`` False and
+        its admission slot held until the real task is confirmed done — never
+        called a hard stop, never force-released.
+
+        C-146 hard-stop gate (12e35d45 门 4): the quarantine conversion first
+        atomically reserves a quarantine slot in the same lock domain as the
+        conversion+persist. When the quarantine quota is full, the registry never
+        writes a state it cannot reload, never guesses a terminal label, and
+        never drops a tombstone: a provably-dead executor whose deadline provably
+        passed is terminalized FAILED/deadline_exceeded from that durable
+        provenance (death confirmed, then terminal — the contract-allowed
+        order); anything else stays non-quarantined, generation-bumped and
+        reloadable."""
         operation_task = runtime.operation_task
         if operation_task is None or operation_task.done():
             return
         async with self._changed:
             if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES or runtime.hard_stopped:
                 return
-            runtime.hard_stopped = True
-            runtime.quarantined = True
-            runtime.quarantine_stage = _QUARANTINE_HARD_STOPPED_STAGE
+            # The generation bump isolates every registry-facing write while the
+            # stop attempt is in flight. The final quarantine stage is assigned
+            # below once the stop outcome is known.
             runtime.generation += 1
-            runtime.snapshot = runtime.snapshot.model_copy(
-                update={
-                    "cancel_pending": True,
-                    "cancellation_requested": True,
-                    "stage": _QUARANTINE_HARD_STOPPED_STAGE,
-                    "error": (
-                        "live planning operation did not stop within the absolute "
-                        "deadline+grace execution budget; the executor is "
-                        "hard-stopped and quarantined non-terminal"
-                    ),
-                    "updated_at": self._utc_now(),
-                    "revision": runtime.snapshot.revision + 1,
-                }
-            )
-            for entry in self._idempotency.values():
-                if entry.job_id == runtime.snapshot.id:
-                    entry.legacy_isolated = True
-            try:
-                self._persist_locked()
-            except Exception:
-                # Best-effort: a permanent write failure keeps the in-memory
-                # quarantine observable; the reconcile persists it on recovery.
-                pass
-            else:
-                # The durable quarantine fact is already committed.
-                runtime.quarantine_reconciled = True
             self._changed.notify_all()
-        operation_task.cancel()
-        await asyncio.wait(
-            (operation_task,),
-            timeout=self._cancel_wait_seconds,
-        )
-        # C-146 P0 supplement (P0-4 / P0-C): an in-process operation that
-        # swallowed CancelledError is NOT provably stopped. Its registry-facing
-        # side effects are isolated by the generation bump, but the admission
-        # permit is NEVER released before ``operation_task.done()`` — only the
-        # normal operation done-callback may release it. The orphan is a bounded
-        # hard-stopped worker: it counts against the quarantine quota, holds its
-        # slot (bounded by that quota), and its record is never deleted while it
-        # may still be alive. ``asyncio.cancel()`` never masquerades as
-        # operation-stopped; if the operation later stops on its own (or the
-        # reconcile proves executor death), the slot is released then.
-        # C-146 P0 supplement (P0-4): arm the bounded reconcile owner so the
-        # quarantine fact is committed on store recovery (and, when a durable
-        # pending outcome exists, the record settles to it once the executor is
-        # provably stopped).
+        # Provably stop the real executor within the bounded confirm budget.
+        worker = runtime.worker_handle
+        if worker is not None:
+            death_confirmed = await worker.kill_and_confirm(self._hard_stop_confirm_seconds)
+        else:
+            operation_task.cancel()
+            await asyncio.wait((operation_task,), timeout=self._hard_stop_confirm_seconds)
+            death_confirmed = operation_task.done()
+        terminalize_from_proven_death = False
+        async with self._changed:
+            if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                return
+            if not self._quarantine_capacity_available_locked():
+                # 门 4: qcap full. Never exceed the quarantine quota and never
+                # write a state the loader rejects.
+                if death_confirmed and runtime.snapshot.deadline_at <= self._utc_now():
+                    # The executor is PROVEN dead and the deadline provably
+                    # passed: FAILED/deadline_exceeded is honest durable
+                    # provenance, not a guessed label. Terminalize after the
+                    # lock is released (below).
+                    terminalize_from_proven_death = True
+                else:
+                    # No provable terminal and no quarantine space: keep the
+                    # record non-quarantined, generation-bumped, and reloadable.
+                    # The slot is released only via the normal done-callback.
+                    runtime.hard_stopped = death_confirmed
+                    runtime.quarantined = False
+                    runtime.quarantine_stage = None
+                self._changed.notify_all()
+            else:
+                if death_confirmed:
+                    runtime.hard_stopped = True
+                    runtime.quarantine_stage = _QUARANTINE_HARD_STOPPED_STAGE
+                else:
+                    # In-process orphan that cannot be proven dead: NOT a hard stop.
+                    runtime.hard_stopped = False
+                    runtime.quarantine_stage = _QUARANTINE_ORPHAN_STAGE
+                runtime.quarantined = True
+                runtime.snapshot = runtime.snapshot.model_copy(
+                    update={
+                        "cancel_pending": True,
+                        "cancellation_requested": True,
+                        "stage": runtime.quarantine_stage,
+                        "error": (
+                            "live planning operation did not stop within the absolute "
+                            "deadline+grace execution budget; the executor is "
+                            "hard-stopped and quarantined non-terminal"
+                        ),
+                        "updated_at": self._utc_now(),
+                        "revision": runtime.snapshot.revision + 1,
+                    }
+                )
+                for entry in self._idempotency.values():
+                    if entry.job_id == runtime.snapshot.id:
+                        entry.legacy_isolated = True
+                        if entry.updated_at is None:
+                            entry.updated_at = self._utc_now()
+                try:
+                    self._persist_locked()
+                except Exception:
+                    # Best-effort: a permanent write failure keeps the in-memory
+                    # quarantine observable; the reconcile persists it on recovery.
+                    pass
+                else:
+                    # The durable quarantine fact is already committed.
+                    runtime.quarantine_reconciled = True
+                self._changed.notify_all()
+        if terminalize_from_proven_death:
+            with suppress(Exception):
+                await self._finish(
+                    runtime,
+                    LivePlanningJobState.FAILED,
+                    stage="deadline_exceeded",
+                    error="TimeoutError: live planning job deadline exceeded",
+                    safe_failure=_safe_failure_diagnostic(
+                        TimeoutError("live planning job deadline exceeded"),
+                        code_override=LivePlanningSafeFailureCode.DEADLINE_EXCEEDED,
+                    ),
+                    expected_generation=runtime.generation,
+                    cancellation_requested=True,
+                )
+            return
+        # Arm the bounded reconcile owner so the quarantine fact is committed on
+        # store recovery (and, when a durable pending outcome exists, the record
+        # settles to it once the executor is provably stopped).
         self._ensure_cleanup_owner(runtime)
 
-    async def _cancel_and_drain_operation(
-        self,
-        operation_task: asyncio.Task[dict[str, Any]] | None,
-    ) -> bool:
-        """Cancel the operation and wait within the bounded budget.
+    async def _cancel_and_drain_operation(self, runtime: _RuntimeJob) -> bool:
+        """Stop the real executor and confirm it is dead within the budget.
 
-        Returns True when the operation is confirmed stopped (already done, or
-        done within the budget) and False when it swallowed CancelledError and is
-        still alive past the budget — the caller must then fail closed rather than
-        publish a fake terminal label over running work."""
+        C-146 hard-stop gate (12e35d45 门 1): a worker subprocess is SIGKILLed
+        and waitpid-confirmed dead (``kill_and_confirm``) — the process death is
+        the proof, and the communicate task drains right after. An in-process
+        task is cancelled and awaited. Returns True only when the executor is
+        confirmed stopped; False means it is still alive past the budget and the
+        caller must fail closed rather than publish a terminal label over live
+        work."""
+        operation_task = runtime.operation_task
         if operation_task is None or operation_task.done():
             return True
+        worker = runtime.worker_handle
+        if worker is not None:
+            confirmed = await worker.kill_and_confirm(self._cancel_wait_seconds)
+            if confirmed:
+                # The PID is dead; let the communicate task drain its buffers so
+                # ``operation_task.done()`` becomes True for the shared
+                # ``_executors_stopped`` predicate.
+                with suppress(Exception):
+                    await asyncio.wait_for(
+                        asyncio.shield(operation_task),
+                        timeout=self._cancel_wait_seconds,
+                    )
+            return confirmed
         operation_task.cancel()
         done, _ = await asyncio.wait(
             (operation_task,),
@@ -3923,6 +4785,14 @@ class LivePlanningJobRegistry:
             }
 
     def _make_capacity_locked(self) -> None:
+        # C-146 P0-5: while persistent quarantine overflow is set the registry is
+        # fail-closed — no NEW admission (job start) is allowed either. Bounded
+        # retention cleanup is the only path that clears the flag and restores
+        # admission capacity.
+        if self._quarantine_overflow:
+            raise LivePlanningJobCapacityError(
+                "live planning job quarantine capacity exceeded"
+            )
         # C-146 P0 supplement (P0-4) / b119: a quarantined record is NON-terminal
         # and never occupies executable active capacity — it has its own bounded
         # quota. A capacity ghost (e.g. an old isolated_ambiguous_cancel record)
@@ -3971,7 +4841,39 @@ class LivePlanningJobRegistry:
             self._reclaim_quarantine_locked(job_id)
         for job_id in expired:
             self._remove_locked(job_id)
-        if expired or reclaimed:
+        # C-146 P0-5: bounded retention cleanup is the ONLY path that restores
+        # admission capacity. Once reclamation brings the durable quarantined
+        # count back to the current qcap, the fail-closed overflow flag is
+        # cleared so new conversions/admissions resume.
+        overflow_was_set = self._quarantine_overflow
+        if overflow_was_set:
+            quarantined_now = sum(
+                1 for item in self._records.values() if item.quarantined
+            )
+            if quarantined_now <= self._quarantine_capacity:
+                self._quarantine_overflow = False
+        # C-146 hard-stop gate (12e35d45 门 5): the durable tombstone /
+        # isolated-identity collection has a bounded TTL sweep, memory=disk. A
+        # dangling isolated tombstone (no live record) older than
+        # ``tombstone_ttl`` is reclaimed; one with a missing ``updated_at``
+        # (a pre-gate legacy file) is NEVER reclaimed by TTL — it stays bounded
+        # by ``idempotency_capacity`` instead, so the loader can never be forced
+        # into an over-quota file and existing recoverable records are never
+        # overwritten by the sweep.
+        ttl_expired = [
+            partition
+            for partition, entry in self._idempotency.items()
+            if (
+                entry.legacy_isolated
+                and self._records.get(entry.job_id) is None
+                and entry.updated_at is not None
+                and entry.updated_at + self._tombstone_ttl <= now
+            )
+        ]
+        for partition in ttl_expired:
+            self._idempotency.pop(partition, None)
+        overflow_cleared = overflow_was_set and self._quarantine_overflow is False
+        if expired or reclaimed or ttl_expired or overflow_cleared:
             self._persist_locked()
 
     def _reclaim_quarantine_locked(self, job_id: str) -> None:
@@ -3979,13 +4881,20 @@ class LivePlanningJobRegistry:
 
         The record is dropped from ``_records`` but its idempotency binding is
         kept as a minimal durable tombstone (``legacy_isolated``) so a same-key
-        request always fails closed and the key is never silently reused."""
+        request always fails closed and the key is never silently reused.
+
+        C-146 hard-stop gate (12e35d45 门 5): the tombstone is stamped with the
+        current time, so the bounded tombstone-TTL sweep (``_prune_locked``) can
+        later reclaim it — the durable identity chain is bounded by TTL as well
+        as by ``idempotency_capacity``."""
         runtime = self._records.pop(job_id, None)
         if runtime is None:
             return
+        now = self._utc_now()
         for entry in self._idempotency.values():
             if entry.job_id == job_id:
                 entry.legacy_isolated = True
+                entry.updated_at = now
 
     def _remove_locked(self, job_id: str) -> None:
         self._records.pop(job_id, None)

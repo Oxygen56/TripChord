@@ -14057,6 +14057,48 @@ class _RealChainArtifacts:
         self.formal_source_binding = formal_source_binding
 
 
+def _in_process_flexible_operation(
+    payload: Any,
+    *,
+    request_digest: str,
+    target_app: Any,
+    cache: Any,
+    principal: Any,
+) -> Any:
+    """In-process seam for the chain's flexible planning job.
+
+    C-146 P0-1 makes the production route wrap the real operation in a
+    subprocess ``LiveJobWorkerCommand``. The formal production chain drives the
+    mounted HTTP route against an IN-PROCESS composition (fake Companion
+    transport, mocked iCom client), which no worker subprocess can reach. This
+    seam returns the SAME pre-worker in-process operation — the exact
+    ``_execute_live_flexible_from_text`` call the production worker entry runs —
+    as a coroutine inside the API process. The REAL subprocess worker + its
+    hard-stop / identity proof is covered by the counterexample tests in
+    ``apps/api/tests/test_live_job_worker_http.py``; this seam only restores the
+    chain's ability to exercise the evidence chain through the mounted HTTP
+    route.
+    """
+
+    import tripchord.main as main_module
+
+    async def operation(report: Any) -> dict[str, Any]:
+        response = await main_module._execute_live_flexible_from_text(
+            payload,
+            target_app=target_app,
+            cache=cache,
+            principal=principal,
+            report_progress=report,
+            report_pair_checkpoint=report.report_pair_checkpoint,
+            expected_request_sha256=request_digest,
+            model_trace_scope_id=report.job_id,
+            report_model_trace_summary=report.report_model_trace_summary,
+        )
+        return response.model_dump(mode="json")
+
+    return operation
+
+
 async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts:
     """Run the formal runner against the real in-process production API.
 
@@ -14440,9 +14482,24 @@ _c4_chain_cache: dict[str, _RealChainArtifacts] = {}
 def _real_production_chain(staging_dir: Path) -> _RealChainArtifacts:
     """Run the formal production chain once and share its persisted raw file."""
     if "artifacts" not in _c4_chain_cache:
-        _c4_chain_cache["artifacts"] = asyncio.run(
-            _drive_real_production_chain(staging_dir)
+        # C-146 P0-1 seam: the flexible planning route now wraps the real
+        # operation in a subprocess ``LiveJobWorkerCommand``, which cannot reach
+        # the in-process test composition. Bind the route to the same in-process
+        # operation during the chain run and restore the production builder
+        # immediately after (the real worker path is proven by the counterexample
+        # suite, not by this evidence-chain run).
+        import tripchord.main as api_main
+
+        original_builder = api_main._build_live_flexible_from_text_worker_command
+        api_main._build_live_flexible_from_text_worker_command = (
+            _in_process_flexible_operation
         )
+        try:
+            _c4_chain_cache["artifacts"] = asyncio.run(
+                _drive_real_production_chain(staging_dir)
+            )
+        finally:
+            api_main._build_live_flexible_from_text_worker_command = original_builder
     return _c4_chain_cache["artifacts"]
 
 
