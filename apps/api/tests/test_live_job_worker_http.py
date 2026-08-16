@@ -1082,3 +1082,759 @@ async def test_state_byte_cap_rejected_on_load_fstat_first(tmp_path: Path) -> No
     assert state_path.stat().st_size > 1024
     with pytest.raises(RuntimeError, match="byte bound"):
         LivePlanningJobRegistry(state_path=state_path, state_max_bytes=1024)
+
+
+# ---------------------------------------------------------------------------
+# C-146 P0 supplement (RETURN 9666a380): native red-then-green counterexamples
+# for the seven NEW P0s — real ready HTTP→worker chain (P0-1), spawn-window
+# cold-start discovery (P0-2), watchdog earlier-deadline wake + concurrent batch
+# (P0-3), worker clean-return group-empty confirm (P0-4), cold-boot drain before
+# terminalize (P0-5), evict rollback on persist failure (P0-6), and qcap atomic
+# reject before stop/kill (P0-7).
+# ---------------------------------------------------------------------------
+
+
+# A worker entry that RETURNS success after forking a stubborn grandchild which
+# keeps writing external side effects forever — a clean LEADER exit is NOT an
+# empty process group.
+_RETURNED_GRANDCHILD_SRC = f'''\
+import asyncio
+import os
+import subprocess
+import sys
+
+_GRANDCHILD = {_GRANDCHILD_SRC!r}
+
+async def run_returned_grandchild(*, probe_path=None, **kwargs):
+    with open(probe_path, "a") as fh:
+        fh.write("leader-start:" + str(os.getpid()) + "\\n")
+        fh.flush()
+    child = subprocess.Popen(
+        [sys.executable, "-c", _GRANDCHILD, probe_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    with open(probe_path, "a") as fh:
+        fh.write("grandchild-pid:" + str(child.pid) + "\\n")
+        fh.flush()
+    # The leader returns a clean success while the grandchild keeps appending.
+    return {{"status": "succeeded", "pid": os.getpid()}}
+'''
+
+
+class _SlowKillConfirm:
+    """Test double for a worker handle whose kill+confirm takes ``slow`` seconds.
+
+    Only used to make one sibling's hard-stop deterministically SLOW so a test
+    can prove a concurrently-due job is NOT delayed by it. The real
+    ``_SubprocessWorkerHandle`` bound is bounded by ``kill_and_confirm``'s
+    confirm budget, which would mask the gather-blocking regression."""
+
+    def __init__(self, slow: float) -> None:
+        self.slow = slow
+
+    async def kill_and_confirm(self, timeout: float) -> bool:
+        await asyncio.sleep(self.slow)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# P0-1: the REAL ready chain runs in the REAL worker subprocess (no builder
+# override) and the FAILED job surfaces the operation's OWN cause.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_http_route_runs_real_ready_chain_and_surfaces_real_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """POSTing a READY payload (destination 目的地/马累) through the real route —
+    NO builder override — runs the REAL ready chain in a REAL worker subprocess,
+    records the
+    durable worker identity, and FAILS with the operation's OWN provenance (the
+    missing flexible-live-system HTTP 503), never a generic ``worker exited with
+    N``. RED on HEAD: the ready chain failed with a generic exit-code RuntimeError
+    and the real cause never surfaced."""
+    registry = _http_app_context(monkeypatch, tmp_path)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+            base_url="http://test",
+        ) as client:
+            created = await client.post(
+                "/api/v1/agents/live-flexible-plan-from-text/jobs",
+                json=_payload(ready=True),
+            )
+            assert created.status_code == 202, created.text
+            job_id = created.json()["job"]["id"]
+            runtime = registry._records[job_id]
+            terminal = await _terminal_job_slow(client, job_id)
+        assert terminal["state"] == "failed", terminal
+        # A REAL worker subprocess ran the ready chain — durable identity.
+        assert runtime.worker_pgid is not None and runtime.worker_pgid > 0
+        assert runtime.worker_marker
+        # The surfaced failure is the REAL operation's cause, not a generic
+        # subprocess exit error.
+        assert "HTTPException" in terminal["error"], terminal
+        assert "worker exited with" not in terminal["error"]
+        assert terminal.get("safe_failure_code") == "http_exception"
+    finally:
+        await registry.close()
+
+
+# ---------------------------------------------------------------------------
+# P0-2: a parent-API crash landing in the spawn window (after the durable
+# spawn-intent write, before the worker's own marker write) leaves only an
+# intent file (marker nonce, no pgid) — a cold start recovers the PGID by
+# scanning process command lines and kills the authenticated orphan.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spawn_intent_window_cold_start_discovers_orphan_group_by_marker(
+    tmp_path: Path,
+) -> None:
+    """A parent-API SIGKILL between ``create_subprocess_exec`` and the worker's
+    own marker write leaves ONLY the durable spawn-intent (marker nonce, NO pgid)
+    plus a live orphan whose command line carries the nonce. A fresh registry's
+    ``restore_after_restart`` must recover the PGID by scanning process command
+    lines, AUTHENTICATE + kill the whole group, and drop the stale intent. RED on
+    HEAD: intent-only marker files were skipped (no pgid), so the orphan was
+    never discovered and kept running."""
+    state_path = tmp_path / "live-jobs.json"
+    probe = tmp_path / "spawn-window-probe.txt"
+    marker = hashlib.sha256(b"spawn-intent-nonce").hexdigest()
+    job_id = "live-job-spawn-window"
+    workers_dir = tmp_path / ".live-jobs.json.workers"
+
+    orphan_code = (
+        "import os, sys, time\n"
+        "probe = sys.argv[2]\n"
+        "with open(probe, 'a') as fh:\n"
+        "    fh.write('orphan-pgid:' + str(os.getpgrp()) + '\\n')\n"
+        "    fh.flush()\n"
+        "while True:\n"
+        "    with open(probe, 'a') as fh:\n"
+        "        fh.write('orphan\\n')\n"
+        "        fh.flush()\n"
+        "    time.sleep(0.01)\n"
+    )
+    # Crasher: writes ONLY the spawn intent (nonce, NO pgid), spawns the orphan
+    # carrying the nonce, then dies — the exact P0-2 Window A. The orphan is
+    # reparented to init so its death is provable.
+    crash_src = (
+        "import json, os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        f"probe = {str(probe)!r}\n"
+        f"marker = {marker!r}\n"
+        f"marker_file = {str(workers_dir / f'{job_id}.json')!r}\n"
+        f"orphan_code = {orphan_code!r}\n"
+        "Path(marker_file).parent.mkdir(parents=True, exist_ok=True)\n"
+        "Path(marker_file).write_text(json.dumps({'marker': marker}, "
+        "ensure_ascii=False, sort_keys=True), encoding='utf-8')\n"
+        "worker = subprocess.Popen(\n"
+        "    [sys.executable, '-c', orphan_code, marker, probe],\n"
+        "    start_new_session=True,\n"
+        "    stdout=subprocess.DEVNULL,\n"
+        "    stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        "time.sleep(1)\n"
+        "os._exit(99)\n"
+    )
+    crash = subprocess.Popen([sys.executable, "-c", crash_src])
+    crash.wait(timeout=10)
+    try:
+        _wait_for_probe(probe, "orphan-pgid")
+        pgid = int(
+            next(
+                line
+                for line in probe.read_text(encoding="utf-8").splitlines()
+                if line.startswith("orphan-pgid:")
+            ).split(":", 1)[1]
+        )
+        assert _group_alive(pgid)
+        # The intent file holds NO pgid — only the nonce.
+        intent = json.loads((workers_dir / f"{job_id}.json").read_text(encoding="utf-8"))
+        assert "pgid" not in intent
+
+        payload = {
+            "schema_version": "tripchord-live-job-registry-v3",
+            "records": [],
+            "idempotency": [],
+        }
+        _write_registry_state(payload, state_path)
+        registry = LivePlanningJobRegistry(state_path=state_path)
+        try:
+            await registry.restore_after_restart()
+            # The whole authenticated group is provably gone and the stale
+            # intent file is removed.
+            assert not _group_alive(pgid)
+            assert not _probe_grows(probe)
+            assert not (workers_dir / f"{job_id}.json").exists()
+        finally:
+            await registry.close()
+    finally:
+        with _suppress_os():
+            os.killpg(pgid, signal.SIGKILL)
+
+
+# ---------------------------------------------------------------------------
+# P0-3: the watchdog must wake when an EARLIER deadline is armed mid-sleep, and
+# a slowly-confirming sibling must never delay a concurrently-due job.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_watchdog_wakes_on_earlier_deadline_inserted_mid_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The watchdog sleeps until the earliest KNOWN deadline. A NEW job whose
+    absolute deadline is EARLIER than the deadline the loop is already sleeping
+    on must WAKE the loop: the new job hard-stops at ITS OWN deadline+grace,
+    never at the later pre-existing deadline. RED on HEAD: the loop slept until
+    the pre-existing later deadline, so the earlier job overran its own bound."""
+    state_path = tmp_path / "live-jobs.json"
+    probe_a = tmp_path / "probe-early-a.txt"
+    probe_b = tmp_path / "probe-early-b.txt"
+    module = _write_stubborn_worker(tmp_path)
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=4,
+        max_running=2,
+        execution_hard_stop_grace_seconds=0.1,
+        hard_stop_confirm_seconds=0.3,
+    )
+    fail_persists = False
+    real_persist = registry._persist_locked
+
+    def conditional_fail() -> None:
+        if fail_persists:
+            raise RuntimeError("injected permanent deadline-intent persist failure")
+        real_persist()
+
+    monkeypatch.setattr(registry, "_persist_locked", conditional_fail)
+    try:
+        snap_a, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_stubborn_command(module, probe_a),
+            idempotency_key="early-a",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=4.0,
+        )
+        ra = registry._records[snap_a.id]
+        await _wait_for_runtime(
+            ra,
+            lambda r: r.worker_pgid is not None
+            and r.operation_task is not None
+            and not r.operation_task.done(),
+        )
+        watchdog = registry._hard_stop_watchdog
+        assert watchdog is not None and not watchdog.done()
+        # Insert job B with a much EARLIER deadline while the watchdog is asleep
+        # on A's 4.0s deadline.
+        snap_b, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_stubborn_command(module, probe_b),
+            idempotency_key="early-b",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=0.6,
+        )
+        rb = registry._records[snap_b.id]
+        await _wait_for_runtime(
+            rb,
+            lambda r: r.worker_pgid is not None
+            and r.operation_task is not None
+            and not r.operation_task.done(),
+        )
+        b_started = time.monotonic()
+        fail_persists = True
+        # B hard-stops within ITS OWN deadline+grace (0.6 + 0.1 + confirm), NOT
+        # at A's later 4.0+0.1 deadline.
+        await _wait_for_runtime(
+            rb,
+            lambda r: r.quarantined and r.hard_stopped,
+            timeout=10.0,
+        )
+        elapsed_b = time.monotonic() - b_started
+        assert rb.quarantine_stage == _QUARANTINE_HARD_STOPPED_STAGE
+        assert elapsed_b <= 0.6 + 0.1 + registry._hard_stop_confirm_seconds + 1.0
+        assert not _group_alive(rb.worker_pgid)
+        assert not _probe_grows(probe_b)
+    finally:
+        monkeypatch.undo()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_does_not_delay_due_sibling_during_slow_confirm(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With tightly staggered deadlines, a job that becomes due WHILE a sibling's
+    hard-stop confirm is still running must stop within its OWN deadline+grace —
+    the shared watchdog spawns a CONCURRENT per-job wrapper instead of gathering
+    (serializing) the batch. A slow sibling confirm (test double on A) must not
+    delay B. RED on HEAD: the batch was gathered, so B waited for A's confirm and
+    overran its own bound."""
+    state_path = tmp_path / "live-jobs.json"
+    probe_a = tmp_path / "probe-tight-a.txt"
+    probe_b = tmp_path / "probe-tight-b.txt"
+    module = _write_stubborn_worker(tmp_path)
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=4,
+        max_running=2,
+        execution_hard_stop_grace_seconds=0.05,
+        hard_stop_confirm_seconds=0.6,
+    )
+    fail_persists = False
+    real_persist = registry._persist_locked
+
+    def conditional_fail() -> None:
+        if fail_persists:
+            raise RuntimeError("injected permanent deadline-intent persist failure")
+        real_persist()
+
+    monkeypatch.setattr(registry, "_persist_locked", conditional_fail)
+    pgid_a: int | None = None
+    pgid_b: int | None = None
+    try:
+        started = time.monotonic()
+        snap_a, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_stubborn_command(module, probe_a),
+            idempotency_key="tight-a",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=0.8,
+        )
+        snap_b, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_stubborn_command(module, probe_b),
+            idempotency_key="tight-b",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=0.9,
+        )
+        ra = registry._records[snap_a.id]
+        rb = registry._records[snap_b.id]
+        await _wait_for_runtime(
+            ra,
+            lambda r: r.worker_pgid is not None
+            and r.operation_task is not None
+            and not r.operation_task.done(),
+        )
+        await _wait_for_runtime(
+            rb,
+            lambda r: r.worker_pgid is not None
+            and r.operation_task is not None
+            and not r.operation_task.done(),
+        )
+        pgid_a = ra.worker_pgid
+        pgid_b = rb.worker_pgid
+        assert pgid_a is not None and pgid_b is not None and pgid_a != pgid_b
+        # A's hard-stop becomes SLOW: replace its real handle with the double so
+        # the confirm takes far longer than B's own bound would tolerate. A's real
+        # process group is never touched by the double — the finally block kills
+        # it after both assertions.
+        ra.worker_handle = _SlowKillConfirm(1.5)
+        fail_persists = True
+        # Poll B's hard-stop CONCURRENTLY with A's and await B FIRST: B must
+        # stop within its own deadline+grace+confirm — never after A's slow 1.5s
+        # confirm completes — and its observed time must be measured the moment
+        # it happens, not after A's quarantine settles.
+        b_waiter = asyncio.create_task(
+            _wait_for_runtime(
+                rb,
+                lambda r: r.quarantined and r.hard_stopped,
+                timeout=10.0,
+            )
+        )
+        await asyncio.wait_for(b_waiter, timeout=10.0)
+        elapsed_b = time.monotonic() - started
+        assert rb.quarantine_stage == _QUARANTINE_HARD_STOPPED_STAGE
+        # B's deadline (0.9 from admission ~started+0.05) + grace 0.05 + its own
+        # confirm 0.6 + a small scheduling buffer.
+        assert elapsed_b <= 0.9 + 0.05 + registry._hard_stop_confirm_seconds + 0.2
+        assert not _group_alive(pgid_b)
+        assert not _probe_grows(probe_b)
+        # A is confirmed via the slow double (1.5s) only afterwards. A's real
+        # process group was never touched by the double — the finally block
+        # below kills it.
+    finally:
+        # The slow double never killed A's real worker; kill both real groups.
+        with _suppress_os():
+            if pgid_a is not None:
+                os.killpg(pgid_a, signal.SIGKILL)
+        with _suppress_os():
+            if pgid_b is not None:
+                os.killpg(pgid_b, signal.SIGKILL)
+        monkeypatch.undo()
+        await registry.close()
+
+
+# ---------------------------------------------------------------------------
+# P0-4: a worker whose ENTRY returns cleanly but that forked a stubborn
+# descendant must not let the job complete over live side effects.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_clean_return_confirms_whole_group_empty_before_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A worker whose entry RETURNS success after forking a stubborn grandchild
+    (same process group, keeps writing external side effects) must NOT let the
+    job terminalize over live work: the registry SIGKILLs the whole group and
+    confirms it empty (probe frozen, group dead) BEFORE surfacing the result.
+    RED on HEAD: a clean leader exit was treated as completion and the grandchild
+    kept growing the probe."""
+    module = tmp_path / "returned_grandchild_worker.py"
+    module.write_text(_RETURNED_GRANDCHILD_SRC, encoding="utf-8")
+    probe = tmp_path / "probe-returned-grandchild.txt"
+    registry = _http_app_context(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main_module,
+        "_build_live_flexible_from_text_worker_command",
+        lambda *a, **k: LiveJobWorkerCommand(
+            module_path=str(module),
+            entry="run_returned_grandchild",
+            args={},
+            probe_path=str(probe),
+        ),
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+            base_url="http://test",
+        ) as client:
+            created = await client.post(
+                "/api/v1/agents/live-flexible-plan-from-text/jobs",
+                json=_payload(ready=False),
+            )
+            assert created.status_code == 202, created.text
+            job_id = created.json()["job"]["id"]
+            runtime = registry._records[job_id]
+            await _wait_for_runtime(runtime, lambda r: r.worker_pgid is not None)
+            pgid = runtime.worker_pgid
+            assert pgid is not None and pgid > 0
+            terminal = await _terminal_job_slow(client, job_id)
+        assert terminal["state"] == "succeeded", terminal
+        # The whole group — leader AND the stubborn grandchild — is provably
+        # empty before the job is allowed to succeed.
+        assert not _group_alive(pgid)
+        assert not _probe_grows(probe)
+    finally:
+        await registry.close()
+
+
+# ---------------------------------------------------------------------------
+# P0-5: a cold-booted runtime whose durable worker identity points at a LIVE,
+# marker-authenticated orphan must drain (kill + confirm) it BEFORE any
+# terminalize / permit release can claim completion.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cold_boot_drain_kills_live_orphan_before_terminalize(
+    tmp_path: Path,
+) -> None:
+    """A cold-booted runtime has no in-memory operation task, but its durable
+    worker identity may still point at a LIVE marker-authenticated orphan group.
+    ``_cancel_and_drain_operation`` must AUTHENTICATE the group, SIGKILL it and
+    confirm it died BEFORE any terminalize / permit release is allowed. RED on
+    HEAD: a cold-booted runtime reported stopped unconditionally, leaving the
+    orphan alive and writing side effects."""
+    state_path = tmp_path / "live-jobs.json"
+    probe = tmp_path / "cold-boot-orphan-probe.txt"
+    marker = hashlib.sha256(b"cold-boot-nonce").hexdigest()
+    job_id = "live-job-cold-boot-drain"
+
+    orphan_code = (
+        "import os, sys, time\n"
+        "probe = sys.argv[2]\n"
+        "with open(probe, 'a') as fh:\n"
+        "    fh.write('orphan-pgid:' + str(os.getpgrp()) + '\\n')\n"
+        "    fh.flush()\n"
+        "while True:\n"
+        "    with open(probe, 'a') as fh:\n"
+        "        fh.write('orphan\\n')\n"
+        "        fh.flush()\n"
+        "    time.sleep(0.01)\n"
+    )
+    # Crasher spawns the marker-carrying orphan then dies (reparented to init).
+    crash_src = (
+        "import os, subprocess, sys, time\n"
+        f"probe = {str(probe)!r}\n"
+        f"marker = {marker!r}\n"
+        f"orphan_code = {orphan_code!r}\n"
+        "worker = subprocess.Popen(\n"
+        "    [sys.executable, '-c', orphan_code, marker, probe],\n"
+        "    start_new_session=True,\n"
+        "    stdout=subprocess.DEVNULL,\n"
+        "    stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        "time.sleep(1)\n"
+        "os._exit(99)\n"
+    )
+    crash = subprocess.Popen([sys.executable, "-c", crash_src])
+    crash.wait(timeout=10)
+    _wait_for_probe(probe, "orphan-pgid")
+    pgid = int(
+        next(
+            line
+            for line in probe.read_text(encoding="utf-8").splitlines()
+            if line.startswith("orphan-pgid:")
+        ).split(":", 1)[1]
+    )
+    try:
+        assert _group_alive(pgid)
+        pending = _PendingTerminalOutcome(
+            state=LivePlanningJobState.FAILED,
+            stage="deadline_exceeded",
+            error="TimeoutError: live planning job deadline exceeded",
+            safe_failure=_safe_failure_diagnostic(
+                TimeoutError("live planning job deadline exceeded"),
+                code_override=LivePlanningSafeFailureCode.DEADLINE_EXCEEDED,
+            ),
+            cancellation_requested=True,
+        )
+        snap = _v3_snapshot(
+            job_id, LivePlanningJobState.RUNNING, _QUARANTINE_ORPHAN_STAGE, 5, 2
+        )
+        payload = {
+            "schema_version": "tripchord-live-job-registry-v3",
+            "records": [
+                _v3_record(
+                    "tenant-a",
+                    snap,
+                    quarantined=True,
+                    quarantine_stage=_QUARANTINE_ORPHAN_STAGE,
+                    pending_terminal=pending.to_persisted(),
+                    worker_pgid=pgid,
+                    worker_marker=marker,
+                    worker_probe=str(probe),
+                )
+            ],
+            "idempotency": [
+                _v3_idempotency_entry("tenant-a", "cold-boot-key", job_id),
+            ],
+        }
+        _write_registry_state(payload, state_path)
+        registry = LivePlanningJobRegistry(state_path=state_path)
+        try:
+            runtime = registry._records[job_id]
+            assert runtime.operation_task is None  # cold boot
+            # Do NOT call restore_after_restart: exercise the drain directly.
+            confirmed = await registry._cancel_and_drain_operation(runtime)
+            assert confirmed is True
+            # The authenticated orphan group is provably gone BEFORE any
+            # terminalize / permit release is allowed to claim completion.
+            assert not _group_alive(pgid)
+            assert not _probe_grows(probe)
+        finally:
+            await registry.close()
+    finally:
+        with _suppress_os():
+            os.killpg(pgid, signal.SIGKILL)
+
+
+# ---------------------------------------------------------------------------
+# P0-6: a pre-commit persist failure on an admission that EVICTED the oldest
+# terminal record must roll the eviction back — the old idempotency binding
+# survives.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_capacity_eviction_rolls_back_idempotency_on_persist_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With ``capacity=1``, job A's success fills the only slot. Job B's
+    admission EVICTS terminal A; a pre-commit persist failure on B's admission
+    must roll the eviction back — A's record and its idempotency binding survive,
+    so a same-key retry with a different digest still fails closed. RED on HEAD:
+    the eviction was applied and never undone, so the old key was silently freed."""
+    state_path = tmp_path / "live-jobs.json"
+
+    async def quick_op(report: Any) -> dict[str, Any]:
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(state_path=state_path, capacity=1)
+    fail_persists = False
+    real_persist = registry._persist_locked
+
+    def conditional_fail() -> None:
+        if fail_persists:
+            raise RuntimeError("injected pre-commit persist failure")
+        real_persist()
+
+    monkeypatch.setattr(registry, "_persist_locked", conditional_fail)
+    try:
+        snap_a, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=quick_op,
+            idempotency_key="key-a",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+        )
+        ra = registry._records[snap_a.id]
+        await _wait_for_runtime(
+            ra,
+            lambda r: r.snapshot.state == LivePlanningJobState.SUCCEEDED,
+        )
+        # B's admission evicts terminal A; the persist of B's admission fails.
+        fail_persists = True
+        with pytest.raises(RuntimeError, match="injected pre-commit persist failure"):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=quick_op,
+                idempotency_key="key-b",
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+            )
+        fail_persists = False
+        # P0-6: A's idempotency binding must have been rolled back — a same-key
+        # request with a DIFFERENT digest still conflicts with terminal A.
+        with pytest.raises(LivePlanningJobIdempotencyConflictError):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=quick_op,
+                idempotency_key="key-a",
+                request_digest="b" * 64,
+                defer_start=False,
+            )
+    finally:
+        monkeypatch.undo()
+        await registry.close()
+
+
+# ---------------------------------------------------------------------------
+# P0-7: the quarantine-capacity check is the ATOMIC precondition of a hard stop
+# — a full quota REFUSES the stop BEFORE any stop/kill side effect.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_qcap_full_refuses_hard_stop_before_any_kill(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With ``quarantine_capacity=1``, A's hard stop consumes the only slot. When
+    B's hard-stop bound passes while the quota is FULL the watchdog REFUSES the
+    stop BEFORE any kill — B stays alive (probe keeps growing), is NOT
+    quarantined, and is marked deferred. Once retention reclaims A's slot, the
+    deferred B is retried immediately and then hard-stopped. RED on HEAD: the
+    stop/kill ran FIRST and the capacity rejection came after — B's probe froze
+    over an irreversible kill.
+
+    B's own deadline stays far in the future so the runner's deadline-timeout
+    path can never race the watchdog: the only force acting on B is the
+    watchdog's qcap-gated hard-stop (armed by overriding ``hard_stop_monotonic``
+    directly)."""
+    state_path = tmp_path / "live-jobs.json"
+    probe_a = tmp_path / "probe-qcap-a.txt"
+    probe_b = tmp_path / "probe-qcap-b.txt"
+    module = _write_stubborn_worker(tmp_path)
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=4,
+        max_running=2,
+        quarantine_capacity=1,
+        execution_hard_stop_grace_seconds=0.1,
+        hard_stop_confirm_seconds=0.3,
+        hard_stop_defer_retry_seconds=60.0,
+    )
+    fail_persists = False
+    real_persist = registry._persist_locked
+
+    def conditional_fail() -> None:
+        if fail_persists:
+            raise RuntimeError("injected permanent deadline-intent persist failure")
+        real_persist()
+
+    monkeypatch.setattr(registry, "_persist_locked", conditional_fail)
+    try:
+        snap_a, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_stubborn_command(module, probe_a, spawn_grandchild=True),
+            idempotency_key="qcap-a",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=1.0,
+        )
+        snap_b, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_stubborn_command(module, probe_b, spawn_grandchild=True),
+            idempotency_key="qcap-b",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=100.0,
+        )
+        ra = registry._records[snap_a.id]
+        rb = registry._records[snap_b.id]
+        await _wait_for_runtime(
+            ra,
+            lambda r: r.worker_pgid is not None
+            and r.operation_task is not None
+            and not r.operation_task.done(),
+        )
+        await _wait_for_runtime(
+            rb,
+            lambda r: r.worker_pgid is not None
+            and r.operation_task is not None
+            and not r.operation_task.done(),
+        )
+        pgid_a = ra.worker_pgid
+        pgid_b = rb.worker_pgid
+        assert pgid_a is not None and pgid_b is not None and pgid_a != pgid_b
+        fail_persists = True
+        # A hard-stops first and consumes the only quarantine slot.
+        await _wait_for_runtime(
+            ra,
+            lambda r: r.quarantined and r.hard_stopped,
+            timeout=10.0,
+        )
+        assert ra.quarantine_stage == _QUARANTINE_HARD_STOPPED_STAGE
+        assert not _group_alive(pgid_a)
+        assert not _probe_grows(probe_a)
+        # Arm B's hard-stop bound PAST now while its own deadline stays in the
+        # future (so the runner never races), then wake the watchdog: the qcap is
+        # FULL, so B's stop must be REFUSED before any kill.
+        async with registry._changed:
+            rb.hard_stop_monotonic = asyncio.get_running_loop().time() - 0.1
+            registry._wake_hard_stop_watchdog()
+        # Give the watchdog B's own confirm budget to settle either outcome,
+        # then prove B was NOT killed: the capacity rejection happened BEFORE
+        # any stop/kill side effect.
+        await asyncio.sleep(0.5 + 0.1 + registry._hard_stop_confirm_seconds + 0.3)
+        assert _probe_grows(probe_b)  # RED: frozen (killed first) -> FAILS
+        assert not rb.quarantined
+        assert not rb.hard_stopped
+        assert rb.hard_stop_deferred is True
+        assert _group_alive(pgid_b)
+        # Retention reclaims A's slot -> the deferred B is retried immediately.
+        # Re-enable persist so the reclamation can actually commit and the
+        # immediate retry can proceed.
+        fail_persists = False
+        async with registry._changed:
+            registry._quarantine_retention = timedelta(milliseconds=1)
+            await asyncio.sleep(0.05)
+            registry._prune_locked(registry._utc_now())
+        await _wait_for_runtime(
+            rb,
+            lambda r: r.quarantined and r.hard_stopped,
+            timeout=10.0,
+        )
+        assert rb.quarantine_stage == _QUARANTINE_HARD_STOPPED_STAGE
+        assert not _group_alive(pgid_b)
+        assert not _probe_grows(probe_b)
+    finally:
+        monkeypatch.undo()
+        await registry.close()

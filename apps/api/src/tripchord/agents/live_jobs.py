@@ -1121,6 +1121,27 @@ class _RuntimeJob:
         # hard-stop watchdog isolates a live operation once this passes.
         self.hard_stop_monotonic = 0.0
         self.hard_stopped = False
+        # C-146 P0-3: True while the watchdog's concurrent hard-stop wrapper is
+        # actively stopping this runtime, so the re-scan never double-processes a
+        # due operation. Cleared (and the watchdog re-awoken) when the wrapper
+        # finishes — success, deferral or exception alike.
+        self.hard_stop_in_flight = False
+        # C-146 P0-7: the watchdog reached this runtime's deadline but the
+        # quarantine quota was full, so the stop was REFUSED before any
+        # irreversible kill. The record stays non-quarantined and running;
+        # ``hard_stop_next_attempt_monotonic`` bounds the retry so the watchdog
+        # re-attempts once capacity frees (or the backoff elapses) instead of
+        # busy-spinning every scan.
+        self.hard_stop_deferred = False
+        self.hard_stop_next_attempt_monotonic = 0.0
+        # C-146 P0-7: a quarantine slot RESERVED atomically (same lock domain as
+        # the conversion) BEFORE any stop/kill side effect, so a capacity
+        # rejection never happens after an irreversible action and a concurrent
+        # sibling hard-stop can never consume the last slot between the check
+        # and the conversion. Counted by ``_quarantine_capacity_available_locked``
+        # alongside ``quarantined`` and released when the record converts or
+        # terminalizes.
+        self.hard_stop_quarantine_reserved = False
         # C-146 P0 supplement (fourth P0) / b119: quarantine membership. A
         # quarantined record is NON-terminal, does NOT count against executable
         # active capacity, is governed by the bounded quarantine quota +
@@ -1228,6 +1249,9 @@ class LivePlanningJobRegistry:
         tombstone_ttl: timedelta = timedelta(days=30),
         now: Callable[[], datetime] | None = None,
         state_path: Path | None = None,
+        # C-146 P0-7: bounded backoff between two hard-stop attempts when the
+        # stop was REFUSED for a full quarantine quota. Never a busy-spin.
+        hard_stop_defer_retry_seconds: float = 1.0,
     ) -> None:
         if capacity < 1:
             raise ValueError("capacity must be positive")
@@ -1278,6 +1302,7 @@ class LivePlanningJobRegistry:
         # enough to fit the quota again.
         self._quarantine_overflow = False
         self._hard_stop_confirm_seconds = hard_stop_confirm_seconds
+        self._hard_stop_defer_retry_seconds = hard_stop_defer_retry_seconds
         self._worker_python = worker_python or sys.executable
         self._worker_module = worker_module or _default_worker_module()
         self._idempotency_capacity = idempotency_capacity
@@ -1299,6 +1324,17 @@ class LivePlanningJobRegistry:
         # bound can be reached; it quarantines the executor past the bound and
         # self-terminates when no operation needs it.
         self._hard_stop_watchdog: asyncio.Task[None] | None = None
+        # C-146 P0-3: wake event for the single hard-stop watchdog. Set whenever
+        # (a) a hard-stop wrapper finishes so the loop re-scans immediately for
+        # newly-due siblings (never delayed past their OWN deadline by a slow
+        # confirm), (b) a new operation arms an EARLIER deadline than the one the
+        # loop is currently sleeping on, or (c) quarantine retention frees a slot
+        # so a P0-7-deferred hard-stop can be retried. Created lazily inside the
+        # watchdog loop; ``_wake_hard_stop_watchdog`` no-ops when it is absent.
+        self._hard_stop_wake: asyncio.Event | None = None
+        # C-146 P0-3: strong refs to in-flight hard-stop wrapper tasks so the
+        # event loop never garbage-collects a running wrapper.
+        self._hard_stop_tasks: set[asyncio.Task[None]] = set()
         # C-146 hard-stop gate (12e35d45 门 3): runtimes that loaded as
         # ``quarantined + pending_terminal`` but whose cleanup owner could not be
         # spawned inside ``__init__`` (no running event loop, e.g. construction
@@ -2208,7 +2244,7 @@ class LivePlanningJobRegistry:
                                 cancellation_pending_error.job_id = existing_runtime.snapshot.id
                                 raise cancellation_pending_error
                         return existing_runtime.snapshot, True
-            self._make_capacity_locked()
+            evicted_runtime, evicted_entries = self._make_capacity_locked()
             # C-146 hard-stop gate (12e35d45 门 5): the idempotency-identity /
             # tombstone collection has a hard CARDINALITY bound, enforced
             # ATOMICALLY BEFORE the new record is admitted to ``_records`` or
@@ -2222,6 +2258,9 @@ class LivePlanningJobRegistry:
                 idempotency_partition is not None
                 and len(self._idempotency) >= self._idempotency_capacity
             ):
+                # C-146 P0-6: a capacity eviction above must not survive a
+                # rejected admission — restore the old record + its bindings.
+                self._restore_capacity_locked(evicted_runtime, evicted_entries)
                 raise LivePlanningJobCapacityError(
                     "live planning job idempotency capacity exceeded"
                 )
@@ -2234,6 +2273,12 @@ class LivePlanningJobRegistry:
                     defer_start=defer_start,
                     updated_at=now,
                 )
+            # C-146 P0-3: a NEW job may arm an EARLIER execution bound than the
+            # one the watchdog is currently sleeping on. Wake it only now that the
+            # record is actually visible in ``_records`` — a wake issued before
+            # insertion would be consumed by a re-scan that cannot see the new
+            # deadline, and the loop would sleep straight past it.
+            self._wake_hard_stop_watchdog()
             try:
                 self._persist_locked()
             except LivePlanningJobRegistryPostCommitError as exc:
@@ -2252,7 +2297,12 @@ class LivePlanningJobRegistry:
                 self._changed.notify_all()
                 raise
             except Exception:
+                # C-146 P0-6: a pre-commit persist failure must roll back BOTH the
+                # just-added record AND any capacity eviction that made room for
+                # it — otherwise the old terminal record's idempotency mapping is
+                # silently destroyed by a failed admission.
                 self._remove_locked(job_id)
+                self._restore_capacity_locked(evicted_runtime, evicted_entries)
                 raise
             if not defer_start:
                 runtime.task = asyncio.create_task(
@@ -3237,6 +3287,75 @@ class LivePlanningJobRegistry:
             return []
         return [line for line in completed.stdout.splitlines() if line]
 
+    @staticmethod
+    def _find_pgid_by_marker(marker: str) -> int | None:
+        """Recover the PGID of a live process whose command line carries ``marker``.
+
+        C-146 P0-2: a parent-API crash can land between
+        ``create_subprocess_exec`` and the worker's own atomic marker-file
+        write. In that window the ONLY durable trace of the orphan is the
+        spawn-intent marker nonce (no PGID). Scanning every process command line
+        for the 32-hex nonce — which never appears in an unrelated argv —
+        recovers the process group so it can be authenticated and cleaned."""
+        try:
+            completed = subprocess.run(
+                ["ps", "-e", "-o", "pid=,pgid=,command="],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return None
+        if completed.returncode != 0:
+            return None
+        for line in completed.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) != 3:
+                continue
+            _pid_str, pgid_str, command = parts
+            if marker in command:
+                try:
+                    return int(pgid_str)
+                except ValueError:
+                    continue
+        return None
+
+    @staticmethod
+    def _write_spawn_intent(marker_file: Path, marker: str) -> None:
+        """Atomically write the durable spawn-intent marker (nonce, NO pgid).
+
+        C-146 P0-2: written BEFORE the worker subprocess exists so a parent-API
+        crash in the spawn window leaves a recoverable record of the orphan. The
+        worker overwrites this same path atomically with its pid/pgid on
+        startup, so a cold start can authenticate + kill the real group either
+        from the full marker file or, when only the intent survived, by scanning
+        process command lines for the nonce."""
+        marker_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = marker_file.parent / f".{marker_file.name}.{os.getpid()}.intent.tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"marker": marker},
+                handle,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, marker_file)
+
+    def _wake_hard_stop_watchdog(self) -> None:
+        """Wake the single hard-stop watchdog so it re-scans immediately.
+
+        C-146 P0-3: the watchdog sleeps until the earliest known deadline or an
+        explicit wake. Arming a new (earlier) execution bound, a hard-stop
+        wrapper completing, or quarantine retention freeing a slot all set this
+        so the loop never sleeps past a deadline that became due while it
+        waited. No-op when the loop is not currently sleeping on the event."""
+        wake = self._hard_stop_wake
+        if wake is not None:
+            wake.set()
+
     async def _discover_and_stop_orphan_workers(self) -> None:
         """Cold-start / parent-API-crash recovery: stop real orphaned workers.
 
@@ -3263,8 +3382,20 @@ class LivePlanningJobRegistry:
                         continue
                     pgid = info.get("pgid")
                     marker = info.get("marker")
-                    if not isinstance(pgid, int) or not isinstance(marker, str) or not marker:
+                    if not isinstance(marker, str) or not marker:
                         continue
+                    if not isinstance(pgid, int) or pgid <= 0:
+                        # C-146 P0-2: spawn-intent only — the parent crashed
+                        # before the worker could write its pid/pgid. Recover the
+                        # real group by scanning every process command line for
+                        # the nonce; when no live process carries it, the spawn
+                        # never happened (or the worker exited without ever
+                        # writing a full marker) and the stale intent is dropped.
+                        pgid = self._find_pgid_by_marker(marker)
+                        if pgid is None:
+                            with suppress(OSError):
+                                marker_path.unlink(missing_ok=True)
+                            continue
                     candidates.append((pgid, marker, marker_path, None))
         async with self._lock:
             runtimes = list(self._records.values())
@@ -3348,6 +3479,33 @@ class LivePlanningJobRegistry:
                 with suppress(OSError):
                     marker_path.unlink(missing_ok=True)
 
+    async def _kill_orphan_group(self, pgid: int, marker: str) -> bool:
+        """SIGKILL a cold-booted orphan group and confirm it died in budget.
+
+        C-146 P0-5: shared with ``_cancel_and_drain_operation`` for a cold-booted
+        runtime whose durable worker identity points at a LIVE, marker-authenticated
+        process group. Returns True only when the whole group is gone within the
+        hard-stop confirm budget; False means the group could not be proven dead
+        and the caller must fail closed (never terminalize / release a permit over
+        live external side effects)."""
+        confirmed = False
+        with suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(pgid, signal.SIGKILL)
+            deadline = asyncio.get_running_loop().time() + self._hard_stop_confirm_seconds
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    confirmed = True
+                    break
+                except PermissionError:
+                    # macOS can briefly answer EPERM for a reparented orphan that
+                    # is dying/being reaped — transient; keep polling within the
+                    # bounded budget.
+                    pass
+                await asyncio.sleep(0.01)
+        return confirmed
+
     def _reap_stale_marker_files(self) -> None:
         """Remove marker files for groups that are already dead (best effort).
 
@@ -3381,6 +3539,44 @@ class LivePlanningJobRegistry:
                     marker_path.unlink(missing_ok=True)
             except PermissionError:
                 continue
+
+    @staticmethod
+    def _parse_worker_failure(stderr: bytes) -> BaseException | None:
+        """Reconstruct a typed failure from the worker's structured marker.
+
+        C-146 P0-1: the worker writes a single bounded, sanitized line
+        ``TRIPCHORD_WORKER_FAILURE:{"class": "...", "status_code": N}`` when its
+        entry raises. Reconstruct the matching exception type so the job's
+        safe-failure diagnostic reflects the REAL operation's cause (an HTTP 503
+        from the ready chain, a domain ValueError, ...) rather than a generic
+        exit-code error. Returns None when no marker is present."""
+        for line in stderr.decode("utf-8", "replace").splitlines():
+            if not line.startswith("TRIPCHORD_WORKER_FAILURE:"):
+                continue
+            try:
+                payload = json.loads(line.split(":", 1)[1])
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            klass = payload.get("class")
+            if klass == "HTTPException":
+                try:
+                    from starlette.exceptions import HTTPException
+                except ImportError:  # pragma: no cover - starlette is a dependency
+                    from fastapi import HTTPException  # type: ignore[no-redef]
+                status_code = 500
+                try:
+                    status_code = int(payload.get("status_code") or 500)
+                except (TypeError, ValueError):
+                    status_code = 500
+                return HTTPException(
+                    status_code=status_code,
+                    detail="live planning operation reported an HTTP failure",
+                )
+            if isinstance(klass, str) and klass:
+                return RuntimeError(f"live planning job worker reported: {klass}")
+        return None
 
     async def _run_worker_command(
         self,
@@ -3422,6 +3618,14 @@ class LivePlanningJobRegistry:
         marker_file = self._marker_file_for(runtime.snapshot.id)
         if marker_file is not None:
             marker = secrets.token_hex(16)
+            # C-146 P0-2: write the durable SPAWN INTENT (unique marker nonce,
+            # NO pgid yet) BEFORE the subprocess exists. A parent-API crash
+            # landing between ``create_subprocess_exec`` and the worker's own
+            # atomic marker-file write otherwise leaves an orphan whose only
+            # durable trace is this intent file; a cold start recovers the real
+            # group by scanning process command lines for the nonce. The worker
+            # overwrites this same path atomically with its pid/pgid on startup.
+            self._write_spawn_intent(marker_file, marker)
         argv = [
             self._worker_python,
             self._worker_module,
@@ -3438,14 +3642,23 @@ class LivePlanningJobRegistry:
             "--marker-file",
             str(marker_file) if marker_file is not None else "",
         ]
-        process = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            start_new_session=True,
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                start_new_session=True,
+            )
+        except BaseException:
+            # Spawn failed: remove the stale spawn intent so a cold start never
+            # chases a process that does not exist (the intent was written before
+            # the spawn attempt).
+            if marker_file is not None:
+                with suppress(OSError):
+                    marker_file.unlink(missing_ok=True)
+            raise
         runtime.worker_handle = _SubprocessWorkerHandle(
             process,
             probe_path=command.probe_path,
@@ -3480,10 +3693,31 @@ class LivePlanningJobRegistry:
                         )
             except Exception:
                 pass
-        stdout, _stderr = await process.communicate()
+        stdout, stderr = await process.communicate()
         if process.returncode != 0:
+            # C-146 P0-1: surface the REAL operation's failure provenance. The
+            # worker emits a structured marker (exception CLASS + HTTP status
+            # only — never the raw message) when its entry raises; reconstruct a
+            # typed exception so the job fails with the operation's OWN cause
+            # (e.g. the ready chain's 503) instead of a generic exit-code error.
+            # A missing/unparseable marker falls back to the generic failure.
+            failure = self._parse_worker_failure(stderr)
+            if failure is not None:
+                raise failure
             raise RuntimeError(f"live planning job worker exited with {process.returncode}")
         text = stdout.decode("utf-8")
+        # C-146 P0-4: a clean LEADER exit is NOT proof the whole process group is
+        # empty — the operation may have forked a stubborn descendant that keeps
+        # writing external side effects after the parent returned. Prove the
+        # group is empty (SIGKILL any survivor + waitpid + empty-group probe)
+        # BEFORE surfacing the result; a group that cannot be confirmed empty
+        # fails the job closed instead of completing over live side effects.
+        if runtime.worker_handle is not None and not await runtime.worker_handle.kill_and_confirm(
+            self._hard_stop_confirm_seconds
+        ):
+            raise RuntimeError(
+                "live planning job worker process group is not empty after clean exit"
+            )
         return json.loads(text) if text.strip() else {}
 
     def _maybe_release_slot(self, runtime: _RuntimeJob) -> None:
@@ -3558,7 +3792,11 @@ class LivePlanningJobRegistry:
         if self._quarantine_overflow:
             return False
         return (
-            sum(1 for item in self._records.values() if item.quarantined)
+            sum(
+                1
+                for item in self._records.values()
+                if item.quarantined or item.hard_stop_quarantine_reserved
+            )
             < self._quarantine_capacity
         )
 
@@ -3792,8 +4030,8 @@ class LivePlanningJobRegistry:
             # CancelledError past the budget fails closed into the observable
             # stuck isolation with the committed FAILED intent intact (first
             # intent wins — never overwritten by a later join).
-            await self._cancel_and_drain_operation(runtime)
-            if not (operation_task is None or operation_task.done()):
+            drain_confirmed = await self._cancel_and_drain_operation(runtime)
+            if not drain_confirmed or not (operation_task is None or operation_task.done()):
                 if runtime.quarantined:
                     # The reconciled quarantine facts are durable but the
                     # executor is still alive: keep the record quarantined and
@@ -4026,9 +4264,18 @@ class LivePlanningJobRegistry:
         exactly when a live operation's absolute execution bound
         (``hard_stop_monotonic``) is reached and self-terminates once no
         operation needs it, so a permanent-failure attack can never accumulate
-        watchdog timers."""
+        watchdog timers.
+
+        C-146 P0-3: called each time a NEW live executor is armed — the exact
+        moment a fresh (possibly EARLIER) hard-stop bound becomes real. When the
+        watchdog is already asleep on an older deadline, wake it so the re-scan
+        sees the new live operation immediately instead of sleeping past its
+        bound. (The watchdog ignores records whose operation task is not yet
+        live, so waking only on admission is not enough — the executor must
+        actually be running for the new deadline to be visible.)"""
         watchdog = self._hard_stop_watchdog
         if watchdog is not None and not watchdog.done():
+            self._wake_hard_stop_watchdog()
             return
         self._hard_stop_watchdog = asyncio.create_task(
             self._hard_stop_watchdog_loop(),
@@ -4043,11 +4290,68 @@ class LivePlanningJobRegistry:
         alone never masquerades as stopped: the operation is hard-stopped by the
         generation isolation plus the bounded slot release, and only a confirmed
         ``operation_task.done()`` is treated as stopped. The loop self-terminates
-        when no live operation needs it — no background task outlives its work."""
+        when no live operation needs it — no background task outlives its work.
+
+        C-146 P0-3: the loop NEVER sleeps past a deadline that became due while
+        it waited. The wait is bounded by the earliest known deadline AND an
+        explicit wake event — a hard-stop wrapper completing, a newly-armed
+        EARLIER deadline, or quarantine retention freeing a slot all set the
+        event — so the re-scan runs immediately instead of only at the oldest
+        pre-sleep deadline. Each due operation is stopped by its OWN concurrent
+        wrapper task: one stubborn kill/confirm never delays a sibling's hard
+        stop past ITS deadline+grace (a ``gather``-blocked re-scan would)."""
         loop = asyncio.get_running_loop()
+        if self._hard_stop_wake is None:
+            self._hard_stop_wake = asyncio.Event()
         while True:
             due: list[_RuntimeJob] = []
+            async with self._lock:
+                for runtime in self._records.values():
+                    if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                        continue
+                    if runtime.hard_stopped:
+                        continue
+                    if runtime.hard_stop_in_flight:
+                        # Already being stopped by a wrapper; the wrapper's
+                        # completion re-awakens this loop for the re-scan.
+                        continue
+                    if runtime.operation_task is None or runtime.operation_task.done():
+                        continue
+                    if runtime.hard_stop_monotonic <= 0.0:
+                        continue
+                    if loop.time() < runtime.hard_stop_monotonic:
+                        continue
+                    # C-146 P0-7: a hard stop refused for a full quarantine quota
+                    # is retried on a bounded backoff (and immediately when
+                    # retention frees a slot), never busy-spun every scan.
+                    if runtime.hard_stop_next_attempt_monotonic > loop.time():
+                        continue
+                    due.append(runtime)
+                    runtime.hard_stop_in_flight = True
+            if due:
+                # C-146 hard-stop gate (12e35d45 门 2) + P0-3: CONCURRENT
+                # per-operation wrappers. Each due operation stops within its own
+                # fixed error budget while the loop re-scans immediately when any
+                # wrapper completes (or an earlier deadline is armed) — a slow
+                # sibling confirm never delays a newly-due job.
+                for item in due:
+                    wrapper = asyncio.create_task(
+                        self._hard_stop_operation(item),
+                        name=f"tripchord:{item.snapshot.id}:hard-stop",
+                    )
+                    self._hard_stop_tasks.add(wrapper)
+                    wrapper.add_done_callback(self._on_hard_stop_wrapper_done)
+            # Lossless wait window. The event is cleared, then ``next_due`` is
+            # re-derived UNDER THE LOCK from the current records: any arming
+            # (a newly-armed earlier deadline, a wrapper completion, a retention
+            # reclaim) that landed between the due-scan and the clear is captured
+            # by this re-derivation, and any arming after it sets the event and
+            # wakes the wait — a deadline is never slept past. The loop also
+            # never self-terminates while a stop wrapper is still in flight
+            # (its completion is the only wake it needs).
+            self._hard_stop_wake.clear()
             next_due: float | None = None
+            in_flight = False
             async with self._lock:
                 for runtime in self._records.values():
                     if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
@@ -4058,24 +4362,37 @@ class LivePlanningJobRegistry:
                         continue
                     if runtime.hard_stop_monotonic <= 0.0:
                         continue
-                    if loop.time() >= runtime.hard_stop_monotonic:
-                        due.append(runtime)
-                    elif next_due is None or runtime.hard_stop_monotonic < next_due:
-                        next_due = runtime.hard_stop_monotonic
-                if not due and next_due is None:
-                    self._hard_stop_watchdog = None
-                    return
-            if due:
-                # C-146 hard-stop gate (12e35d45 门 2): the watchdog CONCURRENTLY
-                # enforces every due operation's own absolute deadline+grace. A
-                # serial ``for`` would let the first stubborn operation's kill /
-                # confirm budget delay the second past ITS deadline+grace; gather
-                # runs each ``_hard_stop_operation`` (SIGKILL+waitpid outside the
-                # shared lock) in parallel, so every operation stops within its
-                # own fixed error budget.
-                await asyncio.gather(*(self._hard_stop_operation(item) for item in due))
+                    if runtime.hard_stop_in_flight:
+                        in_flight = True
+                        continue
+                    candidate = runtime.hard_stop_monotonic
+                    if loop.time() >= candidate:
+                        # Due but not yet in flight (deadline passed between the
+                        # scan and this re-derivation, or a deferred backoff
+                        # elapsed): re-scan immediately.
+                        candidate = runtime.hard_stop_next_attempt_monotonic
+                        if candidate <= loop.time():
+                            candidate = loop.time()
+                    if next_due is None or candidate < next_due:
+                        next_due = candidate
+            if next_due is None and not in_flight:
+                self._hard_stop_watchdog = None
+                return
+            if next_due is None:
+                # Only in-flight stop wrappers remain: wait for one to complete
+                # (its completion re-awakens the loop) rather than busy-spinning.
+                await self._hard_stop_wake.wait()
             else:
-                await asyncio.sleep(max(0.0, next_due - loop.time()))
+                wait_seconds = max(0.0, next_due - loop.time())
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._hard_stop_wake.wait(), timeout=wait_seconds
+                    )
+
+    def _on_hard_stop_wrapper_done(self, wrapper: asyncio.Task[None]) -> None:
+        """A hard-stop wrapper finished (success, deferral or exception)."""
+        self._hard_stop_tasks.discard(wrapper)
+        self._wake_hard_stop_watchdog()
 
     async def _hard_stop_operation(self, runtime: _RuntimeJob) -> None:
         """Hard-stop a live operation past the absolute EXECUTION budget.
@@ -4092,21 +4409,41 @@ class LivePlanningJobRegistry:
         its admission slot held until the real task is confirmed done — never
         called a hard stop, never force-released.
 
-        C-146 hard-stop gate (12e35d45 门 4): the quarantine conversion first
-        atomically reserves a quarantine slot in the same lock domain as the
-        conversion+persist. When the quarantine quota is full, the registry never
-        writes a state it cannot reload, never guesses a terminal label, and
-        never drops a tombstone: a provably-dead executor whose deadline provably
-        passed is terminalized FAILED/deadline_exceeded from that durable
-        provenance (death confirmed, then terminal — the contract-allowed
-        order); anything else stays non-quarantined, generation-bumped and
-        reloadable."""
+        C-146 hard-stop gate (12e35d45 门 4) + P0-7: the quarantine-capacity
+        check is the ATOMIC fail-closed PRECONDITION of the whole stop: the slot
+        is reserved (or the stop REFUSED) in the same lock domain as the
+        conversion+persist, BEFORE any stop/kill side effect. When the quarantine
+        quota is full the registry REFUSES the stop before any irreversible
+        action — the record stays non-quarantined, marked deferred, and the
+        watchdog re-attempts on a bounded backoff / when retention frees a slot.
+        The reservation blocks a concurrent sibling hard-stop from consuming the
+        last slot between the check and the conversion."""
         operation_task = runtime.operation_task
         if operation_task is None or operation_task.done():
             return
         async with self._changed:
             if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES or runtime.hard_stopped:
                 return
+            if not self._quarantine_capacity_available_locked():
+                # 门 4 + P0-7: qcap full — REFUSE the stop BEFORE any stop/kill.
+                # No irreversible side effect may precede a capacity rejection.
+                # The record stays running (deadline already passed, so it is
+                # fail-closed on the quota), is marked deferred, and the watchdog
+                # re-attempts once retention frees a slot or the bounded backoff
+                # elapses — never a busy-spin.
+                runtime.hard_stop_in_flight = False
+                runtime.hard_stop_deferred = True
+                runtime.hard_stop_next_attempt_monotonic = (
+                    asyncio.get_running_loop().time() + self._hard_stop_defer_retry_seconds
+                )
+                self._changed.notify_all()
+                return
+            runtime.hard_stop_deferred = False
+            # Atomically reserve the quarantine slot in the SAME lock domain as
+            # the conversion+persist below, so a capacity rejection can never
+            # follow an irreversible kill and a concurrent sibling can never
+            # steal the last slot mid-stop.
+            runtime.hard_stop_quarantine_reserved = True
             # The generation bump isolates every registry-facing write while the
             # stop attempt is in flight. The final quarantine stage is assigned
             # below once the stop outcome is known.
@@ -4120,80 +4457,56 @@ class LivePlanningJobRegistry:
             operation_task.cancel()
             await asyncio.wait((operation_task,), timeout=self._hard_stop_confirm_seconds)
             death_confirmed = operation_task.done()
-        terminalize_from_proven_death = False
         async with self._changed:
             if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                # A concurrent terminalize won (or the operation finished on its
+                # own); the reserved slot was never consumed. The record is
+                # terminal — clear the in-flight marker so a later re-scan (or a
+                # fresh watchdog) treats it as settled, never as still-being-stopped.
+                runtime.hard_stop_in_flight = False
+                runtime.hard_stop_quarantine_reserved = False
+                self._changed.notify_all()
                 return
-            if not self._quarantine_capacity_available_locked():
-                # 门 4: qcap full. Never exceed the quarantine quota and never
-                # write a state the loader rejects.
-                if death_confirmed and runtime.snapshot.deadline_at <= self._utc_now():
-                    # The executor is PROVEN dead and the deadline provably
-                    # passed: FAILED/deadline_exceeded is honest durable
-                    # provenance, not a guessed label. Terminalize after the
-                    # lock is released (below).
-                    terminalize_from_proven_death = True
-                else:
-                    # No provable terminal and no quarantine space: keep the
-                    # record non-quarantined, generation-bumped, and reloadable.
-                    # The slot is released only via the normal done-callback.
-                    runtime.hard_stopped = death_confirmed
-                    runtime.quarantined = False
-                    runtime.quarantine_stage = None
-                self._changed.notify_all()
+            # The reserved slot is now consumed by the quarantine conversion
+            # (P0-7: it was checked+reserved BEFORE any stop/kill side effect).
+            runtime.hard_stop_quarantine_reserved = False
+            if death_confirmed:
+                runtime.hard_stopped = True
+                runtime.quarantine_stage = _QUARANTINE_HARD_STOPPED_STAGE
             else:
-                if death_confirmed:
-                    runtime.hard_stopped = True
-                    runtime.quarantine_stage = _QUARANTINE_HARD_STOPPED_STAGE
-                else:
-                    # In-process orphan that cannot be proven dead: NOT a hard stop.
-                    runtime.hard_stopped = False
-                    runtime.quarantine_stage = _QUARANTINE_ORPHAN_STAGE
-                runtime.quarantined = True
-                runtime.snapshot = runtime.snapshot.model_copy(
-                    update={
-                        "cancel_pending": True,
-                        "cancellation_requested": True,
-                        "stage": runtime.quarantine_stage,
-                        "error": (
-                            "live planning operation did not stop within the absolute "
-                            "deadline+grace execution budget; the executor is "
-                            "hard-stopped and quarantined non-terminal"
-                        ),
-                        "updated_at": self._utc_now(),
-                        "revision": runtime.snapshot.revision + 1,
-                    }
-                )
-                for entry in self._idempotency.values():
-                    if entry.job_id == runtime.snapshot.id:
-                        entry.legacy_isolated = True
-                        if entry.updated_at is None:
-                            entry.updated_at = self._utc_now()
-                try:
-                    self._persist_locked()
-                except Exception:
-                    # Best-effort: a permanent write failure keeps the in-memory
-                    # quarantine observable; the reconcile persists it on recovery.
-                    pass
-                else:
-                    # The durable quarantine fact is already committed.
-                    runtime.quarantine_reconciled = True
-                self._changed.notify_all()
-        if terminalize_from_proven_death:
-            with suppress(Exception):
-                await self._finish(
-                    runtime,
-                    LivePlanningJobState.FAILED,
-                    stage="deadline_exceeded",
-                    error="TimeoutError: live planning job deadline exceeded",
-                    safe_failure=_safe_failure_diagnostic(
-                        TimeoutError("live planning job deadline exceeded"),
-                        code_override=LivePlanningSafeFailureCode.DEADLINE_EXCEEDED,
+                # In-process orphan that cannot be proven dead: NOT a hard stop.
+                runtime.hard_stopped = False
+                runtime.quarantine_stage = _QUARANTINE_ORPHAN_STAGE
+            runtime.quarantined = True
+            runtime.snapshot = runtime.snapshot.model_copy(
+                update={
+                    "cancel_pending": True,
+                    "cancellation_requested": True,
+                    "stage": runtime.quarantine_stage,
+                    "error": (
+                        "live planning operation did not stop within the absolute "
+                        "deadline+grace execution budget; the executor is "
+                        "hard-stopped and quarantined non-terminal"
                     ),
-                    expected_generation=runtime.generation,
-                    cancellation_requested=True,
-                )
-            return
+                    "updated_at": self._utc_now(),
+                    "revision": runtime.snapshot.revision + 1,
+                }
+            )
+            for entry in self._idempotency.values():
+                if entry.job_id == runtime.snapshot.id:
+                    entry.legacy_isolated = True
+                    if entry.updated_at is None:
+                        entry.updated_at = self._utc_now()
+            try:
+                self._persist_locked()
+            except Exception:
+                # Best-effort: a permanent write failure keeps the in-memory
+                # quarantine observable; the reconcile persists it on recovery.
+                pass
+            else:
+                # The durable quarantine fact is already committed.
+                runtime.quarantine_reconciled = True
+            self._changed.notify_all()
         # Arm the bounded reconcile owner so the quarantine fact is committed on
         # store recovery (and, when a durable pending outcome exists, the record
         # settles to it once the executor is provably stopped).
@@ -4211,6 +4524,26 @@ class LivePlanningJobRegistry:
         work."""
         operation_task = runtime.operation_task
         if operation_task is None or operation_task.done():
+            # C-146 P0-5: a cold-booted runtime has no in-memory operation task,
+            # but its DURABLE worker identity may still point at a LIVE orphan
+            # process group (the parent API was SIGKILLed mid-run; e.g. a
+            # stubborn descendant survived the group kill, or the worker is still
+            # mid-spawn). Never report "stopped" while an authenticated group is
+            # alive: authenticate via the marker nonce in the group's command
+            # line, then kill + confirm the WHOLE group before any terminalize /
+            # permit release. An unauthenticated or already-dead group is a
+            # no-op (reused PGID / natural exit) and stays "stopped".
+            if (
+                runtime.worker_handle is None
+                and runtime.worker_pgid is not None
+                and runtime.worker_marker
+            ):
+                commands = self._group_commands(runtime.worker_pgid)
+                if any(runtime.worker_marker in line for line in commands):
+                    return await self._kill_orphan_group(
+                        runtime.worker_pgid,
+                        runtime.worker_marker,
+                    )
             return True
         worker = runtime.worker_handle
         if worker is not None:
@@ -4784,7 +5117,18 @@ class LivePlanningJobRegistry:
                 "phase": "cancelled",
             }
 
-    def _make_capacity_locked(self) -> None:
+    def _make_capacity_locked(
+        self,
+    ) -> tuple[_RuntimeJob | None, list[tuple[str, _IdempotencyEntry]]]:
+        """Reserve executable admission capacity, evicting the oldest terminal
+        record if needed.
+
+        C-146 P0-6: the eviction is RETURNED (not silently dropped) so a caller
+        whose admission FAILS before the new record is durably committed can roll
+        the eviction back — a failed admission must never destroy the old record's
+        idempotency binding. Returns ``(evicted_runtime, evicted_idempotency)``;
+        ``(None, [])`` when nothing was evicted.
+        """
         # C-146 P0-5: while persistent quarantine overflow is set the registry is
         # fail-closed — no NEW admission (job start) is allowed either. Bounded
         # retention cleanup is the only path that clears the flag and restores
@@ -4801,7 +5145,7 @@ class LivePlanningJobRegistry:
         if quarantined >= self._quarantine_capacity:
             raise LivePlanningJobCapacityError("live planning job quarantine capacity exceeded")
         if sum(1 for item in self._records.values() if not item.quarantined) < self._capacity:
-            return
+            return None, []
         terminal = [
             item
             for item in self._records.values()
@@ -4809,9 +5153,33 @@ class LivePlanningJobRegistry:
         ]
         if terminal:
             oldest = min(terminal, key=lambda item: item.snapshot.updated_at)
+            evicted_entries = [
+                (key, entry)
+                for key, entry in self._idempotency.items()
+                if entry.job_id == oldest.snapshot.id
+            ]
             self._remove_locked(oldest.snapshot.id)
+            return oldest, evicted_entries
         if sum(1 for item in self._records.values() if not item.quarantined) >= self._capacity:
             raise LivePlanningJobCapacityError("live planning job capacity exceeded")
+        return None, []
+
+    def _restore_capacity_locked(
+        self,
+        evicted: _RuntimeJob | None,
+        evicted_entries: list[tuple[str, _IdempotencyEntry]],
+    ) -> None:
+        """C-146 P0-6: roll back a ``_make_capacity_locked`` eviction.
+
+        Called when the admission that triggered the eviction FAILS before the
+        new record is durably committed, restoring the evicted terminal record
+        and its idempotency bindings so the old identity mapping is never
+        silently destroyed by a failed admission."""
+        if evicted is None:
+            return
+        self._records[evicted.snapshot.id] = evicted
+        for key, entry in evicted_entries:
+            self._idempotency[key] = entry
 
     def _prune_locked(self, now: datetime) -> None:
         expired: list[str] = []
@@ -4875,6 +5243,18 @@ class LivePlanningJobRegistry:
         overflow_cleared = overflow_was_set and self._quarantine_overflow is False
         if expired or reclaimed or ttl_expired or overflow_cleared:
             self._persist_locked()
+        # C-146 P0-7: quarantine retention freed a slot / cleared overflow — a
+        # hard stop REFUSED for a full quota can now be retried immediately.
+        # Wake the watchdog so it re-scans the P0-7-deferred records without
+        # waiting for their bounded backoff to elapse. The deferred records'
+        # next-attempt stamps are reset NOW so the re-scan actually processes
+        # them instead of sleeping out the old backoff.
+        if reclaimed or overflow_cleared:
+            for runtime in self._records.values():
+                if runtime.hard_stop_deferred:
+                    runtime.hard_stop_deferred = False
+                    runtime.hard_stop_next_attempt_monotonic = 0.0
+            self._wake_hard_stop_watchdog()
 
     def _reclaim_quarantine_locked(self, job_id: str) -> None:
         """Reclaim a quarantined record after its retention window (P0-4/b119).

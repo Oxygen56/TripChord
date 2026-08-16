@@ -113,8 +113,23 @@ def main(argv: list[str] | None = None) -> int:
         result = asyncio.run(maybe) if inspect.isawaitable(maybe) else maybe
         json.dump(result, sys.stdout, ensure_ascii=False)
         sys.stdout.flush()
-    except BaseException:
+    except BaseException as exc:
         # The registry reads stderr for diagnostics; a failure is a non-zero exit.
+        #
+        # C-146 P0-1: surface the REAL operation's failure provenance so the
+        # parent registry can reconstruct a typed failure instead of a generic
+        # "worker exited with N". Only the exception CLASS and (for an HTTP
+        # failure) the status code are emitted — never the raw message, which may
+        # contain user content. The registry sanitizes further via its own
+        # safe-failure diagnostic before the label is ever published.
+        marker_payload: dict[str, object] = {"class": type(exc).__name__}
+        if type(exc).__name__ == "HTTPException" and hasattr(exc, "status_code"):
+            marker_payload["status_code"] = int(exc.status_code)
+        sys.stderr.write(
+            "TRIPCHORD_WORKER_FAILURE:"
+            + json.dumps(marker_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        )
         sys.stderr.write("live planning job worker failed\n")
         exit_code = 1
     finally:
