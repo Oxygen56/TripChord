@@ -115,12 +115,15 @@ class _SafeFailureDiagnostic:
 
 @dataclass(frozen=True)
 class _PendingTerminalOutcome:
-    """C-145 P1: the durable terminal intent of a failed-closed cleanup.
+    """C-145 P1/P0: the durable terminal intent of a failed-closed cleanup.
 
-    Recorded BEFORE the stuck isolation is persisted so a pre-commit persist
-    failure still keeps the recoverable owner: once the real operation stops on
-    its own, the cleanup owner terminalizes the record to this outcome without an
-    extra retry/close/cold start."""
+    Recorded ATOMICALLY WITH the stuck isolation so the target outcome survives
+    a pre-commit failure (neither is on disk) and a cold restart (both are). Once
+    the real operation stops on its own, the cleanup owner terminalizes the
+    record to exactly this outcome — never a guessed CANCELLED/FAILED label —
+    without an extra retry/close/cold start. The caller (cancel/close/deadline)
+    supplies the unambiguous target: cancel/close → CANCELLED/cancelled,
+    deadline → FAILED/deadline_exceeded with the safe-failure diagnostic."""
 
     state: LivePlanningJobState
     stage: str
@@ -128,6 +131,87 @@ class _PendingTerminalOutcome:
     error: str | None = None
     safe_failure: _SafeFailureDiagnostic | None = None
     cancellation_requested: bool | None = None
+
+    def to_persisted(self) -> dict[str, Any]:
+        return {
+            "state": self.state.value,
+            "stage": self.stage,
+            "result": self.result,
+            "error": self.error,
+            "safe_failure_code": (
+                self.safe_failure.code.value if self.safe_failure is not None else None
+            ),
+            "safe_failure_details": (
+                self.safe_failure.details.model_dump(mode="json")
+                if self.safe_failure is not None
+                else None
+            ),
+            "safe_failure_details_digest": (
+                self.safe_failure.details_digest
+                if self.safe_failure is not None
+                else None
+            ),
+            "cancellation_requested": self.cancellation_requested,
+        }
+
+    @classmethod
+    def from_persisted(cls, raw: Any) -> _PendingTerminalOutcome:
+        """Strictly decode a durable pending outcome, or raise ``ValueError``.
+
+        A malformed payload (unknown state, non-matching safe-failure fields) is
+        treated as corruption — the loader rejects it fail-closed instead of
+        silently rewriting the record to a guessed cancelled/failed label."""
+        if not isinstance(raw, dict):
+            raise ValueError("pending terminal outcome is not an object")
+        state_raw = raw.get("state")
+        stage = raw.get("stage")
+        if not isinstance(state_raw, str) or not isinstance(stage, str) or not stage:
+            raise ValueError("pending terminal outcome is missing its target")
+        try:
+            state = LivePlanningJobState(state_raw)
+        except ValueError as exc:
+            raise ValueError("pending terminal outcome has an unknown state") from exc
+        result = raw.get("result")
+        if result is not None and not isinstance(result, dict):
+            raise ValueError("pending terminal outcome has an invalid result")
+        error = raw.get("error")
+        if error is not None and not isinstance(error, str):
+            raise ValueError("pending terminal outcome has an invalid error")
+        cancellation_requested = raw.get("cancellation_requested")
+        if cancellation_requested is not None and type(cancellation_requested) is not bool:
+            raise ValueError("pending terminal outcome has an invalid cancellation flag")
+        safe_failure: _SafeFailureDiagnostic | None = None
+        code_raw = raw.get("safe_failure_code")
+        if code_raw is not None:
+            details_raw = raw.get("safe_failure_details")
+            digest_raw = raw.get("safe_failure_details_digest")
+            if (
+                not isinstance(code_raw, str)
+                or not isinstance(digest_raw, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest_raw) is None
+                or not isinstance(details_raw, dict)
+            ):
+                raise ValueError("pending terminal outcome has an invalid safe failure")
+            try:
+                code = LivePlanningSafeFailureCode(code_raw)
+                details = LivePlanningSafeFailureDetails.model_validate(details_raw)
+            except (ValueError, ValidationError) as exc:
+                raise ValueError(
+                    "pending terminal outcome has an invalid safe failure"
+                ) from exc
+            safe_failure = _SafeFailureDiagnostic(
+                code=code,
+                details=details,
+                details_digest=digest_raw,
+            )
+        return cls(
+            state=state,
+            stage=stage,
+            result=result,
+            error=error,
+            safe_failure=safe_failure,
+            cancellation_requested=cancellation_requested,
+        )
 
 
 def _safe_exception_class(exc: BaseException) -> str:
@@ -750,6 +834,14 @@ class _RuntimeJob:
         # own — without an extra retry/close/cold start.
         self.cleanup_owner: asyncio.Task[None] | None = None
         self.pending_terminal: _PendingTerminalOutcome | None = None
+        # C-145 P0: bounded-retry bookkeeping for the cleanup owner. A single
+        # owner invocation retries the terminal persist ``budget`` times with a
+        # short backoff; when the budget is exhausted it keeps the DURABLE
+        # pending outcome and arms the registry reaper, which re-spawns the
+        # owner after ``cleanup_next_retry_monotonic`` until the terminal commit
+        # succeeds or the process shuts down.
+        self.cleanup_retry_round = 0
+        self.cleanup_next_retry_monotonic = 0.0
 
 
 class _IdempotencyEntry:
@@ -783,6 +875,7 @@ class LivePlanningJobRegistry:
         terminal_ttl: timedelta = timedelta(minutes=30),
         cancel_wait_seconds: float = 10,
         cancel_isolation_persist_attempts: int = 3,
+        cleanup_retry_backoff_seconds: float = 0.02,
         now: Callable[[], datetime] | None = None,
         state_path: Path | None = None,
     ) -> None:
@@ -796,17 +889,25 @@ class LivePlanningJobRegistry:
             raise ValueError("cancel_wait_seconds must be positive")
         if cancel_isolation_persist_attempts < 1:
             raise ValueError("cancel_isolation_persist_attempts must be at least one")
+        if cleanup_retry_backoff_seconds <= 0:
+            raise ValueError("cleanup_retry_backoff_seconds must be positive")
         self._capacity = capacity
         self._terminal_ttl = terminal_ttl
         self._now = now or (lambda: datetime.now(UTC))
         self._cancel_wait_seconds = cancel_wait_seconds
         self._cancel_isolation_persist_attempts = cancel_isolation_persist_attempts
+        self._cleanup_retry_backoff_seconds = cleanup_retry_backoff_seconds
         self._slots = asyncio.Semaphore(max_running)
         self._records: dict[str, _RuntimeJob] = {}
         self._idempotency: dict[str, _IdempotencyEntry] = {}
         self._lock = asyncio.Lock()
         self._changed = asyncio.Condition(self._lock)
         self._closed = False
+        # C-145 P0: the single, bounded cleanup reaper. Spawned on demand when a
+        # cleanup owner exhausts its per-round persist budget; it re-spawns the
+        # owner after a bounded backoff until the terminal commit succeeds, and
+        # self-terminates when no pending outcome needs a retry.
+        self._reaper_task: asyncio.Task[None] | None = None
         self._state_path = state_path
         if self._state_path is not None:
             self._load_state()
@@ -868,6 +969,11 @@ class LivePlanningJobRegistry:
                 "tripchord-live-job-registry-v3",
             }:
                 expected_record_fields.add("activation_operation")
+            # C-145 P0: the durable pending terminal outcome is an OPTIONAL v3
+            # field. Old v3 files omit it entirely; new files write it (possibly
+            # null) for every record.
+            if schema_version == "tripchord-live-job-registry-v3":
+                expected_record_fields.add("pending_terminal")
             if not isinstance(item, dict) or set(item) != expected_record_fields:
                 raise RuntimeError("live planning job registry record is invalid")
             tenant_partition = item["tenant_partition"]
@@ -903,6 +1009,17 @@ class LivePlanningJobRegistry:
                         activation_operation,
                         expected_job_id=snapshot.id,
                     )
+            if schema_version == "tripchord-live-job-registry-v3":
+                raw_pending = item["pending_terminal"]
+                if raw_pending is not None:
+                    try:
+                        runtime.pending_terminal = _PendingTerminalOutcome.from_persisted(
+                            raw_pending
+                        )
+                    except (ValueError, KeyError, TypeError, ValidationError) as exc:
+                        raise RuntimeError(
+                            "live planning job registry pending terminal is invalid"
+                        ) from exc
             self._records[snapshot.id] = runtime
         for item in idempotency:
             expected_idempotency_fields = {
@@ -970,13 +1087,32 @@ class LivePlanningJobRegistry:
         for runtime in self._records.values():
             if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
                 runtime.prepared = False
-                self._terminalize_locked(
-                    runtime,
-                    LivePlanningJobState.CANCELLED,
-                    stage="restart_cancelled",
-                    error="live planning job cannot continue after process restart",
-                    cancellation_requested=True,
-                )
+                pending = runtime.pending_terminal
+                if pending is not None and runtime.snapshot.cancel_pending:
+                    # C-145 P0: a DURABLE retry intent survives a restart. The
+                    # real operation's process is provably gone, so continue the
+                    # cleanup to the intended terminal outcome now — never guess
+                    # a cancelled/failed label and never treat an unknown state
+                    # as success. A cancel_pending guard keeps an inconsistent
+                    # (corrupted) outcome fail-closed to restart_cancelled.
+                    self._terminalize_locked(
+                        runtime,
+                        pending.state,
+                        stage=pending.stage,
+                        result=pending.result,
+                        error=pending.error,
+                        safe_failure=pending.safe_failure,
+                        cancellation_requested=pending.cancellation_requested,
+                    )
+                else:
+                    self._terminalize_locked(
+                        runtime,
+                        LivePlanningJobState.CANCELLED,
+                        stage="restart_cancelled",
+                        error="live planning job cannot continue after process restart",
+                        cancellation_requested=True,
+                    )
+                runtime.pending_terminal = None
         self._prune_locked(self._utc_now())
         self._persist_locked()
 
@@ -1072,6 +1208,11 @@ class LivePlanningJobRegistry:
                     "snapshot": runtime.snapshot.model_dump(mode="json"),
                     "prepared": runtime.prepared,
                     "activation_operation": runtime.activation_operation,
+                    "pending_terminal": (
+                        runtime.pending_terminal.to_persisted()
+                        if runtime.pending_terminal is not None
+                        else None
+                    ),
                 }
                 for runtime in sorted(
                     self._records.values(), key=lambda item: item.snapshot.id
@@ -1727,11 +1868,11 @@ class LivePlanningJobRegistry:
                 async with self._lock:
                     pending_current = self._owned_locked(job_id, tenant_id)
                 if pending_current is not None:
-                    await self._finish(
+                    await self._join_pending_cleanup(
                         pending_current,
-                        LivePlanningJobState.CANCELLED,
-                        stage="cancelled",
-                        cancellation_requested=True,
+                        fallback_state=LivePlanningJobState.CANCELLED,
+                        fallback_stage="cancelled",
+                        fallback_cancellation_requested=True,
                     )
                     return await self.get(job_id, tenant_id)
                 return None
@@ -1769,11 +1910,11 @@ class LivePlanningJobRegistry:
         else:
             try:
                 if drained:
-                    await self._finish(
+                    await self._join_pending_cleanup(
                         current,
-                        LivePlanningJobState.CANCELLED,
-                        stage="cancelled",
-                        cancellation_requested=True,
+                        fallback_state=LivePlanningJobState.CANCELLED,
+                        fallback_stage="cancelled",
+                        fallback_cancellation_requested=True,
                     )
                 else:
                     await self._mark_cancel_stuck(current)
@@ -1917,11 +2058,11 @@ class LivePlanningJobRegistry:
             if current is None:
                 continue
             if self._executors_stopped(current):
-                await self._finish(
+                await self._join_pending_cleanup(
                     current,
-                    LivePlanningJobState.CANCELLED,
-                    stage="cancelled",
-                    cancellation_requested=True,
+                    fallback_state=LivePlanningJobState.CANCELLED,
+                    fallback_stage="cancelled",
+                    fallback_cancellation_requested=True,
                 )
             else:
                 await self._mark_cancel_stuck(current)
@@ -2039,6 +2180,10 @@ class LivePlanningJobRegistry:
                     # timeout/cancel-pending isolation as the recoverable owner;
                     # the still-alive operation stays drained and the runner
                     # exits without abandoning it or restoring RUNNING.
+                    # C-145 P0: the durable pending outcome is FAILED /
+                    # deadline_exceeded with the safe-failure diagnostic — never
+                    # a guessed CANCELLED label — so a late-stop auto-collect (or
+                    # a cold restart) lands on the true failure semantics.
                     await self._mark_cancel_stuck(
                         runtime,
                         stage="timeout_pending",
@@ -2047,6 +2192,11 @@ class LivePlanningJobRegistry:
                             "cleanup budget; the job stays non-terminal and the "
                             "operation is isolated"
                         ),
+                        pending_state=LivePlanningJobState.FAILED,
+                        pending_stage="deadline_exceeded",
+                        pending_error="TimeoutError: live planning job deadline exceeded",
+                        pending_safe_failure=failure,
+                        pending_cancellation_requested=True,
                     )
         except Exception as exc:
             # Exception messages may contain a raw user prompt, URL, quote or provider
@@ -2139,16 +2289,19 @@ class LivePlanningJobRegistry:
         )
 
     async def _cleanup_owner(self, runtime: _RuntimeJob) -> None:
-        """The unique owner of a pending terminal outcome (C-145 P1).
+        """The unique owner of a pending terminal outcome (C-145 P1/P0).
 
         Awaits the shielded operation task — so the owner outlives the registry
         runner and survives the operation being cancelled while it waits — then
         re-checks the shared ``_executors_stopped`` predicate and terminalizes
-        the record to the pending outcome. A pre/post-commit persist failure
-        keeps the recoverable cancel_pending isolation: a post-commit failure is
-        already durable, and a pre-commit failure leaves ``pending_terminal``
-        intact so a later join (done-callback, close, same-key retry) retries the
-        same terminalization."""
+        the record to the durable pending outcome. The terminal persist is
+        retried within a bounded per-round budget with a short backoff. A
+        post-commit failure is already durable (confirm and clear the outcome);
+        a pre-commit failure keeps ``pending_terminal`` intact for the next
+        attempt. When the whole budget is exhausted, the DURABLE retry intent is
+        kept and the registry reaper re-spawns this owner after a bounded
+        backoff — until the terminal commit succeeds or the process shuts down —
+        with no dependence on an external same-key/cancel/close/query."""
         operation_task = runtime.operation_task
         if operation_task is not None:
             with suppress(BaseException):
@@ -2161,27 +2314,130 @@ class LivePlanningJobRegistry:
         pending = runtime.pending_terminal
         if pending is None:
             return
-        if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+        budget = self._cancel_isolation_persist_attempts
+        loop = asyncio.get_running_loop()
+        for attempt in range(1, budget + 1):
+            if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                # A concurrent terminalize won; confirm and consume the outcome.
+                runtime.pending_terminal = None
+                return
+            try:
+                await self._finish(
+                    runtime,
+                    pending.state,
+                    stage=pending.stage,
+                    result=pending.result,
+                    error=pending.error,
+                    safe_failure=pending.safe_failure,
+                    cancellation_requested=pending.cancellation_requested,
+                )
+                return
+            except LivePlanningJobRegistryPostCommitError:
+                # The terminal state was already committed on disk; the
+                # in-memory record matches it. Confirm and consume the outcome —
+                # never rewrite a conflicting terminal state.
+                runtime.pending_terminal = None
+                return
+            except Exception:
+                # A pre-commit persist failure keeps the recoverable cancel_pending
+                # isolation and the DURABLE pending outcome for the next attempt.
+                if attempt < budget:
+                    await asyncio.sleep(
+                        min(self._cleanup_retry_backoff_seconds * attempt, 0.1)
+                    )
+        # Budget exhausted: keep the durable retry intent and arm the single
+        # registry reaper to re-spawn this owner after a bounded, growing backoff
+        # (never a busy-wait, never a second concurrent owner).
+        runtime.cleanup_retry_round += 1
+        runtime.cleanup_next_retry_monotonic = loop.time() + min(
+            self._cleanup_retry_backoff_seconds
+            * (2 ** (runtime.cleanup_retry_round - 1)),
+            0.5,
+        )
+        self._ensure_reaper()
+
+    def _ensure_reaper(self) -> None:
+        """Ensure the single, bounded cleanup reaper is running (C-145 P0).
+
+        Re-entrant: repeated calls never spawn a second reaper. The reaper
+        self-terminates when no pending outcome needs a retry, so it is spawned
+        lazily here each time a cleanup owner exhausts its per-round budget."""
+        reaper = self._reaper_task
+        if reaper is not None and not reaper.done():
             return
-        try:
-            await self._finish(
-                runtime,
-                pending.state,
-                stage=pending.stage,
-                result=pending.result,
-                error=pending.error,
-                safe_failure=pending.safe_failure,
-                cancellation_requested=pending.cancellation_requested,
-            )
-        except LivePlanningJobRegistryPostCommitError:
-            # The terminal state was already committed on disk; the in-memory
-            # record matches it.
-            pass
-        except Exception:
-            # A pre-commit persist failure keeps the recoverable cancel_pending
-            # isolation (pending_terminal stays set), so a later join retries
-            # the same terminalization.
-            pass
+        self._reaper_task = asyncio.create_task(
+            self._cleanup_reaper(),
+            name="tripchord:registry:cleanup-reaper",
+        )
+
+    async def _cleanup_reaper(self) -> None:
+        """Registry-held single reaper that auto-restarts exhausted cleanup
+        owners (C-145 P0).
+
+        Sleeps exactly until the next due retry (bounded, no busy-wait), then
+        re-spawns every due owner via ``_ensure_cleanup_owner``. It runs while
+        any pending outcome needs a retry and self-terminates once none remain —
+        a later budget exhaustion re-arms it. Survives close(): the registry's
+        closed flag only stops new work, never an in-flight bounded drain."""
+        loop = asyncio.get_running_loop()
+        while True:
+            async with self._lock:
+                if self._closed and not self._any_retry_pending_locked(loop.time()):
+                    # Explicit shutdown with nothing left to drain: stop.
+                    self._reaper_task = None
+                    return
+                next_at = self._next_cleanup_retry_at_locked(loop.time())
+                if next_at is None:
+                    self._reaper_task = None
+                    return
+            delay = max(0.0, next_at - loop.time())
+            if delay > 0:
+                await asyncio.sleep(delay)
+            async with self._lock:
+                if self._closed and not self._any_retry_pending_locked(loop.time()):
+                    self._reaper_task = None
+                    return
+                now = loop.time()
+                for runtime in list(self._records.values()):
+                    if runtime.pending_terminal is None:
+                        continue
+                    if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                        continue
+                    if runtime.cleanup_owner is not None and not runtime.cleanup_owner.done():
+                        continue
+                    if now >= runtime.cleanup_next_retry_monotonic:
+                        self._ensure_cleanup_owner(runtime)
+
+    def _any_retry_pending_locked(self, now: float) -> bool:
+        """True when at least one runtime holds a pending outcome that still
+        needs a reaper (its owner is done and its retry is not yet due or due
+        now). A live owner needs no reaper — it is already retrying."""
+        for runtime in self._records.values():
+            if runtime.pending_terminal is None:
+                continue
+            if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                continue
+            if runtime.cleanup_owner is not None and not runtime.cleanup_owner.done():
+                continue
+            return True
+        return False
+
+    def _next_cleanup_retry_at_locked(self, now: float) -> float | None:
+        """The next monotonic time at which an exhausted cleanup owner is due for
+        a reaper re-spawn, or None when no runtime needs a reaper right now."""
+        next_at: float | None = None
+        for runtime in self._records.values():
+            if runtime.pending_terminal is None:
+                continue
+            if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                continue
+            if runtime.cleanup_owner is not None and not runtime.cleanup_owner.done():
+                continue
+            if runtime.cleanup_next_retry_monotonic <= now:
+                return now
+            if next_at is None or runtime.cleanup_next_retry_monotonic < next_at:
+                next_at = runtime.cleanup_next_retry_monotonic
+        return next_at
 
     async def _cancel_and_drain_operation(
         self,
@@ -2415,6 +2671,7 @@ class LivePlanningJobRegistry:
             previous_generation = runtime.generation
             previous_prepared = runtime.prepared
             previous_activation_operation = runtime.activation_operation
+            previous_pending_terminal = runtime.pending_terminal
             self._terminalize_locked(
                 runtime,
                 state,
@@ -2424,29 +2681,32 @@ class LivePlanningJobRegistry:
                 safe_failure=safe_failure,
                 cancellation_requested=cancellation_requested,
             )
+            # C-145 P0: consume the durable pending outcome IN THE SAME atomic
+            # write as the terminal state — the on-disk record never keeps a
+            # stale retry intent once the terminal commit succeeds. A pre-commit
+            # failure restores it as the recoverable owner for the next attempt,
+            # a close / same-key retry / cold start.
+            runtime.pending_terminal = None
             try:
                 self._persist_locked()
             except LivePlanningJobRegistryPostCommitError:
                 # The terminalized state was already committed to disk; the
-                # in-memory record matches it, so keep it and surface the
-                # indeterminate terminal outcome to the caller.
+                # in-memory record matches it (pending outcome consumed), so keep
+                # it and surface the indeterminate terminal outcome to the caller.
                 raise
             except Exception:
                 # A pre-commit persist failure must leave the whole mutable record —
-                # snapshot, generation, the prepared flag and the full
-                # activation_operation body including every nested field —
-                # byte-identical to the untouched disk file, so a same-process
-                # retry and a cold restart observe the same facts.
+                # snapshot, generation, the prepared flag, the full
+                # activation_operation body including every nested field AND the
+                # pending terminal outcome — byte-identical to the untouched disk
+                # file, so a same-process retry and a cold restart observe the
+                # same facts.
                 runtime.snapshot = previous_snapshot
                 runtime.generation = previous_generation
                 runtime.prepared = previous_prepared
                 runtime.activation_operation = previous_activation_operation
+                runtime.pending_terminal = previous_pending_terminal
                 raise
-            # C-145 P1: the terminal state is durably committed — the pending
-            # terminal outcome is consumed and no cleanup owner may re-publish
-            # it. On a pre-commit failure above it survives as the recoverable
-            # owner for a later close / same-key retry / cold start.
-            runtime.pending_terminal = None
             self._changed.notify_all()
 
     async def _mark_cancel_stuck(
@@ -2455,6 +2715,12 @@ class LivePlanningJobRegistry:
         *,
         stage: str = "cancel_timed_out",
         error: str | None = None,
+        pending_state: LivePlanningJobState = LivePlanningJobState.CANCELLED,
+        pending_stage: str = "cancelled",
+        pending_result: dict[str, Any] | None = None,
+        pending_error: str | None = None,
+        pending_safe_failure: _SafeFailureDiagnostic | None = None,
+        pending_cancellation_requested: bool | None = None,
     ) -> None:
         """P0-1 fail-closed outcome when the operation did not stop within the
         bounded cancellation budget.
@@ -2464,10 +2730,21 @@ class LivePlanningJobRegistry:
         ``timeout_pending`` for a deadline cleanup), so a caller is never told the
         job is cleanly cancelled/failed while the operation may still be running.
         The generation bump isolates the still-alive operation from any further
-        registry writes, and a cold restart fail-closes the record to
-        ``restart_cancelled`` — the only terminal state that is guaranteed to
-        appear after the operation's process is actually gone.
+        registry writes.
+
+        C-145 P0: the caller (cancel/close/deadline) supplies the unambiguous
+        DURABLE terminal intent — cancel/close → CANCELLED/cancelled, deadline →
+        FAILED/deadline_exceeded with the safe-failure diagnostic — which is
+        persisted ATOMICALLY with the stuck isolation. Once the real operation
+        stops on its own, the cleanup owner (or a cold restart reading the same
+        durable intent) collects the record to exactly that outcome — never a
+        guessed cancelled/failed label. A pre-commit persist failure leaves no
+        pending outcome in memory or on disk: the record keeps the previously
+        durable cancel_pending isolation as the recoverable owner, so the
+        operation done-callback never auto-collects over an isolation the disk
+        does not agree with.
         """
+        previous_pending_terminal = runtime.pending_terminal
         async with self._changed:
             if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
                 return
@@ -2492,6 +2769,18 @@ class LivePlanningJobRegistry:
                 }
             )
             runtime.generation += 1
+            # C-145 P0: the pending outcome is part of the SAME atomic write as
+            # the stuck isolation — a pre-commit failure rolls both back, a
+            # successful write makes the retry intent durable for the owner and
+            # for a cold restart.
+            runtime.pending_terminal = _PendingTerminalOutcome(
+                state=pending_state,
+                stage=pending_stage,
+                result=pending_result,
+                error=pending_error,
+                safe_failure=pending_safe_failure,
+                cancellation_requested=pending_cancellation_requested,
+            )
             try:
                 self._persist_locked()
             except LivePlanningJobRegistryPostCommitError:
@@ -2501,22 +2790,49 @@ class LivePlanningJobRegistry:
                 runtime.generation = previous_generation
                 runtime.prepared = previous_prepared
                 runtime.activation_operation = previous_activation_operation
+                runtime.pending_terminal = previous_pending_terminal
                 raise
             self._changed.notify_all()
         # C-145 P1: ONLY a durably committed stuck isolation owns a terminal
-        # outcome — the cleanup owner auto-collects the record to CANCELLED when
-        # the real operation stops on its own. A pre-commit persist failure here
-        # leaves no pending outcome: the record keeps the durable
-        # cancel_pending isolation as the recoverable owner (a later close,
-        # same-key retry or cold restart completes the terminalization), so the
-        # operation done-callback never auto-collects over an isolation the disk
-        # does not agree with.
-        runtime.pending_terminal = _PendingTerminalOutcome(
-            state=LivePlanningJobState.CANCELLED,
-            stage="cancelled",
-            cancellation_requested=True,
-        )
+        # outcome — the cleanup owner auto-collects the record to the pending
+        # state when the real operation stops on its own. The durable intent is
+        # already on disk, so a cold restart continues the same collection.
         self._ensure_cleanup_owner(runtime)
+
+    async def _join_pending_cleanup(
+        self,
+        runtime: _RuntimeJob,
+        *,
+        fallback_state: LivePlanningJobState,
+        fallback_stage: str,
+        fallback_cancellation_requested: bool | None = None,
+    ) -> None:
+        """Terminalize a stopped runtime to its DURABLE pending outcome when one
+        is recorded, otherwise to the caller's own fallback terminal label.
+
+        C-145 P0: cancel()/close()/same-key retry join a cleanup that may have
+        failed closed earlier. The FIRST cleanup owner's durable intent wins — a
+        deadline cleanup stays FAILED/deadline_exceeded even when a later close()
+        or same-key retry joins — so the outcome can never drift to a guessed
+        label. ``_finish`` is idempotent: a concurrent terminalize returns early."""
+        pending = runtime.pending_terminal
+        if pending is not None:
+            await self._finish(
+                runtime,
+                pending.state,
+                stage=pending.stage,
+                result=pending.result,
+                error=pending.error,
+                safe_failure=pending.safe_failure,
+                cancellation_requested=pending.cancellation_requested,
+            )
+        else:
+            await self._finish(
+                runtime,
+                fallback_state,
+                stage=fallback_stage,
+                cancellation_requested=fallback_cancellation_requested,
+            )
 
     def _complete_cancel_terminalize_locked(self, runtime: _RuntimeJob) -> None:
         """P0-1: idempotently terminalize a cancel_pending job whose executor has
@@ -2526,19 +2842,42 @@ class LivePlanningJobRegistry:
         pre-commit persist failure restores the durable cancel_pending snapshot
         (never the pre-cancel RUNNING state), so a later retry completes the same
         terminalization and the job is never reported as active over a dead
-        executor."""
+        executor.
+
+        C-145 P0: the DURABLE pending outcome wins when one is recorded — a
+        deadline cleanup stays FAILED/deadline_exceeded even when the same-key
+        retry joins — and the caller's own CANCELLED label is only the fallback
+        for a cancel_pending record without a recorded intent."""
         if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
             return
         previous_snapshot = runtime.snapshot
         previous_generation = runtime.generation
         previous_prepared = runtime.prepared
         previous_activation_operation = runtime.activation_operation
-        self._terminalize_locked(
-            runtime,
-            LivePlanningJobState.CANCELLED,
-            stage="cancelled",
-            cancellation_requested=True,
-        )
+        previous_pending_terminal = runtime.pending_terminal
+        pending = runtime.pending_terminal
+        if pending is not None:
+            self._terminalize_locked(
+                runtime,
+                pending.state,
+                stage=pending.stage,
+                result=pending.result,
+                error=pending.error,
+                safe_failure=pending.safe_failure,
+                cancellation_requested=pending.cancellation_requested,
+            )
+        else:
+            self._terminalize_locked(
+                runtime,
+                LivePlanningJobState.CANCELLED,
+                stage="cancelled",
+                cancellation_requested=True,
+            )
+        # C-145 P0: consume the durable pending outcome IN THE SAME atomic write
+        # as the terminal state — the on-disk record never keeps a stale retry
+        # intent once the terminal commit succeeds. A pre-commit failure restores
+        # it so a later same-key retry completes the same terminalization.
+        runtime.pending_terminal = None
         try:
             self._persist_locked()
         except LivePlanningJobRegistryPostCommitError:
@@ -2548,10 +2887,8 @@ class LivePlanningJobRegistry:
             runtime.generation = previous_generation
             runtime.prepared = previous_prepared
             runtime.activation_operation = previous_activation_operation
+            runtime.pending_terminal = previous_pending_terminal
             raise
-        # C-145 P1: the terminal CANCELLED is durably committed — consume the
-        # pending terminal outcome so no cleanup owner re-publishes it.
-        runtime.pending_terminal = None
 
     async def _ensure_active(self, runtime: _RuntimeJob, generation: int) -> None:
         async with self._lock:

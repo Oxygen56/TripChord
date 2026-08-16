@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -2064,12 +2065,10 @@ async def test_cancel_fails_closed_when_operation_swallows_cancellation_past_bud
             # is bounded by `release` so a failed assertion cannot strand a
             # forever-looping operation across the pytest event loop.
             while not release.is_set():
-                try:
+                with suppress(asyncio.CancelledError):
                     await asyncio.sleep(0.01)
-                except asyncio.CancelledError:
-                    pass
             side_effects += 1
-            raise asyncio.CancelledError
+            raise asyncio.CancelledError from None
         return {"ok": True}
 
     job = await registry.start(tenant_id="tenant-a", operation=operation)
@@ -2131,10 +2130,8 @@ async def test_cancel_fails_closed_when_operation_swallows_cancellation_past_bud
         runtime = registry._records[job.id]
         if runtime.operation_task is not None and not runtime.operation_task.done():
             runtime.operation_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError, TimeoutError):
                 await asyncio.wait_for(runtime.operation_task, timeout=2)
-            except (asyncio.CancelledError, TimeoutError):
-                pass
         await registry.close()
 
 
@@ -2802,12 +2799,17 @@ async def test_deadline_timeout_publishes_pending_not_failed_over_live_operation
     assert side_effects > before
 
     # Once the operation truly stops, a close() joins the cleanup and settles.
+    # C-145 P0: the DURABLE deadline intent is FAILED/deadline_exceeded with the
+    # safe-failure diagnostic — a later close() joins that outcome, never a
+    # guessed CANCELLED label.
     stop.set()
     await asyncio.sleep(0.05)
     await registry.close()
     assert runtime.operation_task.done()
     final = await registry.get(snapshot.id, "tenant-a")
-    assert final is not None and final.state == LivePlanningJobState.CANCELLED
+    assert final is not None and final.state == LivePlanningJobState.FAILED
+    assert final.stage == "deadline_exceeded"
+    assert final.safe_failure_code == "deadline_exceeded"
 
 
 @pytest.mark.asyncio
@@ -3141,17 +3143,23 @@ async def test_deadline_timeout_isolation_persist_failure_never_abandons_operati
             )
 
         # The operation truly stops; a close() joins the cleanup and settles.
+        # C-145 P0: the DURABLE deadline intent is FAILED/deadline_exceeded —
+        # the late close() joins that outcome, never a guessed CANCELLED label.
         stop.set()
         await asyncio.sleep(0.05)
         await registry.close()
         assert runtime.operation_task.done()
         final = await registry.get(snapshot.id, "tenant-a")
-        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+        assert final is not None and final.state == LivePlanningJobState.FAILED
+        assert final.stage == "deadline_exceeded"
+        assert final.safe_failure_code == "deadline_exceeded"
 
         # A full cold start reads the terminal facts.
         reloaded = LivePlanningJobRegistry(state_path=state_path)
         cold = await reloaded.get(snapshot.id, "tenant-a")
-        assert cold is not None and cold.state == LivePlanningJobState.CANCELLED
+        assert cold is not None and cold.state == LivePlanningJobState.FAILED
+        assert cold.stage == "deadline_exceeded"
+        assert cold.safe_failure_code == "deadline_exceeded"
         await reloaded.close()
         await registry.close()
     finally:
@@ -3750,11 +3758,13 @@ async def test_late_stop_cancel_auto_collects_terminal_without_extra_cancel() ->
 
 @pytest.mark.asyncio
 async def test_late_stop_deadline_auto_collects_terminal_without_extra_close() -> None:
-    """C-145 P1 deadline variant: the deadline fires, the operation swallows the
+    """C-145 P0 deadline variant: the deadline fires, the operation swallows the
     drain cancellation and keeps running (timeout_pending), then stops on its
-    own. The cleanup owner must auto-collect the record to the terminal CANCELLED
-    state without a repeated close / retry. RED on HEAD: the snapshot stays
-    running+cancel_pending (stage=timeout_pending) forever."""
+    own. The cleanup owner must auto-collect the record to the DURABLE deadline
+    outcome — FAILED/deadline_exceeded with the safe-failure diagnostic — without
+    a repeated close / retry. RED on ccc378b: the snapshot stays
+    running+cancel_pending (stage=timeout_pending) forever; even when a
+    cancel/close joined it landed on CANCELLED, losing the deadline semantics."""
     registry = LivePlanningJobRegistry(
         capacity=8,
         max_running=1,
@@ -3789,13 +3799,17 @@ async def test_late_stop_deadline_auto_collects_terminal_without_extra_close() -
         assert runtime.operation_task is not None and not runtime.operation_task.done()
 
         # The operation stops on its own — no repeated close / retry / cold start.
+        # C-145 P0: the durable deadline intent (FAILED/deadline_exceeded) is what
+        # the cleanup owner consumes — never a guessed CANCELLED label.
         stop.set()
         await asyncio.wait_for(runtime.operation_task, timeout=3)
         await _wait_for_terminal_state(
-            registry, snap.id, "tenant-a", LivePlanningJobState.CANCELLED
+            registry, snap.id, "tenant-a", LivePlanningJobState.FAILED
         )
         final = await registry.get(snap.id, "tenant-a")
-        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+        assert final is not None and final.state == LivePlanningJobState.FAILED
+        assert final.stage == "deadline_exceeded"
+        assert final.safe_failure_code == "deadline_exceeded"
         assert final.cancel_pending is False
     finally:
         stop.set()
@@ -4290,4 +4304,884 @@ async def test_late_stop_cleanup_owner_is_waitable_and_terminalizes() -> None:
         stop.set()
         await _settle_leaked_runtime(stop, runtime)
         await _settle_cleanup_owner(runtime)
+        await registry.close()
+
+
+# =========================================================================
+# C-145 P0 counterexamples — RETURN f598b350 (2026-08-15).
+#
+# Gap 1 (terminal-persist failure was permanently fatal): a single pre-commit
+# failure in the cleanup owner's terminal persist permanently orphaned the
+# record — no auto-event re-ensured the owner, so capacity leaked forever and a
+# new key was rejected with LivePlanningJobCapacityError.
+# Gap 2 (deadline outcome was hardcoded): the deadline timeout reused the cancel
+# path, so a late stop landed on CANCELLED, losing the true
+# FAILED/deadline_exceeded + safe_failure semantics.
+#
+# GREEN here means: the owner retries within a bounded per-round budget; budget
+# exhaustion keeps a DURABLE retry intent and the single registry reaper
+# auto-restarts the owner with NO external API/close/retry until the terminal
+# commit succeeds or the process shuts down; the durable deadline outcome is
+# FAILED/deadline_exceeded (cancel/close stay CANCELLED); pre-commit AND
+# post-commit failures both reconcile idempotently; cold starts continue the
+# durable retry intent with no outcome drift. RED on ccc378b: every
+# auto-retry / reaper / FAILED-deadline assertion below fails.
+# =========================================================================
+
+
+def _make_stubborn_swallow_cancel(
+    stop: asyncio.Event,
+    started: asyncio.Event,
+    swallowed: asyncio.Event,
+):
+    """Operation that starts, swallows the drain cancellation, and keeps running
+    until ``stop`` is set — the shared late-stop adversary."""
+
+    async def stubborn(_: Any) -> dict[str, Any]:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            swallowed.set()
+            while not stop.is_set():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(0.001)
+        return {"stopped": True}
+
+    return stubborn
+
+
+async def _settle_reaper(registry: LivePlanningJobRegistry) -> None:
+    """Boundedly await the registry reaper so a test never leaves it sleeping at
+    teardown (it self-terminates once no retry remains)."""
+    reaper = getattr(registry, "_reaper_task", None)
+    if reaper is not None and not reaper.done():
+        with suppress(BaseException):
+            await asyncio.wait_for(reaper, timeout=3)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_owner_retries_terminal_persist_fail_once_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-145 P0 (a) cancel: the cleanup owner's terminal persist fails ONCE
+    pre-commit; the owner retries within its bounded per-round budget and
+    auto-collects to the DURABLE CANCELLED outcome — parent and operation both
+    done, pending cleared, slot recovered, no reaper ever needed. RED on
+    ccc378b: the single failure permanently orphaned the record."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_make_stubborn_swallow_cancel(stop, started, swallowed),
+            idempotency_key="owner-fail-once-cancel",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        runtime = registry._records[snap.id]
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+        outcome = await registry.cancel(snap.id, "tenant-a")
+        assert outcome is not None and outcome.cancel_pending is True
+        assert not runtime.operation_task.done()
+        assert runtime.pending_terminal is not None
+        assert runtime.pending_terminal.state == LivePlanningJobState.CANCELLED
+        assert runtime.pending_terminal.stage == "cancelled"
+
+        real_persist = registry._persist_locked
+        persist_calls = 0
+
+        def fail_first_persist() -> None:
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls == 1:
+                raise RuntimeError("injected terminal persist failure")
+            real_persist()
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_first_persist)
+
+        # The operation stops on its own; the owner retries and collects the
+        # DURABLE CANCELLED outcome — no extra cancel / retry / close.
+        stop.set()
+        await asyncio.wait_for(runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, snap.id, "tenant-a", LivePlanningJobState.CANCELLED
+        )
+        await _settle_cleanup_owner(runtime)
+        monkeypatch.undo()
+
+        final = await registry.get(snap.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+        assert final.stage == "cancelled"
+        assert final.cancel_pending is False
+        assert runtime.pending_terminal is None
+        assert runtime.cleanup_owner is not None and runtime.cleanup_owner.done()
+        assert runtime.cleanup_retry_round == 0
+        assert registry._reaper_task is None
+        assert runtime.slot_held is False
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_owner_retries_terminal_persist_fail_once_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-145 P0 (a) deadline: same fail-once pre-commit retry, but the DURABLE
+    intent is FAILED/deadline_exceeded with the safe-failure diagnostic — never
+    a guessed CANCELLED label. The auto-collected terminal state equals the
+    durable pending outcome and matches the disk (memory=disk)."""
+    state_path = tmp_path / "live-jobs.json"
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_make_stubborn_swallow_cancel(stop, started, swallowed),
+            idempotency_key="owner-fail-once-deadline",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=0.05,
+        )
+        runtime = registry._records[snap.id]
+        await asyncio.wait_for(runtime.task, timeout=5)
+        assert runtime.task.done()
+        assert swallowed.is_set()
+        assert runtime.snapshot.cancel_pending is True
+        assert runtime.snapshot.stage == "timeout_pending"
+        assert runtime.pending_terminal is not None
+        assert runtime.pending_terminal.state == LivePlanningJobState.FAILED
+        assert runtime.pending_terminal.stage == "deadline_exceeded"
+        assert (
+            runtime.pending_terminal.error
+            == "TimeoutError: live planning job deadline exceeded"
+        )
+        assert runtime.pending_terminal.safe_failure is not None
+        assert (
+            runtime.pending_terminal.safe_failure.code.value == "deadline_exceeded"
+        )
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
+
+        real_persist = registry._persist_locked
+        persist_calls = 0
+
+        def fail_first_persist() -> None:
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls == 1:
+                raise RuntimeError("injected terminal persist failure")
+            real_persist()
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_first_persist)
+
+        stop.set()
+        await asyncio.wait_for(runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, snap.id, "tenant-a", LivePlanningJobState.FAILED
+        )
+        await _settle_cleanup_owner(runtime)
+        monkeypatch.undo()
+
+        final = await registry.get(snap.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.FAILED
+        assert final.stage == "deadline_exceeded"
+        assert final.safe_failure_code == "deadline_exceeded"
+        assert final.cancel_pending is False
+        assert runtime.pending_terminal is None
+        assert runtime.cleanup_owner is not None and runtime.cleanup_owner.done()
+        assert runtime.cleanup_retry_round == 0
+        assert registry._reaper_task is None
+        assert runtime.slot_held is False
+
+        # memory == disk: the retried terminal commit wrote the same FAILED state
+        # and consumed the pending outcome.
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record
+            for record in disk["records"]
+            if record["snapshot"]["id"] == snap.id
+        )
+        assert disk_record["snapshot"]["state"] == "failed"
+        assert disk_record["snapshot"]["stage"] == "deadline_exceeded"
+        assert disk_record["snapshot"]["safe_failure_code"] == "deadline_exceeded"
+        assert disk_record["pending_terminal"] is None
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reaper_recollects_cancel_after_budget_exhausted_no_external_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-145 P0 (b) cancel: consecutive terminal-persist failures EXCEED the
+    single-round budget. The owner keeps the DURABLE retry intent and arms the
+    single registry reaper, which auto-restarts the owner after a bounded
+    backoff — the record collects to CANCELLED with NO external API / close /
+    retry. With capacity=1, a new key is rejected while the record is pending
+    and only starts AFTER the auto-collection. The reaper self-terminates once
+    no retry remains. RED on ccc378b: no owner survives the first failure and
+    the record stays running+cancel_pending forever (capacity leaks)."""
+    registry = LivePlanningJobRegistry(
+        capacity=1,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    async def quick_op(_: Any) -> dict[str, Any]:
+        return {"ok": True}
+
+    first_runtime: Any = None
+    second_runtime: Any = None
+    try:
+        first, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_make_stubborn_swallow_cancel(stop, started, swallowed),
+            idempotency_key="reaper-cancel-first",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        first_runtime = registry._records[first.id]
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+        outcome = await registry.cancel(first.id, "tenant-a")
+        assert outcome is not None and outcome.cancel_pending is True
+        assert not first_runtime.operation_task.done()
+        assert first_runtime.pending_terminal is not None
+
+        budget = registry._cancel_isolation_persist_attempts
+        real_persist = registry._persist_locked
+        persist_calls = 0
+
+        def fail_past_budget() -> None:
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls <= budget + 1:
+                raise RuntimeError("injected terminal persist failure")
+            real_persist()
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_past_budget)
+
+        # While the record is still cancel_pending and the operation is alive,
+        # the single slot is occupied: a new key is rejected (capacity=1).
+        with pytest.raises(LivePlanningJobCapacityError):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=quick_op,
+                idempotency_key="reaper-cancel-new-during",
+                request_digest=REQUEST_SHA256,
+                deadline_seconds=30,
+            )
+
+        # The operation stops on its own. The first owner's whole budget fails;
+        # the reaper re-spawns it and the recovered store accepts the terminal
+        # commit — no extra cancel / close / retry.
+        stop.set()
+        await asyncio.wait_for(first_runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, first.id, "tenant-a", LivePlanningJobState.CANCELLED
+        )
+        await _settle_cleanup_owner(first_runtime)
+        await _settle_reaper(registry)
+        monkeypatch.undo()
+
+        final = await registry.get(first.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+        assert final.stage == "cancelled"
+        assert final.cancel_pending is False
+        assert first_runtime.pending_terminal is None
+        assert first_runtime.cleanup_retry_round >= 1
+        assert (
+            first_runtime.cleanup_owner is not None
+            and first_runtime.cleanup_owner.done()
+        )
+        assert registry._reaper_task is None
+        assert first_runtime.slot_held is False
+
+        # Capacity is fully recovered ONLY after the auto-collection: a new key
+        # now starts (the terminal record is evictable).
+        second, _replayed2 = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=quick_op,
+            idempotency_key="reaper-cancel-second",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        second_runtime = registry._records[second.id]
+        assert second.id != first.id
+        assert len(registry._records) == 1
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, first_runtime)
+        await _settle_cleanup_owner(first_runtime)
+        await _settle_reaper(registry)
+        await _settle_leaked_runtime(stop, second_runtime)
+        await _settle_cleanup_owner(second_runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reaper_recollects_deadline_after_budget_exhausted_no_external_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-145 P0 (b) deadline: consecutive failures exceed the single-round budget;
+    the reaper auto-restarts the exhausted owner and the recovered store accepts
+    the DURABLE FAILED/deadline_exceeded commit — with NO external API/close/
+    retry. A same-key retry after the auto-collection replays the terminal FAILED
+    facts. RED on ccc378b: the record stays running+cancel_pending forever and
+    would land on a guessed CANCELLED label."""
+    registry = LivePlanningJobRegistry(
+        capacity=1,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    async def quick_op(_: Any) -> dict[str, Any]:
+        return {"ok": True}
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_make_stubborn_swallow_cancel(stop, started, swallowed),
+            idempotency_key="reaper-deadline",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=0.05,
+        )
+        runtime = registry._records[snap.id]
+        await asyncio.wait_for(runtime.task, timeout=5)
+        assert runtime.task.done()
+        assert runtime.snapshot.cancel_pending is True
+        assert runtime.snapshot.stage == "timeout_pending"
+        assert runtime.pending_terminal is not None
+        assert runtime.pending_terminal.state == LivePlanningJobState.FAILED
+        assert runtime.pending_terminal.stage == "deadline_exceeded"
+        assert not runtime.operation_task.done()
+
+        budget = registry._cancel_isolation_persist_attempts
+        real_persist = registry._persist_locked
+        persist_calls = 0
+
+        def fail_past_budget() -> None:
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls <= budget + 1:
+                raise RuntimeError("injected terminal persist failure")
+            real_persist()
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_past_budget)
+
+        stop.set()
+        await asyncio.wait_for(runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, snap.id, "tenant-a", LivePlanningJobState.FAILED
+        )
+        await _settle_cleanup_owner(runtime)
+        await _settle_reaper(registry)
+        monkeypatch.undo()
+
+        final = await registry.get(snap.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.FAILED
+        assert final.stage == "deadline_exceeded"
+        assert final.safe_failure_code == "deadline_exceeded"
+        assert final.cancel_pending is False
+        assert runtime.pending_terminal is None
+        assert runtime.cleanup_retry_round >= 1
+        assert runtime.cleanup_owner is not None and runtime.cleanup_owner.done()
+        assert registry._reaper_task is None
+        assert runtime.slot_held is False
+
+        # A same-key retry now replays the terminal FAILED facts — no dispatch.
+        replayed_snap, replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=quick_op,
+            idempotency_key="reaper-deadline",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        assert replayed is True and replayed_snap.id == snap.id
+        assert replayed_snap.state == LivePlanningJobState.FAILED
+        assert replayed_snap.stage == "deadline_exceeded"
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        await _settle_reaper(registry)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_owner_post_commit_ambiguous_confirms_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-145 P0 post-commit (indeterminate) failure, cancel path: the terminal
+    state is durably committed on disk but the finalize raises. The owner must
+    treat the committed state as authoritative — confirm and consume the pending
+    outcome, never rewrite a conflicting label. Exactly one terminalize; the
+    in-memory record matches the disk; no reaper is ever needed."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_make_stubborn_swallow_cancel(stop, started, swallowed),
+            idempotency_key="owner-post-commit-cancel",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        runtime = registry._records[snap.id]
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+        outcome = await registry.cancel(snap.id, "tenant-a")
+        assert outcome is not None and outcome.cancel_pending is True
+        assert runtime.pending_terminal is not None
+        assert not runtime.operation_task.done()
+
+        terminalize_calls = 0
+        original_terminalize = registry._terminalize_locked
+
+        def counting_terminalize(*args: Any, **kwargs: Any) -> None:
+            nonlocal terminalize_calls
+            terminalize_calls += 1
+            original_terminalize(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "_terminalize_locked", counting_terminalize)
+        os.environ[
+            "TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT"
+        ] = "post_replace_dir_fsync"
+        try:
+            stop.set()
+            await asyncio.wait_for(runtime.operation_task, timeout=3)
+            await _wait_for_terminal_state(
+                registry, snap.id, "tenant-a", LivePlanningJobState.CANCELLED
+            )
+        finally:
+            os.environ.pop("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT", None)
+        await _settle_cleanup_owner(runtime)
+
+        final = await registry.get(snap.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+        assert final.stage == "cancelled"
+        assert final.cancel_pending is False
+        assert runtime.pending_terminal is None
+        assert terminalize_calls == 1
+        assert runtime.cleanup_owner is not None and runtime.cleanup_owner.done()
+        assert registry._reaper_task is None
+        assert runtime.slot_held is False
+    finally:
+        stop.set()
+        os.environ.pop("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT", None)
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_owner_post_commit_ambiguous_confirms_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-145 P0 post-commit (indeterminate) failure, deadline path: the DURABLE
+    FAILED/deadline_exceeded state is committed on disk but the finalize raises.
+    The owner confirms and consumes the pending outcome — memory=disk, exactly
+    one terminalize, safe_failure preserved."""
+    state_path = tmp_path / "live-jobs.json"
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_make_stubborn_swallow_cancel(stop, started, swallowed),
+            idempotency_key="owner-post-commit-deadline",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=0.05,
+        )
+        runtime = registry._records[snap.id]
+        await asyncio.wait_for(runtime.task, timeout=5)
+        assert runtime.task.done()
+        assert runtime.snapshot.cancel_pending is True
+        assert runtime.pending_terminal is not None
+        assert runtime.pending_terminal.state == LivePlanningJobState.FAILED
+        assert not runtime.operation_task.done()
+
+        terminalize_calls = 0
+        original_terminalize = registry._terminalize_locked
+
+        def counting_terminalize(*args: Any, **kwargs: Any) -> None:
+            nonlocal terminalize_calls
+            terminalize_calls += 1
+            original_terminalize(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "_terminalize_locked", counting_terminalize)
+        os.environ[
+            "TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT"
+        ] = "post_replace_dir_fsync"
+        try:
+            stop.set()
+            await asyncio.wait_for(runtime.operation_task, timeout=3)
+            await _wait_for_terminal_state(
+                registry, snap.id, "tenant-a", LivePlanningJobState.FAILED
+            )
+        finally:
+            os.environ.pop("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT", None)
+        await _settle_cleanup_owner(runtime)
+
+        final = await registry.get(snap.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.FAILED
+        assert final.stage == "deadline_exceeded"
+        assert final.safe_failure_code == "deadline_exceeded"
+        assert final.cancel_pending is False
+        assert runtime.pending_terminal is None
+        assert terminalize_calls == 1
+        assert runtime.cleanup_owner is not None and runtime.cleanup_owner.done()
+        assert registry._reaper_task is None
+        assert runtime.slot_held is False
+
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record
+            for record in disk["records"]
+            if record["snapshot"]["id"] == snap.id
+        )
+        assert disk_record["snapshot"]["state"] == "failed"
+        assert disk_record["snapshot"]["stage"] == "deadline_exceeded"
+        assert disk_record["snapshot"]["safe_failure_code"] == "deadline_exceeded"
+        assert disk_record["pending_terminal"] is None
+    finally:
+        stop.set()
+        os.environ.pop("TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT", None)
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_repeated_ensure_and_done_callback_no_duplicate_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-145 P0: repeated _ensure_cleanup_owner / _maybe_release_slot calls (the
+    operation done-callback, cancel/close joins, same-key retries) NEVER spawn a
+    duplicate owner nor double-terminalize — the owner is unique and waitable and
+    the final label is published exactly once."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    runtime: Any = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_make_stubborn_swallow_cancel(stop, started, swallowed),
+            idempotency_key="owner-repeat-ensure",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        runtime = registry._records[snap.id]
+        for _ in range(1000):
+            if started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert started.is_set()
+        outcome = await registry.cancel(snap.id, "tenant-a")
+        assert outcome is not None and outcome.cancel_pending is True
+        assert runtime.pending_terminal is not None
+        assert not runtime.operation_task.done()
+
+        for _ in range(100):
+            if runtime.cleanup_owner is not None:
+                break
+            await asyncio.sleep(0)
+        owner = runtime.cleanup_owner
+        assert owner is not None and not owner.done()
+
+        # Repeated ensure / release calls must never replace or duplicate the
+        # unique waitable owner.
+        for _ in range(5):
+            registry._ensure_cleanup_owner(runtime)
+            assert runtime.cleanup_owner is owner
+            registry._maybe_release_slot(runtime)
+            assert runtime.cleanup_owner is owner
+
+        terminalize_calls = 0
+        original_terminalize = registry._terminalize_locked
+
+        def counting_terminalize(*args: Any, **kwargs: Any) -> None:
+            nonlocal terminalize_calls
+            terminalize_calls += 1
+            original_terminalize(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "_terminalize_locked", counting_terminalize)
+
+        stop.set()
+        await asyncio.wait_for(runtime.operation_task, timeout=3)
+        await asyncio.wait_for(owner, timeout=3)
+        final = await registry.get(snap.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.CANCELLED
+        assert final.cancel_pending is False
+        assert terminalize_calls == 1
+        assert runtime.pending_terminal is None
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_cold_start_continues_durable_deadline_intent(
+    tmp_path: Path,
+) -> None:
+    """C-145 P0 cold start: a process crashed while the record was isolated
+    (cancel_pending + DURABLE FAILED/deadline_exceeded intent). A fresh registry
+    reading that state must CONTINUE the retry intent — collect to
+    FAILED/deadline_exceeded with the same safe failure — never guess
+    restart_cancelled. Two consecutive cold starts observe identical facts and
+    no reaper / owner residue remains."""
+    state_path = tmp_path / "live-jobs.json"
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=8,
+        max_running=1,
+        cancel_wait_seconds=0.05,
+    )
+    stop = asyncio.Event()
+    started = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    runtime: Any = None
+    cold_a: LivePlanningJobRegistry | None = None
+    cold_b: LivePlanningJobRegistry | None = None
+    try:
+        snap, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_make_stubborn_swallow_cancel(stop, started, swallowed),
+            idempotency_key="cold-deadline-intent",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=0.05,
+        )
+        runtime = registry._records[snap.id]
+        await asyncio.wait_for(runtime.task, timeout=5)
+
+        # Durable retry intent is on disk: cancel_pending + pending FAILED.
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record
+            for record in disk["records"]
+            if record["snapshot"]["id"] == snap.id
+        )
+        assert disk_record["snapshot"]["cancel_pending"] is True
+        assert disk_record["snapshot"]["stage"] == "timeout_pending"
+        assert disk_record["pending_terminal"]["state"] == "failed"
+        assert disk_record["pending_terminal"]["stage"] == "deadline_exceeded"
+        assert (
+            disk_record["pending_terminal"]["safe_failure_code"] == "deadline_exceeded"
+        )
+
+        # Simulate a crash mid-pending: copy the durable file, then let the
+        # original registry settle normally (its own writes don't affect the copy).
+        crash_state = tmp_path / "live-jobs-crash.json"
+        crash_state.write_bytes(state_path.read_bytes())
+        crash_state.chmod(0o600)
+        stop.set()
+        await asyncio.wait_for(runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, snap.id, "tenant-a", LivePlanningJobState.FAILED
+        )
+        await _settle_cleanup_owner(runtime)
+        assert registry._reaper_task is None
+        await registry.close()
+
+        # Cold start #1 continues the durable retry intent.
+        cold_a = LivePlanningJobRegistry(state_path=crash_state)
+        snap_a = await cold_a.get(snap.id, "tenant-a")
+        assert snap_a is not None and snap_a.state == LivePlanningJobState.FAILED
+        assert snap_a.stage == "deadline_exceeded"
+        assert snap_a.safe_failure_code == "deadline_exceeded"
+        assert snap_a.cancel_pending is False
+        disk_a = json.loads(crash_state.read_text(encoding="utf-8"))
+        disk_a_record = next(
+            record
+            for record in disk_a["records"]
+            if record["snapshot"]["id"] == snap.id
+        )
+        assert disk_a_record["snapshot"]["state"] == "failed"
+        assert disk_a_record["snapshot"]["stage"] == "deadline_exceeded"
+        assert disk_a_record["pending_terminal"] is None
+
+        # Cold start #2 reads the SAME terminal facts — no outcome drift.
+        cold_b = LivePlanningJobRegistry(state_path=crash_state)
+        snap_b = await cold_b.get(snap.id, "tenant-a")
+        assert snap_b is not None
+        assert snap_b.state == snap_a.state
+        assert snap_b.stage == snap_a.stage
+        assert snap_b.safe_failure_code == snap_a.safe_failure_code
+
+        # No reaper / owner residue after the cold recovery.
+        assert cold_a._reaper_task is None
+        assert cold_b._reaper_task is None
+        assert cold_a._records[snap.id].cleanup_owner is None
+        await cold_a.close()
+        await cold_b.close()
+        assert cold_a._reaper_task is None
+        assert cold_b._reaper_task is None
+    finally:
+        stop.set()
+        await _settle_leaked_runtime(stop, runtime)
+        await _settle_cleanup_owner(runtime)
+        if cold_a is not None:
+            await cold_a.close()
+        if cold_b is not None:
+            await cold_b.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deadline_failed_vs_cancel_cancelled_outcomes_no_drift() -> None:
+    """C-145 P0: cancel/close record a CANCELLED pending outcome; the deadline
+    records FAILED/deadline_exceeded. The cleanup owner consumes each caller's
+    unambiguous target — the two outcomes never drift into each other and each
+    auto-collects to its DURABLE terminal state with the safe failure preserved
+    on the deadline path."""
+    registry = LivePlanningJobRegistry(
+        capacity=8,
+        max_running=2,
+        cancel_wait_seconds=0.05,
+    )
+    cancel_stop = asyncio.Event()
+    cancel_started = asyncio.Event()
+    cancel_swallowed = asyncio.Event()
+    deadline_stop = asyncio.Event()
+    deadline_started = asyncio.Event()
+    deadline_swallowed = asyncio.Event()
+
+    cancel_runtime: Any = None
+    deadline_runtime: Any = None
+    try:
+        # Cancel path: the durable pending outcome is CANCELLED/cancelled.
+        cancel_snap, _cancel_replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_make_stubborn_swallow_cancel(
+                cancel_stop, cancel_started, cancel_swallowed
+            ),
+            idempotency_key="outcome-cancel",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=30,
+        )
+        cancel_runtime = registry._records[cancel_snap.id]
+        for _ in range(1000):
+            if cancel_started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert cancel_started.is_set()
+        await registry.cancel(cancel_snap.id, "tenant-a")
+        assert cancel_runtime.pending_terminal is not None
+        assert (
+            cancel_runtime.pending_terminal.state == LivePlanningJobState.CANCELLED
+        )
+        assert cancel_runtime.pending_terminal.stage == "cancelled"
+
+        # Deadline path: the durable pending outcome is FAILED/deadline_exceeded.
+        deadline_snap, _deadline_replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_make_stubborn_swallow_cancel(
+                deadline_stop, deadline_started, deadline_swallowed
+            ),
+            idempotency_key="outcome-deadline",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=0.05,
+        )
+        deadline_runtime = registry._records[deadline_snap.id]
+        await asyncio.wait_for(deadline_runtime.task, timeout=5)
+        assert deadline_runtime.pending_terminal is not None
+        assert deadline_runtime.pending_terminal.state == LivePlanningJobState.FAILED
+        assert deadline_runtime.pending_terminal.stage == "deadline_exceeded"
+
+        # Both operations stop; both auto-collect to their DURABLE targets.
+        cancel_stop.set()
+        await asyncio.wait_for(cancel_runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, cancel_snap.id, "tenant-a", LivePlanningJobState.CANCELLED
+        )
+        deadline_stop.set()
+        await asyncio.wait_for(deadline_runtime.operation_task, timeout=3)
+        await _wait_for_terminal_state(
+            registry, deadline_snap.id, "tenant-a", LivePlanningJobState.FAILED
+        )
+
+        cancel_final = await registry.get(cancel_snap.id, "tenant-a")
+        assert cancel_final is not None
+        assert cancel_final.state == LivePlanningJobState.CANCELLED
+        assert cancel_final.stage == "cancelled"
+        deadline_final = await registry.get(deadline_snap.id, "tenant-a")
+        assert deadline_final is not None
+        assert deadline_final.state == LivePlanningJobState.FAILED
+        assert deadline_final.stage == "deadline_exceeded"
+        assert deadline_final.safe_failure_code == "deadline_exceeded"
+    finally:
+        cancel_stop.set()
+        deadline_stop.set()
+        await _settle_leaked_runtime(cancel_stop, cancel_runtime)
+        await _settle_cleanup_owner(cancel_runtime)
+        await _settle_leaked_runtime(deadline_stop, deadline_runtime)
+        await _settle_cleanup_owner(deadline_runtime)
         await registry.close()
