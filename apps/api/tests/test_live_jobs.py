@@ -2,17 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import json
 import os
+import subprocess
+import sys
 from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, ValidationError
 from tripchord.agents.live_jobs import (
+    _ISOLATED_AMBIGUOUS_CANCEL_STAGE,
+    _QUARANTINE_HARD_STOPPED_STAGE,
+    _QUARANTINE_INTENT_UNCOMMITTED_STAGE,
     LivePlanningJobCancellationPendingError,
     LivePlanningJobCapacityError,
     LivePlanningJobIdempotencyConflictError,
@@ -270,8 +277,9 @@ async def test_job_admission_rejects_non_finite_or_non_positive_deadline(
 
 
 @pytest.mark.asyncio
-async def test_pair_checkpoints_accumulate_and_survive_terminal_failure_with_tenant_isolation(
-) -> None:
+async def test_pair_checkpoints_accumulate_and_survive_terminal_failure_with_tenant_isolation() -> (
+    None
+):
     registry = LivePlanningJobRegistry(capacity=2)
     first_reported = asyncio.Event()
     release = asyncio.Event()
@@ -363,9 +371,7 @@ async def test_registry_rejects_checkpoint_bound_to_a_different_request_digest()
     registry = LivePlanningJobRegistry()
 
     async def operation(report: Any) -> dict[str, Any]:
-        await report.report_pair_checkpoint(
-            _pair_checkpoint(1, request_sha256="b" * 64)
-        )
+        await report.report_pair_checkpoint(_pair_checkpoint(1, request_sha256="b" * 64))
         return {"must_not_succeed": True}
 
     job = await registry.start(
@@ -383,9 +389,12 @@ async def test_registry_rejects_checkpoint_bound_to_a_different_request_digest()
     assert failed.safe_failure_details is not None
     assert failed.safe_failure_details.exception_class == "ValueError"
     assert failed.safe_failure_details.validation_model is None
-    assert failed.safe_failure_details.message_sha256 == hashlib.sha256(
-        b"live pair checkpoint request SHA-256 does not match its job"
-    ).hexdigest()
+    assert (
+        failed.safe_failure_details.message_sha256
+        == hashlib.sha256(
+            b"live pair checkpoint request SHA-256 does not match its job"
+        ).hexdigest()
+    )
     await registry.close()
 
 
@@ -421,8 +430,7 @@ async def test_pydantic_failure_exposes_only_typed_locations_and_redacts_dynamic
         ("int_parsing", ("provider_counters", "redacted")),
     )
     assert all(
-        len(item.message_sha256) == 64
-        for item in failed.safe_failure_details.validation_errors
+        len(item.message_sha256) == 64 for item in failed.safe_failure_details.validation_errors
     )
     assert failed.safe_failure_details_digest is not None
     serialized = failed.model_dump_json()
@@ -461,9 +469,10 @@ async def test_http_exception_chain_preserves_value_error_digest_without_detail_
     assert failed.safe_failure_details is not None
     assert failed.safe_failure_details.exception_class == "ValueError"
     assert failed.safe_failure_details.validation_model is None
-    assert failed.safe_failure_details.message_sha256 == hashlib.sha256(
-        sensitive_message.encode("utf-8")
-    ).hexdigest()
+    assert (
+        failed.safe_failure_details.message_sha256
+        == hashlib.sha256(sensitive_message.encode("utf-8")).hexdigest()
+    )
     assert failed.safe_failure_details.validation_errors == ()
     assert failed.safe_failure_details_digest is not None
     serialized = failed.model_dump_json()
@@ -1217,8 +1226,10 @@ async def test_activation_operation_is_durable_and_never_redispatched_after_rest
     assert durable["queued_result"] == queued_result
 
     # A cold restart cannot continue the in-flight dispatch: the job is
-    # terminalized and the activation operation fails closed instead of
-    # replaying the old QUEUED receipt, and it is never re-dispatched.
+    # terminalized (the durable activation operation proves the activation was
+    # interrupted, so restart_cancelled is the contract-allowed outcome) and
+    # the activation fails closed instead of replaying the old QUEUED receipt.
+    # It is never re-dispatched.
     restarted = LivePlanningJobRegistry(state_path=state_path)
     restarted_snapshot = await restarted.get(prepared.id, "tenant-a")
     assert restarted_snapshot is not None
@@ -1545,9 +1556,7 @@ async def test_cancel_post_commit_persist_failure_keeps_committed_state(
 
     disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
     disk_record = next(
-        record
-        for record in disk_payload["records"]
-        if record["snapshot"]["id"] == prepared.id
+        record for record in disk_payload["records"] if record["snapshot"]["id"] == prepared.id
     )
     assert disk_record["snapshot"] == snapshot.model_dump(mode="json")
     assert disk_record["snapshot"]["state"] == "cancelled"
@@ -1659,9 +1668,7 @@ async def test_terminalize_post_commit_persist_failure_keeps_committed_state(
 
     disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
     disk_record = next(
-        record
-        for record in disk_payload["records"]
-        if record["snapshot"]["id"] == prepared.id
+        record for record in disk_payload["records"] if record["snapshot"]["id"] == prepared.id
     )
     assert disk_record["snapshot"] == snapshot.model_dump(mode="json")
     assert disk_record["snapshot"]["state"] == "cancelled"
@@ -1764,9 +1771,7 @@ async def test_cancel_post_commit_persist_failure_physically_cancels_active_oper
 
     disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
     disk_record = next(
-        record
-        for record in disk_payload["records"]
-        if record["snapshot"]["id"] == job.id
+        record for record in disk_payload["records"] if record["snapshot"]["id"] == job.id
     )
     assert disk_record["snapshot"] == snapshot.model_dump(mode="json")
     assert disk_record["snapshot"]["state"] == "cancelled"
@@ -1867,9 +1872,7 @@ async def test_activate_post_commit_persist_failure_completes_dispatch(
     assert snapshot.state == LivePlanningJobState.QUEUED
     disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
     disk_record = next(
-        record
-        for record in disk_payload["records"]
-        if record["snapshot"]["id"] == prepared.id
+        record for record in disk_payload["records"] if record["snapshot"]["id"] == prepared.id
     )
     assert disk_record["snapshot"] == snapshot.model_dump(mode="json")
     assert disk_record["activation_operation"] == operation
@@ -1892,7 +1895,9 @@ async def test_activate_post_commit_persist_failure_completes_dispatch(
     with pytest.raises(LivePlanningJobInactiveError):
         await registry.activate(prepared.id, "tenant-a", operation_id="ff" * 32)
 
-    # A cold restart fail-closes the still-nonterminal dispatched record.
+    # A cold restart fail-closes the still-nonterminal dispatched record: the
+    # durable activation operation proves the activation was interrupted, so it
+    # is terminalized to restart_cancelled and never re-dispatched.
     reloaded = LivePlanningJobRegistry(state_path=state_path)
     reloaded_snapshot = await reloaded.get(prepared.id, "tenant-a")
     assert reloaded_snapshot is not None
@@ -1952,9 +1957,7 @@ async def test_start_post_commit_persist_failure_completes_execution(
     assert snapshot.state == LivePlanningJobState.QUEUED
     disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
     disk_record = next(
-        record
-        for record in disk_payload["records"]
-        if record["snapshot"]["id"] == job_id
+        record for record in disk_payload["records"] if record["snapshot"]["id"] == job_id
     )
     assert disk_record["snapshot"] == snapshot.model_dump(mode="json")
     assert disk_record["prepared"] is runtime.prepared
@@ -1975,12 +1978,14 @@ async def test_start_post_commit_persist_failure_completes_execution(
     assert retried.id == job_id
     assert registry._records[job_id].task is runtime.task
 
-    # A cold restart fail-closes the still-nonterminal record.
+    # A cold restart fail-closes the still-nonterminal record: the operation was
+    # running at the crash, so no terminal label is fabricated — it is quarantined
+    # NON-terminal (isolated_ambiguous_cancel), never guessed to restart_cancelled.
     reloaded = LivePlanningJobRegistry(state_path=state_path)
     reloaded_snapshot = await reloaded.get(job_id, "tenant-a")
     assert reloaded_snapshot is not None
-    assert reloaded_snapshot.state == LivePlanningJobState.CANCELLED
-    assert reloaded_snapshot.stage == "restart_cancelled"
+    assert reloaded_snapshot.state == LivePlanningJobState.QUEUED
+    assert reloaded_snapshot.stage == "isolated_ambiguous_cancel"
 
     await reloaded.close()
     await registry.close()
@@ -2113,9 +2118,7 @@ async def test_cancel_fails_closed_when_operation_swallows_cancellation_past_bud
         assert after == retried
         disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
         disk_record = next(
-            record
-            for record in disk_payload["records"]
-            if record["snapshot"]["id"] == job.id
+            record for record in disk_payload["records"] if record["snapshot"]["id"] == job.id
         )
         assert disk_record["snapshot"] == after.model_dump(mode="json")
         assert disk_record["snapshot"]["cancel_pending"] is False
@@ -2311,9 +2314,7 @@ async def test_cancel_terminalize_precommit_failure_keeps_cancel_pending_not_run
     )
     assert replayed is False
     runtime = registry._records[snapshot.id]
-    await _wait_for_state(
-        registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
-    )
+    await _wait_for_state(registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING)
     assert runtime.operation_task is not None and not runtime.operation_task.done()
     assert invocations == 1
 
@@ -2343,9 +2344,7 @@ async def test_cancel_terminalize_precommit_failure_keeps_cancel_pending_not_run
     assert runtime.snapshot.stage == "cancelling"
     disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
     disk_record = next(
-        record
-        for record in disk_payload["records"]
-        if record["snapshot"]["id"] == snapshot.id
+        record for record in disk_payload["records"] if record["snapshot"]["id"] == snapshot.id
     )
     assert disk_record["snapshot"] == runtime.snapshot.model_dump(mode="json")
     assert disk_record["snapshot"]["cancel_pending"] is True
@@ -2411,9 +2410,9 @@ async def test_v2_to_v3_migration_derives_execution_mode_and_survives_consecutiv
     snap_a = _v2_snapshot_model(
         job_a, LivePlanningJobState.RUNNING, "interpreting_requirement", 5, 1
     ).model_dump(mode="json")
-    snap_b = _v2_snapshot_model(
-        job_b, LivePlanningJobState.QUEUED, "queued", 0, 1
-    ).model_dump(mode="json")
+    snap_b = _v2_snapshot_model(job_b, LivePlanningJobState.QUEUED, "queued", 0, 1).model_dump(
+        mode="json"
+    )
     snap_c = _v2_snapshot_model(
         job_c,
         LivePlanningJobState.CANCELLED,
@@ -2533,9 +2532,7 @@ async def test_v2_to_v3_migration_derives_execution_mode_and_survives_consecutiv
 
         # The prepared job's activation operation survives with phase=cancelled
         # and dispatch_count unchanged — no drift on a cold restart.
-        operation_b = await registry.activation_operation(
-            job_b, "tenant-a", operation_id="c" * 64
-        )
+        operation_b = await registry.activation_operation(job_b, "tenant-a", operation_id="c" * 64)
         assert operation_b["phase"] == "cancelled"
         assert operation_b["dispatch_count"] == 0
 
@@ -2634,9 +2631,7 @@ async def test_close_fails_closed_over_swallowed_cancel_operation(tmp_path: Path
     )
     assert replayed is False
     runtime = registry._records[snapshot.id]
-    await _wait_for_state(
-        registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
-    )
+    await _wait_for_state(registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING)
     assert runtime.operation_task is not None and not runtime.operation_task.done()
 
     await registry.close()
@@ -2650,9 +2645,7 @@ async def test_close_fails_closed_over_swallowed_cancel_operation(tmp_path: Path
     # Disk agrees with memory.
     disk = json.loads(state_path.read_text(encoding="utf-8"))
     disk_record = next(
-        record
-        for record in disk["records"]
-        if record["snapshot"]["id"] == snapshot.id
+        record for record in disk["records"] if record["snapshot"]["id"] == snapshot.id
     )
     assert disk_record["snapshot"]["state"] != "cancelled"
     assert disk_record["snapshot"]["cancel_pending"] is True
@@ -2708,9 +2701,7 @@ async def test_same_key_retry_cancel_pending_with_live_operation_fails_closed(
     )
     assert replayed is False
     runtime = registry._records[snapshot.id]
-    await _wait_for_state(
-        registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
-    )
+    await _wait_for_state(registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING)
 
     await registry.cancel(snapshot.id, "tenant-a")
     assert swallowed.is_set()
@@ -2784,9 +2775,7 @@ async def test_deadline_timeout_publishes_pending_not_failed_over_live_operation
     )
     assert replayed is False
     runtime = registry._records[snapshot.id]
-    await _wait_for_state(
-        registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
-    )
+    await _wait_for_state(registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING)
     # Wait for the deadline to fire and the timeout handler to finish draining.
     await asyncio.sleep(0.6)
 
@@ -2797,9 +2786,7 @@ async def test_deadline_timeout_publishes_pending_not_failed_over_live_operation
     assert runtime.operation_task is not None and not runtime.operation_task.done()
     disk = json.loads(state_path.read_text(encoding="utf-8"))
     disk_record = next(
-        record
-        for record in disk["records"]
-        if record["snapshot"]["id"] == snapshot.id
+        record for record in disk["records"] if record["snapshot"]["id"] == snapshot.id
     )
     assert disk_record["snapshot"]["state"] != "failed"
     assert disk_record["snapshot"]["cancel_pending"] is True
@@ -2892,7 +2879,6 @@ async def test_legacy_immediate_derivation_fails_closed_for_formal_prepared_shap
     await registry.close()
 
 
-
 async def _settle_leaked_runtime(
     stop: asyncio.Event,
     runtime: Any,
@@ -2913,6 +2899,70 @@ async def _settle_leaked_runtime(
         task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await asyncio.wait_for(task, timeout=3)
+
+
+async def _hard_teardown_registry(
+    registry: LivePlanningJobRegistry,
+    stop: asyncio.Event,
+    runtime: Any,
+) -> None:
+    """Hard-teardown a NEW-schema registry whose cleanup loops cannot complete
+    because the store never recovered: cancel every background task (operation,
+    runner, cleanup owner, reaper, watchdog) so no test leaves a pending task
+    behind. Only the durable disk facts survive — exactly an unrecovered
+    process restart."""
+    stop.set()
+    operation_task = runtime.operation_task
+    if operation_task is not None and not operation_task.done():
+        operation_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(operation_task, timeout=3)
+    for task in (runtime.cleanup_owner, runtime.task):
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(task, timeout=3)
+    for task in (registry._hard_stop_watchdog, registry._reaper_task):
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(task, timeout=3)
+
+
+async def _hard_teardown_old_registry(
+    registry: Any,
+    stop: asyncio.Event,
+    runtime: Any,
+) -> None:
+    """Hard-teardown an OLD-schema (pre-P0) registry while preserving the exact
+    disk state it wrote: cancel the reaper FIRST so it can never re-spawn a
+    cleanup owner that would settle the stuck record and rewrite the disk, then
+    the cleanup owner (while the operation is still alive, so it cannot settle),
+    and only then stop the operation. The operation's done-callback just releases
+    the admission slot — no disk write — so the stuck shape survives."""
+    if runtime is None:
+        return
+    reaper = getattr(registry, "_reaper_task", None)
+    if reaper is not None and not reaper.done():
+        reaper.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(reaper, timeout=2)
+    owner = runtime.cleanup_owner
+    if owner is not None and not owner.done():
+        owner.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(owner, timeout=2)
+    stop.set()
+    operation_task = runtime.operation_task
+    if operation_task is not None and not operation_task.done():
+        operation_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(operation_task, timeout=2)
+    task = runtime.task
+    if task is not None and not task.done() and task is not asyncio.current_task():
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(task, timeout=2)
 
 
 @pytest.mark.asyncio
@@ -2959,9 +3009,7 @@ async def test_close_first_intent_persist_failure_keeps_closed_flag_transactiona
         )
         assert replayed is False
         runtime = registry._records[snapshot.id]
-        await _wait_for_state(
-            registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
-        )
+        await _wait_for_state(registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING)
         assert runtime.operation_task is not None and not runtime.operation_task.done()
 
         # --- First close: fail the durable-intent persist pre-commit. ---
@@ -2984,9 +3032,7 @@ async def test_close_first_intent_persist_failure_keeps_closed_flag_transactiona
         assert runtime.operation_task is not None and not runtime.operation_task.done()
         disk = json.loads(state_path.read_text(encoding="utf-8"))
         disk_record = next(
-            record
-            for record in disk["records"]
-            if record["snapshot"]["id"] == snapshot.id
+            record for record in disk["records"] if record["snapshot"]["id"] == snapshot.id
         )
         assert disk_record["snapshot"]["cancel_pending"] is False
         assert disk_record["snapshot"]["stage"] != "closing"
@@ -3014,9 +3060,7 @@ async def test_close_first_intent_persist_failure_keeps_closed_flag_transactiona
         assert registry._closed is True
         disk2 = json.loads(state_path.read_text(encoding="utf-8"))
         disk_record2 = next(
-            record
-            for record in disk2["records"]
-            if record["snapshot"]["id"] == snapshot.id
+            record for record in disk2["records"] if record["snapshot"]["id"] == snapshot.id
         )
         assert disk_record2["snapshot"] == runtime.snapshot.model_dump(mode="json")
         assert disk_record2["snapshot"]["cancel_pending"] is True
@@ -3100,9 +3144,7 @@ async def test_deadline_timeout_isolation_persist_failure_never_abandons_operati
         )
         assert replayed is False
         runtime = registry._records[snapshot.id]
-        await _wait_for_state(
-            registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
-        )
+        await _wait_for_state(registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING)
 
         # Arm a fail-once persist: the FIRST timeout-isolation persist fails
         # pre-commit, the bounded retry then succeeds.
@@ -3136,9 +3178,7 @@ async def test_deadline_timeout_isolation_persist_failure_never_abandons_operati
         assert runtime.operation_task is not None and not runtime.operation_task.done()
         disk = json.loads(state_path.read_text(encoding="utf-8"))
         disk_record = next(
-            record
-            for record in disk["records"]
-            if record["snapshot"]["id"] == snapshot.id
+            record for record in disk["records"] if record["snapshot"]["id"] == snapshot.id
         )
         assert disk_record["snapshot"] == runtime.snapshot.model_dump(mode="json")
         assert disk_record["snapshot"]["cancel_pending"] is True
@@ -3222,9 +3262,7 @@ async def test_deadline_timeout_isolation_permanent_persist_failure_keeps_owner(
         )
         assert replayed is False
         runtime = registry._records[snapshot.id]
-        await _wait_for_state(
-            registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING
-        )
+        await _wait_for_state(registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING)
 
         # Every timeout-isolation persist fails pre-commit (permanent write
         # failure).
@@ -3237,9 +3275,7 @@ async def test_deadline_timeout_isolation_permanent_persist_failure_keeps_owner(
                 and not runtime.operation_task.done()
                 and loop.time() >= runtime.deadline_monotonic
             ):
-                raise RuntimeError(
-                    "injected permanent timeout isolation persist failure"
-                )
+                raise RuntimeError("injected permanent timeout isolation persist failure")
             real_persist()
 
         monkeypatch.setattr(registry, "_persist_locked", fail_all_timeout_isolation)
@@ -3302,9 +3338,7 @@ async def test_deadline_timeout_isolation_permanent_persist_failure_keeps_owner(
         assert final.stage == "deadline_exceeded"
         disk = json.loads(state_path.read_text(encoding="utf-8"))
         disk_record = next(
-            record
-            for record in disk["records"]
-            if record["snapshot"]["id"] == snapshot.id
+            record for record in disk["records"] if record["snapshot"]["id"] == snapshot.id
         )
         assert disk_record["snapshot"]["state"] == "failed"
         assert disk_record["snapshot"]["stage"] == "deadline_exceeded"
@@ -3428,15 +3462,16 @@ async def test_deadline_first_intent_fail_holds_capacity_blocks_new_key(
 async def test_cold_boot_deadline_provenance_recovers_failed_never_restart_cancelled(
     tmp_path: Path,
 ) -> None:
-    """C-146 P0-3 counter-example: a force-exit in the deadline-intent window
+    """C-146 P0-3/P0-4 counter-example: a force-exit in the deadline-intent window
     (the FIRST FAILED intent never committed) cold-boots from the durable
     unforgeable deadline provenance ONLY — an admitted record whose deadline
     provably passed recovers FAILED/deadline_exceeded with a consistent safe
     failure; an admitted record whose deadline did NOT pass gives no provable
-    terminal outcome and is quarantined as ambiguous; a QUEUED (never-admitted)
-    record keeps the honest restart_cancelled tombstone. restart_cancelled is
-    NEVER fabricated for an admitted record, and two consecutive cold boots
-    observe identical facts."""
+    terminal outcome and is quarantined as ambiguous. A QUEUED non-prepared
+    record is NOT provably never-admitted (its operation may already have been
+    executing), so it is never guessed to restart_cancelled either — it is
+    quarantined as ambiguous. restart_cancelled is NEVER fabricated for an
+    admitted record, and two consecutive cold boots observe identical facts."""
     state_path = tmp_path / "live-jobs.json"
     tenant_id = "tenant-a"
     job_expired = "live-job-deadline-expired"
@@ -3449,9 +3484,7 @@ async def test_cold_boot_deadline_provenance_recovers_failed_never_restart_cance
     snap_future = _v3_snapshot(
         job_future, LivePlanningJobState.RUNNING, "interpreting_requirement", 5, 1
     )
-    snap_queued = _v3_snapshot(
-        job_queued, LivePlanningJobState.QUEUED, "queued", 0, 1
-    )
+    snap_queued = _v3_snapshot(job_queued, LivePlanningJobState.QUEUED, "queued", 0, 1)
 
     partition = LivePlanningJobRegistry._tenant_partition(tenant_id)
     payload = {
@@ -3498,8 +3531,9 @@ async def test_cold_boot_deadline_provenance_recovers_failed_never_restart_cance
         assert future.state == LivePlanningJobState.RUNNING
         assert future.stage == "isolated_ambiguous_cancel"
         queued = await registry.get(job_queued, tenant_id)
-        assert queued is not None and queued.state == LivePlanningJobState.CANCELLED
-        assert queued.stage == "restart_cancelled"
+        assert queued is not None and queued.state == LivePlanningJobState.QUEUED
+        assert queued.stage == "isolated_ambiguous_cancel"
+        assert queued.cancel_pending is False
 
     first = LivePlanningJobRegistry(state_path=state_path)
     try:
@@ -3684,10 +3718,7 @@ async def test_capacity_slot_held_until_real_operation_stops_after_deadline() ->
         # The runner dies by deadline; the real operation stays alive.
         await asyncio.wait_for(first_runtime.task, timeout=5)
         assert first_runtime.task.done()
-        assert (
-            first_runtime.operation_task is not None
-            and not first_runtime.operation_task.done()
-        )
+        assert first_runtime.operation_task is not None and not first_runtime.operation_task.done()
         assert first_runtime.snapshot.cancel_pending is True
         assert first_runtime.snapshot.stage == "timeout_pending"
 
@@ -3795,10 +3826,7 @@ async def test_capacity_slot_held_until_real_operation_stops_after_cancel() -> N
         assert cancelled is not None and cancelled.cancel_pending is True
         # cancel() stops the runner; the stubborn operation stays alive.
         assert first_runtime.task.done()
-        assert (
-            first_runtime.operation_task is not None
-            and not first_runtime.operation_task.done()
-        )
+        assert first_runtime.operation_task is not None and not first_runtime.operation_task.done()
 
         # A NEW key must NOT start while the first operation is alive.
         second, _replayed2 = await registry.start_idempotent(
@@ -3928,10 +3956,7 @@ async def test_same_key_retry_while_operation_alive_raises_pending_with_job_id()
         assert started.is_set()
         cancelled = await registry.cancel(snap.id, "tenant-a")
         assert cancelled is not None and cancelled.cancel_pending is True
-        assert (
-            runtime.operation_task is not None
-            and not runtime.operation_task.done()
-        )
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
 
         with pytest.raises(LivePlanningJobCancellationPendingError) as excinfo:
             await registry.start_idempotent(
@@ -3994,10 +4019,7 @@ async def test_capacity_slot_held_until_real_operation_stops_after_close() -> No
         # bounded drain — no close entry may release early.
         await registry.close()
         assert runtime.slot_held is True
-        assert (
-            runtime.operation_task is not None
-            and not runtime.operation_task.done()
-        )
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
         assert runtime.snapshot.cancel_pending is True
 
         # Once the operation truly stops, the done-callback releases the permit.
@@ -4149,9 +4171,7 @@ async def test_late_stop_deadline_auto_collects_terminal_without_extra_close() -
         # the cleanup owner consumes — never a guessed CANCELLED label.
         stop.set()
         await asyncio.wait_for(runtime.operation_task, timeout=3)
-        await _wait_for_terminal_state(
-            registry, snap.id, "tenant-a", LivePlanningJobState.FAILED
-        )
+        await _wait_for_terminal_state(registry, snap.id, "tenant-a", LivePlanningJobState.FAILED)
         final = await registry.get(snap.id, "tenant-a")
         assert final is not None and final.state == LivePlanningJobState.FAILED
         assert final.stage == "deadline_exceeded"
@@ -4199,9 +4219,7 @@ async def test_late_stop_close_auto_collects_terminal_without_extra_close() -> N
             deadline_seconds=30,
         )
         runtime = registry._records[snap.id]
-        await _wait_for_state(
-            registry, snap.id, "tenant-a", LivePlanningJobState.RUNNING
-        )
+        await _wait_for_state(registry, snap.id, "tenant-a", LivePlanningJobState.RUNNING)
         for _ in range(1000):
             if started.is_set():
                 break
@@ -4284,9 +4302,7 @@ async def test_late_stop_auto_collect_memory_matches_disk(tmp_path: Path) -> Non
         assert final is not None and final.state == LivePlanningJobState.CANCELLED
         disk_payload = json.loads(state_path.read_text(encoding="utf-8"))
         disk_record = next(
-            record
-            for record in disk_payload["records"]
-            if record["snapshot"]["id"] == snap.id
+            record for record in disk_payload["records"] if record["snapshot"]["id"] == snap.id
         )
         # RED on HEAD: memory and disk both stay running+cancel_pending.
         assert disk_record["snapshot"] == final.model_dump(mode="json")
@@ -4401,6 +4417,7 @@ async def test_late_stop_cumulative_attacks_never_exhaust_capacity() -> None:
                 with suppress(asyncio.CancelledError):
                     await asyncio.sleep(0.001)
             return {"stopped": True}
+
         return stubborn
 
     try:
@@ -4822,14 +4839,9 @@ async def test_cleanup_owner_retries_terminal_persist_fail_once_deadline(
         assert runtime.pending_terminal is not None
         assert runtime.pending_terminal.state == LivePlanningJobState.FAILED
         assert runtime.pending_terminal.stage == "deadline_exceeded"
-        assert (
-            runtime.pending_terminal.error
-            == "TimeoutError: live planning job deadline exceeded"
-        )
+        assert runtime.pending_terminal.error == "TimeoutError: live planning job deadline exceeded"
         assert runtime.pending_terminal.safe_failure is not None
-        assert (
-            runtime.pending_terminal.safe_failure.code.value == "deadline_exceeded"
-        )
+        assert runtime.pending_terminal.safe_failure.code.value == "deadline_exceeded"
         assert runtime.operation_task is not None and not runtime.operation_task.done()
 
         real_persist = registry._persist_locked
@@ -4846,9 +4858,7 @@ async def test_cleanup_owner_retries_terminal_persist_fail_once_deadline(
 
         stop.set()
         await asyncio.wait_for(runtime.operation_task, timeout=3)
-        await _wait_for_terminal_state(
-            registry, snap.id, "tenant-a", LivePlanningJobState.FAILED
-        )
+        await _wait_for_terminal_state(registry, snap.id, "tenant-a", LivePlanningJobState.FAILED)
         await _settle_cleanup_owner(runtime)
         monkeypatch.undo()
 
@@ -4867,9 +4877,7 @@ async def test_cleanup_owner_retries_terminal_persist_fail_once_deadline(
         # and consumed the pending outcome.
         disk = json.loads(state_path.read_text(encoding="utf-8"))
         disk_record = next(
-            record
-            for record in disk["records"]
-            if record["snapshot"]["id"] == snap.id
+            record for record in disk["records"] if record["snapshot"]["id"] == snap.id
         )
         assert disk_record["snapshot"]["state"] == "failed"
         assert disk_record["snapshot"]["stage"] == "deadline_exceeded"
@@ -4969,10 +4977,7 @@ async def test_cleanup_reaper_recollects_cancel_after_budget_exhausted_no_extern
         assert final.cancel_pending is False
         assert first_runtime.pending_terminal is None
         assert first_runtime.cleanup_retry_round >= 1
-        assert (
-            first_runtime.cleanup_owner is not None
-            and first_runtime.cleanup_owner.done()
-        )
+        assert first_runtime.cleanup_owner is not None and first_runtime.cleanup_owner.done()
         assert registry._reaper_task is None
         assert first_runtime.slot_held is False
 
@@ -5054,9 +5059,7 @@ async def test_cleanup_reaper_recollects_deadline_after_budget_exhausted_no_exte
 
         stop.set()
         await asyncio.wait_for(runtime.operation_task, timeout=3)
-        await _wait_for_terminal_state(
-            registry, snap.id, "tenant-a", LivePlanningJobState.FAILED
-        )
+        await _wait_for_terminal_state(registry, snap.id, "tenant-a", LivePlanningJobState.FAILED)
         await _settle_cleanup_owner(runtime)
         await _settle_reaper(registry)
         monkeypatch.undo()
@@ -5138,9 +5141,7 @@ async def test_cleanup_owner_post_commit_ambiguous_confirms_cancel(
             original_terminalize(*args, **kwargs)
 
         monkeypatch.setattr(registry, "_terminalize_locked", counting_terminalize)
-        os.environ[
-            "TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT"
-        ] = "post_replace_dir_fsync"
+        os.environ["TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT"] = "post_replace_dir_fsync"
         try:
             stop.set()
             await asyncio.wait_for(runtime.operation_task, timeout=3)
@@ -5214,9 +5215,7 @@ async def test_cleanup_owner_post_commit_ambiguous_confirms_deadline(
             original_terminalize(*args, **kwargs)
 
         monkeypatch.setattr(registry, "_terminalize_locked", counting_terminalize)
-        os.environ[
-            "TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT"
-        ] = "post_replace_dir_fsync"
+        os.environ["TRIPCHORD_TEST_REGISTRY_PERSIST_FAILPOINT"] = "post_replace_dir_fsync"
         try:
             stop.set()
             await asyncio.wait_for(runtime.operation_task, timeout=3)
@@ -5240,9 +5239,7 @@ async def test_cleanup_owner_post_commit_ambiguous_confirms_deadline(
 
         disk = json.loads(state_path.read_text(encoding="utf-8"))
         disk_record = next(
-            record
-            for record in disk["records"]
-            if record["snapshot"]["id"] == snap.id
+            record for record in disk["records"] if record["snapshot"]["id"] == snap.id
         )
         assert disk_record["snapshot"]["state"] == "failed"
         assert disk_record["snapshot"]["stage"] == "deadline_exceeded"
@@ -5371,17 +5368,13 @@ async def test_cleanup_cold_start_continues_durable_deadline_intent(
         # Durable retry intent is on disk: cancel_pending + pending FAILED.
         disk = json.loads(state_path.read_text(encoding="utf-8"))
         disk_record = next(
-            record
-            for record in disk["records"]
-            if record["snapshot"]["id"] == snap.id
+            record for record in disk["records"] if record["snapshot"]["id"] == snap.id
         )
         assert disk_record["snapshot"]["cancel_pending"] is True
         assert disk_record["snapshot"]["stage"] == "timeout_pending"
         assert disk_record["pending_terminal"]["state"] == "failed"
         assert disk_record["pending_terminal"]["stage"] == "deadline_exceeded"
-        assert (
-            disk_record["pending_terminal"]["safe_failure_code"] == "deadline_exceeded"
-        )
+        assert disk_record["pending_terminal"]["safe_failure_code"] == "deadline_exceeded"
 
         # Simulate a crash mid-pending: copy the durable file, then let the
         # original registry settle normally (its own writes don't affect the copy).
@@ -5390,9 +5383,7 @@ async def test_cleanup_cold_start_continues_durable_deadline_intent(
         crash_state.chmod(0o600)
         stop.set()
         await asyncio.wait_for(runtime.operation_task, timeout=3)
-        await _wait_for_terminal_state(
-            registry, snap.id, "tenant-a", LivePlanningJobState.FAILED
-        )
+        await _wait_for_terminal_state(registry, snap.id, "tenant-a", LivePlanningJobState.FAILED)
         await _settle_cleanup_owner(runtime)
         assert registry._reaper_task is None
         await registry.close()
@@ -5406,9 +5397,7 @@ async def test_cleanup_cold_start_continues_durable_deadline_intent(
         assert snap_a.cancel_pending is False
         disk_a = json.loads(crash_state.read_text(encoding="utf-8"))
         disk_a_record = next(
-            record
-            for record in disk_a["records"]
-            if record["snapshot"]["id"] == snap.id
+            record for record in disk_a["records"] if record["snapshot"]["id"] == snap.id
         )
         assert disk_a_record["snapshot"]["state"] == "failed"
         assert disk_a_record["snapshot"]["stage"] == "deadline_exceeded"
@@ -5466,9 +5455,7 @@ async def test_cleanup_deadline_failed_vs_cancel_cancelled_outcomes_no_drift() -
         # Cancel path: the durable pending outcome is CANCELLED/cancelled.
         cancel_snap, _cancel_replayed = await registry.start_idempotent(
             tenant_id="tenant-a",
-            operation=_make_stubborn_swallow_cancel(
-                cancel_stop, cancel_started, cancel_swallowed
-            ),
+            operation=_make_stubborn_swallow_cancel(cancel_stop, cancel_started, cancel_swallowed),
             idempotency_key="outcome-cancel",
             request_digest=REQUEST_SHA256,
             deadline_seconds=30,
@@ -5481,9 +5468,7 @@ async def test_cleanup_deadline_failed_vs_cancel_cancelled_outcomes_no_drift() -
         assert cancel_started.is_set()
         await registry.cancel(cancel_snap.id, "tenant-a")
         assert cancel_runtime.pending_terminal is not None
-        assert (
-            cancel_runtime.pending_terminal.state == LivePlanningJobState.CANCELLED
-        )
+        assert cancel_runtime.pending_terminal.state == LivePlanningJobState.CANCELLED
         assert cancel_runtime.pending_terminal.stage == "cancelled"
 
         # Deadline path: the durable pending outcome is FAILED/deadline_exceeded.
@@ -5585,9 +5570,7 @@ def _v3_idempotency_entry(
     """A faithful v3 idempotency binding (defer_start present, legacy_isolated
     omitted — the OLD-v3 shape)."""
     return {
-        "partition": LivePlanningJobRegistry._idempotency_partition(
-            tenant_id, idempotency_key
-        ),
+        "partition": LivePlanningJobRegistry._idempotency_partition(tenant_id, idempotency_key),
         "job_id": job_id,
         "request_digest": REQUEST_SHA256,
         "defer_start": defer_start,
@@ -5722,9 +5705,7 @@ async def test_v3_loader_rejects_unknown_or_missing_record_fields(tmp_path: Path
     patched or migrated."""
     tenant_id = "tenant-a"
     job_id = "live-job-field-strict"
-    snap = _v3_snapshot(
-        job_id, LivePlanningJobState.RUNNING, "interpreting_requirement", 5, 1
-    )
+    snap = _v3_snapshot(job_id, LivePlanningJobState.RUNNING, "interpreting_requirement", 5, 1)
 
     def base_payload(record: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -5807,9 +5788,7 @@ async def test_deadline_first_intent_durably_carries_failed_outcome(
             if not captured:
                 disk = json.loads(state_path.read_text(encoding="utf-8"))
                 record = next(
-                    record
-                    for record in disk["records"]
-                    if record["snapshot"]["id"] == snap.id
+                    record for record in disk["records"] if record["snapshot"]["id"] == snap.id
                 )
                 captured.append((record["snapshot"], record.get("pending_terminal")))
 
@@ -5881,9 +5860,7 @@ async def test_cancel_first_intent_durably_carries_cancelled_outcome(
             if not captured:
                 disk = json.loads(state_path.read_text(encoding="utf-8"))
                 record = next(
-                    record
-                    for record in disk["records"]
-                    if record["snapshot"]["id"] == snap.id
+                    record for record in disk["records"] if record["snapshot"]["id"] == snap.id
                 )
                 captured.append(record.get("pending_terminal"))
 
@@ -5948,9 +5925,7 @@ async def test_close_first_intent_durably_carries_cancelled_outcome(
             if not captured:
                 disk = json.loads(state_path.read_text(encoding="utf-8"))
                 record = next(
-                    record
-                    for record in disk["records"]
-                    if record["snapshot"]["id"] == snap.id
+                    record for record in disk["records"] if record["snapshot"]["id"] == snap.id
                 )
                 captured.append(record.get("pending_terminal"))
 
@@ -6000,9 +5975,7 @@ async def test_crash_mid_cancel_without_outcome_isolated_not_guessed(
                 "pending_terminal": None,
             }
         ],
-        "idempotency": [
-            _v3_idempotency_entry(tenant_id, "mid-cancel-no-outcome", job_id)
-        ],
+        "idempotency": [_v3_idempotency_entry(tenant_id, "mid-cancel-no-outcome", job_id)],
     }
     _write_registry_state(payload, state_path)
 
@@ -6118,9 +6091,7 @@ async def test_pending_terminal_safe_failure_requires_failed_state(
                 },
             }
         ],
-        "idempotency": [
-            _v3_idempotency_entry(tenant_id, "safe-failure-on-cancelled", job_id)
-        ],
+        "idempotency": [_v3_idempotency_entry(tenant_id, "safe-failure-on-cancelled", job_id)],
     }
     _write_registry_state(payload, state_path)
     # RED on HEAD: this inconsistent shape was accepted.
@@ -6136,9 +6107,7 @@ async def test_loader_rejects_idempotency_digest_mismatch(tmp_path: Path) -> Non
     state_path = tmp_path / "live-jobs.json"
     tenant_id = "tenant-a"
     job_id = "live-job-digest-mismatch"
-    snap = _v3_snapshot(
-        job_id, LivePlanningJobState.RUNNING, "interpreting_requirement", 5, 1
-    )
+    snap = _v3_snapshot(job_id, LivePlanningJobState.RUNNING, "interpreting_requirement", 5, 1)
     entry = _v3_idempotency_entry(tenant_id, "digest-mismatch", job_id)
     entry["request_digest"] = "b" * 64  # foreign digest, not the snapshot's
     payload = {
@@ -6194,11 +6163,7 @@ async def test_cleanup_backoff_round_1025_no_overflow_owner_survives_saturates(
 
         # Durable retry intent is on disk (cancel_pending + pending FAILED).
         disk = json.loads(state_path.read_text(encoding="utf-8"))
-        record = next(
-            record
-            for record in disk["records"]
-            if record["snapshot"]["id"] == snap.id
-        )
+        record = next(record for record in disk["records"] if record["snapshot"]["id"] == snap.id)
         assert record["snapshot"]["cancel_pending"] is True
         assert record["pending_terminal"]["state"] == "failed"
 
@@ -6230,16 +6195,14 @@ async def test_cleanup_backoff_round_1025_no_overflow_owner_survives_saturates(
         assert registry._bump_cleanup_retry_round(-3) == 1
         assert registry._bump_cleanup_retry_round("garbage") == 1
         assert registry._bump_cleanup_retry_round(2.5) == 1
-        assert registry._cleanup_retry_delay(10 ** 9) == 0.5
+        assert registry._cleanup_retry_delay(10**9) == 0.5
         assert registry._cleanup_retry_delay(0) == 0.02
         assert registry._cleanup_retry_delay(-5) == 0.02
 
         # Store recovery still auto-terminalizes: restore the real _finish, and
         # the reaper re-spawns the owner which now commits FAILED/deadline_exceeded.
         monkeypatch.undo()
-        await _wait_for_terminal_state(
-            registry, snap.id, "tenant-a", LivePlanningJobState.FAILED
-        )
+        await _wait_for_terminal_state(registry, snap.id, "tenant-a", LivePlanningJobState.FAILED)
         final = await registry.get(snap.id, "tenant-a")
         assert final is not None and final.stage == "deadline_exceeded"
         assert runtime.pending_terminal is None
@@ -6656,3 +6619,800 @@ async def test_isolated_ambiguous_cancel_survives_explicit_cancel_and_cold_boot(
             )
     finally:
         await second.close()
+
+
+# C-146 P0 supplement counterexamples — P0-4 / b119 (permanent-failure hard-stop,
+# bounded reconcile, cold-boot provenance, bounded attacks, quarantine capacity)
+# -------------------------------------------------------------------------------
+
+
+def _load_old_producer(tmp_path: Path) -> ModuleType:
+    """Load the pre-P0 producer module (commit 8cba6bc) so a test can produce
+    REAL old-producer disk state through its own public API — the b119 gate
+    forbids hand-built JSON for the legacy-migration counter-example."""
+    repo_root = Path(__file__).resolve().parents[3]
+    try:
+        old_source = subprocess.check_output(
+            ["git", "show", "8cba6bc:apps/api/src/tripchord/agents/live_jobs.py"],
+            cwd=str(repo_root),
+            text=True,
+        )
+    except OSError as exc:
+        pytest.skip(f"old producer source unavailable: {exc}")
+    module_path = tmp_path / "old_producer_live_jobs.py"
+    module_path.write_text(old_source, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("old_producer_live_jobs", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.asyncio
+async def test_hard_stop_permanent_failure_bounds_side_effects_and_quarantines(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 supplement (P0-4) counter-example (a): under a PERMANENT storage
+    failure a stubborn operation that swallows CancelledError is hard-stopped by
+    the bounded watchdog within the absolute deadline+grace EXECUTION budget.
+    Registry-facing side effects stop growing, the record is quarantined
+    NON-terminal (never a fabricated FAILED/CANCELLED), the disk keeps the
+    original durable facts, and a same-key request fails closed."""
+    state_path = tmp_path / "live-jobs.json"
+    stop = asyncio.Event()
+    side_effects = 0
+    rejected_reports = 0
+
+    async def stubborn_operation(report: Any) -> dict[str, Any]:
+        nonlocal side_effects, rejected_reports
+        while not stop.is_set():
+            try:
+                await report("working", 5)
+                side_effects += 1
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                rejected_reports += 1
+            await asyncio.sleep(0.001)
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        cancel_wait_seconds=0.02,
+        execution_hard_stop_grace_seconds=0.1,
+    )
+    runtime: Any = None
+    try:
+        started = asyncio.get_running_loop().time()
+        snapshot, replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn_operation,
+            idempotency_key="hard-stop-permanent",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=0.15,
+        )
+        assert replayed is False
+        runtime = registry._records[snapshot.id]
+        await _wait_for_state(registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING)
+
+        # Every deadline-intent / quarantine persist fails pre-commit (permanent
+        # write failure).
+        def fail_all_persists() -> None:
+            raise RuntimeError("injected permanent persist failure")
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_all_persists)
+
+        for _ in range(400):
+            if runtime.hard_stopped:
+                break
+            await asyncio.sleep(0.005)
+        assert runtime.hard_stopped is True
+        elapsed = asyncio.get_running_loop().time() - started
+        # The absolute EXECUTION bound (deadline + grace) was respected — the
+        # executor is hard-stopped within a bounded window, never left running.
+        assert elapsed <= 0.15 + 0.1 + 2.0
+
+        assert runtime.quarantined is True
+        assert runtime.quarantine_stage == _QUARANTINE_HARD_STOPPED_STAGE
+        assert runtime.snapshot.cancel_pending is True
+        assert runtime.snapshot.cancellation_requested is True
+        # No terminal label is ever fabricated from the memory-only intent.
+        assert runtime.snapshot.state not in (
+            LivePlanningJobState.SUCCEEDED,
+            LivePlanningJobState.FAILED,
+            LivePlanningJobState.CANCELLED,
+        )
+
+        # Registry-facing side effects froze: the generation bump rejects every
+        # further progress report from the still-alive (swallowed-cancel)
+        # operation, and the rejections are observable.
+        frozen_side_effects = side_effects
+        await asyncio.sleep(0.2)
+        assert side_effects == frozen_side_effects
+        assert rejected_reports > 0
+
+        # The disk still holds the original durable facts (the pre-attack QUEUED
+        # record) — no fake terminal, no half-persisted quarantine.
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record for record in disk["records"] if record["snapshot"]["id"] == snapshot.id
+        )
+        assert disk_record["snapshot"]["state"] == "queued"
+        assert disk_record["snapshot"]["stage"] == "queued"
+
+        # Same-key fails closed; the key is never reused.
+        with pytest.raises(LivePlanningJobIdempotencyConflictError):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=stubborn_operation,
+                idempotency_key="hard-stop-permanent",
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+            )
+    finally:
+        monkeypatch.undo()
+        await _hard_teardown_registry(registry, stop, runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_hard_stop_reconciles_quarantine_on_store_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 supplement (P0-4) counter-example (b): when the store recovers,
+    the bounded cleanup reconcile auto-commits the hard-stop quarantine facts
+    (and the in-memory target facts) durably BEFORE any quota is released — the
+    disk record gains the explicit quarantine marker and stays NON-terminal, and
+    the same-key path remains fail-closed."""
+    state_path = tmp_path / "live-jobs.json"
+    stop = asyncio.Event()
+    fail_writes = True
+
+    async def stubborn_operation(_: Any) -> dict[str, Any]:
+        while not stop.is_set():
+            with suppress(asyncio.CancelledError):
+                await asyncio.sleep(0.001)
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        cancel_wait_seconds=0.02,
+        execution_hard_stop_grace_seconds=0.1,
+    )
+    runtime: Any = None
+    try:
+        snapshot, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn_operation,
+            idempotency_key="hard-stop-reconcile",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=0.15,
+        )
+        runtime = registry._records[snapshot.id]
+        await _wait_for_state(registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING)
+
+        real_persist = registry._persist_locked
+
+        def recoverable_fail() -> None:
+            if fail_writes:
+                raise RuntimeError("injected recoverable persist failure")
+            real_persist()
+
+        monkeypatch.setattr(registry, "_persist_locked", recoverable_fail)
+
+        for _ in range(400):
+            if runtime.hard_stopped:
+                break
+            await asyncio.sleep(0.005)
+        assert runtime.hard_stopped is True
+        assert runtime.quarantined is True
+        assert runtime.quarantine_reconciled is False
+
+        # The quarantine is still in-memory only — the disk never gained it.
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record for record in disk["records"] if record["snapshot"]["id"] == snapshot.id
+        )
+        assert disk_record["quarantined"] is False
+        assert disk_record["quarantine_stage"] is None
+        assert disk_record["snapshot"]["stage"] == "queued"
+
+        # Store recovers: the bounded reconcile auto-commits the quarantine +
+        # in-memory target facts durably.
+        fail_writes = False
+        for _ in range(1000):
+            if runtime.quarantine_reconciled:
+                break
+            await asyncio.sleep(0.005)
+        assert runtime.quarantine_reconciled is True
+
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record for record in disk["records"] if record["snapshot"]["id"] == snapshot.id
+        )
+        assert disk_record["quarantined"] is True
+        assert disk_record["quarantine_stage"] == "quarantine_hard_stopped"
+        assert disk_record["snapshot"]["stage"] == "quarantine_hard_stopped"
+        assert disk_record["snapshot"]["state"] == "running"
+
+        # The record stays quarantined NON-terminal and the same-key path fails
+        # closed even after the durable quarantine commit.
+        assert runtime.snapshot.state not in (
+            LivePlanningJobState.SUCCEEDED,
+            LivePlanningJobState.FAILED,
+            LivePlanningJobState.CANCELLED,
+        )
+        with pytest.raises(LivePlanningJobIdempotencyConflictError):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=stubborn_operation,
+                idempotency_key="hard-stop-reconcile",
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+            )
+
+        # Cleanup: once the operation provably stops, the owner settles to the
+        # DURABLE FAILED/deadline_exceeded intent (never a guessed label).
+        stop.set()
+        for _ in range(1000):
+            if runtime.snapshot.state == LivePlanningJobState.FAILED:
+                break
+            await asyncio.sleep(0.005)
+        assert runtime.snapshot.state == LivePlanningJobState.FAILED
+        assert runtime.snapshot.stage == "deadline_exceeded"
+    finally:
+        monkeypatch.undo()
+        await _hard_teardown_registry(registry, stop, runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_hard_stopped_unrecovered_restart_two_cold_boots_no_fake_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 supplement (P0-4) counter-example (c): if the process restarts
+    before the hard-stop quarantine ever reached the store, no terminal label is
+    fabricated from the memory-only intent. Only the DURABLE deadline provenance
+    (``deadline_at`` at creation) may recover the record —
+    FAILED/deadline_exceeded once the deadline provably passed — never
+    restart_cancelled, never a guessed CANCELLED. A second cold boot reads the
+    same durable facts."""
+    state_path = tmp_path / "live-jobs.json"
+    stop = asyncio.Event()
+
+    async def stubborn_operation(_: Any) -> dict[str, Any]:
+        while not stop.is_set():
+            with suppress(asyncio.CancelledError):
+                await asyncio.sleep(0.001)
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        cancel_wait_seconds=0.02,
+        execution_hard_stop_grace_seconds=0.1,
+    )
+    runtime: Any = None
+    try:
+        snapshot, _replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn_operation,
+            idempotency_key="hard-stop-cold-boot",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=0.15,
+        )
+        runtime = registry._records[snapshot.id]
+        await _wait_for_state(registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING)
+
+        def fail_all_persists() -> None:
+            raise RuntimeError("injected permanent persist failure")
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_all_persists)
+        for _ in range(400):
+            if runtime.hard_stopped:
+                break
+            await asyncio.sleep(0.005)
+        assert runtime.hard_stopped is True
+        assert runtime.quarantined is True
+        # The quarantine was NEVER durable — the disk keeps the original facts.
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record for record in disk["records"] if record["snapshot"]["id"] == snapshot.id
+        )
+        assert disk_record["snapshot"]["state"] == "queued"
+    finally:
+        monkeypatch.undo()
+        await _hard_teardown_registry(registry, stop, runtime)
+        await registry.close()
+
+    # Unrecovered restart: the DURABLE deadline provenance now provably passed.
+    first = LivePlanningJobRegistry(state_path=state_path)
+    try:
+        recovered = await first.get(snapshot.id, "tenant-a")
+        assert recovered is not None
+        assert recovered.state == LivePlanningJobState.FAILED
+        assert recovered.stage == "deadline_exceeded"
+        assert recovered.cancellation_requested is True
+        # Never a guessed cancel / restart label.
+        assert recovered.stage != "restart_cancelled"
+    finally:
+        await first.close()
+
+    # A second cold boot reads exactly the same durable facts — no drift.
+    second = LivePlanningJobRegistry(state_path=state_path)
+    try:
+        again = await second.get(snapshot.id, "tenant-a")
+        assert again is not None
+        assert again.state == LivePlanningJobState.FAILED
+        assert again.stage == "deadline_exceeded"
+    finally:
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_permanent_failure_attacks_all_within_hard_caps(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 supplement (P0-4) counter-example (d): N permanent-failure
+    attacks each end quarantined NON-terminal within the bounded quotas — no fake
+    terminal is ever written, the number of simultaneously-alive real operations
+    stays bounded by max_running, the quarantine count stays within its own
+    bounded capacity, and the hard-stop watchdog remains a single task."""
+    state_path = tmp_path / "live-jobs.json"
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=32,
+        max_running=1,
+        cancel_wait_seconds=0.02,
+        execution_hard_stop_grace_seconds=0.1,
+        quarantine_capacity=8,
+        intent_persist_wallclock_budget_seconds=0.3,
+    )
+    stop = asyncio.Event()
+
+    async def stubborn_operation(_: Any) -> dict[str, Any]:
+        while not stop.is_set():
+            with suppress(asyncio.CancelledError):
+                await asyncio.sleep(0.001)
+        return {"ok": True}
+
+    runtimes: list[Any] = []
+    try:
+        # All starts succeed (future deadlines, no isolation yet); then a
+        # permanent write failure hits every later persist.
+        for attack in range(4):
+            snap, _replayed = await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=stubborn_operation,
+                idempotency_key=f"attack-{attack}",
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+                deadline_seconds=0.3,
+            )
+            runtimes.append(registry._records[snap.id])
+
+        def fail_all_persists() -> None:
+            raise RuntimeError("injected permanent persist failure")
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_all_persists)
+
+        alive_peaks: list[int] = []
+        for runtime in runtimes:
+            for _ in range(600):
+                if runtime.quarantined:
+                    break
+                await asyncio.sleep(0.005)
+            assert runtime.quarantined is True
+            alive_peaks.append(
+                sum(
+                    1
+                    for item in registry._records.values()
+                    if item.operation_task is not None and not item.operation_task.done()
+                )
+            )
+
+        quarantined = [item for item in registry._records.values() if item.quarantined]
+        assert len(quarantined) == 4
+        assert len(quarantined) <= registry._quarantine_capacity
+        for runtime in quarantined:
+            assert runtime.snapshot.state not in (
+                LivePlanningJobState.SUCCEEDED,
+                LivePlanningJobState.FAILED,
+                LivePlanningJobState.CANCELLED,
+            )
+        # Attack 0 held the sole admission slot, so only it was a live executor
+        # and was hard-stopped by the bounded watchdog; the queued attacks hit
+        # the bounded STATE budget and are quarantined intent-uncommitted.
+        assert runtimes[0].quarantine_stage == _QUARANTINE_HARD_STOPPED_STAGE
+        for runtime in runtimes[1:]:
+            assert runtime.quarantine_stage == _QUARANTINE_INTENT_UNCOMMITTED_STAGE
+        # The admission permit is conserved: at most max_running real operations
+        # are ever alive at once — no orphan permit accumulation.
+        assert max(alive_peaks) == 1
+        # The watchdog is a single task (or already self-terminated).
+        watchdog = registry._hard_stop_watchdog
+        assert watchdog is None or not watchdog.done()
+        # The disk never gained a fake terminal — every record is still the
+        # original QUEUED fact (no persist ever succeeded after the starts).
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        for record in disk["records"]:
+            assert record["snapshot"]["state"] == "queued"
+    finally:
+        monkeypatch.undo()
+        for runtime in runtimes:
+            await _hard_teardown_registry(registry, stop, runtime)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_quarantine_records_never_occupy_active_capacity(
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 supplement (P0-4) / b119 gate (P0-B): bounded quarantine/
+    tombstone records do NOT occupy executable ACTIVE capacity — a legal file
+    may hold ``capacity`` ordinary records PLUS ``quarantine_capacity``
+    quarantined ones, each quota enforced independently, and a new key is still
+    admitted while the quarantine stays under its own quota. RED on HEAD: the
+    loader rejected ``len(records) > capacity`` and admission counted quarantined
+    records against the active set."""
+    state_path = tmp_path / "live-jobs.json"
+    tenant_id = "tenant-a"
+    active_id = "live-job-terminal-active"
+    q1 = "live-job-q1"
+    q2 = "live-job-q2"
+    partition = LivePlanningJobRegistry._tenant_partition(tenant_id)
+
+    active_snap = _v3_snapshot(active_id, LivePlanningJobState.SUCCEEDED, "complete", 100, 3)
+    q1_snap = _v3_snapshot(q1, LivePlanningJobState.RUNNING, _QUARANTINE_HARD_STOPPED_STAGE, 5, 2)
+    q2_snap = _v3_snapshot(q2, LivePlanningJobState.RUNNING, _ISOLATED_AMBIGUOUS_CANCEL_STAGE, 5, 2)
+    payload = {
+        "schema_version": "tripchord-live-job-registry-v3",
+        "records": [
+            {
+                "tenant_partition": partition,
+                "snapshot": active_snap.model_dump(mode="json"),
+                "prepared": False,
+                "activation_operation": None,
+                "pending_terminal": None,
+                "quarantined": False,
+                "quarantine_stage": None,
+            },
+            {
+                "tenant_partition": partition,
+                "snapshot": q1_snap.model_dump(mode="json"),
+                "prepared": False,
+                "activation_operation": None,
+                "pending_terminal": None,
+                "quarantined": True,
+                "quarantine_stage": _QUARANTINE_HARD_STOPPED_STAGE,
+            },
+            {
+                "tenant_partition": partition,
+                "snapshot": q2_snap.model_dump(mode="json"),
+                "prepared": False,
+                "activation_operation": None,
+                "pending_terminal": None,
+                "quarantined": True,
+                "quarantine_stage": _ISOLATED_AMBIGUOUS_CANCEL_STAGE,
+            },
+        ],
+        "idempotency": [
+            _v3_idempotency_entry(tenant_id, "terminal-active", active_id),
+            _v3_idempotency_entry(tenant_id, "q1", q1),
+            _v3_idempotency_entry(tenant_id, "q2", q2),
+        ],
+    }
+    _write_registry_state(payload, state_path)
+
+    registry = LivePlanningJobRegistry(state_path=state_path, capacity=1, quarantine_capacity=3)
+    try:
+        # Both quotas load independently: active=1 <= capacity and quarantined=2
+        # <= quarantine_capacity — the two quarantined records never count
+        # against the executable active capacity.
+        assert registry._records[active_id].snapshot.state == LivePlanningJobState.SUCCEEDED
+        assert registry._records[q1].quarantined is True
+        assert registry._records[q2].quarantined is True
+
+        # A NEW key is admitted: the quarantined records do not occupy ACTIVE
+        # capacity, so the terminal SUCCEEDED record is evicted (not the
+        # quarantine) to make room.
+        async def operation(_: Any) -> dict[str, Any]:
+            return {"ok": True}
+
+        fresh, replayed = await registry.start_idempotent(
+            tenant_id=tenant_id,
+            operation=operation,
+            idempotency_key="fresh-key",
+            request_digest=REQUEST_SHA256,
+            defer_start=True,
+        )
+        assert replayed is False
+        assert registry._records[fresh.id] is not None
+        # The two quarantined records are untouched.
+        assert registry._records[q1].quarantined is True
+        assert registry._records[q2].quarantined is True
+        assert active_id not in registry._records
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_reclaimed_quarantine_tombstone_same_key_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 supplement (P0-4) / b119 gate (P0-B): after a quarantined record
+    passes its bounded retention AND its executor is provably dead, reclamation
+    keeps a minimal durable tombstone (the legacy_isolated idempotency binding)
+    so a same-key request always fails closed — the key is never silently popped
+    and reused."""
+    state_path = tmp_path / "live-jobs.json"
+    tenant_id = "tenant-a"
+    job_id = "live-job-reclaimed-q"
+    key = "reclaimed-q-key"
+    aged = datetime.now(UTC) - timedelta(hours=7)
+    snapshot = LivePlanningJobSnapshot(
+        id=job_id,
+        state=LivePlanningJobState.RUNNING,
+        stage=_QUARANTINE_HARD_STOPPED_STAGE,
+        progress=5,
+        revision=2,
+        cancellation_requested=True,
+        cancel_pending=True,
+        request_sha256=REQUEST_SHA256,
+        model_trace_scope_sha256=REQUEST_SHA256,
+        created_at=aged,
+        updated_at=aged,
+        deadline_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    payload = {
+        "schema_version": "tripchord-live-job-registry-v3",
+        "records": [
+            {
+                "tenant_partition": LivePlanningJobRegistry._tenant_partition(tenant_id),
+                "snapshot": snapshot.model_dump(mode="json"),
+                "prepared": False,
+                "activation_operation": None,
+                "pending_terminal": None,
+                "quarantined": True,
+                "quarantine_stage": _QUARANTINE_HARD_STOPPED_STAGE,
+            }
+        ],
+        "idempotency": [_v3_idempotency_entry(tenant_id, key, job_id)],
+    }
+    _write_registry_state(payload, state_path)
+
+    registry = LivePlanningJobRegistry(state_path=state_path, capacity=4, quarantine_capacity=2)
+    try:
+        # The loader reclaimed the aged quarantined record at load (retention
+        # passed and no executor survives a cold boot): a minimal tombstone
+        # remains and the key is never reusable.
+        assert job_id not in registry._records
+
+        async def operation(_: Any) -> dict[str, Any]:
+            return {"ok": True}
+
+        with pytest.raises(LivePlanningJobIdempotencyConflictError, match="reclaimed or isolated"):
+            await registry.start_idempotent(
+                tenant_id=tenant_id,
+                operation=operation,
+                idempotency_key=key,
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+            )
+        # The tombstone survived the failed same-key attempt — never popped.
+        assert job_id not in registry._records
+        assert (
+            registry._idempotency[
+                LivePlanningJobRegistry._idempotency_partition(tenant_id, key)
+            ].legacy_isolated
+            is True
+        )
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_v3_none_cancellation_real_old_producer_migrates_atomic(
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 supplement (P0-4) / b119 gate (P0-A): the loader's
+    ``legacy_v3_none_cancellation`` branch is REAL and reachable — it is
+    exercised with ACTUAL old-producer disk state (the pre-P0 implementation at
+    8cba6bc writing through its own cancel/deadline paths), not hand-built JSON.
+    The exact old cancel stuck shape (``cancellation_requested: null`` at
+    ``cancel_timed_out``, no quarantine marker) is accepted ONLY via the legacy
+    discriminator, converted to the explicit True semantics, atomically
+    rewritten to new-v3, and stable across two cold boots. The deadline old stuck
+    shape (``timeout_pending``) migrates to FAILED/deadline_exceeded. A
+    new-schema ``None`` (quarantine marker present) stays rejected fail-closed."""
+    old = _load_old_producer(tmp_path)
+    tenant_id = "tenant-a"
+
+    # -- REAL old-producer cancel-stuck shape (cancellation_requested null) ---
+    cancel_path = tmp_path / "old-cancel.json"
+    # The migration reads a byte-identical COPY of the stuck disk state: the
+    # teardown below must stop the stubborn operation, and the old producer's
+    # own done-callback then settles the record — so the untouched stuck shape is
+    # captured before the teardown runs.
+    cancel_upgrade_path = tmp_path / "old-cancel-upgrade.json"
+    stop_cancel = asyncio.Event()
+
+    async def stubborn(_: Any) -> dict[str, Any]:
+        while not stop_cancel.is_set():
+            with suppress(asyncio.CancelledError):
+                await asyncio.sleep(0.001)
+        return {"stopped": True}
+
+    old_cancel = old.LivePlanningJobRegistry(
+        state_path=cancel_path, capacity=8, cancel_wait_seconds=0.05
+    )
+    old_cancel_runtime: Any = None
+    try:
+        snap, _replayed = await old_cancel.start_idempotent(
+            tenant_id=tenant_id,
+            operation=stubborn,
+            idempotency_key="old-cancel",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=30,
+        )
+        old_cancel_runtime = old_cancel._records[snap.id]
+        await _wait_for_state(old_cancel, snap.id, tenant_id, old.LivePlanningJobState.RUNNING)
+        await old_cancel.cancel(snap.id, tenant_id)
+        for _ in range(300):
+            if old_cancel_runtime.snapshot.stage == "cancel_timed_out":
+                break
+            await asyncio.sleep(0.01)
+        assert old_cancel_runtime.snapshot.stage == "cancel_timed_out"
+        assert old_cancel_runtime.snapshot.cancel_pending is True
+        assert old_cancel_runtime.pending_terminal is not None
+        assert old_cancel_runtime.pending_terminal.cancellation_requested is None
+        # Capture the exact stuck disk state for the migration below (the new
+        # loader validates the owner-only 0600 mode, so preserve it).
+        cancel_upgrade_path.write_bytes(cancel_path.read_bytes())
+        cancel_upgrade_path.chmod(0o600)
+    finally:
+        await _hard_teardown_old_registry(old_cancel, stop_cancel, old_cancel_runtime)
+
+    old_disk = json.loads(cancel_upgrade_path.read_text(encoding="utf-8"))
+    old_record = next(
+        record for record in old_disk["records"] if record["snapshot"]["id"] == snap.id
+    )
+    assert old_record["snapshot"]["stage"] == "cancel_timed_out"
+    assert old_record["snapshot"]["cancel_pending"] is True
+    assert old_record["pending_terminal"]["cancellation_requested"] is None
+    assert "quarantined" not in old_record
+
+    # Upgrade load: the legacy branch accepts the historical None and the record
+    # cold-starts to the DURABLE cancel intent (CANCELLED/cancelled).
+    first = LivePlanningJobRegistry(state_path=cancel_upgrade_path, capacity=8)
+    try:
+        recovered = await first.get(snap.id, tenant_id)
+        assert recovered is not None
+        assert recovered.state == LivePlanningJobState.CANCELLED
+        assert recovered.stage == "cancelled"
+    finally:
+        await first.close()
+
+    # The file was atomically rewritten to new-v3 — terminal facts, no null.
+    migrated_disk = json.loads(cancel_upgrade_path.read_text(encoding="utf-8"))
+    migrated_record = next(
+        record for record in migrated_disk["records"] if record["snapshot"]["id"] == snap.id
+    )
+    assert migrated_record["snapshot"]["state"] == "cancelled"
+    assert migrated_record["snapshot"]["stage"] == "cancelled"
+    assert migrated_record["pending_terminal"] is None
+
+    # A second cold boot reads the same terminal facts — no drift.
+    second = LivePlanningJobRegistry(state_path=cancel_upgrade_path, capacity=8)
+    try:
+        again = await second.get(snap.id, tenant_id)
+        assert again is not None
+        assert again.state == LivePlanningJobState.CANCELLED
+        assert again.stage == "cancelled"
+    finally:
+        await second.close()
+
+    # -- REAL old-producer deadline-stuck shape (timeout_pending, True) -------
+    deadline_path = tmp_path / "old-deadline.json"
+    deadline_upgrade_path = tmp_path / "old-deadline-upgrade.json"
+    stop_deadline = asyncio.Event()
+
+    async def stubborn_deadline(_: Any) -> dict[str, Any]:
+        while not stop_deadline.is_set():
+            with suppress(asyncio.CancelledError):
+                await asyncio.sleep(0.001)
+        return {"stopped": True}
+
+    old_deadline = old.LivePlanningJobRegistry(
+        state_path=deadline_path, capacity=8, cancel_wait_seconds=0.05
+    )
+    old_deadline_runtime: Any = None
+    try:
+        snap2, _replayed = await old_deadline.start_idempotent(
+            tenant_id=tenant_id,
+            operation=stubborn_deadline,
+            idempotency_key="old-deadline",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=0.15,
+        )
+        old_deadline_runtime = old_deadline._records[snap2.id]
+        for _ in range(300):
+            if old_deadline_runtime.snapshot.stage == "timeout_pending":
+                break
+            await asyncio.sleep(0.01)
+        assert old_deadline_runtime.snapshot.stage == "timeout_pending"
+        assert old_deadline_runtime.snapshot.cancel_pending is True
+        assert old_deadline_runtime.pending_terminal is not None
+        assert old_deadline_runtime.pending_terminal.cancellation_requested is True
+        assert old_deadline_runtime.pending_terminal.state == old.LivePlanningJobState.FAILED
+        # Capture the exact stuck disk state for the migration below.
+        deadline_upgrade_path.write_bytes(deadline_path.read_bytes())
+        deadline_upgrade_path.chmod(0o600)
+    finally:
+        await _hard_teardown_old_registry(old_deadline, stop_deadline, old_deadline_runtime)
+
+    old_deadline_disk = json.loads(deadline_upgrade_path.read_text(encoding="utf-8"))
+    old_deadline_record = next(
+        record for record in old_deadline_disk["records"] if record["snapshot"]["id"] == snap2.id
+    )
+    assert old_deadline_record["snapshot"]["stage"] == "timeout_pending"
+    assert old_deadline_record["snapshot"]["cancel_pending"] is True
+    assert old_deadline_record["pending_terminal"]["cancellation_requested"] is True
+    assert "quarantined" not in old_deadline_record
+
+    first_dl = LivePlanningJobRegistry(state_path=deadline_upgrade_path, capacity=8)
+    try:
+        recovered_dl = await first_dl.get(snap2.id, tenant_id)
+        assert recovered_dl is not None
+        assert recovered_dl.state == LivePlanningJobState.FAILED
+        assert recovered_dl.stage == "deadline_exceeded"
+    finally:
+        await first_dl.close()
+
+    second_dl = LivePlanningJobRegistry(state_path=deadline_upgrade_path, capacity=8)
+    try:
+        again_dl = await second_dl.get(snap2.id, tenant_id)
+        assert again_dl is not None
+        assert again_dl.state == LivePlanningJobState.FAILED
+        assert again_dl.stage == "deadline_exceeded"
+    finally:
+        await second_dl.close()
+
+    # -- Negative: new-schema None (quarantine marker present) is rejected -----
+    new_schema_path = tmp_path / "new-schema-null.json"
+    new_snap = _v3_snapshot(
+        "live-job-new-null",
+        LivePlanningJobState.RUNNING,
+        "cancel_timed_out",
+        5,
+        2,
+        cancellation_requested=True,
+        cancel_pending=True,
+    )
+    new_payload = {
+        "schema_version": "tripchord-live-job-registry-v3",
+        "records": [
+            {
+                "tenant_partition": LivePlanningJobRegistry._tenant_partition(tenant_id),
+                "snapshot": new_snap.model_dump(mode="json"),
+                "prepared": False,
+                "activation_operation": None,
+                "pending_terminal": _pending_outcome(cancellation_requested=None),
+                "quarantined": False,
+                "quarantine_stage": None,
+            }
+        ],
+        "idempotency": [_v3_idempotency_entry(tenant_id, "new-null", "live-job-new-null")],
+    }
+    _write_registry_state(new_payload, new_schema_path)
+    with pytest.raises(RuntimeError, match="pending terminal is invalid"):
+        LivePlanningJobRegistry(state_path=new_schema_path, capacity=4)

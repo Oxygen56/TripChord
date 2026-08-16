@@ -78,6 +78,36 @@ _ISOLATED_AMBIGUOUS_CANCEL_STAGE = "isolated_ambiguous_cancel"
 # owner re-commits it, then drains the operation and terminalizes.
 _DEADLINE_INTENT_PERSIST_PENDING_STAGE = "deadline_intent_persist_pending"
 
+# C-146 P0 supplement (fourth P0): the explicit NON-terminal quarantine stage a
+# record enters once the bounded STATE budget (attempts / total wall-clock) for
+# the first durable intent is exhausted under a permanent storage failure. The
+# in-memory intent and isolation stay recoverable, but the registry stops the
+# burst retry — no FAILED/CANCELLED is ever written or claimed from memory, and
+# the record no longer counts against executable active capacity. Store
+# recovery auto-reconciles it (persist quarantine + target facts, then release
+# quotas).
+_QUARANTINE_INTENT_UNCOMMITTED_STAGE = "quarantine_intent_uncommitted"
+
+# C-146 P0 supplement (fourth P0): the explicit NON-terminal quarantine stage a
+# record enters once the EXECUTION budget (absolute deadline + grace) is
+# reached and the real operation did not provably stop. The executor is
+# hard-stopped/detached within that absolute bound — its registry-facing side
+# effects are isolated by the generation bump, the admission slot is released
+# only in a bounded way, and the orphan is counted against the quarantine
+# quota. Never a fabricated FAILED/CANCELLED label.
+_QUARANTINE_HARD_STOPPED_STAGE = "quarantine_hard_stopped"
+
+# Every explicit quarantine stage. Records in these stages are NON-terminal,
+# excluded from executable active capacity, and governed by the bounded
+# quarantine quota + retention.
+_QUARANTINE_STAGES = frozenset(
+    {
+        _ISOLATED_AMBIGUOUS_CANCEL_STAGE,
+        _QUARANTINE_INTENT_UNCOMMITTED_STAGE,
+        _QUARANTINE_HARD_STOPPED_STAGE,
+    }
+)
+
 
 def _aware(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
@@ -187,16 +217,28 @@ class _PendingTerminalOutcome:
                 else None
             ),
             "safe_failure_details_digest": (
-                self.safe_failure.details_digest
-                if self.safe_failure is not None
-                else None
+                self.safe_failure.details_digest if self.safe_failure is not None else None
             ),
             "cancellation_requested": self.cancellation_requested,
         }
 
     @classmethod
-    def from_persisted(cls, raw: Any) -> _PendingTerminalOutcome:
+    def from_persisted(
+        cls,
+        raw: Any,
+        *,
+        legacy_v3_none_cancellation: bool = False,
+    ) -> _PendingTerminalOutcome:
         """Strictly decode a durable pending outcome, or raise ``ValueError``.
+
+        ``legacy_v3_none_cancellation`` is set ONLY by the v3 loader for the
+        exact historical combination the pre-P0 ``_mark_cancel_stuck`` producer
+        wrote on disk (a stuck isolation with ``cancel_pending`` and a pending
+        outcome whose ``cancellation_requested`` defaulted to ``None``). That
+        bounded migration accepts the ``None`` and converts it to the explicit
+        ``True`` semantics; every new-schema ``None`` / foreign / tampered value
+        is rejected fail-closed (the new producer always writes exactly
+        ``True``).
 
         The decoder accepts ONLY the exact field set the producer writes
         (``to_persisted``), forbids a SUCCEEDED target, and precisely binds the
@@ -252,7 +294,16 @@ class _PendingTerminalOutcome:
                 raise ValueError("pending terminal outcome is missing its failure error")
         cancellation_requested = raw["cancellation_requested"]
         if cancellation_requested is not True:
-            raise ValueError("pending terminal outcome has an invalid cancellation flag")
+            # C-146 P0 supplement (P0-4 / b119): a REAL old-v3 file may carry
+            # ``None`` here from the historical ``_mark_cancel_stuck`` default
+            # path. ONLY the loader's exact legacy combination (same field set +
+            # the old producer's stuck isolation + untampered identity) may
+            # migrate the None to the explicit True semantics; every new-schema
+            # None or foreign value is corruption and rejected fail-closed.
+            if cancellation_requested is None and legacy_v3_none_cancellation:
+                cancellation_requested = True
+            else:
+                raise ValueError("pending terminal outcome has an invalid cancellation flag")
         safe_failure: _SafeFailureDiagnostic | None = None
         code_raw = raw["safe_failure_code"]
         details_raw = raw["safe_failure_details"]
@@ -261,9 +312,7 @@ class _PendingTerminalOutcome:
             # cancel/close intents never carry a safe-failure diagnostic; any
             # dangling details/digest here is corruption.
             if code_raw is not None or details_raw is not None or digest_raw is not None:
-                raise ValueError(
-                    "pending terminal outcome has dangling safe failure fields"
-                )
+                raise ValueError("pending terminal outcome has dangling safe failure fields")
         else:
             # A FAILED/deadline_exceeded intent ALWAYS carries a complete,
             # consistent safe-failure diagnostic — the digest must recompute
@@ -280,13 +329,9 @@ class _PendingTerminalOutcome:
                 code = LivePlanningSafeFailureCode(code_raw)
                 details = LivePlanningSafeFailureDetails.model_validate(details_raw)
             except (ValueError, ValidationError) as exc:
-                raise ValueError(
-                    "pending terminal outcome has an invalid safe failure"
-                ) from exc
+                raise ValueError("pending terminal outcome has an invalid safe failure") from exc
             if _safe_failure_details_digest(code, details) != digest_raw:
-                raise ValueError(
-                    "pending terminal outcome safe failure digest is inconsistent"
-                )
+                raise ValueError("pending terminal outcome safe failure digest is inconsistent")
             safe_failure = _SafeFailureDiagnostic(
                 code=code,
                 details=details,
@@ -325,8 +370,7 @@ def _safe_validation_errors(exc: ValidationError) -> tuple[LivePlanningSafeValid
         raw_type = raw_error.get("type")
         error_type = (
             raw_type
-            if isinstance(raw_type, str)
-            and _SAFE_VALIDATION_TYPE_PATTERN.fullmatch(raw_type)
+            if isinstance(raw_type, str) and _SAFE_VALIDATION_TYPE_PATTERN.fullmatch(raw_type)
             else "unknown_error_type"
         )
         raw_loc = raw_error.get("loc")
@@ -410,8 +454,7 @@ def _safe_failure_diagnostic(
         raw_title = target.title
         validation_model = (
             raw_title
-            if isinstance(raw_title, str)
-            and _SAFE_VALIDATION_MODEL_PATTERN.fullmatch(raw_title)
+            if isinstance(raw_title, str) and _SAFE_VALIDATION_MODEL_PATTERN.fullmatch(raw_title)
             else "ValidationModel"
         )
     elif isinstance(target, ValueError):
@@ -568,9 +611,7 @@ class LivePlanningPairCheckpoint(DomainModel):
             json.dumps(
                 value,
                 default=lambda item: (
-                    item.isoformat()
-                    if isinstance(item, (date, datetime))
-                    else str(item)
+                    item.isoformat() if isinstance(item, (date, datetime)) else str(item)
                 ),
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -644,12 +685,8 @@ class LivePlanningJobSnapshot(DomainModel):
         "终态按容量和 TTL 有界保存。进程重启不恢复任务，不能视为持久化生产队列。"
     )
 
-    _validate_created_at = field_validator("created_at")(
-        lambda value: _aware(value, "created_at")
-    )
-    _validate_updated_at = field_validator("updated_at")(
-        lambda value: _aware(value, "updated_at")
-    )
+    _validate_created_at = field_validator("created_at")(lambda value: _aware(value, "created_at"))
+    _validate_updated_at = field_validator("updated_at")(lambda value: _aware(value, "updated_at"))
     _validate_deadline_at = field_validator("deadline_at")(
         lambda value: _aware(value, "deadline_at")
     )
@@ -670,10 +707,7 @@ class LivePlanningJobSnapshot(DomainModel):
             raise ValueError("live job model trace counts must add up")
         if (self.request_sha256 is None) != (self.model_trace_scope_sha256 is None):
             raise ValueError("live job request and model trace scope SHA-256 must be set together")
-        if (
-            self.request_sha256 is not None
-            and self.model_trace_scope_sha256 != self.request_sha256
-        ):
+        if self.request_sha256 is not None and self.model_trace_scope_sha256 != self.request_sha256:
             raise ValueError("live job model trace scope SHA-256 must match its request")
         if tuple(item.sequence for item in self.pair_checkpoints) != tuple(
             range(1, len(self.pair_checkpoints) + 1)
@@ -684,9 +718,7 @@ class LivePlanningJobSnapshot(DomainModel):
             raise ValueError("live pair checkpoints must bind unique date pairs")
         if self.pair_checkpoints and self.request_sha256 is None:
             raise ValueError("live pair checkpoints require a bound job request SHA-256")
-        if any(
-            item.request_sha256 != self.request_sha256 for item in self.pair_checkpoints
-        ):
+        if any(item.request_sha256 != self.request_sha256 for item in self.pair_checkpoints):
             raise ValueError("live pair checkpoint request SHA-256 must match its job")
         safe_failure_fields = (
             self.safe_failure_code,
@@ -936,6 +968,30 @@ class _RuntimeJob:
         # the real operation and the admission slot are left untouched — the
         # cleanup owner re-commits the intent before any cancel/drain.
         self.intent_persist_pending = False
+        # C-146 P0 supplement (fourth P0): bounded STATE budget bookkeeping for
+        # the first durable intent. The total attempts and the wall-clock since
+        # the first attempt bound the burst retry; when either budget is
+        # exhausted the record is quarantined non-terminal and the burst stops.
+        self.intent_persist_attempts = 0
+        self.intent_persist_started_monotonic = 0.0
+        # C-146 P0 supplement (fourth P0): EXECUTION budget. The absolute bound
+        # at which the real executor must be hard-stopped/quarantined regardless
+        # of storage recovery is ``deadline_monotonic + grace``. The single
+        # hard-stop watchdog isolates a live operation once this passes.
+        self.hard_stop_monotonic = 0.0
+        self.hard_stopped = False
+        # C-146 P0 supplement (fourth P0) / b119: quarantine membership. A
+        # quarantined record is NON-terminal, does NOT count against executable
+        # active capacity, is governed by the bounded quarantine quota +
+        # retention, and keeps a minimal durable tombstone after reclamation so
+        # a same-key request still fails closed.
+        self.quarantined = False
+        self.quarantine_stage: str | None = None
+        # C-146 P0 supplement (fourth P0): has the durable quarantine fact been
+        # committed? For a quarantined record WITHOUT a pending terminal outcome
+        # (hard-stopped / ambiguous-isolated) the reconcile is complete exactly
+        # once the quarantine facts are on disk — no terminal settlement exists.
+        self.quarantine_reconciled = False
 
 
 class _IdempotencyEntry:
@@ -970,6 +1026,24 @@ class LivePlanningJobRegistry:
         cancel_wait_seconds: float = 10,
         cancel_isolation_persist_attempts: int = 3,
         cleanup_retry_backoff_seconds: float = 0.02,
+        # C-146 P0 supplement (fourth P0): the absolute EXECUTION budget is the
+        # deadline plus this grace. The single hard-stop watchdog quarantines a
+        # live operation once the bound passes, regardless of storage recovery.
+        execution_hard_stop_grace_seconds: float = 5.0,
+        # C-146 P0 supplement (fourth P0): the bounded STATE budget for the
+        # first durable intent. A burst of persist attempts beyond either cap
+        # stops and the record is quarantined non-terminal. Defaults are
+        # deliberately generous so a short transient write failure never
+        # quarantines a record whose intent commits a moment later.
+        intent_persist_budget_attempts: int = 30,
+        intent_persist_wallclock_budget_seconds: float = 5.0,
+        # C-146 P0 supplement (fourth P0) / b119: the bounded quarantine quota
+        # and retention. Quarantined (non-terminal) records are NOT counted
+        # against executable active capacity; they are governed by their own
+        # quota and are reclaimed after the retention window, leaving a minimal
+        # durable tombstone so a same-key request still fails closed.
+        quarantine_capacity: int = 8,
+        quarantine_retention: timedelta = timedelta(hours=6),
         now: Callable[[], datetime] | None = None,
         state_path: Path | None = None,
     ) -> None:
@@ -985,12 +1059,27 @@ class LivePlanningJobRegistry:
             raise ValueError("cancel_isolation_persist_attempts must be at least one")
         if cleanup_retry_backoff_seconds <= 0:
             raise ValueError("cleanup_retry_backoff_seconds must be positive")
+        if execution_hard_stop_grace_seconds < 0:
+            raise ValueError("execution_hard_stop_grace_seconds must be non-negative")
+        if intent_persist_budget_attempts < 1:
+            raise ValueError("intent_persist_budget_attempts must be at least one")
+        if intent_persist_wallclock_budget_seconds <= 0:
+            raise ValueError("intent_persist_wallclock_budget_seconds must be positive")
+        if quarantine_capacity < 1:
+            raise ValueError("quarantine_capacity must be positive")
+        if quarantine_retention <= timedelta(0):
+            raise ValueError("quarantine_retention must be positive")
         self._capacity = capacity
         self._terminal_ttl = terminal_ttl
         self._now = now or (lambda: datetime.now(UTC))
         self._cancel_wait_seconds = cancel_wait_seconds
         self._cancel_isolation_persist_attempts = cancel_isolation_persist_attempts
         self._cleanup_retry_backoff_seconds = cleanup_retry_backoff_seconds
+        self._execution_hard_stop_grace_seconds = execution_hard_stop_grace_seconds
+        self._intent_persist_budget_attempts = intent_persist_budget_attempts
+        self._intent_persist_wallclock_budget_seconds = intent_persist_wallclock_budget_seconds
+        self._quarantine_capacity = quarantine_capacity
+        self._quarantine_retention = quarantine_retention
         self._slots = asyncio.Semaphore(max_running)
         self._records: dict[str, _RuntimeJob] = {}
         self._idempotency: dict[str, _IdempotencyEntry] = {}
@@ -1002,6 +1091,11 @@ class LivePlanningJobRegistry:
         # owner after a bounded backoff until the terminal commit succeeds, and
         # self-terminates when no pending outcome needs a retry.
         self._reaper_task: asyncio.Task[None] | None = None
+        # C-146 P0 supplement (fourth P0): the single, bounded hard-stop
+        # watchdog. Spawned lazily once a live operation's absolute execution
+        # bound can be reached; it quarantines the executor past the bound and
+        # self-terminates when no operation needs it.
+        self._hard_stop_watchdog: asyncio.Task[None] | None = None
         self._state_path = state_path
         if self._state_path is not None:
             self._load_state()
@@ -1046,12 +1140,8 @@ class LivePlanningJobRegistry:
             raise RuntimeError("live planning job registry state schema is invalid")
         records = payload["records"]
         idempotency = payload["idempotency"]
-        if (
-            not isinstance(records, list)
-            or len(records) > self._capacity
-            or not isinstance(idempotency, list)
-        ):
-            raise RuntimeError("live planning job registry state exceeds its bounds")
+        if not isinstance(records, list) or not isinstance(idempotency, list):
+            raise RuntimeError("live planning job registry state has an invalid shape")
         for item in records:
             expected_record_fields = {
                 "tenant_partition",
@@ -1068,6 +1158,12 @@ class LivePlanningJobRegistry:
             # null) for every record.
             if schema_version == "tripchord-live-job-registry-v3":
                 expected_record_fields.add("pending_terminal")
+            # C-146 P0 supplement (P0-4): ``quarantined``/``quarantine_stage`` are
+            # OPTIONAL v3 fields. Old v3 files omit them entirely; new files
+            # write them for every record (null stage when not quarantined).
+            if schema_version == "tripchord-live-job-registry-v3":
+                expected_record_fields.add("quarantined")
+                expected_record_fields.add("quarantine_stage")
             # C-145 P0 supplement: the v3 loader explicitly accepts BOTH the
             # new-v3 field set (with ``pending_terminal``, possibly null) AND the
             # old-v3 field set (without the key at all — migrated to a null
@@ -1077,7 +1173,13 @@ class LivePlanningJobRegistry:
             if schema_version == "tripchord-live-job-registry-v3":
                 accepted_record_field_sets = {
                     frozenset(expected_record_fields),
-                    frozenset(expected_record_fields - {"pending_terminal"}),
+                    # old v3 with the intent but without the quarantine marker
+                    frozenset(expected_record_fields - {"quarantined", "quarantine_stage"}),
+                    # old v3 without either the intent or the quarantine marker
+                    frozenset(
+                        expected_record_fields
+                        - {"pending_terminal", "quarantined", "quarantine_stage"}
+                    ),
                 }
             if not isinstance(item, dict) or set(item) not in accepted_record_field_sets:
                 raise RuntimeError("live planning job registry record is invalid")
@@ -1118,15 +1220,57 @@ class LivePlanningJobRegistry:
                 # ``get`` migrates an old-v3 record (no key) to a null intent.
                 raw_pending = item.get("pending_terminal")
                 if raw_pending is not None:
+                    # C-146 P0 supplement (P0-4 / b119): the historical
+                    # ``cancellation_requested: None`` is migrated to the
+                    # explicit True semantics ONLY for the exact old-producer
+                    # combination — a pre-this-change v3 record (no durable
+                    # quarantine marker) whose snapshot carries the OLD stuck
+                    # isolation (``cancel_pending`` at the old ``cancel_timed_out``
+                    # stage, the shape the pre-P0 producer's default path wrote).
+                    # The identity/digest were already validated untampered above.
+                    # Every new-schema None / foreign / mixed / wrong-stage value
+                    # is rejected fail-closed.
+                    legacy_v3_none_cancellation = (
+                        "quarantined" not in item
+                        and snapshot.cancel_pending
+                        and snapshot.stage == "cancel_timed_out"
+                    )
                     try:
                         runtime.pending_terminal = _PendingTerminalOutcome.from_persisted(
-                            raw_pending
+                            raw_pending,
+                            legacy_v3_none_cancellation=legacy_v3_none_cancellation,
                         )
                     except (ValueError, KeyError, TypeError, ValidationError) as exc:
                         raise RuntimeError(
                             "live planning job registry pending terminal is invalid"
                         ) from exc
+                # C-146 P0 supplement (P0-4): quarantine membership is durable.
+                # ``get`` migrates an old-v3 record (no key) to non-quarantined.
+                quarantined = item.get("quarantined", False)
+                quarantine_stage = item.get("quarantine_stage")
+                if type(quarantined) is not bool:
+                    raise RuntimeError("live planning job registry quarantine flag is invalid")
+                if quarantined:
+                    if quarantine_stage not in _QUARANTINE_STAGES:
+                        raise RuntimeError("live planning job registry quarantine stage is invalid")
+                    runtime.quarantined = True
+                    runtime.quarantine_stage = quarantine_stage
+                elif quarantine_stage is not None:
+                    raise RuntimeError("live planning job registry quarantine stage is invalid")
             self._records[snapshot.id] = runtime
+        # C-146 P0 supplement (P0-4) / b119: active record capacity and
+        # quarantine capacity are validated INDEPENDENTLY. A legal file may hold
+        # ``capacity`` ordinary executable records PLUS up to
+        # ``quarantine_capacity`` isolated/quarantined records — the latter never
+        # occupy executable active capacity. Each quota is enforced separately so
+        # neither a ghost quarantine nor an overflowing active set can hide
+        # behind the other.
+        active_records = sum(1 for item in self._records.values() if not item.quarantined)
+        quarantined_records = len(self._records) - active_records
+        if active_records > self._capacity:
+            raise RuntimeError("live planning job registry state exceeds its bounds")
+        if quarantined_records > self._quarantine_capacity:
+            raise RuntimeError("live planning job registry quarantine bounds exceeded")
         for item in idempotency:
             expected_idempotency_fields = {
                 "partition",
@@ -1165,16 +1309,28 @@ class LivePlanningJobRegistry:
                 if type(legacy_isolated) is not bool:
                     raise RuntimeError("live planning idempotency isolation is invalid")
             runtime = self._records.get(job_id)
-            if (
-                runtime is None
-                or runtime.snapshot.request_sha256 != request_digest
-            ):
+            if runtime is None:
+                # C-146 P0 supplement (P0-4)/b119: a minimal durable tombstone
+                # keeps the idempotency binding after its quarantined record is
+                # reclaimed, so a same-key request always fails closed and the
+                # key is never silently reused. ONLY an isolated v3 binding is a
+                # valid tombstone — a non-isolated binding pointing at a missing
+                # record is corrupt, and a legacy v1/v2 binding can never be a
+                # tombstone (quarantine only exists in v3).
+                if (
+                    not legacy_isolated
+                    or defer_start is None
+                    or schema_version != "tripchord-live-job-registry-v3"
+                ):
+                    raise RuntimeError("live planning idempotency binding is invalid")
+            elif runtime.snapshot.request_sha256 != request_digest:
                 raise RuntimeError("live planning idempotency binding is invalid")
             if defer_start is None:
                 # P0-2: legacy v1/v2 records carry no execution mode. Derive the
                 # provable mode from the surviving durable facts; when the facts
                 # are insufficient, fail closed into an isolated binding that is
                 # never replayed (the derived bool is persisted, never null).
+                assert runtime is not None
                 derived = self._derive_legacy_execution_mode(
                     runtime,
                     schema_version=schema_version,
@@ -1192,7 +1348,24 @@ class LivePlanningJobRegistry:
             )
         for runtime in self._records.values():
             if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                # C-146 P0 supplement (P0-4): a record that loaded as
+                # ``prepared=True`` is provably never-executed (the on-disk
+                # invariant forbids a prepared record in any state but QUEUED,
+                # and activation is the only way a prepared job ever starts).
+                # ``prepared`` is reset below, so capture the durable flag
+                # before the reset: restart_cancelled is honest ONLY for this
+                # shape — never for an admitted immediate (prepared=False)
+                # record whose operation may already have been executing.
+                was_prepared = runtime.prepared
                 runtime.prepared = False
+                if runtime.quarantined:
+                    # C-146 P0 supplement (P0-4): a quarantined record stays
+                    # quarantined NON-terminal across a cold boot — never
+                    # terminalized from a memory-only intent, never re-isolated,
+                    # never unquarantined. The quarantine facts (stage, error,
+                    # updated_at) are durable and idempotent, so a second cold
+                    # boot observes exactly the same state.
+                    continue
                 pending = runtime.pending_terminal
                 if pending is not None and runtime.snapshot.cancel_pending:
                     # C-145 P0: a DURABLE retry intent survives a restart. The
@@ -1214,8 +1387,12 @@ class LivePlanningJobRegistry:
                     # C-145 P0 supplement: a record quarantined by an earlier
                     # cold start stays quarantined — re-isolating is idempotent,
                     # so two consecutive cold starts never drift it into a
-                    # guessed CANCELLED/FAILED label.
-                    pass
+                    # guessed CANCELLED/FAILED label. C-146 P0 supplement
+                    # (P0-4): old v3 files lack the durable ``quarantined``
+                    # marker, so a record at this stage is upgraded atomically to
+                    # the explicit quarantine flag (persisted on the next write).
+                    runtime.quarantined = True
+                    runtime.quarantine_stage = _ISOLATED_AMBIGUOUS_CANCEL_STAGE
                 elif pending is not None or runtime.snapshot.cancel_pending:
                     # C-145 P0 supplement: a non-terminal record whose durable
                     # cancel intent (pending=true) has NO provable terminal
@@ -1225,12 +1402,14 @@ class LivePlanningJobRegistry:
                     # the record is isolated (never replayed) and the ambiguity
                     # is surfaced explicitly.
                     self._isolate_ambiguous_cancel_locked(runtime)
-                elif runtime.snapshot.state == LivePlanningJobState.QUEUED:
+                elif was_prepared and runtime.snapshot.state == LivePlanningJobState.QUEUED:
                     # C-146 P0 supplement (P0-3): a record that never passed the
                     # admission barrier provably never executed — the operation
                     # closure cannot have started, so a CANCELLED label guesses
                     # nothing about live work. restart_cancelled is the honest,
-                    # provable tombstone for a never-started job.
+                    # provable tombstone for a never-started job. P0-4 narrows
+                    # this to ``was_prepared`` records ONLY: a prepared record is
+                    # the one shape whose durable flag proves it never executed.
                     self._terminalize_locked(
                         runtime,
                         LivePlanningJobState.CANCELLED,
@@ -1239,7 +1418,7 @@ class LivePlanningJobRegistry:
                         cancellation_requested=True,
                     )
                 elif runtime.snapshot.deadline_at <= self._utc_now():
-                    # C-146 P0 supplement (P0-3): recover FAILED/deadline_exceeded
+                    # C-146 P0 supplement (P0-3/P0-4): recover FAILED/deadline_exceeded
                     # ONLY from durable unforgeable deadline provenance. An
                     # admitted record with NO cancel intent whose deadline
                     # provably passed before the crash — including one that died
@@ -1258,21 +1437,62 @@ class LivePlanningJobRegistry:
                         ),
                         cancellation_requested=True,
                     )
+                elif (
+                    runtime.activation_operation is not None
+                    and runtime.activation_operation.get("phase")
+                    in {"intent", "dispatched", "committed"}
+                    and runtime.snapshot.state == LivePlanningJobState.QUEUED
+                ):
+                    # C-143 (91648931) / C-146 P0-4: a FORMAL activation that was
+                    # interrupted by the process death. ``activate`` resets
+                    # ``prepared`` (so the was_prepared branch above cannot fire)
+                    # and the durable activation_operation proves the job passed
+                    # the admission barrier and was activating (intent/dispatched)
+                    # or already committed (committed) while its snapshot never
+                    # advanced past QUEUED. With the deadline NOT yet passed (the
+                    # branch above would otherwise have proved deadline
+                    # provenance) and the executor gone with the process boundary,
+                    # restart_cancelled is the contract-allowed, provable
+                    # outcome — the same-key retry fails closed and the dispatched
+                    # operation is never replayed. Distinct from a plain immediate
+                    # (prepared=False, no activation) QUEUED record, whose
+                    # operation may have been executing when the process died and
+                    # which stays quarantined ambiguous.
+                    self._terminalize_locked(
+                        runtime,
+                        LivePlanningJobState.CANCELLED,
+                        stage="restart_cancelled",
+                        error="live planning job cannot continue after process restart",
+                        cancellation_requested=True,
+                    )
                 else:
-                    # C-146 P0 supplement (P0-3): an admitted record whose
+                    # C-146 P0 supplement (P0-3/P0-4): an admitted record whose
                     # deadline did not pass and that carries no durable cancel
                     # intent gives insufficient unforgeable facts to prove ANY
-                    # terminal outcome. restart_cancelled is a guess (was it
-                    # cancelled? a deadline? still running?), so it is never
-                    # fabricated: the record is quarantined as ambiguous instead.
+                    # terminal outcome. This includes a QUEUED immediate record
+                    # (prepared=False): its operation may already have been
+                    # executing when the process died (RUNNING is never a
+                    # durable write), so restart_cancelled would guess a CANCELLED
+                    # label over live work. No terminal label is fabricated: the
+                    # record is quarantined as ambiguous instead.
                     self._isolate_ambiguous_cancel_locked(runtime)
                 runtime.pending_terminal = None
+        # C-146 P0 supplement (P0-4) / b119: the resolution loop above may have
+        # quarantined newly-isolated ambiguous records. Re-validate the two
+        # INDEPENDENT quotas AFTER resolution so a hand-crafted file whose
+        # quarantine exceeds its own bounded quota is rejected fail-closed
+        # before anything is persisted.
+        active_records = sum(1 for item in self._records.values() if not item.quarantined)
+        if active_records > self._capacity:
+            raise RuntimeError("live planning job registry state exceeds its bounds")
+        if len(self._records) - active_records > self._quarantine_capacity:
+            raise RuntimeError("live planning job registry quarantine bounds exceeded")
         self._prune_locked(self._utc_now())
         self._persist_locked()
 
     def _isolate_ambiguous_cancel_locked(self, runtime: _RuntimeJob) -> None:
         """Quarantine a non-terminal record whose durable cancel intent has no
-        provable terminal outcome (C-145 P0 supplement).
+        provable terminal outcome (C-145 P0 supplement / C-146 P0-4/b119).
 
         A record that was mid-cancel at the crash (``snapshot.cancel_pending``)
         but carries no durable ``pending_terminal`` gives no unforgeable fact to
@@ -1297,6 +1517,11 @@ class LivePlanningJobRegistry:
             }
         )
         runtime.cancel_pending = False
+        # C-146 P0 supplement (P0-4): a quarantined record is non-terminal but
+        # never occupies executable active capacity — the quarantine has its own
+        # bounded quota and retention.
+        runtime.quarantined = True
+        runtime.quarantine_stage = _ISOLATED_AMBIGUOUS_CANCEL_STAGE
         for entry in self._idempotency.values():
             if entry.job_id == runtime.snapshot.id:
                 entry.legacy_isolated = True
@@ -1398,10 +1623,14 @@ class LivePlanningJobRegistry:
                         if runtime.pending_terminal is not None
                         else None
                     ),
+                    # C-146 P0 supplement (P0-4): quarantine membership is durable
+                    # so a cold restart never treats a quarantined record as
+                    # active, never fabricates a terminal label for it, and never
+                    # silently reuses its key.
+                    "quarantined": runtime.quarantined,
+                    "quarantine_stage": runtime.quarantine_stage,
                 }
-                for runtime in sorted(
-                    self._records.values(), key=lambda item: item.snapshot.id
-                )
+                for runtime in sorted(self._records.values(), key=lambda item: item.snapshot.id)
             ],
             "idempotency": [
                 {
@@ -1450,9 +1679,7 @@ class LivePlanningJobRegistry:
                 raise OSError("injected post-replace directory fsync failure")
             parent_descriptor = os.open(
                 path.parent,
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
             )
             try:
                 os.fsync(parent_descriptor)
@@ -1542,6 +1769,12 @@ class LivePlanningJobRegistry:
             operation=operation,
             prepared=defer_start,
         )
+        # C-146 P0 supplement (fourth P0): the absolute EXECUTION bound. Once
+        # this monotonic time passes, the hard-stop watchdog must quarantine a
+        # still-live operation regardless of storage recovery.
+        runtime.hard_stop_monotonic = (
+            runtime.deadline_monotonic + self._execution_hard_stop_grace_seconds
+        )
         async with self._changed:
             if self._closed:
                 raise RuntimeError("live planning job registry is closed")
@@ -1551,7 +1784,17 @@ class LivePlanningJobRegistry:
                 if existing is not None:
                     existing_runtime = self._records.get(existing.job_id)
                     if existing_runtime is None:
-                        self._idempotency.pop(idempotency_partition, None)
+                        # C-146 P0 supplement (P0-4) / b119: a durable idempotency
+                        # binding whose record is gone is a minimal tombstone
+                        # (quarantine reclamation / cold-start load of a reclaimed
+                        # record). It ALWAYS fails closed — the key is never
+                        # silently deleted and reused, never re-admitted, never
+                        # replayed. Runtime-missing + close/cancel/prune/retention
+                        # must never clear it.
+                        raise LivePlanningJobIdempotencyConflictError(
+                            "idempotency key is bound to a reclaimed or isolated "
+                            "record and cannot be reused"
+                        )
                     elif not secrets.compare_digest(existing.request_digest, request_digest or ""):
                         raise LivePlanningJobIdempotencyConflictError(
                             "idempotency key was already used with a different request"
@@ -1562,10 +1805,7 @@ class LivePlanningJobRegistry:
                         raise LivePlanningJobIdempotencyConflictError(
                             "idempotency key is bound to an isolated legacy record"
                         )
-                    elif (
-                        existing.defer_start is not None
-                        and existing.defer_start != defer_start
-                    ):
+                    elif existing.defer_start is not None and existing.defer_start != defer_start:
                         # P0-3: the execution mode is part of the identity. A
                         # same-key request that switches between a prepared and an
                         # immediate execution must fail closed — never reuse the
@@ -1585,9 +1825,7 @@ class LivePlanningJobRegistry:
                         if existing_runtime.snapshot.cancel_pending:
                             if self._executors_stopped(existing_runtime):
                                 try:
-                                    self._complete_cancel_terminalize_locked(
-                                        existing_runtime
-                                    )
+                                    self._complete_cancel_terminalize_locked(existing_runtime)
                                 except LivePlanningJobRegistryPostCommitError as exc:
                                     exc.job_id = existing_runtime.snapshot.id
                                     raise
@@ -1602,9 +1840,7 @@ class LivePlanningJobRegistry:
                                 # P0-2: the HTTP layer must be able to surface
                                 # the original identity and a status query
                                 # location instead of a bare 500.
-                                cancellation_pending_error.job_id = (
-                                    existing_runtime.snapshot.id
-                                )
+                                cancellation_pending_error.job_id = existing_runtime.snapshot.id
                                 raise cancellation_pending_error
                         return existing_runtime.snapshot, True
             self._make_capacity_locked()
@@ -1664,20 +1900,27 @@ class LivePlanningJobRegistry:
             if runtime is None:
                 return None
             activation = runtime.activation_operation
+            if activation is not None and operation_id != activation["operation_id"]:
+                raise LivePlanningJobInactiveError(
+                    "live planning job uses a foreign activation operation"
+                )
+            if runtime.quarantined:
+                # C-146 P0 supplement (P0-4 / b119): a quarantined record is
+                # NON-terminal and never actionable — it must not be started,
+                # replayed, committed or reported as an in-flight dispatch. The
+                # quarantine is explicit and stable; fail closed, never guess a
+                # label for it.
+                raise LivePlanningJobInactiveError(
+                    "live planning job is quarantined and cannot be activated"
+                )
             if activation is not None:
-                if operation_id != activation["operation_id"]:
-                    raise LivePlanningJobInactiveError(
-                        "live planning job uses a foreign activation operation"
-                    )
                 if activation["phase"] == "cancelled":
                     raise LivePlanningJobInactiveError(
                         "live planning activation operation was cancelled"
                     )
                 if activation["phase"] in {"dispatched", "committed"}:
                     if runtime.snapshot.state == LivePlanningJobState.CANCELLED:
-                        raise LivePlanningJobInactiveError(
-                            "live planning job was cancelled"
-                        )
+                        raise LivePlanningJobInactiveError("live planning job was cancelled")
                     return runtime.snapshot
                 if activation["phase"] != "intent" or activation["dispatch_count"] != 0:
                     raise LivePlanningJobInactiveError(
@@ -1694,9 +1937,7 @@ class LivePlanningJobRegistry:
                     "live planning job is not an unactivated prepared job"
                 )
             if runtime.snapshot.state != LivePlanningJobState.QUEUED:
-                raise LivePlanningJobInactiveError(
-                    "prepared live planning job is no longer queued"
-                )
+                raise LivePlanningJobInactiveError("prepared live planning job is no longer queued")
             runtime.prepared = False
             if activation is not None:
                 # Reassign a fresh operation object instead of mutating in place so
@@ -1758,10 +1999,15 @@ class LivePlanningJobRegistry:
             "companion_identity_sha256",
             "queued_result",
         }
-        fields = immutable_fields if allow_intent_shape else immutable_fields | {
-            "phase",
-            "dispatch_count",
-        }
+        fields = (
+            immutable_fields
+            if allow_intent_shape
+            else immutable_fields
+            | {
+                "phase",
+                "dispatch_count",
+            }
+        )
         if not isinstance(value, dict) or set(value) != fields:
             raise RuntimeError("live planning activation operation has an invalid shape")
         if value["schema_version"] != "tripchord-live-activation-operation-v1":
@@ -1775,21 +2021,18 @@ class LivePlanningJobRegistry:
             "capability_sha256",
             "companion_identity_sha256",
         ):
-            if not isinstance(value[field_name], str) or re.fullmatch(
-                r"[0-9a-f]{64}", value[field_name]
-            ) is None:
-                raise RuntimeError(
-                    f"live planning activation operation {field_name} is invalid"
-                )
+            if (
+                not isinstance(value[field_name], str)
+                or re.fullmatch(r"[0-9a-f]{64}", value[field_name]) is None
+            ):
+                raise RuntimeError(f"live planning activation operation {field_name} is invalid")
         for field_name in ("idempotency_key", "challenge_id"):
             if (
                 not isinstance(value[field_name], str)
                 or not value[field_name].strip()
                 or len(value[field_name]) > 200
             ):
-                raise RuntimeError(
-                    f"live planning activation operation {field_name} is invalid"
-                )
+                raise RuntimeError(f"live planning activation operation {field_name} is invalid")
         queued_result = value["queued_result"]
         if (
             not isinstance(queued_result, dict)
@@ -1836,10 +2079,7 @@ class LivePlanningJobRegistry:
                 )
             existing = runtime.activation_operation
             if existing is not None:
-                existing_intent = {
-                    key: existing[key]
-                    for key in checked
-                }
+                existing_intent = {key: existing[key] for key in checked}
                 if existing_intent != checked:
                     raise LivePlanningJobInactiveError(
                         "live planning activation intent differs from the durable intent"
@@ -1849,8 +2089,7 @@ class LivePlanningJobRegistry:
                 not runtime.prepared
                 or runtime.task is not None
                 or runtime.snapshot.state != LivePlanningJobState.QUEUED
-                or checked["queued_result"]["job"]
-                != runtime.snapshot.model_dump(mode="json")
+                or checked["queued_result"]["job"] != runtime.snapshot.model_dump(mode="json")
             ):
                 raise LivePlanningJobInactiveError(
                     "live planning activation intent requires the exact prepared job"
@@ -1902,14 +2141,19 @@ class LivePlanningJobRegistry:
                 raise LivePlanningJobInactiveError(
                     "live planning job uses a foreign activation operation"
                 )
+            if runtime is not None and runtime.quarantined:
+                # C-146 P0 supplement (P0-4 / b119): a quarantined record's
+                # activation is never committed — fail closed, keep the durable
+                # facts untouched.
+                raise LivePlanningJobInactiveError(
+                    "live planning job is quarantined and cannot be committed"
+                )
             if operation["phase"] == "cancelled":
                 raise LivePlanningJobInactiveError(
                     "live planning activation operation was cancelled"
                 )
             if runtime is not None and runtime.snapshot.state == LivePlanningJobState.CANCELLED:
-                raise LivePlanningJobInactiveError(
-                    "live planning job was cancelled"
-                )
+                raise LivePlanningJobInactiveError("live planning job was cancelled")
             if operation["phase"] == "intent":
                 raise LivePlanningJobInactiveError(
                     "live planning activation operation was not dispatched"
@@ -1984,12 +2228,12 @@ class LivePlanningJobRegistry:
                 return None
             if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
                 return runtime.snapshot
-            if runtime.snapshot.stage == _ISOLATED_AMBIGUOUS_CANCEL_STAGE:
-                # C-145 P0 supplement: an ambiguous-cancel record is quarantined
-                # with no provable terminal outcome — an explicit cancel must NOT
-                # guess CANCELLED. Return the isolated snapshot unchanged
-                # (idempotent, fail-closed) so a later cold start sees the same
-                # isolation and the same-key path keeps failing closed.
+            if runtime.quarantined:
+                # C-145 P0 supplement / C-146 P0 supplement (P0-4): a quarantined
+                # record has no provable terminal outcome — an explicit cancel
+                # must NOT guess CANCELLED. Return the quarantined snapshot
+                # unchanged (idempotent, fail-closed) so a later cold start sees
+                # the same quarantine and the same-key path keeps failing closed.
                 return runtime.snapshot
             if runtime.intent_persist_pending:
                 # C-146 P0 supplement (P0-3): a deadline record whose FIRST
@@ -2198,9 +2442,11 @@ class LivePlanningJobRegistry:
         ``operation_task`` reference is never dropped while the operation lives.
         """
         async with self._changed:
-            # C-145 P0 supplement: an ``isolated_ambiguous_cancel`` record has
-            # NO provable terminal outcome — close() must never guess a
-            # CANCELLED label for it. It is excluded from the active set so the
+            # C-145 P0 supplement / C-146 P0 supplement (P0-4): a quarantined
+            # record has NO provable terminal outcome — close() must never guess
+            # a CANCELLED label for it. Every quarantine stage
+            # (``isolated_ambiguous_cancel``, ``quarantine_intent_uncommitted``,
+            # ``quarantine_hard_stopped``) is excluded from the active set so the
             # closing isolation, the durable CANCELLED intent and the executor
             # settle all leave it untouched; a later cold start still sees the
             # same quarantine.
@@ -2208,7 +2454,7 @@ class LivePlanningJobRegistry:
                 runtime
                 for runtime in self._records.values()
                 if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
-                and runtime.snapshot.stage != _ISOLATED_AMBIGUOUS_CANCEL_STAGE
+                and not runtime.quarantined
             )
             if not active:
                 self._closed = True
@@ -2226,9 +2472,7 @@ class LivePlanningJobRegistry:
                 # executors. A later close() then re-persists the intent because
                 # ``_closed`` is still False.
                 previous_snapshots = [runtime.snapshot for runtime in active]
-                previous_pending_terminals = [
-                    runtime.pending_terminal for runtime in active
-                ]
+                previous_pending_terminals = [runtime.pending_terminal for runtime in active]
                 for runtime in active:
                     if not runtime.snapshot.cancel_pending:
                         runtime.snapshot = runtime.snapshot.model_copy(
@@ -2254,9 +2498,7 @@ class LivePlanningJobRegistry:
                 try:
                     await self._persist_locked_with_bounded_retry()
                 except Exception:
-                    for runtime, previous_snapshot in zip(
-                        active, previous_snapshots, strict=True
-                    ):
+                    for runtime, previous_snapshot in zip(active, previous_snapshots, strict=True):
                         runtime.snapshot = previous_snapshot
                     for runtime, previous_pending in zip(
                         active, previous_pending_terminals, strict=True
@@ -2336,6 +2578,11 @@ class LivePlanningJobRegistry:
                 name=f"tripchord:{runtime.snapshot.id}:operation",
             )
             runtime.operation_task = operation_task
+            # C-146 P0 supplement (fourth P0): the single hard-stop watchdog is
+            # armed once a real executor is live. Past the absolute deadline +
+            # grace it quarantines the operation even under a permanent storage
+            # failure, so the executor and its side effects have a hard bound.
+            self._ensure_hard_stop_watchdog()
 
             def _on_operation_done(task: asyncio.Task[dict[str, Any]]) -> None:
                 # Consume any un-retrieved exception, then release the admission
@@ -2363,9 +2610,7 @@ class LivePlanningJobRegistry:
             # done) and only then terminalize (or fail closed). Recording the
             # drain result here and re-raising keeps this task genuinely
             # cancelled so the real work and the registry record never disagree.
-            runtime.cancel_drain_succeeded = await self._cancel_and_drain_operation(
-                operation_task
-            )
+            runtime.cancel_drain_succeeded = await self._cancel_and_drain_operation(operation_task)
             raise
         except TimeoutError as exc:
             failure = _safe_failure_diagnostic(
@@ -2418,6 +2663,15 @@ class LivePlanningJobRegistry:
                         # before ANY stop/drain. The runner NEVER restores the
                         # pre-timeout RUNNING snapshot over the live executor.
                         runtime.intent_persist_pending = True
+                        # C-146 P0 supplement (fourth P0): start the bounded
+                        # STATE budget clock. The bounded burst inside
+                        # ``_persist_locked_with_bounded_retry`` already
+                        # consumed its attempts; the owner continues counting so
+                        # the total stays bounded by attempts and wall-clock.
+                        loop_now = asyncio.get_running_loop().time()
+                        if runtime.intent_persist_started_monotonic == 0.0:
+                            runtime.intent_persist_started_monotonic = loop_now
+                        runtime.intent_persist_attempts += self._cancel_isolation_persist_attempts
                         runtime.snapshot = runtime.snapshot.model_copy(
                             update={
                                 "stage": _DEADLINE_INTENT_PERSIST_PENDING_STAGE,
@@ -2543,6 +2797,65 @@ class LivePlanningJobRegistry:
         if not self._cancel_settler_active(runtime):
             self._ensure_cleanup_owner(runtime)
 
+    def _intent_persist_budget_exhausted_locked(self, runtime: _RuntimeJob) -> bool:
+        """C-146 P0 supplement (P0-4): has the bounded STATE budget for the first
+        durable intent been exhausted?
+
+        The budget is a pair of caps: total attempts AND total wall-clock since
+        the first attempt. Either cap reached means the burst retry must stop and
+        the record must be quarantined non-terminal — the store is (or appears)
+        permanently broken, and hammering it further cannot make the in-memory
+        intent durable. Callers hold ``self._lock`` (or ``self._changed``)."""
+        if runtime.intent_persist_attempts >= self._intent_persist_budget_attempts:
+            return True
+        started = runtime.intent_persist_started_monotonic
+        return (
+            started > 0.0
+            and asyncio.get_running_loop().time() - started
+            >= self._intent_persist_wallclock_budget_seconds
+        )
+
+    def _quarantine_runtime_locked(
+        self,
+        runtime: _RuntimeJob,
+        stage: str,
+        reason: str,
+    ) -> None:
+        """C-146 P0 supplement (P0-4) / b119: quarantine a non-terminal record.
+
+        The record keeps its snapshot (non-terminal) with an explicit quarantine
+        stage and error, is excluded from executable active capacity, and its
+        idempotency binding (if any) is marked ``legacy_isolated`` so a same-key
+        request always fails closed and is never reused or started. The bounded
+        cleanup reconcile re-arms via the single reaper, so store recovery
+        auto-durably reconciles the quarantine + target facts before any quota
+        is released. Never writes or claims a FAILED/CANCELLED label from
+        memory-only facts."""
+        runtime.quarantined = True
+        runtime.quarantine_stage = stage
+        # The generation bump isolates every registry-facing write (progress
+        # reporter, checkpoint, trace summary) from the still-alive operation,
+        # exactly like the hard-stop path — a quarantined record's marker must
+        # stay stable and the operation must never mutate it.
+        runtime.generation += 1
+        runtime.snapshot = runtime.snapshot.model_copy(
+            update={
+                "stage": stage,
+                "error": reason,
+                "updated_at": self._utc_now(),
+                "revision": runtime.snapshot.revision + 1,
+            }
+        )
+        for entry in self._idempotency.values():
+            if entry.job_id == runtime.snapshot.id:
+                entry.legacy_isolated = True
+        loop = asyncio.get_running_loop()
+        runtime.cleanup_retry_round = self._bump_cleanup_retry_round(runtime.cleanup_retry_round)
+        runtime.cleanup_next_retry_monotonic = loop.time() + self._cleanup_retry_delay(
+            runtime.cleanup_retry_round
+        )
+        self._ensure_reaper()
+
     def _cancel_settler_active(self, runtime: _RuntimeJob) -> bool:
         """True while a cancel()/close() caller is actively settling a record.
 
@@ -2560,9 +2873,8 @@ class LivePlanningJobRegistry:
         are confirmed done (or never existed). A final CANCELLED / FAILED /
         close-completed label may be published only when this holds — never while
         an executor could still be writing side effects."""
-        return (
-            (runtime.task is None or runtime.task.done())
-            and (runtime.operation_task is None or runtime.operation_task.done())
+        return (runtime.task is None or runtime.task.done()) and (
+            runtime.operation_task is None or runtime.operation_task.done()
         )
 
     def _ensure_cleanup_owner(self, runtime: _RuntimeJob) -> None:
@@ -2575,7 +2887,9 @@ class LivePlanningJobRegistry:
         record — without an extra retry/close/cold start. Safe to call from the
         operation done-callback and from any cleanup join; re-entrant, so
         repeated calls never spawn a duplicate owner."""
-        if runtime.pending_terminal is None:
+        if runtime.pending_terminal is None and (
+            not runtime.quarantined or runtime.quarantine_reconciled
+        ):
             return
         if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
             return
@@ -2602,33 +2916,82 @@ class LivePlanningJobRegistry:
         backoff — until the terminal commit succeeds or the process shuts down —
         with no dependence on an external same-key/cancel/close/query."""
         operation_task = runtime.operation_task
-        if runtime.intent_persist_pending:
-            # C-146 P0 supplement (P0-3), Phase-0: the FIRST durable deadline
-            # intent is the HARD PRECONDITION for stopping the executor. Re-commit
-            # the in-memory isolation AND the FAILED/deadline_exceeded pending
-            # outcome here (bounded retry) BEFORE any cancel/drain — the real
-            # operation and the admission slot stay untouched until the intent is
-            # durable.
+        if runtime.intent_persist_pending or runtime.quarantined:
+            # C-146 P0 supplement (P0-3 / P0-4), Phase-0: the FIRST durable
+            # intent is the HARD PRECONDITION for stopping the executor. For a
+            # plain intent-pending record the in-memory isolation AND the
+            # FAILED/deadline_exceeded pending outcome are re-committed here
+            # (bounded retry) BEFORE any cancel/drain — the real operation and
+            # the admission slot stay untouched until the intent is durable. A
+            # QUARANTINED record runs this as a RECONCILE: ONE bounded persist
+            # attempt per interval; on store recovery the quarantine + in-memory
+            # target facts become durable, and only then may quotas be released.
             async with self._lock:
-                try:
-                    await self._persist_locked_with_bounded_retry()
-                except Exception:
-                    intent_committed = False
+                if runtime.quarantined:
+                    try:
+                        self._persist_locked()
+                    except Exception:
+                        intent_committed = False
+                    else:
+                        runtime.intent_persist_pending = False
+                        # C-146 P0 supplement (P0-4): the durable quarantine fact
+                        # is now committed. For a quarantined record WITHOUT a
+                        # pending terminal outcome (hard-stopped / ambiguous
+                        # isolated) this IS the whole reconcile — there is no
+                        # terminal settlement, so the record stays quarantined
+                        # non-terminal until its bounded retention reclaims it.
+                        runtime.quarantine_reconciled = True
+                        intent_committed = True
                 else:
-                    runtime.intent_persist_pending = False
-                    intent_committed = True
+                    try:
+                        await self._persist_locked_with_bounded_retry()
+                    except Exception:
+                        intent_committed = False
+                    else:
+                        runtime.intent_persist_pending = False
+                        intent_committed = True
             if not intent_committed:
+                loop = asyncio.get_running_loop()
+                if runtime.intent_persist_started_monotonic == 0.0:
+                    runtime.intent_persist_started_monotonic = loop.time()
+                if not runtime.quarantined:
+                    runtime.intent_persist_attempts += self._cancel_isolation_persist_attempts
+                if not runtime.quarantined and self._intent_persist_budget_exhausted_locked(
+                    runtime
+                ):
+                    # C-146 P0 supplement (P0-4): bounded STATE budget reached —
+                    # the burst retry STOPS and the record is quarantined
+                    # non-terminal. The in-memory intent stays recoverable, but
+                    # no FAILED/CANCELLED is ever written or claimed from
+                    # memory, and the burst never hammers the store again.
+                    self._quarantine_runtime_locked(
+                        runtime,
+                        _QUARANTINE_INTENT_UNCOMMITTED_STAGE,
+                        (
+                            "first durable intent could not be committed within "
+                            "the bounded state budget; the job is quarantined "
+                            "non-terminal"
+                        ),
+                    )
+                    return
                 # Every bounded attempt failed again: keep the recoverable
                 # in-memory intent and re-arm the single reaper — the same
-                # saturating owner backoff auto-continues the persistence.
+                # saturating owner backoff auto-continues the persistence (or
+                # the bounded reconcile for a quarantined record).
                 runtime.cleanup_retry_round = self._bump_cleanup_retry_round(
                     runtime.cleanup_retry_round
                 )
-                runtime.cleanup_next_retry_monotonic = (
-                    asyncio.get_running_loop().time()
-                    + self._cleanup_retry_delay(runtime.cleanup_retry_round)
+                runtime.cleanup_next_retry_monotonic = loop.time() + self._cleanup_retry_delay(
+                    runtime.cleanup_retry_round
                 )
                 self._ensure_reaper()
+                return
+            # C-146 P0 supplement (P0-4): a quarantined record WITHOUT a pending
+            # terminal outcome has no settlement — the reconcile (durable
+            # quarantine fact) is complete, so it stays quarantined non-terminal
+            # until retention reclaims it. No drain, no terminal label, no
+            # unquarantine.
+            if runtime.quarantined and runtime.pending_terminal is None:
                 return
             # The intent is durable now: only now may the real executor be
             # stopped and drained. A stubborn operation that swallows
@@ -2637,6 +3000,20 @@ class LivePlanningJobRegistry:
             # intent wins — never overwritten by a later join).
             await self._cancel_and_drain_operation(operation_task)
             if not (operation_task is None or operation_task.done()):
+                if runtime.quarantined:
+                    # The reconciled quarantine facts are durable but the
+                    # executor is still alive: keep the record quarantined and
+                    # re-arm the bounded reconcile. Never unquarantine over
+                    # live work, never publish a terminal label.
+                    loop = asyncio.get_running_loop()
+                    runtime.cleanup_retry_round = self._bump_cleanup_retry_round(
+                        runtime.cleanup_retry_round
+                    )
+                    runtime.cleanup_next_retry_monotonic = loop.time() + self._cleanup_retry_delay(
+                        runtime.cleanup_retry_round
+                    )
+                    self._ensure_reaper()
+                    return
                 pending = runtime.pending_terminal
                 if pending is not None:
                     with suppress(Exception):
@@ -2655,6 +3032,11 @@ class LivePlanningJobRegistry:
                             pending_cancellation_requested=pending.cancellation_requested,
                         )
                 return
+            # The operation stopped and the quarantine + target facts are
+            # durable: the shared terminalize loop below settles to the durable
+            # intent via an ATOMIC settle (unquarantine + terminal commit in the
+            # same write). No manual unquarantine here — a pre-commit failure
+            # must restore the quarantine flag together with the snapshot.
             # The operation stopped: also await the registry runner so the
             # shared _executors_stopped predicate holds before terminalizing —
             # the runner was mid-exit when it spawned this owner. Awaiting a
@@ -2697,6 +3079,7 @@ class LivePlanningJobRegistry:
                     error=pending.error,
                     safe_failure=pending.safe_failure,
                     cancellation_requested=pending.cancellation_requested,
+                    settle_quarantined=True,
                 )
                 return
             except LivePlanningJobRegistryPostCommitError:
@@ -2709,15 +3092,11 @@ class LivePlanningJobRegistry:
                 # A pre-commit persist failure keeps the recoverable cancel_pending
                 # isolation and the DURABLE pending outcome for the next attempt.
                 if attempt < budget:
-                    await asyncio.sleep(
-                        min(self._cleanup_retry_backoff_seconds * attempt, 0.1)
-                    )
+                    await asyncio.sleep(min(self._cleanup_retry_backoff_seconds * attempt, 0.1))
         # Budget exhausted: keep the durable retry intent and arm the single
         # registry reaper to re-spawn this owner after a bounded, growing backoff
         # (never a busy-wait, never a second concurrent owner).
-        runtime.cleanup_retry_round = self._bump_cleanup_retry_round(
-            runtime.cleanup_retry_round
-        )
+        runtime.cleanup_retry_round = self._bump_cleanup_retry_round(runtime.cleanup_retry_round)
         runtime.cleanup_next_retry_monotonic = loop.time() + self._cleanup_retry_delay(
             runtime.cleanup_retry_round
         )
@@ -2751,7 +3130,7 @@ class LivePlanningJobRegistry:
         if round_number < 0:
             round_number = 0
         exponent: int = max(0, min(round_number - 1, 30))
-        backoff: float = self._cleanup_retry_backoff_seconds * (2 ** exponent)
+        backoff: float = self._cleanup_retry_backoff_seconds * (2**exponent)
         return min(backoff, 0.5)
 
     def _ensure_reaper(self) -> None:
@@ -2797,23 +3176,34 @@ class LivePlanningJobRegistry:
                     return
                 now = loop.time()
                 for runtime in list(self._records.values()):
-                    if runtime.pending_terminal is None:
-                        continue
-                    if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                    if not self._cleanup_owner_needed_locked(runtime):
                         continue
                     if runtime.cleanup_owner is not None and not runtime.cleanup_owner.done():
                         continue
                     if now >= runtime.cleanup_next_retry_monotonic:
                         self._ensure_cleanup_owner(runtime)
 
+    def _cleanup_owner_needed_locked(self, runtime: _RuntimeJob) -> bool:
+        """True when a runtime still needs its (re)spawned cleanup owner.
+
+        C-145 P0: any pending terminal outcome. C-146 P0 supplement (P0-4): a
+        quarantined record whose durable quarantine fact has NOT been committed
+        yet also needs the owner — the bounded reconcile keeps persisting until
+        the store recovers. A quarantined record WITHOUT a pending outcome whose
+        fact IS durable needs no owner (it stays quarantined until retention
+        reclaims it)."""
+        if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+            return False
+        if runtime.pending_terminal is not None:
+            return True
+        return runtime.quarantined and not runtime.quarantine_reconciled
+
     def _any_retry_pending_locked(self, now: float) -> bool:
         """True when at least one runtime holds a pending outcome that still
         needs a reaper (its owner is done and its retry is not yet due or due
         now). A live owner needs no reaper — it is already retrying."""
         for runtime in self._records.values():
-            if runtime.pending_terminal is None:
-                continue
-            if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+            if not self._cleanup_owner_needed_locked(runtime):
                 continue
             if runtime.cleanup_owner is not None and not runtime.cleanup_owner.done():
                 continue
@@ -2825,9 +3215,7 @@ class LivePlanningJobRegistry:
         a reaper re-spawn, or None when no runtime needs a reaper right now."""
         next_at: float | None = None
         for runtime in self._records.values():
-            if runtime.pending_terminal is None:
-                continue
-            if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+            if not self._cleanup_owner_needed_locked(runtime):
                 continue
             if runtime.cleanup_owner is not None and not runtime.cleanup_owner.done():
                 continue
@@ -2836,6 +3224,132 @@ class LivePlanningJobRegistry:
             if next_at is None or runtime.cleanup_next_retry_monotonic < next_at:
                 next_at = runtime.cleanup_next_retry_monotonic
         return next_at
+
+    def _ensure_hard_stop_watchdog(self) -> None:
+        """Ensure the single, bounded hard-stop watchdog is running (P0-4).
+
+        Re-entrant: repeated calls never spawn a second watchdog. It wakes
+        exactly when a live operation's absolute execution bound
+        (``hard_stop_monotonic``) is reached and self-terminates once no
+        operation needs it, so a permanent-failure attack can never accumulate
+        watchdog timers."""
+        watchdog = self._hard_stop_watchdog
+        if watchdog is not None and not watchdog.done():
+            return
+        self._hard_stop_watchdog = asyncio.create_task(
+            self._hard_stop_watchdog_loop(),
+            name="tripchord:registry:hard-stop-watchdog",
+        )
+
+    async def _hard_stop_watchdog_loop(self) -> None:
+        """Single, bounded watchdog that enforces the absolute EXECUTION budget.
+
+        It sleeps until the earliest due hard-stop, then quarantines every live
+        operation whose ``hard_stop_monotonic`` has passed. ``asyncio.cancel()``
+        alone never masquerades as stopped: the operation is hard-stopped by the
+        generation isolation plus the bounded slot release, and only a confirmed
+        ``operation_task.done()`` is treated as stopped. The loop self-terminates
+        when no live operation needs it — no background task outlives its work."""
+        loop = asyncio.get_running_loop()
+        while True:
+            due: list[_RuntimeJob] = []
+            next_due: float | None = None
+            async with self._lock:
+                for runtime in self._records.values():
+                    if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                        continue
+                    if runtime.hard_stopped:
+                        continue
+                    if runtime.operation_task is None or runtime.operation_task.done():
+                        continue
+                    if runtime.hard_stop_monotonic <= 0.0:
+                        continue
+                    if loop.time() >= runtime.hard_stop_monotonic:
+                        due.append(runtime)
+                    elif next_due is None or runtime.hard_stop_monotonic < next_due:
+                        next_due = runtime.hard_stop_monotonic
+                if not due and next_due is None:
+                    self._hard_stop_watchdog = None
+                    return
+            if due:
+                for runtime in due:
+                    await self._hard_stop_operation(runtime)
+            else:
+                await asyncio.sleep(max(0.0, next_due - loop.time()))
+
+    async def _hard_stop_operation(self, runtime: _RuntimeJob) -> None:
+        """Quarantine and hard-stop a live operation past the absolute EXECUTION
+        budget (C-146 P0 supplement / P0-4).
+
+        Under the lock, the record is moved into the explicit NON-terminal
+        ``quarantine_hard_stopped`` quarantine, the generation is bumped so every
+        registry-facing write (progress reporter, checkpoint, trace summary) is
+        rejected, and the quarantine facts are persisted best-effort. Then the
+        operation is cancelled and awaited within the bounded budget; if it truly
+        stops, the slot release follows the normal done-callback. If it swallows
+        CancelledError, it is an ORPHAN — the registry provably stopped driving it,
+        the orphan counts against the bounded quarantine quota, and the admission
+        permit is NEVER released before ``operation_task.done()`` (an in-process
+        coroutine that ignores cancellation is not provably stopped, so only its
+        real completion releases the slot). No terminal label is ever fabricated
+        from the memory-only intent."""
+        operation_task = runtime.operation_task
+        if operation_task is None or operation_task.done():
+            return
+        async with self._changed:
+            if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES or runtime.hard_stopped:
+                return
+            runtime.hard_stopped = True
+            runtime.quarantined = True
+            runtime.quarantine_stage = _QUARANTINE_HARD_STOPPED_STAGE
+            runtime.generation += 1
+            runtime.snapshot = runtime.snapshot.model_copy(
+                update={
+                    "cancel_pending": True,
+                    "cancellation_requested": True,
+                    "stage": _QUARANTINE_HARD_STOPPED_STAGE,
+                    "error": (
+                        "live planning operation did not stop within the absolute "
+                        "deadline+grace execution budget; the executor is "
+                        "hard-stopped and quarantined non-terminal"
+                    ),
+                    "updated_at": self._utc_now(),
+                    "revision": runtime.snapshot.revision + 1,
+                }
+            )
+            for entry in self._idempotency.values():
+                if entry.job_id == runtime.snapshot.id:
+                    entry.legacy_isolated = True
+            try:
+                self._persist_locked()
+            except Exception:
+                # Best-effort: a permanent write failure keeps the in-memory
+                # quarantine observable; the reconcile persists it on recovery.
+                pass
+            else:
+                # The durable quarantine fact is already committed.
+                runtime.quarantine_reconciled = True
+            self._changed.notify_all()
+        operation_task.cancel()
+        await asyncio.wait(
+            (operation_task,),
+            timeout=self._cancel_wait_seconds,
+        )
+        # C-146 P0 supplement (P0-4 / P0-C): an in-process operation that
+        # swallowed CancelledError is NOT provably stopped. Its registry-facing
+        # side effects are isolated by the generation bump, but the admission
+        # permit is NEVER released before ``operation_task.done()`` — only the
+        # normal operation done-callback may release it. The orphan is a bounded
+        # hard-stopped worker: it counts against the quarantine quota, holds its
+        # slot (bounded by that quota), and its record is never deleted while it
+        # may still be alive. ``asyncio.cancel()`` never masquerades as
+        # operation-stopped; if the operation later stops on its own (or the
+        # reconcile proves executor death), the slot is released then.
+        # C-146 P0 supplement (P0-4): arm the bounded reconcile owner so the
+        # quarantine fact is committed on store recovery (and, when a durable
+        # pending outcome exists, the record settles to it once the executor is
+        # provably stopped).
+        self._ensure_cleanup_owner(runtime)
 
     async def _cancel_and_drain_operation(
         self,
@@ -3000,9 +3514,7 @@ class LivePlanningJobRegistry:
     ) -> None:
         if not events:
             return
-        validated = tuple(
-            LiveSourceTerminalEvent.model_validate(event) for event in events
-        )
+        validated = tuple(LiveSourceTerminalEvent.model_validate(event) for event in events)
         if len(validated) > 64:
             raise ValueError("live source terminal events exceed the capacity bound")
         async with self._changed:
@@ -3055,8 +3567,22 @@ class LivePlanningJobRegistry:
         safe_failure: _SafeFailureDiagnostic | None = None,
         expected_generation: int | None = None,
         cancellation_requested: bool | None = None,
+        # C-146 P0 supplement (P0-4): settle a quarantined record whose
+        # reconciliation is complete (quarantine + target facts durable AND the
+        # executor provably stopped) to its DURABLE pending outcome. The
+        # unquarantine is atomic with the terminal commit: a pre-commit failure
+        # restores the quarantine flag and every quarantine field together with
+        # the snapshot, so memory and disk never split.
+        settle_quarantined: bool = False,
     ) -> None:
         async with self._changed:
+            if runtime.quarantined and not settle_quarantined:
+                # C-146 P0 supplement (P0-4): a quarantined record is
+                # NON-terminal by contract — no path may terminalize it. Only
+                # the bounded reconcile (after the quarantine + target facts are
+                # durable AND the executor is provably stopped) settles it, and
+                # it does so atomically via ``settle_quarantined``.
+                return
             if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
                 return
             if expected_generation is not None and runtime.generation != expected_generation:
@@ -3070,6 +3596,12 @@ class LivePlanningJobRegistry:
             previous_prepared = runtime.prepared
             previous_activation_operation = runtime.activation_operation
             previous_pending_terminal = runtime.pending_terminal
+            previous_quarantined = runtime.quarantined
+            previous_quarantine_stage = runtime.quarantine_stage
+            previous_quarantine_reconciled = runtime.quarantine_reconciled
+            if settle_quarantined:
+                runtime.quarantined = False
+                runtime.quarantine_stage = None
             self._terminalize_locked(
                 runtime,
                 state,
@@ -3098,12 +3630,17 @@ class LivePlanningJobRegistry:
                 # activation_operation body including every nested field AND the
                 # pending terminal outcome — byte-identical to the untouched disk
                 # file, so a same-process retry and a cold restart observe the
-                # same facts.
+                # same facts. A quarantined settlement also restores every
+                # quarantine field so the record is quarantined again in memory,
+                # matching the untouched disk file.
                 runtime.snapshot = previous_snapshot
                 runtime.generation = previous_generation
                 runtime.prepared = previous_prepared
                 runtime.activation_operation = previous_activation_operation
                 runtime.pending_terminal = previous_pending_terminal
+                runtime.quarantined = previous_quarantined
+                runtime.quarantine_stage = previous_quarantine_stage
+                runtime.quarantine_reconciled = previous_quarantine_reconciled
                 raise
             self._changed.notify_all()
 
@@ -3149,6 +3686,12 @@ class LivePlanningJobRegistry:
         """
         previous_pending_terminal = runtime.pending_terminal
         async with self._changed:
+            if runtime.quarantined:
+                # C-146 P0 supplement (P0-4): a quarantined record is
+                # NON-terminal by contract — never re-isolated under a new stuck
+                # stage, never given a terminal label. The bounded reconcile
+                # owns its settlement.
+                return
             if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
                 return
             previous_snapshot = runtime.snapshot
@@ -3314,9 +3857,7 @@ class LivePlanningJobRegistry:
             or runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES
             or runtime.snapshot.cancellation_requested
         ):
-            raise LivePlanningJobInactiveError(
-                "live planning job generation is no longer active"
-            )
+            raise LivePlanningJobInactiveError("live planning job generation is no longer active")
 
     def _terminalize_locked(
         self,
@@ -3329,6 +3870,13 @@ class LivePlanningJobRegistry:
         safe_failure: _SafeFailureDiagnostic | None = None,
         cancellation_requested: bool | None = None,
     ) -> None:
+        if runtime.quarantined:
+            # C-146 P0 supplement (P0-4): a quarantined record is NON-terminal by
+            # contract — the shared terminalize primitive itself refuses to
+            # fabricate a terminal label for it, no matter the caller. Only the
+            # bounded reconcile (facts durable + executor stopped) unquarantines,
+            # and only then may this settle the durable intent.
+            return
         if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
             return
         now = self._utc_now()
@@ -3339,9 +3887,7 @@ class LivePlanningJobRegistry:
             "result": result,
             "error": error,
             "safe_failure_code": safe_failure.code if safe_failure is not None else None,
-            "safe_failure_details": (
-                safe_failure.details if safe_failure is not None else None
-            ),
+            "safe_failure_details": (safe_failure.details if safe_failure is not None else None),
             "safe_failure_details_digest": (
                 safe_failure.details_digest if safe_failure is not None else None
             ),
@@ -3366,8 +3912,7 @@ class LivePlanningJobRegistry:
         if (
             state == LivePlanningJobState.CANCELLED
             and runtime.activation_operation is not None
-            and runtime.activation_operation.get("phase")
-            not in {"committed", "cancelled"}
+            and runtime.activation_operation.get("phase") not in {"committed", "cancelled"}
         ):
             # Reassign a fresh operation object instead of mutating the existing
             # dict in place so a caller that snapshots the mutable record before
@@ -3378,37 +3923,69 @@ class LivePlanningJobRegistry:
             }
 
     def _make_capacity_locked(self) -> None:
-        if len(self._records) < self._capacity:
+        # C-146 P0 supplement (P0-4) / b119: a quarantined record is NON-terminal
+        # and never occupies executable active capacity — it has its own bounded
+        # quota. A capacity ghost (e.g. an old isolated_ambiguous_cancel record)
+        # can therefore never permanently deny every new key.
+        quarantined = sum(1 for item in self._records.values() if item.quarantined)
+        if quarantined >= self._quarantine_capacity:
+            raise LivePlanningJobCapacityError("live planning job quarantine capacity exceeded")
+        if sum(1 for item in self._records.values() if not item.quarantined) < self._capacity:
             return
         terminal = [
             item
             for item in self._records.values()
-            if item.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES
+            if not item.quarantined and item.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES
         ]
         if terminal:
             oldest = min(terminal, key=lambda item: item.snapshot.updated_at)
             self._remove_locked(oldest.snapshot.id)
-        if len(self._records) >= self._capacity:
+        if sum(1 for item in self._records.values() if not item.quarantined) >= self._capacity:
             raise LivePlanningJobCapacityError("live planning job capacity exceeded")
 
     def _prune_locked(self, now: datetime) -> None:
-        expired = tuple(
-            job_id
-            for job_id, runtime in self._records.items()
-            if (
-                runtime.snapshot.expires_at is not None
-                and runtime.snapshot.expires_at <= now
-            )
-            or (
-                runtime.prepared
-                and runtime.task is None
-                and runtime.snapshot.deadline_at <= now
-            )
-        )
+        expired: list[str] = []
+        reclaimed: list[str] = []
+        for job_id, runtime in self._records.items():
+            if runtime.quarantined:
+                # C-146 P0 supplement (P0-4) / b119: a quarantined record is
+                # reclaimed after its own bounded retention window, but ONLY
+                # once its executor is provably dead (no live in-process
+                # operation task / subprocess may still be writing side
+                # effects). Retention/compression never deletes an unknown or
+                # live orphan. Reclamation keeps a minimal durable tombstone
+                # (the legacy_isolated idempotency binding) so a same-key
+                # request still fails closed and the key is never silently
+                # reused.
+                if (
+                    runtime.snapshot.updated_at + self._quarantine_retention <= now
+                    and self._executors_stopped(runtime)
+                ):
+                    reclaimed.append(job_id)
+                continue
+            if (runtime.snapshot.expires_at is not None and runtime.snapshot.expires_at <= now) or (
+                runtime.prepared and runtime.task is None and runtime.snapshot.deadline_at <= now
+            ):
+                expired.append(job_id)
+        for job_id in reclaimed:
+            self._reclaim_quarantine_locked(job_id)
         for job_id in expired:
             self._remove_locked(job_id)
-        if expired:
+        if expired or reclaimed:
             self._persist_locked()
+
+    def _reclaim_quarantine_locked(self, job_id: str) -> None:
+        """Reclaim a quarantined record after its retention window (P0-4/b119).
+
+        The record is dropped from ``_records`` but its idempotency binding is
+        kept as a minimal durable tombstone (``legacy_isolated``) so a same-key
+        request always fails closed and the key is never silently reused."""
+        runtime = self._records.pop(job_id, None)
+        if runtime is None:
+            return
+        for entry in self._idempotency.values():
+            if entry.job_id == job_id:
+                entry.legacy_isolated = True
 
     def _remove_locked(self, job_id: str) -> None:
         self._records.pop(job_id, None)
@@ -3436,9 +4013,7 @@ class LivePlanningJobRegistry:
     @classmethod
     def _idempotency_partition(cls, tenant_id: str, idempotency_key: str) -> str:
         tenant_partition = cls._tenant_partition(tenant_id)
-        return hashlib.sha256(
-            f"{tenant_partition}\0{idempotency_key}".encode()
-        ).hexdigest()
+        return hashlib.sha256(f"{tenant_partition}\0{idempotency_key}".encode()).hexdigest()
 
     @staticmethod
     def _valid_request_digest(value: str) -> bool:
