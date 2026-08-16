@@ -6,13 +6,13 @@
 
 ## 当前状态
 
-- **当前版本**：v1.0 Done-Gate C-122 R46（正式 runner 自产 raw 收口）——C-round4 正向不再手工构造 run/checkpoint/raw，而是以 `benchmarks.run_live_done_gate_v4._run` 为唯一入口，并由正式 `_install_browser_bridge` composition 创建/绑定 Browser bridge、真实 `IComTransferProvider`、pair runner 与 flexible runner；Companion 经 mounted HTTP heartbeat/claim/complete 入口上报，iCom 只在 `httpx` transport 返回原始官方形状 JSON，schema/normalize/evidence/领域结果均由真实 provider 产生。随后真实走 API job、三 pair checkpoint、15 项 producer、completed bundle、0600 writer、compact/consumer。compact 同时修复正式顶层 `pair_checkpoint_binding` 断链；顶层与 legacy 双副本不一致时 fail-closed。
+- **当前版本**：v1.0 Done-Gate C-146 RETURN 5-P0 收口——正式 HTTP 持久任务不再使用 deterministic/HUMAN_BLOCK/空库存替身；父 API 把已认证的正式 composition/runtime 和本次正式执行 capability 交给独立 worker，worker 经真实 Browser bridge + iCom HTTP + model runtime 完成 ready 链，再把 progress、pair checkpoint、source 终态、barrier、model trace 与精确 cache snapshot 回传父 registry。Layer 6 正向不替换 production builder，走真实 HTTP→独立 worker→正式 producer/compact/consumer。
 - **当前分支**：`productization/v1.0`（未 push；本轮代码、测试、账本与独立阶段评审同一交付提交。API 必须在该 clean HEAD 上受控重启并由 provenance 三哈希验证；六层门结果只按同 HEAD 新报告认定，旧报告不用于收口。）
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
-- **最后完成的最小任务**：C-122 R46——正式 `_run` 自产 raw、正式 app composition + Companion HTTP 入口 + 真实 iCom Provider HTTP 边界、正式顶层 checkpoint binding 被 compact 正确消费、正式 raw 派生的 query/checkpoint/request/check/evidence 反例矩阵 fail-closed；provider/composition/heartbeat 旁路反例不能满足正向回执。全局类/函数身份与 FastAPI routes/state 在测试后保持原样，测试持久化由 session 临时 DB/bridge-state 隔离。
-- **最新六层门**：交付前的权威六层仍为 `passed=false`（L5/L6 未过、`evidence_commit=null`、`gate_ref=null`）；本轮最终提交后必须重启 API 并从头运行，精确 run_id/tested SHA/各层结果写入 C-122 交付评论。无论结果如何，不复用旧门、不把代码级 15/15 当作机器六层通过。
-- **审查/终验状态**：旧 C-125 PASS 已撤销；C-125/C-124 均保持 backlog。本轮 C-122 完成后只转 `in_review`，先由不同 Agent 复审正式 raw 链；复审通过前暂停 Companion 配对与终验，不请求用户动作。
+- **最后完成的最小任务**：C-146 五项 RETURN P0——正式跨进程 ready 链与父 API 可观察回传；clean/nonzero leader 共享“整组退出确认为 True 才准终态”合同；冷启持久化每个 worker identity 的认证/死亡确认事实；持续 kill/confirm 异常按饱和+固定窗口上界重试并消费 task exception；idcap 在 UUID/runtime/worker command/驱逐前原子拒绝。
+- **最新六层门**：交付前权威报告仍是旧 HEAD 的 `passed=false`。本轮所有代码、测试、账本和阶段评审同一提交后，才在 clean HEAD 受控重启 API 并从头运行；精确 run_id/tested SHA/各层结果只写 C-146 唯一交付回执，避免尾部文档提交移动 HEAD。
+- **审查/终验状态**：C-125 本轮 RETURN 已由唯一实现者修复，C-125/C-124 仍保持 backlog。C-146 交付只转 `in_review`，不自批、不启动复审/终验/Companion；由总管另行启动不同 Agent 复审。
 
 ## 版本状态
 
@@ -368,6 +368,19 @@
 | 来源能力防自证 | 追加独审评论 `3d5717e4-913b-446a-ae7a-f92008bca8ea`：每个 installation 由生产 Browser bridge token 派生独立 HMAC capability；snapshot、逐事件 receipt 与 before/after binding 均带 capability MAC。只重算公开 SHA、完整字段、精确顺序/路径/状态并用 foreign key 自签的手工 binding，在 raw writer、compact 与 final 三层均拒绝；`formal_live_source_binding` missing/null/list 在 raw writer 当场拒绝 |
 | 进程与持久化隔离 | 不替换生产类/函数；运行后方法/函数 identity、FastAPI routes/state、模块 globals 均保持原值；pytest session 使用临时 DB 与 bridge-state，不读写 live 数据库/桥接状态 |
 | 最终验证与机器门 | 聚焦、全量、clean-env、ruff、API provenance 与同 HEAD 六层门的精确结果以 C-122 唯一交付评论为准；`passed=false` 时仍如实保留空 evidence/ref，不触发 C-125/C-124 |
+
+### 第四十七轮（C-146 RETURN 5-P0 正式生产链）验证结果
+
+| 命令/证据 | 结果 |
+|---|---|
+| 正式跨进程 ready 链 | 删除 deterministic-blocking/HUMAN_BLOCK/空库存成功替身；Layer 6 不替换 production builder。正式 runner→真实 HTTP job→独立 worker，worker 验证父 API runtime identity 并重建 Browser bridge/iCom/model composition，正式 raw 再进 producer→compact→consumer |
+| 父 API 可观察回传 | worker 回传 progress、pair checkpoints、source terminal events、barrier 和 model trace；父 registry 按同一 job/request/generation 重放并与公开 response 精确绑定。worker cache 按响应 handle 回读精确 snapshot，父端校验 pair 成员/内容后原子换发新 handle；缺失、畸形或不一致回传不发布结果 |
+| clean/nonzero 整组退出 | leader 正常或非零退出都必须 kill-and-confirm 精确为 True；False、超时、异常均保持非终态、worker identity 与 permit，由唯一 owner 自动重试，不先写 SUCCEEDED/FAILED/CANCELLED |
+| 冷启认证/死亡事实 | durable record 按精确 PGID/marker/probe identity 持久化 authenticated + death-confirmed；marker 失配或进程查询失败后连续冷启仍保持 orphan quarantine，不调用终态 resolver 猜标签。没有 worker identity 却携带 marker/probe/auth/death 事实的文件直接 fail-closed |
+| 持续清理异常 | kill/confirm exception、False 与 qcap-full 均进入饱和退避 + 固定窗口调用上限；wrapper done callback 消费异常，cancel race 在 finally 释放 in-flight/reservation，无热循环、无未处理 task exception |
+| idcap 构造前硬门 | 新 key 在 UUID、runtime、worker command 构造及任何 eviction 前先检查满 identity 集合；拒绝时构造器零调用，内存 identity 映射与 durable bytes 逐字节不变 |
+| 提交前回归 | 新增边界反例、完整 worker HTTP 测试与 API 全量测试原生退出码均为 0；精确计数及 clean HEAD 的 scripts clean-env、Ruff、diff-check 结果写入 C-146 唯一交付回执 |
+| 最终运行与机器门 | 本表不预写最终 SHA/run_id。同一 clean HEAD 上受控重启 API、provenance 三哈希校验、从头运行六层门；精确结果只写交付回执，`passed=false` 仍保留空 evidence/ref 且不触发 C-125/C-124 |
 
 ## 当前可对外声明
 

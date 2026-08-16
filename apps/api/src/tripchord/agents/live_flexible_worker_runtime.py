@@ -11,218 +11,418 @@ runtime into the app:
   ``TRIPCHORD_LIVE_FLEXIBLE_WORKER_RUNTIME_BUNDLE``) into the worker command args
   when it builds the command.
 - The worker subprocess, after reconstructing its own app, installs the bundle's
-  runtime on it — a real ``FlexibleLiveAgentSystem`` built IN the worker process
-  from the spec, never an injected/patched in-process object.
+  runtime on it by calling the SAME production composition entry the API process
+  uses (``tripchord.main._install_browser_bridge``): a REAL ``BrowserTaskBridge``,
+  a REAL ``LivePackageAgentSystem``, and a REAL ``FlexibleLiveAgentSystem`` are
+  built IN the worker process from the spec — never an injected/patched
+  in-process object and never the former deterministic HUMAN_BLOCK stand-in.
 
-The ``deterministic-blocking`` runtime uses a side-effect-free, deterministic
-pair runner (no browser, no model, no network): every pair resolves identically
-to a HUMAN_BLOCK decision with the same blocked coverage and a succeeded
-scheduler. That makes a cross-process ready HTTP chain PROVABLE — interpretation
-``ready``, run blocked, job ``succeeded`` — without external services. Future
-browser bundles can extend the same install hook with the real bridge spec.
+When the bundle carries an ``http_port``, the worker serves the reconstructed app
+over REAL loopback HTTP so an external Companion can heartbeat / claim / complete
+bridge tasks over the network — the production cross-process ready chain, not an
+in-process ASGI substitute.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from time import monotonic
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+from collections.abc import Callable
+from contextlib import suppress
+from datetime import datetime
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from tripchord.agents.flexible_live_system import FlexibleLiveAgentSystem
-from tripchord.agents.live_system import (
-    LiveCoverageMode,
-    LivePackageAgentRun,
-    PlatformSearchCoverage,
+import httpx
+
+from tripchord.runtime_provenance import PROVENANCE, provenance_mismatches
+
+_RUNTIME_ENVELOPE_SCHEMA = "tripchord-live-worker-runtime-envelope-v1"
+_RUNTIME_RECEIPT_SCHEMA = "tripchord-live-worker-runtime-receipt-v1"
+_PROVENANCE_FIELDS = (
+    "repo_toplevel",
+    "commit_sha",
+    "dependency_lock_sha256",
+    "live_system_source_sha256",
 )
-from tripchord.agents.models import (
-    AgentRole,
-    AgentTask,
-    AgentTaskResult,
-    TaskGraph,
-)
-from tripchord.agents.runtime import SchedulerOutcome
-from tripchord.planning.package import (
-    PackageDecision,
-    PackageDecisionState,
-    PackageIntent,
-    PackageInventory,
-)
-from tripchord.providers.browser_bridge import (
-    BrowserProvider,
-    BrowserSearchQuery,
-    BrowserVertical,
+_API_RUNTIME_IDENTITY_FIELDS = frozenset(PROVENANCE.to_dict())
+_SPEC_FIELDS = frozenset(
+    {
+        "runtime",
+        "bridge_token",
+        "providers",
+        "model_agents_required",
+        "adaptive_agent_scaling_enabled",
+        "now_iso",
+        "http_host",
+        "http_port",
+        "icom_api_origin",
+        "formal_source_private_key_path",
+        "formal_source_ledger_path",
+    }
 )
 
 
-def _source_ids() -> tuple[str, ...]:
-    return tuple(
-        f"source-{provider.value}-{suffix}"
-        for provider in BrowserProvider
-        for suffix in (
-            "flight",
-            "lodging-full",
-            "lodging-first",
-            "lodging-middle",
-            "lodging-last",
-        )
-    )
+def _canonical_json(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("live worker runtime configuration is not canonical JSON") from exc
 
 
-def _deterministic_blocked_run(
-    intent: PackageIntent,
-    query: BrowserSearchQuery,
-    mode: LiveCoverageMode,
-) -> LivePackageAgentRun:
-    """The deterministic HUMAN_BLOCK run every pair resolves to.
-
-    Identical shape to the fixture used by the in-process ready-chain contract,
-    but a production class: coverage reports every source blocked by the
-    deterministic boundary, and the scheduler graph succeeds. No live coverage
-    claim is ever made (``claim_boundary`` says so explicitly)."""
-    source_ids = _source_ids()
-    coverage = tuple(
-        PlatformSearchCoverage(
-            provider=provider,
-            failed_verticals=(BrowserVertical.FLIGHT, BrowserVertical.LODGING),
-            failed_source_ids=tuple(
-                source_id
-                for source_id in source_ids
-                if source_id.startswith(f"source-{provider.value}-")
-            ),
-            failure_reasons=(
-                "deterministic worker runtime does not access a real browser",
-            ),
-            complete=False,
-        )
-        for provider in BrowserProvider
-    )
-    final_tasks = (
-        AgentTask(
-            id="orchestrate-travel-package",
-            role=AgentRole.SAFETY_GATE,
-            goal="deterministic worker runtime decision",
-        ),
-        AgentTask(
-            id="explain-final-decision",
-            role=AgentRole.EXPLANATION,
-            goal="deterministic worker runtime explanation",
-            dependencies=("orchestrate-travel-package",),
-        ),
-        AgentTask(
-            id="curate-run-memory",
-            role=AgentRole.MEMORY_CURATOR,
-            goal="deterministic worker runtime memory curation",
-            dependencies=("explain-final-decision",),
-        ),
-        AgentTask(
-            id="publish-live-run",
-            role=AgentRole.SAFETY_GATE,
-            goal="deterministic worker runtime publication gate",
-            dependencies=("curate-run-memory",),
-        ),
-    )
-    return LivePackageAgentRun(
-        mode=mode,
-        intent=intent,
-        search_query=query,
-        decision=PackageDecision(
-            state=PackageDecisionState.HUMAN_BLOCK,
-            summary="deterministic worker runtime intentionally blocks browser search",
-        ),
-        claim_boundary="deterministic worker runtime only; no live coverage claim",
-        all_platforms_complete=False,
-        coverage=coverage,
-        inventory=PackageInventory(),
-        normalization_results=(),
-        package=None,
-        scheduler=SchedulerOutcome(
-            graph=TaskGraph(tasks=final_tasks),
-            results=tuple(
-                AgentTaskResult(
-                    task_id=task.id,
-                    agent_role=task.role,
-                    success=True,
-                    summary="deterministic worker runtime stage complete",
-                    output={"publication_gate_passed": True}
-                    if task.id == "publish-live-run"
-                    else {},
-                )
-                for task in final_tasks
-            ),
-            trace=(),
-            wall_time_seconds=0,
-            max_parallel_tasks=15,
-            succeeded=True,
-        ),
-        source_task_ids=source_ids,
-    )
+def _runtime_provenance_identity() -> dict[str, str]:
+    raw = PROVENANCE.to_dict()
+    identity: dict[str, str] = {}
+    for field in _PROVENANCE_FIELDS:
+        value = raw.get(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"live worker runtime provenance lacks a canonical {field}"
+            )
+        identity[field] = value
+    return identity
 
 
-class DeterministicBlockingPairRunner:
-    """Deterministic, side-effect-free :class:`LiveDatePairRunner`.
+def build_authenticated_runtime_bundle(spec: dict[str, Any]) -> dict[str, Any]:
+    """Bind one JSON runtime spec to the API process's immutable provenance.
 
-    Every pair resolves identically to a HUMAN_BLOCK run, so a cross-process
-    ready HTTP chain built on this runner is byte-deterministic and provable.
+    The parent calls this before constructing the worker command. The worker
+    independently recomputes the spec digest and compares every static runtime
+    provenance field against the code it imported. A stale/foreign/tampered
+    handoff therefore fails closed before any bridge, provider, HTTP listener or
+    planning task is created. The receipt returned by ``install_runtime_bundle``
+    exposes the same non-secret binding to the parent job result.
     """
+    if not isinstance(spec, dict):
+        raise ValueError("live worker runtime configuration must be an object")
+    canonical = _canonical_json(spec)
+    return {
+        "schema_version": _RUNTIME_ENVELOPE_SCHEMA,
+        "spec": spec,
+        "spec_sha256": hashlib.sha256(canonical).hexdigest(),
+        "runtime_provenance": _runtime_provenance_identity(),
+        # Full parent-API identity, including PID/start time.  The child checks
+        # that this live PID is its direct parent before it may continue the
+        # parent's formal source ledger; a copied bundle in an unrelated process
+        # cannot impersonate the formal coordinator.
+        "api_runtime_identity": PROVENANCE.to_dict(),
+    }
 
-    async def run(
-        self,
-        intent: PackageIntent,
-        query: BrowserSearchQuery,
-        *,
-        mode: LiveCoverageMode = LiveCoverageMode.STRICT,
-        timeout_seconds: int = 120,
-        source_start_delays_ms: dict[str, int] | None = None,
-    ) -> LivePackageAgentRun:
-        return _deterministic_blocked_run(intent, query, mode)
+
+def _verified_runtime_spec(
+    bundle: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+    expected_fields = {
+        "schema_version",
+        "spec",
+        "spec_sha256",
+        "runtime_provenance",
+        "api_runtime_identity",
+    }
+    if set(bundle) != expected_fields or bundle.get("schema_version") != (
+        _RUNTIME_ENVELOPE_SCHEMA
+    ):
+        raise RuntimeError("live worker runtime envelope is invalid")
+    spec = bundle.get("spec")
+    digest = bundle.get("spec_sha256")
+    provenance = bundle.get("runtime_provenance")
+    api_runtime_identity = bundle.get("api_runtime_identity")
+    if not isinstance(spec, dict) or set(spec) - _SPEC_FIELDS:
+        raise RuntimeError("live worker runtime spec fields are invalid")
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise RuntimeError("live worker runtime spec digest is invalid")
+    actual_digest = hashlib.sha256(_canonical_json(spec)).hexdigest()
+    if not hmac.compare_digest(digest, actual_digest):
+        raise RuntimeError("live worker runtime spec digest does not match")
+    current_provenance = _runtime_provenance_identity()
+    if not isinstance(provenance, dict) or set(provenance) != set(
+        _PROVENANCE_FIELDS
+    ):
+        raise RuntimeError("live worker runtime provenance binding is invalid")
+    for field, current in current_provenance.items():
+        reported = provenance.get(field)
+        if not isinstance(reported, str) or not hmac.compare_digest(
+            reported.encode("utf-8"),
+            current.encode("utf-8"),
+        ):
+            raise RuntimeError(
+                f"live worker runtime provenance {field} does not match"
+            )
+    if (
+        not isinstance(api_runtime_identity, dict)
+        or set(api_runtime_identity) != _API_RUNTIME_IDENTITY_FIELDS
+    ):
+        raise RuntimeError("live worker API runtime identity is invalid")
+    if provenance_mismatches(api_runtime_identity, current_provenance):
+        raise RuntimeError("live worker API runtime identity does not match live code")
+    return spec, current_provenance, dict(api_runtime_identity)
 
 
-def _parse_clock(
-    spec: dict[str, Any],
-) -> tuple[callable, callable]:
+def _parse_clock(spec: dict[str, Any]) -> Callable[[], datetime]:
+    now_iso = spec.get("now_iso")
+    if not isinstance(now_iso, str):
+        raise RuntimeError("worker browser-bridge runtime requires now_iso")
+    try:
+        fixed_now = datetime.fromisoformat(now_iso)
+    except ValueError as exc:
+        raise RuntimeError("worker browser-bridge runtime now_iso is invalid") from exc
+    if fixed_now.tzinfo is None or fixed_now.utcoffset() is None:
+        raise RuntimeError("worker browser-bridge runtime now_iso must be timezone-aware")
+
     def fixed_now_clock() -> datetime:
         return fixed_now
 
-    now_iso = spec.get("now_iso")
-    if isinstance(now_iso, str):
-        try:
-            fixed_now = datetime.fromisoformat(now_iso)
-        except ValueError:
-            fixed_now = datetime.now(UTC)
-    else:
-        fixed_now = datetime.now(UTC)
-    now: callable = fixed_now_clock
-    monotonic_value = spec.get("monotonic_clock")
-    if isinstance(monotonic_value, (int, float)):
-        fixed_monotonic = float(monotonic_value)
-
-        def fixed_monotonic_clock() -> float:
-            return fixed_monotonic
-
-        monotonic_clock: callable = fixed_monotonic_clock
-    else:
-        monotonic_clock = monotonic
-    return now, monotonic_clock
+    return fixed_now_clock
 
 
-def install_runtime_bundle(target_app: Any, bundle: dict[str, Any]) -> None:
+async def _serve_loopback_http(target_app: Any, host: str, port: int) -> None:
+    """Serve ``target_app`` over REAL loopback HTTP until shutdown.
+
+    The app is served with its lifespan disabled: the worker owns its own bridge
+    composition (already mounted by ``_install_browser_bridge``) and must not run
+    the API process's startup/shutdown resource lifecycle. Only the mounted
+    ``/browser-bridge`` routes are consumed by the external Companion.
+    """
+    import uvicorn
+
+    config = uvicorn.Config(
+        target_app,
+        host=host,
+        port=port,
+        log_level="warning",
+        lifespan="off",
+    )
+    server = uvicorn.Server(config)
+    # The worker is a subprocess; uvicorn's default SIGINT/SIGTERM handlers must
+    # not touch this process group's signal disposition. Stash the server on the
+    # app so the worker entry can shut it down after the operation.
+    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+    target_app.state.live_worker_http_server = server
+    await server.serve()
+
+
+def _path_or_none(value: object) -> Path | None:
+    return Path(value) if isinstance(value, str) and value else None
+
+
+class _CanonicalIComLoopbackTransport(httpx.AsyncBaseTransport):
+    """Forward canonical iCom HTTPS requests over a real loopback connection.
+
+    Formal source evidence must retain the exact public HTTPS URL. Replacing the
+    provider's configured origin with ``http://127.0.0.1`` makes the fetch real
+    but falsifies that signed identity. This transport keeps the request and
+    response URL canonical for every provider/formal validator while rewriting
+    only the socket destination to the explicitly authenticated loopback
+    harness. The default inner transport is a real ``AsyncHTTPTransport``;
+    tests may inject a bounded transport to verify the rewrite contract.
+    """
+
+    def __init__(
+        self,
+        loopback_origin: str,
+        *,
+        inner: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        parsed = urlsplit(loopback_origin)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost"}
+            or parsed.port is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RuntimeError("worker iCom loopback transport origin is invalid")
+        self._host = parsed.hostname
+        self._port = parsed.port
+        self._inner = inner or httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if (
+            request.url.scheme != "https"
+            or request.url.host.casefold() != "sfs-api.icomtours.com"
+            or request.url.port not in {None, 443}
+        ):
+            raise httpx.ConnectError(
+                "iCom loopback transport received a non-canonical origin",
+                request=request,
+            )
+        target = request.url.copy_with(
+            scheme="http",
+            host=self._host,
+            port=self._port,
+        )
+        headers = request.headers.copy()
+        headers["host"] = f"{self._host}:{self._port}"
+        forwarded = httpx.Request(
+            method=request.method,
+            url=target,
+            headers=headers,
+            content=await request.aread(),
+            extensions=request.extensions,
+        )
+        response = await self._inner.handle_async_request(forwarded)
+        # Preserve the ORIGINAL canonical request on the returned response. The
+        # provider's response-boundary validator and formal event signer therefore
+        # see only the exact public endpoint, never the local socket destination.
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=response.headers,
+            stream=response.stream,
+            extensions=response.extensions,
+            request=request,
+        )
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+def install_runtime_bundle(target_app: Any, bundle: dict[str, Any]) -> dict[str, Any]:
     """Install the worker's ``runtime_bundle`` onto its reconstructed app.
 
     The worker subprocess imports ``tripchord.main`` fresh; with no browser
     bridge configured its ``flexible_live_agent_system`` is None. This builds a
-    REAL ``FlexibleLiveAgentSystem`` in THIS process from the bundle spec and
+    REAL composition in THIS process from the bundle spec — via the SAME
+    production ``_install_browser_bridge`` entry the API process uses — and
     installs it, so the ready chain's ``_flexible_live_agent_system_from_app``
-    resolves a production system — never a monkeypatched private runtime.
-
-    ``deterministic-blocking``: a fixed-clock system over
-    :class:`DeterministicBlockingPairRunner`. Unknown runtimes fail closed."""
-    runtime = bundle.get("runtime")
-    if runtime != "deterministic-blocking":
+    resolves a production system. The ``browser-bridge`` runtime is the only
+    supported runtime; unknown runtimes fail closed (the former
+    ``deterministic-blocking`` HUMAN_BLOCK stand-in is removed).
+    """
+    spec, provenance, api_runtime_identity = _verified_runtime_spec(bundle)
+    if api_runtime_identity.get("pid") != os.getppid():
+        raise RuntimeError("live worker API runtime is not this process's direct parent")
+    runtime = spec.get("runtime")
+    if runtime != "browser-bridge":
         raise RuntimeError(f"unknown live flexible worker runtime: {runtime!r}")
-    now, monotonic_clock = _parse_clock(bundle)
-    system = FlexibleLiveAgentSystem(
-        DeterministicBlockingPairRunner(),
-        now=now,
-        monotonic_clock=monotonic_clock,
+    import tripchord.main as api_main
+
+    token = spec.get("bridge_token")
+    if not isinstance(token, str) or len(token) < 32:
+        raise RuntimeError(
+            "worker browser-bridge runtime requires a bridge token of at least 32 characters"
+        )
+    providers = spec.get("providers")
+    if not isinstance(providers, list) or not providers or not all(
+        isinstance(provider, str) for provider in providers
+    ):
+        raise RuntimeError("worker browser-bridge runtime requires a non-empty providers list")
+    from tripchord.platform.adapters import default_browser_providers_from_registry
+
+    expected_providers = tuple(
+        provider.value for provider in default_browser_providers_from_registry()
     )
-    target_app.state.flexible_live_agent_system = system
+    if len(set(providers)) != len(providers) or tuple(providers) != expected_providers:
+        raise RuntimeError(
+            "worker browser-bridge providers do not match the production registry"
+        )
+    for field in ("model_agents_required", "adaptive_agent_scaling_enabled"):
+        if type(spec.get(field)) is not bool:
+            raise RuntimeError(f"worker browser-bridge runtime {field} must be boolean")
+    host = spec.get("http_host")
+    port = spec.get("http_port")
+    if host != "127.0.0.1":
+        raise RuntimeError("worker browser-bridge HTTP host must be loopback")
+    if type(port) is not int or not 1 <= port <= 65_535:
+        raise RuntimeError("worker browser-bridge HTTP port is invalid")
+    icom_api_origin = spec.get("icom_api_origin")
+    icom_http_client: httpx.AsyncClient | None = None
+    if icom_api_origin is not None:
+        if not isinstance(icom_api_origin, str):
+            raise RuntimeError("worker iCom API origin is invalid")
+        parsed_origin = urlsplit(icom_api_origin)
+        if (
+            parsed_origin.scheme != "http"
+            or parsed_origin.hostname not in {"127.0.0.1", "localhost"}
+            or parsed_origin.port is None
+            or parsed_origin.username is not None
+            or parsed_origin.password is not None
+            or parsed_origin.path not in {"", "/"}
+            or parsed_origin.query
+            or parsed_origin.fragment
+        ):
+            raise RuntimeError("worker iCom API origin must be an exact loopback origin")
+        icom_http_client = httpx.AsyncClient(
+            transport=_CanonicalIComLoopbackTransport(icom_api_origin)
+        )
+    private_path = _path_or_none(spec.get("formal_source_private_key_path"))
+    ledger_path = _path_or_none(spec.get("formal_source_ledger_path"))
+    if (private_path is None) != (ledger_path is None):
+        raise RuntimeError("worker formal source paths must be configured together")
+    if any(path is not None and not path.is_absolute() for path in (private_path, ledger_path)):
+        raise RuntimeError("worker formal source paths must be absolute")
+    now = _parse_clock(spec)
+    configured = api_main.settings.model_copy(
+        update={
+            "browser_bridge_enabled": True,
+            "browser_bridge_token": token,
+            "browser_bridge_control_token": None,
+            "browser_companion_auto_reload_enabled": False,
+            "model_agents_required": spec["model_agents_required"],
+            "adaptive_agent_scaling_enabled": spec[
+                "adaptive_agent_scaling_enabled"
+            ],
+        }
+    )
+    bridge, live_system = api_main._install_browser_bridge(
+        target_app,
+        configured,
+        now=now,
+        sleep=asyncio.sleep,
+        icom_http_client=icom_http_client,
+        formal_source_private_key_path=private_path,
+        formal_source_ledger_path=ledger_path,
+        formal_source_runtime_identity=(
+            api_runtime_identity if private_path is not None else None
+        ),
+    )
+    if bridge is None or live_system is None:
+        raise RuntimeError("worker browser-bridge install did not produce a live system")
+    target_app.state.live_worker_fixed_clock = now
+    target_app.state.live_worker_icom_http_client = icom_http_client
+    target_app.state.live_worker_http_host = host
+    target_app.state.live_worker_http_port = port
+    target_app.state.live_worker_http_server_task = asyncio.create_task(
+        _serve_loopback_http(target_app, host, port),
+        name="tripchord-live-worker-http",
+    )
+    return {
+        "schema_version": _RUNTIME_RECEIPT_SCHEMA,
+        "runtime": runtime,
+        "providers": providers,
+        "spec_sha256": bundle["spec_sha256"],
+        "runtime_provenance": provenance,
+        "api_runtime_identity_sha256": hashlib.sha256(
+            _canonical_json(api_runtime_identity)
+        ).hexdigest(),
+        "worker_runtime_identity": PROVENANCE.to_dict(),
+    }
+
+
+async def shutdown_runtime_http(target_app: Any) -> None:
+    """Stop the worker's loopback HTTP server, if one was started."""
+    server = getattr(target_app.state, "live_worker_http_server", None)
+    task = getattr(target_app.state, "live_worker_http_server_task", None)
+    if server is not None:
+        server.should_exit = True
+    if isinstance(task, asyncio.Task) and not task.done():
+        try:
+            await asyncio.wait_for(task, timeout=5.0)
+        except (asyncio.CancelledError, Exception):
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+    icom_client = getattr(target_app.state, "live_worker_icom_http_client", None)
+    if isinstance(icom_client, httpx.AsyncClient):
+        await icom_client.aclose()

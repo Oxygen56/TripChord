@@ -2467,10 +2467,20 @@ def _validate_business_event_details(
         if isinstance(item, dict)
     ]
     observed_icom_keys = list(icom_by_query)
-    if observed_icom_keys != expected_icom_keys[: len(observed_icom_keys)] or (
-        require_complete and observed_icom_keys != expected_icom_keys
+    # Independent transfer tasks execute concurrently in the real worker, so
+    # WHOSE three-call group reaches the ledger next is intentionally unordered.
+    # Identity remains strict: each (query_task_id, query digest) is unique and
+    # must belong to the frozen graph; finalize requires the exact complete set.
+    # The loop below still requires every group's three canonical endpoints in
+    # exact order and contiguous receipt sequence, so calls cannot be interleaved,
+    # duplicated, reassigned to a foreign pair, or padded with extra paths.
+    if (
+        len(observed_icom_keys) != len(set(observed_icom_keys))
+        or not set(observed_icom_keys).issubset(expected_icom_keys)
     ):
-        raise ValueError("formal iCom query group order/membership differs from job graph")
+        raise ValueError("formal iCom query group membership is duplicate or foreign")
+    if require_complete and set(observed_icom_keys) != set(expected_icom_keys):
+        raise ValueError("formal iCom query group membership is incomplete")
     for (task_id, _query_digest), query_events in icom_by_query.items():
         paths = [str(item["path"]) for item in query_events]
         sequences = [int(item["sequence"]) for item in query_events]

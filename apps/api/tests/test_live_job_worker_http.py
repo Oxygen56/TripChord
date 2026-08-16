@@ -36,12 +36,16 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 import tripchord.main as main_module
 from httpx import ASGITransport, AsyncClient
@@ -63,6 +67,13 @@ from tripchord.main import (
     app,
     package_requirement_agent,
     settings,
+)
+from tripchord.providers.browser_bridge import (
+    BrowserProvider,
+    BrowserTaskCompletion,
+    BrowserTaskLease,
+    BrowserTaskState,
+    BrowserVertical,
 )
 
 REQUEST_SHA256 = "a" * 64
@@ -1915,6 +1926,373 @@ class _FlakyKillConfirm:
         return bool(outcome)
 
 
+def _free_loopback_port() -> int:
+    """Pick a free loopback port for the worker's real HTTP bridge."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _ready_chain_flight_quote(lease: Any) -> Any:
+    """Date-adaptive flight quote for the ready-chain pair window.
+
+    The stock ``_flight_quote`` fixture hardcodes 2026-08-23/08-30; the ready
+    chain's pair window is derived from the payload's reference_date, so the
+    four departure/arrival stamps are re-anchored to the leased query dates —
+    every other contract field stays identical.
+    """
+    from test_live_agent_system import MALDIVES_OFFSET, _flight_quote, _sealed_quote
+
+    base = _flight_quote(lease)
+    start = lease.query.start_date
+    end = lease.query.end_date
+    assert end is not None
+    details = dict(base.details)
+    details.update(
+        {
+            "outbound_departure_at": f"{start.isoformat()}T08:30:00+08:00",
+            "outbound_arrival_at": f"{start.isoformat()}T18:35:00{MALDIVES_OFFSET}",
+            "return_departure_at": f"{end.isoformat()}T10:45:00{MALDIVES_OFFSET}",
+            "return_arrival_at": f"{(end + timedelta(days=1)).isoformat()}T09:10:00+08:00",
+        }
+    )
+    return _sealed_quote(
+        lease,
+        page_url=base.page_url,
+        amount=base.amount,
+        basis=base.price_basis,
+        title=base.title,
+        details=details,
+    )
+
+
+def _ready_chain_completion(lease: Any) -> BrowserTaskCompletion:
+    """Serve a real SUCCEEDED completion for one ready-chain bridge lease."""
+    from test_live_agent_system import _lodging_quote, _lodging_segment, _sealed_quote
+
+    if lease.kind == BrowserVertical.FLIGHT:
+        quote = _ready_chain_flight_quote(lease)
+        details = dict(quote.details)
+        details.update(
+            {
+                "provider_itinerary_id": f"{lease.provider.value}-hgh-mle-roundtrip",
+                "provider_offer_id": f"{lease.provider.value}-economy-rate",
+                "outbound_flight_numbers": ["MU509", "UL123"],
+                "return_flight_numbers": ["UL122", "MU510"],
+            }
+        )
+    else:
+        quote = _lodging_quote(lease)
+        details = dict(quote.details)
+        segment = _lodging_segment(lease)
+        details.update(
+            {
+                "property_id": f"{lease.provider.value}-{segment}-property",
+                "room_id": f"{lease.provider.value}-{segment}-room",
+                "rate_plan_id": f"{lease.provider.value}-{segment}-rate",
+                "provider_offer_id": f"{lease.provider.value}-{segment}-offer",
+            }
+        )
+    return BrowserTaskCompletion(
+        state=BrowserTaskState.SUCCEEDED,
+        quotes=(
+            _sealed_quote(
+                lease,
+                page_url=quote.page_url,
+                amount=quote.amount,
+                basis=quote.price_basis,
+                title=quote.title,
+                details=details,
+            ),
+        ),
+    )
+
+
+class _IComHarnessServer(ThreadingHTTPServer):
+    """Loopback HTTP server carrying the harness state for its handler."""
+
+    harness: _LocalIComHarness
+
+
+class _IComHarnessHandler(BaseHTTPRequestHandler):
+    """Serve the exact iCom public-read JSON over REAL loopback HTTP."""
+
+    server: _IComHarnessServer
+
+    def do_GET(self) -> None:
+        harness = self.server.harness
+        parsed = urlparse(self.path)
+        harness.paths.append(parsed.path)
+        meta = {
+            "timestamp": harness._now.isoformat(),
+            "apiVersion": "v1",
+            "status": "success",
+            "message": "Success",
+        }
+        if parsed.path == "/api/v1/public/trips/schedules":
+            params = parse_qs(parsed.query)
+            assert set(params) == {"date"} and len(params["date"]) == 1
+            travel_date = params["date"][0]
+            call = harness.schedule_calls.get(travel_date, 0) + 1
+            harness.schedule_calls[travel_date] = call
+            ordinal = date.fromisoformat(travel_date).toordinal()
+
+            def row(
+                *,
+                suffix: int,
+                origin_id: int,
+                origin: str,
+                destination_id: int,
+                destination: str,
+                hour: int,
+            ) -> dict[str, object]:
+                departure_hour = hour + call - 1
+                return {
+                    "id": ordinal * 10 + suffix + call * 1_000_000,
+                    "tripDate": travel_date,
+                    "departureTime": f"{departure_hour:02d}:00",
+                    "arrivalTime": f"{departure_hour:02d}:45",
+                    "capacity": 45,
+                    "remainingCapacity": 45,
+                    "cancelledAt": None,
+                    "isCancelled": False,
+                    "scheduleId": ordinal * 10 + suffix + call * 2_000_000,
+                    "stops": 0,
+                    "ferryName": f"iCom loopback harness {suffix}",
+                    "vessel": {
+                        "id": suffix,
+                        "name": f"iCom Vessel {suffix}",
+                        "totalCapacity": 45,
+                    },
+                    "origin": {"id": origin_id, "name": origin},
+                    "destination": {
+                        "id": destination_id,
+                        "name": destination,
+                    },
+                }
+
+            payload = {
+                "meta": meta,
+                "data": [
+                    row(
+                        suffix=1,
+                        origin_id=3,
+                        origin="Airport",
+                        destination_id=1,
+                        destination="Maafushi",
+                        hour=21,
+                    ),
+                    row(
+                        suffix=2,
+                        origin_id=1,
+                        origin="Maafushi",
+                        destination_id=3,
+                        destination="Airport",
+                        hour=6,
+                    ),
+                ],
+            }
+        elif parsed.path == "/api/v1/public/ferry-fares/schedule-base-price":
+            payload = {"meta": meta, "data": {"amount": 30, "currencyCode": "USD"}}
+        elif parsed.path == "/api/v1/public/policy-sections":
+            payload = {
+                "meta": meta,
+                "data": [
+                    {
+                        "id": 1,
+                        "title": "Payments",
+                        "richtext": {
+                            "blocks": [
+                                {
+                                    "type": "paragraph",
+                                    "data": {
+                                        "text": (
+                                            "All prices are displayed and charged "
+                                            "in US Dollars (USD)."
+                                        )
+                                    },
+                                }
+                            ]
+                        },
+                        "isActive": True,
+                    }
+                ],
+            }
+        else:
+            self.send_error(404, "unexpected iCom URL")
+            return
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        # Keep the loopback server quiet during the chain run.
+        return
+
+
+class _LocalIComHarness:
+    """A REAL loopback HTTP server for the worker's iCom public-transfer reads.
+
+    C-146 P0-1: the cross-process ready chain's public-transfer reads must
+    SUCCEED against a reachable origin. The live upstream API has drifted from
+    the adapter's schema contract, so the worker runtime bundle points
+    ``icom_api_origin`` at this server. Raw upstream JSON only — schema
+    validation, evidence hashing and option construction stay owned by
+    ``IComTransferProvider``.
+    """
+
+    def __init__(self, now: Any) -> None:
+        self._now = now
+        self.paths: list[str] = []
+        self.schedule_calls: dict[str, int] = {}
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def origin(self) -> str:
+        assert self._server is not None
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def start(self) -> None:
+        self._server = _IComHarnessServer(("127.0.0.1", 0), _IComHarnessHandler)
+        self._server.harness = self
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            daemon=True,
+            name="tripchord-test-icom-harness",
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+
+
+async def _serve_worker_ready_bridge(port: int, bridge_token: str) -> None:
+    """The external Companion: real loopback HTTP to the WORKER's bridge.
+
+    Heartbeats, claims and completes over the network exactly like the real
+    extension. The worker only starts serving after the job is activated, so
+    connection errors are retried until the port answers.
+    """
+    from tripchord.platform.registry import build_default_registry
+    from tripchord.providers.browser_bridge import BRIDGE_TOKEN_HEADER
+
+    headers = {BRIDGE_TOKEN_HEADER: bridge_token}
+    companions = {
+        "companion_id": "ready-chain-companion",
+        "providers": [provider.value for provider in BrowserProvider],
+        "authorized_scope_keys": sorted(
+            key.key
+            for key in build_default_registry().certified_scopes()
+            if not key.key.startswith("icom:")
+        ),
+        "adapter_version": "ready-chain-http-transport",
+        "contract_version": "tripchord-browser-companion-v1",
+        "build_identity": {
+            "protocol_version": "tripchord-companion-control-v1",
+            "manifest_version": "ready-chain-build-v1",
+            "build_sha256": "e" * 64,
+            "content_runtime_version": "ready-chain-runtime-v1",
+        },
+        "runtime_instance_id": "ready-chain-runtime-instance-0001",
+    }
+    async with AsyncClient(
+        base_url=f"http://127.0.0.1:{port}",
+        headers=headers,
+        timeout=15.0,
+    ) as companion_client:
+        while True:
+            try:
+                heartbeat = await companion_client.post(
+                    "/browser-bridge/v1/companions/heartbeat",
+                    json=companions,
+                )
+                heartbeat.raise_for_status()
+                claim = await companion_client.post(
+                    "/browser-bridge/v1/tasks/claim",
+                    json={**companions, "limit": 6},
+                )
+                claim.raise_for_status()
+                leases = tuple(
+                    BrowserTaskLease.model_validate(item)
+                    for item in claim.json().get("leases", [])
+                )
+                for lease in leases:
+                    completion = _ready_chain_completion(lease)
+                    await companion_client.post(
+                        f"/browser-bridge/v1/tasks/{lease.task_id}/complete",
+                        json={
+                            "claim_token": lease.claim_token,
+                            "completion": completion.model_dump(mode="json"),
+                        },
+                    )
+            except httpx.ConnectError:
+                # Worker not serving yet; retry until the bridge is up.
+                await asyncio.sleep(0.05)
+                continue
+            except httpx.HTTPStatusError:
+                await asyncio.sleep(0.05)
+                continue
+            await asyncio.sleep(0)
+
+
+def test_worker_runtime_envelope_rejects_tampered_spec_and_provenance() -> None:
+    """The independent worker verifies both canonical configuration bytes and
+    the parent API's immutable code provenance before composing capabilities.
+    """
+    from copy import deepcopy
+
+    from tripchord.agents.live_flexible_worker_runtime import (
+        _verified_runtime_spec,
+        build_authenticated_runtime_bundle,
+    )
+    from tripchord.platform.adapters import default_browser_providers_from_registry
+    from tripchord.runtime_provenance import PROVENANCE
+
+    spec = {
+        "runtime": "browser-bridge",
+        "bridge_token": "runtime-attestation-token-000000000000000",
+        "providers": [
+            provider.value
+            for provider in default_browser_providers_from_registry()
+        ],
+        "model_agents_required": False,
+        "adaptive_agent_scaling_enabled": False,
+        "now_iso": "2026-07-30T09:00:00+00:00",
+        "http_host": "127.0.0.1",
+        "http_port": 43123,
+        "icom_api_origin": "http://127.0.0.1:43124",
+    }
+    envelope = build_authenticated_runtime_bundle(spec)
+    verified, _, coordinator = _verified_runtime_spec(envelope)
+    assert verified == spec
+    assert coordinator == PROVENANCE.to_dict()
+
+    tampered_spec = deepcopy(envelope)
+    tampered_spec["spec"]["http_port"] = 43125
+    with pytest.raises(RuntimeError, match="digest does not match"):
+        _verified_runtime_spec(tampered_spec)
+
+    foreign_provenance = deepcopy(envelope)
+    foreign_provenance["runtime_provenance"]["commit_sha"] = "f" * 40
+    with pytest.raises(RuntimeError, match="commit_sha does not match"):
+        _verified_runtime_spec(foreign_provenance)
+
+    foreign_api_process = deepcopy(envelope)
+    foreign_api_process["api_runtime_identity"]["pid"] = -1
+    with pytest.raises(RuntimeError, match="API runtime identity"):
+        _verified_runtime_spec(foreign_api_process)
+
+
 @pytest.mark.asyncio
 async def test_http_route_runs_real_cross_process_ready_chain_to_success(
     monkeypatch: pytest.MonkeyPatch,
@@ -1922,37 +2300,81 @@ async def test_http_route_runs_real_cross_process_ready_chain_to_success(
 ) -> None:
     """A READY payload POSTed through the REAL route runs the REAL ready chain
     in a REAL independent worker subprocess whose reconstructed app installs a
-    PRODUCTION ``FlexibleLiveAgentSystem`` from the API process's env handoff —
-    never a monkeypatched private runtime — and the job SUCCEEDS with the
-    ready-chain provenance. RED on baseline: with no bundle the ready chain died
-    at the 503 and the job failed, so no cross-process ready chain existed."""
+    REAL browser-bridge composition (the SAME ``_install_browser_bridge`` entry
+    the API process uses) and serves it over REAL loopback HTTP — an external
+    Companion heartbeats / claims / completes over the network, and the parent
+    API observes the worker's progress, per-pair checkpoints, model trace and
+    cache on the durable job. RED on baseline: the worker ran a deterministic
+    HUMAN_BLOCK stand-in (no real capability) and no real HTTP chain existed."""
+    from test_live_agent_system import NOW as FIXTURE_NOW
+    from tripchord.platform.adapters import default_browser_providers_from_registry
+
     registry = _http_app_context(monkeypatch, tmp_path)
-    bundle = json.dumps(
-        {
-            "runtime": "deterministic-blocking",
-            "now_iso": "2026-07-30T09:00:00+00:00",
-            "monotonic_clock": 100.0,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    monkeypatch.setenv("TRIPCHORD_LIVE_FLEXIBLE_WORKER_RUNTIME_BUNDLE", bundle)
+    port = _free_loopback_port()
+    bridge_token = "ready-chain-bridge-token-000000000000000000"
+    icom_harness = _LocalIComHarness(FIXTURE_NOW)
+    icom_harness.start()
     try:
-        async with AsyncClient(
-            transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
-            base_url="http://test",
-        ) as client:
-            created = await client.post(
-                "/api/v1/agents/live-flexible-plan-from-text/jobs",
-                json=_payload(ready=True),
-            )
-            assert created.status_code == 202, created.text
-            job_id = created.json()["job"]["id"]
-            terminal = await _terminal_job_slow(client, job_id)
+        bundle = json.dumps(
+            {
+                "runtime": "browser-bridge",
+                "bridge_token": bridge_token,
+                "providers": [
+                    provider.value
+                    for provider in default_browser_providers_from_registry()
+                ],
+                "model_agents_required": False,
+                "adaptive_agent_scaling_enabled": False,
+                "now_iso": FIXTURE_NOW.isoformat(),
+                "http_host": "127.0.0.1",
+                "http_port": port,
+                "icom_api_origin": icom_harness.origin,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        monkeypatch.setenv("TRIPCHORD_LIVE_FLEXIBLE_WORKER_RUNTIME_BUNDLE", bundle)
+        companion_task = asyncio.create_task(
+            _serve_worker_ready_bridge(port, bridge_token),
+            name="ready-chain-companion",
+        )
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+                base_url="http://test",
+            ) as client:
+                created = await client.post(
+                    "/api/v1/agents/live-flexible-plan-from-text/jobs",
+                    json=_payload(ready=True),
+                )
+                assert created.status_code == 202, created.text
+                job_id = created.json()["job"]["id"]
+                # The Maldives stay-plan anti-bot floor gives the lodging source
+                # tasks real 40s/80s/120s/160s/200s start delays; the Companion
+                # must stay alive for the full chain (~250s) to complete them.
+                terminal = await _terminal_job_slow(client, job_id, timeout=300.0)
+        finally:
+            companion_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await companion_task
+        assert icom_harness.paths, "the worker must have consumed the local iCom harness"
+        assert set(icom_harness.paths) >= {
+            "/api/v1/public/trips/schedules",
+            "/api/v1/public/ferry-fares/schedule-base-price",
+            "/api/v1/public/policy-sections",
+        }
         assert terminal["state"] == "succeeded", terminal
         result = terminal["result"]
         assert result["interpretation"]["state"] == "ready", result
+        assert result.get("run") is not None, result
+        receipt = result.get("worker_runtime_receipt")
+        assert receipt is not None, result
+        assert receipt["schema_version"] == (
+            "tripchord-live-worker-runtime-receipt-v1"
+        )
+        assert receipt["runtime"] == "browser-bridge"
+        assert len(receipt["spec_sha256"]) == 64
         runtime = registry._records[job_id]
         # A REAL worker subprocess ran the ready chain — durable identity.
         assert runtime.worker_pgid is not None and runtime.worker_pgid > 0
@@ -1960,7 +2382,28 @@ async def test_http_route_runs_real_cross_process_ready_chain_to_success(
         # The API process itself never installed a flexible runtime — the ready
         # chain ran ONLY inside the worker subprocess via the env bundle.
         assert getattr(app.state, "flexible_live_agent_system", None) is None
+        # --- P0-1 observability: the parent API observes the FULL chain ---
+        # Progress: the job snapshot carries the worker's stages/progress.
+        assert terminal["stage"] in {"complete", "failed", "cancelled"}
+        # Per-pair checkpoints were replayed onto the durable job record.
+        assert len(terminal["pair_checkpoints"]) >= 1, terminal
+        assert len(terminal["source_terminal_events"]) >= 1, terminal
+        assert terminal["barrier_released_at"] is not None, terminal
+        # Model trace: the worker's scope is bound to this job and counted.
+        assert result.get("model_trace_scope_sha256") is not None
+        assert result.get("model_trace_count") is not None
+        # Cache: the worker cached its pair runs (observable cache handoff).
+        assert isinstance(result.get("cached_pair_runs"), list)
+        assert len(result["cached_pair_runs"]) >= 1, result
+        # The handles are newly allocated by the PARENT cache importer, not the
+        # worker's process-local cache: every returned id is immediately usable
+        # by the parent API's event-replan path.
+        parent_cache = app.state.live_run_cache
+        tenant_id = runtime.operation.args["tenant_id"]
+        for handle in result["cached_pair_runs"]:
+            assert await parent_cache.get(handle["run_id"], tenant_id) is not None
     finally:
+        icom_harness.stop()
         await registry.close()
 
 
@@ -2026,6 +2469,54 @@ async def test_worker_nonzero_exit_kills_stubborn_descendant_before_terminal(
         if pgid is not None:
             with _suppress_os():
                 os.killpg(pgid, signal.SIGKILL)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_importer_rejects_missing_cross_process_observability(
+    tmp_path: Path,
+) -> None:
+    """A production-style worker import cannot publish a result that omitted
+    the progress/checkpoint/model/source envelope owned by that same process.
+    """
+    module = tmp_path / "missing_observability_worker.py"
+    module.write_text(
+        "async def run_clean(**kwargs):\n    return {'ok': True}\n",
+        encoding="utf-8",
+    )
+    importer_called = False
+
+    async def import_result(result: dict[str, Any]) -> dict[str, Any]:
+        nonlocal importer_called
+        importer_called = True
+        return result
+
+    registry = LivePlanningJobRegistry(
+        state_path=tmp_path / "missing-observability.json",
+        capacity=2,
+        max_running=1,
+    )
+    try:
+        snapshot, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=LiveJobWorkerCommand(
+                module_path=str(module),
+                entry="run_clean",
+                result_importer=import_result,
+            ),
+            idempotency_key="missing-observability",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=30.0,
+        )
+        runtime = registry._records[snapshot.id]
+        await _wait_for_runtime(
+            runtime,
+            lambda item: item.snapshot.state == LivePlanningJobState.FAILED,
+        )
+        assert importer_called is False
+        assert runtime.snapshot.result is None
+    finally:
         await registry.close()
 
 
@@ -2373,6 +2864,625 @@ async def test_idcap_admission_rejects_when_collection_full_preserving_old_mappi
         assert registry._idempotency[key_a].job_id == snap_a.id
         assert registry._idempotency[key_a].request_digest == REQUEST_SHA256
     finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "entry", "first_confirmation", "expected_terminal"),
+    (
+        (
+            _RAISING_STUBBORN_SRC,
+            "run_raising_stubborn",
+            False,
+            LivePlanningJobState.FAILED,
+        ),
+        (
+            _RETURNED_GRANDCHILD_SRC,
+            "run_returned_grandchild",
+            "raise",
+            LivePlanningJobState.SUCCEEDED,
+        ),
+    ),
+    ids=("nonzero-false", "clean-raise"),
+)
+async def test_worker_exit_confirmation_failure_keeps_identity_and_permit_until_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source: str,
+    entry: str,
+    first_confirmation: object,
+    expected_terminal: LivePlanningJobState,
+) -> None:
+    """Clean and non-zero leader exits share one fail-closed group contract.
+
+    A False/raising first confirmation leaves the stubborn descendant alive,
+    therefore the job must remain non-terminal with its durable identity and
+    admission permit intact.  The same owner retries automatically; only the
+    subsequent real group kill may publish SUCCEEDED/FAILED and release the
+    permit.  This is the original P0-2 attack shape, not a terminal-state mock.
+    """
+    from tripchord.agents import live_jobs as live_jobs_module
+
+    module = tmp_path / f"worker-exit-{entry}.py"
+    probe = tmp_path / f"worker-exit-{entry}.txt"
+    state_path = tmp_path / f"worker-exit-{entry}.json"
+    module.write_text(source, encoding="utf-8")
+    original_confirm = live_jobs_module._SubprocessWorkerHandle.kill_and_confirm
+    release_confirmation = asyncio.Event()
+    call_count = 0
+
+    async def controlled_confirm(handle: Any, timeout: float) -> bool:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            if first_confirmation == "raise":
+                raise OSError("injected worker-exit confirmation failure")
+            return False
+        await release_confirmation.wait()
+        return await original_confirm(handle, timeout)
+
+    monkeypatch.setattr(
+        live_jobs_module._SubprocessWorkerHandle,
+        "kill_and_confirm",
+        controlled_confirm,
+    )
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=2,
+        max_running=1,
+        hard_stop_confirm_seconds=0.5,
+        execution_hard_stop_grace_seconds=10.0,
+        cleanup_retry_backoff_seconds=0.01,
+    )
+    pgid: int | None = None
+    try:
+        snapshot, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=LiveJobWorkerCommand(
+                module_path=str(module),
+                entry=entry,
+                args={},
+                probe_path=str(probe),
+            ),
+            idempotency_key=f"exit-confirm-{entry}",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=30.0,
+        )
+        runtime = registry._records[snapshot.id]
+        await _wait_for_runtime(runtime, lambda item: item.worker_pgid is not None)
+        _wait_for_probe(probe, "grandchild-pid")
+        pgid = runtime.worker_pgid
+        assert pgid is not None
+        await _wait_for_runtime(runtime, lambda _: call_count >= 2)
+
+        # First confirmation failed and the retry is deliberately blocked: no
+        # terminal label, no permit release, no identity loss over live work.
+        assert runtime.snapshot.state not in {
+            LivePlanningJobState.SUCCEEDED,
+            LivePlanningJobState.FAILED,
+            LivePlanningJobState.CANCELLED,
+        }
+        assert runtime.slot_held is True
+        assert runtime.worker_pgid == pgid
+        assert runtime.worker_marker
+        assert _group_alive(pgid)
+        assert _probe_grows(probe)
+        durable = json.loads(state_path.read_text(encoding="utf-8"))
+        durable_record = next(
+            item
+            for item in durable["records"]
+            if item["snapshot"]["id"] == snapshot.id
+        )
+        assert durable_record["worker_pgid"] == pgid
+        assert durable_record["worker_marker"] == runtime.worker_marker
+
+        release_confirmation.set()
+        await _wait_for_runtime(
+            runtime,
+            lambda item: item.snapshot.state == expected_terminal,
+            timeout=15.0,
+        )
+        assert runtime.slot_held is False
+        assert not _group_alive(pgid)
+        assert not _probe_grows(probe)
+    finally:
+        release_confirmation.set()
+        monkeypatch.undo()
+        if pgid is not None:
+            with _suppress_os():
+                os.killpg(pgid, signal.SIGKILL)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ("marker-mismatch", "ps-failure"))
+async def test_orphan_auth_failure_stays_isolated_across_two_cold_boots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    """An unauthenticated durable worker identity is never terminalized.
+
+    Marker mismatch and process-query failure both preserve explicit durable
+    ``authenticated=False`` / ``death_confirmed=False`` facts.  Two complete
+    cold boots keep the same non-terminal orphan quarantine and continue to
+    re-check it; neither boot guesses the pending FAILED outcome or kills an
+    unauthenticated process group.
+    """
+    from tripchord.agents import live_jobs as live_jobs_module
+
+    state_path = tmp_path / f"orphan-auth-{failure_mode}.json"
+    probe = tmp_path / f"orphan-auth-{failure_mode}.txt"
+    expected_marker = "expected-orphan-marker-000000000001"
+    process_marker = (
+        expected_marker
+        if failure_mode == "ps-failure"
+        else "foreign-orphan-marker-000000000002"
+    )
+    orphan_code = (
+        "import sys, time\n"
+        "probe = sys.argv[2]\n"
+        "while True:\n"
+        "    with open(probe, 'a') as fh:\n"
+        "        fh.write('foreign-orphan\\n')\n"
+        "        fh.flush()\n"
+        "    time.sleep(0.01)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", orphan_code, process_marker, str(probe)],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pgid = process.pid
+    if failure_mode == "ps-failure":
+        monkeypatch.setattr(
+            live_jobs_module.LivePlanningJobRegistry,
+            "_group_commands",
+            staticmethod(lambda _pgid: []),
+        )
+    pending = _PendingTerminalOutcome(
+        state=LivePlanningJobState.FAILED,
+        stage="deadline_exceeded",
+        error="TimeoutError: live planning job deadline exceeded",
+        safe_failure=_safe_failure_diagnostic(
+            TimeoutError("live planning job deadline exceeded"),
+            code_override=LivePlanningSafeFailureCode.DEADLINE_EXCEEDED,
+        ),
+        cancellation_requested=True,
+    )
+    job_id = f"live-job-orphan-auth-{failure_mode}"
+    snapshot = _v3_snapshot(
+        job_id,
+        LivePlanningJobState.RUNNING,
+        "timeout_pending",
+        5,
+        2,
+        cancellation_requested=True,
+        cancel_pending=True,
+    )
+    _write_registry_state(
+        {
+            "schema_version": "tripchord-live-job-registry-v3",
+            "records": [
+                _v3_record(
+                    "tenant-a",
+                    snapshot,
+                    pending_terminal=pending.to_persisted(),
+                    worker_pgid=pgid,
+                    worker_marker=expected_marker,
+                    worker_probe=str(probe),
+                )
+            ],
+            "idempotency": [
+                _v3_idempotency_entry("tenant-a", "orphan-auth-key", job_id)
+            ],
+        },
+        state_path,
+    )
+    try:
+        _wait_for_probe(probe, "foreign-orphan")
+        observed: list[tuple[object, ...]] = []
+        for _boot in range(2):
+            registry = LivePlanningJobRegistry(state_path=state_path)
+            try:
+                await registry.restore_after_restart()
+                # Let the restored cleanup owner and reaper run.  They must
+                # treat auth/death-confirm failure as an unproven live executor,
+                # not race the startup resolver and publish pending FAILED.
+                await asyncio.sleep(0.15)
+                runtime = registry._records[job_id]
+                observed.append(
+                    (
+                        runtime.snapshot.state,
+                        runtime.snapshot.stage,
+                        runtime.quarantined,
+                        runtime.quarantine_stage,
+                        runtime.orphan_authenticated,
+                        runtime.orphan_death_confirmed,
+                        runtime.pending_terminal.state
+                        if runtime.pending_terminal is not None
+                        else None,
+                    )
+                )
+                assert _group_alive(pgid)
+                assert _probe_grows(probe)
+            finally:
+                await registry.close()
+        expected = (
+            LivePlanningJobState.RUNNING,
+            _QUARANTINE_ORPHAN_STAGE,
+            True,
+            _QUARANTINE_ORPHAN_STAGE,
+            False,
+            False,
+            LivePlanningJobState.FAILED,
+        )
+        assert observed == [expected, expected]
+        durable = json.loads(state_path.read_text(encoding="utf-8"))
+        durable_record = durable["records"][0]
+        assert durable_record["orphan_authenticated"] is False
+        assert durable_record["orphan_death_confirmed"] is False
+    finally:
+        with _suppress_os():
+            os.killpg(pgid, signal.SIGKILL)
+        with _suppress_os():
+            process.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("authenticated", "death_confirmed"),
+    (("yes", False), (False, "yes"), (False, True)),
+    ids=("foreign-auth-type", "foreign-death-type", "death-without-auth"),
+)
+def test_cold_load_rejects_invalid_or_impossible_orphan_facts(
+    tmp_path: Path,
+    authenticated: object,
+    death_confirmed: object,
+) -> None:
+    """Persisted orphan facts are an exact typed tuple: booleans/None only,
+    and death confirmation can never exist without prior marker authentication.
+    """
+    state_path = tmp_path / "invalid-orphan-facts.json"
+    job_id = "live-job-invalid-orphan-facts"
+    record = _v3_record(
+        "tenant-a",
+        _v3_snapshot(
+            job_id,
+            LivePlanningJobState.RUNNING,
+            _QUARANTINE_ORPHAN_STAGE,
+            5,
+            2,
+        ),
+        quarantined=True,
+        quarantine_stage=_QUARANTINE_ORPHAN_STAGE,
+        worker_pgid=2_147_483_647,
+        worker_marker="invalid-orphan-fact-marker-00000001",
+    )
+    record["orphan_authenticated"] = authenticated
+    record["orphan_death_confirmed"] = death_confirmed
+    _write_registry_state(
+        {
+            "schema_version": "tripchord-live-job-registry-v3",
+            "records": [record],
+            "idempotency": [
+                _v3_idempotency_entry("tenant-a", "invalid-orphan-key", job_id)
+            ],
+        },
+        state_path,
+    )
+    with pytest.raises(RuntimeError, match="orphan"):
+        LivePlanningJobRegistry(state_path=state_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("worker_marker", "orphan-marker-without-pgid-00000001"),
+        ("worker_probe", "/foreign/orphan-probe"),
+        ("orphan_authenticated", False),
+        ("orphan_death_confirmed", False),
+    ),
+    ids=("marker", "probe", "authentication-fact", "death-fact"),
+)
+def test_cold_load_rejects_orphan_state_without_worker_identity(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    """Marker/probe/auth/death state cannot survive without its exact PGID.
+
+    Otherwise a cold boot silently drops an authentication failure or death
+    fact and may later recycle the record as if no orphan had ever existed.
+    """
+    state_path = tmp_path / f"orphan-without-identity-{field}.json"
+    job_id = f"live-job-orphan-without-identity-{field}"
+    record = _v3_record(
+        "tenant-a",
+        _v3_snapshot(
+            job_id,
+            LivePlanningJobState.RUNNING,
+            _QUARANTINE_ORPHAN_STAGE,
+            5,
+            2,
+        ),
+        quarantined=True,
+        quarantine_stage=_QUARANTINE_ORPHAN_STAGE,
+    )
+    record[field] = value
+    _write_registry_state(
+        {
+            "schema_version": "tripchord-live-job-registry-v3",
+            "records": [record],
+            "idempotency": [
+                _v3_idempotency_entry(
+                    "tenant-a",
+                    f"orphan-without-identity-{field}",
+                    job_id,
+                )
+            ],
+        },
+        state_path,
+    )
+    with pytest.raises(RuntimeError, match="worker identity"):
+        LivePlanningJobRegistry(state_path=state_path)
+
+
+@pytest.mark.asyncio
+async def test_persistent_hard_stop_exception_is_rate_bounded_and_consumed(
+    tmp_path: Path,
+) -> None:
+    """A permanent kill exception has a fixed-window call ceiling and never
+    leaves an unretrieved wrapper exception or a leaked in-flight reservation.
+    """
+
+    class AlwaysRaiseConfirm:
+        def __init__(self) -> None:
+            self.calls: list[float] = []
+
+        async def kill_and_confirm(self, timeout: float) -> bool:
+            self.calls.append(asyncio.get_running_loop().time())
+            raise OSError("permanent injected kill failure")
+
+    loop = asyncio.get_running_loop()
+    contexts: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    registry = LivePlanningJobRegistry(
+        state_path=tmp_path / "persistent-hard-stop.json",
+        capacity=2,
+        max_running=1,
+        quarantine_capacity=1,
+        hard_stop_confirm_seconds=0.02,
+        cleanup_retry_backoff_seconds=0.01,
+        hard_stop_confirm_budget_window_seconds=0.5,
+        hard_stop_confirm_budget_window_calls=3,
+        execution_hard_stop_grace_seconds=10.0,
+    )
+    runtime: Any = None
+    handle = AlwaysRaiseConfirm()
+    try:
+        snapshot, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_never_finish,
+            idempotency_key="persistent-hard-stop",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=60.0,
+        )
+        runtime = registry._records[snapshot.id]
+        await _wait_for_runtime(
+            runtime,
+            lambda item: item.operation_task is not None
+            and not item.operation_task.done(),
+        )
+        runtime.worker_handle = handle
+        async with registry._changed:
+            runtime.hard_stop_monotonic = loop.time() - 0.1
+            registry._wake_hard_stop_watchdog()
+        await _wait_for_runtime(runtime, lambda _: len(handle.calls) >= 3)
+        await asyncio.sleep(0.2)
+        # The fixed 0.5s window allows at most three calls; the old path spun
+        # continuously once the deadline was already past.
+        assert len(handle.calls) == 3
+        assert runtime.snapshot.state not in {
+            LivePlanningJobState.SUCCEEDED,
+            LivePlanningJobState.FAILED,
+            LivePlanningJobState.CANCELLED,
+        }
+        assert runtime.hard_stop_in_flight is False
+        assert runtime.hard_stop_quarantine_reserved is False
+        assert not any(
+            "never retrieved" in str(context.get("message", "")).casefold()
+            for context in contexts
+        )
+    finally:
+        loop.set_exception_handler(previous_handler)
+        if runtime is not None:
+            async with registry._changed:
+                runtime.hard_stop_monotonic = loop.time() + 3600
+                runtime.worker_handle = None
+            for task in tuple(registry._hard_stop_tasks):
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+            operation = runtime.operation_task
+            if operation is not None and not operation.done():
+                operation.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await operation
+            runner = runtime.task
+            if runner is not None and not runner.done():
+                runner.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await runner
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_hard_stop_wrapper_cancel_race_releases_owner_and_reservation(
+    tmp_path: Path,
+) -> None:
+    """Cancelling a wrapper while kill/confirm is suspended releases both
+    ownership flags, and its done callback consumes the cancellation cleanly.
+    """
+
+    class BlockingConfirm:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        async def kill_and_confirm(self, timeout: float) -> bool:
+            self.entered.set()
+            await asyncio.Event().wait()
+            return False
+
+    loop = asyncio.get_running_loop()
+    contexts: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    registry = LivePlanningJobRegistry(
+        state_path=tmp_path / "cancel-race-hard-stop.json",
+        capacity=2,
+        max_running=1,
+        quarantine_capacity=1,
+        execution_hard_stop_grace_seconds=10.0,
+    )
+    runtime: Any = None
+    handle = BlockingConfirm()
+    try:
+        snapshot, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_never_finish,
+            idempotency_key="cancel-race-hard-stop",
+            request_digest=REQUEST_SHA256,
+            deadline_seconds=60.0,
+        )
+        runtime = registry._records[snapshot.id]
+        await _wait_for_runtime(
+            runtime,
+            lambda item: item.operation_task is not None
+            and not item.operation_task.done(),
+        )
+        runtime.worker_handle = handle
+        async with registry._changed:
+            runtime.hard_stop_monotonic = loop.time() - 0.1
+            registry._wake_hard_stop_watchdog()
+        await asyncio.wait_for(handle.entered.wait(), timeout=5.0)
+        await _wait_for_runtime(
+            runtime,
+            lambda item: item.hard_stop_in_flight
+            and item.hard_stop_quarantine_reserved,
+        )
+        wrapper = next(iter(registry._hard_stop_tasks))
+        async with registry._changed:
+            runtime.hard_stop_monotonic = loop.time() + 3600
+        wrapper.cancel()
+        with suppress(asyncio.CancelledError):
+            await wrapper
+        await asyncio.sleep(0)
+        assert runtime.hard_stop_in_flight is False
+        assert runtime.hard_stop_quarantine_reserved is False
+        assert wrapper not in registry._hard_stop_tasks
+        assert not contexts
+    finally:
+        loop.set_exception_handler(previous_handler)
+        if runtime is not None:
+            runtime.worker_handle = None
+            operation = runtime.operation_task
+            if operation is not None and not operation.done():
+                operation.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await operation
+            runner = runtime.task
+            if runner is not None and not runner.done():
+                runner.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await runner
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_http_idcap_gate_precedes_uuid_runtime_and_worker_command_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A full idempotency collection rejects a new HTTP key before every
+    constructor and leaves both the durable bytes and in-memory bindings intact.
+    """
+    from tripchord.agents import live_jobs as live_jobs_module
+
+    registry = _http_app_context(
+        monkeypatch,
+        tmp_path,
+        registry_kwargs={"idempotency_capacity": 1},
+    )
+    first, _ = await registry.start_idempotent(
+        tenant_id="local",
+        operation=_quick_success,
+        idempotency_key="idcap-existing",
+        request_digest=REQUEST_SHA256,
+        deadline_seconds=30.0,
+    )
+    await _wait_for_runtime(
+        registry._records[first.id],
+        lambda item: item.snapshot.state == LivePlanningJobState.SUCCEEDED,
+    )
+    state_path = tmp_path / "live-jobs.json"
+    before_bytes = state_path.read_bytes()
+    before_records = tuple(registry._records)
+    before_idempotency = {
+        key: (entry.job_id, entry.request_digest, entry.defer_start)
+        for key, entry in registry._idempotency.items()
+    }
+    calls = {"uuid": 0, "runtime": 0, "worker_command": 0}
+    original_uuid4 = live_jobs_module.uuid4
+    original_runtime = live_jobs_module._RuntimeJob
+    original_builder = main_module._build_live_flexible_from_text_worker_command
+
+    def uuid_probe() -> Any:
+        calls["uuid"] += 1
+        return original_uuid4()
+
+    def runtime_probe(*args: Any, **kwargs: Any) -> Any:
+        calls["runtime"] += 1
+        return original_runtime(*args, **kwargs)
+
+    def builder_probe(*args: Any, **kwargs: Any) -> Any:
+        calls["worker_command"] += 1
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(live_jobs_module, "uuid4", uuid_probe)
+    monkeypatch.setattr(live_jobs_module, "_RuntimeJob", runtime_probe)
+    monkeypatch.setattr(
+        main_module,
+        "_build_live_flexible_from_text_worker_command",
+        builder_probe,
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(
+                app=app,
+                client=("127.0.0.1", 51342),
+                raise_app_exceptions=False,
+            ),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/v1/agents/live-flexible-plan-from-text/jobs",
+                headers={"Idempotency-Key": "idcap-new"},
+                json=_payload(ready=False),
+            )
+        assert response.status_code == 503, response.text
+        assert calls == {"uuid": 0, "runtime": 0, "worker_command": 0}
+        assert state_path.read_bytes() == before_bytes
+        assert tuple(registry._records) == before_records
+        assert {
+            key: (entry.job_id, entry.request_digest, entry.defer_start)
+            for key, entry in registry._idempotency.items()
+        } == before_idempotency
+    finally:
+        monkeypatch.undo()
         await registry.close()
 
 

@@ -12,14 +12,17 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from tripchord.planning.frozen_graph import (
@@ -1183,6 +1186,47 @@ def _realistic_e2e_evidence(
     assert isinstance(source, dict)
     _attach_fixture_formal_context(evidence, source)
     return evidence
+
+
+def test_formal_icom_query_groups_accept_concurrent_group_order_but_not_membership_drift() -> None:
+    """Real worker transfer tasks may finish in any GROUP order; every group's
+    identity and internal three-endpoint sequence remain exact and complete."""
+    from tripchord.formal_live_source import _validate_business_event_details
+
+    binding = _fixture_formal_source_binding()
+    challenge = binding["challenge"]
+    assert isinstance(challenge, dict)
+    graph = challenge["job_graph"]
+    assert isinstance(graph, dict)
+    receipts = binding["receipts"]
+    assert isinstance(receipts, list)
+    non_icom = [event for event in receipts if event["kind"] != "icom_public_get"]
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for event in receipts:
+        if event["kind"] != "icom_public_get":
+            continue
+        details = event["details"]
+        assert isinstance(details, dict)
+        grouped.setdefault(str(details["query_task_id"]), []).append(event)
+    reordered = [
+        *non_icom,
+        *(event for group in reversed(tuple(grouped.values())) for event in group),
+    ]
+    _validate_business_event_details(
+        reordered,
+        job_graph=graph,
+        candidate_set_sha256=str(challenge["candidate_set_sha256"]),
+        require_complete=True,
+    )
+
+    duplicated = [*reordered, *next(iter(grouped.values()))]
+    with pytest.raises(ValueError, match=r"exact public GET|duplicate or foreign"):
+        _validate_business_event_details(
+            duplicated,
+            job_graph=graph,
+            candidate_set_sha256=str(challenge["candidate_set_sha256"]),
+            require_complete=True,
+        )
 
 
 def _repo_head_or_none() -> str | None:
@@ -13823,20 +13867,25 @@ class _C4IComHTTPHarness:
         self.paths: list[str] = []
         self.schedule_calls: dict[str, int] = {}
 
-    def __call__(self, request: Any) -> Any:
-        import httpx
+    def respond(
+        self,
+        path: str,
+        params: dict[str, str],
+    ) -> tuple[int, dict[str, object]]:
+        """Return ``(status, payload)`` for one raw iCom public-read request.
 
-        assert request.method == "GET"
-        assert request.url.host == "sfs-api.icomtours.com"
-        self.paths.append(request.url.path)
+        Pure response logic shared by the MockTransport handler and the REAL
+        loopback server the C-146 P0-1 ready chain reaches (``icom_api_origin``).
+        """
+        self.paths.append(path)
         meta = {
             "timestamp": NOW.isoformat(),
             "apiVersion": "v1",
             "status": "success",
             "message": "Success",
         }
-        if request.url.path == "/api/v1/public/trips/schedules":
-            travel_date = str(request.url.params["date"])
+        if path == "/api/v1/public/trips/schedules":
+            travel_date = params["date"]
             call = self.schedule_calls.get(travel_date, 0) + 1
             self.schedule_calls[travel_date] = call
             ordinal = date.fromisoformat(travel_date).toordinal()
@@ -13875,9 +13924,9 @@ class _C4IComHTTPHarness:
                     },
                 }
 
-            return httpx.Response(
+            return (
                 200,
-                json={
+                {
                     "meta": meta,
                     "data": [
                         row(
@@ -13899,20 +13948,15 @@ class _C4IComHTTPHarness:
                     ],
                 },
             )
-        if request.url.path == (
-            "/api/v1/public/ferry-fares/schedule-base-price"
-        ):
-            return httpx.Response(
+        if path == "/api/v1/public/ferry-fares/schedule-base-price":
+            return 200, {
+                "meta": meta,
+                "data": {"amount": 30, "currencyCode": "USD"},
+            }
+        if path == "/api/v1/public/policy-sections":
+            return (
                 200,
-                json={
-                    "meta": meta,
-                    "data": {"amount": 30, "currencyCode": "USD"},
-                },
-            )
-        if request.url.path == "/api/v1/public/policy-sections":
-            return httpx.Response(
-                200,
-                json={
+                {
                     "meta": meta,
                     "data": [
                         {
@@ -13936,7 +13980,67 @@ class _C4IComHTTPHarness:
                     ],
                 },
             )
-        raise AssertionError(f"unexpected iCom URL: {request.url}")
+        raise AssertionError(f"unexpected iCom URL: {path}")
+
+    def __call__(self, request: Any) -> Any:
+        import httpx
+
+        assert request.method == "GET"
+        assert request.url.host == "sfs-api.icomtours.com"
+        params = {key: values[0] for key, values in request.url.params.multi_items()}
+        status, payload = self.respond(request.url.path, params)
+        return httpx.Response(status, json=payload)
+
+
+class _C4IComHTTPServer(ThreadingHTTPServer):
+    """REAL loopback HTTP server serving the C4 iCom public-read JSON.
+
+    C-146 P0-1: the formal Layer 6 ready chain reaches the worker through a REAL
+    cross-process HTTP boundary, so the worker's public-transfer reads must hit a
+    REACHABLE origin — not the in-process ``httpx.MockTransport`` of the old
+    seam. Raw upstream JSON only; schema validation and evidence hashing stay
+    owned by ``IComTransferProvider`` in the worker.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, harness: _C4IComHTTPHarness) -> None:
+        super().__init__(("127.0.0.1", 0), _C4IComHTTPHandler)
+        self.harness = harness
+
+    @property
+    def origin(self) -> str:
+        host, port = self.server_address[:2]
+        return f"http://{host}:{port}"
+
+
+class _C4IComHTTPHandler(BaseHTTPRequestHandler):
+    """Serve the harness's raw JSON for one GET request."""
+
+    def do_GET(self) -> None:
+        parsed = urlsplit(self.path)
+        params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+        try:
+            status, payload = self.server.harness.respond(parsed.path, params)  # type: ignore[attr-defined]
+        except AssertionError as exc:
+            self.send_error(404, str(exc))
+            return
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+def _c4_free_loopback_port() -> int:
+    """Pick a free loopback port for the worker's real HTTP server."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        return int(reserved.getsockname()[1])
 
 
 def _c4_validate_formal_composition(
@@ -14057,58 +14161,20 @@ class _RealChainArtifacts:
         self.formal_source_binding = formal_source_binding
 
 
-def _in_process_flexible_operation(
-    payload: Any,
-    *,
-    request_digest: str,
-    target_app: Any,
-    cache: Any,
-    principal: Any,
-) -> Any:
-    """In-process seam for the chain's flexible planning job.
-
-    C-146 P0-1 makes the production route wrap the real operation in a
-    subprocess ``LiveJobWorkerCommand``. The formal production chain drives the
-    mounted HTTP route against an IN-PROCESS composition (fake Companion
-    transport, mocked iCom client), which no worker subprocess can reach. This
-    seam returns the SAME pre-worker in-process operation — the exact
-    ``_execute_live_flexible_from_text`` call the production worker entry runs —
-    as a coroutine inside the API process. The REAL subprocess worker + its
-    hard-stop / identity proof is covered by the counterexample tests in
-    ``apps/api/tests/test_live_job_worker_http.py``; this seam only restores the
-    chain's ability to exercise the evidence chain through the mounted HTTP
-    route.
-    """
-
-    import tripchord.main as main_module
-
-    async def operation(report: Any) -> dict[str, Any]:
-        response = await main_module._execute_live_flexible_from_text(
-            payload,
-            target_app=target_app,
-            cache=cache,
-            principal=principal,
-            report_progress=report,
-            report_pair_checkpoint=report.report_pair_checkpoint,
-            expected_request_sha256=request_digest,
-            model_trace_scope_id=report.job_id,
-            report_model_trace_summary=report.report_model_trace_summary,
-        )
-        return response.model_dump(mode="json")
-
-    return operation
-
-
 async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts:
-    """Run the formal runner against the real in-process production API.
+    """Run the formal runner against the production API with a REAL worker.
 
-    Only transport, clocks, and the output path are bounded.  The formal
+    C-146 P0-1: the flexible planning route wraps the real operation in a
+    ``LiveJobWorkerCommand``; the worker runtime bundle points the REAL
+    subprocess worker at a REAL loopback iCom origin and a REAL loopback bridge
+    port, and the Companion serves the worker's bridge over the network — the
+    exact production ready chain, never an in-process substitute. The formal
     ``run_live_done_gate_v4._run`` owns request loading, runtime/Companion
     preflight, async job submission, checkpoint validation, event replan,
     producer evaluation, completed-bundle construction, and the atomic 0600
-    evidence write.  No production class/function is replaced: black-box
+    evidence write. No production class/function is replaced: black-box
     persisted evidence proves every required stage, and the enclosing
-    ``try/finally`` restores the bounded in-process API transport state.
+    ``try/finally`` restores the bounded API transport/env state.
     """
     import httpx
     import tripchord.main as api_main
@@ -14169,94 +14235,184 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
         "content_runtime_version": "c4-formal-runtime-v1",
     }
     raw_output = staging_dir.parent / "formal-run" / "live-done-gate-v4.json"
+    # The REAL cross-process worker reaches the iCom origin over loopback HTTP
+    # (never an in-process MockTransport), so the harness is served by a REAL
+    # server.  The parent's own bridge keeps a MockTransport client — it only
+    # exists for preflight/composition, never for the worker's reads.
     icom_harness = _C4IComHTTPHarness()
+    icom_server = _C4IComHTTPServer(icom_harness)
+    icom_thread = threading.Thread(
+        target=icom_server.serve_forever,
+        daemon=True,
+        name="tripchord-c4-icom-loopback",
+    )
+    icom_thread.start()
     icom_client = httpx.AsyncClient(
         transport=httpx.MockTransport(icom_harness),
     )
+    assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
+    assert _TEST_FORMAL_LEDGER_PATH is not None
+    assert _TEST_FORMAL_CONTROL_TOKEN_PATH is not None
     composition_types: dict[str, str] = {}
     companion_heartbeat_status = 0
-
-    async def serve_browser_transport() -> None:
-        headers = {BRIDGE_TOKEN_HEADER: bridge_token}
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(
-                app=app,
-                client=("127.0.0.1", 51343),
+    worker_port = _c4_free_loopback_port()
+    _BUNDLE_ENV = "TRIPCHORD_LIVE_FLEXIBLE_WORKER_RUNTIME_BUNDLE"
+    original_bundle = os.environ.get(_BUNDLE_ENV)
+    worker_bundle = json.dumps(
+        {
+            "runtime": "browser-bridge",
+            "bridge_token": bridge_token,
+            "providers": [
+                BrowserProvider.CTRIP.value,
+                BrowserProvider.QUNAR.value,
+                BrowserProvider.TONGCHENG.value,
+            ],
+            "model_agents_required": False,
+            "adaptive_agent_scaling_enabled": False,
+            "now_iso": NOW.isoformat(),
+            "http_host": "127.0.0.1",
+            "http_port": worker_port,
+            "icom_api_origin": icom_server.origin,
+            "formal_source_private_key_path": str(
+                _TEST_FORMAL_PRIVATE_KEY_PATH
             ),
-            base_url="http://tripchord.test",
-            headers=headers,
-        ) as companion_client:
+            "formal_source_ledger_path": str(_TEST_FORMAL_LEDGER_PATH),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    companion_payload = {
+        "companion_id": companion_id,
+        "providers": ["ctrip", "qunar", "tongcheng"],
+        "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
+        "adapter_version": "c4-formal-http-transport",
+        "contract_version": "tripchord-browser-companion-v1",
+        "build_identity": companion_build_identity,
+        "runtime_instance_id": companion_runtime_id,
+    }
+
+    async def complete_leases(
+        companion_client: httpx.AsyncClient,
+        leases: tuple[BrowserTaskLease, ...],
+    ) -> None:
+        for lease in leases:
+            is_event_recheck = (
+                lease.kind == BrowserVertical.LODGING
+                and lease.query.options.get(
+                    "__tripchord_allow_recent_quote_reuse"
+                )
+                is False
+            )
+            completion = (
+                _c4_event_source_replacement(lease)
+                if is_event_recheck
+                else _c4_frozen_success(lease)
+            )
+            completed = await companion_client.post(
+                f"/browser-bridge/v1/tasks/{lease.task_id}/complete",
+                headers={BRIDGE_TOKEN_HEADER: bridge_token},
+                json={
+                    "claim_token": lease.claim_token,
+                    "completion": completion.model_dump(mode="json"),
+                },
+            )
+            completed.raise_for_status()
+
+    async def serve_ready_chain_companion() -> None:
+        """Serve the flexible job's source tasks on the WORKER's bridge and the
+        event-replan recheck tasks on the PARENT's bridge.
+
+        C-146 P0-1: the flexible job executes in the REAL independent worker, so
+        its browser tasks are queued on the WORKER's bridge — reached over REAL
+        loopback HTTP (the worker only starts serving after activation, so
+        connection errors are retried).  The post-run event replan submits its
+        recheck tasks to the PARENT's bridge (in-process ASGI), which this loop
+        also serves.
+        """
+        async with client_factory(base_url="http://tripchord.test") as parent_client:
             while True:
-                heartbeat_payload = {
-                    "companion_id": companion_id,
-                    "providers": ["ctrip", "qunar", "tongcheng"],
-                    "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
-                    "adapter_version": "c4-formal-http-transport",
-                    "contract_version": "tripchord-browser-companion-v1",
-                    "build_identity": companion_build_identity,
-                    "runtime_instance_id": companion_runtime_id,
-                }
-                heartbeat = await companion_client.post(
-                    "/browser-bridge/v1/companions/heartbeat",
-                    json=heartbeat_payload,
-                )
-                heartbeat.raise_for_status()
-                pending_activation = heartbeat.json().get(
-                    "formal_activation_request"
-                )
-                if pending_activation is not None:
-                    acknowledged = await companion_client.post(
+                # Parent bridge: keep the Companion FRESH for the formal
+                # activation (the activation endpoint waits for a real heartbeat)
+                # and serve the event-replan recheck tasks that land here.
+                try:
+                    heartbeat = await parent_client.post(
                         "/browser-bridge/v1/companions/heartbeat",
-                        json={
-                            **heartbeat_payload,
-                            "formal_activation_ack": pending_activation,
-                        },
+                        headers={BRIDGE_TOKEN_HEADER: bridge_token},
+                        json=companion_payload,
                     )
-                    acknowledged.raise_for_status()
-                response = await companion_client.post(
-                    "/browser-bridge/v1/tasks/claim",
-                    json={
-                        "companion_id": companion_id,
-                        "providers": ["ctrip", "qunar", "tongcheng"],
-                        "authorized_scope_keys": sorted(
-                            gate._CERTIFIED_OTA_SCOPES
-                        ),
-                        "adapter_version": "c4-formal-http-transport",
-                        "contract_version": "tripchord-browser-companion-v1",
-                        "build_identity": companion_build_identity,
-                        "runtime_instance_id": companion_runtime_id,
-                        "limit": 6,
-                    },
-                )
-                response.raise_for_status()
-                leases = tuple(
-                    BrowserTaskLease.model_validate(item)
-                    for item in response.json()["leases"]
-                )
-                if not leases:
-                    await asyncio.sleep(0)
-                    continue
-                for lease in leases:
-                    is_event_recheck = (
-                        lease.kind == BrowserVertical.LODGING
-                        and lease.query.options.get(
-                            "__tripchord_allow_recent_quote_reuse"
+                    heartbeat.raise_for_status()
+                    pending_activation = heartbeat.json().get(
+                        "formal_activation_request"
+                    )
+                    if pending_activation is not None:
+                        acknowledged = await parent_client.post(
+                            "/browser-bridge/v1/companions/heartbeat",
+                            headers={BRIDGE_TOKEN_HEADER: bridge_token},
+                            json={
+                                **companion_payload,
+                                "formal_activation_ack": pending_activation,
+                            },
                         )
-                        is False
+                        acknowledged.raise_for_status()
+                    claim = await parent_client.post(
+                        "/browser-bridge/v1/tasks/claim",
+                        headers={BRIDGE_TOKEN_HEADER: bridge_token},
+                        json={**companion_payload, "limit": 6},
                     )
-                    completion = (
-                        _c4_event_source_replacement(lease)
-                        if is_event_recheck
-                        else _c4_frozen_success(lease)
+                    claim.raise_for_status()
+                    leases = tuple(
+                        BrowserTaskLease.model_validate(item)
+                        for item in claim.json().get("leases", [])
                     )
-                    completed = await companion_client.post(
-                        f"/browser-bridge/v1/tasks/{lease.task_id}/complete",
-                        json={
-                            "claim_token": lease.claim_token,
-                            "completion": completion.model_dump(mode="json"),
-                        },
-                    )
-                    completed.raise_for_status()
+                    if leases:
+                        await complete_leases(parent_client, leases)
+                except httpx.HTTPStatusError:
+                    pass
+                # Worker bridge: the flexible job's REAL source tasks.
+                try:
+                    async with httpx.AsyncClient(
+                        base_url=f"http://127.0.0.1:{worker_port}",
+                        headers={BRIDGE_TOKEN_HEADER: bridge_token},
+                        timeout=15.0,
+                    ) as worker_client:
+                        heartbeat = await worker_client.post(
+                            "/browser-bridge/v1/companions/heartbeat",
+                            json=companion_payload,
+                        )
+                        heartbeat.raise_for_status()
+                        pending_activation = heartbeat.json().get(
+                            "formal_activation_request"
+                        )
+                        if pending_activation is not None:
+                            acknowledged = await worker_client.post(
+                                "/browser-bridge/v1/companions/heartbeat",
+                                json={
+                                    **companion_payload,
+                                    "formal_activation_ack": pending_activation,
+                                },
+                            )
+                            acknowledged.raise_for_status()
+                        claim = await worker_client.post(
+                            "/browser-bridge/v1/tasks/claim",
+                            json={**companion_payload, "limit": 6},
+                        )
+                        claim.raise_for_status()
+                        leases = tuple(
+                            BrowserTaskLease.model_validate(item)
+                            for item in claim.json().get("leases", [])
+                        )
+                        if leases:
+                            await complete_leases(worker_client, leases)
+                except httpx.HTTPError:
+                    # Worker not serving yet (pre-activation), shutting down
+                    # after publishing its terminal result, or transient.  A
+                    # shutdown-side read timeout must not kill the same
+                    # Companion loop before it serves the parent's subsequent
+                    # synthetic event-recheck lease.
+                    pass
+                await asyncio.sleep(0)
 
     def client_factory(**kwargs: Any) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -14269,9 +14425,6 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
 
     serve_task: asyncio.Task[None] | None = None
     try:
-        assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
-        assert _TEST_FORMAL_LEDGER_PATH is not None
-        assert _TEST_FORMAL_CONTROL_TOKEN_PATH is not None
         api_main._FORMAL_SOURCE_CONTROL_PATH = _TEST_FORMAL_CONTROL_TOKEN_PATH
         # The production composition entry creates and binds the real bridge,
         # provider, pair runner, flexible runner, and mounted bridge API.  The
@@ -14347,7 +14500,8 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
             )
             prime.raise_for_status()
 
-        serve_task = asyncio.create_task(serve_browser_transport())
+        os.environ[_BUNDLE_ENV] = worker_bundle
+        serve_task = asyncio.create_task(serve_ready_chain_companion())
         args = SimpleNamespace(
             request=(
                 _C4_REPO_ROOT
@@ -14406,6 +14560,12 @@ async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts
             serve_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await serve_task
+        if original_bundle is None:
+            os.environ.pop(_BUNDLE_ENV, None)
+        else:
+            os.environ[_BUNDLE_ENV] = original_bundle
+        icom_server.shutdown()
+        icom_server.server_close()
         await icom_client.aclose()
         app.router.routes[:] = original_routes
         api_main._FORMAL_SOURCE_CONTROL_PATH = original_control_path
@@ -14480,26 +14640,18 @@ _c4_chain_cache: dict[str, _RealChainArtifacts] = {}
 
 
 def _real_production_chain(staging_dir: Path) -> _RealChainArtifacts:
-    """Run the formal production chain once and share its persisted raw file."""
-    if "artifacts" not in _c4_chain_cache:
-        # C-146 P0-1 seam: the flexible planning route now wraps the real
-        # operation in a subprocess ``LiveJobWorkerCommand``, which cannot reach
-        # the in-process test composition. Bind the route to the same in-process
-        # operation during the chain run and restore the production builder
-        # immediately after (the real worker path is proven by the counterexample
-        # suite, not by this evidence-chain run).
-        import tripchord.main as api_main
+    """Run the formal production chain once and share its persisted raw file.
 
-        original_builder = api_main._build_live_flexible_from_text_worker_command
-        api_main._build_live_flexible_from_text_worker_command = (
-            _in_process_flexible_operation
+    C-146 P0-1: the production builder is NEVER replaced.  The flexible planning
+    route wraps the real operation in a ``LiveJobWorkerCommand`` and the formal
+    chain drives the REAL independent worker subprocess over REAL loopback HTTP
+    (Companion + iCom harness are reachable origins), so the sealed evidence is
+    produced by the exact production ready chain.
+    """
+    if "artifacts" not in _c4_chain_cache:
+        _c4_chain_cache["artifacts"] = asyncio.run(
+            _drive_real_production_chain(staging_dir)
         )
-        try:
-            _c4_chain_cache["artifacts"] = asyncio.run(
-                _drive_real_production_chain(staging_dir)
-            )
-        finally:
-            api_main._build_live_flexible_from_text_worker_command = original_builder
     return _c4_chain_cache["artifacts"]
 
 
@@ -16805,10 +16957,6 @@ def test_formal_authority_second_cold_start_detects_old_process_still_bound(
     async def scenario() -> None:
         first_process = await start_and_wait(1)
         async with httpx.AsyncClient(timeout=30.0) as client:
-            first_runtime = (
-                await client.get(f"{base}/api/v1/agents/runtime")
-            ).json()["runtime_provenance"]
-
             # The old process is intentionally left alive: the port still
             # answers, so a port-release probe would keep seeing a listener and
             # time out — the false-green condition the harness must detect.
@@ -17193,7 +17341,7 @@ def test_formal_activation_interrupt_windows_fail_closed_over_real_http(
         # Deterministic second-crash counter-example: the failure terminal state
         # is stable across another cold start and the retry still fails closed
         # with no additional dispatch.
-        third_process = await start_server(3, fault=None)
+        await start_server(3, fault=None)
         async with httpx.AsyncClient(timeout=30.0) as client:
             # server3 must be a genuinely new runtime with strictly later
             # provenance — never the old process answering on the same port.

@@ -7,7 +7,7 @@ import os
 import secrets
 import stat
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -357,6 +357,59 @@ class LiveRunCache:
                 raise
             return run_id, expires_at
 
+    async def import_worker_runs(
+        self,
+        tenant_id: str,
+        pair_runs: tuple[tuple[str, LivePackageAgentRun], ...],
+    ) -> tuple[LiveFlexiblePairRunHandle, ...]:
+        """Atomically import cache results returned by one worker process.
+
+        Worker-local ``LiveRunCache`` ids are meaningless in the parent API.
+        The parent validates every serialized run first, then allocates fresh
+        tenant-bound ids and commits the entire batch in one cache transaction.
+        Any validation/persist failure restores the exact pre-import entries;
+        no partial handle set can be published by the job registry.
+        """
+        if len(pair_runs) > 8:
+            raise ValueError("worker live-run cache batch exceeds eight pairs")
+        if len(pair_runs) > self._capacity:
+            raise ValueError("worker live-run cache batch exceeds cache capacity")
+        pair_ids = tuple(pair_id for pair_id, _run in pair_runs)
+        if any(not pair_id or len(pair_id) > 200 for pair_id in pair_ids):
+            raise ValueError("worker live-run cache date pair id is invalid")
+        if len(set(pair_ids)) != len(pair_ids):
+            raise ValueError("worker live-run cache date pair ids must be unique")
+        partition = self._tenant_partition(tenant_id)
+        async with self._lock:
+            before = OrderedDict(self._entries)
+            now = self._utc_now()
+            self._prune(now)
+            handles: list[LiveFlexiblePairRunHandle] = []
+            try:
+                for date_pair_id, run in pair_runs:
+                    while len(self._entries) >= self._capacity:
+                        self._entries.popitem(last=False)
+                    run_id = self._new_run_id()
+                    expires_at = now + self._ttl
+                    self._entries[run_id] = _LiveRunCacheEntry(
+                        tenant_partition_sha256=partition,
+                        run=run,
+                        created_at=now,
+                        expires_at=expires_at,
+                    )
+                    handles.append(
+                        LiveFlexiblePairRunHandle(
+                            date_pair_id=date_pair_id,
+                            run_id=run_id,
+                            expires_at=expires_at,
+                        )
+                    )
+                self._persist_locked()
+            except Exception:
+                self._entries = before
+                raise
+            return tuple(handles)
+
     async def get(
         self,
         run_id: str,
@@ -682,6 +735,7 @@ def _install_browser_bridge(
     sleep: Callable[[float], Awaitable[None]] | None = None,
     formal_source_private_key_path: Path | None = None,
     formal_source_ledger_path: Path | None = None,
+    formal_source_runtime_identity: Mapping[str, object] | None = None,
 ) -> tuple[BrowserTaskBridge | None, LivePackageAgentSystem | None]:
     token = configured_settings.browser_bridge_token
     if not configured_settings.browser_bridge_enabled or token is None or len(token) < 32:
@@ -705,6 +759,13 @@ def _install_browser_bridge(
         or formal_source_ledger_path is not None
         or bool(os.environ.get("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"))
     )
+    if formal_source_runtime_identity is not None and (
+        formal_source_private_key_path is None
+        or formal_source_ledger_path is None
+    ):
+        raise RuntimeError(
+            "delegated formal source runtime requires explicit key and ledger paths"
+        )
     source_authority: FormalLiveSourceAuthority | None = None
     if formal_source_requested:
         authority_kwargs: dict[str, Any] = {}
@@ -714,7 +775,17 @@ def _install_browser_bridge(
             authority_kwargs["ledger_path"] = formal_source_ledger_path
         source_authority = load_formal_live_source_authority(
             commit_sha=commit_sha,
-            runtime_identity=PROVENANCE.to_dict(),
+            # A real worker subprocess is a delegated executor of the live API
+            # challenge, not an API restart. Its authenticated runtime envelope
+            # carries the direct parent API's full identity; using that identity
+            # lets both processes serialize events through the same protected
+            # ledger without the worker falsely aborting the active challenge as
+            # a cold restart. Ordinary API composition always uses its own.
+            runtime_identity=(
+                formal_source_runtime_identity
+                if formal_source_runtime_identity is not None
+                else PROVENANCE.to_dict()
+            ),
             now=now,
             **authority_kwargs,
         )
@@ -1622,6 +1693,7 @@ async def activate_formal_live_source_job_endpoint(
                             job_id,
                             principal.tenant_id,
                             operation_id=operation_id,
+                            worker_execution_capability=capability,
                         )
                 else:
                     snapshot = await registry.get(job_id, principal.tenant_id)
@@ -2687,21 +2759,26 @@ def _live_flexible_worker_runtime_bundle() -> dict[str, Any] | None:
 
     C-146 P0-1 (RETURN 7de8cf3e): a JSON spec in
     ``TRIPCHORD_LIVE_FLEXIBLE_WORKER_RUNTIME_BUNDLE`` configures what runtime the
-    worker subprocess builds for the ready chain (e.g. the deterministic,
-    side-effect-free blocking runtime). Read at command-build time so the API
-    process forwards its own runtime configuration to the worker; an absent or
-    malformed value means the worker keeps its default (reconstructed) runtime.
+    worker subprocess builds for the ready chain. Read at command-build time and
+    bind its canonical digest to this API process's immutable code provenance;
+    the worker recomputes both before it creates any capability. An absent value
+    keeps the reconstructed app's default; malformed/foreign configured values
+    fail closed instead of silently dropping the production runtime.
     """
     raw = os.environ.get("TRIPCHORD_LIVE_FLEXIBLE_WORKER_RUNTIME_BUNDLE")
     if raw is None:
         return None
     try:
         parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        return None
+    except (TypeError, ValueError) as exc:
+        raise ValueError("live flexible worker runtime bundle is not valid JSON") from exc
     if not isinstance(parsed, dict):
-        return None
-    return parsed
+        raise ValueError("live flexible worker runtime bundle must be an object")
+    from tripchord.agents.live_flexible_worker_runtime import (
+        build_authenticated_runtime_bundle,
+    )
+
+    return build_authenticated_runtime_bundle(parsed)
 
 
 def _build_live_flexible_from_text_worker_command(
@@ -2731,10 +2808,70 @@ def _build_live_flexible_from_text_worker_command(
     runtime_bundle = _live_flexible_worker_runtime_bundle()
     if runtime_bundle is not None:
         args["runtime_bundle"] = runtime_bundle
+
+    async def import_result(result: dict[str, Any]) -> dict[str, Any]:
+        raw_runs = result.pop("_worker_cache_runs", None)
+        raw_handles = result.get("cached_pair_runs")
+        if not isinstance(raw_runs, list) or not isinstance(raw_handles, list):
+            raise RuntimeError("live planning worker cache handoff is missing")
+        if len(raw_runs) != len(raw_handles) or len(raw_runs) > 8:
+            raise RuntimeError("live planning worker cache handoff count is invalid")
+        public_result = {
+            key: value
+            for key, value in result.items()
+            if key != "worker_runtime_receipt"
+        }
+        response = LiveFlexibleFromTextPlanningResponse.model_validate(public_result)
+        if (response.interpretation.state == PackageRequestState.READY) != (
+            response.run is not None
+        ):
+            raise RuntimeError("live planning worker result readiness is invalid")
+        expected_pair_runs = (
+            tuple(
+                (execution.date_pair.id, execution.run)
+                for execution in response.run.pair_runs
+                if execution.run is not None
+            )
+            if response.run is not None
+            else ()
+        )
+        parsed: list[tuple[str, LivePackageAgentRun]] = []
+        worker_pair_ids: list[str] = []
+        for item in raw_runs:
+            if not isinstance(item, dict) or set(item) != {"date_pair_id", "run"}:
+                raise RuntimeError("live planning worker cache entry is invalid")
+            pair_id = item["date_pair_id"]
+            if not isinstance(pair_id, str):
+                raise RuntimeError("live planning worker cache pair id is invalid")
+            parsed.append((pair_id, LivePackageAgentRun.model_validate(item["run"])))
+            worker_pair_ids.append(pair_id)
+        handle_pair_ids = [handle.date_pair_id for handle in response.cached_pair_runs]
+        expected_pair_ids = [pair_id for pair_id, _run in expected_pair_runs]
+        if worker_pair_ids != handle_pair_ids or worker_pair_ids != expected_pair_ids:
+            raise RuntimeError("live planning worker cache handles do not match runs")
+        if any(
+            cached_run != expected_run
+            for (_pair_id, cached_run), (_expected_id, expected_run) in zip(
+                parsed,
+                expected_pair_runs,
+                strict=True,
+            )
+        ):
+            raise RuntimeError("live planning worker cache entries do not match result")
+        parent_handles = await cache.import_worker_runs(
+            principal.tenant_id,
+            tuple(parsed),
+        )
+        result["cached_pair_runs"] = [
+            handle.model_dump(mode="json") for handle in parent_handles
+        ]
+        return result
+
     return LiveJobWorkerCommand(
         module_path=str(Path(live_flexible_from_text_worker.__file__)),
         entry="run_live_flexible_from_text",
         args=args,
+        result_importer=import_result,
     )
 
 
@@ -2771,21 +2908,21 @@ async def start_live_flexible_from_text_job_endpoint(
     if defer_start:
         _authorize_formal_source_control(http_request, formal_prepare_credential)
 
-    # C-146 P0-1: the real operation is wrapped in a ``LiveJobWorkerCommand`` so
-    # it executes in an INDEPENDENT worker/process, never as a coroutine inside
-    # this API process. Query / cancel / retry / cold-start recovery stay bound
-    # to the durable job identity the registry owns.
-    operation = _build_live_flexible_from_text_worker_command(
-        payload,
-        request_digest=request_digest,
-        target_app=target_app,
-        cache=cache,
-        principal=principal,
-    )
     try:
         job, replayed = await registry.start_idempotent(
             tenant_id=principal.tenant_id,
-            operation=operation,
+            # C-146 P0-1/P0-5: the real operation is a worker command, but the
+            # registry builds it LAZILY only after its atomic idempotency-capacity
+            # gate accepts this new key. A full collection therefore performs
+            # zero worker-command / UUID / runtime construction and the existing
+            # identity bytes stay untouched, even under concurrent admissions.
+            operation_factory=lambda: _build_live_flexible_from_text_worker_command(
+                payload,
+                request_digest=request_digest,
+                target_app=target_app,
+                cache=cache,
+                principal=principal,
+            ),
             idempotency_key=idempotency_key,
             request_digest=request_digest,
             deadline_seconds=effective_total_timeout_seconds,

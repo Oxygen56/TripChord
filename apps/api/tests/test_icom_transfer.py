@@ -524,3 +524,54 @@ async def test_package_conversion_rejects_unrepresentable_or_expired_evidence() 
 
     with pytest.raises(ValueError, match="between 1 and 9"):
         to_package_transfer_option(option, adults=10)
+
+
+@pytest.mark.asyncio
+async def test_loopback_transport_preserves_canonical_icom_evidence_url() -> None:
+    """C-146 P0-1 counterexample: the worker's loopback harness is a transport
+    boundary only; provider/formal evidence must still name the exact public
+    HTTPS endpoint. RED on the first WIP: changing ``api_origin`` exposed the
+    loopback URL and the formal validator rejected every iCom call."""
+    from urllib.parse import urlsplit
+
+    from tripchord.agents.live_flexible_worker_runtime import (
+        _CanonicalIComLoopbackTransport,
+    )
+
+    loopback_origin = "http://127.0.0.1:9999"
+    observed_transport_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed_transport_urls.append(str(request.url))
+        assert request.url.host == "127.0.0.1"
+        assert request.url.port == 9999
+        if request.url.path == "/api/v1/public/trips/schedules":
+            return httpx.Response(200, json=_schedule_payload())
+        if request.url.path == "/api/v1/public/ferry-fares/schedule-base-price":
+            return httpx.Response(200, json=_fare_payload())
+        if request.url.path == "/api/v1/public/policy-sections":
+            return httpx.Response(200, json=_policy_payload())
+        raise AssertionError(f"unexpected iCom URL: {request.url}")
+
+    transport = _CanonicalIComLoopbackTransport(
+        loopback_origin,
+        inner=httpx.MockTransport(handler),
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        provider = IComTransferProvider(
+            client=client,
+        )
+        result = await provider.search(_query())
+
+    assert observed_transport_urls
+    option = result.options[0]
+    # The socket went to loopback, but all externally visible evidence retains
+    # the exact canonical origin and therefore passes the existing hard boundary.
+    assert option.source_url.startswith("https://sfs-api.icomtours.com/")
+    packaged = to_package_transfer_option(option, adults=2)
+    assert packaged is not None
+    parsed = urlsplit(packaged.detail_url)
+    assert parsed.scheme == "https"
+    assert parsed.hostname == "sfs-api.icomtours.com"
+    assert "127.0.0.1" not in packaged.detail_url
+    assert packaged.detail_url == option.source_url

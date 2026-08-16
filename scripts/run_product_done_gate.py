@@ -2393,7 +2393,7 @@ def _scan_decoded_string_value(
     characters surface).
     """
     encoded_value = value.encode("utf-8")
-    for needle in tuple(needles):
+    for needle in needles:
         if needle in encoded_value:
             raise GateStateChangedError(
                 f"secret leak: secret value found in decoded value in "
@@ -2433,7 +2433,7 @@ def _scan_decoded_string_value(
     shape_pairs = (
         _FINAL_TEXT_SHAPE_PAIRS
         if name.endswith(".failure.json")
-        else registry_shape_pairs(PatternScope.FINAL_VALUE)
+        else _FINAL_VALUE_SHAPE_PAIRS
     )
     # R21 Block 26: the SAME exact-marker blanking applies to a decoded
     # JSON-string level — a clean redacted report smuggled through json.dumps
@@ -2443,11 +2443,17 @@ def _scan_decoded_string_value(
     value_shapes = _blank_exact_marker_assignments(value_masked)
     if name.endswith(".failure.json"):
         value_shapes = _blank_diagnostic_schema_version(value_shapes)
-    value_shapes_norm = (
-        _normalize_for_scan(value_shapes)
-        if _requires_distinct_normalized_scan(value_shapes)
-        else value_shapes
-    )
+    if value_shapes is normalized_input:
+        # No URL/marker/schema blanking changed the value. Reuse the exact
+        # normalized copy already scanned above instead of normalizing the same
+        # decoded string a second time.
+        value_shapes_norm = value_norm
+    else:
+        value_shapes_norm = (
+            _normalize_for_scan(value_shapes)
+            if _requires_distinct_normalized_scan(value_shapes)
+            else value_shapes
+        )
     for pattern, kind in shape_pairs:
         if public_proofs and pattern is _BARE_CREDENTIAL_PAIRS[0][0]:
             leaked = _linear_bare_credential_match(value_shapes)
@@ -2497,7 +2503,19 @@ def _make_decoded_value_scanner(
     """The ``on_string_value`` callback for :func:`_secret_scan_bytes`'s shared
     bounded walker — scans every decoded string value (补充 A) and aborts the
     walk by raising."""
+    # The value scanner is deliberately path-independent; structural/path
+    # contracts are enforced by the walker around this callback. A formal raw
+    # repeats the same provider/task/status strings hundreds of thousands of
+    # times across pairs and nested snapshots. Scan each distinct value once
+    # under this immutable needles/label/name/proof policy. The bounded set keeps
+    # memory deterministic, and a leaking first occurrence raises before it can
+    # ever be cached.
+    safe_values: set[str] = set()
+    safe_value_capacity = 4096
+
     def scan(value: str) -> None:
+        if value in safe_values:
+            return
         _scan_decoded_string_value(
             value,
             needles,
@@ -2505,6 +2523,8 @@ def _make_decoded_value_scanner(
             name,
             public_proofs,
         )
+        if len(safe_values) < safe_value_capacity:
+            safe_values.add(value)
 
     return scan
 
@@ -3390,6 +3410,14 @@ _NORMALIZED_DIAG_SHAPE_PATTERNS: tuple[re.Pattern[str], ...] = registry_patterns
 # never by rejecting every URL.
 _FINAL_TEXT_SHAPE_PAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
     registry_shape_pairs(PatternScope.FINAL_TEXT)
+)
+# The same registry-derived set for each decoded committed-evidence value.
+# Keep it immutable at module load just like FINAL_TEXT above: rebuilding this
+# tuple for every string in a ~28MB formal artifact consumed most of the fixed
+# 15-second scan budget without adding any validation. Caching changes no
+# pattern, scope, order, or fail-closed decision.
+_FINAL_VALUE_SHAPE_PAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
+    registry_shape_pairs(PatternScope.FINAL_VALUE)
 )
 # The single credential-FIELD-NAME shape applied to the RAW TOP-LEVEL text of
 # EVERY artifact — committed evidence AND free-form diagnostics.  A free-form

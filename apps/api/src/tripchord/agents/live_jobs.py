@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -23,6 +24,8 @@ from uuid import uuid4
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from tripchord.domain.common import DomainModel
+
+logger = logging.getLogger(__name__)
 
 
 class LivePlanningJobState(StrEnum):
@@ -907,6 +910,13 @@ class LiveJobWorkerCommand:
     entry: str
     args: dict[str, Any] = field(default_factory=dict)
     probe_path: str | None = None
+    # Parent-only import hook. It is NEVER serialized into worker argv or the
+    # durable registry: after the worker returns validated JSON, the parent uses
+    # this to atomically import process-local artifacts (notably live-run cache
+    # entries) and replace worker-local handles before publishing the result.
+    result_importer: Callable[
+        [dict[str, Any]], Awaitable[dict[str, Any]]
+    ] | None = field(default=None, repr=False, compare=False)
 
 
 class _SubprocessWorkerHandle:
@@ -1134,6 +1144,16 @@ class _RuntimeJob:
         # busy-spinning every scan.
         self.hard_stop_deferred = False
         self.hard_stop_next_attempt_monotonic = 0.0
+        # C-146 P0-4 (RETURN 7de8cf3e): SATURATING + fixed-window-bounded retry
+        # bookkeeping for a hard-stop death-confirmation that KEEPS failing
+        # (kill/confirm exception or death-not-confirmed). The retry round
+        # drives an exponential backoff capped at 0.5s; the per-window call
+        # count is a hard upper bound so a persistently failing confirm can
+        # never hot-loop the watchdog. ``hard_stop_next_attempt_monotonic`` is
+        # the wake time the watchdog loop sleeps on.
+        self.hard_stop_confirm_retry_round = 0
+        self.hard_stop_confirm_window_start_monotonic = 0.0
+        self.hard_stop_confirm_window_calls = 0
         # C-146 P0-7: a quarantine slot RESERVED atomically (same lock domain as
         # the conversion) BEFORE any stop/kill side effect, so a capacity
         # rejection never happens after an irreversible action and a concurrent
@@ -1168,6 +1188,33 @@ class _RuntimeJob:
         self.worker_pgid: int | None = None
         self.worker_marker: str | None = None
         self.worker_probe: str | None = None
+        # Parent-validated, signed formal execution capability handed to a real
+        # worker only at the prepared-job activation boundary. It is never part
+        # of the initial command (which is built before challenge issuance), and
+        # is not persisted because a parent restart kills/isolates the old worker
+        # rather than resuming its process-local execution scope.
+        self.worker_execution_capability: dict[str, Any] | None = None
+        # C-146 P0-3: durable per-identity orphan facts persisted across cold
+        # starts. ``orphan_authenticated`` records whether a cold boot ever
+        # AUTHENTICATED this durable worker group via its marker nonce (False
+        # covers both "marker not found in the group" AND "the ps query itself
+        # failed"); ``orphan_death_confirmed`` records whether the authenticated
+        # group was ever CONFIRMED dead (whole group ESRCH within the confirm
+        # budget). None = this identity has never been cold-boot checked. A
+        # cold start may settle a record ONLY when BOTH are provably True;
+        # auth/ps failure keeps the record isolated (orphan quarantine) so
+        # consecutive cold starts can re-check the group.
+        self.orphan_authenticated: bool | None = None
+        self.orphan_death_confirmed: bool | None = None
+        # C-146 P0-2: worker-EXIT confirmation retry state (in-memory). When
+        # the worker leader exits (clean OR non-zero) but the whole process
+        # group cannot yet be proven empty, the confirmation AUTO-RETRIES on a
+        # SATURATING + fixed-window-bounded backoff while the job stays
+        # non-terminal, keeps its durable worker identity and its admission
+        # permit. These counters mirror the hard-stop confirm budget windows.
+        self.worker_exit_confirm_retry_round: int = 0
+        self.worker_exit_confirm_window_start_monotonic: float = 0.0
+        self.worker_exit_confirm_window_calls: int = 0
 
 
 class _IdempotencyEntry:
@@ -1252,6 +1299,14 @@ class LivePlanningJobRegistry:
         # C-146 P0-7: bounded backoff between two hard-stop attempts when the
         # stop was REFUSED for a full quarantine quota. Never a busy-spin.
         hard_stop_defer_retry_seconds: float = 1.0,
+        # C-146 P0-4 (RETURN 7de8cf3e): SATURATING + fixed-window-bounded
+        # retry for a hard-stop death-confirmation that KEEPS failing
+        # (kill/confirm exception or death-not-confirmed). The exponential
+        # backoff saturates (capped); the per-window call-count is a hard upper
+        # bound so a persistently failing confirm can never hot-loop the
+        # watchdog. Both are test-controllable.
+        hard_stop_confirm_budget_window_seconds: float = 2.0,
+        hard_stop_confirm_budget_window_calls: int = 8,
     ) -> None:
         if capacity < 1:
             raise ValueError("capacity must be positive")
@@ -1283,6 +1338,10 @@ class LivePlanningJobRegistry:
             raise ValueError("state_max_bytes must be at least 1024")
         if tombstone_ttl <= timedelta(0):
             raise ValueError("tombstone_ttl must be positive")
+        if hard_stop_confirm_budget_window_seconds <= 0:
+            raise ValueError("hard_stop_confirm_budget_window_seconds must be positive")
+        if hard_stop_confirm_budget_window_calls < 1:
+            raise ValueError("hard_stop_confirm_budget_window_calls must be at least one")
         self._capacity = capacity
         self._terminal_ttl = terminal_ttl
         self._now = now or (lambda: datetime.now(UTC))
@@ -1303,6 +1362,8 @@ class LivePlanningJobRegistry:
         self._quarantine_overflow = False
         self._hard_stop_confirm_seconds = hard_stop_confirm_seconds
         self._hard_stop_defer_retry_seconds = hard_stop_defer_retry_seconds
+        self._hard_stop_confirm_budget_window_seconds = hard_stop_confirm_budget_window_seconds
+        self._hard_stop_confirm_budget_window_calls = hard_stop_confirm_budget_window_calls
         self._worker_python = worker_python or sys.executable
         self._worker_module = worker_module or _default_worker_module()
         self._idempotency_capacity = idempotency_capacity
@@ -1460,7 +1521,14 @@ class LivePlanningJobRegistry:
                 )
                 full_v3 = frozenset(
                     expected_record_fields
-                    | {"worker_pgid", "worker_marker", "worker_probe"}
+                    | {
+                        "worker_pgid",
+                        "worker_marker",
+                        "worker_probe",
+                        # C-146 P0-3: durable per-identity orphan facts.
+                        "orphan_authenticated",
+                        "orphan_death_confirmed",
+                    }
                 )
                 if not minimal_v3.issubset(set(item)) or not set(item).issubset(full_v3):
                     raise RuntimeError("live planning job registry record is invalid")
@@ -1547,6 +1615,20 @@ class LivePlanningJobRegistry:
                 raw_pgid = item.get("worker_pgid")
                 raw_marker = item.get("worker_marker")
                 raw_probe = item.get("worker_probe")
+                raw_orphan_auth = item.get("orphan_authenticated")
+                raw_orphan_death = item.get("orphan_death_confirmed")
+                if raw_pgid is None and any(
+                    value is not None
+                    for value in (
+                        raw_marker,
+                        raw_probe,
+                        raw_orphan_auth,
+                        raw_orphan_death,
+                    )
+                ):
+                    raise RuntimeError(
+                        "live planning job orphan facts lack a worker identity"
+                    )
                 if raw_pgid is not None:
                     if type(raw_pgid) is not int or raw_pgid <= 0:
                         raise RuntimeError("live planning job registry worker pgid is invalid")
@@ -1557,6 +1639,23 @@ class LivePlanningJobRegistry:
                     runtime.worker_pgid = raw_pgid
                     runtime.worker_marker = raw_marker
                     runtime.worker_probe = raw_probe
+                    # C-146 P0-3: durable per-identity auth/death-confirm facts
+                    # (optional; absent in pre-P0-3 v3 files → None, meaning the
+                    # identity has never been cold-boot checked).
+                    if raw_orphan_auth is not None and type(raw_orphan_auth) is not bool:
+                        raise RuntimeError(
+                            "live planning job orphan authentication fact is invalid"
+                        )
+                    runtime.orphan_authenticated = raw_orphan_auth
+                    if raw_orphan_death is not None and type(raw_orphan_death) is not bool:
+                        raise RuntimeError(
+                            "live planning job orphan death-confirmation fact is invalid"
+                        )
+                    if raw_orphan_death is True and raw_orphan_auth is not True:
+                        raise RuntimeError(
+                            "live planning job orphan death confirmation lacks authentication"
+                        )
+                    runtime.orphan_death_confirmed = raw_orphan_death
             self._records[snapshot.id] = runtime
         # C-146 P0 supplement (P0-4) / b119: active record capacity and
         # quarantine capacity are validated INDEPENDENTLY. A legal file may hold
@@ -2100,6 +2199,11 @@ class LivePlanningJobRegistry:
                     "worker_pgid": runtime.worker_pgid,
                     "worker_marker": runtime.worker_marker,
                     "worker_probe": runtime.worker_probe,
+                    # C-146 P0-3: durable per-identity auth/death-confirm facts so
+                    # a cold start can prove it may settle a record and never
+                    # guesses over an unauthenticated/unconfirmed executor.
+                    "orphan_authenticated": runtime.orphan_authenticated,
+                    "orphan_death_confirmed": runtime.orphan_death_confirmed,
                 }
                 for runtime in sorted(self._records.values(), key=lambda item: item.snapshot.id)
             ],
@@ -2208,7 +2312,11 @@ class LivePlanningJobRegistry:
         self,
         *,
         tenant_id: str,
-        operation: LiveJobOperation,
+        operation: LiveJobOperation | LiveJobWorkerCommand | None = None,
+        operation_factory: Callable[
+            [], LiveJobOperation | LiveJobWorkerCommand
+        ]
+        | None = None,
         idempotency_key: str | None = None,
         request_digest: str | None = None,
         deadline_seconds: float = 3600,
@@ -2217,6 +2325,8 @@ class LivePlanningJobRegistry:
         self._spawn_deferred_cleanup_owners()
         if not math.isfinite(deadline_seconds) or deadline_seconds <= 0:
             raise ValueError("deadline_seconds must be a finite positive number")
+        if (operation is None) == (operation_factory is None):
+            raise ValueError("exactly one live planning operation source is required")
         idempotency_partition: str | None = None
         if request_digest is not None and not self._valid_request_digest(request_digest):
             raise ValueError("request_digest must be a lowercase SHA-256 hex digest")
@@ -2226,39 +2336,10 @@ class LivePlanningJobRegistry:
             if request_digest is None:
                 raise ValueError("request_digest must be a lowercase SHA-256 hex digest")
             idempotency_partition = self._idempotency_partition(tenant_id, idempotency_key)
-
-        now = self._utc_now()
-        deadline_at = now + timedelta(seconds=deadline_seconds)
-        # Canonical UUID ids remain globally unique without the mixed-case
-        # random runs that resemble bare credentials in committed evidence.
-        job_id = f"live-job-{uuid4()}"
-        runtime = _RuntimeJob(
-            tenant_partition=self._tenant_partition(tenant_id),
-            deadline_monotonic=asyncio.get_running_loop().time() + deadline_seconds,
-            snapshot=LivePlanningJobSnapshot(
-                id=job_id,
-                state=LivePlanningJobState.QUEUED,
-                stage="queued",
-                progress=0,
-                revision=1,
-                request_sha256=request_digest,
-                model_trace_scope_sha256=request_digest,
-                created_at=now,
-                updated_at=now,
-                deadline_at=deadline_at,
-            ),
-            operation=operation,
-            prepared=defer_start,
-        )
-        # C-146 P0 supplement (fourth P0): the absolute EXECUTION bound. Once
-        # this monotonic time passes, the hard-stop watchdog must quarantine a
-        # still-live operation regardless of storage recovery.
-        runtime.hard_stop_monotonic = (
-            runtime.deadline_monotonic + self._execution_hard_stop_grace_seconds
-        )
         async with self._changed:
             if self._closed:
                 raise RuntimeError("live planning job registry is closed")
+            now = self._utc_now()
             self._prune_locked(now)
             if idempotency_partition is not None:
                 existing = self._idempotency.get(idempotency_partition)
@@ -2349,6 +2430,50 @@ class LivePlanningJobRegistry:
                 raise LivePlanningJobCapacityError(
                     "live planning job idempotency capacity exceeded"
                 )
+            # C-146 P0-5 (RETURN 7de8cf3e): the identity-capacity check above is
+            # the ATOMIC authority.  Only after it accepts the new key do we
+            # invoke the lazy operation factory (the HTTP worker-command
+            # builder), mint a UUID, construct ``_RuntimeJob``, or evict an
+            # executable record.  Keeping every step under this SAME lock closes
+            # the old pre-check/build/re-check race: two concurrent new keys can
+            # never both build commands for one remaining identity slot. A full
+            # collection therefore rejects with zero constructor calls and
+            # byte-identical memory/disk state.
+            resolved_operation = (
+                operation_factory() if operation_factory is not None else operation
+            )
+            assert resolved_operation is not None
+            deadline_at = now + timedelta(seconds=deadline_seconds)
+            # Canonical UUID ids remain globally unique without the mixed-case
+            # random runs that resemble bare credentials in committed evidence.
+            job_id = f"live-job-{uuid4()}"
+            runtime = _RuntimeJob(
+                tenant_partition=self._tenant_partition(tenant_id),
+                deadline_monotonic=(
+                    asyncio.get_running_loop().time() + deadline_seconds
+                ),
+                snapshot=LivePlanningJobSnapshot(
+                    id=job_id,
+                    state=LivePlanningJobState.QUEUED,
+                    stage="queued",
+                    progress=0,
+                    revision=1,
+                    request_sha256=request_digest,
+                    model_trace_scope_sha256=request_digest,
+                    created_at=now,
+                    updated_at=now,
+                    deadline_at=deadline_at,
+                ),
+                operation=resolved_operation,
+                prepared=defer_start,
+            )
+            # C-146 P0 supplement (fourth P0): the absolute EXECUTION bound.
+            # Once this monotonic time passes, the hard-stop watchdog must
+            # quarantine a still-live operation regardless of storage recovery.
+            runtime.hard_stop_monotonic = (
+                runtime.deadline_monotonic
+                + self._execution_hard_stop_grace_seconds
+            )
             evicted_runtime, evicted_entries = self._make_capacity_locked()
             self._records[job_id] = runtime
             if idempotency_partition is not None:
@@ -2377,7 +2502,7 @@ class LivePlanningJobRegistry:
                 exc.job_id = job_id
                 if not defer_start:
                     runtime.task = asyncio.create_task(
-                        self._run(runtime, operation),
+                        self._run(runtime, resolved_operation),
                         name=f"tripchord:{job_id}",
                     )
                 self._changed.notify_all()
@@ -2392,7 +2517,7 @@ class LivePlanningJobRegistry:
                 raise
             if not defer_start:
                 runtime.task = asyncio.create_task(
-                    self._run(runtime, operation),
+                    self._run(runtime, resolved_operation),
                     name=f"tripchord:{job_id}",
                 )
             self._changed.notify_all()
@@ -2404,6 +2529,7 @@ class LivePlanningJobRegistry:
         tenant_id: str,
         *,
         operation_id: str | None = None,
+        worker_execution_capability: object | None = None,
     ) -> LivePlanningJobSnapshot | None:
         """Start one explicitly prepared job exactly once.
 
@@ -2457,6 +2583,31 @@ class LivePlanningJobRegistry:
                 )
             if runtime.snapshot.state != LivePlanningJobState.QUEUED:
                 raise LivePlanningJobInactiveError("prepared live planning job is no longer queued")
+            previous_worker_capability = runtime.worker_execution_capability
+            if worker_execution_capability is not None:
+                if not isinstance(runtime.operation, LiveJobWorkerCommand) or activation is None:
+                    raise LivePlanningJobInactiveError(
+                        "formal execution capability requires a prepared worker activation"
+                    )
+                try:
+                    canonical_capability = json.dumps(
+                        worker_execution_capability,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                except (TypeError, ValueError) as exc:
+                    raise LivePlanningJobInactiveError(
+                        "formal worker execution capability is not canonical JSON"
+                    ) from exc
+                if not secrets.compare_digest(
+                    hashlib.sha256(canonical_capability).hexdigest(),
+                    str(activation["capability_sha256"]),
+                ):
+                    raise LivePlanningJobInactiveError(
+                        "formal worker execution capability differs from activation"
+                    )
+                runtime.worker_execution_capability = json.loads(canonical_capability)
             runtime.prepared = False
             if activation is not None:
                 # Reassign a fresh operation object instead of mutating in place so
@@ -2484,6 +2635,7 @@ class LivePlanningJobRegistry:
                 raise
             except Exception:
                 runtime.prepared = True
+                runtime.worker_execution_capability = previous_worker_capability
                 if activation is not None:
                     runtime.activation_operation = activation
                 raise
@@ -2998,6 +3150,8 @@ class LivePlanningJobRegistry:
                     runtime.quarantined
                     and runtime.quarantine_stage == _QUARANTINE_ORPHAN_STAGE
                     and runtime.hard_stopped
+                    and runtime.orphan_authenticated is True
+                    and runtime.orphan_death_confirmed is True
                     and runtime.worker_pgid is not None
                     and runtime.worker_marker
                     and runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
@@ -3015,8 +3169,49 @@ class LivePlanningJobRegistry:
                     # loader's OWN resolution — a cold-booted durable PGID/marker
                     # is never terminalized/pruned before zero-request orphan
                     # recovery.
-                    async with self._lock:
-                        self._resolve_cold_booted_record_locked(runtime)
+                    #
+                    # C-146 P0-3 supplement: resolution is honest ONLY when the
+                    # durable per-identity facts PROVE the group was both
+                    # authenticated (the marker nonce was observed in its command
+                    # lines / the ps query succeeded) AND death-confirmed (the
+                    # whole group returned ESRCH within the confirm budget). An
+                    # orphan that was never authenticated (auth failure or ps-query
+                    # failure) has an executor whose death is NOT provable — it may
+                    # still be live. The terminal resolver is never called to guess
+                    # a label over it: the record is quarantined as an orphan
+                    # (isolated, non-terminal) and stays durable so consecutive
+                    # cold starts keep re-checking the same group.
+                    if runtime.orphan_authenticated and runtime.orphan_death_confirmed:
+                        async with self._lock:
+                            self._resolve_cold_booted_record_locked(runtime)
+                    else:
+                        async with self._lock:
+                            current = self._records.get(runtime.snapshot.id)
+                            if (
+                                current is not None
+                                and current.snapshot.state
+                                not in TERMINAL_LIVE_PLANNING_JOB_STATES
+                            ):
+                                current.quarantined = True
+                                current.quarantine_stage = _QUARANTINE_ORPHAN_STAGE
+                                current.hard_stopped = bool(
+                                    current.orphan_death_confirmed
+                                )
+                                current.generation += 1
+                                current.snapshot = current.snapshot.model_copy(
+                                    update={
+                                        "stage": _QUARANTINE_ORPHAN_STAGE,
+                                        "error": (
+                                            "live planning job executor was orphaned by "
+                                            "a parent crash without confirmed death"
+                                        ),
+                                        "updated_at": self._utc_now(),
+                                    }
+                                )
+                                with suppress(Exception):
+                                    self._persist_locked()
+                                self._changed.notify_all()
+                        self._ensure_cleanup_owner(runtime)
 
     async def close(self) -> None:
         """Close the registry, reusing the exact durable drain state machine as a
@@ -3485,7 +3680,16 @@ class LivePlanningJobRegistry:
         owning record as an orphan so it is isolated, never replayed, and
         reclaimed only by bounded retention. Returns without blocking on any
         live operation; a group that cannot be confirmed dead stays quarantined
-        and is re-attempted by the next startup."""
+        and is re-attempted by the next startup.
+
+        C-146 P0-3: the per-identity auth and exit-confirmation are DURABLY
+        persisted (``orphan_authenticated`` / ``orphan_death_confirmed``) and are
+        monotonic — a re-check never downgrades an earlier authenticated /
+        death-confirmed observation. A group that cannot be AUTHENTICATED (marker
+        not found in its command lines, or the ``ps`` query itself failed) is
+        never killed and its record is still quarantined as an orphan so
+        consecutive cold starts keep re-checking the same group; no terminal
+        resolver ever runs over an executor whose death was never confirmed."""
         candidates: list[tuple[int, str, Path | None, _RuntimeJob | None]] = []
         if self._state_path is not None:
             workers_dir = self._workers_dir()
@@ -3543,56 +3747,114 @@ class LivePlanningJobRegistry:
         for pgid, marker, marker_path, runtime in unique:
             commands = self._group_commands(pgid)
             authenticated = any(marker in line for line in commands)
-            if not authenticated:
-                continue
             # Kill the whole authenticated group; confirm every member died.
+            # An unauthenticated group (marker not found in its command lines,
+            # or the ps query itself failed) is NEVER killed — a reused PGID
+            # owned by an unrelated process is never touched.
             confirmed = False
-            with suppress(ProcessLookupError, PermissionError, OSError):
-                os.killpg(pgid, signal.SIGKILL)
-                deadline = asyncio.get_running_loop().time() + self._hard_stop_confirm_seconds
-                while asyncio.get_running_loop().time() < deadline:
-                    try:
-                        os.killpg(pgid, 0)
-                    except ProcessLookupError:
-                        confirmed = True
-                        break
-                    except PermissionError:
-                        # macOS can briefly answer EPERM for a reparented orphan
-                        # that is dying/being reaped (its group still exists but
-                        # is no longer signalable). That is transient — the group
-                        # becomes ESRCH within the confirm budget — so keep
-                        # polling instead of giving up. The deadline still bounds
-                        # the wait; an EPERM that persists until it expires means
-                        # "cannot prove dead" and the group stays quarantined for
-                        # the next startup.
-                        pass
-                    await asyncio.sleep(0.01)
+            if authenticated:
+                with suppress(ProcessLookupError, PermissionError, OSError):
+                    os.killpg(pgid, signal.SIGKILL)
+                    deadline = asyncio.get_running_loop().time() + self._hard_stop_confirm_seconds
+                    while asyncio.get_running_loop().time() < deadline:
+                        try:
+                            os.killpg(pgid, 0)
+                        except ProcessLookupError:
+                            confirmed = True
+                            break
+                        except PermissionError:
+                            # macOS can briefly answer EPERM for a reparented orphan
+                            # that is dying/being reaped (its group still exists but
+                            # is no longer signalable). That is transient — the group
+                            # becomes ESRCH within the confirm budget — so keep
+                            # polling instead of giving up. The deadline still bounds
+                            # the wait; an EPERM that persists until it expires means
+                            # "cannot prove dead" and the group stays quarantined for
+                            # the next startup.
+                            pass
+                        await asyncio.sleep(0.01)
+            elif runtime is not None and runtime.orphan_authenticated is True:
+                # A previous boot authenticated THIS exact marker/PGID but could
+                # not confirm its death.  Never use that historical fact to kill
+                # a currently-live group (the PGID may have been reused); do,
+                # however, accept current ESRCH as the missing death proof.  A
+                # live/EPERM group or a failed probe remains isolated for the
+                # next boot.
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    confirmed = True
+                except (PermissionError, OSError):
+                    pass
             if runtime is not None:
+                # C-146 P0-3: quarantine EVERY cold-booted record with a durable
+                # worker identity — authenticated OR not. An unauthenticated
+                # group (marker not found in its command lines, or the ps query
+                # itself failed) is never killed, and its record stays ISOLATED
+                # (orphan quarantine) with the durable per-identity auth fact
+                # persisted, so consecutive cold starts keep re-checking the same
+                # group and no terminal resolver ever guesses a label over an
+                # executor whose death was never confirmed.
                 async with self._lock:
                     current = self._records.get(runtime.snapshot.id)
                     if (
                         current is not None
                         and current.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
                     ):
-                        current.quarantined = True
-                        current.quarantine_stage = _QUARANTINE_ORPHAN_STAGE
-                        current.hard_stopped = confirmed
-                        current.worker_pgid = pgid
-                        current.worker_marker = marker
-                        current.generation += 1
-                        current.snapshot = current.snapshot.model_copy(
-                            update={
-                                "stage": _QUARANTINE_ORPHAN_STAGE,
-                                "error": (
-                                    "live planning job executor was orphaned by a parent crash"
-                                ),
-                                "updated_at": self._utc_now(),
-                            }
-                        )
-                        with suppress(Exception):
-                            self._persist_locked()
-                        self._changed.notify_all()
-            if marker_path is not None:
+                        # C-146 P0-3: the durable auth/death-confirm facts are
+                        # MONOTONIC per identity — a cold start only ever STRENGTHENS
+                        # them (a later boot's re-check that fails to authenticate,
+                        # e.g. a reused PGID / ps failure / an already-ESRCH group,
+                        # never downgrades an earlier authenticated + death-confirmed
+                        # observation). A death-confirmed record is already provably
+                        # settled and needs no re-quarantine.
+                        if current.orphan_death_confirmed:
+                            self._changed.notify_all()
+                        else:
+                            # A legacy pre-P0-3 file proves a confirmed kill via
+                            # an ORPHAN-stage ``hard_stopped=True`` alone; that
+                            # durable proof also proves the old recovery path had
+                            # authenticated the marker before killing. Migrate the
+                            # pair together so a new file can never carry the
+                            # impossible death=True/authenticated=False shape.
+                            legacy_confirmed = (
+                                current.orphan_authenticated is None
+                                and current.orphan_death_confirmed is None
+                                and current.quarantine_stage
+                                == _QUARANTINE_ORPHAN_STAGE
+                                and current.hard_stopped
+                            )
+                            authenticated_so_far = bool(
+                                current.orphan_authenticated
+                                or authenticated
+                                or legacy_confirmed
+                            )
+                            confirmed_so_far = (
+                                legacy_confirmed
+                                or current.orphan_death_confirmed
+                                or confirmed
+                            )
+                            current.quarantined = True
+                            current.quarantine_stage = _QUARANTINE_ORPHAN_STAGE
+                            current.hard_stopped = confirmed_so_far
+                            current.worker_pgid = pgid
+                            current.worker_marker = marker
+                            current.orphan_authenticated = authenticated_so_far
+                            current.orphan_death_confirmed = confirmed_so_far
+                            current.generation += 1
+                            current.snapshot = current.snapshot.model_copy(
+                                update={
+                                    "stage": _QUARANTINE_ORPHAN_STAGE,
+                                    "error": (
+                                        "live planning job executor was orphaned by a parent crash"
+                                    ),
+                                    "updated_at": self._utc_now(),
+                                }
+                            )
+                            with suppress(Exception):
+                                self._persist_locked()
+                            self._changed.notify_all()
+            if marker_path is not None and (authenticated or confirmed):
                 with suppress(OSError):
                     marker_path.unlink(missing_ok=True)
 
@@ -3695,6 +3957,63 @@ class LivePlanningJobRegistry:
                 return RuntimeError(f"live planning job worker reported: {klass}")
         return None
 
+    async def _confirm_worker_group_exit(self, runtime: _RuntimeJob) -> None:
+        """C-146 P0-2: prove the worker's WHOLE process tree exited.
+
+        Called on BOTH worker exit paths (clean leader exit AND non-zero exit)
+        BEFORE any terminal label may be written. ``kill_and_confirm`` SIGKILLs
+        any survivor of the worker's process group and confirms the group is
+        empty within the bounded budget. When confirmation returns False, times
+        out, or raises, the job KEEPS its non-terminal state, its durable worker
+        identity and its admission permit, and the confirmation AUTO-RETRIES on
+        a saturating + fixed-window-bounded backoff — a terminal state is never
+        written while any group member may still be writing external side
+        effects. The job's deadline (bounded by ``_run``'s wait) is the terminal
+        bound, and even then the timeout path only terminalizes after a
+        confirmed drain. Returns once the group is provably empty."""
+        if runtime.worker_handle is None:
+            return
+        logged = False
+        while True:
+            confirmed = False
+            try:
+                confirmed = await runtime.worker_handle.kill_and_confirm(
+                    self._hard_stop_confirm_seconds
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A persistent confirmation EXCEPTION is the same "cannot prove
+                # dead" outcome: never surface an unhandled task exception, keep
+                # the record non-terminal and keep retrying.
+                if not logged:
+                    logger.warning(
+                        "worker-exit group confirm raised for job %s: %s",
+                        runtime.snapshot.id,
+                        type(exc).__name__,
+                    )
+                    logged = True
+                confirmed = False
+            if confirmed:
+                # This process owns the handle/marker that was durably attached
+                # to this runtime, so a successful whole-group confirmation is
+                # also the strongest possible per-identity auth/death fact. Keep
+                # it on the runtime so the ensuing terminal persist survives a
+                # crash/reload without reclassifying a proven-dead executor as
+                # an unauthenticated orphan.
+                runtime.orphan_authenticated = True
+                runtime.orphan_death_confirmed = True
+                return
+            now = asyncio.get_running_loop().time()
+            wait_until = self._worker_exit_next_attempt_locked(runtime, now)
+            # The registry runner owns the deadline timeout concurrently.  Do
+            # NOT clamp this sleep to the (possibly already-expired) job
+            # deadline: doing so turns a persistent False/exception into a hot
+            # loop exactly when the deadline passes.  This confirmation owner
+            # keeps its own saturating/fixed-window cadence until cancellation
+            # or a provable group death; the timeout path remains fail-closed.
+            await asyncio.sleep(max(0.001, wait_until - now))
+
     async def _run_worker_command(
         self,
         runtime: _RuntimeJob,
@@ -3743,6 +4062,19 @@ class LivePlanningJobRegistry:
             # group by scanning process command lines for the nonce. The worker
             # overwrites this same path atomically with its pid/pgid on startup.
             self._write_spawn_intent(marker_file, marker)
+        # C-146 P0-1 (RETURN 7de8cf3e): the worker needs the durable job identity
+        # to bind its model-trace scope / checkpoint request digest to the job the
+        # parent registry owns (the same ``job_id`` the in-process reporter
+        # exposes). The command is built before ``start_idempotent`` minted the
+        # job id, so the registry injects it here at spawn time.
+        worker_args = dict(command.args)
+        worker_args["job_id"] = runtime.snapshot.id
+        if runtime.worker_execution_capability is not None:
+            if "formal_execution_capability" in worker_args:
+                raise RuntimeError("worker command already carries a formal capability")
+            worker_args["formal_execution_capability"] = (
+                runtime.worker_execution_capability
+            )
         argv = [
             self._worker_python,
             self._worker_module,
@@ -3751,7 +4083,7 @@ class LivePlanningJobRegistry:
             "--entry",
             command.entry,
             "--args-json",
-            json.dumps(command.args, ensure_ascii=False),
+            json.dumps(worker_args, ensure_ascii=False),
             "--probe-path",
             command.probe_path or "",
             "--marker",
@@ -3790,6 +4122,12 @@ class LivePlanningJobRegistry:
         runtime.worker_pgid = runtime.worker_handle.pgid
         runtime.worker_marker = marker
         runtime.worker_probe = command.probe_path
+        # C-146 P0-3: this is a NEW worker identity; reset the durable orphan
+        # facts so a stale authenticated/death-confirmed result from a PREVIOUS
+        # worker never settles a record whose current executor has not been
+        # cold-boot checked.
+        runtime.orphan_authenticated = None
+        runtime.orphan_death_confirmed = None
         if marker_file is not None:
             try:
                 async with self._lock:
@@ -3811,6 +4149,18 @@ class LivePlanningJobRegistry:
             except Exception:
                 pass
         stdout, stderr = await process.communicate()
+        # C-146 P0-2 (RETURN 7de8cf3e): BOTH exit paths — a NON-ZERO leader exit
+        # AND a clean leader exit — prove the WHOLE process group is gone BEFORE
+        # any terminal label is written. The worker's own finally already deleted
+        # the durable marker file, so only the group kill can stop a stubborn
+        # descendant's external side effects; a non-zero leader exit is NOT proof
+        # the group is empty (the entry may have forked a descendant before
+        # raising), and a clean exit is NOT proof either. A group that cannot be
+        # confirmed empty keeps the job NON-terminal (identity + permit held) and
+        # AUTO-RETRIES the confirmation on a saturating + fixed-window-bounded
+        # backoff inside ``_confirm_worker_group_exit`` — the failure/result is
+        # only surfaced AFTER the executor is provably gone.
+        await self._confirm_worker_group_exit(runtime)
         if process.returncode != 0:
             # C-146 P0-1: surface the REAL operation's failure provenance. The
             # worker emits a structured marker (exception CLASS + HTTP status
@@ -3818,37 +4168,179 @@ class LivePlanningJobRegistry:
             # typed exception so the job fails with the operation's OWN cause
             # (e.g. the ready chain's 503) instead of a generic exit-code error.
             # A missing/unparseable marker falls back to the generic failure.
-            #
-            # C-146 P0-2 (RETURN 7de8cf3e): a NON-ZERO leader exit is NOT proof
-            # the whole process group is empty — the entry may have forked a
-            # stubborn descendant before raising, and the worker's own finally
-            # already deleted the durable marker file. Raising here would strand
-            # a live grandchild that keeps writing external side effects while
-            # the job enters a terminal state and releases its permit. Prove the
-            # whole group is dead (SIGKILL any survivor + waitpid + empty-group
-            # probe) BEFORE surfacing the failure; a group that cannot be
-            # confirmed empty fails the job closed instead of completing over
-            # live side effects.
-            if runtime.worker_handle is not None:
-                await runtime.worker_handle.kill_and_confirm(self._hard_stop_confirm_seconds)
             failure = self._parse_worker_failure(stderr)
             if failure is not None:
                 raise failure
             raise RuntimeError(f"live planning job worker exited with {process.returncode}")
         text = stdout.decode("utf-8")
-        # C-146 P0-4: a clean LEADER exit is NOT proof the whole process group is
-        # empty — the operation may have forked a stubborn descendant that keeps
-        # writing external side effects after the parent returned. Prove the
-        # group is empty (SIGKILL any survivor + waitpid + empty-group probe)
-        # BEFORE surfacing the result; a group that cannot be confirmed empty
-        # fails the job closed instead of completing over live side effects.
-        if runtime.worker_handle is not None and not await runtime.worker_handle.kill_and_confirm(
-            self._hard_stop_confirm_seconds
-        ):
-            raise RuntimeError(
-                "live planning job worker process group is not empty after clean exit"
+        result = json.loads(text) if text.strip() else {}
+        # C-146 P0-1 (RETURN 7de8cf3e): the worker captured its progress /
+        # checkpoint / model-trace observability in a cross-process collector;
+        # replay it onto the durable job record NOW (still inside the operation,
+        # before any terminal label) so the parent API's job GET observes the
+        # full ready-chain progress, per-pair checkpoints and model trace. The
+        # internal envelope is removed from the stored result.
+        await self._replay_worker_observability(
+            runtime,
+            result,
+            strict=command.result_importer is not None,
+        )
+        if command.result_importer is not None:
+            result = await command.result_importer(result)
+        return result
+
+    async def _replay_worker_observability(
+        self,
+        runtime: _RuntimeJob,
+        result: dict[str, Any],
+        *,
+        strict: bool = False,
+    ) -> None:
+        """Replay a worker's collected observability onto the durable job record.
+
+        The worker subprocess cannot call the parent's in-process reporters, so
+        ``run_live_flexible_from_text`` returns a ``_worker_observability``
+        envelope inside its result. This replays each progress stage, each pair
+        checkpoint and the model-trace summary through the SAME registry update
+        methods the in-process reporters use, then removes the envelope so the
+        stored job result stays clean. Replay happens inside the operation task
+        under the current generation, so the updates are identical to what an
+        in-process run would have persisted.
+        """
+        observability = result.pop("_worker_observability", None)
+        if not isinstance(observability, dict):
+            if strict:
+                raise RuntimeError("live planning worker observability is missing")
+            return
+        expected_fields = {
+            "progress_events",
+            "pair_checkpoints",
+            "model_trace_summary",
+            "source_terminal_events",
+            "barrier_released_at",
+        }
+        if strict and set(observability) != expected_fields:
+            raise RuntimeError("live planning worker observability shape is invalid")
+        generation = runtime.generation
+        progress_events = observability.get("progress_events", [])
+        if strict and (
+            not isinstance(progress_events, list)
+            or not progress_events
+            or not all(
+                isinstance(entry, list)
+                and len(entry) == 2
+                and isinstance(entry[0], str)
+                and bool(entry[0])
+                and type(entry[1]) is int
+                for entry in progress_events
             )
-        return json.loads(text) if text.strip() else {}
+        ):
+            raise RuntimeError("live planning worker progress observability is invalid")
+        for entry in progress_events:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                continue
+            stage, progress = entry
+            if isinstance(stage, str) and isinstance(progress, int):
+                await self._update_running(
+                    runtime,
+                    stage,
+                    progress,
+                    generation=generation,
+                )
+        pair_checkpoints = observability.get("pair_checkpoints", [])
+        if strict and (
+            not isinstance(pair_checkpoints, list)
+            or not all(isinstance(checkpoint, dict) for checkpoint in pair_checkpoints)
+        ):
+            raise RuntimeError("live planning worker checkpoint observability is invalid")
+        for checkpoint in pair_checkpoints:
+            if isinstance(checkpoint, dict):
+                await self._update_pair_checkpoint(
+                    runtime,
+                    checkpoint,
+                    generation=generation,
+                )
+        source_events = observability.get("source_terminal_events")
+        if strict and (
+            not isinstance(source_events, list)
+            or not all(isinstance(event, dict) for event in source_events)
+        ):
+            raise RuntimeError("live planning worker source observability is invalid")
+        if isinstance(source_events, list) and all(
+            isinstance(event, dict) for event in source_events
+        ):
+            await self._update_source_terminal_events(
+                runtime,
+                tuple(source_events),
+                generation=generation,
+            )
+        barrier_released_at = observability.get("barrier_released_at")
+        if strict and barrier_released_at is not None and not isinstance(
+            barrier_released_at,
+            str,
+        ):
+            raise RuntimeError("live planning worker barrier observability is invalid")
+        if isinstance(barrier_released_at, str):
+            try:
+                parsed_barrier = datetime.fromisoformat(barrier_released_at)
+            except ValueError as exc:
+                raise ValueError(
+                    "worker barrier release timestamp is invalid"
+                ) from exc
+            await self._mark_barrier_released(
+                runtime,
+                parsed_barrier,
+                generation=generation,
+            )
+        trace_summary = observability.get("model_trace_summary")
+        expected_trace_fields = {
+            "scope_id",
+            "scope_request_sha256",
+            "trace_count",
+            "success_count",
+            "failure_count",
+        }
+        if strict and (
+            not isinstance(trace_summary, dict)
+            or set(trace_summary) != expected_trace_fields
+            or not isinstance(trace_summary.get("scope_id"), str)
+            or not trace_summary.get("scope_id")
+            or not isinstance(trace_summary.get("scope_request_sha256"), str)
+            or any(
+                type(trace_summary.get(field)) is not int
+                for field in ("trace_count", "success_count", "failure_count")
+            )
+        ):
+            raise RuntimeError("live planning worker model observability is invalid")
+        ready_result = result.get("run") is not None
+        if strict and ready_result and (
+            not pair_checkpoints
+            or not source_events
+            or not isinstance(barrier_released_at, str)
+        ):
+            raise RuntimeError("live planning worker ready observability is incomplete")
+        if strict and isinstance(trace_summary, dict) and (
+            result.get("model_trace_scope_sha256")
+            != trace_summary["scope_request_sha256"]
+            or result.get("model_trace_count") != trace_summary["trace_count"]
+            or result.get("model_trace_success_count")
+            != trace_summary["success_count"]
+            or result.get("model_trace_failure_count")
+            != trace_summary["failure_count"]
+        ):
+            raise RuntimeError("live planning worker model result binding is invalid")
+        if isinstance(trace_summary, dict):
+            await self._update_model_trace_summary(
+                runtime,
+                scope_id=str(trace_summary.get("scope_id", "")),
+                scope_request_sha256=str(
+                    trace_summary.get("scope_request_sha256", "")
+                ),
+                trace_count=int(trace_summary.get("trace_count", 0)),
+                success_count=int(trace_summary.get("success_count", 0)),
+                failure_count=int(trace_summary.get("failure_count", 0)),
+                generation=generation,
+            )
 
     def _maybe_release_slot(self, runtime: _RuntimeJob) -> None:
         """Release the admission permit only once the REAL operation task is done.
@@ -3993,29 +4485,22 @@ class LivePlanningJobRegistry:
         return cancel_future is not None and not cancel_future.done()
 
     def _authenticated_orphan_alive(self, runtime: _RuntimeJob) -> bool:
-        """True when the runtime's DURABLE worker identity points at a LIVE,
-        marker-authenticated process group this process has not yet reaped.
+        """True while a cold worker identity lacks durable death confirmation.
 
         C-146 P0-3 (RETURN 7de8cf3e): only meaningful for a cold-booted runtime
         (no in-process ``worker_handle``): a live handle's group is owned by the
-        in-process kill/confirm machinery and is not re-derived here. A group is
-        authenticated ONLY via the durable marker nonce in its command lines — a
-        reused PGID owned by an unrelated process is never treated as our orphan.
-        A group that cannot be proven dead (killpg probe or ``ps`` failure) fails
-        closed as alive so no terminalize/prune/permit release happens over
-        unconfirmed external side effects."""
+        in-process kill/confirm machinery. For a cold identity, neither ESRCH nor
+        an empty/foreign ``ps`` result is enough here: discovery must first bind
+        authentication to the marker and persist
+        ``orphan_death_confirmed=True``. Every other shape is unknown/alive for
+        terminalization purposes, so an auth failure or process-query failure can
+        never be converted into a terminal label by a concurrently restored
+        cleanup owner."""
         if runtime.worker_handle is not None:
             return False
         if runtime.worker_pgid is None or not runtime.worker_marker:
             return False
-        try:
-            os.killpg(runtime.worker_pgid, 0)
-        except ProcessLookupError:
-            return False
-        except (PermissionError, OSError):
-            return True
-        commands = self._group_commands(runtime.worker_pgid)
-        return any(runtime.worker_marker in line for line in commands)
+        return runtime.orphan_death_confirmed is not True
 
     def _executors_stopped(self, runtime: _RuntimeJob) -> bool:
         """Shared terminalize predicate (硬门 B / P0-4).
@@ -4328,6 +4813,59 @@ class LivePlanningJobRegistry:
         backoff: float = self._cleanup_retry_backoff_seconds * (2**exponent)
         return min(backoff, 0.5)
 
+    def _hard_stop_next_attempt_locked(self, runtime: _RuntimeJob, now: float) -> float:
+        """Next attempt time for a failed hard-stop death-confirmation.
+
+        C-146 P0-4 (RETURN 7de8cf3e): a persistently failing cleanup confirm
+        (kill/confirm exception OR death-not-confirmed) must NEVER hot-loop the
+        watchdog. The retry uses the SAME saturating exponential backoff as the
+        cleanup owner (capped), PLUS a hard per-window call-count upper bound:
+        once the budget within the fixed window is consumed, no further attempt
+        is scheduled until the window resets. Callers hold ``self._changed``."""
+        window = self._hard_stop_confirm_budget_window_seconds
+        window_calls = self._hard_stop_confirm_budget_window_calls
+        start = runtime.hard_stop_confirm_window_start_monotonic
+        if start == 0.0 or now - start >= window:
+            start = now
+            runtime.hard_stop_confirm_window_start_monotonic = start
+            runtime.hard_stop_confirm_window_calls = 0
+        runtime.hard_stop_confirm_window_calls += 1
+        if runtime.hard_stop_confirm_window_calls >= window_calls:
+            # Fixed time-window call-count upper bound reached: no further
+            # attempts until the window resets — a hard, non-spinning cap. The
+            # round resets so a later window starts from the base backoff.
+            runtime.hard_stop_confirm_retry_round = 0
+            return start + window
+        runtime.hard_stop_confirm_retry_round = self._bump_cleanup_retry_round(
+            runtime.hard_stop_confirm_retry_round
+        )
+        return now + self._cleanup_retry_delay(runtime.hard_stop_confirm_retry_round)
+
+    def _worker_exit_next_attempt_locked(self, runtime: _RuntimeJob, now: float) -> float:
+        """Next attempt time for a failed worker-exit group confirmation.
+
+        C-146 P0-2: mirrors ``_hard_stop_next_attempt_locked`` for the
+        worker-exit path — a confirmation that returns False, times out, or
+        raises must NEVER hot-loop the operation task. The retry uses the SAME
+        saturating exponential backoff (capped) PLUS the same hard per-window
+        call-count upper bound: once the budget within the fixed window is
+        consumed, no further attempt is scheduled until the window resets."""
+        window = self._hard_stop_confirm_budget_window_seconds
+        window_calls = self._hard_stop_confirm_budget_window_calls
+        start = runtime.worker_exit_confirm_window_start_monotonic
+        if start == 0.0 or now - start >= window:
+            start = now
+            runtime.worker_exit_confirm_window_start_monotonic = start
+            runtime.worker_exit_confirm_window_calls = 0
+        runtime.worker_exit_confirm_window_calls += 1
+        if runtime.worker_exit_confirm_window_calls >= window_calls:
+            runtime.worker_exit_confirm_retry_round = 0
+            return start + window
+        runtime.worker_exit_confirm_retry_round = self._bump_cleanup_retry_round(
+            runtime.worker_exit_confirm_retry_round
+        )
+        return now + self._cleanup_retry_delay(runtime.worker_exit_confirm_retry_round)
+
     def _ensure_reaper(self) -> None:
         """Ensure the single, bounded cleanup reaper is running (C-145 P0).
 
@@ -4553,8 +5091,23 @@ class LivePlanningJobRegistry:
                     )
 
     def _on_hard_stop_wrapper_done(self, wrapper: asyncio.Task[None]) -> None:
-        """A hard-stop wrapper finished (success, deferral or exception)."""
+        """A hard-stop wrapper finished (success, deferral, cancellation or
+        exception).
+
+        C-146 P0-4 (RETURN): the wrapper's outcome is CONSUMED here so no task
+        exception is ever left unretrieved (an unhandled ``asyncio`` task
+        exception is a runtime symptom, not a control signal — the wrapper's own
+        ``except``/``finally`` already armed the bounded retry). The watchdog is
+        then woken so a deferred/retryable record is re-scanned on its bounded
+        backoff."""
         self._hard_stop_tasks.discard(wrapper)
+        if not wrapper.cancelled():
+            exc = wrapper.exception()
+            if exc is not None:
+                logger.warning(
+                    "hard-stop wrapper raised for a live job: %s",
+                    type(exc).__name__,
+                )
         self._wake_hard_stop_watchdog()
 
     async def _hard_stop_operation(self, runtime: _RuntimeJob) -> None:
@@ -4610,9 +5163,15 @@ class LivePlanningJobRegistry:
                         # never a busy-spin.
                         runtime.hard_stop_in_flight = False
                         runtime.hard_stop_deferred = True
+                        # C-146 P0-4 (RETURN): a qcap-full refusal is also a
+                        # failed stop attempt — it is re-armed on the same
+                        # SATURATING + fixed-window-bounded backoff, never a
+                        # fixed 1.0s busy-spin.
                         runtime.hard_stop_next_attempt_monotonic = (
-                            asyncio.get_running_loop().time()
-                            + self._hard_stop_defer_retry_seconds
+                            self._hard_stop_next_attempt_locked(
+                                runtime,
+                                asyncio.get_running_loop().time(),
+                            )
                         )
                         self._changed.notify_all()
                         return
@@ -4636,16 +5195,37 @@ class LivePlanningJobRegistry:
                 self._changed.notify_all()
             # Provably stop the real executor within the bounded confirm budget.
             worker = runtime.worker_handle
-            if worker is not None:
-                death_confirmed = await worker.kill_and_confirm(
-                    self._hard_stop_confirm_seconds
+            try:
+                if worker is not None:
+                    death_confirmed = await worker.kill_and_confirm(
+                        self._hard_stop_confirm_seconds
+                    )
+                else:
+                    operation_task.cancel()
+                    await asyncio.wait(
+                        (operation_task,), timeout=self._hard_stop_confirm_seconds
+                    )
+                    death_confirmed = operation_task.done()
+            except asyncio.CancelledError:
+                # Cancel race: the watchdog is being torn down (registry close).
+                # Re-raise so the wrapper is genuinely cancelled; the ``finally``
+                # clears the in-flight/reservation flags and NO retry is armed —
+                # never a spurious backoff during shutdown, never a leaked flag.
+                raise
+            except Exception as exc:
+                # C-146 P0-4 (RETURN): a persistent cleanup-confirm EXCEPTION
+                # must NOT surface as an unhandled wrapper task exception nor
+                # busy-spin the watchdog. The executor death is UNPROVEN: keep
+                # the record non-terminal, treat it exactly like a death-NOT-
+                # confirmed outcome below (quarantine as orphan-in-process,
+                # deferred on a SATURATING + fixed-window-bounded backoff), and
+                # consume the exception here so the wrapper completes normally.
+                logger.warning(
+                    "hard-stop kill/confirm raised for job %s: %s",
+                    runtime.snapshot.id,
+                    type(exc).__name__,
                 )
-            else:
-                operation_task.cancel()
-                await asyncio.wait(
-                    (operation_task,), timeout=self._hard_stop_confirm_seconds
-                )
-                death_confirmed = operation_task.done()
+                death_confirmed = False
             async with self._changed:
                 if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
                     # A concurrent terminalize won (or the operation finished on
@@ -4663,18 +5243,23 @@ class LivePlanningJobRegistry:
                 runtime.hard_stop_quarantine_reserved = False
                 if death_confirmed:
                     runtime.hard_stopped = True
+                    runtime.orphan_authenticated = True
+                    runtime.orphan_death_confirmed = True
                     runtime.quarantine_stage = _QUARANTINE_HARD_STOPPED_STAGE
                 else:
                     # In-process orphan that cannot be proven dead: NOT a hard
-                    # stop. C-146 P0-4 (RETURN): re-arm a bounded-backoff retry
-                    # so the record KEEPS its close-out opportunity instead of
-                    # silently losing it forever.
+                    # stop. C-146 P0-4 (RETURN): re-arm a SATURATING +
+                    # fixed-window-bounded retry so the record KEEPS its
+                    # close-out opportunity instead of silently losing it
+                    # forever.
                     runtime.hard_stopped = False
                     runtime.quarantine_stage = _QUARANTINE_ORPHAN_STAGE
                     runtime.hard_stop_deferred = True
                     runtime.hard_stop_next_attempt_monotonic = (
-                        asyncio.get_running_loop().time()
-                        + self._hard_stop_defer_retry_seconds
+                        self._hard_stop_next_attempt_locked(
+                            runtime,
+                            asyncio.get_running_loop().time(),
+                        )
                     )
                 runtime.quarantined = True
                 runtime.snapshot = runtime.snapshot.model_copy(
@@ -4750,17 +5335,42 @@ class LivePlanningJobRegistry:
                 and runtime.worker_pgid is not None
                 and runtime.worker_marker
             ):
+                if runtime.orphan_death_confirmed is True:
+                    return True
                 commands = self._group_commands(runtime.worker_pgid)
                 if any(runtime.worker_marker in line for line in commands):
-                    return await self._kill_orphan_group(
+                    runtime.orphan_authenticated = True
+                    confirmed = await self._kill_orphan_group(
                         runtime.worker_pgid,
                         runtime.worker_marker,
                     )
+                    if confirmed:
+                        runtime.orphan_death_confirmed = True
+                        runtime.hard_stopped = True
+                    return confirmed
+                return False
             return True
         worker = runtime.worker_handle
         if worker is not None:
-            confirmed = await worker.kill_and_confirm(self._cancel_wait_seconds)
+            try:
+                confirmed = await worker.kill_and_confirm(
+                    self._cancel_wait_seconds
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A kill/query failure is not evidence of death.  Consume the
+                # exception, keep the record non-terminal and let the existing
+                # confirmation/cleanup owner retry on its bounded cadence.
+                logger.warning(
+                    "live planning worker drain confirmation raised for job %s: %s",
+                    runtime.snapshot.id,
+                    type(exc).__name__,
+                )
+                return False
             if confirmed:
+                runtime.orphan_authenticated = True
+                runtime.orphan_death_confirmed = True
                 # The PID is dead; let the communicate task drain its buffers so
                 # ``operation_task.done()`` becomes True for the shared
                 # ``_executors_stopped`` predicate.
