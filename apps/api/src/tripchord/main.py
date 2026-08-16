@@ -2682,6 +2682,28 @@ async def live_flexible_agent_plan_from_text_endpoint(
     )
 
 
+def _live_flexible_worker_runtime_bundle() -> dict[str, Any] | None:
+    """The worker runtime bundle configured for this API process, if any.
+
+    C-146 P0-1 (RETURN 7de8cf3e): a JSON spec in
+    ``TRIPCHORD_LIVE_FLEXIBLE_WORKER_RUNTIME_BUNDLE`` configures what runtime the
+    worker subprocess builds for the ready chain (e.g. the deterministic,
+    side-effect-free blocking runtime). Read at command-build time so the API
+    process forwards its own runtime configuration to the worker; an absent or
+    malformed value means the worker keeps its default (reconstructed) runtime.
+    """
+    raw = os.environ.get("TRIPCHORD_LIVE_FLEXIBLE_WORKER_RUNTIME_BUNDLE")
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
 def _build_live_flexible_from_text_worker_command(
     payload: LiveFlexibleFromTextPlanningRequest,
     *,
@@ -2697,16 +2719,22 @@ def _build_live_flexible_from_text_worker_command(
     ``module_path`` points at the production worker entry, which reconstructs the
     durable request and runs the SAME ``_execute_live_flexible_from_text`` path
     the API uses. Query / cancel / retry / cold-start recovery stay bound to the
-    durable job identity owned by the registry.
+    durable job identity owned by the registry. When a runtime bundle is
+    configured it is forwarded to the worker so the ready chain builds its OWN
+    real system in the worker process.
     """
+    args: dict[str, Any] = {
+        "payload": payload.model_dump(mode="json"),
+        "request_digest": request_digest,
+        "tenant_id": principal.tenant_id,
+    }
+    runtime_bundle = _live_flexible_worker_runtime_bundle()
+    if runtime_bundle is not None:
+        args["runtime_bundle"] = runtime_bundle
     return LiveJobWorkerCommand(
         module_path=str(Path(live_flexible_from_text_worker.__file__)),
         entry="run_live_flexible_from_text",
-        args={
-            "payload": payload.model_dump(mode="json"),
-            "request_digest": request_digest,
-            "tenant_id": principal.tenant_id,
-        },
+        args=args,
     )
 
 

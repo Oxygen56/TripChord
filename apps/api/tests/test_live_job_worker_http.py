@@ -37,6 +37,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1838,3 +1839,660 @@ async def test_qcap_full_refuses_hard_stop_before_any_kill(
     finally:
         monkeypatch.undo()
         await registry.close()
+
+
+# ---------------------------------------------------------------------------
+# RETURN 7de8cf3e — six native red-then-green counterexamples.
+#
+# 1. P0-1: the REAL ready HTTP chain runs in a REAL cross-process worker whose
+#    reconstructed app installs a PRODUCTION runtime from the API's env handoff
+#    (no monkeypatched private runtime) — the job SUCCEEDS.
+# 2. P0-2: a NON-ZERO leader exit after forking a stubborn grandchild proves the
+#    WHOLE group dead BEFORE the terminal FAILED label is published.
+# 3. P0-3: a cold boot defers resolution of a durable PGID/marker record until
+#    ``restore_after_restart`` has discovered + killed the real orphan — never a
+#    terminalize/prune over live external side effects.
+# 4. P0-4: a kill/confirm EXCEPTION or cancel race releases
+#    ``hard_stop_in_flight``/``hard_stop_quarantine_reserved`` in ``finally``
+#    and re-arms a bounded-backoff retry — no leaked flag/reservation.
+# 5. P0-5: a durable quarantine ABOVE the new small qcap cold-loads COMPLETELY
+#    and fail-closed (``_quarantine_overflow``), never a loader RuntimeError.
+# 6. P0-6: an idcap-FULL collection atomically rejects a NEW key BEFORE any
+#    eviction — the old identity mapping stays byte-identical.
+# ---------------------------------------------------------------------------
+
+
+async def _quick_success(report: Any) -> dict[str, Any]:
+    """A plain in-process operation that succeeds immediately."""
+    return {"ok": True}
+
+
+async def _never_finish(report: Any) -> dict[str, Any]:
+    await asyncio.Event().wait()
+    raise AssertionError("unreachable")
+
+
+# A worker whose LEADER raises after forking a stubborn grandchild: the group
+# must be proven dead before the terminal FAILED label is published (P0-2).
+_RAISING_STUBBORN_SRC = f'''\
+import os
+import subprocess
+import sys
+
+_GRANDCHILD = {_GRANDCHILD_SRC!r}
+
+async def run_raising_stubborn(*, probe_path=None, **kwargs):
+    with open(probe_path, "a") as fh:
+        fh.write("leader-start:" + str(os.getpid()) + "\\n")
+        fh.flush()
+    child = subprocess.Popen(
+        [sys.executable, "-c", _GRANDCHILD, probe_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    with open(probe_path, "a") as fh:
+        fh.write("grandchild-pid:" + str(child.pid) + "\\n")
+        fh.flush()
+    raise RuntimeError("worker entry exploded")
+'''
+
+
+class _FlakyKillConfirm:
+    """A fake worker handle whose ``kill_and_confirm`` raises once (an injected
+    OS kill failure), then reports False (death not confirmed), then True — so
+    the watchdog's finally-cleanup + bounded-backoff retry are the only forces
+    that can ever close the record out."""
+
+    def __init__(self, behavior: list[object]) -> None:
+        self.behavior = behavior
+        self.calls = 0
+
+    async def kill_and_confirm(self, timeout: float) -> bool:
+        outcome = self.behavior[min(self.calls, len(self.behavior) - 1)]
+        self.calls += 1
+        if outcome == "raise":
+            raise OSError("injected kill_and_confirm failure")
+        return bool(outcome)
+
+
+@pytest.mark.asyncio
+async def test_http_route_runs_real_cross_process_ready_chain_to_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A READY payload POSTed through the REAL route runs the REAL ready chain
+    in a REAL independent worker subprocess whose reconstructed app installs a
+    PRODUCTION ``FlexibleLiveAgentSystem`` from the API process's env handoff —
+    never a monkeypatched private runtime — and the job SUCCEEDS with the
+    ready-chain provenance. RED on baseline: with no bundle the ready chain died
+    at the 503 and the job failed, so no cross-process ready chain existed."""
+    registry = _http_app_context(monkeypatch, tmp_path)
+    bundle = json.dumps(
+        {
+            "runtime": "deterministic-blocking",
+            "now_iso": "2026-07-30T09:00:00+00:00",
+            "monotonic_clock": 100.0,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    monkeypatch.setenv("TRIPCHORD_LIVE_FLEXIBLE_WORKER_RUNTIME_BUNDLE", bundle)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+            base_url="http://test",
+        ) as client:
+            created = await client.post(
+                "/api/v1/agents/live-flexible-plan-from-text/jobs",
+                json=_payload(ready=True),
+            )
+            assert created.status_code == 202, created.text
+            job_id = created.json()["job"]["id"]
+            terminal = await _terminal_job_slow(client, job_id)
+        assert terminal["state"] == "succeeded", terminal
+        result = terminal["result"]
+        assert result["interpretation"]["state"] == "ready", result
+        runtime = registry._records[job_id]
+        # A REAL worker subprocess ran the ready chain — durable identity.
+        assert runtime.worker_pgid is not None and runtime.worker_pgid > 0
+        assert runtime.worker_marker
+        # The API process itself never installed a flexible runtime — the ready
+        # chain ran ONLY inside the worker subprocess via the env bundle.
+        assert getattr(app.state, "flexible_live_agent_system", None) is None
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_nonzero_exit_kills_stubborn_descendant_before_terminal(
+    tmp_path: Path,
+) -> None:
+    """A worker whose LEADER exits non-zero after forking a stubborn grandchild
+    must prove the WHOLE group is dead (SIGKILL + confirm) BEFORE the job fails
+    terminal — the worker's own finally already deleted the durable marker file,
+    so only the group kill can stop the descendant's external side effects. RED
+    on baseline: the non-zero exit raised immediately, stranding the grandchild
+    appending the probe while the job entered a terminal state."""
+    state_path = tmp_path / "live-jobs.json"
+    probe = tmp_path / "raising-probe.txt"
+    module = tmp_path / "raising_stubborn_worker.py"
+    module.write_text(_RAISING_STUBBORN_SRC, encoding="utf-8")
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=4,
+        max_running=2,
+        execution_hard_stop_grace_seconds=10.0,
+        hard_stop_confirm_seconds=0.5,
+    )
+    pgid: int | None = None
+    try:
+        snap, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=LiveJobWorkerCommand(
+                module_path=str(module),
+                entry="run_raising_stubborn",
+                args={},
+                probe_path=str(probe),
+            ),
+            idempotency_key="raising-a",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=30.0,
+        )
+        runtime = registry._records[snap.id]
+        # Await the REAL worker subprocess spawn (yields to the event loop so
+        # the runner's operation task can start), then read the probe the worker
+        # process itself writes.
+        await _wait_for_runtime(
+            runtime,
+            lambda r: r.worker_pgid is not None
+            and r.operation_task is not None
+            and not r.operation_task.done(),
+        )
+        _wait_for_probe(probe, "grandchild-pid")
+        pgid = runtime.worker_pgid
+        assert pgid is not None and _group_alive(pgid)
+        await _wait_for_runtime(
+            runtime,
+            lambda r: r.snapshot.state == LivePlanningJobState.FAILED,
+        )
+        # The whole group — INCLUDING the stubborn grandchild — is dead and the
+        # probe permanently froze BEFORE the terminal FAILED label was published.
+        assert pgid is not None
+        assert not _group_alive(pgid)
+        assert not _probe_grows(probe)
+    finally:
+        if pgid is not None:
+            with _suppress_os():
+                os.killpg(pgid, signal.SIGKILL)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cold_load_does_not_terminalize_prune_before_orphan_discovery(
+    tmp_path: Path,
+) -> None:
+    """A cold boot loads a durable RUNNING record with a live orphaned worker
+    group (PGID + marker) AND a durable pending_terminal: the load must DEFER
+    resolution (no terminalize, no prune) until ``restore_after_restart`` has
+    discovered + killed the orphan — resolution over a live executor would
+    publish a terminal label or reclaim over external side effects. RED on
+    baseline: the loader terminalized the record to the pending FAILED label
+    BEFORE the orphan was authenticated + killed."""
+    state_path = tmp_path / "live-jobs.json"
+    probe = tmp_path / "cold-orphan-probe.txt"
+    marker = hashlib.sha256(b"cold-orphan-nonce").hexdigest()
+    job_id = "live-job-cold-orphan"
+    workers_dir = tmp_path / ".live-jobs.json.workers"
+
+    orphan_code = (
+        "import sys, time\n"
+        "probe = sys.argv[2]\n"
+        "while True:\n"
+        "    with open(probe, 'a') as fh:\n"
+        "        fh.write('orphan\\n')\n"
+        "        fh.flush()\n"
+        "    time.sleep(0.01)\n"
+    )
+    # A "crasher" parent spawns the stubborn worker in its own session, writes
+    # the durable marker file, then dies — a genuine orphan (reparented to
+    # init) exactly as a SIGKILLed API process would leave.
+    crash_src = (
+        "import json, os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        f"probe = {str(probe)!r}\n"
+        f"marker = {marker!r}\n"
+        f"marker_file = {str(workers_dir / f'{job_id}.json')!r}\n"
+        f"orphan_code = {orphan_code!r}\n"
+        "worker = subprocess.Popen(\n"
+        "    [sys.executable, '-c', orphan_code, marker, probe],\n"
+        "    start_new_session=True,\n"
+        "    stdout=subprocess.DEVNULL,\n"
+        "    stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        "pgid = worker.pid\n"
+        "Path(marker_file).parent.mkdir(parents=True, exist_ok=True)\n"
+        "Path(marker_file).write_text(json.dumps({\n"
+        "    'pid': pgid,\n"
+        "    'pgid': pgid,\n"
+        "    'marker': marker,\n"
+        "    'probe_path': probe,\n"
+        "    'started_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),\n"
+        "}, ensure_ascii=False, sort_keys=True), encoding='utf-8')\n"
+        "time.sleep(1)\n"
+        "os._exit(99)\n"
+    )
+    crash = subprocess.Popen([sys.executable, "-c", crash_src])
+    crash.wait(timeout=10)
+    pgid = json.loads(
+        (workers_dir / f"{job_id}.json").read_text(encoding="utf-8")
+    )["pgid"]
+    pending = _PendingTerminalOutcome(
+        state=LivePlanningJobState.FAILED,
+        stage="deadline_exceeded",
+        error="TimeoutError: live planning job deadline exceeded",
+        safe_failure=_safe_failure_diagnostic(
+            TimeoutError("live planning job deadline exceeded"),
+            code_override=LivePlanningSafeFailureCode.DEADLINE_EXCEEDED,
+        ),
+        cancellation_requested=True,
+    )
+    snap = _v3_snapshot(
+        job_id,
+        LivePlanningJobState.RUNNING,
+        "interpreting_requirement",
+        5,
+        2,
+        cancellation_requested=True,
+        cancel_pending=True,
+    )
+    payload = {
+        "schema_version": "tripchord-live-job-registry-v3",
+        "records": [
+            _v3_record(
+                "tenant-a",
+                snap,
+                pending_terminal=pending.to_persisted(),
+                worker_pgid=pgid,
+                worker_marker=marker,
+                worker_probe=str(probe),
+            )
+        ],
+        "idempotency": [
+            _v3_idempotency_entry("tenant-a", "cold-orphan-key", job_id),
+        ],
+    }
+    _write_registry_state(payload, state_path)
+    try:
+        _wait_for_probe(probe, "orphan")
+        assert _group_alive(pgid)
+        registry = LivePlanningJobRegistry(state_path=state_path)
+        try:
+            runtime = registry._records[job_id]
+            # RED: the load terminalized the record (FAILED) over the live
+            # orphan BEFORE any orphan discovery; GREEN defers resolution.
+            assert runtime.snapshot.state == LivePlanningJobState.RUNNING
+            assert not runtime.quarantined
+            assert runtime.pending_terminal is not None
+            # The orphan is STILL live pre-restore: no terminalize/prune
+            # claimed it, no prune removed the record.
+            assert _group_alive(pgid)
+            assert _probe_grows(probe)
+            await registry.restore_after_restart()
+            # Zero-request recovery: the real orphan is discovered + killed +
+            # reaped and the probe permanently froze.
+            assert not _group_alive(pgid)
+            assert not _probe_grows(probe)
+        finally:
+            await registry.close()
+    finally:
+        # The orphan is not a child of this process (reparented), so only the
+        # group kill is needed for cleanup.
+        with _suppress_os():
+            os.killpg(pgid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+async def test_hard_stop_clears_in_flight_and_retries_after_kill_exception(
+    tmp_path: Path,
+) -> None:
+    """A kill/confirm EXCEPTION inside a hard stop must release the in-flight
+    marker AND the quarantine slot reservation on EVERY exit, and a death-NOT-
+    confirmed outcome must re-arm a bounded-backoff retry — the deferred record
+    never permanently loses its close-out opportunity. RED on baseline: the
+    exception leaked ``hard_stop_in_flight``/``hard_stop_quarantine_reserved``
+    so the watchdog skipped the record forever and the deadline never settled."""
+    state_path = tmp_path / "live-jobs.json"
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=4,
+        max_running=1,
+        quarantine_capacity=1,
+        execution_hard_stop_grace_seconds=5.0,
+        hard_stop_confirm_seconds=0.5,
+        hard_stop_defer_retry_seconds=0.05,
+    )
+    runtime: Any = None
+    try:
+        snap, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_never_finish,
+            idempotency_key="hardstop-flaky",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=60.0,
+        )
+        runtime = registry._records[snap.id]
+        await _wait_for_runtime(
+            runtime,
+            lambda r: r.operation_task is not None and not r.operation_task.done(),
+        )
+        handle = _FlakyKillConfirm(["raise", False, True])
+        runtime.worker_handle = handle
+        async with registry._changed:
+            runtime.hard_stop_monotonic = asyncio.get_running_loop().time() - 0.1
+            registry._wake_hard_stop_watchdog()
+        # The finally-cleanup + backoff retry drive the flaky kill to a
+        # CONFIRMED hard stop (raise -> not-confirmed -> confirmed).
+        await _wait_for_runtime(
+            runtime,
+            lambda r: r.quarantined and r.hard_stopped,
+            timeout=10.0,
+        )
+        assert runtime.quarantine_stage == _QUARANTINE_HARD_STOPPED_STAGE
+        assert runtime.hard_stop_in_flight is False
+        assert runtime.hard_stop_quarantine_reserved is False
+        assert handle.calls == 3
+    finally:
+        if runtime is not None:
+            operation = runtime.operation_task
+            if operation is not None and not operation.done():
+                operation.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(operation, timeout=3)
+            for task in (runtime.task, runtime.cleanup_owner, registry._hard_stop_watchdog):
+                if (
+                    task is not None
+                    and not task.done()
+                    and task is not asyncio.current_task()
+                ):
+                    task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await asyncio.wait_for(task, timeout=3)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cold_load_full_durable_quarantine_overflow_new_small_qcap(
+    tmp_path: Path,
+) -> None:
+    """A state file holding MORE durable quarantined records than the CURRENT
+    qcap (a config shrink) must load COMPLETELY and fail-closed — no loader
+    RuntimeError, no record dropped, ``_quarantine_overflow`` set, admissions
+    refused until bounded retention cleanup restores capacity. RED on baseline:
+    the load-tail persist rejected the combined active+quarantine count and the
+    cold start crashed."""
+    state_path = tmp_path / "live-jobs.json"
+    records = []
+    idempotency = []
+    for i in range(2):
+        job_id = f"live-job-overflow-active-{i}"
+        snap = _v3_snapshot(job_id, LivePlanningJobState.SUCCEEDED, "complete", 100, 3)
+        records.append(_v3_record("tenant-a", snap))
+        idempotency.append(
+            _v3_idempotency_entry("tenant-a", f"overflow-key-active-{i}", job_id)
+        )
+    for i in range(2):
+        job_id = f"live-job-overflow-q-{i}"
+        snap = _v3_snapshot(
+            job_id, LivePlanningJobState.RUNNING, _QUARANTINE_ORPHAN_STAGE, 5, 2
+        )
+        records.append(
+            _v3_record(
+                "tenant-a",
+                snap,
+                quarantined=True,
+                quarantine_stage=_QUARANTINE_ORPHAN_STAGE,
+            )
+        )
+        idempotency.append(
+            _v3_idempotency_entry("tenant-a", f"overflow-key-q-{i}", job_id)
+        )
+    _write_registry_state(
+        {
+            "schema_version": "tripchord-live-job-registry-v3",
+            "records": records,
+            "idempotency": idempotency,
+        },
+        state_path,
+    )
+
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=2,
+        quarantine_capacity=1,
+        idempotency_capacity=6,
+    )
+    try:
+        # Complete load: every durable record survives, none dropped (RED: the
+        # load crashed on the combined-count reject).
+        assert registry._quarantine_overflow is True
+        assert len(registry._records) == 4
+        for i in range(2):
+            assert f"live-job-overflow-active-{i}" in registry._records
+            assert f"live-job-overflow-q-{i}" in registry._records
+        # Fail-closed: no NEW admission while overflow holds.
+        with pytest.raises(LivePlanningJobCapacityError, match="quarantine capacity exceeded"):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=_quick_success,
+                idempotency_key="overflow-new-key",
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+            )
+        # Bounded retention cleanup reclaims the quarantined records and
+        # restores admission capacity.
+        async with registry._changed:
+            registry._quarantine_retention = timedelta(milliseconds=1)
+            await asyncio.sleep(0.05)
+            registry._prune_locked(registry._utc_now())
+        assert registry._quarantine_overflow is False
+        await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_quick_success,
+            idempotency_key="overflow-after-cleanup",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+        )
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_idcap_admission_rejects_when_collection_full_preserving_old_mapping(
+    tmp_path: Path,
+) -> None:
+    """``capacity=2`` + ``idempotency_capacity=2``: two terminal jobs fill both
+    identity slots. A THIRD job with a NEW key must fail closed at the FULL
+    identity collection — eviction of an executable record slot never frees an
+    identity slot, so the old mapping stays byte-identical. RED on baseline: the
+    capacity eviction ran FIRST, deleting job1's binding so the reduced count
+    admitted the new key and destroyed the old mapping."""
+    state_path = tmp_path / "live-jobs.json"
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        capacity=2,
+        max_running=2,
+        idempotency_capacity=2,
+        quarantine_capacity=1,
+    )
+    try:
+        snap_a, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_quick_success,
+            idempotency_key="idcap-a",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+        )
+        ra = registry._records[snap_a.id]
+        await _wait_for_runtime(
+            ra,
+            lambda r: r.snapshot.state == LivePlanningJobState.SUCCEEDED,
+        )
+        snap_b, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=_quick_success,
+            idempotency_key="idcap-b",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+        )
+        rb = registry._records[snap_b.id]
+        await _wait_for_runtime(
+            rb,
+            lambda r: r.snapshot.state == LivePlanningJobState.SUCCEEDED,
+        )
+        key_a = LivePlanningJobRegistry._idempotency_partition("tenant-a", "idcap-a")
+        assert key_a in registry._idempotency
+        assert registry._idempotency[key_a].job_id == snap_a.id
+        before = state_path.read_bytes()
+        # A third NEW key must fail closed at the FULL identity collection —
+        # BEFORE any capacity eviction could delete the old mapping.
+        with pytest.raises(LivePlanningJobCapacityError, match="idempotency capacity exceeded"):
+            await registry.start_idempotent(
+                tenant_id="tenant-a",
+                operation=_quick_success,
+                idempotency_key="idcap-c",
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+            )
+        after = state_path.read_bytes()
+        # The rejected admission wrote NOTHING: the old identity is byte-identical.
+        assert after == before
+        assert snap_a.id in registry._records
+        assert registry._idempotency[key_a].job_id == snap_a.id
+        assert registry._idempotency[key_a].request_digest == REQUEST_SHA256
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cold_load_settles_confirmed_orphan_activation_to_restart_cancelled(
+    tmp_path: Path,
+) -> None:
+    """A cold boot loads a durable QUEUED record whose durable worker identity
+    (PGID + marker) points at a LIVE orphaned worker AND whose durable
+    ``activation_operation`` proves a formal activation was committed when the
+    parent crashed: the load must DEFER resolution (never terminalize over a live
+    executor), ``restore_after_restart`` must first discover + authenticate +
+    SIGKILL + confirm the orphan group, and ONLY THEN settle the record from
+    durable facts to ``restart_cancelled``. RED on baseline: the loader resolved
+    the activation-committed QUEUED record to ``restart_cancelled`` at load time
+    — over the still-live orphan, before any discovery/kill — while the group
+    kept running."""
+    state_path = tmp_path / "live-jobs.json"
+    probe = tmp_path / "cold-activation-orphan-probe.txt"
+    marker = hashlib.sha256(b"cold-activation-orphan-nonce").hexdigest()
+    job_id = "live-job-cold-activation-orphan"
+    workers_dir = tmp_path / ".live-jobs.json.workers"
+
+    orphan_code = (
+        "import sys, time\n"
+        "probe = sys.argv[2]\n"
+        "while True:\n"
+        "    with open(probe, 'a') as fh:\n"
+        "        fh.write('orphan\\n')\n"
+        "        fh.flush()\n"
+        "    time.sleep(0.01)\n"
+    )
+    crash_src = (
+        "import json, os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        f"probe = {str(probe)!r}\n"
+        f"marker = {marker!r}\n"
+        f"marker_file = {str(workers_dir / f'{job_id}.json')!r}\n"
+        f"orphan_code = {orphan_code!r}\n"
+        "worker = subprocess.Popen(\n"
+        "    [sys.executable, '-c', orphan_code, marker, probe],\n"
+        "    start_new_session=True,\n"
+        "    stdout=subprocess.DEVNULL,\n"
+        "    stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        "pgid = worker.pid\n"
+        "Path(marker_file).parent.mkdir(parents=True, exist_ok=True)\n"
+        "Path(marker_file).write_text(json.dumps({\n"
+        "    'pid': pgid,\n"
+        "    'pgid': pgid,\n"
+        "    'marker': marker,\n"
+        "    'probe_path': probe,\n"
+        "    'started_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),\n"
+        "}, ensure_ascii=False, sort_keys=True), encoding='utf-8')\n"
+        "time.sleep(1)\n"
+        "os._exit(99)\n"
+    )
+    crash = subprocess.Popen([sys.executable, "-c", crash_src])
+    crash.wait(timeout=10)
+    pgid = json.loads(
+        (workers_dir / f"{job_id}.json").read_text(encoding="utf-8")
+    )["pgid"]
+    # Durable formal activation that was committed when the parent crashed: the
+    # job passed the admission barrier and was dispatched, but its snapshot never
+    # advanced past QUEUED.
+    activation_operation = {
+        "schema_version": "tripchord-live-activation-operation-v1",
+        "operation_id": "a" * 64,
+        "idempotency_key": f"formal-activate-{job_id}",
+        "request_digest": REQUEST_SHA256,
+        "job_id": job_id,
+        "challenge_id": f"challenge-{job_id}",
+        "attempt_digest": REQUEST_SHA256,
+        "capability_sha256": REQUEST_SHA256,
+        "companion_identity_sha256": REQUEST_SHA256,
+        "queued_result": {"job": {"id": job_id, "state": "queued"}},
+        "phase": "committed",
+        "dispatch_count": 1,
+    }
+    snap = _v3_snapshot(job_id, LivePlanningJobState.QUEUED, "queued", 0, 1)
+    record = _v3_record(
+        "tenant-a",
+        snap,
+        worker_pgid=pgid,
+        worker_marker=marker,
+        worker_probe=str(probe),
+    )
+    record["activation_operation"] = activation_operation
+    payload = {
+        "schema_version": "tripchord-live-job-registry-v3",
+        "records": [record],
+        "idempotency": [
+            _v3_idempotency_entry("tenant-a", "cold-activation-key", job_id),
+        ],
+    }
+    _write_registry_state(payload, state_path)
+    try:
+        _wait_for_probe(probe, "orphan")
+        assert _group_alive(pgid)
+        registry = LivePlanningJobRegistry(state_path=state_path)
+        try:
+            runtime = registry._records[job_id]
+            # RED: the load terminalized the activation record to CANCELLED over
+            # the LIVE orphan BEFORE any discovery; GREEN defers resolution so
+            # the record stays non-terminal QUEUED until the executor is proven
+            # gone.
+            assert runtime.snapshot.state == LivePlanningJobState.QUEUED
+            assert not runtime.quarantined
+            assert _group_alive(pgid)
+            assert _probe_grows(probe)
+            await registry.restore_after_restart()
+            # Zero-request recovery: the orphan was discovered + killed first,
+            # then the record was settled from durable facts only.
+            assert not _group_alive(pgid)
+            assert not _probe_grows(probe)
+            settled = registry._records[job_id]
+            assert settled.snapshot.state == LivePlanningJobState.CANCELLED
+            assert settled.snapshot.stage == "restart_cancelled"
+        finally:
+            await registry.close()
+    finally:
+        with _suppress_os():
+            os.killpg(pgid, signal.SIGKILL)

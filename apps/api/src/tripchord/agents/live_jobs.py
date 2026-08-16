@@ -1680,135 +1680,19 @@ class LivePlanningJobRegistry:
             raise RuntimeError("live planning job registry idempotency bounds exceeded")
         for runtime in self._records.values():
             if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
-                # C-146 P0 supplement (P0-4): a record that loaded as
-                # ``prepared=True`` is provably never-executed (the on-disk
-                # invariant forbids a prepared record in any state but QUEUED,
-                # and activation is the only way a prepared job ever starts).
-                # ``prepared`` is reset below, so capture the durable flag
-                # before the reset: restart_cancelled is honest ONLY for this
-                # shape — never for an admitted immediate (prepared=False)
-                # record whose operation may already have been executing.
-                was_prepared = runtime.prepared
-                runtime.prepared = False
-                if runtime.quarantined:
-                    # C-146 P0 supplement (P0-4): a quarantined record stays
-                    # quarantined NON-terminal across a cold boot — never
-                    # terminalized from a memory-only intent, never re-isolated,
-                    # never unquarantined. The quarantine facts (stage, error,
-                    # updated_at) are durable and idempotent, so a second cold
-                    # boot observes exactly the same state.
+                if runtime.worker_pgid is not None and runtime.worker_marker:
+                    # C-146 P0-3 (RETURN 7de8cf3e): a DURABLE worker identity
+                    # means a real executor process may still be alive (the
+                    # parent API was SIGKILLed mid-run and the worker was
+                    # orphaned). Resolution must NOT run at load time — a
+                    # terminalize/prune before the orphan is authenticated +
+                    # killed + reaped would publish a terminal label or reclaim
+                    # over live external side effects. The record is resolved in
+                    # ``restore_after_restart`` AFTER
+                    # ``_discover_and_stop_orphan_workers`` provably handled the
+                    # group.
                     continue
-                pending = runtime.pending_terminal
-                if pending is not None and runtime.snapshot.cancel_pending:
-                    # C-145 P0: a DURABLE retry intent survives a restart. The
-                    # real operation's process is provably gone, so continue the
-                    # cleanup to the intended terminal outcome now — never guess
-                    # a cancelled/failed label and never treat an unknown state
-                    # as success. A cancel_pending guard keeps an inconsistent
-                    # (corrupted) outcome fail-closed to restart_cancelled.
-                    self._terminalize_locked(
-                        runtime,
-                        pending.state,
-                        stage=pending.stage,
-                        result=pending.result,
-                        error=pending.error,
-                        safe_failure=pending.safe_failure,
-                        cancellation_requested=pending.cancellation_requested,
-                    )
-                elif runtime.snapshot.stage == _ISOLATED_AMBIGUOUS_CANCEL_STAGE:
-                    # C-145 P0 supplement: a record quarantined by an earlier
-                    # cold start stays quarantined — re-isolating is idempotent,
-                    # so two consecutive cold starts never drift it into a
-                    # guessed CANCELLED/FAILED label. C-146 P0 supplement
-                    # (P0-4): old v3 files lack the durable ``quarantined``
-                    # marker, so a record at this stage is upgraded atomically to
-                    # the explicit quarantine flag (persisted on the next write).
-                    runtime.quarantined = True
-                    runtime.quarantine_stage = _ISOLATED_AMBIGUOUS_CANCEL_STAGE
-                elif pending is not None or runtime.snapshot.cancel_pending:
-                    # C-145 P0 supplement: a non-terminal record whose durable
-                    # cancel intent (pending=true) has NO provable terminal
-                    # outcome — or carries an outcome inconsistent with its
-                    # snapshot — gives no unforgeable fact to prove whether the
-                    # intended label was CANCELLED or FAILED. We never guess:
-                    # the record is isolated (never replayed) and the ambiguity
-                    # is surfaced explicitly.
-                    self._isolate_ambiguous_cancel_locked(runtime)
-                elif was_prepared and runtime.snapshot.state == LivePlanningJobState.QUEUED:
-                    # C-146 P0 supplement (P0-3): a record that never passed the
-                    # admission barrier provably never executed — the operation
-                    # closure cannot have started, so a CANCELLED label guesses
-                    # nothing about live work. restart_cancelled is the honest,
-                    # provable tombstone for a never-started job. P0-4 narrows
-                    # this to ``was_prepared`` records ONLY: a prepared record is
-                    # the one shape whose durable flag proves it never executed.
-                    self._terminalize_locked(
-                        runtime,
-                        LivePlanningJobState.CANCELLED,
-                        stage="restart_cancelled",
-                        error="live planning job cannot continue after process restart",
-                        cancellation_requested=True,
-                    )
-                elif runtime.snapshot.deadline_at <= self._utc_now():
-                    # C-146 P0 supplement (P0-3/P0-4): recover FAILED/deadline_exceeded
-                    # ONLY from durable unforgeable deadline provenance. An
-                    # admitted record with NO cancel intent whose deadline
-                    # provably passed before the crash — including one that died
-                    # in the deadline-intent-persist-pending window, where the
-                    # FIRST FAILED intent never committed — carries the deadline
-                    # as its single provable explanation. We never fake a
-                    # deadline and never guess restart_cancelled over it.
-                    self._terminalize_locked(
-                        runtime,
-                        LivePlanningJobState.FAILED,
-                        stage="deadline_exceeded",
-                        error="TimeoutError: live planning job deadline exceeded",
-                        safe_failure=_safe_failure_diagnostic(
-                            TimeoutError("live planning job deadline exceeded"),
-                            code_override=LivePlanningSafeFailureCode.DEADLINE_EXCEEDED,
-                        ),
-                        cancellation_requested=True,
-                    )
-                elif (
-                    runtime.activation_operation is not None
-                    and runtime.activation_operation.get("phase")
-                    in {"intent", "dispatched", "committed"}
-                    and runtime.snapshot.state == LivePlanningJobState.QUEUED
-                ):
-                    # C-143 (91648931) / C-146 P0-4: a FORMAL activation that was
-                    # interrupted by the process death. ``activate`` resets
-                    # ``prepared`` (so the was_prepared branch above cannot fire)
-                    # and the durable activation_operation proves the job passed
-                    # the admission barrier and was activating (intent/dispatched)
-                    # or already committed (committed) while its snapshot never
-                    # advanced past QUEUED. With the deadline NOT yet passed (the
-                    # branch above would otherwise have proved deadline
-                    # provenance) and the executor gone with the process boundary,
-                    # restart_cancelled is the contract-allowed, provable
-                    # outcome — the same-key retry fails closed and the dispatched
-                    # operation is never replayed. Distinct from a plain immediate
-                    # (prepared=False, no activation) QUEUED record, whose
-                    # operation may have been executing when the process died and
-                    # which stays quarantined ambiguous.
-                    self._terminalize_locked(
-                        runtime,
-                        LivePlanningJobState.CANCELLED,
-                        stage="restart_cancelled",
-                        error="live planning job cannot continue after process restart",
-                        cancellation_requested=True,
-                    )
-                else:
-                    # C-146 P0 supplement (P0-3/P0-4): an admitted record whose
-                    # deadline did not pass and that carries no durable cancel
-                    # intent gives insufficient unforgeable facts to prove ANY
-                    # terminal outcome. This includes a QUEUED immediate record
-                    # (prepared=False): its operation may already have been
-                    # executing when the process died (RUNNING is never a
-                    # durable write), so restart_cancelled would guess a CANCELLED
-                    # label over live work. No terminal label is fabricated: the
-                    # record is quarantined as ambiguous instead.
-                    self._isolate_ambiguous_cancel_locked(runtime)
-                runtime.pending_terminal = None
+                self._resolve_cold_booted_record_locked(runtime)
         # C-146 P0 supplement (P0-4) / b119: the resolution loop above may have
         # quarantined newly-isolated ambiguous records. Re-validate the two
         # INDEPENDENT quotas AFTER resolution so a hand-crafted file whose
@@ -1838,6 +1722,190 @@ class LivePlanningJobRegistry:
                 self._defer_cleanup_owner_spawn(runtime)
         self._prune_locked(self._utc_now())
         self._persist_locked()
+
+    def _resolve_cold_booted_record_locked(self, runtime: _RuntimeJob) -> None:
+        """Settle a cold-booted non-terminal record from DURABLE facts only.
+
+        C-146 P0-3 (RETURN 7de8cf3e): extracted from the ``_load_state``
+        resolution loop so ``restore_after_restart`` runs the SAME resolution for
+        a record whose durable worker identity pointed at an orphan group that
+        was only just discovered + killed + reaped. Resolution is honest ONLY
+        when the executor is provably gone — the caller must guarantee that
+        (``_load_state`` skips records with a durable worker identity; the post-
+        discovery ``restore_after_restart`` path runs after
+        ``_discover_and_stop_orphan_workers``).
+        """
+        # C-146 P0 supplement (P0-4): a record that loaded as ``prepared=True``
+        # is provably never-executed (the on-disk invariant forbids a prepared
+        # record in any state but QUEUED, and activation is the only way a
+        # prepared job ever starts). ``prepared`` is reset below, so capture the
+        # durable flag before the reset: restart_cancelled is honest ONLY for
+        # this shape — never for an admitted immediate (prepared=False) record
+        # whose operation may already have been executing.
+        was_prepared = runtime.prepared
+        runtime.prepared = False
+        if runtime.quarantined:
+            # C-146 P0 supplement (P0-4): a quarantined record stays
+            # quarantined NON-terminal across a cold boot — never terminalized
+            # from a memory-only intent, never re-isolated, never unquarantined.
+            # The quarantine facts (stage, error, updated_at) are durable and
+            # idempotent, so a second cold boot observes exactly the same state.
+            #
+            # C-146 P0-3 (RETURN 7de8cf3e) supplement: the ONE exception is an
+            # ORPHAN quarantine set by this boot's ``_discover_and_stop_orphan_workers``
+            # after it AUTHENTICATED the durable worker group, SIGKILLed it and
+            # CONFIRMED every member died (``hard_stopped``). That proves the
+            # executor is provably gone, so the loader's OWN resolution may settle
+            # the record from durable facts — e.g. a formal activation interrupted
+            # by the parent crash (``activation_operation`` phase committed +
+            # snapshot QUEUED) to ``restart_cancelled``. An orphan group that could
+            # NOT be confirmed dead stays quarantined for the next startup; any
+            # other quarantine stage stays non-terminal by the P0-4 contract.
+            if not (
+                runtime.quarantine_stage == _QUARANTINE_ORPHAN_STAGE
+                and runtime.hard_stopped
+            ):
+                return
+            was_orphan_confirmed = True
+            runtime.quarantined = False
+            runtime.quarantine_stage = None
+        else:
+            was_orphan_confirmed = False
+        pending = runtime.pending_terminal
+        # C-146 P0-3 supplement (regression guard): an orphan-confirmed record
+        # may ONLY be settled when the durable facts prove a terminal outcome.
+        # A RUNNING record that died mid-run (no durable cancel intent, no
+        # activation, deadline not passed) has no provable terminal label — the
+        # honest outcome is to KEEP the confirmed-orphan quarantine (the
+        # strongest durable fact: the executor was authenticated + SIGKILLed +
+        # confirmed dead), never downgrade it to ``isolated_ambiguous_cancel``
+        # and never guess a terminal label over live work.
+        provable_terminal = (
+            (pending is not None and runtime.snapshot.cancel_pending)
+            or (
+                was_prepared
+                and runtime.snapshot.state == LivePlanningJobState.QUEUED
+            )
+            or (runtime.snapshot.deadline_at <= self._utc_now())
+            or (
+                runtime.activation_operation is not None
+                and runtime.activation_operation.get("phase")
+                in {"intent", "dispatched", "committed"}
+                and runtime.snapshot.state == LivePlanningJobState.QUEUED
+            )
+        )
+        if was_orphan_confirmed and not provable_terminal:
+            runtime.quarantined = True
+            runtime.quarantine_stage = _QUARANTINE_ORPHAN_STAGE
+            runtime.hard_stopped = True
+            return
+        if pending is not None and runtime.snapshot.cancel_pending:
+            # C-145 P0: a DURABLE retry intent survives a restart. The real
+            # operation's process is provably gone, so continue the cleanup to
+            # the intended terminal outcome now — never guess a cancelled/failed
+            # label and never treat an unknown state as success. A cancel_pending
+            # guard keeps an inconsistent (corrupted) outcome fail-closed to
+            # restart_cancelled.
+            self._terminalize_locked(
+                runtime,
+                pending.state,
+                stage=pending.stage,
+                result=pending.result,
+                error=pending.error,
+                safe_failure=pending.safe_failure,
+                cancellation_requested=pending.cancellation_requested,
+            )
+        elif runtime.snapshot.stage == _ISOLATED_AMBIGUOUS_CANCEL_STAGE:
+            # C-145 P0 supplement: a record quarantined by an earlier cold start
+            # stays quarantined — re-isolating is idempotent, so two consecutive
+            # cold starts never drift it into a guessed CANCELLED/FAILED label.
+            # C-146 P0 supplement (P0-4): old v3 files lack the durable
+            # ``quarantined`` marker, so a record at this stage is upgraded
+            # atomically to the explicit quarantine flag (persisted on the next
+            # write).
+            runtime.quarantined = True
+            runtime.quarantine_stage = _ISOLATED_AMBIGUOUS_CANCEL_STAGE
+        elif pending is not None or runtime.snapshot.cancel_pending:
+            # C-145 P0 supplement: a non-terminal record whose durable cancel
+            # intent (pending=true) has NO provable terminal outcome — or
+            # carries an outcome inconsistent with its snapshot — gives no
+            # unforgeable fact to prove whether the intended label was CANCELLED
+            # or FAILED. We never guess: the record is isolated (never replayed)
+            # and the ambiguity is surfaced explicitly.
+            self._isolate_ambiguous_cancel_locked(runtime)
+        elif was_prepared and runtime.snapshot.state == LivePlanningJobState.QUEUED:
+            # C-146 P0 supplement (P0-3): a record that never passed the
+            # admission barrier provably never executed — the operation closure
+            # cannot have started, so a CANCELLED label guesses nothing about
+            # live work. restart_cancelled is the honest, provable tombstone for
+            # a never-started job. P0-4 narrows this to ``was_prepared`` records
+            # ONLY: a prepared record is the one shape whose durable flag proves
+            # it never executed.
+            self._terminalize_locked(
+                runtime,
+                LivePlanningJobState.CANCELLED,
+                stage="restart_cancelled",
+                error="live planning job cannot continue after process restart",
+                cancellation_requested=True,
+            )
+        elif runtime.snapshot.deadline_at <= self._utc_now():
+            # C-146 P0 supplement (P0-3/P0-4): recover FAILED/deadline_exceeded
+            # ONLY from durable unforgeable deadline provenance. An admitted
+            # record with NO cancel intent whose deadline provably passed before
+            # the crash — including one that died in the
+            # deadline-intent-persist-pending window, where the FIRST FAILED
+            # intent never committed — carries the deadline as its single
+            # provable explanation. We never fake a deadline and never guess
+            # restart_cancelled over it.
+            self._terminalize_locked(
+                runtime,
+                LivePlanningJobState.FAILED,
+                stage="deadline_exceeded",
+                error="TimeoutError: live planning job deadline exceeded",
+                safe_failure=_safe_failure_diagnostic(
+                    TimeoutError("live planning job deadline exceeded"),
+                    code_override=LivePlanningSafeFailureCode.DEADLINE_EXCEEDED,
+                ),
+                cancellation_requested=True,
+            )
+        elif (
+            runtime.activation_operation is not None
+            and runtime.activation_operation.get("phase")
+            in {"intent", "dispatched", "committed"}
+            and runtime.snapshot.state == LivePlanningJobState.QUEUED
+        ):
+            # C-143 (91648931) / C-146 P0-4: a FORMAL activation that was
+            # interrupted by the process death. ``activate`` resets ``prepared``
+            # (so the was_prepared branch above cannot fire) and the durable
+            # activation_operation proves the job passed the admission barrier
+            # and was activating (intent/dispatched) or already committed
+            # (committed) while its snapshot never advanced past QUEUED. With the
+            # deadline NOT yet passed (the branch above would otherwise have
+            # proved deadline provenance) and the executor gone with the process
+            # boundary, restart_cancelled is the contract-allowed, provable
+            # outcome — the same-key retry fails closed and the dispatched
+            # operation is never replayed. Distinct from a plain immediate
+            # (prepared=False, no activation) QUEUED record, whose operation may
+            # have been executing when the process died and which stays
+            # quarantined ambiguous.
+            self._terminalize_locked(
+                runtime,
+                LivePlanningJobState.CANCELLED,
+                stage="restart_cancelled",
+                error="live planning job cannot continue after process restart",
+                cancellation_requested=True,
+            )
+        else:
+            # C-146 P0 supplement (P0-3/P0-4): an admitted record whose deadline
+            # did not pass and that carries no durable cancel intent gives
+            # insufficient unforgeable facts to prove ANY terminal outcome. This
+            # includes a QUEUED immediate record (prepared=False): its operation
+            # may already have been executing when the process died (RUNNING is
+            # never a durable write), so restart_cancelled would guess a
+            # CANCELLED label over live work. No terminal label is fabricated:
+            # the record is quarantined as ambiguous instead.
+            self._isolate_ambiguous_cancel_locked(runtime)
+        runtime.pending_terminal = None
 
     def _isolate_ambiguous_cancel_locked(self, runtime: _RuntimeJob) -> None:
         """Quarantine a non-terminal record whose durable cancel intent has no
@@ -1975,7 +2043,19 @@ class LivePlanningJobRegistry:
         # reaches this point already fits the quotas; this pre-check makes the
         # byte-boundary failure happen before the full blob is built, never after
         # an unbounded list was materialized on disk.
-        if len(self._records) > self._capacity + self._quarantine_capacity:
+        #
+        # C-146 P0-5 (RETURN 7de8cf3e): the two quotas are INDEPENDENT — active
+        # records vs ``capacity`` and quarantined records vs ``quarantine_capacity``
+        # — never the old combined sum. A legitimately-loaded durable quarantine
+        # that exceeds the CURRENT qcap (a config shrink) must load AND persist
+        # fail-closed (``_quarantine_overflow`` set, no new conversion/admission);
+        # only bounded retention cleanup restores capacity. The combined-count
+        # reject would crash the cold start instead of preserving the overflow.
+        active_records = sum(1 for item in self._records.values() if not item.quarantined)
+        quarantined_records = len(self._records) - active_records
+        if active_records > self._capacity or (
+            quarantined_records > self._quarantine_capacity and not self._quarantine_overflow
+        ):
             raise RuntimeError("live planning job registry record bounds exceeded")
         if len(self._idempotency) > self._idempotency_capacity:
             raise RuntimeError("live planning job registry idempotency bounds exceeded")
@@ -2244,7 +2324,6 @@ class LivePlanningJobRegistry:
                                 cancellation_pending_error.job_id = existing_runtime.snapshot.id
                                 raise cancellation_pending_error
                         return existing_runtime.snapshot, True
-            evicted_runtime, evicted_entries = self._make_capacity_locked()
             # C-146 hard-stop gate (12e35d45 门 5): the idempotency-identity /
             # tombstone collection has a hard CARDINALITY bound, enforced
             # ATOMICALLY BEFORE the new record is admitted to ``_records`` or
@@ -2254,16 +2333,23 @@ class LivePlanningJobRegistry:
             # bound on read, so a file this function writes is always
             # reloadable. Existing recoverable identities are never evicted — a
             # full collection fails closed.
+            #
+            # C-146 P0-6 (RETURN 7de8cf3e): the idcap check runs BEFORE any
+            # capacity eviction. Eviction frees an executable RECORD slot, never
+            # an identity slot — checking the count AFTER eviction would let a
+            # full idempotency collection wrongly admit a NEW key by first
+            # deleting the oldest terminal record's binding (the eviction
+            # shrinks the count below the cap), silently destroying the old
+            # mapping and breaking idempotent replay/audit. A full collection
+            # must fail closed with the old identity byte-identical.
             if (
                 idempotency_partition is not None
                 and len(self._idempotency) >= self._idempotency_capacity
             ):
-                # C-146 P0-6: a capacity eviction above must not survive a
-                # rejected admission — restore the old record + its bindings.
-                self._restore_capacity_locked(evicted_runtime, evicted_entries)
                 raise LivePlanningJobCapacityError(
                     "live planning job idempotency capacity exceeded"
                 )
+            evicted_runtime, evicted_entries = self._make_capacity_locked()
             self._records[job_id] = runtime
             if idempotency_partition is not None:
                 assert request_digest is not None
@@ -2899,7 +2985,38 @@ class LivePlanningJobRegistry:
             runtimes = list(self._records.values())
         for runtime in runtimes:
             if runtime.pending_terminal is not None or runtime.quarantined:
+                # C-146 P0-3 (RETURN 7de8cf3e): a record whose durable worker
+                # identity was deferred at load was QUARANTINED as an orphan by
+                # ``_discover_and_stop_orphan_workers`` above. When that discovery
+                # authenticated + killed + CONFIRMED the group dead, the executor
+                # is provably gone and the loader's OWN resolution may settle the
+                # record from durable facts (a formal activation interrupted by
+                # the crash -> restart_cancelled); otherwise (unconfirmed death or
+                # a non-orphan quarantine) the record stays quarantined and the
+                # bounded cleanup reconcile owns it.
+                if (
+                    runtime.quarantined
+                    and runtime.quarantine_stage == _QUARANTINE_ORPHAN_STAGE
+                    and runtime.hard_stopped
+                    and runtime.worker_pgid is not None
+                    and runtime.worker_marker
+                    and runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
+                ):
+                    async with self._lock:
+                        self._resolve_cold_booted_record_locked(runtime)
                 self._ensure_cleanup_owner(runtime)
+            elif runtime.worker_pgid is not None and runtime.worker_marker:
+                if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                    # C-146 P0-3 (RETURN 7de8cf3e): this record's durable worker
+                    # identity was deferred at load (resolution must not run over
+                    # a possibly-live orphan). Its orphan group has NOW been
+                    # discovered + killed (or was already gone), so the executor
+                    # is provably dead and the record can be settled with the
+                    # loader's OWN resolution — a cold-booted durable PGID/marker
+                    # is never terminalized/pruned before zero-request orphan
+                    # recovery.
+                    async with self._lock:
+                        self._resolve_cold_booted_record_locked(runtime)
 
     async def close(self) -> None:
         """Close the registry, reusing the exact durable drain state machine as a
@@ -3701,6 +3818,19 @@ class LivePlanningJobRegistry:
             # typed exception so the job fails with the operation's OWN cause
             # (e.g. the ready chain's 503) instead of a generic exit-code error.
             # A missing/unparseable marker falls back to the generic failure.
+            #
+            # C-146 P0-2 (RETURN 7de8cf3e): a NON-ZERO leader exit is NOT proof
+            # the whole process group is empty — the entry may have forked a
+            # stubborn descendant before raising, and the worker's own finally
+            # already deleted the durable marker file. Raising here would strand
+            # a live grandchild that keeps writing external side effects while
+            # the job enters a terminal state and releases its permit. Prove the
+            # whole group is dead (SIGKILL any survivor + waitpid + empty-group
+            # probe) BEFORE surfacing the failure; a group that cannot be
+            # confirmed empty fails the job closed instead of completing over
+            # live side effects.
+            if runtime.worker_handle is not None:
+                await runtime.worker_handle.kill_and_confirm(self._hard_stop_confirm_seconds)
             failure = self._parse_worker_failure(stderr)
             if failure is not None:
                 raise failure
@@ -3862,16 +3992,49 @@ class LivePlanningJobRegistry:
         cancel_future = runtime.cancel_future
         return cancel_future is not None and not cancel_future.done()
 
+    def _authenticated_orphan_alive(self, runtime: _RuntimeJob) -> bool:
+        """True when the runtime's DURABLE worker identity points at a LIVE,
+        marker-authenticated process group this process has not yet reaped.
+
+        C-146 P0-3 (RETURN 7de8cf3e): only meaningful for a cold-booted runtime
+        (no in-process ``worker_handle``): a live handle's group is owned by the
+        in-process kill/confirm machinery and is not re-derived here. A group is
+        authenticated ONLY via the durable marker nonce in its command lines — a
+        reused PGID owned by an unrelated process is never treated as our orphan.
+        A group that cannot be proven dead (killpg probe or ``ps`` failure) fails
+        closed as alive so no terminalize/prune/permit release happens over
+        unconfirmed external side effects."""
+        if runtime.worker_handle is not None:
+            return False
+        if runtime.worker_pgid is None or not runtime.worker_marker:
+            return False
+        try:
+            os.killpg(runtime.worker_pgid, 0)
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            return True
+        commands = self._group_commands(runtime.worker_pgid)
+        return any(runtime.worker_marker in line for line in commands)
+
     def _executors_stopped(self, runtime: _RuntimeJob) -> bool:
         """Shared terminalize predicate (硬门 B / P0-4).
 
         True only when BOTH the registry runner task AND the real operation task
         are confirmed done (or never existed). A final CANCELLED / FAILED /
         close-completed label may be published only when this holds — never while
-        an executor could still be writing side effects."""
-        return (runtime.task is None or runtime.task.done()) and (
-            runtime.operation_task is None or runtime.operation_task.done()
-        )
+        an executor could still be writing side effects.
+
+        C-146 P0-3 (RETURN 7de8cf3e): a cold-booted runtime has no in-process
+        tasks, but its DURABLE worker identity may still point at a LIVE orphan
+        process group that this process has NOT yet authenticated + killed +
+        reaped. That group is a real executor — never report "stopped" while it
+        is alive."""
+        if runtime.task is not None and not runtime.task.done():
+            return False
+        if runtime.operation_task is not None and not runtime.operation_task.done():
+            return False
+        return not self._authenticated_orphan_alive(runtime)
 
     def _defer_cleanup_owner_spawn(self, runtime: _RuntimeJob) -> None:
         """Restore the unique cleanup owner for a cold-booted runtime, or defer.
@@ -4417,100 +4580,149 @@ class LivePlanningJobRegistry:
         action — the record stays non-quarantined, marked deferred, and the
         watchdog re-attempts on a bounded backoff / when retention frees a slot.
         The reservation blocks a concurrent sibling hard-stop from consuming the
-        last slot between the check and the conversion."""
+        last slot between the check and the conversion.
+
+        C-146 P0-4 (RETURN 7de8cf3e): the in-flight marker and the quarantine
+        slot reservation are released on EVERY exit (kill/confirm exception,
+        cancel race, deferred qcap, conversion) via the ``finally`` below, and a
+        death-NOT-confirmed outcome is RE-ARMED for a bounded-backoff retry. An
+        already-quarantined record is re-attempted WITHOUT consuming a new slot —
+        a qcap-full refusal can never permanently strand a record whose death was
+        never confirmed."""
         operation_task = runtime.operation_task
         if operation_task is None or operation_task.done():
             return
-        async with self._changed:
-            if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES or runtime.hard_stopped:
-                return
-            if not self._quarantine_capacity_available_locked():
-                # 门 4 + P0-7: qcap full — REFUSE the stop BEFORE any stop/kill.
-                # No irreversible side effect may precede a capacity rejection.
-                # The record stays running (deadline already passed, so it is
-                # fail-closed on the quota), is marked deferred, and the watchdog
-                # re-attempts once retention frees a slot or the bounded backoff
-                # elapses — never a busy-spin.
-                runtime.hard_stop_in_flight = False
-                runtime.hard_stop_deferred = True
-                runtime.hard_stop_next_attempt_monotonic = (
-                    asyncio.get_running_loop().time() + self._hard_stop_defer_retry_seconds
+        try:
+            async with self._changed:
+                if (
+                    runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES
+                    or runtime.hard_stopped
+                ):
+                    return
+                if not runtime.quarantined:
+                    if not self._quarantine_capacity_available_locked():
+                        # 门 4 + P0-7: qcap full — REFUSE the stop BEFORE any
+                        # stop/kill. No irreversible side effect may precede a
+                        # capacity rejection. The record stays running (deadline
+                        # already passed, so it is fail-closed on the quota), is
+                        # marked deferred, and the watchdog re-attempts once
+                        # retention frees a slot or the bounded backoff elapses —
+                        # never a busy-spin.
+                        runtime.hard_stop_in_flight = False
+                        runtime.hard_stop_deferred = True
+                        runtime.hard_stop_next_attempt_monotonic = (
+                            asyncio.get_running_loop().time()
+                            + self._hard_stop_defer_retry_seconds
+                        )
+                        self._changed.notify_all()
+                        return
+                    runtime.hard_stop_deferred = False
+                    # Atomically reserve the quarantine slot in the SAME lock
+                    # domain as the conversion+persist below, so a capacity
+                    # rejection can never follow an irreversible kill and a
+                    # concurrent sibling can never steal the last slot mid-stop.
+                    runtime.hard_stop_quarantine_reserved = True
+                else:
+                    # C-146 P0-4 (RETURN): an ALREADY-quarantined record is
+                    # re-attempted without consuming a NEW quarantine slot — it
+                    # holds its own. Without this, the qcap-full refusal above
+                    # would reject the retry forever and the record would
+                    # permanently lose its death-confirmation close-out attempt.
+                    runtime.hard_stop_deferred = False
+                # The generation bump isolates every registry-facing write while
+                # the stop attempt is in flight. The final quarantine stage is
+                # assigned below once the stop outcome is known.
+                runtime.generation += 1
+                self._changed.notify_all()
+            # Provably stop the real executor within the bounded confirm budget.
+            worker = runtime.worker_handle
+            if worker is not None:
+                death_confirmed = await worker.kill_and_confirm(
+                    self._hard_stop_confirm_seconds
                 )
-                self._changed.notify_all()
-                return
-            runtime.hard_stop_deferred = False
-            # Atomically reserve the quarantine slot in the SAME lock domain as
-            # the conversion+persist below, so a capacity rejection can never
-            # follow an irreversible kill and a concurrent sibling can never
-            # steal the last slot mid-stop.
-            runtime.hard_stop_quarantine_reserved = True
-            # The generation bump isolates every registry-facing write while the
-            # stop attempt is in flight. The final quarantine stage is assigned
-            # below once the stop outcome is known.
-            runtime.generation += 1
-            self._changed.notify_all()
-        # Provably stop the real executor within the bounded confirm budget.
-        worker = runtime.worker_handle
-        if worker is not None:
-            death_confirmed = await worker.kill_and_confirm(self._hard_stop_confirm_seconds)
-        else:
-            operation_task.cancel()
-            await asyncio.wait((operation_task,), timeout=self._hard_stop_confirm_seconds)
-            death_confirmed = operation_task.done()
-        async with self._changed:
-            if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
-                # A concurrent terminalize won (or the operation finished on its
-                # own); the reserved slot was never consumed. The record is
-                # terminal — clear the in-flight marker so a later re-scan (or a
-                # fresh watchdog) treats it as settled, never as still-being-stopped.
-                runtime.hard_stop_in_flight = False
+            else:
+                operation_task.cancel()
+                await asyncio.wait(
+                    (operation_task,), timeout=self._hard_stop_confirm_seconds
+                )
+                death_confirmed = operation_task.done()
+            async with self._changed:
+                if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                    # A concurrent terminalize won (or the operation finished on
+                    # its own); the reserved slot was never consumed. The record
+                    # is terminal — clear the in-flight marker so a later re-scan
+                    # (or a fresh watchdog) treats it as settled, never as
+                    # still-being-stopped.
+                    runtime.hard_stop_in_flight = False
+                    runtime.hard_stop_quarantine_reserved = False
+                    self._changed.notify_all()
+                    return
+                # The reserved slot is now consumed by the quarantine conversion
+                # (P0-7: it was checked+reserved BEFORE any stop/kill side
+                # effect).
                 runtime.hard_stop_quarantine_reserved = False
+                if death_confirmed:
+                    runtime.hard_stopped = True
+                    runtime.quarantine_stage = _QUARANTINE_HARD_STOPPED_STAGE
+                else:
+                    # In-process orphan that cannot be proven dead: NOT a hard
+                    # stop. C-146 P0-4 (RETURN): re-arm a bounded-backoff retry
+                    # so the record KEEPS its close-out opportunity instead of
+                    # silently losing it forever.
+                    runtime.hard_stopped = False
+                    runtime.quarantine_stage = _QUARANTINE_ORPHAN_STAGE
+                    runtime.hard_stop_deferred = True
+                    runtime.hard_stop_next_attempt_monotonic = (
+                        asyncio.get_running_loop().time()
+                        + self._hard_stop_defer_retry_seconds
+                    )
+                runtime.quarantined = True
+                runtime.snapshot = runtime.snapshot.model_copy(
+                    update={
+                        "cancel_pending": True,
+                        "cancellation_requested": True,
+                        "stage": runtime.quarantine_stage,
+                        "error": (
+                            "live planning operation did not stop within the absolute "
+                            "deadline+grace execution budget; the executor is "
+                            "hard-stopped and quarantined non-terminal"
+                        ),
+                        "updated_at": self._utc_now(),
+                        "revision": runtime.snapshot.revision + 1,
+                    }
+                )
+                for entry in self._idempotency.values():
+                    if entry.job_id == runtime.snapshot.id:
+                        entry.legacy_isolated = True
+                        if entry.updated_at is None:
+                            entry.updated_at = self._utc_now()
+                try:
+                    self._persist_locked()
+                except Exception:
+                    # Best-effort: a permanent write failure keeps the in-memory
+                    # quarantine observable; the reconcile persists it on
+                    # recovery.
+                    pass
+                else:
+                    # The durable quarantine fact is already committed.
+                    runtime.quarantine_reconciled = True
                 self._changed.notify_all()
-                return
-            # The reserved slot is now consumed by the quarantine conversion
-            # (P0-7: it was checked+reserved BEFORE any stop/kill side effect).
+            # Arm the bounded reconcile owner so the quarantine fact is committed
+            # on store recovery (and, when a durable pending outcome exists, the
+            # record settles to it once the executor is provably stopped).
+            self._ensure_cleanup_owner(runtime)
+        finally:
+            # C-146 P0-4 (RETURN 7de8cf3e): the in-flight marker and the
+            # quarantine slot reservation are released on EVERY exit — a
+            # kill/confirm exception or a cancel race must never leak them, or
+            # the watchdog would skip the record forever and it would
+            # permanently lose its close-out attempt. Synchronous (no await) so
+            # a cancellation delivered mid-stop cannot abort the cleanup; the
+            # watchdog only re-scans after this wrapper completes, so the cleared
+            # flags are visible to that re-scan.
+            runtime.hard_stop_in_flight = False
             runtime.hard_stop_quarantine_reserved = False
-            if death_confirmed:
-                runtime.hard_stopped = True
-                runtime.quarantine_stage = _QUARANTINE_HARD_STOPPED_STAGE
-            else:
-                # In-process orphan that cannot be proven dead: NOT a hard stop.
-                runtime.hard_stopped = False
-                runtime.quarantine_stage = _QUARANTINE_ORPHAN_STAGE
-            runtime.quarantined = True
-            runtime.snapshot = runtime.snapshot.model_copy(
-                update={
-                    "cancel_pending": True,
-                    "cancellation_requested": True,
-                    "stage": runtime.quarantine_stage,
-                    "error": (
-                        "live planning operation did not stop within the absolute "
-                        "deadline+grace execution budget; the executor is "
-                        "hard-stopped and quarantined non-terminal"
-                    ),
-                    "updated_at": self._utc_now(),
-                    "revision": runtime.snapshot.revision + 1,
-                }
-            )
-            for entry in self._idempotency.values():
-                if entry.job_id == runtime.snapshot.id:
-                    entry.legacy_isolated = True
-                    if entry.updated_at is None:
-                        entry.updated_at = self._utc_now()
-            try:
-                self._persist_locked()
-            except Exception:
-                # Best-effort: a permanent write failure keeps the in-memory
-                # quarantine observable; the reconcile persists it on recovery.
-                pass
-            else:
-                # The durable quarantine fact is already committed.
-                runtime.quarantine_reconciled = True
-            self._changed.notify_all()
-        # Arm the bounded reconcile owner so the quarantine fact is committed on
-        # store recovery (and, when a durable pending outcome exists, the record
-        # settles to it once the executor is provably stopped).
-        self._ensure_cleanup_owner(runtime)
+            self._wake_hard_stop_watchdog()
 
     async def _cancel_and_drain_operation(self, runtime: _RuntimeJob) -> bool:
         """Stop the real executor and confirm it is dead within the budget.
@@ -5200,6 +5412,15 @@ class LivePlanningJobRegistry:
                     and self._executors_stopped(runtime)
                 ):
                     reclaimed.append(job_id)
+                continue
+            if self._authenticated_orphan_alive(runtime):
+                # C-146 P0-3 (RETURN 7de8cf3e): never prune a record whose
+                # DURABLE worker identity still points at a LIVE orphan process
+                # group that this process has not yet authenticated + killed +
+                # reaped — its executor is not stopped. At cold load this gate
+                # runs BEFORE ``restore_after_restart`` discovers and cleans the
+                # orphan, so a legitimate orphaned executor is never silently
+                # removed/reclaimed over live external side effects.
                 continue
             if (runtime.snapshot.expires_at is not None and runtime.snapshot.expires_at <= now) or (
                 runtime.prepared and runtime.task is None and runtime.snapshot.deadline_at <= now

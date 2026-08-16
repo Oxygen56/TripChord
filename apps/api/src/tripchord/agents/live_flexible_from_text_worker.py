@@ -33,12 +33,21 @@ async def run_live_flexible_from_text(
     request_digest: str,
     tenant_id: str,
     probe_path: str | None = None,
+    runtime_bundle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Delayed import: only an actual worker execution pulls in ``tripchord.main``
     # (and, under TRIPCHORD_LIVE_WORKER_SUBPROCESS=1, no second job registry).
     from tripchord.api import LiveFlexibleFromTextPlanningRequest
     from tripchord.auth import Principal
     from tripchord.main import _execute_live_flexible_from_text, app, live_run_cache
+
+    if runtime_bundle is not None:
+        # C-146 P0-1 (RETURN 7de8cf3e): the API process handed this worker a
+        # runtime bundle so the ready chain runs in THIS process against a REAL
+        # system built from the spec — never a monkeypatched private runtime.
+        from tripchord.agents.live_flexible_worker_runtime import install_runtime_bundle
+
+        install_runtime_bundle(app, runtime_bundle)
 
     request = LiveFlexibleFromTextPlanningRequest.model_validate(payload)
     response = await _execute_live_flexible_from_text(
