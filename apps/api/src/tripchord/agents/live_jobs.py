@@ -38,6 +38,39 @@ TERMINAL_LIVE_PLANNING_JOB_STATES = frozenset(
     }
 )
 
+# C-145 P0 supplement: a DURABLE pending outcome is the terminal intent of a
+# failed-closed cancel/close/deadline cleanup — the caller only ever chooses
+# CANCELLED/cancelled or FAILED/deadline_exceeded. SUCCEEDED (or any
+# non-terminal value) would terminalize a live record to a label the caller
+# never chose, so the loader rejects it fail-closed instead.
+_PENDING_TERMINAL_ALLOWED_STATES = frozenset(
+    {
+        LivePlanningJobState.CANCELLED,
+        LivePlanningJobState.FAILED,
+    }
+)
+
+# The EXACT field set ``to_persisted`` writes for every durable pending
+# outcome. The decoder accepts only this precise set — a missing field or any
+# unknown/extra field is corruption and is rejected fail-closed, never patched.
+_PENDING_TERMINAL_PERSISTED_FIELDS = frozenset(
+    {
+        "state",
+        "stage",
+        "result",
+        "error",
+        "safe_failure_code",
+        "safe_failure_details",
+        "safe_failure_details_digest",
+        "cancellation_requested",
+    }
+)
+
+# C-145 P0 supplement: the explicit stage of a non-terminal record quarantined
+# by an earlier cold start. It must stay quarantined across close()/cancel()/
+# same-key paths and consecutive cold boots — never guessed to CANCELLED/FAILED.
+_ISOLATED_AMBIGUOUS_CANCEL_STAGE = "isolated_ambiguous_cancel"
+
 
 def _aware(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
@@ -158,13 +191,22 @@ class _PendingTerminalOutcome:
     def from_persisted(cls, raw: Any) -> _PendingTerminalOutcome:
         """Strictly decode a durable pending outcome, or raise ``ValueError``.
 
-        A malformed payload (unknown state, non-matching safe-failure fields) is
-        treated as corruption — the loader rejects it fail-closed instead of
-        silently rewriting the record to a guessed cancelled/failed label."""
+        The decoder accepts ONLY the exact field set the producer writes
+        (``to_persisted``), forbids a SUCCEEDED target, and precisely binds the
+        legal state/stage/result/error/safe_failure/cancellation combination:
+        cancel/close → CANCELLED/cancelled with no result/error/safe failure;
+        deadline → FAILED/deadline_exceeded with a complete safe-failure whose
+        digest recomputes consistently from the stored code + details. A
+        malformed payload (unknown state, wrong stage, missing/extra fields,
+        dangling or tampered safe-failure fields, illegal result/error/cancel
+        flag) is treated as corruption — the loader rejects it fail-closed
+        instead of silently rewriting the record to a guessed label."""
         if not isinstance(raw, dict):
             raise ValueError("pending terminal outcome is not an object")
-        state_raw = raw.get("state")
-        stage = raw.get("stage")
+        if set(raw) != _PENDING_TERMINAL_PERSISTED_FIELDS:
+            raise ValueError("pending terminal outcome has an invalid field set")
+        state_raw = raw["state"]
+        stage = raw["stage"]
         if not isinstance(state_raw, str) or not isinstance(stage, str) or not stage:
             raise ValueError("pending terminal outcome is missing its target")
         try:
@@ -172,25 +214,54 @@ class _PendingTerminalOutcome:
         except ValueError as exc:
             raise ValueError("pending terminal outcome has an unknown state") from exc
         # C-145 P0 supplement: a durable pending outcome can only target an
-        # ALLOWED terminal state — RUNNING/QUEUED (or any other non-terminal
-        # value) would terminalize a live record to a label the caller never
-        # chose, so the loader rejects it fail-closed instead.
-        if state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
-            raise ValueError("pending terminal outcome is not a terminal state")
-        result = raw.get("result")
-        if result is not None and not isinstance(result, dict):
-            raise ValueError("pending terminal outcome has an invalid result")
-        error = raw.get("error")
-        if error is not None and not isinstance(error, str):
-            raise ValueError("pending terminal outcome has an invalid error")
-        cancellation_requested = raw.get("cancellation_requested")
-        if cancellation_requested is not None and type(cancellation_requested) is not bool:
+        # ALLOWED terminal state — SUCCEEDED (or any non-terminal value) would
+        # terminalize a live record to a label the caller never chose, so the
+        # loader rejects it fail-closed instead.
+        if state not in _PENDING_TERMINAL_ALLOWED_STATES:
+            raise ValueError("pending terminal outcome has an unforgeable state")
+        # C-145 P0 supplement: the stage is part of the contract. A CANCELLED
+        # intent must carry exactly stage ``cancelled`` and a FAILED intent
+        # exactly ``deadline_exceeded``; any other stage is corruption and is
+        # rejected fail-closed, never patched.
+        expected_stage = (
+            "cancelled" if state is LivePlanningJobState.CANCELLED else "deadline_exceeded"
+        )
+        if stage != expected_stage:
+            raise ValueError("pending terminal outcome has an inconsistent stage")
+        result = raw["result"]
+        if result is not None:
+            # A durable terminal intent never carries a success result — only a
+            # real SUCCEEDED run publishes one, and SUCCEEDED is never a pending
+            # target. Any non-null result here is corruption.
+            raise ValueError("pending terminal outcome has an illegal result")
+        error = raw["error"]
+        if state is LivePlanningJobState.CANCELLED:
+            # cancel/close intents carry no error.
+            if error is not None:
+                raise ValueError("pending terminal outcome has an illegal error")
+        else:
+            # A FAILED/deadline_exceeded intent ALWAYS carries the timeout error.
+            if not isinstance(error, str) or not error:
+                raise ValueError("pending terminal outcome is missing its failure error")
+        cancellation_requested = raw["cancellation_requested"]
+        if cancellation_requested is not True:
             raise ValueError("pending terminal outcome has an invalid cancellation flag")
         safe_failure: _SafeFailureDiagnostic | None = None
-        code_raw = raw.get("safe_failure_code")
-        if code_raw is not None:
-            details_raw = raw.get("safe_failure_details")
-            digest_raw = raw.get("safe_failure_details_digest")
+        code_raw = raw["safe_failure_code"]
+        details_raw = raw["safe_failure_details"]
+        digest_raw = raw["safe_failure_details_digest"]
+        if state is LivePlanningJobState.CANCELLED:
+            # cancel/close intents never carry a safe-failure diagnostic; any
+            # dangling details/digest here is corruption.
+            if code_raw is not None or details_raw is not None or digest_raw is not None:
+                raise ValueError(
+                    "pending terminal outcome has dangling safe failure fields"
+                )
+        else:
+            # A FAILED/deadline_exceeded intent ALWAYS carries a complete,
+            # consistent safe-failure diagnostic — the digest must recompute
+            # from the stored code + details, never be accepted from a
+            # hand-written blob.
             if (
                 not isinstance(code_raw, str)
                 or not isinstance(digest_raw, str)
@@ -205,18 +276,14 @@ class _PendingTerminalOutcome:
                 raise ValueError(
                     "pending terminal outcome has an invalid safe failure"
                 ) from exc
+            if _safe_failure_details_digest(code, details) != digest_raw:
+                raise ValueError(
+                    "pending terminal outcome safe failure digest is inconsistent"
+                )
             safe_failure = _SafeFailureDiagnostic(
                 code=code,
                 details=details,
                 details_digest=digest_raw,
-            )
-        # C-145 P0 supplement: state/stage/safe_failure must be mutually
-        # consistent. A safe-failure diagnostic only ever accompanies a FAILED
-        # outcome — a CANCELLED (or SUCCEEDED) intent carrying a safe failure is
-        # corruption and is rejected fail-closed, never default-patched.
-        if safe_failure is not None and state != LivePlanningJobState.FAILED:
-            raise ValueError(
-                "pending terminal outcome safe failure requires a FAILED state"
             )
         return cls(
             state=state,
@@ -1130,7 +1197,7 @@ class LivePlanningJobRegistry:
                         safe_failure=pending.safe_failure,
                         cancellation_requested=pending.cancellation_requested,
                     )
-                elif runtime.snapshot.stage == "isolated_ambiguous_cancel":
+                elif runtime.snapshot.stage == _ISOLATED_AMBIGUOUS_CANCEL_STAGE:
                     # C-145 P0 supplement: a record quarantined by an earlier
                     # cold start stays quarantined — re-isolating is idempotent,
                     # so two consecutive cold starts never drift it into a
@@ -1174,7 +1241,7 @@ class LivePlanningJobRegistry:
         runtime.snapshot = runtime.snapshot.model_copy(
             update={
                 "cancel_pending": False,
-                "stage": "isolated_ambiguous_cancel",
+                "stage": _ISOLATED_AMBIGUOUS_CANCEL_STAGE,
                 "error": (
                     "cancel was pending at restart without a provable terminal "
                     "outcome; the job is isolated and never replayed"
@@ -1871,6 +1938,13 @@ class LivePlanningJobRegistry:
                 return None
             if runtime.snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
                 return runtime.snapshot
+            if runtime.snapshot.stage == _ISOLATED_AMBIGUOUS_CANCEL_STAGE:
+                # C-145 P0 supplement: an ambiguous-cancel record is quarantined
+                # with no provable terminal outcome — an explicit cancel must NOT
+                # guess CANCELLED. Return the isolated snapshot unchanged
+                # (idempotent, fail-closed) so a later cold start sees the same
+                # isolation and the same-key path keeps failing closed.
+                return runtime.snapshot
             if runtime.snapshot.cancel_pending:
                 pending_future = runtime.cancel_future
                 pending_runtime = runtime
@@ -2070,10 +2144,17 @@ class LivePlanningJobRegistry:
         ``operation_task`` reference is never dropped while the operation lives.
         """
         async with self._changed:
+            # C-145 P0 supplement: an ``isolated_ambiguous_cancel`` record has
+            # NO provable terminal outcome — close() must never guess a
+            # CANCELLED label for it. It is excluded from the active set so the
+            # closing isolation, the durable CANCELLED intent and the executor
+            # settle all leave it untouched; a later cold start still sees the
+            # same quarantine.
             active = tuple(
                 runtime
                 for runtime in self._records.values()
                 if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
+                and runtime.snapshot.stage != _ISOLATED_AMBIGUOUS_CANCEL_STAGE
             )
             if not active:
                 self._closed = True
@@ -2891,7 +2972,12 @@ class LivePlanningJobRegistry:
         pending_result: dict[str, Any] | None = None,
         pending_error: str | None = None,
         pending_safe_failure: _SafeFailureDiagnostic | None = None,
-        pending_cancellation_requested: bool | None = None,
+        # C-145 P0 supplement: every durable pending outcome is a cancel/close
+        # (or deadline) intent, so its cancellation flag is ALWAYS true — the
+        # strict decoder requires exactly ``True``. A None default would let a
+        # cancel/close stuck isolation persist a pending outcome the decoder
+        # would reject on a later cold start.
+        pending_cancellation_requested: bool | None = True,
     ) -> None:
         """P0-1 fail-closed outcome when the operation did not stop within the
         bounded cancellation budget.

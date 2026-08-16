@@ -23,7 +23,10 @@ from tripchord.agents.live_jobs import (
     LivePlanningJobState,
     LivePlanningPairCheckpoint,
     LivePlanningPairCheckpointState,
+    LivePlanningSafeFailureCode,
+    LivePlanningSafeFailureDetails,
     LiveSourceTerminalEvent,
+    _safe_failure_details_digest,
 )
 
 REQUEST_SHA256 = "a" * 64
@@ -5902,3 +5905,410 @@ async def test_cleanup_backoff_round_1025_no_overflow_owner_survives_saturates(
         await _settle_cleanup_owner(runtime)
         await _settle_reaper(registry)
         await registry.close()
+
+
+# C-146 P0 supplement counterexamples — RETURN a6f3e884 on 7a403f1 / green after the fix
+# ---------------------------------------------------------------------------------------
+
+
+def _pending_outcome(**overrides: Any) -> dict[str, Any]:
+    """The EXACT producer field set for a CANCELLED/cancelled durable intent."""
+    base: dict[str, Any] = {
+        "state": "cancelled",
+        "stage": "cancelled",
+        "result": None,
+        "error": None,
+        "safe_failure_code": None,
+        "safe_failure_details": None,
+        "safe_failure_details_digest": None,
+        "cancellation_requested": True,
+    }
+    base.update(overrides)
+    return base
+
+
+def _failed_outcome(**overrides: Any) -> dict[str, Any]:
+    """The EXACT producer field set for a FAILED/deadline_exceeded durable intent
+    with a complete, digest-consistent safe-failure diagnostic."""
+    details = LivePlanningSafeFailureDetails(exception_class="TimeoutError")
+    base: dict[str, Any] = {
+        "state": "failed",
+        "stage": "deadline_exceeded",
+        "result": None,
+        "error": "TimeoutError: live planning job deadline exceeded",
+        "safe_failure_code": LivePlanningSafeFailureCode.DEADLINE_EXCEEDED.value,
+        "safe_failure_details": details.model_dump(mode="json"),
+        "safe_failure_details_digest": _safe_failure_details_digest(
+            LivePlanningSafeFailureCode.DEADLINE_EXCEEDED, details
+        ),
+        "cancellation_requested": True,
+    }
+    base.update(overrides)
+    return base
+
+
+def _write_pending_outcome_state(
+    state_path: Path,
+    job_id: str,
+    tenant_id: str,
+    idempotency_key: str,
+    *,
+    pending: dict[str, Any] | None,
+) -> None:
+    """Write a v3 state file for one RUNNING/cancelling/cancel_pending record with
+    the given durable pending outcome (None = the old-v3 ambiguous shape)."""
+    snap = _v3_snapshot(
+        job_id,
+        LivePlanningJobState.RUNNING,
+        "cancelling",
+        5,
+        2,
+        cancellation_requested=True,
+        cancel_pending=True,
+    )
+    payload = {
+        "schema_version": "tripchord-live-job-registry-v3",
+        "records": [
+            {
+                "tenant_partition": LivePlanningJobRegistry._tenant_partition(tenant_id),
+                "snapshot": snap.model_dump(mode="json"),
+                "prepared": False,
+                "activation_operation": None,
+                "pending_terminal": pending,
+            }
+        ],
+        "idempotency": [_v3_idempotency_entry(tenant_id, idempotency_key, job_id)],
+    }
+    _write_registry_state(payload, state_path)
+
+
+@pytest.mark.asyncio
+async def test_pending_terminal_foreign_success_rejected(tmp_path: Path) -> None:
+    """C-146 P0 counterexample (C-125 RETURN P0-1): a durable pending outcome
+    targeting SUCCEEDED would terminalize a live record to a success label the
+    caller never chose. RED on HEAD: the loader accepted ``succeeded/complete``
+    and cold-started the record to SUCCEEDED/complete. Fixed: rejected fail-closed."""
+    state_path = tmp_path / "live-jobs.json"
+    _write_pending_outcome_state(
+        state_path,
+        "live-job-pending-succeeded",
+        "tenant-a",
+        "pending-succeeded",
+        pending=_pending_outcome(state="succeeded", stage="complete"),
+    )
+    with pytest.raises(RuntimeError, match="pending terminal is invalid"):
+        LivePlanningJobRegistry(state_path=state_path, capacity=4)
+
+
+@pytest.mark.asyncio
+async def test_pending_terminal_wrong_state_stage_rejected(tmp_path: Path) -> None:
+    """C-146 P0 counterexample: the stage is part of the contract — CANCELLED must
+    carry exactly ``cancelled`` and FAILED exactly ``deadline_exceeded``.
+    ``cancelled/complete`` and ``failed/cancelled`` (with a complete safe-failure)
+    are corruption. RED on HEAD: both accepted. Fixed: rejected fail-closed."""
+    cancelled_path = tmp_path / "cancelled-complete.json"
+    _write_pending_outcome_state(
+        cancelled_path,
+        "live-job-cancelled-complete",
+        "tenant-a",
+        "cancelled-complete",
+        pending=_pending_outcome(stage="complete"),
+    )
+    with pytest.raises(RuntimeError, match="pending terminal is invalid"):
+        LivePlanningJobRegistry(state_path=cancelled_path, capacity=4)
+
+    failed_path = tmp_path / "failed-cancelled.json"
+    _write_pending_outcome_state(
+        failed_path,
+        "live-job-failed-cancelled",
+        "tenant-b",
+        "failed-cancelled",
+        pending=_failed_outcome(stage="cancelled"),
+    )
+    with pytest.raises(RuntimeError, match="pending terminal is invalid"):
+        LivePlanningJobRegistry(state_path=failed_path, capacity=4)
+
+
+@pytest.mark.asyncio
+async def test_pending_terminal_extra_field_rejected(tmp_path: Path) -> None:
+    """C-146 P0 counterexample: a legal cancel shape carrying an unknown extra
+    field must be rejected — the decoder accepts ONLY the producer's exact field
+    set. RED on HEAD: unknown fields were ignored. Fixed: rejected fail-closed."""
+    state_path = tmp_path / "live-jobs.json"
+    pending = _pending_outcome()
+    pending["bogus_extra_field"] = True
+    _write_pending_outcome_state(
+        state_path,
+        "live-job-extra-field",
+        "tenant-a",
+        "extra-field",
+        pending=pending,
+    )
+    with pytest.raises(RuntimeError, match="pending terminal is invalid"):
+        LivePlanningJobRegistry(state_path=state_path, capacity=4)
+
+
+@pytest.mark.asyncio
+async def test_pending_terminal_missing_field_rejected(tmp_path: Path) -> None:
+    """C-146 P0 counterexample: a legal cancel shape missing one producer field
+    must be rejected — nothing is silently default-patched. RED on HEAD: missing
+    fields fell back to None. Fixed: rejected fail-closed."""
+    state_path = tmp_path / "live-jobs.json"
+    pending = _pending_outcome()
+    del pending["safe_failure_code"]
+    _write_pending_outcome_state(
+        state_path,
+        "live-job-missing-field",
+        "tenant-a",
+        "missing-field",
+        pending=pending,
+    )
+    with pytest.raises(RuntimeError, match="pending terminal is invalid"):
+        LivePlanningJobRegistry(state_path=state_path, capacity=4)
+
+
+@pytest.mark.asyncio
+async def test_pending_terminal_deadline_without_safe_failure_rejected(
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 counterexample: FAILED/deadline_exceeded must ALWAYS carry a
+    complete safe-failure diagnostic. RED on HEAD: the missing-safe-failure shape
+    was accepted and cold-started to FAILED. Fixed: rejected fail-closed."""
+    state_path = tmp_path / "live-jobs.json"
+    _write_pending_outcome_state(
+        state_path,
+        "live-job-deadline-no-safe-failure",
+        "tenant-a",
+        "deadline-no-safe-failure",
+        pending=_pending_outcome(
+            state="failed",
+            stage="deadline_exceeded",
+            error="TimeoutError: live planning job deadline exceeded",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="pending terminal is invalid"):
+        LivePlanningJobRegistry(state_path=state_path, capacity=4)
+
+
+@pytest.mark.asyncio
+async def test_pending_terminal_dangling_safe_failure_rejected(tmp_path: Path) -> None:
+    """C-146 P0 counterexample: a CANCELLED intent carrying safe-failure fields is
+    corruption — dangling details/digest must never be silently dropped. RED on
+    HEAD: the dangling shape was accepted. Fixed: rejected fail-closed."""
+    state_path = tmp_path / "live-jobs.json"
+    _write_pending_outcome_state(
+        state_path,
+        "live-job-dangling-safe-failure",
+        "tenant-a",
+        "dangling-safe-failure",
+        pending=_pending_outcome(safe_failure_code="deadline_exceeded"),
+    )
+    with pytest.raises(RuntimeError, match="pending terminal is invalid"):
+        LivePlanningJobRegistry(state_path=state_path, capacity=4)
+
+
+@pytest.mark.asyncio
+async def test_pending_terminal_cancellation_flag_not_true_rejected(
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 counterexample: every durable pending outcome is a
+    cancel/close/deadline intent, so its cancellation flag must be exactly True.
+    RED on HEAD: a False/None flag was accepted. Fixed: rejected fail-closed."""
+    for flag in (False, None):
+        state_path = tmp_path / f"live-jobs-{flag}.json"
+        _write_pending_outcome_state(
+            state_path,
+            f"live-job-cancel-flag-{flag}",
+            "tenant-a",
+            f"cancel-flag-{flag}",
+            pending=_pending_outcome(cancellation_requested=flag),
+        )
+        with pytest.raises(RuntimeError, match="pending terminal is invalid"):
+            LivePlanningJobRegistry(state_path=state_path, capacity=4)
+
+
+@pytest.mark.asyncio
+async def test_pending_terminal_safe_failure_digest_mismatch_rejected(
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 counterexample: a FAILED intent's safe-failure digest must
+    recompute from the stored code + details — a hand-written/tampered digest is
+    corruption. RED on HEAD: any 64-hex digest was accepted. Fixed: rejected."""
+    state_path = tmp_path / "live-jobs.json"
+    _write_pending_outcome_state(
+        state_path,
+        "live-job-bad-digest",
+        "tenant-a",
+        "bad-digest",
+        pending=_failed_outcome(safe_failure_details_digest="f" * 64),
+    )
+    with pytest.raises(RuntimeError, match="pending terminal is invalid"):
+        LivePlanningJobRegistry(state_path=state_path, capacity=4)
+
+
+@pytest.mark.asyncio
+async def test_pending_terminal_valid_shapes_load_and_terminalize(
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 control: the EXACT producer shapes for a cancel intent and a
+    deadline intent still load and cold-start to the intended terminal state —
+    the strict decoder rejects only foreign/tampered shapes, never its own
+    output."""
+    cancelled_path = tmp_path / "valid-cancelled.json"
+    _write_pending_outcome_state(
+        cancelled_path,
+        "live-job-valid-cancelled",
+        "tenant-a",
+        "valid-cancelled",
+        pending=_pending_outcome(),
+    )
+    first = LivePlanningJobRegistry(state_path=cancelled_path, capacity=4)
+    try:
+        snap = await first.get("live-job-valid-cancelled", "tenant-a")
+        assert snap is not None and snap.state == LivePlanningJobState.CANCELLED
+        assert snap.stage == "cancelled"
+        assert snap.cancellation_requested is True
+    finally:
+        await first.close()
+
+    failed_path = tmp_path / "valid-failed.json"
+    _write_pending_outcome_state(
+        failed_path,
+        "live-job-valid-failed",
+        "tenant-b",
+        "valid-failed",
+        pending=_failed_outcome(),
+    )
+    second = LivePlanningJobRegistry(state_path=failed_path, capacity=4)
+    try:
+        snap = await second.get("live-job-valid-failed", "tenant-b")
+        assert snap is not None and snap.state == LivePlanningJobState.FAILED
+        assert snap.stage == "deadline_exceeded"
+        assert snap.safe_failure_code == LivePlanningSafeFailureCode.DEADLINE_EXCEEDED
+    finally:
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_isolated_ambiguous_cancel_survives_close_and_second_cold_boot(
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 counterexample (C-125 RETURN P0-2): after a cold start isolates an
+    ambiguous cancel-pending record, close() must NOT guess CANCELLED. RED on
+    HEAD: close() included the quarantined record in its active set, wrote a
+    durable CANCELLED intent, and the SECOND cold boot drifted it to CANCELLED.
+    Fixed: close() leaves it quarantined and the second cold boot still sees the
+    same isolation with a fail-closed same-key path."""
+    state_path = tmp_path / "live-jobs.json"
+    tenant_id = "tenant-a"
+    job_id = "live-job-close-keeps-isolated"
+    _write_pending_outcome_state(
+        state_path,
+        job_id,
+        tenant_id,
+        "close-keeps-isolated",
+        pending=None,
+    )
+
+    first = LivePlanningJobRegistry(state_path=state_path, capacity=4)
+    try:
+        snapshot = await first.get(job_id, tenant_id)
+        assert snapshot is not None
+        assert snapshot.state == LivePlanningJobState.RUNNING
+        assert snapshot.stage == "isolated_ambiguous_cancel"
+        assert snapshot.cancel_pending is False
+        # close() must not touch the quarantined record.
+        await first.close()
+    finally:
+        await first.close()
+
+    disk = json.loads(state_path.read_text(encoding="utf-8"))
+    record = next(item for item in disk["records"] if item["snapshot"]["id"] == job_id)
+    # The on-disk record is STILL quarantined — never rewritten to a guessed label.
+    assert record["snapshot"]["state"] == "running"
+    assert record["snapshot"]["stage"] == "isolated_ambiguous_cancel"
+    assert record["snapshot"]["cancel_pending"] is False
+    assert record["pending_terminal"] is None
+
+    second = LivePlanningJobRegistry(state_path=state_path, capacity=4)
+    try:
+        snapshot = await second.get(job_id, tenant_id)
+        assert snapshot is not None
+        assert snapshot.state == LivePlanningJobState.RUNNING
+        assert snapshot.stage == "isolated_ambiguous_cancel"
+
+        async def operation(_: Any) -> dict[str, Any]:
+            return {"ok": True}
+
+        with pytest.raises(LivePlanningJobIdempotencyConflictError):
+            await second.start_idempotent(
+                tenant_id=tenant_id,
+                operation=operation,
+                idempotency_key="close-keeps-isolated",
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+            )
+    finally:
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_isolated_ambiguous_cancel_survives_explicit_cancel_and_cold_boot(
+    tmp_path: Path,
+) -> None:
+    """C-146 P0 counterexample (P0-2): an explicit cancel() on a quarantined
+    ambiguous-cancel record must NOT guess CANCELLED — it returns the isolated
+    snapshot unchanged (idempotent, fail-closed) and a later cold boot still sees
+    the same isolation. RED on HEAD: cancel() wrote a durable CANCELLED intent and
+    drifted the record."""
+    state_path = tmp_path / "live-jobs.json"
+    tenant_id = "tenant-a"
+    job_id = "live-job-cancel-keeps-isolated"
+    _write_pending_outcome_state(
+        state_path,
+        job_id,
+        tenant_id,
+        "cancel-keeps-isolated",
+        pending=None,
+    )
+
+    first = LivePlanningJobRegistry(state_path=state_path, capacity=4)
+    try:
+        snapshot = await first.get(job_id, tenant_id)
+        assert snapshot is not None
+        assert snapshot.stage == "isolated_ambiguous_cancel"
+        outcome = await first.cancel(job_id, tenant_id)
+        assert outcome is not None
+        assert outcome.state == LivePlanningJobState.RUNNING
+        assert outcome.stage == "isolated_ambiguous_cancel"
+        assert outcome.cancel_pending is False
+    finally:
+        await first.close()
+
+    disk = json.loads(state_path.read_text(encoding="utf-8"))
+    record = next(item for item in disk["records"] if item["snapshot"]["id"] == job_id)
+    assert record["snapshot"]["state"] == "running"
+    assert record["snapshot"]["stage"] == "isolated_ambiguous_cancel"
+    assert record["snapshot"]["cancel_pending"] is False
+    assert record["pending_terminal"] is None
+
+    second = LivePlanningJobRegistry(state_path=state_path, capacity=4)
+    try:
+        snapshot = await second.get(job_id, tenant_id)
+        assert snapshot is not None
+        assert snapshot.state == LivePlanningJobState.RUNNING
+        assert snapshot.stage == "isolated_ambiguous_cancel"
+
+        async def operation(_: Any) -> dict[str, Any]:
+            return {"ok": True}
+
+        with pytest.raises(LivePlanningJobIdempotencyConflictError):
+            await second.start_idempotent(
+                tenant_id=tenant_id,
+                operation=operation,
+                idempotency_key="cancel-keeps-isolated",
+                request_digest=REQUEST_SHA256,
+                defer_start=False,
+            )
+    finally:
+        await second.close()
