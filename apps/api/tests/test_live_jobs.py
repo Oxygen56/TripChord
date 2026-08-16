@@ -2515,9 +2515,15 @@ async def test_v2_to_v3_migration_derives_execution_mode_and_survives_consecutiv
         assert entries[job_c]["defer_start"] is False  # placeholder, gated by isolation
         assert entries[job_c]["legacy_isolated"] is True
 
+        # C-146 P0-3: an admitted RUNNING record with no cancel intent and a
+        # deadline that did NOT pass gives no provable terminal outcome — it is
+        # quarantined as isolated_ambiguous_cancel, never guessed to
+        # restart_cancelled. A QUEUED (never-admitted) record is provably
+        # never-executing, so it keeps the honest restart_cancelled tombstone.
         cold_a = await registry.get(job_a, "tenant-a")
-        assert cold_a is not None and cold_a.state == LivePlanningJobState.CANCELLED
-        assert cold_a.stage == "restart_cancelled"
+        assert cold_a is not None and cold_a.state == LivePlanningJobState.RUNNING
+        assert cold_a.stage == "isolated_ambiguous_cancel"
+        assert cold_a.cancel_pending is False
         cold_b = await registry.get(job_b, "tenant-a")
         assert cold_b is not None and cold_b.state == LivePlanningJobState.CANCELLED
         assert cold_b.stage == "restart_cancelled"
@@ -3177,12 +3183,16 @@ async def test_deadline_timeout_isolation_permanent_persist_failure_keeps_owner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """C-143 P0: when the timeout/cancel-pending isolation can NEVER be persisted
-    (every bounded attempt fails pre-commit), the runner must not restore the
-    pre-timeout RUNNING snapshot and exit over a live operation. The record keeps
-    the in-memory timeout/cancel-pending isolation as the observable owner, the
-    operation is drained, a same-key retry fails closed, and once the operation
-    stops a close() settles the record — healing the disk."""
+    """C-146 P0-3: the FIRST durable deadline intent is the HARD PRECONDITION
+    for stopping the executor. When every bounded pre-commit attempt fails, the
+    runner must NOT restore the pre-timeout RUNNING snapshot and must NOT
+    cancel/drain the live operation: the unique owner, the real operation and the
+    capacity lease stay untouched, and the record enters the explicit
+    ``deadline_intent_persist_pending`` retry state with the FAILED/deadline_exceeded
+    intent held IN MEMORY. The same bounded cleanup owner auto-continues the
+    persistence; once the intent commits, THEN the operation is stopped and drained
+    and the record settles to the terminal FAILED/deadline_exceeded — never a
+    guessed CANCELLED. A same-key retry fails closed in the uncommitted window."""
 
     state_path = tmp_path / "live-jobs.json"
     stop = asyncio.Event()
@@ -3236,17 +3246,21 @@ async def test_deadline_timeout_isolation_permanent_persist_failure_keeps_owner(
         await asyncio.sleep(0.8)
         monkeypatch.undo()
 
-        # The runner exited (its task is done) but the operation is NOT
-        # abandoned: the record keeps the timeout/cancel-pending isolation in
-        # memory, never the plain pre-timeout RUNNING snapshot.
+        # C-146 P0-3: the runner exited (its task is done) but the operation is
+        # NOT drained and the capacity lease is still held — the record keeps the
+        # in-memory isolation and the FAILED/deadline_exceeded intent in the
+        # explicit deadline_intent_persist_pending retry state, never the plain
+        # pre-timeout RUNNING snapshot.
         assert runtime.task is not None and runtime.task.done()
-        assert swallowed.is_set()
+        assert not swallowed.is_set()
+        assert runtime.intent_persist_pending is True
         assert runtime.snapshot.cancel_pending is True
         assert runtime.snapshot.cancellation_requested is True
-        assert runtime.snapshot.stage == "timeout_pending"
+        assert runtime.snapshot.stage == "deadline_intent_persist_pending"
         assert runtime.operation_task is not None and not runtime.operation_task.done()
+        assert runtime.slot_held is True
 
-        # Same-key retry fails closed while the operation is alive.
+        # Same-key retry fails closed while the FIRST intent is uncommitted.
         with pytest.raises(LivePlanningJobCancellationPendingError):
             await registry.start_idempotent(
                 tenant_id="tenant-a",
@@ -3255,6 +3269,26 @@ async def test_deadline_timeout_isolation_permanent_persist_failure_keeps_owner(
                 request_digest=REQUEST_SHA256,
                 defer_start=False,
             )
+
+        # Persist recovers: the same bounded cleanup owner re-commits the FIRST
+        # FAILED intent, THEN stops and drains the operation (swallowed fires),
+        # and keeps the durable intent for the terminal settle.
+        for _ in range(200):
+            if (
+                runtime.intent_persist_pending is False
+                and swallowed.is_set()
+                and runtime.snapshot.stage == "timeout_pending"
+                and not runtime.operation_task.done()
+            ):
+                break
+            await asyncio.sleep(0.05)
+        assert runtime.intent_persist_pending is False
+        assert swallowed.is_set()
+        assert runtime.snapshot.cancel_pending is True
+        assert runtime.snapshot.stage == "timeout_pending"
+        pending = runtime.pending_terminal
+        assert pending is not None and pending.state == LivePlanningJobState.FAILED
+        assert pending.stage == "deadline_exceeded"
 
         # Once the operation truly stops, close() settles the record and heals
         # the disk to the terminal FAILED/deadline_exceeded — the deadline's
@@ -3282,6 +3316,308 @@ async def test_deadline_timeout_isolation_permanent_persist_failure_keeps_owner(
         assert cold.stage == "deadline_exceeded"
         await reloaded.close()
         await registry.close()
+    finally:
+        await _settle_leaked_runtime(stop, runtime)
+
+
+@pytest.mark.asyncio
+async def test_deadline_first_intent_fail_holds_capacity_blocks_new_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-146 P0-3 counter-example: with the FIRST FAILED/deadline_exceeded intent
+    uncommittable (every bounded pre-commit attempt fails), the unique owner, the
+    real operation and the capacity lease all stay in place — the operation is
+    NEVER cancelled/drained, the admission slot is NEVER released, and a NEW key
+    request cannot start over the held capacity. RED on HEAD: the deadline handler
+    drained the operation, so a new key could start over the still-live executor."""
+    state_path = tmp_path / "live-jobs.json"
+    stop = asyncio.Event()
+    side_effects = 0
+
+    async def stubborn(_: Any) -> dict[str, Any]:
+        nonlocal side_effects
+        while not stop.is_set():
+            try:
+                side_effects += 1
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                pass
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        max_running=1,
+        capacity=4,
+        cancel_wait_seconds=0.05,
+    )
+    runtime: Any = None
+    try:
+        first, replayed = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn,
+            idempotency_key="deadline-capacity-hold",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=0.4,
+        )
+        assert replayed is False
+        runtime = registry._records[first.id]
+        await _wait_for_state(registry, first.id, "tenant-a", LivePlanningJobState.RUNNING)
+
+        real_persist = registry._persist_locked
+
+        def fail_timeout_isolation() -> None:
+            loop = asyncio.get_running_loop()
+            if (
+                runtime.operation_task is not None
+                and not runtime.operation_task.done()
+                and loop.time() >= runtime.deadline_monotonic
+            ):
+                raise RuntimeError("injected permanent timeout isolation persist failure")
+            real_persist()
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_timeout_isolation)
+        await asyncio.sleep(0.8)
+        monkeypatch.undo()
+
+        # The first job is in the intent-persist-pending retry state; the
+        # operation is NOT drained and the admission slot is still held.
+        assert runtime.task is not None and runtime.task.done()
+        assert runtime.intent_persist_pending is True
+        assert runtime.slot_held is True
+        effects_while_holding = side_effects
+
+        # A NEW key request must NOT start over the held capacity lease: the
+        # second job stays QUEUED (never RUNNING) while the first holds the slot,
+        # and the first operation is provably still alive (side effects advance).
+        second, replayed_second = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=stubborn,
+            idempotency_key="deadline-capacity-new-key",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=10,
+        )
+        assert replayed_second is False
+        await asyncio.sleep(0.1)
+        second_snapshot = await registry.get(second.id, "tenant-a")
+        assert second_snapshot is not None
+        assert second_snapshot.state == LivePlanningJobState.QUEUED
+        assert side_effects > effects_while_holding
+
+        # Cleanup: stop the first operation so the shared owner re-commits the
+        # intent, drains and terminalizes FAILED; the second job then acquires
+        # the released slot and succeeds.
+        stop.set()
+        for _ in range(300):
+            first_final = await registry.get(first.id, "tenant-a")
+            if first_final is not None and first_final.state == LivePlanningJobState.FAILED:
+                break
+            await asyncio.sleep(0.05)
+        first_final = await registry.get(first.id, "tenant-a")
+        assert first_final is not None and first_final.state == LivePlanningJobState.FAILED
+        assert first_final.stage == "deadline_exceeded"
+        await _wait_for_state(registry, second.id, "tenant-a", LivePlanningJobState.SUCCEEDED)
+        await registry.close()
+    finally:
+        await _settle_leaked_runtime(stop, runtime)
+
+
+@pytest.mark.asyncio
+async def test_cold_boot_deadline_provenance_recovers_failed_never_restart_cancelled(
+    tmp_path: Path,
+) -> None:
+    """C-146 P0-3 counter-example: a force-exit in the deadline-intent window
+    (the FIRST FAILED intent never committed) cold-boots from the durable
+    unforgeable deadline provenance ONLY — an admitted record whose deadline
+    provably passed recovers FAILED/deadline_exceeded with a consistent safe
+    failure; an admitted record whose deadline did NOT pass gives no provable
+    terminal outcome and is quarantined as ambiguous; a QUEUED (never-admitted)
+    record keeps the honest restart_cancelled tombstone. restart_cancelled is
+    NEVER fabricated for an admitted record, and two consecutive cold boots
+    observe identical facts."""
+    state_path = tmp_path / "live-jobs.json"
+    tenant_id = "tenant-a"
+    job_expired = "live-job-deadline-expired"
+    job_future = "live-job-deadline-future"
+    job_queued = "live-job-queued-never-admitted"
+
+    snap_expired = _v3_snapshot(
+        job_expired, LivePlanningJobState.RUNNING, "interpreting_requirement", 5, 1
+    ).model_copy(update={"deadline_at": datetime.now(UTC) - timedelta(minutes=1)})
+    snap_future = _v3_snapshot(
+        job_future, LivePlanningJobState.RUNNING, "interpreting_requirement", 5, 1
+    )
+    snap_queued = _v3_snapshot(
+        job_queued, LivePlanningJobState.QUEUED, "queued", 0, 1
+    )
+
+    partition = LivePlanningJobRegistry._tenant_partition(tenant_id)
+    payload = {
+        "schema_version": "tripchord-live-job-registry-v3",
+        "records": [
+            {
+                "tenant_partition": partition,
+                "snapshot": snap_expired.model_dump(mode="json"),
+                "prepared": False,
+                "activation_operation": None,
+            },
+            {
+                "tenant_partition": partition,
+                "snapshot": snap_future.model_dump(mode="json"),
+                "prepared": False,
+                "activation_operation": None,
+            },
+            {
+                "tenant_partition": partition,
+                "snapshot": snap_queued.model_dump(mode="json"),
+                "prepared": False,
+                "activation_operation": None,
+            },
+        ],
+        "idempotency": [
+            _v3_idempotency_entry(tenant_id, "deadline-expired", job_expired),
+            _v3_idempotency_entry(tenant_id, "deadline-future", job_future),
+            _v3_idempotency_entry(tenant_id, "deadline-queued", job_queued),
+        ],
+    }
+    _write_registry_state(payload, state_path)
+
+    async def verify(registry: LivePlanningJobRegistry) -> None:
+        expired = await registry.get(job_expired, tenant_id)
+        assert expired is not None and expired.state == LivePlanningJobState.FAILED
+        assert expired.stage == "deadline_exceeded"
+        assert expired.error == "TimeoutError: live planning job deadline exceeded"
+        assert expired.safe_failure_code == "deadline_exceeded"
+        assert expired.safe_failure_details is not None
+        assert expired.safe_failure_details.exception_class == "TimeoutError"
+        assert expired.safe_failure_details_digest is not None
+        future = await registry.get(job_future, tenant_id)
+        assert future is not None
+        assert future.state == LivePlanningJobState.RUNNING
+        assert future.stage == "isolated_ambiguous_cancel"
+        queued = await registry.get(job_queued, tenant_id)
+        assert queued is not None and queued.state == LivePlanningJobState.CANCELLED
+        assert queued.stage == "restart_cancelled"
+
+    first = LivePlanningJobRegistry(state_path=state_path)
+    try:
+        await verify(first)
+    finally:
+        await first.close()
+
+    # A second consecutive cold boot observes the SAME facts — no drift.
+    second = LivePlanningJobRegistry(state_path=state_path)
+    try:
+        await verify(second)
+    finally:
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_deadline_intent_pending_cancel_and_close_never_bypass_ordering(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """C-146 P0-3 counter-example: while the FIRST FAILED intent is uncommitted
+    (deadline_intent_persist_pending), an explicit cancel() returns the observable
+    retry-state snapshot unchanged — it neither drains the executor nor guesses
+    CANCELLED — and a close() joins the ordering by committing/preserving the
+    FAILED intent (first intent wins) instead of overwriting it with CANCELLED.
+    Once the operation truly stops, the record settles to FAILED/deadline_exceeded,
+    never CANCELLED, and the cold start reads the same durable facts."""
+    state_path = tmp_path / "live-jobs.json"
+    stop = asyncio.Event()
+    swallowed = asyncio.Event()
+
+    async def operation(_: Any) -> dict[str, Any]:
+        while not stop.is_set():
+            try:
+                await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                swallowed.set()
+        return {"ok": True}
+
+    registry = LivePlanningJobRegistry(
+        state_path=state_path,
+        cancel_wait_seconds=0.05,
+    )
+    runtime: Any = None
+    try:
+        snapshot, _ = await registry.start_idempotent(
+            tenant_id="tenant-a",
+            operation=operation,
+            idempotency_key="deadline-intent-pending-joins",
+            request_digest=REQUEST_SHA256,
+            defer_start=False,
+            deadline_seconds=0.4,
+        )
+        runtime = registry._records[snapshot.id]
+        await _wait_for_state(registry, snapshot.id, "tenant-a", LivePlanningJobState.RUNNING)
+
+        real_persist = registry._persist_locked
+
+        def fail_timeout_isolation() -> None:
+            loop = asyncio.get_running_loop()
+            if (
+                runtime.operation_task is not None
+                and not runtime.operation_task.done()
+                and loop.time() >= runtime.deadline_monotonic
+            ):
+                raise RuntimeError("injected permanent timeout isolation persist failure")
+            real_persist()
+
+        monkeypatch.setattr(registry, "_persist_locked", fail_timeout_isolation)
+        await asyncio.sleep(0.8)
+
+        assert runtime.intent_persist_pending is True
+        assert not swallowed.is_set()
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
+
+        # An explicit cancel during the uncommitted window joins nothing and
+        # guesses nothing: it returns the observable retry-state snapshot. The
+        # persist is still failing, so the intent stays uncommitted.
+        cancelled = await registry.cancel(snapshot.id, "tenant-a")
+        assert cancelled is not None
+        assert cancelled.stage == "deadline_intent_persist_pending"
+        assert runtime.intent_persist_pending is True
+        assert not swallowed.is_set()
+        assert runtime.operation_task is not None and not runtime.operation_task.done()
+
+        # The write failure is only temporary: from here on the shared owner
+        # re-commits the FIRST intent, then stops and drains the executor.
+        monkeypatch.undo()
+
+        # Stop the operation for real, then close(): close() joins the ordering
+        # (committing the FAILED intent, first intent wins) and the record
+        # settles to FAILED/deadline_exceeded, never a guessed CANCELLED.
+        stop.set()
+        for _ in range(200):
+            if runtime.operation_task is not None and runtime.operation_task.done():
+                break
+            await asyncio.sleep(0.05)
+        assert runtime.operation_task is not None and runtime.operation_task.done()
+        await registry.close()
+        final = await registry.get(snapshot.id, "tenant-a")
+        assert final is not None and final.state == LivePlanningJobState.FAILED
+        assert final.stage == "deadline_exceeded"
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        disk_record = next(
+            record for record in disk["records"] if record["snapshot"]["id"] == snapshot.id
+        )
+        assert disk_record["snapshot"]["state"] == "failed"
+        assert disk_record["snapshot"]["stage"] == "deadline_exceeded"
+        assert disk_record["snapshot"]["safe_failure_code"] == "deadline_exceeded"
+
+        # A full cold start reads the same durable FAILED facts.
+        reloaded = LivePlanningJobRegistry(state_path=state_path)
+        try:
+            cold = await reloaded.get(snapshot.id, "tenant-a")
+            assert cold is not None and cold.state == LivePlanningJobState.FAILED
+            assert cold.stage == "deadline_exceeded"
+        finally:
+            await reloaded.close()
     finally:
         await _settle_leaked_runtime(stop, runtime)
 
@@ -5336,9 +5672,15 @@ async def test_old_v3_schema_without_pending_terminal_loads_rewrites_new_v3(
             # Every record was rewritten to the NEW-v3 shape.
             assert "pending_terminal" in records[job]
 
-        # The plain non-terminal record was restart_cancelled.
-        assert records[job_running]["snapshot"]["state"] == "cancelled"
-        assert records[job_running]["snapshot"]["stage"] == "restart_cancelled"
+        # C-146 P0-3: the plain admitted RUNNING record (no cancel intent, deadline
+        # not passed) has no provable terminal outcome — it is isolated as
+        # ambiguous, NEVER guessed to restart_cancelled. The terminal record stays
+        # terminal. The ambiguous cancel-pending record (no provable outcome) is
+        # isolated as well.
+        assert records[job_running]["snapshot"]["state"] == "running"
+        assert records[job_running]["snapshot"]["stage"] == "isolated_ambiguous_cancel"
+        assert records[job_running]["snapshot"]["cancel_pending"] is False
+        assert records[job_running]["pending_terminal"] is None
         # The terminal record stays terminal.
         assert records[job_terminal]["snapshot"]["state"] == "cancelled"
         # The ambiguous cancel-pending record (no provable outcome) was isolated,
@@ -5357,7 +5699,9 @@ async def test_old_v3_schema_without_pending_terminal_loads_rewrites_new_v3(
         cold = LivePlanningJobRegistry(state_path=state_path, capacity=4, max_running=2)
         try:
             running = await cold.get(job_running, tenant_id)
-            assert running is not None and running.state == LivePlanningJobState.CANCELLED
+            assert running is not None
+            assert running.state == LivePlanningJobState.RUNNING
+            assert running.stage == "isolated_ambiguous_cancel"
             pending = await cold.get(job_pending, tenant_id)
             assert pending is not None
             assert pending.state == LivePlanningJobState.RUNNING

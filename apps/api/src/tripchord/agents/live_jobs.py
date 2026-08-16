@@ -71,6 +71,13 @@ _PENDING_TERMINAL_PERSISTED_FIELDS = frozenset(
 # same-key paths and consecutive cold boots — never guessed to CANCELLED/FAILED.
 _ISOLATED_AMBIGUOUS_CANCEL_STAGE = "isolated_ambiguous_cancel"
 
+# C-146 P0 supplement (third P0): the explicit observable stage of a deadline
+# record whose FIRST durable FAILED/deadline_exceeded intent could not be
+# committed (every bounded pre-commit attempt failed). The executor and the
+# admission slot stay untouched until the intent commits; the bounded cleanup
+# owner re-commits it, then drains the operation and terminalizes.
+_DEADLINE_INTENT_PERSIST_PENDING_STAGE = "deadline_intent_persist_pending"
+
 
 def _aware(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
@@ -923,6 +930,12 @@ class _RuntimeJob:
         # succeeds or the process shuts down.
         self.cleanup_retry_round = 0
         self.cleanup_next_retry_monotonic = 0.0
+        # C-146 P0 supplement (third P0): the deadline handler created the
+        # FAILED/deadline_exceeded durable intent IN MEMORY but could not commit
+        # it (every bounded pre-commit attempt failed). While this flag is set,
+        # the real operation and the admission slot are left untouched — the
+        # cleanup owner re-commits the intent before any cancel/drain.
+        self.intent_persist_pending = False
 
 
 class _IdempotencyEntry:
@@ -1212,7 +1225,12 @@ class LivePlanningJobRegistry:
                     # the record is isolated (never replayed) and the ambiguity
                     # is surfaced explicitly.
                     self._isolate_ambiguous_cancel_locked(runtime)
-                else:
+                elif runtime.snapshot.state == LivePlanningJobState.QUEUED:
+                    # C-146 P0 supplement (P0-3): a record that never passed the
+                    # admission barrier provably never executed — the operation
+                    # closure cannot have started, so a CANCELLED label guesses
+                    # nothing about live work. restart_cancelled is the honest,
+                    # provable tombstone for a never-started job.
                     self._terminalize_locked(
                         runtime,
                         LivePlanningJobState.CANCELLED,
@@ -1220,6 +1238,34 @@ class LivePlanningJobRegistry:
                         error="live planning job cannot continue after process restart",
                         cancellation_requested=True,
                     )
+                elif runtime.snapshot.deadline_at <= self._utc_now():
+                    # C-146 P0 supplement (P0-3): recover FAILED/deadline_exceeded
+                    # ONLY from durable unforgeable deadline provenance. An
+                    # admitted record with NO cancel intent whose deadline
+                    # provably passed before the crash — including one that died
+                    # in the deadline-intent-persist-pending window, where the
+                    # FIRST FAILED intent never committed — carries the deadline
+                    # as its single provable explanation. We never fake a
+                    # deadline and never guess restart_cancelled over it.
+                    self._terminalize_locked(
+                        runtime,
+                        LivePlanningJobState.FAILED,
+                        stage="deadline_exceeded",
+                        error="TimeoutError: live planning job deadline exceeded",
+                        safe_failure=_safe_failure_diagnostic(
+                            TimeoutError("live planning job deadline exceeded"),
+                            code_override=LivePlanningSafeFailureCode.DEADLINE_EXCEEDED,
+                        ),
+                        cancellation_requested=True,
+                    )
+                else:
+                    # C-146 P0 supplement (P0-3): an admitted record whose
+                    # deadline did not pass and that carries no durable cancel
+                    # intent gives insufficient unforgeable facts to prove ANY
+                    # terminal outcome. restart_cancelled is a guess (was it
+                    # cancelled? a deadline? still running?), so it is never
+                    # fabricated: the record is quarantined as ambiguous instead.
+                    self._isolate_ambiguous_cancel_locked(runtime)
                 runtime.pending_terminal = None
         self._prune_locked(self._utc_now())
         self._persist_locked()
@@ -1945,6 +1991,14 @@ class LivePlanningJobRegistry:
                 # (idempotent, fail-closed) so a later cold start sees the same
                 # isolation and the same-key path keeps failing closed.
                 return runtime.snapshot
+            if runtime.intent_persist_pending:
+                # C-146 P0 supplement (P0-3): a deadline record whose FIRST
+                # durable intent is still uncommitted must not be cancelled by a
+                # caller — the intent commits first, then the executor is stopped
+                # to the committed FAILED/deadline_exceeded outcome. An explicit
+                # cancel joins nothing and guesses nothing: return the observable
+                # retry-state snapshot unchanged (idempotent, fail-closed).
+                return runtime.snapshot
             if runtime.snapshot.cancel_pending:
                 pending_future = runtime.cancel_future
                 pending_runtime = runtime
@@ -2325,6 +2379,7 @@ class LivePlanningJobRegistry:
             # operation swallows CancelledError past the budget, fail closed into
             # a non-terminal timeout/cancel-pending state and keep cleanup
             # ownership (a retry or close joins it).
+            intent_committed = False
             async with self._lock:
                 if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
                     runtime.snapshot = runtime.snapshot.model_copy(
@@ -2339,9 +2394,7 @@ class LivePlanningJobRegistry:
                     # entry carries the full FAILED/deadline_exceeded outcome —
                     # pending state, stage, error and the safe-failure diagnostic —
                     # in the SAME atomic commit as the timeout isolation. Only a
-                    # successful commit ever permits the cancel/drain below; a
-                    # pre-commit failure keeps the intent in memory as the
-                    # recoverable owner and still drains the live operation.
+                    # successful commit ever permits the cancel/drain below.
                     runtime.pending_terminal = _PendingTerminalOutcome(
                         state=LivePlanningJobState.FAILED,
                         stage="deadline_exceeded",
@@ -2349,15 +2402,40 @@ class LivePlanningJobRegistry:
                         safe_failure=failure,
                         cancellation_requested=True,
                     )
-                    with suppress(Exception):
-                        # Pre-commit write failure that every bounded retry
-                        # exhausted: the timeout/cancel-pending isolation AND the
-                        # pending outcome are kept IN MEMORY as the
-                        # observable/recoverable owner and the operation is still
-                        # drained below — the runner NEVER restores the
-                        # pre-timeout RUNNING snapshot and exits over a live
-                        # executor it has abandoned.
+                    try:
                         await self._persist_locked_with_bounded_retry()
+                        intent_committed = True
+                    except Exception:
+                        # C-146 P0 supplement (P0-3): the FIRST durable intent is
+                        # the HARD PRECONDITION for stopping the executor. When
+                        # every bounded pre-commit attempt failed, the unique
+                        # owner, the real operation and the capacity lease stay
+                        # untouched — NO cancel, NO drain, NO slot release, NO
+                        # terminal claim. The in-memory isolation and the
+                        # FAILED/deadline_exceeded intent are the observable
+                        # recoverable owner; the stage flips to the explicit
+                        # retry state and the cleanup owner re-commits the intent
+                        # before ANY stop/drain. The runner NEVER restores the
+                        # pre-timeout RUNNING snapshot over the live executor.
+                        runtime.intent_persist_pending = True
+                        runtime.snapshot = runtime.snapshot.model_copy(
+                            update={
+                                "stage": _DEADLINE_INTENT_PERSIST_PENDING_STAGE,
+                                "updated_at": self._utc_now(),
+                            }
+                        )
+                else:
+                    # A concurrent terminalize already settled the record; the
+                    # drain path below is a harmless no-op.
+                    intent_committed = True
+            if not intent_committed:
+                # C-146 P0 supplement (P0-3): the bounded cleanup owner
+                # auto-continues the persistence (same saturating backoff), and
+                # only after the intent commits does it stop/drain the executor
+                # and terminalize. close()/cancel()/same-key join this ordering
+                # and never create a second owner.
+                self._ensure_cleanup_owner(runtime)
+                return
             drained = await self._cancel_and_drain_operation(operation_task)
             operation_stopped = operation_task is None or operation_task.done()
             if drained and operation_stopped:
@@ -2524,6 +2602,74 @@ class LivePlanningJobRegistry:
         backoff — until the terminal commit succeeds or the process shuts down —
         with no dependence on an external same-key/cancel/close/query."""
         operation_task = runtime.operation_task
+        if runtime.intent_persist_pending:
+            # C-146 P0 supplement (P0-3), Phase-0: the FIRST durable deadline
+            # intent is the HARD PRECONDITION for stopping the executor. Re-commit
+            # the in-memory isolation AND the FAILED/deadline_exceeded pending
+            # outcome here (bounded retry) BEFORE any cancel/drain — the real
+            # operation and the admission slot stay untouched until the intent is
+            # durable.
+            async with self._lock:
+                try:
+                    await self._persist_locked_with_bounded_retry()
+                except Exception:
+                    intent_committed = False
+                else:
+                    runtime.intent_persist_pending = False
+                    intent_committed = True
+            if not intent_committed:
+                # Every bounded attempt failed again: keep the recoverable
+                # in-memory intent and re-arm the single reaper — the same
+                # saturating owner backoff auto-continues the persistence.
+                runtime.cleanup_retry_round = self._bump_cleanup_retry_round(
+                    runtime.cleanup_retry_round
+                )
+                runtime.cleanup_next_retry_monotonic = (
+                    asyncio.get_running_loop().time()
+                    + self._cleanup_retry_delay(runtime.cleanup_retry_round)
+                )
+                self._ensure_reaper()
+                return
+            # The intent is durable now: only now may the real executor be
+            # stopped and drained. A stubborn operation that swallows
+            # CancelledError past the budget fails closed into the observable
+            # stuck isolation with the committed FAILED intent intact (first
+            # intent wins — never overwritten by a later join).
+            await self._cancel_and_drain_operation(operation_task)
+            if not (operation_task is None or operation_task.done()):
+                pending = runtime.pending_terminal
+                if pending is not None:
+                    with suppress(Exception):
+                        await self._mark_cancel_stuck(
+                            runtime,
+                            stage="timeout_pending",
+                            error=(
+                                "live planning operation did not stop within the "
+                                "deadline cleanup budget; the job stays "
+                                "non-terminal and the operation is isolated"
+                            ),
+                            pending_state=pending.state,
+                            pending_stage=pending.stage,
+                            pending_error=pending.error,
+                            pending_safe_failure=pending.safe_failure,
+                            pending_cancellation_requested=pending.cancellation_requested,
+                        )
+                return
+            # The operation stopped: also await the registry runner so the
+            # shared _executors_stopped predicate holds before terminalizing —
+            # the runner was mid-exit when it spawned this owner. Awaiting a
+            # completed/cancelled task is a safe no-op, so a concurrent
+            # close()/cancel() can never deadlock this.
+            runner_task = runtime.task
+            if (
+                runner_task is not None
+                and not runner_task.done()
+                and runner_task is not asyncio.current_task()
+            ):
+                with suppress(BaseException):
+                    await asyncio.shield(runner_task)
+            # Fall through to the shared terminalize loop below, which retries
+            # the terminal commit within its own bounded per-round budget.
         if operation_task is not None:
             with suppress(BaseException):
                 # The operation was cancelled or raised while the owner waited;
@@ -3029,15 +3175,19 @@ class LivePlanningJobRegistry:
             # C-145 P0: the pending outcome is part of the SAME atomic write as
             # the stuck isolation — a pre-commit failure rolls both back, a
             # successful write makes the retry intent durable for the owner and
-            # for a cold restart.
-            runtime.pending_terminal = _PendingTerminalOutcome(
-                state=pending_state,
-                stage=pending_stage,
-                result=pending_result,
-                error=pending_error,
-                safe_failure=pending_safe_failure,
-                cancellation_requested=pending_cancellation_requested,
-            )
+            # for a cold restart. C-146 P0 supplement: the FIRST durable intent
+            # wins — an existing intent (e.g. a deadline's committed
+            # FAILED/deadline_exceeded recorded before the operation proved
+            # stubborn) is NEVER overwritten by a later join's guess.
+            if runtime.pending_terminal is None:
+                runtime.pending_terminal = _PendingTerminalOutcome(
+                    state=pending_state,
+                    stage=pending_stage,
+                    result=pending_result,
+                    error=pending_error,
+                    safe_failure=pending_safe_failure,
+                    cancellation_requested=pending_cancellation_requested,
+                )
             try:
                 self._persist_locked()
             except LivePlanningJobRegistryPostCommitError:
