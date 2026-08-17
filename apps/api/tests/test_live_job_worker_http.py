@@ -36,16 +36,12 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
 from contextlib import suppress
-from datetime import UTC, date, datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 
-import httpx
 import pytest
 import tripchord.main as main_module
 from httpx import ASGITransport, AsyncClient
@@ -67,13 +63,6 @@ from tripchord.main import (
     app,
     package_requirement_agent,
     settings,
-)
-from tripchord.providers.browser_bridge import (
-    BrowserProvider,
-    BrowserTaskCompletion,
-    BrowserTaskLease,
-    BrowserTaskState,
-    BrowserVertical,
 )
 
 REQUEST_SHA256 = "a" * 64
@@ -1926,325 +1915,6 @@ class _FlakyKillConfirm:
         return bool(outcome)
 
 
-def _free_loopback_port() -> int:
-    """Pick a free loopback port for the worker's real HTTP bridge."""
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _ready_chain_flight_quote(lease: Any) -> Any:
-    """Date-adaptive flight quote for the ready-chain pair window.
-
-    The stock ``_flight_quote`` fixture hardcodes 2026-08-23/08-30; the ready
-    chain's pair window is derived from the payload's reference_date, so the
-    four departure/arrival stamps are re-anchored to the leased query dates —
-    every other contract field stays identical.
-    """
-    from test_live_agent_system import MALDIVES_OFFSET, _flight_quote, _sealed_quote
-
-    base = _flight_quote(lease)
-    start = lease.query.start_date
-    end = lease.query.end_date
-    assert end is not None
-    details = dict(base.details)
-    details.update(
-        {
-            "outbound_departure_at": f"{start.isoformat()}T08:30:00+08:00",
-            "outbound_arrival_at": f"{start.isoformat()}T18:35:00{MALDIVES_OFFSET}",
-            "return_departure_at": f"{end.isoformat()}T10:45:00{MALDIVES_OFFSET}",
-            "return_arrival_at": f"{(end + timedelta(days=1)).isoformat()}T09:10:00+08:00",
-        }
-    )
-    return _sealed_quote(
-        lease,
-        page_url=base.page_url,
-        amount=base.amount,
-        basis=base.price_basis,
-        title=base.title,
-        details=details,
-    )
-
-
-def _ready_chain_completion(lease: Any) -> BrowserTaskCompletion:
-    """Serve a real SUCCEEDED completion for one ready-chain bridge lease."""
-    from test_live_agent_system import _lodging_quote, _lodging_segment, _sealed_quote
-
-    if lease.kind == BrowserVertical.FLIGHT:
-        quote = _ready_chain_flight_quote(lease)
-        details = dict(quote.details)
-        details.update(
-            {
-                "provider_itinerary_id": f"{lease.provider.value}-hgh-mle-roundtrip",
-                "provider_offer_id": f"{lease.provider.value}-economy-rate",
-                "outbound_flight_numbers": ["MU509", "UL123"],
-                "return_flight_numbers": ["UL122", "MU510"],
-            }
-        )
-    else:
-        quote = _lodging_quote(lease)
-        details = dict(quote.details)
-        segment = _lodging_segment(lease)
-        details.update(
-            {
-                "property_id": f"{lease.provider.value}-{segment}-property",
-                "room_id": f"{lease.provider.value}-{segment}-room",
-                "rate_plan_id": f"{lease.provider.value}-{segment}-rate",
-                "provider_offer_id": f"{lease.provider.value}-{segment}-offer",
-            }
-        )
-    return BrowserTaskCompletion(
-        state=BrowserTaskState.SUCCEEDED,
-        quotes=(
-            _sealed_quote(
-                lease,
-                page_url=quote.page_url,
-                amount=quote.amount,
-                basis=quote.price_basis,
-                title=quote.title,
-                details=details,
-            ),
-        ),
-    )
-
-
-class _IComHarnessServer(ThreadingHTTPServer):
-    """Loopback HTTP server carrying the harness state for its handler."""
-
-    harness: _LocalIComHarness
-
-
-class _IComHarnessHandler(BaseHTTPRequestHandler):
-    """Serve the exact iCom public-read JSON over REAL loopback HTTP."""
-
-    server: _IComHarnessServer
-
-    def do_GET(self) -> None:
-        harness = self.server.harness
-        parsed = urlparse(self.path)
-        harness.paths.append(parsed.path)
-        meta = {
-            "timestamp": harness._now.isoformat(),
-            "apiVersion": "v1",
-            "status": "success",
-            "message": "Success",
-        }
-        if parsed.path == "/api/v1/public/trips/schedules":
-            params = parse_qs(parsed.query)
-            assert set(params) == {"date"} and len(params["date"]) == 1
-            travel_date = params["date"][0]
-            call = harness.schedule_calls.get(travel_date, 0) + 1
-            harness.schedule_calls[travel_date] = call
-            ordinal = date.fromisoformat(travel_date).toordinal()
-
-            def row(
-                *,
-                suffix: int,
-                origin_id: int,
-                origin: str,
-                destination_id: int,
-                destination: str,
-                hour: int,
-            ) -> dict[str, object]:
-                departure_hour = hour + call - 1
-                return {
-                    "id": ordinal * 10 + suffix + call * 1_000_000,
-                    "tripDate": travel_date,
-                    "departureTime": f"{departure_hour:02d}:00",
-                    "arrivalTime": f"{departure_hour:02d}:45",
-                    "capacity": 45,
-                    "remainingCapacity": 45,
-                    "cancelledAt": None,
-                    "isCancelled": False,
-                    "scheduleId": ordinal * 10 + suffix + call * 2_000_000,
-                    "stops": 0,
-                    "ferryName": f"iCom loopback harness {suffix}",
-                    "vessel": {
-                        "id": suffix,
-                        "name": f"iCom Vessel {suffix}",
-                        "totalCapacity": 45,
-                    },
-                    "origin": {"id": origin_id, "name": origin},
-                    "destination": {
-                        "id": destination_id,
-                        "name": destination,
-                    },
-                }
-
-            payload = {
-                "meta": meta,
-                "data": [
-                    row(
-                        suffix=1,
-                        origin_id=3,
-                        origin="Airport",
-                        destination_id=1,
-                        destination="Maafushi",
-                        hour=21,
-                    ),
-                    row(
-                        suffix=2,
-                        origin_id=1,
-                        origin="Maafushi",
-                        destination_id=3,
-                        destination="Airport",
-                        hour=6,
-                    ),
-                ],
-            }
-        elif parsed.path == "/api/v1/public/ferry-fares/schedule-base-price":
-            payload = {"meta": meta, "data": {"amount": 30, "currencyCode": "USD"}}
-        elif parsed.path == "/api/v1/public/policy-sections":
-            payload = {
-                "meta": meta,
-                "data": [
-                    {
-                        "id": 1,
-                        "title": "Payments",
-                        "richtext": {
-                            "blocks": [
-                                {
-                                    "type": "paragraph",
-                                    "data": {
-                                        "text": (
-                                            "All prices are displayed and charged "
-                                            "in US Dollars (USD)."
-                                        )
-                                    },
-                                }
-                            ]
-                        },
-                        "isActive": True,
-                    }
-                ],
-            }
-        else:
-            self.send_error(404, "unexpected iCom URL")
-            return
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format: str, *args: Any) -> None:
-        # Keep the loopback server quiet during the chain run.
-        return
-
-
-class _LocalIComHarness:
-    """A REAL loopback HTTP server for the worker's iCom public-transfer reads.
-
-    C-146 P0-1: the cross-process ready chain's public-transfer reads must
-    SUCCEED against a reachable origin. The live upstream API has drifted from
-    the adapter's schema contract, so the worker runtime bundle points
-    ``icom_api_origin`` at this server. Raw upstream JSON only — schema
-    validation, evidence hashing and option construction stay owned by
-    ``IComTransferProvider``.
-    """
-
-    def __init__(self, now: Any) -> None:
-        self._now = now
-        self.paths: list[str] = []
-        self.schedule_calls: dict[str, int] = {}
-        self._server: ThreadingHTTPServer | None = None
-        self._thread: threading.Thread | None = None
-
-    @property
-    def origin(self) -> str:
-        assert self._server is not None
-        host, port = self._server.server_address[:2]
-        return f"http://{host}:{port}"
-
-    def start(self) -> None:
-        self._server = _IComHarnessServer(("127.0.0.1", 0), _IComHarnessHandler)
-        self._server.harness = self
-        self._thread = threading.Thread(
-            target=self._server.serve_forever,
-            daemon=True,
-            name="tripchord-test-icom-harness",
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        if self._server is not None:
-            self._server.shutdown()
-            self._server.server_close()
-            self._server = None
-
-
-async def _serve_worker_ready_bridge(port: int, bridge_token: str) -> None:
-    """The external Companion: real loopback HTTP to the WORKER's bridge.
-
-    Heartbeats, claims and completes over the network exactly like the real
-    extension. The worker only starts serving after the job is activated, so
-    connection errors are retried until the port answers.
-    """
-    from tripchord.platform.registry import build_default_registry
-    from tripchord.providers.browser_bridge import BRIDGE_TOKEN_HEADER
-
-    headers = {BRIDGE_TOKEN_HEADER: bridge_token}
-    companions = {
-        "companion_id": "ready-chain-companion",
-        "providers": [provider.value for provider in BrowserProvider],
-        "authorized_scope_keys": sorted(
-            key.key
-            for key in build_default_registry().certified_scopes()
-            if not key.key.startswith("icom:")
-        ),
-        "adapter_version": "ready-chain-http-transport",
-        "contract_version": "tripchord-browser-companion-v1",
-        "build_identity": {
-            "protocol_version": "tripchord-companion-control-v1",
-            "manifest_version": "ready-chain-build-v1",
-            "build_sha256": "e" * 64,
-            "content_runtime_version": "ready-chain-runtime-v1",
-        },
-        "runtime_instance_id": "ready-chain-runtime-instance-0001",
-    }
-    async with AsyncClient(
-        base_url=f"http://127.0.0.1:{port}",
-        headers=headers,
-        timeout=15.0,
-    ) as companion_client:
-        while True:
-            try:
-                heartbeat = await companion_client.post(
-                    "/browser-bridge/v1/companions/heartbeat",
-                    json=companions,
-                )
-                heartbeat.raise_for_status()
-                claim = await companion_client.post(
-                    "/browser-bridge/v1/tasks/claim",
-                    json={**companions, "limit": 6},
-                )
-                claim.raise_for_status()
-                leases = tuple(
-                    BrowserTaskLease.model_validate(item)
-                    for item in claim.json().get("leases", [])
-                )
-                for lease in leases:
-                    completion = _ready_chain_completion(lease)
-                    await companion_client.post(
-                        f"/browser-bridge/v1/tasks/{lease.task_id}/complete",
-                        json={
-                            "claim_token": lease.claim_token,
-                            "completion": completion.model_dump(mode="json"),
-                        },
-                    )
-            except httpx.ConnectError:
-                # Worker not serving yet; retry until the bridge is up.
-                await asyncio.sleep(0.05)
-                continue
-            except httpx.HTTPStatusError:
-                await asyncio.sleep(0.05)
-                continue
-            await asyncio.sleep(0)
-
-
 def test_worker_runtime_envelope_rejects_tampered_spec_and_provenance() -> None:
     """The independent worker verifies both canonical configuration bytes and
     the parent API's immutable code provenance before composing capabilities.
@@ -2294,116 +1964,71 @@ def test_worker_runtime_envelope_rejects_tampered_spec_and_provenance() -> None:
 
 
 @pytest.mark.asyncio
-async def test_http_route_runs_real_cross_process_ready_chain_to_success(
+async def test_http_route_rejects_formal_worker_with_models_disabled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A READY payload POSTed through the REAL route runs the REAL ready chain
-    in a REAL independent worker subprocess whose reconstructed app installs a
-    REAL browser-bridge composition (the SAME ``_install_browser_bridge`` entry
-    the API process uses) and serves it over REAL loopback HTTP — an external
-    Companion heartbeats / claims / completes over the network, and the parent
-    API observes the worker's progress, per-pair checkpoints, model trace and
-    cache on the durable job. RED on baseline: the worker ran a deterministic
-    HUMAN_BLOCK stand-in (no real capability) and no real HTTP chain existed."""
-    from test_live_agent_system import NOW as FIXTURE_NOW
+    """The former HTTP positive cannot disable model execution and self-certify.
+
+    A real route and independent subprocess still run, but the parent-owned
+    formal source boundary makes ``model_agents_required=False`` an authenticated
+    runtime-contract violation before any synthetic inventory can enter.
+    """
     from tripchord.platform.adapters import default_browser_providers_from_registry
+    from tripchord.providers.browser_bridge import formal_worker_source_token
 
     registry = _http_app_context(monkeypatch, tmp_path)
-    port = _free_loopback_port()
-    bridge_token = "ready-chain-bridge-token-000000000000000000"
-    icom_harness = _LocalIComHarness(FIXTURE_NOW)
-    icom_harness.start()
+    companion_token = "ready-chain-bridge-token-000000000000000000"
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        settings.model_copy(update={"browser_bridge_token": companion_token}),
+    )
+    worker_source_token = formal_worker_source_token(companion_token)
     try:
         bundle = json.dumps(
             {
                 "runtime": "browser-bridge",
-                "bridge_token": bridge_token,
+                "bridge_token": worker_source_token,
                 "providers": [
                     provider.value
                     for provider in default_browser_providers_from_registry()
                 ],
                 "model_agents_required": False,
+                "formal_parent_api_origin": "http://127.0.0.1:8000",
                 "adaptive_agent_scaling_enabled": False,
-                "now_iso": FIXTURE_NOW.isoformat(),
-                "http_host": "127.0.0.1",
-                "http_port": port,
-                "icom_api_origin": icom_harness.origin,
+                "now_iso": "2026-08-17T09:00:00+08:00",
+                "http_host": None,
+                "http_port": None,
+                "icom_api_origin": None,
+                "formal_source_private_key_path": None,
+                "formal_source_ledger_path": None,
             },
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         )
         monkeypatch.setenv("TRIPCHORD_LIVE_FLEXIBLE_WORKER_RUNTIME_BUNDLE", bundle)
-        companion_task = asyncio.create_task(
-            _serve_worker_ready_bridge(port, bridge_token),
-            name="ready-chain-companion",
-        )
-        try:
-            async with AsyncClient(
-                transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
-                base_url="http://test",
-            ) as client:
-                created = await client.post(
-                    "/api/v1/agents/live-flexible-plan-from-text/jobs",
-                    json=_payload(ready=True),
-                )
-                assert created.status_code == 202, created.text
-                job_id = created.json()["job"]["id"]
-                # The Maldives stay-plan anti-bot floor gives the lodging source
-                # tasks real 40s/80s/120s/160s/200s start delays; the Companion
-                # must stay alive for the full chain (~250s) to complete them.
-                terminal = await _terminal_job_slow(client, job_id, timeout=300.0)
-        finally:
-            companion_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await companion_task
-        assert icom_harness.paths, "the worker must have consumed the local iCom harness"
-        assert set(icom_harness.paths) >= {
-            "/api/v1/public/trips/schedules",
-            "/api/v1/public/ferry-fares/schedule-base-price",
-            "/api/v1/public/policy-sections",
-        }
-        assert terminal["state"] == "succeeded", terminal
-        result = terminal["result"]
-        assert result["interpretation"]["state"] == "ready", result
-        assert result.get("run") is not None, result
-        receipt = result.get("worker_runtime_receipt")
-        assert receipt is not None, result
-        assert receipt["schema_version"] == (
-            "tripchord-live-worker-runtime-receipt-v1"
-        )
-        assert receipt["runtime"] == "browser-bridge"
-        assert len(receipt["spec_sha256"]) == 64
-        runtime = registry._records[job_id]
-        # A REAL worker subprocess ran the ready chain — durable identity.
-        assert runtime.worker_pgid is not None and runtime.worker_pgid > 0
-        assert runtime.worker_marker
-        # The API process itself never installed a flexible runtime — the ready
-        # chain ran ONLY inside the worker subprocess via the env bundle.
-        assert getattr(app.state, "flexible_live_agent_system", None) is None
-        # --- P0-1 observability: the parent API observes the FULL chain ---
-        # Progress: the job snapshot carries the worker's stages/progress.
-        assert terminal["stage"] in {"complete", "failed", "cancelled"}
-        # Per-pair checkpoints were replayed onto the durable job record.
-        assert len(terminal["pair_checkpoints"]) >= 1, terminal
-        assert len(terminal["source_terminal_events"]) >= 1, terminal
-        assert terminal["barrier_released_at"] is not None, terminal
-        # Model trace: the worker's scope is bound to this job and counted.
-        assert result.get("model_trace_scope_sha256") is not None
-        assert result.get("model_trace_count") is not None
-        # Cache: the worker cached its pair runs (observable cache handoff).
-        assert isinstance(result.get("cached_pair_runs"), list)
-        assert len(result["cached_pair_runs"]) >= 1, result
-        # The handles are newly allocated by the PARENT cache importer, not the
-        # worker's process-local cache: every returned id is immediately usable
-        # by the parent API's event-replan path.
-        parent_cache = app.state.live_run_cache
-        tenant_id = runtime.operation.args["tenant_id"]
-        for handle in result["cached_pair_runs"]:
-            assert await parent_cache.get(handle["run_id"], tenant_id) is not None
+        async with AsyncClient(
+            transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+            base_url="http://test",
+        ) as client:
+            created = await client.post(
+                "/api/v1/agents/live-flexible-plan-from-text/jobs",
+                json=_payload(ready=True),
+            )
+            assert created.status_code == 202, created.text
+            job_id = created.json()["job"]["id"]
+            terminal = await _terminal_job_slow(client, job_id)
+
+        assert terminal["state"] == "failed", terminal
+        assert terminal["error"] == "RuntimeError: live planning execution failed"
+        assert terminal["safe_failure_code"] == "execution_exception"
+        assert terminal["pair_checkpoints"] == []
+        assert terminal["source_terminal_events"] == []
+        assert terminal["barrier_released_at"] is None
+        assert terminal.get("result") is None
     finally:
-        icom_harness.stop()
         await registry.close()
 
 

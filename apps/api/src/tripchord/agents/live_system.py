@@ -151,6 +151,7 @@ from tripchord.platform.capability import ProviderScopeKey, ProviderVertical
 from tripchord.platform.terminal import (
     ScopeCancellationTombstone,
     ScopeCancellationTombstoneRegistry,
+    SourceTerminalState,
 )
 from tripchord.providers.base import ProviderError
 from tripchord.providers.browser_bridge import (
@@ -1534,6 +1535,84 @@ class IComTransferSearcher(Protocol):
     ) -> IComTransferSearchResult: ...
 
 
+LiveSourceTerminalReporter = Callable[
+    [tuple[dict[str, JsonValue], ...]],
+    Awaitable[None],
+]
+
+
+def _browser_source_terminal_state(
+    snapshot: BrowserTaskSnapshot | None,
+) -> SourceTerminalState:
+    """Reduce one settled browser task to the shared typed-terminal contract."""
+
+    if snapshot is None:
+        return SourceTerminalState.PROVIDER_ERROR
+    if snapshot.state is BrowserTaskState.SUCCEEDED:
+        return (
+            SourceTerminalState.QUOTE_FOUND
+            if snapshot.quotes
+            else SourceTerminalState.BOUNDED_NO_EXACT_QUOTE
+        )
+    if snapshot.state is BrowserTaskState.CANCELLED:
+        return SourceTerminalState.CANCELLED
+    failure_code = snapshot.failure.code if snapshot.failure is not None else None
+    failure_states = {
+        BrowserFailureCode.LOGIN_REQUIRED: SourceTerminalState.LOGIN_REQUIRED,
+        BrowserFailureCode.CAPTCHA_REQUIRED: SourceTerminalState.CAPTCHA_REQUIRED,
+        BrowserFailureCode.DOM_DRIFT: SourceTerminalState.DOM_DRIFT,
+        BrowserFailureCode.TIMEOUT: SourceTerminalState.TIMED_OUT,
+        BrowserFailureCode.NO_INVENTORY: SourceTerminalState.CONFIRMED_EMPTY,
+    }
+    return failure_states.get(failure_code, SourceTerminalState.PROVIDER_ERROR)
+
+
+def _browser_source_identity(
+    source_task_id: str,
+    snapshot: BrowserTaskSnapshot | None,
+) -> tuple[str, str]:
+    if snapshot is not None:
+        return snapshot.provider.value, snapshot.kind.value
+    prefix = "source-"
+    if not source_task_id.startswith(prefix):
+        raise RuntimeError("settled browser source task identity is invalid")
+    provider, separator, suffix = source_task_id[len(prefix) :].partition("-")
+    vertical = "flight" if suffix == "flight" else "lodging" if suffix.startswith("lodging") else ""
+    if not provider or not separator or not vertical:
+        raise RuntimeError("settled browser source task identity is invalid")
+    return provider, vertical
+
+
+def _settled_browser_source_events(
+    state: _RunState,
+    occurred_at: datetime,
+) -> tuple[dict[str, JsonValue], ...]:
+    """Build privacy-safe source events at the actual ALL_TERMINAL barrier.
+
+    This deliberately runs before Normalizer/model/finalization tasks. A later
+    planning failure therefore cannot erase proof that the real browser tasks
+    already reached typed terminal states.
+    """
+
+    events: list[dict[str, JsonValue]] = []
+    for source_task_id in state.source_task_ids:
+        snapshot = state.snapshots.get(source_task_id)
+        provider, vertical = _browser_source_identity(source_task_id, snapshot)
+        terminal_at = snapshot.updated_at if snapshot is not None else occurred_at
+        events.append(
+            {
+                "schema_version": "live-source-terminal-event-v1",
+                "source_task_id": source_task_id,
+                "provider": provider,
+                "vertical": vertical,
+                "terminal_state": _browser_source_terminal_state(snapshot).value,
+                "occurred_at": terminal_at.isoformat(),
+                "detail": None,
+            }
+        )
+    return tuple(events)
+
+
 class LivePackageAgentSystem:
     """Browser and public-transfer Agent DAG with a six-tab browser lease cap."""
 
@@ -1552,6 +1631,7 @@ class LivePackageAgentSystem:
         sleep: Callable[[float], Awaitable[None]] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
         providers: tuple[BrowserProvider, ...] = LIVE_V5_BROWSER_PROVIDERS,
+        source_terminal_reporter: LiveSourceTerminalReporter | None = None,
     ) -> None:
         if max_concurrency < 15:
             raise ValueError("max_concurrency must be at least fifteen for platform fan-out")
@@ -1569,6 +1649,7 @@ class LivePackageAgentSystem:
         self._model_agents_required = model_agents_required
         self._context_builder = context_builder
         self._memory_store = memory_store
+        self._source_terminal_reporter = source_terminal_reporter
         self._planner = PackagePlanner()
         self._verifier = PackageVerifier()
         self._package_reverifier = DeclarativePackageReVerifier()
@@ -3619,10 +3700,11 @@ class LivePackageAgentSystem:
         role: AgentRole,
     ) -> _AgentProposalPolicy | None:
         if role == AgentRole.EVIDENCE_ARBITER:
-            frontier_quote_ids = tuple(quote.id for quote in self._evidence_frontier_quotes(state))
+            frontier_quotes = self._evidence_frontier_quotes(state)
+            frontier_quote_ids = tuple(quote.id for quote in frontier_quotes)
             protected_transfer_ids = tuple(
                 quote.id
-                for quote in self._evidence_frontier_quotes(state)
+                for quote in frontier_quotes
                 if isinstance(quote, TransferOption)
                 and quote.purchase_scope == TransferPurchaseScope.PUBLIC_INDEPENDENT
                 and quote.price_guarantee == TransferPriceGuarantee.PUBLISHED_BASE_FARE
@@ -3630,9 +3712,44 @@ class LivePackageAgentSystem:
                 and quote.adults == intent.adults
                 and quote.service_date in {intent.start_date, intent.end_date}
             )
+            # This set contains no semantic/model judgement.  Every member has
+            # already passed the source normalizer and the exact candidate
+            # frontier's party/date/route checks, and carries an available CNY
+            # all-in total.  Missing provider identifiers may remain a risk
+            # flag, but cannot erase these typed comparability facts.
+            must_be_comparable_ids = tuple(
+                quote.id
+                for quote in frontier_quotes
+                if not isinstance(quote, TransferOption)
+                and quote.availability.value == "available"
+                and quote.currency == intent.currency
+                and quote.total_for_party_cents > 0
+                and quote.taxes_and_fees_included is True
+                and (
+                    not isinstance(quote, NormalizedFlightQuote)
+                    or (
+                        quote.adults == intent.adults
+                        and quote.party_availability_confirmed is True
+                        and quote.origin == intent.origin
+                        and quote.destination == intent.destination
+                        and quote.outbound_depart_at.date() == intent.start_date
+                        and quote.return_depart_at.date() == intent.end_date
+                    )
+                )
+                and (
+                    not isinstance(quote, NormalizedLodgingQuote)
+                    or (
+                        quote.adults == intent.adults
+                        and quote.rooms == intent.rooms
+                        and intent.start_date <= quote.check_in < quote.check_out
+                        <= intent.end_date
+                    )
+                )
+            )
             context = _json_object(
                 {
                     "disclosure_only_public_transfer_ids": list(protected_transfer_ids),
+                    "must_be_comparable_quote_ids": list(must_be_comparable_ids),
                     "required_classification_quote_ids": [
                         quote_id
                         for quote_id in frontier_quote_ids
@@ -3655,6 +3772,12 @@ class LivePackageAgentSystem:
                             "when candidate Scout expansion is active, classify every non-"
                             "disclosure-only quote in the decision frontier before merger"
                         ),
+                        (
+                            "quotes listed in must_be_comparable_quote_ids already have an "
+                            "exact party/date/route, CNY all-in total and available state; "
+                            "keep them comparable and disclose missing provider identifiers "
+                            "only as risk flags"
+                        ),
                     ],
                 }
             )
@@ -3670,6 +3793,20 @@ class LivePackageAgentSystem:
                         "disclosure-only public base-fare transfers were excluded even though "
                         "their foreign currency and unknown taxes are already kept outside the "
                         f"confirmed subtotal: {wrongly_excluded}"
+                    )
+                comparable = set(proposal.comparable_quote_ids)
+                missing_comparable = sorted(
+                    set(must_be_comparable_ids) - comparable
+                )
+                wrongly_non_comparable = sorted(
+                    set(must_be_comparable_ids)
+                    & set(proposal.excluded_quote_ids)
+                )
+                if missing_comparable or wrongly_non_comparable:
+                    return (
+                        "typed all-in exact quotes must remain comparable; "
+                        f"missing={missing_comparable}, "
+                        f"wrongly_excluded={wrongly_non_comparable}"
                     )
                 if state.candidate_shard_merge_audit is not None:
                     allowed = set(frontier_quote_ids)
@@ -5466,6 +5603,10 @@ class LivePackageAgentSystem:
                     generation=0,
                     reason=f"source task {task_id} reached a cancelled terminal state",
                 )
+            if self._source_terminal_reporter is not None:
+                await self._source_terminal_reporter(
+                    _settled_browser_source_events(state, now)
+                )
             output: dict[str, JsonValue] = {
                 "barrier": "released",
                 "terminal_source_ids": list(terminal_source_ids),
@@ -6958,6 +7099,48 @@ class LivePackageAgentSystem:
                     )
                     + ", "
                     f"model_required_failed={state.model_required_failed}, "
+                    "decision_frontier_counts="
+                    + json.dumps(
+                        {
+                            "inventory_flights": len(state.inventory.flights),
+                            "inventory_lodgings": len(state.inventory.lodgings),
+                            "inventory_transfers": len(state.inventory.transfers),
+                            "normalization_issue_codes": sorted(
+                                {
+                                    issue.code.value
+                                    for result in state.normalization_results
+                                    for issue in result.issues
+                                }
+                            ),
+                            "normalization_result_count": len(
+                                state.normalization_results
+                            ),
+                            "candidate_shortlist": len(state.candidate_shortlist),
+                            "candidate_decision_frontier": len(
+                                state.candidate_decision_frontier
+                            ),
+                            "comparison_ready": len(
+                                state.comparison_ready_candidate_ids
+                            ),
+                            "evidence_comparable": len(
+                                state.evidence_proposal.comparable_quote_ids
+                                if state.evidence_proposal is not None
+                                else ()
+                            ),
+                            "evidence_excluded": len(
+                                state.evidence_proposal.excluded_quote_ids
+                                if state.evidence_proposal is not None
+                                else ()
+                            ),
+                            "initial_candidate_present": (
+                                state.initial_candidate is not None
+                            ),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + ", "
                     f"explanation_present={state.explanation is not None}, "
                     f"memory_present={state.memory_candidates is not None}, "
                     f"publication_gate_passed={state.publication_gate_passed}"

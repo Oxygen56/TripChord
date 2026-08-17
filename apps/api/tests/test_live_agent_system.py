@@ -3613,6 +3613,49 @@ async def test_evidence_policy_keeps_disclosed_public_base_fare_out_of_exclusion
 
 
 @pytest.mark.asyncio
+async def test_evidence_policy_cannot_exclude_typed_exact_all_in_quotes() -> None:
+    candidate, _ = await _two_visible_hard_valid_candidates()
+    state = _RunState(
+        source_task_ids=(),
+        inventory=PackageInventory(
+            flights=(candidate.flight,),
+            lodgings=candidate.lodgings,
+            transfers=candidate.transfers,
+        ),
+        candidate_shortlist=(candidate,),
+    )
+    system = LivePackageAgentSystem(BrowserTaskBridge(now=lambda: NOW), now=lambda: NOW)
+    policy = system._agent_proposal_policy(
+        state,
+        intent(),
+        AgentRole.EVIDENCE_ARBITER,
+    )
+    assert policy is not None
+    exact_ids = tuple(policy.context["must_be_comparable_quote_ids"])
+    assert candidate.flight.id in exact_ids
+    assert exact_ids
+
+    rejected = policy.validate(
+        EvidenceArbitrationProposal(
+            summary="把已确认人数、日期、路线、税费和总价的报价错误排除",
+            excluded_quote_ids=exact_ids,
+            risk_flags=("供应商稳定标识仍需下单前确认",),
+        )
+    )
+    accepted = policy.validate(
+        EvidenceArbitrationProposal(
+            summary="保留已经确定性归一化的精确报价",
+            comparable_quote_ids=exact_ids,
+            risk_flags=("供应商稳定标识仍需下单前确认",),
+        )
+    )
+
+    assert rejected is not None
+    assert "must remain comparable" in rejected
+    assert accepted is None
+
+
+@pytest.mark.asyncio
 async def test_soft_risk_switch_is_applied_then_reverified_and_recriticized() -> None:
     initial, alternative = await _two_visible_hard_valid_candidates()
 

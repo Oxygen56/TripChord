@@ -63,6 +63,11 @@ _ICOM_PATH_ORDER = (
 )
 _ICOM_PATHS = frozenset(_ICOM_PATH_ORDER)
 _ICOM_PUBLIC_HOST = "sfs-api.icomtours.com"
+_PRODUCTION_COMPANION_ADAPTER_VERSION = "0.2.0"
+_PRODUCTION_COMPANION_CONTRACT_VERSION = "tripchord-capability-v1"
+_PRODUCTION_COMPANION_CONTROL_PROTOCOL_VERSION = (
+    "tripchord-companion-control-v1"
+)
 _COMPOSITION_TYPES = {
     "bridge": "tripchord.providers.browser_bridge.BrowserTaskBridge",
     "icom_provider": "tripchord.providers.icom_transfer.IComTransferProvider",
@@ -1205,6 +1210,14 @@ def _validate_companion_binding(value: object) -> dict[str, object]:
             value["runtime_instance_id"], "formal Companion runtime instance"
         ),
     }
+    if (
+        identity["adapter_version"] != _PRODUCTION_COMPANION_ADAPTER_VERSION
+        or identity["contract_version"]
+        != _PRODUCTION_COMPANION_CONTRACT_VERSION
+    ):
+        raise ValueError(
+            "formal Companion is not the production adapter/contract"
+        )
     providers = identity["providers"]
     scopes = identity["authorized_scope_keys"]
     if (
@@ -1237,6 +1250,11 @@ def _validate_companion_binding(value: object) -> dict[str, object]:
             "formal Companion content runtime version",
         ),
     }
+    if (
+        checked_build["protocol_version"]
+        != _PRODUCTION_COMPANION_CONTROL_PROTOCOL_VERSION
+    ):
+        raise ValueError("formal Companion control protocol is not production")
     identity["build_identity"] = checked_build
     digest = _require_sha256(
         value["identity_sha256"], "formal Companion identity sha256"
@@ -1328,6 +1346,8 @@ def _validate_terminal_job_contract(
         "publication_query_task_membership_sha256",
         "icom_query_membership_sha256",
         "publication_icom_query_membership_sha256",
+        "worker_runtime_receipt_sha256",
+        "model_execution_receipt_sha256",
     }
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("formal terminal job has an invalid shape")
@@ -1362,6 +1382,14 @@ def _validate_terminal_job_contract(
     if value["checkpoint_chain_sha256"] != _sha256(checkpoints):
         raise ValueError("formal terminal checkpoint chain digest is invalid")
     _require_sha256(value["result_sha256"], "formal terminal result_sha256")
+    _require_sha256(
+        value["worker_runtime_receipt_sha256"],
+        "formal terminal worker runtime receipt",
+    )
+    _require_sha256(
+        value["model_execution_receipt_sha256"],
+        "formal terminal model execution receipt",
+    )
     if not isinstance(pair_checkpoint_binding, dict):
         raise ValueError("formal pair checkpoint binding is not an exact object")
     bindings = pair_checkpoint_binding.get("bindings")
@@ -1402,6 +1430,10 @@ def _validate_terminal_job_contract(
 def _job_member_summary(
     job_graph: Mapping[str, object],
     terminal_job: Mapping[str, object],
+    events: Sequence[Mapping[str, object]],
+    *,
+    execution_capability_id: str,
+    execution_attempt_digest: str,
 ) -> dict[str, object]:
     pairs = job_graph["pairs"]
     if not isinstance(pairs, list):
@@ -1426,6 +1458,48 @@ def _job_member_summary(
     ]
     if len(pair_members) != len(pairs):
         raise ValueError("formal job graph pair members are invalid")
+    try:
+        UUID(execution_capability_id)
+    except ValueError as exc:
+        raise ValueError("formal source execution capability identity is invalid") from exc
+    _require_sha256(
+        execution_attempt_digest,
+        "formal source execution attempt digest",
+    )
+    source_receipts: list[Mapping[str, object]] = []
+    for event in events:
+        if event.get("kind") != "browser_complete":
+            continue
+        details = event.get("details")
+        receipt = (
+            details.get("source_execution_receipt")
+            if isinstance(details, Mapping)
+            else None
+        )
+        if not isinstance(receipt, Mapping):
+            raise ValueError("formal browser completion has no source receipt")
+        if (
+            receipt.get("capability_id") != execution_capability_id
+            or receipt.get("attempt_digest") != execution_attempt_digest
+        ):
+            raise ValueError(
+                "formal browser source receipt crosses execution capabilities"
+            )
+        source_receipts.append(receipt)
+    if not source_receipts:
+        raise ValueError("formal source execution receipt set is empty")
+    source_task_ids = [str(receipt.get("task_id")) for receipt in source_receipts]
+    if any(not task_id or task_id == "None" for task_id in source_task_ids) or len(
+        source_task_ids
+    ) != len(set(source_task_ids)):
+        raise ValueError("formal source execution receipt task identities are invalid")
+    source_receipt_sha256 = [
+        _require_sha256(
+            receipt.get("receipt_sha256"),
+            "formal source execution receipt digest",
+        )
+        for receipt in source_receipts
+    ]
     summary: dict[str, object] = {
         "terminal_job_id": job_graph["terminal_job_id"],
         "ordered_pair_ids_sha256": job_graph["ordered_pair_ids_sha256"],
@@ -1444,6 +1518,19 @@ def _job_member_summary(
         ],
         "checkpoint_chain_sha256": terminal_job["checkpoint_chain_sha256"],
         "terminal_result_sha256": terminal_job["result_sha256"],
+        "worker_runtime_receipt_sha256": terminal_job[
+            "worker_runtime_receipt_sha256"
+        ],
+        "model_execution_receipt_sha256": terminal_job[
+            "model_execution_receipt_sha256"
+        ],
+        "execution_capability_id": execution_capability_id,
+        "execution_attempt_digest": execution_attempt_digest,
+        "source_execution_receipt_count": len(source_receipts),
+        "source_execution_task_ids_sha256": _sha256(source_task_ids),
+        "source_execution_receipt_chain_sha256": _sha256(
+            source_receipt_sha256
+        ),
         "job_graph_sha256": job_graph["job_graph_sha256"],
     }
     summary["terminal_job_graph_sha256"] = _sha256(summary)
@@ -1720,6 +1807,8 @@ def _validate_business_event_details(
     *,
     job_graph: Mapping[str, object],
     candidate_set_sha256: str,
+    challenge_id: str,
+    run_id: str,
     require_complete: bool = True,
 ) -> None:
     """Cross-check transport receipts with their exact business identities."""
@@ -1729,6 +1818,7 @@ def _validate_business_event_details(
     icom_by_query: dict[tuple[str, str], list[Mapping[str, object]]] = {}
     claimed_query_members: list[str] = []
     publication_query_members: list[str] = []
+    source_capability_identity: tuple[str, ...] | None = None
 
     def exact_object(value: object, fields: set[str], label: str) -> dict[str, object]:
         if not isinstance(value, dict) or set(value) != fields:
@@ -2178,6 +2268,7 @@ def _validate_business_event_details(
             if set(details) != {
                 "task_id",
                 "completion",
+                "source_execution_receipt",
                 "snapshot",
                 "formal_query",
                 "result_sha256",
@@ -2236,6 +2327,126 @@ def _validate_business_event_details(
             )
             if completion_formal_query != lease["formal_query"]:
                 raise ValueError("formal completion query differs from independently checked claim")
+            source_receipt = exact_object(
+                details["source_execution_receipt"],
+                {
+                    "schema_version",
+                    "task_id",
+                    "provider",
+                    "kind",
+                    "companion_id",
+                    "runtime_instance_id",
+                    "build_identity",
+                    "execution_environment",
+                    "parser_version",
+                    "query_sha256",
+                    "source_observation_sha256",
+                    "completion_sha256",
+                    "capability_id",
+                    "challenge_id",
+                    "run_id",
+                    "terminal_job_id",
+                    "request_sha256",
+                    "job_graph_sha256",
+                    "attempt_digest",
+                    "completed_at",
+                    "receipt_sha256",
+                },
+                "formal source execution receipt",
+            )
+            if heartbeat_identity is None:
+                raise ValueError("formal source receipt precedes its heartbeat")
+            expected_source_identity = (
+                _nonempty_string(
+                    source_receipt["capability_id"],
+                    "formal source capability_id",
+                ),
+                _nonempty_string(
+                    source_receipt["challenge_id"],
+                    "formal source challenge_id",
+                ),
+                _nonempty_string(source_receipt["run_id"], "formal source run_id"),
+                _require_sha256(
+                    source_receipt["attempt_digest"],
+                    "formal source attempt digest",
+                ),
+            )
+            if source_capability_identity is None:
+                source_capability_identity = expected_source_identity
+            elif source_capability_identity != expected_source_identity:
+                raise ValueError("formal source receipts cross execution capabilities")
+            expected_observation = {
+                "task_id": task_id,
+                "provider": snapshot["provider"],
+                "kind": snapshot["kind"],
+                "query": checked_snapshot_query,
+                "quote_evidence_sha256": [
+                    quote.get("evidence_sha256")
+                    for quote in completion["quotes"]
+                    if isinstance(quote, dict)
+                ],
+                "parser_version": "tripchord-visible-dom-v3",
+            }
+            unsigned_source_receipt = {
+                key: value
+                for key, value in source_receipt.items()
+                if key != "receipt_sha256"
+            }
+            receipt_field_matches = {
+                "schema_version": source_receipt["schema_version"]
+                == "tripchord-browser-source-execution-receipt-v1",
+                "task_id": source_receipt["task_id"] == task_id,
+                "provider": source_receipt["provider"] == snapshot["provider"],
+                "kind": source_receipt["kind"] == snapshot["kind"],
+                "companion_id": source_receipt["companion_id"]
+                == heartbeat_identity.get("companion_id"),
+                "runtime_instance_id": source_receipt["runtime_instance_id"]
+                == heartbeat_identity.get("runtime_instance_id"),
+                "build_identity": source_receipt["build_identity"]
+                == heartbeat_identity.get("build_identity"),
+                "execution_environment": (
+                    source_receipt["execution_environment"]
+                    == "chrome_extension_service_worker"
+                ),
+                "parser_version": source_receipt["parser_version"]
+                == "tripchord-visible-dom-v3",
+                "query_sha256": source_receipt["query_sha256"]
+                == _sha256(checked_snapshot_query),
+                "source_observation_sha256": source_receipt[
+                    "source_observation_sha256"
+                ]
+                == _sha256(expected_observation),
+                "completion_sha256": source_receipt["completion_sha256"]
+                == _sha256(completion),
+                "challenge_id": source_receipt["challenge_id"] == challenge_id,
+                "run_id": source_receipt["run_id"] == run_id,
+                "terminal_job_id": source_receipt["terminal_job_id"]
+                == job_graph["terminal_job_id"],
+                "request_sha256": source_receipt["request_sha256"]
+                == job_graph["request_sha256"],
+                "job_graph_sha256": source_receipt["job_graph_sha256"]
+                == job_graph["job_graph_sha256"],
+                "receipt_sha256": source_receipt["receipt_sha256"]
+                == _sha256(unsigned_source_receipt),
+            }
+            receipt_mismatches = sorted(
+                field for field, matches in receipt_field_matches.items() if not matches
+            )
+            if receipt_mismatches:
+                raise ValueError(
+                    "formal source execution receipt is not exact: "
+                    + ",".join(receipt_mismatches)
+                )
+            try:
+                UUID(str(source_receipt["capability_id"]))
+            except ValueError as exc:
+                raise ValueError(
+                    "formal source execution capability identity is invalid"
+                ) from exc
+            completed_at = _require_aware_time(
+                source_receipt["completed_at"],
+                "formal source completed_at",
+            )
             for left, right in (
                 ("id", "task_id"),
                 ("provider", "provider"),
@@ -2267,6 +2478,8 @@ def _validate_business_event_details(
             )
             if not timedelta(0) <= completion_observed - updated_at <= timedelta(seconds=1):
                 raise ValueError("formal completion time differs from receipt")
+            if not timedelta(0) <= completion_observed - completed_at <= timedelta(seconds=1):
+                raise ValueError("formal source completion time differs from receipt")
             if snapshot["reused_from_task_id"] is not None:
                 _nonempty_string(
                     snapshot["reused_from_task_id"], "formal completion reused task"
@@ -2620,6 +2833,8 @@ def validate_formal_source_evidence(
         checked_events,
         job_graph=graph,
         candidate_set_sha256=str(checked_challenge["candidate_set_sha256"]),
+        challenge_id=str(checked_challenge["challenge_id"]),
+        run_id=str(checked_challenge["run_id"]),
     )
     unsigned_binding = {
         key: item
@@ -2684,6 +2899,13 @@ def validate_formal_source_evidence(
         "publication_icom_query_membership_sha256",
         "checkpoint_chain_sha256",
         "terminal_result_sha256",
+        "worker_runtime_receipt_sha256",
+        "model_execution_receipt_sha256",
+        "execution_capability_id",
+        "execution_attempt_digest",
+        "source_execution_receipt_count",
+        "source_execution_task_ids_sha256",
+        "source_execution_receipt_chain_sha256",
         "job_graph_sha256",
         "terminal_job_graph_sha256",
     }
@@ -2755,6 +2977,32 @@ def validate_formal_source_evidence(
         job_member_summary["terminal_result_sha256"],
         "formal receipt terminal result",
     )
+    for field in (
+        "worker_runtime_receipt_sha256",
+        "model_execution_receipt_sha256",
+        "execution_attempt_digest",
+        "source_execution_task_ids_sha256",
+        "source_execution_receipt_chain_sha256",
+    ):
+        _require_sha256(
+            job_member_summary[field],
+            f"formal receipt {field}",
+        )
+    try:
+        UUID(str(job_member_summary["execution_capability_id"]))
+    except ValueError as exc:
+        raise ValueError(
+            "formal receipt execution capability identity is invalid"
+        ) from exc
+    source_count = _exact_int(
+        job_member_summary["source_execution_receipt_count"],
+        "formal receipt source execution count",
+        minimum=1,
+    )
+    if source_count != sum(
+        item.get("kind") == "browser_complete" for item in checked_events
+    ):
+        raise ValueError("formal receipt source execution count is inconsistent")
     expected_terminal_summary_digest = _sha256(
         {
             key: item
@@ -2795,7 +3043,20 @@ def validate_formal_source_evidence(
                 job_graph=graph,
                 pair_checkpoint_binding=expected_context["pair_checkpoint_binding"],
             )
-            if _job_member_summary(graph, terminal) != job_member_summary:
+            if (
+                _job_member_summary(
+                    graph,
+                    terminal,
+                    checked_events,
+                    execution_capability_id=str(
+                        job_member_summary["execution_capability_id"]
+                    ),
+                    execution_attempt_digest=str(
+                        job_member_summary["execution_attempt_digest"]
+                    ),
+                )
+                != job_member_summary
+            ):
                 raise ValueError(
                     "formal source evidence differs from terminal job/checkpoint binding"
                 )
@@ -2912,6 +3173,65 @@ def validate_formal_source_summary(
     job_member_summary = summary["job_member_summary"]
     if not isinstance(job_member_summary, dict):
         raise ValueError("formal source summary job membership is invalid")
+    summary_member_fields = {
+        "terminal_job_id",
+        "ordered_pair_ids_sha256",
+        "pair_members",
+        "query_task_membership_sha256",
+        "publication_query_task_membership_sha256",
+        "icom_query_count",
+        "icom_query_membership_sha256",
+        "publication_icom_query_count",
+        "publication_icom_query_membership_sha256",
+        "checkpoint_chain_sha256",
+        "terminal_result_sha256",
+        "worker_runtime_receipt_sha256",
+        "model_execution_receipt_sha256",
+        "execution_capability_id",
+        "execution_attempt_digest",
+        "source_execution_receipt_count",
+        "source_execution_task_ids_sha256",
+        "source_execution_receipt_chain_sha256",
+        "job_graph_sha256",
+        "terminal_job_graph_sha256",
+    }
+    if set(job_member_summary) != summary_member_fields:
+        raise ValueError("formal source summary job membership shape is invalid")
+    expected_terminal_graph_sha256 = _sha256(
+        {
+            key: value
+            for key, value in job_member_summary.items()
+            if key != "terminal_job_graph_sha256"
+        }
+    )
+    if (
+        job_member_summary["terminal_job_graph_sha256"]
+        != expected_terminal_graph_sha256
+    ):
+        raise ValueError("formal source summary terminal graph digest is invalid")
+    for field in (
+        "terminal_result_sha256",
+        "worker_runtime_receipt_sha256",
+        "model_execution_receipt_sha256",
+        "execution_attempt_digest",
+        "source_execution_task_ids_sha256",
+        "source_execution_receipt_chain_sha256",
+    ):
+        _require_sha256(
+            job_member_summary[field],
+            f"formal source summary {field}",
+        )
+    _exact_int(
+        job_member_summary["source_execution_receipt_count"],
+        "formal source summary source execution count",
+        minimum=1,
+    )
+    try:
+        UUID(str(job_member_summary["execution_capability_id"]))
+    except ValueError as exc:
+        raise ValueError(
+            "formal source summary execution capability identity is invalid"
+        ) from exc
     if "job_graph" in expected_context:
         graph = _validate_job_graph(expected_context["job_graph"])
         if (
@@ -4424,7 +4744,6 @@ class FormalLiveSourceAuthority:
             job_graph=job_graph,
             pair_checkpoint_binding=context["pair_checkpoint_binding"],
         )
-        job_member_summary = _job_member_summary(job_graph, terminal_job)
         if self._utc_now() > _require_aware_time(
             challenge["expires_at"], "challenge expires_at"
         ):
@@ -4441,6 +4760,17 @@ class FormalLiveSourceAuthority:
         pre = _validate_snapshot(self._baseline, challenge)
         post = _validate_snapshot(after, challenge)
         receipts = post["events"][int(pre["event_count"]) :]
+        job_member_summary = _job_member_summary(
+            job_graph,
+            terminal_job,
+            receipts,
+            execution_capability_id=str(
+                execution_capability["capability_id"]
+            ),
+            execution_attempt_digest=str(
+                execution_capability["attempt_digest"]
+            ),
+        )
         binding: dict[str, object] = {
             "schema_version": _BINDING_SCHEMA_VERSION,
             "anchor_version": _anchor_version(),
@@ -4645,6 +4975,8 @@ class FormalLiveSourceAuthority:
             (*self._events, event),
             job_graph=_validate_job_graph(challenge["job_graph"]),
             candidate_set_sha256=str(challenge["candidate_set_sha256"]),
+            challenge_id=str(challenge["challenge_id"]),
+            run_id=str(challenge["run_id"]),
             require_complete=False,
         )
         self._events.append(event)

@@ -359,8 +359,8 @@
 
 | 命令/证据 | 结果 |
 |---|---|
-| 正式 C-round4 正向链 | 正式 `_install_browser_bridge` composition → mounted Companion HTTP heartbeat/claim/complete → `_run` → 真实 API job → 3 pair/控制面 checkpoints → 15/15 producer → completed bundle → 0600 writer → compact → consumer；raw 从正式输出文件回读，不再由测试拼装业务对象或生产状态 |
-| 真实 iCom provider | composition 实例化精确 `IComTransferProvider`；测试只在 `httpx.MockTransport` 返回 schedules/base-fare/policy 原始 JSON，三条官方 public GET path 均有调用回执；provider 自行做 URL/schema/字段标准化、证据 SHA 与领域结果。领域 provider 桩、空 HTTP 回执、直接 heartbeat/手工 composition 均不能满足正向回执 |
+| 旧 C-round4 正向链（已撤销） | 历史测试生成 quote、调用 `httpx.MockTransport` 并在测试进程自签来源，即使走过 production 类型与 producer/compact/consumer，也不能证明实际 Companion/iCom/模型执行。本轮把该链从正向验收移除，仅保留为 typed unit 与反例资料 |
+| 真实 iCom provider 口径 | 正式正向只认父 API 持有的精确 `IComTransferProvider` 对官方 endpoint 的实际网络读取与 authority receipt；`httpx.MockTransport`、领域 provider 桩、空/手工 HTTP 回执一律不是 Layer 6 正向 |
 | 正式 raw 对抗矩阵 | foreign/cross-pair/missing/extra query，missing/extra/cross-pair checkpoint，foreign request identity，extra check，empty evidence 均从同一正式 raw 深拷贝并由正式 writer 落盘；producer/compact/consumer 按责任边界拒绝 |
 | compact 顶层绑定 | 正式顶层 `pair_checkpoint_binding` 被消费；legacy `context` 仅作旧证据兼容；两份同时存在且不同立即拒绝 |
 | 正式入口回执绑定 | `_install_browser_bridge` 在生产装配时创建单一 installation authority；只有 mounted Companion HTTP heartbeat/claim/complete 与精确 `IComTransferProvider` 三条 public GET 成功调用能写入哈希链回执。raw/compact/final 共验 installation、composition、事件次序、claim-complete 对应、精确路径及 source commit；手工拼接同名类型/路径/HTTP 200、direct heartbeat、领域 provider 桩均 fail-closed |
@@ -373,8 +373,9 @@
 
 | 命令/证据 | 结果 |
 |---|---|
-| 正式跨进程 ready 链 | 删除 deterministic-blocking/HUMAN_BLOCK/空库存成功替身；Layer 6 不替换 production builder。正式 runner→真实 HTTP job→独立 worker，worker 验证父 API runtime identity 并重建 Browser bridge/iCom/model composition，正式 raw 再进 producer→compact→consumer |
+| 正式跨进程 ready 链 | 删除 deterministic-blocking/HUMAN_BLOCK/空库存成功替身；Layer 6 不替换 production builder。正式 runner→真实 HTTP job→独立 worker；worker 验证父 API runtime identity，通过真实回环 TCP 使用父 API 持有的 Companion/Browser 队列与 iCom provider，并在 worker 内启动实际 production model transport。worker 不复制 formal 私钥、不开第二 Browser 队列；正式 raw 再进 producer→compact→consumer |
 | 父 API 可观察回传 | worker 回传 progress、pair checkpoints、source terminal events、barrier 和 model trace；父 registry 按同一 job/request/generation 重放并与公开 response 精确绑定。worker cache 按响应 handle 回读精确 snapshot，父端校验 pair 成员/内容后原子换发新 handle；缺失、畸形或不一致回传不发布结果 |
+| 正式 receipt 绑定 | runtime receipt、实际 model trace receipt 与每条 Companion/iCom source receipt 逐级进入 raw、signed compact 和 consumer；共同绑定 challenge/run/job graph、capability/attempt、runtime/model identity、ordered source task set/chain。整份交换 worker/model receipt、替换 source 或重算自洽 hash 均 fail-closed |
 | clean/nonzero 整组退出 | leader 正常或非零退出都必须 kill-and-confirm 精确为 True；False、超时、异常均保持非终态、worker identity 与 permit，由唯一 owner 自动重试，不先写 SUCCEEDED/FAILED/CANCELLED |
 | 冷启认证/死亡事实 | durable record 按精确 PGID/marker/probe identity 持久化 authenticated + death-confirmed；marker 失配或进程查询失败后连续冷启仍保持 orphan quarantine，不调用终态 resolver 猜标签。没有 worker identity 却携带 marker/probe/auth/death 事实的文件直接 fail-closed |
 | 持续清理异常 | kill/confirm exception、False 与 qcap-full 均进入饱和退避 + 固定窗口调用上限；wrapper done callback 消费异常，cancel race 在 finally 释放 in-flight/reservation，无热循环、无未处理 task exception |

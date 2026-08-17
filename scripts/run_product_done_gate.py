@@ -1054,6 +1054,13 @@ _DIGEST_BINDING_PATHS: frozenset[tuple[str | None, ...]] = frozenset(
             "build_identity",
             "build_sha256",
         ),
+        (
+            "companion_preflight",
+            "companions",
+            _ARRAY_MARKER,
+            "build_identity",
+            "build_sha256",
+        ),
         # Layer-6 compact: candidate-set / scenario bindings, runtime-provenance
         # digests, the bridge-state lease hashes, the raw-original hash and the
         # raw request payload's own SHA (``api_payload_sha256`` — the checkpoint
@@ -1112,6 +1119,31 @@ _DIGEST_BINDING_PATHS: frozenset[tuple[str | None, ...]] = frozenset(
         (
             "formal_live_source_summary",
             "job_member_summary",
+            "worker_runtime_receipt_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "model_execution_receipt_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "execution_attempt_digest",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "source_execution_task_ids_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
+            "source_execution_receipt_chain_sha256",
+        ),
+        (
+            "formal_live_source_summary",
+            "job_member_summary",
             "job_graph_sha256",
         ),
         (
@@ -1156,6 +1188,134 @@ _DIGEST_BINDING_PATHS: frozenset[tuple[str | None, ...]] = frozenset(
             "runtime_before_run",
             "runtime_provenance",
             "live_system_source_sha256",
+        ),
+        (
+            "runtime_before_run",
+            "worker_model_runtime",
+            "runtime_bundle_spec_sha256",
+        ),
+        # C-146: production worker/model/source execution receipts.  Each
+        # value is recomputed and exact-shape validated by the raw compact
+        # builder and again by the final Layer-6 consumer; the scanner grants
+        # only these typed producer-owned paths, never a generic *_sha256 key.
+        ("worker_runtime_receipt", "spec_sha256"),
+        ("worker_runtime_receipt", "api_runtime_identity_sha256"),
+        (
+            "worker_runtime_receipt",
+            "runtime_provenance",
+            "dependency_lock_sha256",
+        ),
+        (
+            "worker_runtime_receipt",
+            "runtime_provenance",
+            "live_system_source_sha256",
+        ),
+        (
+            "worker_runtime_receipt",
+            "worker_runtime_identity",
+            "dependency_lock_sha256",
+        ),
+        (
+            "worker_runtime_receipt",
+            "worker_runtime_identity",
+            "live_system_source_sha256",
+        ),
+        ("worker_runtime_summary", "spec_sha256"),
+        ("worker_runtime_summary", "runtime_receipt_sha256"),
+        ("worker_runtime_summary", "api_runtime_identity_sha256"),
+        (
+            "worker_runtime_summary",
+            "runtime_provenance",
+            "dependency_lock_sha256",
+        ),
+        (
+            "worker_runtime_summary",
+            "runtime_provenance",
+            "live_system_source_sha256",
+        ),
+        (
+            "worker_runtime_summary",
+            "worker_runtime_identity",
+            "dependency_lock_sha256",
+        ),
+        (
+            "worker_runtime_summary",
+            "worker_runtime_identity",
+            "live_system_source_sha256",
+        ),
+        ("worker_runtime_summary", "worker_runtime_identity_sha256"),
+        ("worker_runtime_summary", "summary_sha256"),
+        ("model_execution_receipt", "request_sha256"),
+        ("model_execution_receipt", "runtime_bundle_spec_sha256"),
+        ("model_execution_receipt", "worker_runtime_identity_sha256"),
+        (
+            "model_execution_receipt",
+            "traces",
+            _ARRAY_MARKER,
+            "request_digest",
+        ),
+        (
+            "model_execution_receipt",
+            "traces",
+            _ARRAY_MARKER,
+            "scope_request_digest",
+        ),
+        ("model_execution_receipt", "receipt_sha256"),
+        ("model_trace_receipt", "scope_sha256"),
+        (
+            "source_execution_receipts",
+            "ordered_receipt_sha256",
+            _ARRAY_MARKER,
+        ),
+        ("source_execution_receipts", "receipt_chain_sha256"),
+        (
+            "source_execution_receipts",
+            "receipts",
+            _ARRAY_MARKER,
+            "build_identity",
+            "build_sha256",
+        ),
+        (
+            "source_execution_receipts",
+            "receipts",
+            _ARRAY_MARKER,
+            "query_sha256",
+        ),
+        (
+            "source_execution_receipts",
+            "receipts",
+            _ARRAY_MARKER,
+            "source_observation_sha256",
+        ),
+        (
+            "source_execution_receipts",
+            "receipts",
+            _ARRAY_MARKER,
+            "completion_sha256",
+        ),
+        (
+            "source_execution_receipts",
+            "receipts",
+            _ARRAY_MARKER,
+            "request_sha256",
+        ),
+        (
+            "source_execution_receipts",
+            "receipts",
+            _ARRAY_MARKER,
+            "job_graph_sha256",
+        ),
+        (
+            "source_execution_receipts",
+            "receipts",
+            _ARRAY_MARKER,
+            "attempt_digest",
+        ),
+        (
+            "source_execution_receipts",
+            "receipts",
+            _ARRAY_MARKER,
+            "receipt_sha256",
         ),
         ("bridge_state_lease_preflight", "sha256"),
         ("bridge_state_lease_postcheck", "sha256"),
@@ -1288,6 +1448,71 @@ _DIGEST_BINDING_PATHS: frozenset[tuple[str | None, ...]] = frozenset(
             "quotes",
             _ARRAY_MARKER,
             "content_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "source_execution_receipt",
+            "build_identity",
+            "build_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "source_execution_receipt",
+            "query_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "source_execution_receipt",
+            "source_observation_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "source_execution_receipt",
+            "completion_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "source_execution_receipt",
+            "request_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "source_execution_receipt",
+            "job_graph_sha256",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "source_execution_receipt",
+            "attempt_digest",
+        ),
+        (
+            "formal_live_source_binding",
+            "receipts",
+            _ARRAY_MARKER,
+            "details",
+            "source_execution_receipt",
+            "receipt_sha256",
         ),
         (
             "formal_live_source_binding",
@@ -5275,7 +5500,7 @@ _COMPACT_E2E_STAGED_NAME = "done-gate-layer6-compact.json"
 # read-back validator requires — a compact built by any other schema version is
 # rejected (C-122 acceptance).
 _LAYER5_COMPACT_SCHEMA = "tripchord-done-gate-layer5-compact-v2"
-_LAYER6_COMPACT_SCHEMA = "tripchord-done-gate-layer6-compact-v3"
+_LAYER6_COMPACT_SCHEMA = "tripchord-done-gate-layer6-compact-v4"
 # C-122 supervision 09:59 (Block 1): a compact is a PUBLIC contract — its
 # top-level field set is fixed.  A non-canonical ALIAS of a whitelisted digest
 # key (``API_PAYLOAD_CANDIDATE_SET_SHA256``, ``api-payload-candidate-set-
@@ -5313,6 +5538,9 @@ _LAYER6_COMPACT_ALLOWED_TOP_LEVEL = frozenset(
         "runtime_before_run",
         "runtime_identity_sha256",
         "formal_live_source_summary",
+        "worker_runtime_summary",
+        "model_execution_receipt",
+        "source_execution_receipts",
         "companion_preflight",
         "bridge_state_lease_preflight",
         "bridge_state_lease_postcheck",
@@ -6208,6 +6436,95 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
             )
     formal_source_receipt = payload["formal_live_source_authority_receipt"]
     formal_source_challenge = payload["formal_live_source_challenge"]
+    raw_worker_runtime_receipt = payload.get("worker_runtime_receipt")
+    raw_model_execution_receipt = payload.get("model_execution_receipt")
+    raw_model_trace_receipt = payload.get("model_trace_receipt")
+    if (
+        not isinstance(raw_worker_runtime_receipt, dict)
+        or not isinstance(raw_model_execution_receipt, dict)
+        or not isinstance(raw_model_trace_receipt, dict)
+    ):
+        raise GateStateChangedError(
+            "layer-6 raw evidence lacks exact worker/model execution receipts"
+        )
+    from tripchord.agents.live_flexible_from_text_worker import (
+        validate_model_execution_receipt,
+    )
+
+    try:
+        checked_model_receipt = validate_model_execution_receipt(
+            raw_model_execution_receipt,
+            raw_worker_runtime_receipt,
+            job_id=str(raw_model_execution_receipt.get("job_id", "")),
+            request_sha256=str(
+                (payload.get("request_identity") or {}).get(
+                    "api_payload_sha256",
+                    "",
+                )
+            ),
+            trace_count=int(raw_model_trace_receipt.get("total_count", -1)),
+            success_count=int(raw_model_trace_receipt.get("success_count", -1)),
+            failure_count=int(raw_model_trace_receipt.get("failure_count", -1)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise GateStateChangedError(
+            f"layer-6 raw model execution receipt is invalid: {exc}"
+        ) from exc
+    runtime_provenance = raw_worker_runtime_receipt.get("runtime_provenance")
+    worker_runtime_identity = raw_worker_runtime_receipt.get(
+        "worker_runtime_identity"
+    )
+    if not isinstance(runtime_provenance, dict) or not isinstance(
+        worker_runtime_identity,
+        dict,
+    ):
+        raise GateStateChangedError(
+            "layer-6 raw worker runtime provenance is invalid"
+        )
+    worker_runtime_summary_unsigned = {
+        "schema_version": "tripchord-live-worker-runtime-summary-v1",
+        "runtime_receipt_sha256": _canonical_sha256(
+            raw_worker_runtime_receipt
+        ),
+        "runtime": raw_worker_runtime_receipt.get("runtime"),
+        "providers": raw_worker_runtime_receipt.get("providers"),
+        "spec_sha256": raw_worker_runtime_receipt.get("spec_sha256"),
+        "api_runtime_identity_sha256": raw_worker_runtime_receipt.get(
+            "api_runtime_identity_sha256"
+        ),
+        "runtime_provenance": {
+            key: runtime_provenance.get(key)
+            for key in (
+                "commit_sha",
+                "dependency_lock_sha256",
+                "live_system_source_sha256",
+            )
+        },
+        "worker_runtime_identity": {
+            key: worker_runtime_identity.get(key)
+            for key in (
+                "commit_sha",
+                "dependency_lock_sha256",
+                "live_system_source_sha256",
+                "python_version",
+                "started_at",
+                "pid",
+            )
+        },
+        "worker_runtime_identity_sha256": checked_model_receipt[
+            "worker_runtime_identity_sha256"
+        ],
+        "model_agents_required": raw_worker_runtime_receipt.get(
+            "model_agents_required"
+        ),
+        "model_runtime_identity": raw_worker_runtime_receipt.get(
+            "model_runtime_identity"
+        ),
+    }
+    worker_runtime_summary = {
+        **worker_runtime_summary_unsigned,
+        "summary_sha256": _canonical_sha256(worker_runtime_summary_unsigned),
+    }
     # Each raw-layer context object is mandatory and exact at this boundary;
     # do not let a present null/list fall through to a later generic formal
     # validation error or a legacy-context fallback.
@@ -6265,6 +6582,29 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
         raise GateStateChangedError(
             f"layer-6 raw evidence cannot minimize formal source proof: {exc}"
         ) from exc
+    source_receipts = [
+        event.get("details", {}).get("source_execution_receipt")
+        for event in formal_source_binding.get("receipts", [])
+        if isinstance(event, dict) and event.get("kind") == "browser_complete"
+    ]
+    if not source_receipts or not all(
+        isinstance(receipt, dict) for receipt in source_receipts
+    ):
+        raise GateStateChangedError(
+            "layer-6 raw formal binding lacks source execution receipts"
+        )
+    ordered_source_receipt_sha256 = [
+        receipt["receipt_sha256"] for receipt in source_receipts
+    ]
+    source_execution_receipts = {
+        "schema_version": "tripchord-source-execution-receipt-set-v1",
+        "count": len(source_receipts),
+        "ordered_receipt_sha256": ordered_source_receipt_sha256,
+        "receipt_chain_sha256": _canonical_sha256(
+            ordered_source_receipt_sha256
+        ),
+        "receipts": source_receipts,
+    }
     # C-122 supervision 01:10: the run's checkpoint-bound sealed pair ids from
     # the job control plane (the terminal job's pair checkpoints), merged into
     # the v4_source_graph evidence so the compact carries an independent record
@@ -6418,6 +6758,7 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
             "primary_model": rb.get("primary_model"),
             "model_enabled": rb.get("model_enabled"),
             "model_required": rb.get("model_required"),
+            "worker_model_runtime": rb.get("worker_model_runtime"),
             "runtime_provenance": {
                 "commit_sha": rp.get("commit_sha"),
                 "dependency_lock_sha256": rp.get("dependency_lock_sha256"),
@@ -6428,6 +6769,9 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
         },
         "runtime_identity_sha256": formal_source_summary["runtime_identity_sha256"],
         "formal_live_source_summary": formal_source_summary,
+        "worker_runtime_summary": worker_runtime_summary,
+        "model_execution_receipt": checked_model_receipt,
+        "source_execution_receipts": source_execution_receipts,
         "companion_preflight": {
             "status": cp.get("status"),
             "stale_after_seconds": cp.get("stale_after_seconds"),
@@ -6435,6 +6779,8 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
                 {
                     "companion_id": comp.get("companion_id"),
                     "authorized_scope_keys": comp.get("authorized_scope_keys"),
+                    "build_identity": comp.get("build_identity"),
+                    "runtime_instance_id": comp.get("runtime_instance_id"),
                 }
                 for comp in companions
             ],
@@ -8410,6 +8756,9 @@ def _verify_layer6_compact_contract(
         "runtime_before_run",
         "runtime_identity_sha256",
         "formal_live_source_summary",
+        "worker_runtime_summary",
+        "model_execution_receipt",
+        "source_execution_receipts",
         "companion_preflight",
         "event_injection_contract",
         "timeout_contract",
@@ -8474,6 +8823,285 @@ def _verify_layer6_compact_contract(
             f"evidence commit E layer-6 compact {tracked_rel} has invalid "
             f"formal production source binding: {exc}"
         ) from exc
+    worker_summary = compact.get("worker_runtime_summary")
+    model_receipt = compact.get("model_execution_receipt")
+    job_members = summary_value.get("job_member_summary")
+    if not isinstance(job_members, dict):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} has no signed "
+            "job member summary"
+        )
+    worker_fields = {
+        "schema_version",
+        "runtime_receipt_sha256",
+        "runtime",
+        "providers",
+        "spec_sha256",
+        "api_runtime_identity_sha256",
+        "runtime_provenance",
+        "worker_runtime_identity",
+        "worker_runtime_identity_sha256",
+        "model_agents_required",
+        "model_runtime_identity",
+        "summary_sha256",
+    }
+    receipt_fields = {
+        "schema_version",
+        "job_id",
+        "request_sha256",
+        "runtime_bundle_spec_sha256",
+        "worker_runtime_identity_sha256",
+        "model_runtime_identity",
+        "trace_count",
+        "success_count",
+        "failure_count",
+        "traces",
+        "receipt_sha256",
+    }
+    if (
+        not isinstance(worker_summary, dict)
+        or set(worker_summary) != worker_fields
+        or worker_summary.get("schema_version")
+        != "tripchord-live-worker-runtime-summary-v1"
+        or worker_summary.get("runtime") != "browser-bridge"
+        or worker_summary.get("model_agents_required") is not True
+        or worker_summary.get("runtime_receipt_sha256")
+        != job_members.get("worker_runtime_receipt_sha256")
+        or worker_summary.get("summary_sha256")
+        != _canonical_sha256(
+            {
+                key: value
+                for key, value in worker_summary.items()
+                if key != "summary_sha256"
+            }
+        )
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} has invalid "
+            "worker runtime summary"
+        )
+    traces = model_receipt.get("traces") if isinstance(model_receipt, dict) else None
+    model_identity = worker_summary.get("model_runtime_identity")
+    expected_job_id = job_members.get("terminal_job_id")
+    if (
+        not isinstance(model_receipt, dict)
+        or set(model_receipt) != receipt_fields
+        or model_receipt.get("schema_version")
+        != "tripchord-model-execution-receipt-v1"
+        or model_receipt.get("job_id") != expected_job_id
+        or model_receipt.get("request_sha256") != api_payload_sha
+        or model_receipt.get("runtime_bundle_spec_sha256")
+        != worker_summary.get("spec_sha256")
+        or model_receipt.get("worker_runtime_identity_sha256")
+        != worker_summary.get("worker_runtime_identity_sha256")
+        or model_receipt.get("model_runtime_identity") != model_identity
+        or model_receipt.get("receipt_sha256")
+        != job_members.get("model_execution_receipt_sha256")
+        or type(model_receipt.get("trace_count")) is not int
+        or model_receipt.get("trace_count", 0) <= 0
+        or model_receipt.get("success_count") != model_receipt.get("trace_count")
+        or model_receipt.get("failure_count") != 0
+        or not isinstance(traces, list)
+        or len(traces) != model_receipt.get("trace_count")
+        or model_receipt.get("receipt_sha256")
+        != _canonical_sha256(
+            {
+                key: value
+                for key, value in model_receipt.items()
+                if key != "receipt_sha256"
+            }
+        )
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} has invalid "
+            "model execution receipt"
+        )
+    allowed_models = (
+        {model_identity.get("primary_model"), model_identity.get("fast_model")}
+        if isinstance(model_identity, dict)
+        else set()
+    )
+    for trace in traces:
+        if (
+            not isinstance(trace, dict)
+            or trace.get("scope_id") != expected_job_id
+            or trace.get("scope_request_digest") != api_payload_sha
+            or trace.get("provider")
+            != (model_identity.get("provider") if isinstance(model_identity, dict) else None)
+            or trace.get("model") not in allowed_models
+            or trace.get("success") is not True
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} has a "
+                "foreign/failed model trace"
+            )
+    worker_preflight = (compact.get("runtime_before_run") or {}).get(
+        "worker_model_runtime"
+    )
+    if (
+        not isinstance(worker_preflight, dict)
+        or worker_preflight.get("required") is not True
+        or worker_preflight.get("enabled") is not True
+        or worker_preflight.get("runtime_bundle_spec_sha256")
+        != worker_summary.get("spec_sha256")
+        or any(
+            worker_preflight.get(field) != model_identity.get(field)
+            for field in ("provider", "base_url", "primary_model", "fast_model")
+        )
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} worker model "
+            "preflight differs from its execution receipt"
+        )
+    source_set = compact.get("source_execution_receipts")
+    source_set_fields = {
+        "schema_version",
+        "count",
+        "ordered_receipt_sha256",
+        "receipt_chain_sha256",
+        "receipts",
+    }
+    source_receipt_fields = {
+        "schema_version",
+        "task_id",
+        "provider",
+        "kind",
+        "companion_id",
+        "runtime_instance_id",
+        "build_identity",
+        "execution_environment",
+        "parser_version",
+        "query_sha256",
+        "source_observation_sha256",
+        "completion_sha256",
+        "capability_id",
+        "challenge_id",
+        "run_id",
+        "terminal_job_id",
+        "request_sha256",
+        "job_graph_sha256",
+        "attempt_digest",
+        "completed_at",
+        "receipt_sha256",
+    }
+    source_receipts = (
+        source_set.get("receipts") if isinstance(source_set, dict) else None
+    )
+    ordered_source_hashes = (
+        source_set.get("ordered_receipt_sha256")
+        if isinstance(source_set, dict)
+        else None
+    )
+    if (
+        not isinstance(source_set, dict)
+        or set(source_set) != source_set_fields
+        or source_set.get("schema_version")
+        != "tripchord-source-execution-receipt-set-v1"
+        or type(source_set.get("count")) is not int
+        or source_set.get("count", 0) <= 0
+        or source_set.get("count")
+        != job_members.get("source_execution_receipt_count")
+        or not isinstance(source_receipts, list)
+        or len(source_receipts) != source_set.get("count")
+        or not isinstance(ordered_source_hashes, list)
+        or len(ordered_source_hashes) != len(source_receipts)
+        or source_set.get("receipt_chain_sha256")
+        != _canonical_sha256(ordered_source_hashes)
+        or source_set.get("receipt_chain_sha256")
+        != job_members.get("source_execution_receipt_chain_sha256")
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} has invalid "
+            "source execution receipt set"
+        )
+    companion_preflight = compact.get("companion_preflight")
+    companion_rows = (
+        companion_preflight.get("companions")
+        if isinstance(companion_preflight, dict)
+        else None
+    )
+    if not isinstance(companion_rows, list) or len(companion_rows) != 1:
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} has no unique "
+            "formal Companion identity"
+        )
+    companion = companion_rows[0]
+    source_identity: tuple[object, ...] | None = None
+    source_task_ids: set[str] = set()
+    for index, receipt in enumerate(source_receipts):
+        if not isinstance(receipt, dict) or set(receipt) != source_receipt_fields:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} source "
+                f"receipt {index} shape is invalid"
+            )
+        unsigned_receipt = {
+            key: value for key, value in receipt.items() if key != "receipt_sha256"
+        }
+        identity = (
+            receipt.get("capability_id"),
+            receipt.get("challenge_id"),
+            receipt.get("run_id"),
+            receipt.get("attempt_digest"),
+        )
+        task_id = receipt.get("task_id")
+        if (
+            receipt.get("schema_version")
+            != "tripchord-browser-source-execution-receipt-v1"
+            or receipt.get("parser_version") != "tripchord-visible-dom-v3"
+            or receipt.get("execution_environment")
+            != "chrome_extension_service_worker"
+            or receipt.get("terminal_job_id") != expected_job_id
+            or receipt.get("request_sha256") != api_payload_sha
+            or receipt.get("capability_id")
+            != job_members.get("execution_capability_id")
+            or receipt.get("attempt_digest")
+            != job_members.get("execution_attempt_digest")
+            or receipt.get("challenge_id") != summary_value.get("challenge_id")
+            or receipt.get("run_id") != summary_value.get("run_id")
+            or receipt.get("job_graph_sha256")
+            != job_members.get("job_graph_sha256")
+            or receipt.get("companion_id") != companion.get("companion_id")
+            or receipt.get("runtime_instance_id")
+            != companion.get("runtime_instance_id")
+            or receipt.get("build_identity") != companion.get("build_identity")
+            or not isinstance(task_id, str)
+            or not task_id
+            or task_id in source_task_ids
+            or receipt.get("receipt_sha256") != _canonical_sha256(unsigned_receipt)
+            or ordered_source_hashes[index] != receipt.get("receipt_sha256")
+            or any(
+                not isinstance(receipt.get(field), str)
+                or _HEX_HASH_RE.fullmatch(receipt[field]) is None
+                for field in (
+                    "query_sha256",
+                    "source_observation_sha256",
+                    "completion_sha256",
+                    "job_graph_sha256",
+                    "attempt_digest",
+                    "receipt_sha256",
+                )
+            )
+        ):
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} source "
+                f"receipt {index} binding is invalid"
+            )
+        if source_identity is None:
+            source_identity = identity
+        elif source_identity != identity:
+            raise GateStateChangedError(
+                f"evidence commit E layer-6 compact {tracked_rel} crosses "
+                "source execution identities"
+            )
+        source_task_ids.add(task_id)
+    ordered_source_task_ids = [str(receipt["task_id"]) for receipt in source_receipts]
+    if _canonical_sha256(ordered_source_task_ids) != job_members.get(
+        "source_execution_task_ids_sha256"
+    ):
+        raise GateStateChangedError(
+            f"evidence commit E layer-6 compact {tracked_rel} source task "
+            "membership differs from the signed authority summary"
+        )
     if not isinstance(compact.get("repo_revision"), dict):
         raise GateStateChangedError(
             f"evidence commit E layer-6 compact {tracked_rel} repo_revision is "

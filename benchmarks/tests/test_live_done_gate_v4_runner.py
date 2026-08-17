@@ -14,6 +14,9 @@ from typing import Any
 import httpx
 import pytest
 from pydantic import TypeAdapter
+from tripchord.agents.companion_control_tools import (
+    verified_companion_build_identity,
+)
 from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
 from tripchord.agents.live_system import (
     LiveDataProvider,
@@ -59,6 +62,7 @@ def _runtime_payload(*, model_trace_count: int = 7) -> dict[str, Any]:
         "rag_enabled": True,
         "runtime_provenance": _runtime_provenance_payload(),
         "formal_live_source": {"fixture_anchor_available": True},
+        "worker_model_runtime": None,
     }
 
 
@@ -81,12 +85,11 @@ def _companion_preflight_payload() -> dict[str, Any]:
                 "adapter_version": "0.2.0",
                 "contract_version": "tripchord-capability-v1",
                 "runtime_instance_id": "formal-companion-runtime-v1",
-                "build_identity": {
-                    "protocol_version": "tripchord-companion-control-v1",
-                    "manifest_version": "formal-companion-build-v1",
-                    "build_sha256": "8" * 64,
-                    "content_runtime_version": "formal-companion-runtime-v1",
-                },
+                "build_identity": verified_companion_build_identity(
+                    Path(__file__).resolve().parents[2]
+                    / "apps"
+                    / "browser-companion"
+                ).model_dump(mode="json"),
                 "last_seen": "2026-08-15T00:00:00+00:00",
                 "age_seconds": 0.0,
                 "is_fresh": True,
@@ -162,6 +165,81 @@ def _install_failed_run_formal_control_double(
 
 def _api_payload_sha256() -> str:
     return run_live_done_gate_v4._canonical_sha256(run_live_done_gate_v4._api_payload(_request()))
+
+
+def _formal_worker_model_receipts(
+    *,
+    trace_count: int,
+    job_id: str = "live-job-fixture",
+    request_sha256: str | None = None,
+) -> dict[str, object]:
+    """Exact unit-fixture receipts for runner boundary tests only."""
+
+    request_digest = request_sha256 or _api_payload_sha256()
+    runtime = _runtime_provenance_payload()
+    model_identity = {
+        "provider": "openai_compatible",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "primary_model": "gpt-oss:20b",
+        "fast_model": "gpt-oss:20b",
+    }
+    spec_sha256 = "b" * 64
+    worker_receipt: dict[str, object] = {
+        "schema_version": "tripchord-live-worker-runtime-receipt-v1",
+        "runtime": "browser-bridge",
+        "providers": ["ctrip", "qunar", "tongcheng"],
+        "spec_sha256": spec_sha256,
+        "runtime_provenance": runtime,
+        "api_runtime_identity_sha256": (
+            run_live_done_gate_v4._canonical_sha256(runtime)
+        ),
+        "worker_runtime_identity": runtime,
+        "model_agents_required": True,
+        "model_runtime_identity": model_identity,
+    }
+    traces = [
+        {
+            "id": f"fixture-model-trace-{index:04d}",
+            "provider": model_identity["provider"],
+            "model": model_identity["primary_model"],
+            "role": "context",
+            "request_digest": f"{index + 1:064x}",
+            "scope_id": job_id,
+            "scope_request_digest": request_digest,
+            "response_schema_requested": True,
+            "tool_count": 0,
+            "started_at": "2026-08-10T00:00:01+00:00",
+            "finished_at": "2026-08-10T00:00:02+00:00",
+            "success": True,
+            "usage": {"input_tokens": 8, "output_tokens": 4},
+            "estimated_cost_usd": 0.0,
+            "error_class": None,
+        }
+        for index in range(trace_count)
+    ]
+    unsigned_model_receipt: dict[str, object] = {
+        "schema_version": "tripchord-model-execution-receipt-v1",
+        "job_id": job_id,
+        "request_sha256": request_digest,
+        "runtime_bundle_spec_sha256": spec_sha256,
+        "worker_runtime_identity_sha256": (
+            run_live_done_gate_v4._canonical_sha256(runtime)
+        ),
+        "model_runtime_identity": model_identity,
+        "trace_count": trace_count,
+        "success_count": trace_count,
+        "failure_count": 0,
+        "traces": traces,
+    }
+    return {
+        "worker_runtime_receipt": worker_receipt,
+        "model_execution_receipt": {
+            **unsigned_model_receipt,
+            "receipt_sha256": run_live_done_gate_v4._canonical_sha256(
+                unsigned_model_receipt
+            ),
+        },
+    }
 
 
 def _checkpoint(
@@ -1376,6 +1454,10 @@ def test_formal_control_context_budget_isolated_and_reset() -> None:
 
 
 def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
+    from tripchord.agents.companion_control_tools import (
+        verified_companion_build_identity,
+    )
+
     companion = {
         "companion_id": "formal-companion-v1",
         "providers": ["ctrip", "qunar", "tongcheng"],
@@ -1389,12 +1471,9 @@ def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
         "adapter_version": "0.2.0",
         "contract_version": "tripchord-capability-v1",
         "runtime_instance_id": "formal-companion-runtime-v1",
-        "build_identity": {
-            "protocol_version": "tripchord-companion-control-v1",
-            "manifest_version": "formal-companion-build-v1",
-            "build_sha256": "8" * 64,
-            "content_runtime_version": "formal-companion-runtime-v1",
-        },
+        "build_identity": verified_companion_build_identity(
+            run_live_done_gate_v4._REPO_ROOT / "apps/browser-companion"
+        ).model_dump(mode="json"),
         "last_seen": "2026-08-15T00:00:00+00:00",
         "age_seconds": 0.0,
         "is_fresh": True,
@@ -1411,6 +1490,32 @@ def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
     assert binding["identity_sha256"] == run_live_done_gate_v4._canonical_sha256(
         {key: value for key, value in binding.items() if key != "identity_sha256"}
     )
+    for field, foreign, message in (
+        ("adapter_version", "test-companion-v1", "production adapter/contract"),
+        ("contract_version", "test-contract-v1", "production adapter/contract"),
+    ):
+        with pytest.raises(RuntimeError, match=message):
+            run_live_done_gate_v4._formal_companion_binding_from_preflight(
+                {
+                    **preflight,
+                    "companions": [{**companion, field: foreign}],
+                }
+            )
+    with pytest.raises(RuntimeError, match="verified release"):
+        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+            {
+                **preflight,
+                "companions": [
+                    {
+                        **companion,
+                        "build_identity": {
+                            **companion["build_identity"],
+                            "build_sha256": "7" * 64,
+                        },
+                    }
+                ],
+            }
+        )
     with pytest.raises(RuntimeError, match="exactly one"):
         run_live_done_gate_v4._formal_companion_binding_from_preflight(
             {**preflight, "companions": [companion, copy.deepcopy(companion)]}
@@ -1811,6 +1916,7 @@ async def test_v4_run_without_recommendation_emits_gate_failure_and_skips_event(
         "model_trace_failure_count": 0,
         "cached_pair_runs": [],
         "run": {"validated": "by test double"},
+        **_formal_worker_model_receipts(trace_count=2),
     }
     posts: list[dict[str, Any]] = []
     client_timeouts: list[httpx.Timeout] = []
@@ -2133,10 +2239,11 @@ async def test_v4_job_bound_trace_receipt_ignores_non_positive_global_delta(
         "model_enhancement_enabled": True,
         "model_trace_scope_sha256": _api_payload_sha256(),
         "model_trace_count": 3,
-        "model_trace_success_count": 2,
-        "model_trace_failure_count": 1,
+        "model_trace_success_count": 3,
+        "model_trace_failure_count": 0,
         "cached_pair_runs": [],
         "run": {"validated": "by test double"},
+        **_formal_worker_model_receipts(trace_count=3),
     }
 
     class FakeClient:
@@ -2157,8 +2264,8 @@ async def test_v4_job_bound_trace_receipt_ignores_non_positive_global_delta(
                         progress=100,
                         result=response_payload,
                         pair_checkpoints=_three_checkpoints(),
-                        model_trace_success_count=2,
-                        model_trace_failure_count=1,
+                        model_trace_success_count=3,
+                        model_trace_failure_count=0,
                     ),
                     request=httpx.Request("GET", url),
                 )
@@ -2249,8 +2356,8 @@ async def test_v4_job_bound_trace_receipt_ignores_non_positive_global_delta(
     assert evidence["model_trace_receipt"] == {
         "scope_sha256": _api_payload_sha256(),
         "total_count": 3,
-        "success_count": 2,
-        "failure_count": 1,
+        "success_count": 3,
+        "failure_count": 0,
     }
     assert evidence["process_global_model_trace_diagnostic"]["delta"] == expected_delta
     assert evidence["process_global_model_trace_diagnostic"]["authoritative"] is False

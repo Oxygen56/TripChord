@@ -173,6 +173,49 @@ async def test_deepseek_auto_mode_uses_json_object_and_client_side_schema_gate()
 
 
 @pytest.mark.asyncio
+async def test_gpt_oss_disabled_thinking_uses_bounded_reasoning_effort() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": '{"status":"ok"}'},
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        await OpenAICompatibleChatClient(
+            model="gpt-oss:20b",
+            base_url="http://127.0.0.1:11434/v1",
+            http_client=http_client,
+            thinking_mode=ModelThinkingMode.DISABLED,
+        ).complete(
+            ModelRequest(
+                role=AgentRole.CONTEXT,
+                system="Return JSON.",
+                messages=(ModelMessage(role="user", content="status"),),
+                response_schema={
+                    "type": "object",
+                    "required": ["status"],
+                    "properties": {"status": {"type": "string"}},
+                },
+            )
+        )
+
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert body["reasoning_effort"] == "low"
+    assert "thinking" not in body
+
+
+@pytest.mark.asyncio
 async def test_deepseek_enabled_thinking_replays_reasoning_with_tool_turn() -> None:
     captured: list[dict[str, object]] = []
 

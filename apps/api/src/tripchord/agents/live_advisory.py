@@ -1224,6 +1224,10 @@ class StructuredLiveModelAgent:
                             "disclosure_only_public_transfer_ids",
                             [],
                         )
+                        must_be_comparable_quote_ids = policy_context.get(
+                            "must_be_comparable_quote_ids",
+                            [],
+                        )
                         repair_rules.extend(
                             (
                                 "comparable_quote_ids 与 excluded_quote_ids 各自不得重复且必须互斥",
@@ -1258,6 +1262,12 @@ class StructuredLiveModelAgent:
                             repair_rules.append(
                                 "以下 quote ID 必须从 excluded_quote_ids 中移除，且不得改写："
                                 f"{disclosure_only_quote_ids}"
+                            )
+                        if must_be_comparable_quote_ids:
+                            repair_rules.append(
+                                "以下 quote ID 已由确定性合同确认为可比，必须全部放入 "
+                                "comparable_quote_ids，不得放入 excluded_quote_ids："
+                                f"{must_be_comparable_quote_ids}"
                             )
                     elif self._output_model is ExplanationSelectionProposal:
                         repair_rules.extend(
@@ -1343,6 +1353,40 @@ class StructuredLiveModelAgent:
                                 (
                                     "repair_required 必须与是否存在至少一个合法 error finding "
                                     "严格等价"
+                                ),
+                            )
+                        )
+                    elif self._output_model.__name__ == "SearchSupervisorProposal":
+                        repair_rules.extend(
+                            (
+                                (
+                                    "strict 模式必须把 proposal_policy.context."
+                                    "allowed_task_ids 按给定顺序全部且只出现一次；"
+                                    "skipped_task_ids 必须为空"
+                                ),
+                                (
+                                    "declared_budget_units 必须精确等于 "
+                                    "proposal_policy.context.hard_budget_units，不得自行计数"
+                                ),
+                                (
+                                    "一个 wave 可容纳所有 allowed_task_ids 时优先使用单 wave，"
+                                    "避免增加浏览器 barrier 批次"
+                                ),
+                            )
+                        )
+                    elif self._output_model is RepairStrategyProposal:
+                        repair_rules.extend(
+                            (
+                                (
+                                    "当 proposal_policy.context.initial_candidate_id=null 时，"
+                                    "action 必须为 expand_search，target_candidate_id 必须为 null，"
+                                    "dependencies_to_refresh 必须为 []"
+                                ),
+                                (
+                                    "当 hard_error_codes 和 soft_error_codes 都为空，"
+                                    "且存在初始候选时，"
+                                    "action 必须为 keep，target_candidate_id 必须为 null，"
+                                    "dependencies_to_refresh 必须为 []"
                                 ),
                             )
                         )
@@ -1593,6 +1637,10 @@ class StructuredLiveModelAgent:
                 "disclosure_only_public_transfer_ids",
                 [],
             )
+            must_be_comparable_quote_ids = policy_context.get(
+                "must_be_comparable_quote_ids",
+                [],
+            )
 
             def duplicates(values: tuple[str, ...]) -> list[str]:
                 seen: set[str] = set()
@@ -1617,6 +1665,7 @@ class StructuredLiveModelAgent:
                 "unknown_quote_ids": unknown_quote_ids,
                 "required_risk_flags": list(required_evidence_risk_flags),
                 "must_not_be_excluded_quote_ids": disclosure_only_quote_ids,
+                "must_be_comparable_quote_ids": must_be_comparable_quote_ids,
                 "requirements": [
                     "each quote ID list is unique",
                     "comparable and excluded quote ID sets are disjoint",
@@ -1626,10 +1675,53 @@ class StructuredLiveModelAgent:
                         "placed in excluded_quote_ids"
                     ),
                     (
+                        "every must_be_comparable_quote_id belongs in "
+                        "comparable_quote_ids and never in excluded_quote_ids"
+                    ),
+                    (
                         "other materially uncertain quotes belong only to "
                         "excluded_quote_ids"
                     ),
                     "every required risk flag is preserved verbatim",
+                ],
+            }
+        elif self._output_model.__name__ == "SearchSupervisorProposal":
+            policy_context = proposal_policy_context or {}
+            contract["search_schedule"] = {
+                "coverage_mode": policy_context.get("coverage_mode"),
+                "ordered_allowed_task_ids": policy_context.get(
+                    "allowed_task_ids",
+                    [],
+                ),
+                "required_task_ids": policy_context.get("required_task_ids", []),
+                "declared_budget_units": policy_context.get(
+                    "hard_budget_units"
+                ),
+                "requirements": [
+                    "include every ordered allowed task exactly once",
+                    "strict mode has no skipped task ids",
+                    "copy hard_budget_units exactly into declared_budget_units",
+                    "use one wave when the browser lease cap permits it",
+                ],
+            }
+        elif self._output_model is RepairStrategyProposal:
+            policy_context = proposal_policy_context or {}
+            contract["repair_strategy"] = {
+                "initial_candidate_id": policy_context.get(
+                    "initial_candidate_id"
+                ),
+                "hard_error_codes": policy_context.get("hard_error_codes", []),
+                "soft_error_codes": policy_context.get("soft_error_codes", []),
+                "requirements": [
+                    (
+                        "when initial_candidate_id is null: action=expand_search, "
+                        "target_candidate_id=null, dependencies_to_refresh=[]"
+                    ),
+                    (
+                        "when a candidate exists and both error lists are empty: "
+                        "action=keep, target_candidate_id=null, "
+                        "dependencies_to_refresh=[]"
+                    ),
                 ],
             }
         elif self._output_model is ExplanationSelectionProposal:

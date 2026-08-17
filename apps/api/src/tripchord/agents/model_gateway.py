@@ -914,7 +914,14 @@ class OpenAICompatibleChatClient:
         }
         resolved_thinking_mode = self._resolved_thinking_mode()
         if resolved_thinking_mode is not None:
-            body["thinking"] = {"type": resolved_thinking_mode.value}
+            if self._uses_gpt_oss_contract():
+                body["reasoning_effort"] = (
+                    "low"
+                    if resolved_thinking_mode == ModelThinkingMode.DISABLED
+                    else "high"
+                )
+            else:
+                body["thinking"] = {"type": resolved_thinking_mode.value}
         if request.tools:
             body["tools"] = [
                 {
@@ -1105,6 +1112,10 @@ class OpenAICompatibleChatClient:
         return "deepseek.com" in self._base_url.casefold() or normalized_model.startswith(
             ("deepseek-v4", "deepseek-chat", "deepseek-reasoner")
         )
+
+    def _uses_gpt_oss_contract(self) -> bool:
+        normalized_model = self.model.casefold()
+        return normalized_model.startswith(("gpt-oss", "openai/gpt-oss"))
 
     def _messages(self, request: ModelRequest) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = [{"role": "system", "content": request.system}]

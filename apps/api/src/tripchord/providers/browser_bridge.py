@@ -14,7 +14,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Protocol
+from typing import Annotated, Any, Protocol
 from urllib.parse import ParseResult, parse_qsl, urlencode, urlparse
 from urllib.parse import quote as url_quote
 from uuid import uuid4
@@ -32,6 +32,15 @@ IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 COMPANION_HEARTBEAT_STALE_AFTER_SECONDS = 45
 RECENT_EXACT_QUOTE_REUSE_SECONDS = 600
 PRODUCTION_VISIBLE_DOM_PARSER_VERSION = "tripchord-visible-dom-v3"
+SOURCE_EXECUTION_ATTESTATION_SCHEMA = (
+    "tripchord-browser-source-execution-attestation-v1"
+)
+SOURCE_EXECUTION_RECEIPT_SCHEMA = "tripchord-browser-source-execution-receipt-v1"
+PRODUCTION_SOURCE_EXECUTION_ENVIRONMENT = "chrome_extension_service_worker"
+UNTRUSTED_SOURCE_EXECUTION_ENVIRONMENT = "untrusted_external_executor"
+_FORMAL_WORKER_SOURCE_TOKEN_CONTEXT = (
+    b"tripchord-formal-worker-parent-source-v1"
+)
 DEFAULT_TERMINAL_RECORD_RETENTION_SECONDS = 3600
 DEFAULT_MAX_TERMINAL_RECORDS = 256
 DEFAULT_MAX_COMPANION_CONTROL_RECORDS = 64
@@ -119,6 +128,35 @@ _FORBIDDEN_ACTION_TRACE_MARKERS = (
     "支付",
     "预订",
 )
+
+
+def _canonical_json_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def formal_worker_source_token(bridge_token: str) -> str:
+    """Derive a one-way worker credential distinct from the Companion token.
+
+    A formal worker may submit/poll/cancel tasks on the parent queue, but it
+    must never possess the credential accepted by Companion heartbeat, claim,
+    or completion routes.  The derived value is domain-separated and cannot be
+    used to recover or authenticate as the original bridge token.
+    """
+
+    if len(bridge_token) < 32:
+        raise ValueError("bridge_token must contain at least 32 characters")
+    return hmac.new(
+        bridge_token.encode("utf-8"),
+        _FORMAL_WORKER_SOURCE_TOKEN_CONTEXT,
+        hashlib.sha256,
+    ).hexdigest()
 
 
 class BrowserProvider(StrEnum):
@@ -1665,6 +1703,28 @@ class SubmitBrowserTasksResponse(DomainModel):
     tasks: tuple[BrowserTaskSnapshot, ...]
 
 
+class SubmitFormalBrowserTasksRequest(DomainModel):
+    execution_capability: dict[str, object]
+    tasks: tuple[BrowserTaskSubmission, ...] = Field(min_length=1, max_length=24)
+
+
+class CancelFormalBrowserTasksRequest(DomainModel):
+    execution_capability: dict[str, object]
+    task_ids: tuple[str, ...] = Field(min_length=1, max_length=24)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class ReadFormalBrowserTasksRequest(DomainModel):
+    execution_capability: dict[str, object]
+    task_ids: tuple[str, ...] = Field(min_length=1, max_length=24)
+
+
+class FormalIComSearchRequest(DomainModel):
+    execution_capability: dict[str, object]
+    query_task_id: str = Field(min_length=1, max_length=240)
+    query: dict[str, object]
+
+
 class BrowserCompanionBuildIdentity(DomainModel):
     protocol_version: str = Field(
         default=COMPANION_CONTROL_PROTOCOL_VERSION,
@@ -1881,9 +1941,76 @@ class BrowserCompanionStatusResponse(DomainModel):
     _validate_server_time = field_validator("server_time")(_require_timezone)
 
 
+class BrowserSourceExecutionAttestation(DomainModel):
+    """Public Companion identity bound to one visible-DOM observation.
+
+    The lease token authorizes a state transition; it is deliberately not
+    accepted as proof that the production parser/build/runtime performed the
+    observation.  This separate envelope is checked against the live claim
+    heartbeat and the exact task/query/result before a formal task can finish.
+    """
+
+    schema_version: str = Field(
+        default=SOURCE_EXECUTION_ATTESTATION_SCHEMA,
+        pattern=f"^{SOURCE_EXECUTION_ATTESTATION_SCHEMA}$",
+    )
+    task_id: str = Field(min_length=1)
+    provider: BrowserProvider
+    kind: BrowserVertical
+    companion_id: str = Field(min_length=1, max_length=128)
+    runtime_instance_id: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$"
+    )
+    build_identity: BrowserCompanionBuildIdentity
+    execution_environment: str = Field(
+        pattern=(
+            "^(chrome_extension_service_worker|"
+            "untrusted_external_executor)$"
+        )
+    )
+    parser_version: str = Field(min_length=1, max_length=64)
+    query_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_observation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    completed_at: datetime
+
+    _validate_completed_at = field_validator("completed_at")(_require_timezone)
+
+
+class BrowserSourceExecutionReceipt(DomainModel):
+    """Server-derived, formal-job-bound proof for one Companion observation."""
+
+    schema_version: str = Field(
+        default=SOURCE_EXECUTION_RECEIPT_SCHEMA,
+        pattern=f"^{SOURCE_EXECUTION_RECEIPT_SCHEMA}$",
+    )
+    task_id: str = Field(min_length=1)
+    provider: BrowserProvider
+    kind: BrowserVertical
+    companion_id: str = Field(min_length=1, max_length=128)
+    runtime_instance_id: str
+    build_identity: BrowserCompanionBuildIdentity
+    execution_environment: str
+    parser_version: str
+    query_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_observation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    completion_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    capability_id: str = Field(min_length=1)
+    challenge_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    terminal_job_id: str = Field(min_length=1)
+    request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    job_graph_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    attempt_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    completed_at: datetime
+    receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    _validate_completed_at = field_validator("completed_at")(_require_timezone)
+
+
 class CompleteBrowserTaskRequest(DomainModel):
     claim_token: str = Field(min_length=16)
     completion: BrowserTaskCompletion
+    source_execution_attestation: BrowserSourceExecutionAttestation | None = None
 
 
 class BrowserBridgeError(RuntimeError):
@@ -1924,6 +2051,7 @@ class _TaskRecord:
     reuse_age_seconds: float | None = None
     inflight_coalesce_count: int = 0
     formal_execution_capability: dict[str, object] | None = None
+    source_execution_receipt: BrowserSourceExecutionReceipt | None = None
 
 
 @dataclass(frozen=True)
@@ -2260,6 +2388,16 @@ class BrowserTaskBridge:
             capability = record.formal_execution_capability
             return dict(capability) if capability is not None else None
 
+    async def source_execution_receipt(
+        self,
+        task_id: str,
+    ) -> BrowserSourceExecutionReceipt | None:
+        """Return the server-derived receipt attached to a terminal formal task."""
+
+        async with self._changed:
+            receipt = self._record(task_id).source_execution_receipt
+            return receipt.model_copy(deep=True) if receipt is not None else None
+
     async def claim(
         self,
         companion_id: str,
@@ -2577,6 +2715,7 @@ class BrowserTaskBridge:
         task_id: str,
         claim_token: str,
         completion: BrowserTaskCompletion,
+        source_execution_attestation: BrowserSourceExecutionAttestation | None = None,
     ) -> BrowserTaskSnapshot:
         async with self._changed:
             self._housekeep_and_notify_locked()
@@ -2589,17 +2728,213 @@ class BrowserTaskBridge:
                 raise BrowserClaimError("task lease has expired")
             self._validate_completion(record.submission, completion)
             now = self._utc_now()
+            source_receipt = self._validate_source_execution_attestation(
+                record,
+                completion,
+                source_execution_attestation,
+                now=now,
+            )
+            previous_terminal_fields = (
+                record.state,
+                record.updated_at,
+                record.quotes,
+                record.failure,
+                record.source_execution_receipt,
+            )
             record.state = completion.state
             record.updated_at = now
             record.quotes = completion.quotes
             record.failure = completion.failure
+            record.source_execution_receipt = source_receipt
+            snapshot = self._snapshot(record)
+            try:
+                self._record_formal_completion(
+                    record,
+                    completion,
+                    snapshot,
+                    source_receipt,
+                )
+            except BaseException:
+                (
+                    record.state,
+                    record.updated_at,
+                    record.quotes,
+                    record.failure,
+                    record.source_execution_receipt,
+                ) = previous_terminal_fields
+                raise
             record.claim_token = None
             record.lease_expires_at = None
             self._active_consumers.pop(record.id, None)
             self._prune_terminal_records()
             self._persist_state()
             self._changed.notify_all()
-            return self._snapshot(record)
+            return snapshot
+
+    def _record_formal_completion(
+        self,
+        record: _TaskRecord,
+        completion: BrowserTaskCompletion,
+        snapshot: BrowserTaskSnapshot,
+        source_receipt: BrowserSourceExecutionReceipt | None,
+    ) -> None:
+        capability = record.formal_execution_capability
+        authority = self._source_authority
+        if authority is None or capability is None:
+            return
+        if source_receipt is None:
+            raise BrowserClaimError("formal task has no source execution receipt")
+        snapshot_payload = snapshot.model_dump(mode="json")
+        try:
+            with authority.execution_scope(capability):
+                authority.record_browser_http(
+                    "browser_complete",
+                    subject_ids=(record.id,),
+                    details={
+                        "task_id": record.id,
+                        "completion": completion.model_dump(mode="json"),
+                        "source_execution_receipt": source_receipt.model_dump(
+                            mode="json"
+                        ),
+                        "snapshot": snapshot_payload,
+                        "formal_query": authority.formal_browser_query(
+                            task_id=snapshot.id,
+                            provider=snapshot.provider.value,
+                            kind=snapshot.kind.value,
+                            query=snapshot.query.model_dump(mode="json"),
+                        ),
+                        "result_sha256": _canonical_json_sha256(snapshot_payload),
+                    },
+                )
+        except ValueError as exc:
+            raise BrowserClaimError(str(exc)) from exc
+
+    def _validate_source_execution_attestation(
+        self,
+        record: _TaskRecord,
+        completion: BrowserTaskCompletion,
+        attestation: BrowserSourceExecutionAttestation | None,
+        *,
+        now: datetime,
+    ) -> BrowserSourceExecutionReceipt | None:
+        capability = record.formal_execution_capability
+        if attestation is None:
+            if capability is not None:
+                raise BrowserClaimError(
+                    "formal task requires a source execution attestation"
+                )
+            return None
+        if record.claimed_by is None or record.claimed_at is None:
+            raise BrowserClaimError("source execution attestation has no active claim")
+        heartbeat = self._companion_heartbeats.get(record.claimed_by)
+        if (
+            heartbeat is None
+            or heartbeat.build_identity is None
+            or heartbeat.runtime_instance_id is None
+            or now - heartbeat.last_seen
+            > timedelta(seconds=COMPANION_HEARTBEAT_STALE_AFTER_SECONDS)
+        ):
+            raise BrowserClaimError(
+                "source execution attestation has no fresh Companion runtime identity"
+            )
+        query_payload = record.submission.query.model_dump(mode="json")
+        query_sha256 = _canonical_json_sha256(query_payload)
+        observation_payload = {
+            "task_id": record.id,
+            "provider": record.submission.provider.value,
+            "kind": record.submission.kind.value,
+            "query": query_payload,
+            "quote_evidence_sha256": [
+                quote.evidence_sha256 for quote in completion.quotes
+            ],
+            "parser_version": attestation.parser_version,
+        }
+        expected_observation_sha256 = _canonical_json_sha256(observation_payload)
+        if (
+            attestation.task_id != record.id
+            or attestation.provider != record.submission.provider
+            or attestation.kind != record.submission.kind
+            or attestation.companion_id != record.claimed_by
+            or attestation.companion_id != heartbeat.companion_id
+            or attestation.runtime_instance_id != heartbeat.runtime_instance_id
+            or attestation.build_identity != heartbeat.build_identity
+            or attestation.parser_version != PRODUCTION_VISIBLE_DOM_PARSER_VERSION
+            or attestation.query_sha256 != query_sha256
+            or attestation.source_observation_sha256
+            != expected_observation_sha256
+        ):
+            raise BrowserClaimError(
+                "source execution attestation differs from the claimed task/runtime"
+            )
+        if any(
+            quote.parser_version != attestation.parser_version
+            for quote in completion.quotes
+        ):
+            raise BrowserClaimError(
+                "source execution attestation parser differs from its quotes"
+            )
+        completed_at = attestation.completed_at.astimezone(UTC)
+        if (
+            completed_at < record.claimed_at.astimezone(UTC)
+            or completed_at > now.astimezone(UTC) + timedelta(seconds=1)
+        ):
+            raise BrowserClaimError(
+                "source execution attestation timestamp is outside its claim"
+            )
+        if capability is None:
+            return None
+        if (
+            attestation.execution_environment
+            != PRODUCTION_SOURCE_EXECUTION_ENVIRONMENT
+        ):
+            raise BrowserClaimError(
+                "formal task requires the production extension execution environment"
+            )
+        required_capability_fields = {
+            "capability_id",
+            "challenge_id",
+            "run_id",
+            "terminal_job_id",
+            "request_sha256",
+            "job_graph_sha256",
+            "attempt_digest",
+        }
+        if any(
+            not isinstance(capability.get(field), str)
+            or not capability.get(field)
+            for field in required_capability_fields
+        ):
+            raise BrowserClaimError(
+                "source execution attestation has an invalid formal capability"
+            )
+        serialized_attestation = attestation.model_dump(mode="json")
+        unsigned = {
+            "schema_version": SOURCE_EXECUTION_RECEIPT_SCHEMA,
+            "task_id": record.id,
+            "provider": record.submission.provider.value,
+            "kind": record.submission.kind.value,
+            "companion_id": heartbeat.companion_id,
+            "runtime_instance_id": heartbeat.runtime_instance_id,
+            "build_identity": heartbeat.build_identity.model_dump(mode="json"),
+            "execution_environment": attestation.execution_environment,
+            "parser_version": attestation.parser_version,
+            "query_sha256": query_sha256,
+            "source_observation_sha256": expected_observation_sha256,
+            "completion_sha256": _canonical_json_sha256(
+                completion.model_dump(mode="json")
+            ),
+            **{
+                field: capability[field]
+                for field in sorted(required_capability_fields)
+            },
+            "completed_at": serialized_attestation["completed_at"],
+        }
+        return BrowserSourceExecutionReceipt.model_validate(
+            {
+                **unsigned,
+                "receipt_sha256": _canonical_json_sha256(unsigned),
+            }
+        )
 
     async def get(self, task_id: str) -> BrowserTaskSnapshot:
         async with self._changed:
@@ -3571,6 +3906,7 @@ def create_browser_bridge_app(
         r"http://(?:127\.0\.0\.1|localhost)(?::\d+)?)$"
     ),
     source_authority: FormalLiveSourceAuthority | None = None,
+    icom_provider: Any | None = None,
 ) -> FastAPI:
     if len(bridge_token) < 32:
         raise ValueError("bridge_token must contain at least 32 characters")
@@ -3578,6 +3914,7 @@ def create_browser_bridge_app(
         raise ValueError("control_token must contain at least 32 characters")
     if control_token is not None and hmac.compare_digest(control_token, bridge_token):
         raise ValueError("control_token must be distinct from bridge_token")
+    formal_source_token = formal_worker_source_token(bridge_token)
     task_bridge = bridge or BrowserTaskBridge()
     if source_authority is not None:
         task_bridge.bind_source_authority(source_authority)
@@ -3620,6 +3957,22 @@ def create_browser_bridge_app(
                 detail="browser companion control is unavailable or unauthorized",
             )
 
+    async def authorize_formal_worker(
+        request: Request,
+        token: str | None,
+    ) -> None:
+        host = request.client.host if request.client else None
+        if not is_loopback_client(host):
+            raise HTTPException(
+                status_code=403,
+                detail="browser bridge accepts loopback clients only",
+            )
+        if token is None or not hmac.compare_digest(token, formal_source_token):
+            raise HTTPException(
+                status_code=401,
+                detail="invalid formal worker source token",
+            )
+
     @app.get("/health")
     async def health(request: Request) -> dict[str, str]:
         host = request.client.host if request.client else None
@@ -3642,6 +3995,128 @@ def create_browser_bridge_app(
         except BrowserBridgeError as exc:
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         return SubmitBrowserTasksResponse(tasks=tasks)
+
+    @app.post(
+        "/v1/formal/tasks",
+        response_model=SubmitBrowserTasksResponse,
+    )
+    async def submit_formal_tasks(
+        payload: SubmitFormalBrowserTasksRequest,
+        request: Request,
+        token: Annotated[str | None, Header(alias=BRIDGE_TOKEN_HEADER)] = None,
+    ) -> SubmitBrowserTasksResponse:
+        """Attach worker-produced tasks to the parent authority's signed scope."""
+
+        await authorize_formal_worker(request, token)
+        if source_authority is None:
+            raise HTTPException(status_code=409, detail="formal source is unavailable")
+        try:
+            with source_authority.execution_scope(payload.execution_capability):
+                tasks = await task_bridge.submit_many(payload.tasks)
+        except (BrowserBridgeError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return SubmitBrowserTasksResponse(tasks=tasks)
+
+    @app.post(
+        "/v1/formal/tasks/cancel",
+        response_model=SubmitBrowserTasksResponse,
+    )
+    async def cancel_formal_tasks(
+        payload: CancelFormalBrowserTasksRequest,
+        request: Request,
+        token: Annotated[str | None, Header(alias=BRIDGE_TOKEN_HEADER)] = None,
+    ) -> SubmitBrowserTasksResponse:
+        await authorize_formal_worker(request, token)
+        if source_authority is None:
+            raise HTTPException(status_code=409, detail="formal source is unavailable")
+        try:
+            with source_authority.execution_scope(payload.execution_capability):
+                checked_capability = source_authority.current_execution_capability()
+                if checked_capability is None:
+                    raise ValueError("formal browser cancellation has no capability")
+                attached = tuple(
+                    await asyncio.gather(
+                        *(
+                            task_bridge.formal_execution_capability(task_id)
+                            for task_id in payload.task_ids
+                        )
+                    )
+                )
+                if any(item != checked_capability for item in attached):
+                    raise ValueError(
+                        "formal browser cancellation crosses execution capabilities"
+                    )
+                tasks = await task_bridge.cancel_many(
+                    payload.task_ids,
+                    reason=payload.reason,
+                )
+        except (BrowserBridgeError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return SubmitBrowserTasksResponse(tasks=tasks)
+
+    @app.post(
+        "/v1/formal/tasks/snapshots",
+        response_model=SubmitBrowserTasksResponse,
+    )
+    async def read_formal_tasks(
+        payload: ReadFormalBrowserTasksRequest,
+        request: Request,
+        token: Annotated[str | None, Header(alias=BRIDGE_TOKEN_HEADER)] = None,
+    ) -> SubmitBrowserTasksResponse:
+        """Read only tasks attached to this exact signed worker capability."""
+
+        await authorize_formal_worker(request, token)
+        if source_authority is None:
+            raise HTTPException(status_code=409, detail="formal source is unavailable")
+        try:
+            with source_authority.execution_scope(payload.execution_capability):
+                checked_capability = source_authority.current_execution_capability()
+                if checked_capability is None:
+                    raise ValueError("formal browser snapshot has no capability")
+                attached = tuple(
+                    await asyncio.gather(
+                        *(
+                            task_bridge.formal_execution_capability(task_id)
+                            for task_id in payload.task_ids
+                        )
+                    )
+                )
+                if any(item != checked_capability for item in attached):
+                    raise ValueError(
+                        "formal browser snapshot crosses execution capabilities"
+                    )
+                tasks = tuple(
+                    await asyncio.gather(
+                        *(task_bridge.get(task_id) for task_id in payload.task_ids)
+                    )
+                )
+        except (BrowserBridgeError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return SubmitBrowserTasksResponse(tasks=tasks)
+
+    @app.post("/v1/formal/icom/search")
+    async def search_formal_icom(
+        payload: FormalIComSearchRequest,
+        request: Request,
+        token: Annotated[str | None, Header(alias=BRIDGE_TOKEN_HEADER)] = None,
+    ) -> dict[str, Any]:
+        """Execute the real parent-owned iCom adapter for one worker query."""
+
+        await authorize_formal_worker(request, token)
+        if source_authority is None or icom_provider is None:
+            raise HTTPException(status_code=409, detail="formal iCom source is unavailable")
+        from tripchord.providers.icom_transfer import IComTransferQuery
+
+        try:
+            query = IComTransferQuery.model_validate(payload.query)
+            with source_authority.execution_scope(payload.execution_capability):
+                result = await icom_provider.search(
+                    query,
+                    query_task_id=payload.query_task_id,
+                )
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return result.model_dump(mode="json")
 
     @app.post(
         "/v1/tasks/claim",
@@ -3919,38 +4394,8 @@ def create_browser_bridge_app(
                 task_id,
                 payload.claim_token,
                 payload.completion,
+                payload.source_execution_attestation,
             )
-            capability = (
-                await task_bridge.formal_execution_capability(task_id)
-                if source_authority is not None
-                else None
-            )
-            if source_authority is not None and capability is not None:
-                snapshot_payload = snapshot.model_dump(mode="json")
-                with source_authority.execution_scope(capability):
-                    source_authority.record_browser_http(
-                        "browser_complete",
-                        subject_ids=(task_id,),
-                        details={
-                            "task_id": task_id,
-                            "completion": payload.completion.model_dump(mode="json"),
-                            "snapshot": snapshot_payload,
-                            "formal_query": source_authority.formal_browser_query(
-                                task_id=snapshot.id,
-                                provider=snapshot.provider.value,
-                                kind=snapshot.kind.value,
-                                query=snapshot.query.model_dump(mode="json"),
-                            ),
-                            "result_sha256": hashlib.sha256(
-                                json.dumps(
-                                    snapshot_payload,
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                    sort_keys=True,
-                                ).encode("utf-8")
-                            ).hexdigest(),
-                        },
-                    )
             return snapshot
         except BrowserTaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

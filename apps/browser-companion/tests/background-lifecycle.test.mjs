@@ -6355,6 +6355,28 @@ for (const [mutated, reason] of [
   assert.equal(completionPayload.completion.state, "failed");
   assert.equal(completionPayload.completion.failure.code, "timeout");
   assert.equal(completionPayload.completion.failure.retryable, true);
+  const sourceAttestation = completionPayload.source_execution_attestation;
+  assert.equal(
+    sourceAttestation.schema_version,
+    "tripchord-browser-source-execution-attestation-v1",
+  );
+  assert.equal(sourceAttestation.task_id, "initial-landing-budget-fixture");
+  assert.equal(sourceAttestation.provider, "ctrip");
+  assert.equal(sourceAttestation.kind, "lodging");
+  assert.equal(sourceAttestation.companion_id, "chrome-mv3-test-extension");
+  assert.match(sourceAttestation.runtime_instance_id, /^[A-Za-z0-9._:-]{16,128}$/);
+  assert.equal(
+    sourceAttestation.execution_environment,
+    "chrome_extension_service_worker",
+  );
+  assert.equal(
+    sourceAttestation.parser_version,
+    "tripchord-visible-dom-v3",
+  );
+  assert.match(sourceAttestation.query_sha256, /^[0-9a-f]{64}$/);
+  assert.match(sourceAttestation.source_observation_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(sourceAttestation.build_identity.manifest_version, "0.1.16");
+  assert.match(sourceAttestation.build_identity.build_sha256, /^[0-9a-f]{64}$/);
   const stageTrace =
     completionPayload.completion.failure.details.stage_trace;
   assert.equal(stageTrace.length, 1);

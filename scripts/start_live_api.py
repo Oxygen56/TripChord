@@ -167,6 +167,9 @@ def run_live_api(*, port: int, repository: Path | None = None) -> int:
     environment["TRIPCHORD_BROWSER_BRIDGE_ENABLED"] = "true"
     environment["TRIPCHORD_BROWSER_BRIDGE_TOKEN"] = token
     environment["TRIPCHORD_BROWSER_COMPANION_AUTO_RELOAD_ENABLED"] = "true"
+    environment["TRIPCHORD_LIVE_WORKER_PARENT_API_ORIGIN"] = (
+        f"http://127.0.0.1:{port}"
+    )
     _load_model_api_key(runtime_directory, environment)
 
     print("TripChord 实时只读服务即将启动。", flush=True)

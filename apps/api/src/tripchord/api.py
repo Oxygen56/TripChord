@@ -194,6 +194,7 @@ class AgentRuntimeStatusResponse(ApiModel):
     model_provider: str | None = None
     primary_model: str | None = None
     fast_model: str | None = None
+    worker_model_runtime: dict[str, JsonValue] | None = None
     model_trace_count: int = Field(default=0, ge=0)
     effective_flexible_timeout_seconds: int = Field(ge=60, le=3600)
     context_engine: str = "versioned evidence blackboard + role/budget scoped context packs"

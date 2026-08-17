@@ -21,6 +21,9 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from pydantic import TypeAdapter
+from tripchord.agents.companion_control_tools import (
+    verified_companion_build_identity,
+)
 from tripchord.agents.flexible_live_system import FlexibleLiveAgentRun
 from tripchord.agents.live_done_gate_v4 import (
     LiveV4DoneGateReport,
@@ -256,6 +259,7 @@ _RUNTIME_EVIDENCE_FIELDS = (
     "model_provider",
     "primary_model",
     "fast_model",
+    "worker_model_runtime",
     "model_trace_count",
     "effective_flexible_timeout_seconds",
     "rag_enabled",
@@ -877,10 +881,28 @@ def _validate_required_model_runtime(
 
     if not require_model_enhancement:
         return
-    invalid_fields = tuple(
-        field for field in ("model_enabled", "model_required") if runtime.get(field) is not True
+    worker = runtime.get("worker_model_runtime")
+    worker_ready = (
+        isinstance(worker, dict)
+        and worker.get("enabled") is True
+        and worker.get("required") is True
+        and worker.get("provider") in {"anthropic", "openai_compatible"}
+        and all(
+            isinstance(worker.get(field), str) and bool(worker.get(field))
+            for field in (
+                "base_url",
+                "primary_model",
+                "fast_model",
+                "runtime_bundle_spec_sha256",
+            )
+        )
     )
-    if invalid_fields:
+    invalid_fields = tuple(
+        field
+        for field in ("model_enabled", "model_required")
+        if runtime.get(field) is not True
+    )
+    if invalid_fields and not worker_ready:
         requirements = "; ".join(f"runtime.{field} must be true" for field in invalid_fields)
         raise RuntimeError(
             "--require-model-enhancement runtime preflight failed before "
@@ -1449,6 +1471,13 @@ def _formal_companion_binding_from_preflight(
         for field in identity_fields
     ):
         raise RuntimeError("formal Companion preflight identity is incomplete")
+    if (
+        companion["adapter_version"] != "0.2.0"
+        or companion["contract_version"] != "tripchord-capability-v1"
+    ):
+        raise RuntimeError(
+            "formal Companion preflight requires the production adapter/contract"
+        )
     providers = companion["providers"]
     scopes = companion["authorized_scope_keys"]
     build = companion.get("build_identity")
@@ -1472,6 +1501,13 @@ def _formal_companion_binding_from_preflight(
         or not re.fullmatch(r"[0-9a-f]{64}", str(build.get("build_sha256")))
     ):
         raise RuntimeError("formal Companion preflight binding is invalid")
+    expected_build = verified_companion_build_identity(
+        _REPO_ROOT / "apps/browser-companion"
+    ).model_dump(mode="json")
+    if build != expected_build:
+        raise RuntimeError(
+            "formal Companion preflight build differs from the verified release"
+        )
     identity: dict[str, object] = {
         "companion_id": companion["companion_id"],
         "providers": sorted(providers),
@@ -1491,6 +1527,24 @@ def _formal_terminal_job_contract(
 ) -> dict[str, object]:
     if snapshot.result is None:
         raise RuntimeError("formal terminal job has no result")
+    worker_runtime_receipt = snapshot.result.get("worker_runtime_receipt")
+    model_execution_receipt = snapshot.result.get("model_execution_receipt")
+    if not isinstance(worker_runtime_receipt, dict) or not isinstance(
+        model_execution_receipt,
+        dict,
+    ):
+        raise RuntimeError(
+            "formal terminal job has no exact worker/model execution receipts"
+        )
+    model_execution_receipt_sha256 = model_execution_receipt.get(
+        "receipt_sha256"
+    )
+    if (
+        not isinstance(model_execution_receipt_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", model_execution_receipt_sha256)
+        is None
+    ):
+        raise RuntimeError("formal terminal model receipt digest is invalid")
     checkpoint_sha256 = [item.checkpoint_sha256 for item in snapshot.pair_checkpoints]
     return {
         "id": snapshot.id,
@@ -1513,6 +1567,10 @@ def _formal_terminal_job_contract(
         "publication_icom_query_membership_sha256": job_graph[
             "publication_icom_query_membership_sha256"
         ],
+        "worker_runtime_receipt_sha256": _canonical_sha256(
+            worker_runtime_receipt
+        ),
+        "model_execution_receipt_sha256": model_execution_receipt_sha256,
     }
 
 
@@ -2258,6 +2316,25 @@ async def _run(
                 api_payload_sha256=api_payload_sha256,
                 require_model_enhancement=require_model_enhancement,
             )
+            if require_model_enhancement:
+                from tripchord.agents.live_flexible_from_text_worker import (
+                    validate_model_execution_receipt,
+                )
+
+                context["worker_runtime_receipt"] = TypeAdapter(
+                    dict[str, Any]
+                ).validate_python(response_payload.get("worker_runtime_receipt"))
+                context["model_execution_receipt"] = (
+                    validate_model_execution_receipt(
+                        response_payload.get("model_execution_receipt"),
+                        context["worker_runtime_receipt"],
+                        job_id=terminal_job.id,
+                        request_sha256=api_payload_sha256,
+                        trace_count=terminal_job.model_trace_count,
+                        success_count=terminal_job.model_trace_success_count,
+                        failure_count=terminal_job.model_trace_failure_count,
+                    )
+                )
             context["flexible_run"] = run.model_dump(mode="json")
             stage = "runtime_postflight"
             runtime_after = await _runtime_evidence(

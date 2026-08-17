@@ -5,6 +5,9 @@ const POLL_ALARM = "tripchord-read-only-poll";
 const CONTENT_RUNTIME_VERSION = "2026-08-05.16";
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const COMPANION_ID = `chrome-mv3-${chrome.runtime.id}`;
+const SOURCE_EXECUTION_ATTESTATION_SCHEMA =
+  "tripchord-browser-source-execution-attestation-v1";
+const PRODUCTION_VISIBLE_DOM_PARSER_VERSION = "tripchord-visible-dom-v3";
 const CONTROL_RECEIPT_PATH = "/v1/companions/control/receipt";
 const PENDING_RELOAD_STORAGE_KEY = "tripchordPendingCompanionReload";
 const LAST_RELOAD_RECEIPT_STORAGE_KEY = "tripchordLastCompanionReloadReceipt";
@@ -10426,11 +10429,50 @@ async function completeLease(
   completion,
   timeoutMs = LEASE_COMPLETION_REQUEST_CAP_MS,
 ) {
+  const parserVersions = new Set(
+    (Array.isArray(completion && completion.quotes) ? completion.quotes : [])
+      .map((quote) => String(quote && quote.parser_version || ""))
+      .filter(Boolean),
+  );
+  const parserVersion = parserVersions.size === 1
+    ? [...parserVersions][0]
+    : PRODUCTION_VISIBLE_DOM_PARSER_VERSION;
+  const querySha256 = await inventoryReceiptSha256(
+    canonicalInventoryJson(lease.query),
+  );
+  const observation = {
+    task_id: lease.task_id,
+    provider: lease.provider,
+    kind: lease.kind,
+    query: lease.query,
+    quote_evidence_sha256:
+      Array.isArray(completion && completion.quotes)
+        ? completion.quotes.map((quote) => quote.evidence_sha256)
+        : [],
+    parser_version: parserVersion,
+  };
+  const sourceExecutionAttestation = {
+    schema_version: SOURCE_EXECUTION_ATTESTATION_SCHEMA,
+    task_id: lease.task_id,
+    provider: lease.provider,
+    kind: lease.kind,
+    companion_id: COMPANION_ID,
+    runtime_instance_id: RUNTIME_INSTANCE_ID,
+    build_identity: currentBuildIdentity(),
+    execution_environment: "chrome_extension_service_worker",
+    parser_version: parserVersion,
+    query_sha256: querySha256,
+    source_observation_sha256: await inventoryReceiptSha256(
+      canonicalInventoryJson(observation),
+    ),
+    completed_at: new Date().toISOString(),
+  };
   return bridgeFetch(`/v1/tasks/${encodeURIComponent(lease.task_id)}/complete`, {
     method: "POST",
     body: JSON.stringify({
       claim_token: lease.claim_token,
       completion,
+      source_execution_attestation: sourceExecutionAttestation,
     }),
     timeoutMs,
   });

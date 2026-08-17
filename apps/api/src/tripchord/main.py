@@ -217,6 +217,7 @@ from tripchord.providers.browser_bridge import (
     LIVE_V5_BROWSER_PROVIDERS,
     BrowserTaskBridge,
     create_browser_bridge_app,
+    formal_worker_source_token,
     is_loopback_client,
 )
 from tripchord.providers.factory import build_amap_provider, build_provider_registry
@@ -736,6 +737,15 @@ def _install_browser_bridge(
     formal_source_private_key_path: Path | None = None,
     formal_source_ledger_path: Path | None = None,
     formal_source_runtime_identity: Mapping[str, object] | None = None,
+    source_terminal_reporter: Callable[
+        [tuple[dict[str, Any], ...]],
+        Awaitable[None],
+    ]
+    | None = None,
+    browser_bridge_override: Any | None = None,
+    icom_provider_override: Any | None = None,
+    mount_browser_bridge: bool = True,
+    formal_source_owned_by_parent: bool = False,
 ) -> tuple[BrowserTaskBridge | None, LivePackageAgentSystem | None]:
     token = configured_settings.browser_bridge_token
     if not configured_settings.browser_bridge_enabled or token is None or len(token) < 32:
@@ -754,7 +764,7 @@ def _install_browser_bridge(
     commit_sha = PROVENANCE.commit_sha
     if commit_sha is None:
         raise RuntimeError("formal browser composition requires a git commit identity")
-    formal_source_requested = (
+    formal_source_requested = not formal_source_owned_by_parent and (
         formal_source_private_key_path is not None
         or formal_source_ledger_path is not None
         or bool(os.environ.get("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"))
@@ -765,6 +775,18 @@ def _install_browser_bridge(
     ):
         raise RuntimeError(
             "delegated formal source runtime requires explicit key and ledger paths"
+        )
+    if formal_source_owned_by_parent != (
+        browser_bridge_override is not None
+        and icom_provider_override is not None
+        and not mount_browser_bridge
+    ):
+        raise RuntimeError("parent-owned formal source composition is incomplete")
+    if (browser_bridge_override is not None or icom_provider_override is not None) and (
+        formal_source_requested or mount_browser_bridge
+    ):
+        raise RuntimeError(
+            "remote source overrides require an unmounted, parent-owned formal authority"
         )
     source_authority: FormalLiveSourceAuthority | None = None
     if formal_source_requested:
@@ -789,8 +811,11 @@ def _install_browser_bridge(
             now=now,
             **authority_kwargs,
         )
-    bridge = BrowserTaskBridge(now=now, source_authority=source_authority)
-    icom_provider = IComTransferProvider(
+    bridge = browser_bridge_override or BrowserTaskBridge(
+        now=now,
+        source_authority=source_authority,
+    )
+    icom_provider = icom_provider_override or IComTransferProvider(
         client=icom_http_client,
         now=now,
         source_authority=source_authority,
@@ -809,6 +834,7 @@ def _install_browser_bridge(
         now=now,
         sleep=sleep,
         providers=default_browser_providers_from_registry(),
+        source_terminal_reporter=source_terminal_reporter,
     )
     flexible_system = FlexibleLiveAgentSystem(
         cast(LiveDatePairRunner, live_system),
@@ -824,16 +850,18 @@ def _install_browser_bridge(
             configured_settings.adaptive_agent_scaling_enabled and model_router is not None
         ),
     )
-    target_app.mount(
-        _BROWSER_BRIDGE_MOUNT,
-        create_browser_bridge_app(
-            bridge,
-            bridge_token=token,
-            control_token=configured_settings.browser_bridge_control_token,
-            allowed_origin_regex=configured_settings.browser_bridge_allowed_origin_regex,
-            source_authority=source_authority,
-        ),
-    )
+    if mount_browser_bridge:
+        target_app.mount(
+            _BROWSER_BRIDGE_MOUNT,
+            create_browser_bridge_app(
+                bridge,
+                bridge_token=token,
+                control_token=configured_settings.browser_bridge_control_token,
+                allowed_origin_regex=configured_settings.browser_bridge_allowed_origin_regex,
+                source_authority=source_authority,
+                icom_provider=icom_provider,
+            ),
+        )
     target_app.state.browser_task_bridge = bridge
     target_app.state.live_package_agent_system = live_system
     target_app.state.flexible_live_agent_system = flexible_system
@@ -844,7 +872,7 @@ def _install_browser_bridge(
     auto_reload_enabled = configured_settings.browser_companion_auto_reload_enabled
     runtime_agent = (
         BrowserCompanionRuntimeExecutorAgent(bridge)
-        if auto_reload_enabled or control_token is not None
+        if mount_browser_bridge and (auto_reload_enabled or control_token is not None)
         else None
     )
     target_app.state.browser_bridge_control_token = control_token
@@ -1261,9 +1289,19 @@ def _load_booking_ledger_for_run(run_id: str) -> BookingLedger | None:
 
 app.include_router(provider_api_router)
 app.include_router(wiring_api_router)
+# The independent worker imports this module to reuse the production planning
+# composition, but the parent API remains the sole Browser queue and formal
+# signing authority.  Its authenticated runtime bundle installs the remote
+# source facade after import; constructing the normal bridge here would load a
+# second copy of the trust root and could abort the parent's active challenge.
+initial_bridge_settings = (
+    settings.model_copy(update={"browser_bridge_enabled": False})
+    if _LIVE_WORKER_SUBPROCESS
+    else settings
+)
 browser_task_bridge, live_package_agent_system = _install_browser_bridge(
     app,
-    settings,
+    initial_bridge_settings,
     model_router=model_router,
     context_builder=context_builder,
     memory_store=memory_store,
@@ -1408,6 +1446,13 @@ async def agent_runtime_status_endpoint(
     await rate_limiter.check(principal.tenant_id, "agent-runtime-status")
     primary = settings.model_client_config()
     fast = settings.model_client_config(fast=True)
+    worker_bundle = _live_flexible_worker_runtime_bundle()
+    worker_spec = worker_bundle.get("spec") if worker_bundle is not None else None
+    worker_model_identity = (
+        worker_spec.get("model_runtime_identity")
+        if isinstance(worker_spec, dict)
+        else None
+    )
     companion_supervisor = cast(
         BrowserCompanionRuntimeSupervisor | None,
         getattr(app.state, "browser_companion_runtime_supervisor", None),
@@ -1418,6 +1463,18 @@ async def agent_runtime_status_endpoint(
         model_provider=primary.provider.value if primary is not None else None,
         primary_model=primary.model if primary is not None else None,
         fast_model=fast.model if fast is not None else None,
+        worker_model_runtime=(
+            {
+                "enabled": True,
+                "required": True,
+                **worker_model_identity,
+                "runtime_bundle_spec_sha256": worker_bundle["spec_sha256"],
+            }
+            if isinstance(worker_model_identity, dict)
+            and isinstance(worker_spec, dict)
+            and worker_spec.get("model_agents_required") is True
+            else None
+        ),
         model_trace_count=len(model_trace_sink.records),
         effective_flexible_timeout_seconds=_flexible_total_timeout_seconds(None),
         runtime_provenance=AgentRuntimeProvenance(**PROVENANCE.to_dict()),
@@ -2310,35 +2367,53 @@ def _source_terminal_events_from_run(
     skipped sources stay out so the pre-barrier SSE stream never leaks a
     ``quote_found`` that did not really happen.
     """
-    events: list[LiveSourceTerminalEvent] = []
+    events: dict[str, LiveSourceTerminalEvent] = {}
     for execution in run.pair_runs:
-        live_run = execution.run or execution.exploration_run
-        if live_run is None:
-            continue
-        usable = set(live_run.source_execution_completeness.terminal_source_ids or ())
-        for item in live_run.coverage:
-            for source_id in item.terminal_outcome_source_ids or item.successful_source_ids:
-                scope = derive_scope_from_task_id(source_id)
-                if scope is None:
-                    continue
-                if source_id in usable and source_id in (
-                    item.usable_quote_source_ids or item.successful_source_ids
-                ):
-                    terminal_state = "quote_found"
-                elif item.failed_source_ids and source_id in item.failed_source_ids:
-                    terminal_state = _terminal_state_from_reasons(item.failure_reasons)
-                else:
-                    terminal_state = "bounded_no_exact_quote"
-                events.append(
-                    LiveSourceTerminalEvent(
+        pair_runs = [
+            item
+            for item in (execution.exploration_run, execution.run)
+            if item is not None
+        ]
+        if len(pair_runs) == 2 and pair_runs[0] is pair_runs[1]:
+            pair_runs.pop()
+        for live_run in pair_runs:
+            usable = set(
+                live_run.source_execution_completeness.terminal_source_ids or ()
+            )
+            for item in live_run.coverage:
+                terminal_source_ids = tuple(
+                    dict.fromkeys(
+                        (
+                            *item.terminal_outcome_source_ids,
+                            *item.successful_source_ids,
+                            *item.failed_source_ids,
+                        )
+                    )
+                )
+                for source_id in terminal_source_ids:
+                    scope = derive_scope_from_task_id(source_id)
+                    if scope is None:
+                        continue
+                    if item.failed_source_ids and source_id in item.failed_source_ids:
+                        terminal_state = _terminal_state_from_reasons(
+                            item.failure_reasons
+                        )
+                    elif source_id in usable and source_id in (
+                        item.usable_quote_source_ids or item.successful_source_ids
+                    ):
+                        terminal_state = "quote_found"
+                    elif source_id in usable:
+                        terminal_state = "bounded_no_exact_quote"
+                    else:
+                        continue
+                    events[source_id] = LiveSourceTerminalEvent(
                         source_task_id=source_id,
                         provider=scope.provider,
                         vertical=scope.vertical.value,
                         terminal_state=terminal_state,
                         occurred_at=now,
                     )
-                )
-    return tuple(dict.fromkeys(events))
+    return tuple(events.values())
 
 
 def _terminal_state_from_reasons(reasons: tuple[str, ...]) -> str:
@@ -2767,13 +2842,72 @@ def _live_flexible_worker_runtime_bundle() -> dict[str, Any] | None:
     """
     raw = os.environ.get("TRIPCHORD_LIVE_FLEXIBLE_WORKER_RUNTIME_BUNDLE")
     if raw is None:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("live flexible worker runtime bundle is not valid JSON") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError("live flexible worker runtime bundle must be an object")
+        authority = getattr(app.state, "formal_live_source_authority", None)
+        if authority is None:
+            return None
+        parent_origin = os.environ.get(
+            "TRIPCHORD_LIVE_WORKER_PARENT_API_ORIGIN"
+        )
+        if not parent_origin:
+            # Keep ordinary runtime/status and cold-restart diagnostics
+            # available.  A strict model-required gate sees no worker runtime
+            # and fails before live search; the controlled launcher supplies
+            # the exact loopback origin for production execution.
+            return None
+        primary = settings.model_client_config()
+        fast = settings.model_client_config(fast=True) or primary
+        if primary is None or fast is None or model_router is None:
+            raise ValueError("formal live worker model runtime is unavailable")
+        companion_token = settings.browser_bridge_token
+        if not isinstance(companion_token, str):
+            raise ValueError("formal live worker source token is unavailable")
+        parsed = {
+            "runtime": "browser-bridge",
+            # A worker receives only the one-way, domain-separated source
+            # credential.  It cannot authenticate to Companion heartbeat,
+            # claim, or completion routes with this value.
+            "bridge_token": formal_worker_source_token(companion_token),
+            "providers": [
+                provider.value
+                for provider in default_browser_providers_from_registry()
+            ],
+            "model_agents_required": True,
+            "model_runtime_identity": {
+                "provider": primary.provider.value,
+                "base_url": primary.base_url,
+                "primary_model": primary.model,
+                "fast_model": fast.model,
+            },
+            "formal_parent_api_origin": parent_origin,
+            "adaptive_agent_scaling_enabled": (
+                settings.adaptive_agent_scaling_enabled
+            ),
+            "now_iso": None,
+            "http_host": None,
+            "http_port": None,
+            "icom_api_origin": None,
+            "formal_source_private_key_path": None,
+            "formal_source_ledger_path": None,
+        }
+    else:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "live flexible worker runtime bundle is not valid JSON"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("live flexible worker runtime bundle must be an object")
+        if parsed.get("formal_parent_api_origin") is not None:
+            companion_token = settings.browser_bridge_token
+            if (
+                not isinstance(companion_token, str)
+                or parsed.get("bridge_token")
+                != formal_worker_source_token(companion_token)
+            ):
+                raise ValueError(
+                    "formal live worker must use the separated parent-source token"
+                )
     from tripchord.agents.live_flexible_worker_runtime import (
         build_authenticated_runtime_bundle,
     )
@@ -2819,7 +2953,7 @@ def _build_live_flexible_from_text_worker_command(
         public_result = {
             key: value
             for key, value in result.items()
-            if key != "worker_runtime_receipt"
+            if key not in {"worker_runtime_receipt", "model_execution_receipt"}
         }
         response = LiveFlexibleFromTextPlanningResponse.model_validate(public_result)
         if (response.interpretation.state == PackageRequestState.READY) != (

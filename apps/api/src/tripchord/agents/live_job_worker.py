@@ -123,8 +123,30 @@ def main(argv: list[str] | None = None) -> int:
         # contain user content. The registry sanitizes further via its own
         # safe-failure diagnostic before the label is ever published.
         marker_payload: dict[str, object] = {"class": type(exc).__name__}
+        exception_chain: list[str] = []
+        current: BaseException | None = exc
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen and len(exception_chain) < 8:
+            seen.add(id(current))
+            exception_chain.append(type(current).__name__)
+            current = current.__cause__ or current.__context__
+        marker_payload["exception_chain"] = exception_chain
         if type(exc).__name__ == "HTTPException" and hasattr(exc, "status_code"):
             marker_payload["status_code"] = int(exc.status_code)
+        api_main = sys.modules.get("tripchord.main")
+        trace_sink = getattr(api_main, "model_trace_sink", None)
+        records = getattr(trace_sink, "records", ())
+        if isinstance(records, (list, tuple)):
+            marker_payload["model_traces"] = [
+                {
+                    "role": trace.role.value,
+                    "provider": trace.provider,
+                    "model": trace.model,
+                    "success": trace.success,
+                    "error_class": trace.error_class,
+                }
+                for trace in records[-32:]
+            ]
         sys.stderr.write(
             "TRIPCHORD_WORKER_FAILURE:"
             + json.dumps(marker_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

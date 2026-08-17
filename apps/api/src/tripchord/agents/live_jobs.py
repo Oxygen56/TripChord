@@ -3929,7 +3929,8 @@ class LivePlanningJobRegistry:
         safe-failure diagnostic reflects the REAL operation's cause (an HTTP 503
         from the ready chain, a domain ValueError, ...) rather than a generic
         exit-code error. Returns None when no marker is present."""
-        for line in stderr.decode("utf-8", "replace").splitlines():
+        decoded_stderr = stderr.decode("utf-8", "replace")
+        for line in decoded_stderr.splitlines():
             if not line.startswith("TRIPCHORD_WORKER_FAILURE:"):
                 continue
             try:
@@ -4174,6 +4175,7 @@ class LivePlanningJobRegistry:
             raise RuntimeError(f"live planning job worker exited with {process.returncode}")
         text = stdout.decode("utf-8")
         result = json.loads(text) if text.strip() else {}
+        self._validate_formal_worker_execution_receipts(runtime, command, result)
         # C-146 P0-1 (RETURN 7de8cf3e): the worker captured its progress /
         # checkpoint / model-trace observability in a cross-process collector;
         # replay it onto the durable job record NOW (still inside the operation,
@@ -4188,6 +4190,251 @@ class LivePlanningJobRegistry:
         if command.result_importer is not None:
             result = await command.result_importer(result)
         return result
+
+    @staticmethod
+    def _validate_formal_worker_execution_receipts(
+        runtime: _RuntimeJob,
+        command: LiveJobWorkerCommand,
+        result: dict[str, Any],
+    ) -> None:
+        """Fail closed unless a formal ready result proves real model execution."""
+
+        bundle = command.args.get("runtime_bundle")
+        if not isinstance(bundle, dict):
+            return
+        spec = bundle.get("spec")
+        if (
+            not isinstance(spec, dict)
+            or spec.get("formal_parent_api_origin") is None
+        ):
+            return
+
+        def digest(value: object) -> str:
+            return hashlib.sha256(
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+
+        runtime_receipt = result.get("worker_runtime_receipt")
+        expected_runtime_fields = {
+            "schema_version",
+            "runtime",
+            "providers",
+            "spec_sha256",
+            "runtime_provenance",
+            "api_runtime_identity_sha256",
+            "worker_runtime_identity",
+            "model_agents_required",
+            "model_runtime_identity",
+        }
+        if (
+            not isinstance(runtime_receipt, dict)
+            or set(runtime_receipt) != expected_runtime_fields
+            or runtime_receipt.get("schema_version")
+            != "tripchord-live-worker-runtime-receipt-v1"
+            or runtime_receipt.get("runtime") != "browser-bridge"
+            or runtime_receipt.get("providers") != spec.get("providers")
+            or runtime_receipt.get("spec_sha256") != bundle.get("spec_sha256")
+            or runtime_receipt.get("runtime_provenance")
+            != bundle.get("runtime_provenance")
+            or runtime_receipt.get("model_agents_required") is not True
+            or runtime_receipt.get("model_runtime_identity")
+            != spec.get("model_runtime_identity")
+        ):
+            raise RuntimeError("formal worker runtime receipt is invalid")
+        receipt = result.get("model_execution_receipt")
+        expected_receipt_fields = {
+            "schema_version",
+            "job_id",
+            "request_sha256",
+            "runtime_bundle_spec_sha256",
+            "worker_runtime_identity_sha256",
+            "model_runtime_identity",
+            "trace_count",
+            "success_count",
+            "failure_count",
+            "traces",
+            "receipt_sha256",
+        }
+        if not isinstance(receipt, dict) or set(receipt) != expected_receipt_fields:
+            raise RuntimeError("formal worker model execution receipt is missing")
+        traces = receipt.get("traces")
+        expected_trace_fields = {
+            "id",
+            "provider",
+            "model",
+            "role",
+            "request_digest",
+            "scope_id",
+            "scope_request_digest",
+            "response_schema_requested",
+            "tool_count",
+            "started_at",
+            "finished_at",
+            "success",
+            "usage",
+            "estimated_cost_usd",
+            "error_class",
+        }
+        request_sha256 = runtime.snapshot.request_sha256
+        model_identity = spec.get("model_runtime_identity")
+        allowed_models = (
+            {
+                model_identity.get("primary_model"),
+                model_identity.get("fast_model"),
+            }
+            if isinstance(model_identity, dict)
+            else set()
+        )
+        if (
+            receipt.get("schema_version")
+            != "tripchord-model-execution-receipt-v1"
+            or receipt.get("job_id") != runtime.snapshot.id
+            or receipt.get("request_sha256") != request_sha256
+            or receipt.get("runtime_bundle_spec_sha256")
+            != bundle.get("spec_sha256")
+            or receipt.get("worker_runtime_identity_sha256")
+            != digest(runtime_receipt["worker_runtime_identity"])
+            or receipt.get("model_runtime_identity") != model_identity
+            or type(receipt.get("trace_count")) is not int
+            or receipt.get("trace_count", 0) <= 0
+            or receipt.get("success_count") != receipt.get("trace_count")
+            or receipt.get("failure_count") != 0
+            or not isinstance(traces, list)
+            or len(traces) != receipt.get("trace_count")
+            or receipt.get("receipt_sha256")
+            != digest({key: value for key, value in receipt.items() if key != "receipt_sha256"})
+            or result.get("model_trace_count") != receipt.get("trace_count")
+            or result.get("model_trace_success_count") != receipt.get("success_count")
+            or result.get("model_trace_failure_count") != 0
+        ):
+            raise RuntimeError("formal worker model execution receipt is invalid")
+        provider = model_identity.get("provider") if isinstance(model_identity, dict) else None
+        for trace in traces:
+            if (
+                not isinstance(trace, dict)
+                or set(trace) != expected_trace_fields
+                or trace.get("provider") != provider
+                or trace.get("model") not in allowed_models
+                or trace.get("scope_id") != runtime.snapshot.id
+                or trace.get("scope_request_digest") != request_sha256
+                or trace.get("success") is not True
+                or trace.get("error_class") is not None
+                or not isinstance(trace.get("role"), str)
+                or not trace.get("role")
+                or not isinstance(trace.get("request_digest"), str)
+                or len(trace["request_digest"]) != 64
+                or type(trace.get("tool_count")) is not int
+                or not isinstance(trace.get("usage"), dict)
+            ):
+                raise RuntimeError("formal worker model trace is invalid")
+            try:
+                started_at = datetime.fromisoformat(str(trace["started_at"]))
+                finished_at = datetime.fromisoformat(str(trace["finished_at"]))
+            except ValueError as exc:
+                raise RuntimeError("formal worker model trace time is invalid") from exc
+            if (
+                started_at.tzinfo is None
+                or finished_at.tzinfo is None
+                or finished_at < started_at
+            ):
+                raise RuntimeError("formal worker model trace time is invalid")
+        observability = result.get("_worker_observability")
+        expected_observability_fields = {
+            "progress_events",
+            "pair_checkpoints",
+            "model_trace_summary",
+            "source_terminal_events",
+            "barrier_released_at",
+        }
+        if (
+            not isinstance(observability, dict)
+            or set(observability) != expected_observability_fields
+        ):
+            raise RuntimeError("formal worker observability is missing or malformed")
+        if observability.get("progress_events") != [
+            ["interpreting_requirement", 10],
+            ["searching_live_sources", 25],
+            ["caching_pair_runs", 90],
+            ["assembling_result", 95],
+        ]:
+            raise RuntimeError("formal worker progress history is not exact")
+
+        from tripchord.api import LiveFlexibleFromTextPlanningResponse
+        from tripchord.main import _source_terminal_events_from_run
+
+        public_result = {
+            key: value
+            for key, value in result.items()
+            if key
+            not in {
+                "_worker_observability",
+                "_worker_cache_runs",
+                "worker_runtime_receipt",
+                "model_execution_receipt",
+            }
+        }
+        response = LiveFlexibleFromTextPlanningResponse.model_validate(public_result)
+        if response.run is None:
+            raise RuntimeError("formal worker returned no executed flexible run")
+        raw_barrier = observability.get("barrier_released_at")
+        if not isinstance(raw_barrier, str):
+            raise RuntimeError("formal worker barrier receipt is missing")
+        try:
+            barrier = datetime.fromisoformat(raw_barrier)
+        except ValueError as exc:
+            raise RuntimeError("formal worker barrier receipt time is invalid") from exc
+        if barrier.tzinfo is None or barrier.utcoffset() is None:
+            raise RuntimeError("formal worker barrier receipt time is invalid")
+        expected_source_events = [
+            item.model_dump(mode="json")
+            for item in _source_terminal_events_from_run(response.run, barrier)
+        ]
+        if (
+            not expected_source_events
+            or observability.get("source_terminal_events")
+            != expected_source_events
+        ):
+            raise RuntimeError(
+                "formal worker source/barrier observability differs from its run"
+            )
+        raw_checkpoints = observability.get("pair_checkpoints")
+        if not isinstance(raw_checkpoints, list):
+            raise RuntimeError("formal worker pair checkpoints are missing")
+        checkpoints = tuple(
+            LivePlanningPairCheckpoint.model_validate(item)
+            for item in raw_checkpoints
+        )
+        executions = response.run.pair_runs
+        if (
+            len(checkpoints) != len(executions)
+            or tuple(item.sequence for item in checkpoints)
+            != tuple(range(1, len(executions) + 1))
+            or any(
+                checkpoint.date_pair_id != execution.date_pair.id
+                or checkpoint.departure_date != execution.date_pair.departure_date
+                or checkpoint.return_date != execution.date_pair.return_date
+                or checkpoint.request_sha256 != request_sha256
+                for checkpoint, execution in zip(
+                    checkpoints,
+                    executions,
+                    strict=True,
+                )
+            )
+        ):
+            raise RuntimeError(
+                "formal worker pair checkpoints differ from its executed pairs"
+            )
+        capability = runtime.worker_execution_capability
+        if capability is not None and (
+            capability.get("terminal_job_id") != receipt["job_id"]
+            or capability.get("request_sha256") != receipt["request_sha256"]
+        ):
+            raise RuntimeError("formal worker model receipt is bound to a foreign capability")
 
     async def _replay_worker_observability(
         self,

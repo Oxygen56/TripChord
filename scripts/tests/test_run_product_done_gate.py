@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import copy
 import hashlib
 import json
@@ -12,17 +11,13 @@ import sqlite3
 import stat
 import subprocess
 import sys
-import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from tripchord.planning.frozen_graph import (
@@ -386,8 +381,8 @@ def _fixture_formal_source_binding(
             "companion_id": "comp-1",
             "providers": ["ctrip", "qunar", "tongcheng"],
             "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
-            "adapter_version": "fixture-adapter",
-            "contract_version": "tripchord-browser-companion-v1",
+            "adapter_version": "0.2.0",
+            "contract_version": "tripchord-capability-v1",
             "runtime_instance_id": "fixture-runtime-instance-0001",
         }
         query_identity = {
@@ -772,8 +767,8 @@ def _strict_fixture_formal_source_binding(
         "companion_id": "comp-1",
         "providers": ["ctrip", "qunar", "tongcheng"],
         "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
-        "adapter_version": "fixture-adapter",
-        "contract_version": "tripchord-browser-companion-v1",
+        "adapter_version": "0.2.0",
+        "contract_version": "tripchord-capability-v1",
         "build_identity": build_identity,
         "runtime_instance_id": "fixture-runtime-instance-0001",
     }
@@ -957,6 +952,52 @@ def _strict_fixture_formal_source_binding(
                 "reuse_age_seconds": None,
                 "inflight_coalesced": False,
             }
+            completion = {
+                "state": "succeeded",
+                "quotes": quotes,
+                "failure": None,
+            }
+            completed_at = (
+                base_time + timedelta(seconds=len(events) + 1)
+            ).isoformat()
+            source_observation = {
+                "task_id": runtime_task_id,
+                "provider": provider,
+                "kind": kind,
+                "query": query,
+                "quote_evidence_sha256": [
+                    quote.get("evidence_sha256") for quote in quotes
+                ],
+                "parser_version": "tripchord-visible-dom-v3",
+            }
+            unsigned_source_receipt: dict[str, object] = {
+                "schema_version": (
+                    "tripchord-browser-source-execution-receipt-v1"
+                ),
+                "task_id": runtime_task_id,
+                "provider": provider,
+                "kind": kind,
+                "companion_id": companion["companion_id"],
+                "runtime_instance_id": companion["runtime_instance_id"],
+                "build_identity": build_identity,
+                "execution_environment": "chrome_extension_service_worker",
+                "parser_version": "tripchord-visible-dom-v3",
+                "query_sha256": digest(query),
+                "source_observation_sha256": digest(source_observation),
+                "completion_sha256": digest(completion),
+                "capability_id": "20000000-0000-4000-8000-000000000001",
+                "challenge_id": challenge["challenge_id"],
+                "run_id": challenge["run_id"],
+                "terminal_job_id": job_graph["terminal_job_id"],
+                "request_sha256": job_graph["request_sha256"],
+                "job_graph_sha256": job_graph["job_graph_sha256"],
+                "attempt_digest": "7" * 64,
+                "completed_at": completed_at,
+            }
+            source_execution_receipt = {
+                **unsigned_source_receipt,
+                "receipt_sha256": digest(unsigned_source_receipt),
+            }
             add_event(
                 "browser_complete",
                 "POST",
@@ -964,11 +1005,8 @@ def _strict_fixture_formal_source_binding(
                 [runtime_task_id],
                 {
                     "task_id": runtime_task_id,
-                    "completion": {
-                        "state": "succeeded",
-                        "quotes": quotes,
-                        "failure": None,
-                    },
+                    "completion": completion,
+                    "source_execution_receipt": source_execution_receipt,
                     "snapshot": snapshot,
                     "formal_query": formal_query,
                     "result_sha256": digest(snapshot),
@@ -1058,12 +1096,25 @@ def _strict_fixture_formal_source_binding(
     binding["binding_digest"] = digest(binding)
     checkpoint_binding = _fixture_checkpoint_binding()
     checkpoint_sha256 = list(checkpoint_binding["ordered_checkpoint_sha256"])
+    fixture_worker_receipt, fixture_model_receipt, _fixture_trace_receipt = (
+        _fixture_worker_model_receipts_for_challenge(challenge)
+    )
     terminal_job = {
         "checkpoint_sha256": checkpoint_sha256,
         "checkpoint_chain_sha256": digest(checkpoint_sha256),
         "result_sha256": digest({"terminal": "result"}),
+        "worker_runtime_receipt_sha256": digest(fixture_worker_receipt),
+        "model_execution_receipt_sha256": fixture_model_receipt[
+            "receipt_sha256"
+        ],
     }
-    job_member_summary = _job_member_summary(job_graph, terminal_job)
+    job_member_summary = _job_member_summary(
+        job_graph,
+        terminal_job,
+        events,
+        execution_capability_id="20000000-0000-4000-8000-000000000001",
+        execution_attempt_digest="7" * 64,
+    )
     receipt: dict[str, object] = {
         "schema_version": _RECEIPT_SCHEMA_VERSION,
         "anchor_version": anchor_version,
@@ -1216,6 +1267,8 @@ def test_formal_icom_query_groups_accept_concurrent_group_order_but_not_membersh
         reordered,
         job_graph=graph,
         candidate_set_sha256=str(challenge["candidate_set_sha256"]),
+        challenge_id=str(challenge["challenge_id"]),
+        run_id=str(challenge["run_id"]),
         require_complete=True,
     )
 
@@ -1225,6 +1278,8 @@ def test_formal_icom_query_groups_accept_concurrent_group_order_but_not_membersh
             duplicated,
             job_graph=graph,
             candidate_set_sha256=str(challenge["candidate_set_sha256"]),
+            challenge_id=str(challenge["challenge_id"]),
+            run_id=str(challenge["run_id"]),
             require_complete=True,
         )
 
@@ -1735,6 +1790,83 @@ def _fixture_checkpoint_binding() -> dict[str, object]:
     return _checkpoint_binding_for_pair_ids(_FIXTURE_PAIR_IDS, _FIXTURE_PAIR_DATES)
 
 
+def _fixture_worker_model_receipts_for_challenge(
+    challenge: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    """Typed unit-fixture receipts for compact/consumer contract tests only."""
+
+    runtime_identity = challenge["runtime_identity"]
+    assert isinstance(runtime_identity, dict)
+    model_identity = {
+        "provider": "openai_compatible",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "primary_model": "gpt-oss:20b",
+        "fast_model": "gpt-oss:20b",
+    }
+    spec_sha256 = "b" * 64
+    worker_receipt: dict[str, object] = {
+        "schema_version": "tripchord-live-worker-runtime-receipt-v1",
+        "runtime": "browser-bridge",
+        "providers": ["ctrip", "qunar", "tongcheng"],
+        "spec_sha256": spec_sha256,
+        "runtime_provenance": copy.deepcopy(runtime_identity),
+        "api_runtime_identity_sha256": gate._canonical_sha256(runtime_identity),
+        "worker_runtime_identity": copy.deepcopy(runtime_identity),
+        "model_agents_required": True,
+        "model_runtime_identity": model_identity,
+    }
+    trace = {
+        "id": "fixture-model-trace-0001",
+        "provider": model_identity["provider"],
+        "model": model_identity["primary_model"],
+        "role": "context",
+        "request_digest": "c" * 64,
+        "scope_id": challenge["job_graph"]["terminal_job_id"],  # type: ignore[index]
+        "scope_request_digest": challenge["request_sha256"],
+        "response_schema_requested": True,
+        "tool_count": 0,
+        "started_at": "2026-08-10T00:00:01+00:00",
+        "finished_at": "2026-08-10T00:00:02+00:00",
+        "success": True,
+        "usage": {"input_tokens": 8, "output_tokens": 4},
+        "estimated_cost_usd": 0.0,
+        "error_class": None,
+    }
+    unsigned_model_receipt: dict[str, object] = {
+        "schema_version": "tripchord-model-execution-receipt-v1",
+        "job_id": trace["scope_id"],
+        "request_sha256": challenge["request_sha256"],
+        "runtime_bundle_spec_sha256": spec_sha256,
+        "worker_runtime_identity_sha256": gate._canonical_sha256(
+            runtime_identity
+        ),
+        "model_runtime_identity": model_identity,
+        "trace_count": 1,
+        "success_count": 1,
+        "failure_count": 0,
+        "traces": [trace],
+    }
+    model_receipt = {
+        **unsigned_model_receipt,
+        "receipt_sha256": gate._canonical_sha256(unsigned_model_receipt),
+    }
+    trace_receipt = {
+        "scope_sha256": challenge["request_sha256"],
+        "total_count": 1,
+        "success_count": 1,
+        "failure_count": 0,
+    }
+    return worker_receipt, model_receipt, trace_receipt
+
+
+def _fixture_worker_model_receipts(
+    source: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    challenge = source["challenge"]
+    assert isinstance(challenge, dict)
+    return _fixture_worker_model_receipts_for_challenge(challenge)
+
+
 def _attach_fixture_formal_context(
     evidence: dict[str, object],
     source: dict[str, object],
@@ -1767,7 +1899,16 @@ def _attach_fixture_formal_context(
         "publication_icom_query_membership_sha256": graph[
             "publication_icom_query_membership_sha256"
         ],
+        "worker_runtime_receipt_sha256": member_summary[
+            "worker_runtime_receipt_sha256"
+        ],
+        "model_execution_receipt_sha256": member_summary[
+            "model_execution_receipt_sha256"
+        ],
     }
+    worker_receipt, model_receipt, trace_receipt = (
+        _fixture_worker_model_receipts(source)
+    )
     evidence.update(
         {
             "formal_live_source_binding": source,
@@ -1786,8 +1927,37 @@ def _attach_fixture_formal_context(
                 "api_payload_sha256": challenge["request_sha256"],
                 "digests_are_distinct_contracts": True,
             },
+            "worker_runtime_receipt": worker_receipt,
+            "model_execution_receipt": model_receipt,
+            "model_trace_receipt": trace_receipt,
         }
     )
+    runtime_before = evidence.get("runtime_before_run")
+    if isinstance(runtime_before, dict):
+        runtime_before["worker_model_runtime"] = {
+            "enabled": True,
+            "required": True,
+            **worker_receipt["model_runtime_identity"],  # type: ignore[misc]
+            "runtime_bundle_spec_sha256": worker_receipt["spec_sha256"],
+        }
+    heartbeat = source["companion_heartbeat_receipt"]
+    assert isinstance(heartbeat, dict)
+    heartbeat_details = heartbeat["details"]
+    assert isinstance(heartbeat_details, dict)
+    heartbeat_value = heartbeat_details["heartbeat"]
+    assert isinstance(heartbeat_value, dict)
+    companion_preflight = evidence.get("companion_preflight")
+    if isinstance(companion_preflight, dict):
+        companions = companion_preflight.get("companions")
+        if isinstance(companions, list) and len(companions) == 1:
+            companion = companions[0]
+            assert isinstance(companion, dict)
+            companion["build_identity"] = copy.deepcopy(
+                heartbeat_value["build_identity"]
+            )
+            companion["runtime_instance_id"] = heartbeat_value[
+                "runtime_instance_id"
+            ]
 
 
 def _per_check_evidence(name: str) -> dict[str, object]:
@@ -11945,6 +12115,74 @@ def _layer6_compact_fixture() -> dict[str, object]:
             )
         },
     )
+    worker_receipt, model_receipt, _trace_receipt = (
+        _fixture_worker_model_receipts(source)
+    )
+    runtime_provenance = worker_receipt["runtime_provenance"]
+    worker_identity = worker_receipt["worker_runtime_identity"]
+    assert isinstance(runtime_provenance, dict)
+    assert isinstance(worker_identity, dict)
+    worker_summary_unsigned: dict[str, object] = {
+        "schema_version": "tripchord-live-worker-runtime-summary-v1",
+        "runtime_receipt_sha256": gate._canonical_sha256(worker_receipt),
+        "runtime": worker_receipt["runtime"],
+        "providers": worker_receipt["providers"],
+        "spec_sha256": worker_receipt["spec_sha256"],
+        "api_runtime_identity_sha256": worker_receipt[
+            "api_runtime_identity_sha256"
+        ],
+        "runtime_provenance": {
+            key: runtime_provenance[key]
+            for key in (
+                "commit_sha",
+                "dependency_lock_sha256",
+                "live_system_source_sha256",
+            )
+        },
+        "worker_runtime_identity": {
+            key: worker_identity[key]
+            for key in (
+                "commit_sha",
+                "dependency_lock_sha256",
+                "live_system_source_sha256",
+                "python_version",
+                "started_at",
+                "pid",
+            )
+        },
+        "worker_runtime_identity_sha256": model_receipt[
+            "worker_runtime_identity_sha256"
+        ],
+        "model_agents_required": True,
+        "model_runtime_identity": worker_receipt["model_runtime_identity"],
+    }
+    worker_summary = {
+        **worker_summary_unsigned,
+        "summary_sha256": gate._canonical_sha256(worker_summary_unsigned),
+    }
+    source_receipts = [
+        event["details"]["source_execution_receipt"]  # type: ignore[index]
+        for event in source["receipts"]  # type: ignore[union-attr]
+        if event["kind"] == "browser_complete"  # type: ignore[index]
+    ]
+    ordered_source_hashes = [
+        receipt["receipt_sha256"] for receipt in source_receipts
+    ]
+    source_receipt_set = {
+        "schema_version": "tripchord-source-execution-receipt-set-v1",
+        "count": len(source_receipts),
+        "ordered_receipt_sha256": ordered_source_hashes,
+        "receipt_chain_sha256": gate._canonical_sha256(
+            ordered_source_hashes
+        ),
+        "receipts": source_receipts,
+    }
+    heartbeat = source["companion_heartbeat_receipt"]
+    assert isinstance(heartbeat, dict)
+    heartbeat_details = heartbeat["details"]
+    assert isinstance(heartbeat_details, dict)
+    heartbeat_value = heartbeat_details["heartbeat"]
+    assert isinstance(heartbeat_value, dict)
     compact: dict[str, object] = {
         "schema_version": gate._LAYER6_COMPACT_SCHEMA,
         "run_status": "completed",
@@ -11957,11 +12195,20 @@ def _layer6_compact_fixture() -> dict[str, object]:
         "runtime_before_run": {
             "model_provider": "test-provider",
             "primary_model": "test-model",
+            "worker_model_runtime": {
+                "enabled": True,
+                "required": True,
+                **worker_receipt["model_runtime_identity"],  # type: ignore[misc]
+                "runtime_bundle_spec_sha256": worker_receipt["spec_sha256"],
+            },
             "runtime_provenance": {
                 "commit_sha": "a" * 40,
             },
         },
         "formal_live_source_summary": formal_summary,
+        "worker_runtime_summary": worker_summary,
+        "model_execution_receipt": model_receipt,
+        "source_execution_receipts": source_receipt_set,
         "runtime_identity_sha256": formal_summary["runtime_identity_sha256"],
         "gate_run_id": source["challenge"]["run_id"],  # type: ignore[index]
         "companion_preflight": {
@@ -11976,6 +12223,10 @@ def _layer6_compact_fixture() -> dict[str, object]:
                     # authorization set, and the DISABLED ``tongcheng:lodging``
                     # never enters the compact.
                     "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
+                    "build_identity": heartbeat_value["build_identity"],
+                    "runtime_instance_id": heartbeat_value[
+                        "runtime_instance_id"
+                    ],
                 }
             ],
         },
@@ -12024,13 +12275,103 @@ def _layer6_compact_fixture() -> dict[str, object]:
 
 
 def test_verify_layer6_compact_contract_accepts_full_passing_set() -> None:
-    """C-118 Gap 7 positive: the full fifteen-check layer-6 compact passes the
-    blob read-back contract."""
+    """An isolated typed fixture still exercises the compact blob contract.
+
+    This is deliberately not an end-to-end production-source acceptance test;
+    the formal gate's actual positive can only be emitted by the extension
+    service-worker execution environment bound below.
+    """
     gate._verify_layer6_compact_contract(
         "done-gate-layer6-compact.json",
         _layer6_compact_fixture(),
         tested_commit_sha="a" * 40,
     )
+
+
+def test_verify_layer6_compact_contract_rejects_untrusted_source_executor() -> None:
+    """A fully self-consistent browser/fixture executor cannot certify Layer 6.
+
+    Recompute every public receipt digest after changing only the execution
+    environment.  The final consumer must still reject it because production
+    source authority is bound to the shipped extension service worker, not to
+    a test browser, local HTML fixture, or external hand-authored executor.
+    """
+    compact = _layer6_compact_fixture()
+    source_set = compact["source_execution_receipts"]
+    assert isinstance(source_set, dict)
+    receipts = source_set["receipts"]
+    assert isinstance(receipts, list) and receipts
+    rebuilt_hashes: list[str] = []
+    for receipt in receipts:
+        assert isinstance(receipt, dict)
+        receipt["execution_environment"] = "untrusted_external_executor"
+        unsigned = {
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_sha256"
+        }
+        receipt["receipt_sha256"] = gate._canonical_sha256(unsigned)
+        rebuilt_hashes.append(str(receipt["receipt_sha256"]))
+    source_set["ordered_receipt_sha256"] = rebuilt_hashes
+    source_set["receipt_chain_sha256"] = gate._canonical_sha256(
+        rebuilt_hashes
+    )
+
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="invalid source execution receipt set",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_rejects_self_consistent_worker_receipt_swap() -> None:
+    """The signed source summary fixes the exact worker receipt projection."""
+
+    compact = _layer6_compact_fixture()
+    worker = compact["worker_runtime_summary"]
+    assert isinstance(worker, dict)
+    worker["runtime_receipt_sha256"] = "6" * 64
+    worker["summary_sha256"] = gate._canonical_sha256(
+        {key: value for key, value in worker.items() if key != "summary_sha256"}
+    )
+
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="invalid worker runtime summary",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
+
+
+def test_verify_layer6_compact_rejects_self_consistent_model_receipt_swap() -> None:
+    """A recomputed model receipt still cannot escape the signed job graph."""
+
+    compact = _layer6_compact_fixture()
+    receipt = compact["model_execution_receipt"]
+    assert isinstance(receipt, dict)
+    traces = receipt["traces"]
+    assert isinstance(traces, list) and isinstance(traces[0], dict)
+    traces[0]["id"] = "foreign-but-self-consistent-model-trace"
+    receipt["receipt_sha256"] = gate._canonical_sha256(
+        {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    )
+
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="invalid model execution receipt",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
 
 
 def test_verify_layer6_compact_contract_rejects_non_passing_check() -> None:
@@ -12387,7 +12728,8 @@ def test_verify_layer6_compact_contract_rejects_bad_companion_preflight() -> Non
     compact = _layer6_compact_fixture()
     compact["companion_preflight"] = {"status": "ok", "companions": []}  # type: ignore[assignment]
     with pytest.raises(
-        gate.GateStateChangedError, match="stale_after_seconds"
+        gate.GateStateChangedError,
+        match=r"no unique formal Companion identity|stale_after_seconds",
     ):
         gate._verify_layer6_compact_contract(
             "done-gate-layer6-compact.json",
@@ -13692,18 +14034,11 @@ def test_verify_layer6_compact_contract_rejects_checkpoint_binding_wrong_field_d
 
 
 # =====================================================================
-# C-round4 (fresh independent RETURN, formal-runner gate): the POSITIVE and every
-# counterexample run on ONE formal production chain —
-#   run_live_done_gate_v4._run() unique production entry
-#   → FlexibleLiveAgentSystem.run() production entry
-#   → execute_pair() per-pair expansion (real LivePackageAgentSystem.run())
-#   → JobControlPlane.report_pair_checkpoint() forming the checkpoints
-#   → the official 15-check evaluate_live_v4_done_gate producer
-#   → _completed_evidence_bundle() + atomic 0600 _write_evidence_bundle()
-#   → the real compact writer _compact_live_e2e
-#   → _verify_layer6_compact_contract.
-# The raw payload is read back from the formal runner's actual output file — no
-# hand-built run / checkpoint / raw payload and no _realistic_e2e_evidence reuse.
+# C-146: former C-round4 test-generated inventory is retained only as a bounded
+# rejection fixture.  It may exercise ordinary quote/domain types, but it can
+# never mint a formal source execution receipt or certify Layer 6.  The actual
+# positive remains exclusively the production HTTP → independent worker →
+# shipped Companion/model → producer/compact/consumer path.
 # =====================================================================
 
 _C4_REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -13739,7 +14074,7 @@ async def _c4_noop_sleep(_seconds: float) -> None:
 
 
 def _c4_frozen_flight_quote(lease: Any) -> Any:
-    """Date-adaptive flight quote for the frozen scenario pair windows.
+    """Former date-adaptive test quote, retained only for rejection coverage.
 
     The stock ``_flight_quote`` fixture hardcodes 2026-08-23/08-30, which the
     frozen pairs (08-06..08-11, 08-18..08-24, 08-31..09-08) never match; the
@@ -13771,7 +14106,7 @@ def _c4_frozen_flight_quote(lease: Any) -> Any:
 
 
 def _c4_frozen_success(lease: Any) -> BrowserTaskCompletion:
-    """Serve the frozen scenario with official product ids on every quote.
+    """Former synthetic success body, retained only for rejection coverage.
 
     The synthetic sold-out event resolution must be able to *confirm* a
     different product; that requires the sold-out target to carry official
@@ -13817,7 +14152,7 @@ def _c4_frozen_success(lease: Any) -> BrowserTaskCompletion:
 
 
 def _c4_event_source_replacement(lease: Any) -> BrowserTaskCompletion:
-    """Serve the single event-source task with a confirmed different product.
+    """Former synthetic event body, retained only for rejection coverage.
 
     Returns the original product (same stable identity as the sold-out target)
     and an alternative lodging with a distinct official product id; the
@@ -13855,192 +14190,91 @@ def _c4_event_source_replacement(lease: Any) -> BrowserTaskCompletion:
     )
 
 
-class _C4IComHTTPHarness:
-    """Exact public-read HTTP boundary for the REAL iCom provider.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "legacy_completion",
+    (_c4_frozen_success, _c4_event_source_replacement),
+    ids=("frozen-test-quote", "test-event-replacement"),
+)
+async def test_formal_browser_rejects_legacy_test_quote_standins(
+    legacy_completion: Callable[[Any], BrowserTaskCompletion],
+) -> None:
+    """The former test-fixture positive cannot satisfy formal source proof."""
+    from tripchord.providers.browser_bridge import (
+        BrowserClaimError,
+        BrowserCompanionBuildIdentity,
+        BrowserProvider,
+        BrowserSearchQuery,
+        BrowserTaskBridge,
+        BrowserTaskSubmission,
+    )
 
-    The harness returns raw upstream JSON only.  Schema validation,
-    normalization, evidence hashing, option construction, and public-transfer
-    conversion remain owned by ``IComTransferProvider``.
-    """
-
-    def __init__(self) -> None:
-        self.paths: list[str] = []
-        self.schedule_calls: dict[str, int] = {}
-
-    def respond(
-        self,
-        path: str,
-        params: dict[str, str],
-    ) -> tuple[int, dict[str, object]]:
-        """Return ``(status, payload)`` for one raw iCom public-read request.
-
-        Pure response logic shared by the MockTransport handler and the REAL
-        loopback server the C-146 P0-1 ready chain reaches (``icom_api_origin``).
-        """
-        self.paths.append(path)
-        meta = {
-            "timestamp": NOW.isoformat(),
-            "apiVersion": "v1",
-            "status": "success",
-            "message": "Success",
-        }
-        if path == "/api/v1/public/trips/schedules":
-            travel_date = params["date"]
-            call = self.schedule_calls.get(travel_date, 0) + 1
-            self.schedule_calls[travel_date] = call
-            ordinal = date.fromisoformat(travel_date).toordinal()
-
-            def row(
-                *,
-                suffix: int,
-                origin_id: int,
-                origin: str,
-                destination_id: int,
-                destination: str,
-                hour: int,
-            ) -> dict[str, object]:
-                departure_hour = hour + call - 1
-                return {
-                    "id": ordinal * 10 + suffix + call * 1_000_000,
-                    "tripDate": travel_date,
-                    "departureTime": f"{departure_hour:02d}:00",
-                    "arrivalTime": f"{departure_hour:02d}:45",
-                    "capacity": 45,
-                    "remainingCapacity": 45,
-                    "cancelledAt": None,
-                    "isCancelled": False,
-                    "scheduleId": ordinal * 10 + suffix + call * 2_000_000,
-                    "stops": 0,
-                    "ferryName": f"iCom formal HTTP fixture {suffix}",
-                    "vessel": {
-                        "id": suffix,
-                        "name": f"iCom Vessel {suffix}",
-                        "totalCapacity": 45,
-                    },
-                    "origin": {"id": origin_id, "name": origin},
-                    "destination": {
-                        "id": destination_id,
-                        "name": destination,
-                    },
-                }
-
-            return (
-                200,
-                {
-                    "meta": meta,
-                    "data": [
-                        row(
-                            suffix=1,
-                            origin_id=3,
-                            origin="Airport",
-                            destination_id=1,
-                            destination="Maafushi",
-                            hour=21,
-                        ),
-                        row(
-                            suffix=2,
-                            origin_id=1,
-                            origin="Maafushi",
-                            destination_id=3,
-                            destination="Airport",
-                            hour=6,
-                        ),
-                    ],
-                },
-            )
-        if path == "/api/v1/public/ferry-fares/schedule-base-price":
-            return 200, {
-                "meta": meta,
-                "data": {"amount": 30, "currencyCode": "USD"},
+    class _LegacyFormalScope:
+        def current_execution_capability(self) -> dict[str, object]:
+            return {
+                "capability_id": "20000000-0000-4000-8000-000000000002",
+                "challenge_id": "legacy-test-quote-challenge",
+                "run_id": "legacy-test-quote-run",
+                "terminal_job_id": "live-job-legacy-test-quote",
+                "request_sha256": "1" * 64,
+                "job_graph_sha256": "2" * 64,
+                "attempt_digest": "3" * 64,
             }
-        if path == "/api/v1/public/policy-sections":
-            return (
-                200,
-                {
-                    "meta": meta,
-                    "data": [
-                        {
-                            "id": 1,
-                            "title": "Payments",
-                            "richtext": {
-                                "blocks": [
-                                    {
-                                        "type": "paragraph",
-                                        "data": {
-                                            "text": (
-                                                "All prices are displayed and charged "
-                                                "in US Dollars (USD)."
-                                            )
-                                        },
-                                    }
-                                ]
-                            },
-                            "isActive": True,
-                        }
-                    ],
-                },
+
+    class _MemoryOnlyState:
+        def load(self) -> None:
+            return None
+
+        def save(self, _state: object) -> None:
+            return None
+
+    bridge = BrowserTaskBridge(
+        source_authority=_LegacyFormalScope(),  # type: ignore[arg-type]
+        state_store=_MemoryOnlyState(),  # type: ignore[arg-type]
+        now=lambda: NOW,
+    )
+    task = (
+        await bridge.submit_many(
+            (
+                BrowserTaskSubmission(
+                    provider=BrowserProvider.CTRIP,
+                    kind=BrowserVertical.LODGING,
+                    query=BrowserSearchQuery(
+                        origin="HGH",
+                        destination="Maafushi",
+                        start_date=date(2026, 8, 23),
+                        end_date=date(2026, 8, 30),
+                        adults=2,
+                        rooms=1,
+                        options={
+                            "segment": "full",
+                            "expected_package_area": "destination_island",
+                        },
+                    ),
+                ),
             )
-        raise AssertionError(f"unexpected iCom URL: {path}")
+        )
+    )[0]
+    response = await bridge.claim_response(
+        "legacy-test-companion",
+        providers=(BrowserProvider.CTRIP,),
+        limit=1,
+        build_identity=BrowserCompanionBuildIdentity(
+            manifest_version="0.1.0",
+            build_sha256="4" * 64,
+            content_runtime_version="2026-08-17.1",
+        ),
+        runtime_instance_id="legacy-test-runtime-instance",
+    )
+    lease = response.leases[0]
+    assert lease.task_id == task.id
 
-    def __call__(self, request: Any) -> Any:
-        import httpx
-
-        assert request.method == "GET"
-        assert request.url.host == "sfs-api.icomtours.com"
-        params = {key: values[0] for key, values in request.url.params.multi_items()}
-        status, payload = self.respond(request.url.path, params)
-        return httpx.Response(status, json=payload)
-
-
-class _C4IComHTTPServer(ThreadingHTTPServer):
-    """REAL loopback HTTP server serving the C4 iCom public-read JSON.
-
-    C-146 P0-1: the formal Layer 6 ready chain reaches the worker through a REAL
-    cross-process HTTP boundary, so the worker's public-transfer reads must hit a
-    REACHABLE origin — not the in-process ``httpx.MockTransport`` of the old
-    seam. Raw upstream JSON only; schema validation and evidence hashing stay
-    owned by ``IComTransferProvider`` in the worker.
-    """
-
-    daemon_threads = True
-
-    def __init__(self, harness: _C4IComHTTPHarness) -> None:
-        super().__init__(("127.0.0.1", 0), _C4IComHTTPHandler)
-        self.harness = harness
-
-    @property
-    def origin(self) -> str:
-        host, port = self.server_address[:2]
-        return f"http://{host}:{port}"
-
-
-class _C4IComHTTPHandler(BaseHTTPRequestHandler):
-    """Serve the harness's raw JSON for one GET request."""
-
-    def do_GET(self) -> None:
-        parsed = urlsplit(self.path)
-        params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
-        try:
-            status, payload = self.server.harness.respond(parsed.path, params)  # type: ignore[attr-defined]
-        except AssertionError as exc:
-            self.send_error(404, str(exc))
-            return
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format: str, *args: Any) -> None:
-        return
-
-
-def _c4_free_loopback_port() -> int:
-    """Pick a free loopback port for the worker's real HTTP server."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reserved:
-        reserved.bind(("127.0.0.1", 0))
-        return int(reserved.getsockname()[1])
+    with pytest.raises(BrowserClaimError, match="source execution attestation"):
+        await bridge.complete(
+            lease.task_id,
+            lease.claim_token,
+            legacy_completion(lease),
+        )
 
 
 def _c4_validate_formal_composition(
@@ -14119,990 +14353,47 @@ def _c4_validate_formal_transport_receipts(
         raise AssertionError("formal production source binding lacks exact iCom receipts")
 
 
-class _RealChainArtifacts:
-    """One REAL production-chain run's frozen artifacts — the shared run / pair
-    / query identity the positive and every counterexample are bound to."""
+def test_former_visible_dom_positive_is_rejected_as_untrusted_source() -> None:
+    """The former browser-fixture positive is now a deterministic negative.
 
-    def __init__(
-        self,
-        *,
-        run: Any,
-        cs: Any,
-        request_sha256: str,
-        report: Any,
-        publication_run: Any,
-        event: Any,
-        head: str,
-        binding: dict[str, object],
-        observed_by_pair: dict[str, tuple[str, ...]],
-        raw_output: Path,
-        raw_payload: dict[str, Any],
-        restored: dict[str, bool],
-        composition_types: dict[str, str],
-        icom_http_paths: tuple[str, ...],
-        companion_heartbeat_status: int,
-        formal_source_binding: dict[str, object],
-    ) -> None:
-        self.run = run
-        self.cs = cs
-        self.request_sha256 = request_sha256
-        self.report = report
-        self.publication_run = publication_run
-        self.event = event
-        self.head = head
-        self.binding = binding
-        self.observed_by_pair = observed_by_pair
-        self.raw_output = raw_output
-        self.raw_payload = raw_payload
-        self.restored = restored
-        self.composition_types = composition_types
-        self.icom_http_paths = icom_http_paths
-        self.companion_heartbeat_status = companion_heartbeat_status
-        self.formal_source_binding = formal_source_binding
-
-
-async def _drive_real_production_chain(staging_dir: Path) -> _RealChainArtifacts:
-    """Run the formal runner against the production API with a REAL worker.
-
-    C-146 P0-1: the flexible planning route wraps the real operation in a
-    ``LiveJobWorkerCommand``; the worker runtime bundle points the REAL
-    subprocess worker at a REAL loopback iCom origin and a REAL loopback bridge
-    port, and the Companion serves the worker's bridge over the network — the
-    exact production ready chain, never an in-process substitute. The formal
-    ``run_live_done_gate_v4._run`` owns request loading, runtime/Companion
-    preflight, async job submission, checkpoint validation, event replan,
-    producer evaluation, completed-bundle construction, and the atomic 0600
-    evidence write. No production class/function is replaced: black-box
-    persisted evidence proves every required stage, and the enclosing
-    ``try/finally`` restores the bounded API transport/env state.
+    Even after an attacker recomputes every public digest, a controlled local
+    page or other external executor cannot claim the extension service-worker
+    execution environment required by the production Layer-6 consumer.
     """
-    import httpx
-    import tripchord.main as api_main
-    from tripchord.agents.flexible_live_system import FlexibleLiveAgentSystem
-    from tripchord.agents.live_done_gate_v4 import LiveV4DoneGateReport
-    from tripchord.agents.live_system import (
-        LiveEventReplanRun,
-        LivePackageAgentRun,
-        LivePackageAgentSystem,
-    )
-    from tripchord.main import app
-    from tripchord.providers.browser_bridge import (
-        BRIDGE_TOKEN_HEADER,
-        BrowserProvider,
-        BrowserTaskLease,
-    )
-
-    from benchmarks import run_live_done_gate_v4
-
-    # These identities are never patched.  Retaining and checking them makes
-    # process-isolation regressions explicit without global instrumentation.
-    _orig_run = FlexibleLiveAgentSystem.run
-    _orig_live_run = LivePackageAgentSystem.run
-    _orig_completed = run_live_done_gate_v4._completed_evidence_bundle
-    _orig_write = run_live_done_gate_v4._write_evidence_bundle
-
-    original_routes = tuple(app.router.routes)
-    state_names = (
-        "browser_task_bridge",
-        "live_package_agent_system",
-        "flexible_live_agent_system",
-        "icom_transfer_provider",
-        "formal_live_source_authority",
-        "browser_bridge_token",
-        "browser_bridge_control_token",
-        "browser_bridge_control_enabled",
-        "browser_companion_auto_reload_enabled",
-        "browser_companion_runtime_agent",
-        "browser_companion_runtime_supervisor",
-    )
-    missing = object()
-    original_state = {
-        name: getattr(app.state, name, missing)
-        for name in state_names
-    }
-    original_model_router = api_main.model_router
-    original_model_trace_sink = api_main.model_trace_sink
-    original_control_path = api_main._FORMAL_SOURCE_CONTROL_PATH
-    restored: dict[str, bool] = {}
-
-    bridge_token = "c4-formal-run-local-bridge-token-000000000000"
-    companion_id = "c4-formal-run-companion"
-    companion_runtime_id = "c4-formal-runtime-instance-0001"
-    companion_build_identity = {
-        "protocol_version": "tripchord-companion-control-v1",
-        "manifest_version": "c4-formal-build-v1",
-        "build_sha256": "9" * 64,
-        "content_runtime_version": "c4-formal-runtime-v1",
-    }
-    raw_output = staging_dir.parent / "formal-run" / "live-done-gate-v4.json"
-    # The REAL cross-process worker reaches the iCom origin over loopback HTTP
-    # (never an in-process MockTransport), so the harness is served by a REAL
-    # server.  The parent's own bridge keeps a MockTransport client — it only
-    # exists for preflight/composition, never for the worker's reads.
-    icom_harness = _C4IComHTTPHarness()
-    icom_server = _C4IComHTTPServer(icom_harness)
-    icom_thread = threading.Thread(
-        target=icom_server.serve_forever,
-        daemon=True,
-        name="tripchord-c4-icom-loopback",
-    )
-    icom_thread.start()
-    icom_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(icom_harness),
-    )
-    assert _TEST_FORMAL_PRIVATE_KEY_PATH is not None
-    assert _TEST_FORMAL_LEDGER_PATH is not None
-    assert _TEST_FORMAL_CONTROL_TOKEN_PATH is not None
-    composition_types: dict[str, str] = {}
-    companion_heartbeat_status = 0
-    worker_port = _c4_free_loopback_port()
-    _BUNDLE_ENV = "TRIPCHORD_LIVE_FLEXIBLE_WORKER_RUNTIME_BUNDLE"
-    original_bundle = os.environ.get(_BUNDLE_ENV)
-    worker_bundle = json.dumps(
-        {
-            "runtime": "browser-bridge",
-            "bridge_token": bridge_token,
-            "providers": [
-                BrowserProvider.CTRIP.value,
-                BrowserProvider.QUNAR.value,
-                BrowserProvider.TONGCHENG.value,
-            ],
-            "model_agents_required": False,
-            "adaptive_agent_scaling_enabled": False,
-            "now_iso": NOW.isoformat(),
-            "http_host": "127.0.0.1",
-            "http_port": worker_port,
-            "icom_api_origin": icom_server.origin,
-            "formal_source_private_key_path": str(
-                _TEST_FORMAL_PRIVATE_KEY_PATH
-            ),
-            "formal_source_ledger_path": str(_TEST_FORMAL_LEDGER_PATH),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-    companion_payload = {
-        "companion_id": companion_id,
-        "providers": ["ctrip", "qunar", "tongcheng"],
-        "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
-        "adapter_version": "c4-formal-http-transport",
-        "contract_version": "tripchord-browser-companion-v1",
-        "build_identity": companion_build_identity,
-        "runtime_instance_id": companion_runtime_id,
-    }
-
-    async def complete_leases(
-        companion_client: httpx.AsyncClient,
-        leases: tuple[BrowserTaskLease, ...],
-    ) -> None:
-        for lease in leases:
-            is_event_recheck = (
-                lease.kind == BrowserVertical.LODGING
-                and lease.query.options.get(
-                    "__tripchord_allow_recent_quote_reuse"
-                )
-                is False
-            )
-            completion = (
-                _c4_event_source_replacement(lease)
-                if is_event_recheck
-                else _c4_frozen_success(lease)
-            )
-            completed = await companion_client.post(
-                f"/browser-bridge/v1/tasks/{lease.task_id}/complete",
-                headers={BRIDGE_TOKEN_HEADER: bridge_token},
-                json={
-                    "claim_token": lease.claim_token,
-                    "completion": completion.model_dump(mode="json"),
-                },
-            )
-            completed.raise_for_status()
-
-    async def serve_ready_chain_companion() -> None:
-        """Serve the flexible job's source tasks on the WORKER's bridge and the
-        event-replan recheck tasks on the PARENT's bridge.
-
-        C-146 P0-1: the flexible job executes in the REAL independent worker, so
-        its browser tasks are queued on the WORKER's bridge — reached over REAL
-        loopback HTTP (the worker only starts serving after activation, so
-        connection errors are retried).  The post-run event replan submits its
-        recheck tasks to the PARENT's bridge (in-process ASGI), which this loop
-        also serves.
-        """
-        async with client_factory(base_url="http://tripchord.test") as parent_client:
-            while True:
-                # Parent bridge: keep the Companion FRESH for the formal
-                # activation (the activation endpoint waits for a real heartbeat)
-                # and serve the event-replan recheck tasks that land here.
-                try:
-                    heartbeat = await parent_client.post(
-                        "/browser-bridge/v1/companions/heartbeat",
-                        headers={BRIDGE_TOKEN_HEADER: bridge_token},
-                        json=companion_payload,
-                    )
-                    heartbeat.raise_for_status()
-                    pending_activation = heartbeat.json().get(
-                        "formal_activation_request"
-                    )
-                    if pending_activation is not None:
-                        acknowledged = await parent_client.post(
-                            "/browser-bridge/v1/companions/heartbeat",
-                            headers={BRIDGE_TOKEN_HEADER: bridge_token},
-                            json={
-                                **companion_payload,
-                                "formal_activation_ack": pending_activation,
-                            },
-                        )
-                        acknowledged.raise_for_status()
-                    claim = await parent_client.post(
-                        "/browser-bridge/v1/tasks/claim",
-                        headers={BRIDGE_TOKEN_HEADER: bridge_token},
-                        json={**companion_payload, "limit": 6},
-                    )
-                    claim.raise_for_status()
-                    leases = tuple(
-                        BrowserTaskLease.model_validate(item)
-                        for item in claim.json().get("leases", [])
-                    )
-                    if leases:
-                        await complete_leases(parent_client, leases)
-                except httpx.HTTPStatusError:
-                    pass
-                # Worker bridge: the flexible job's REAL source tasks.
-                try:
-                    async with httpx.AsyncClient(
-                        base_url=f"http://127.0.0.1:{worker_port}",
-                        headers={BRIDGE_TOKEN_HEADER: bridge_token},
-                        timeout=15.0,
-                    ) as worker_client:
-                        heartbeat = await worker_client.post(
-                            "/browser-bridge/v1/companions/heartbeat",
-                            json=companion_payload,
-                        )
-                        heartbeat.raise_for_status()
-                        pending_activation = heartbeat.json().get(
-                            "formal_activation_request"
-                        )
-                        if pending_activation is not None:
-                            acknowledged = await worker_client.post(
-                                "/browser-bridge/v1/companions/heartbeat",
-                                json={
-                                    **companion_payload,
-                                    "formal_activation_ack": pending_activation,
-                                },
-                            )
-                            acknowledged.raise_for_status()
-                        claim = await worker_client.post(
-                            "/browser-bridge/v1/tasks/claim",
-                            json={**companion_payload, "limit": 6},
-                        )
-                        claim.raise_for_status()
-                        leases = tuple(
-                            BrowserTaskLease.model_validate(item)
-                            for item in claim.json().get("leases", [])
-                        )
-                        if leases:
-                            await complete_leases(worker_client, leases)
-                except httpx.HTTPError:
-                    # Worker not serving yet (pre-activation), shutting down
-                    # after publishing its terminal result, or transient.  A
-                    # shutdown-side read timeout must not kill the same
-                    # Companion loop before it serves the parent's subsequent
-                    # synthetic event-recheck lease.
-                    pass
-                await asyncio.sleep(0)
-
-    def client_factory(**kwargs: Any) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            transport=httpx.ASGITransport(
-                app=app,
-                client=("127.0.0.1", 51342),
-            ),
-            **kwargs,
-        )
-
-    serve_task: asyncio.Task[None] | None = None
-    try:
-        api_main._FORMAL_SOURCE_CONTROL_PATH = _TEST_FORMAL_CONTROL_TOKEN_PATH
-        # The production composition entry creates and binds the real bridge,
-        # provider, pair runner, flexible runner, and mounted bridge API.  The
-        # test never assembles those objects or writes their app.state slots.
-        configured = api_main.settings.model_copy(
-            update={
-                "browser_bridge_enabled": True,
-                "browser_bridge_token": bridge_token,
-                "browser_bridge_control_token": None,
-                "browser_companion_auto_reload_enabled": False,
-                "model_agents_required": False,
-                "adaptive_agent_scaling_enabled": False,
-            }
-        )
-        bridge, live_system = api_main._install_browser_bridge(
-            app,
-            configured,
-            icom_http_client=icom_client,
-            now=lambda: NOW,
-            sleep=_c4_noop_sleep,
-            formal_source_private_key_path=_TEST_FORMAL_PRIVATE_KEY_PATH,
-            formal_source_ledger_path=_TEST_FORMAL_LEDGER_PATH,
-        )
-        assert bridge is not None and live_system is not None
-        flexible_system = app.state.flexible_live_agent_system
-        icom_provider = app.state.icom_transfer_provider
-        composition_types = _c4_validate_formal_composition(
-            bridge,
-            live_system,
-            flexible_system,
-            icom_provider,
-        )
-        await api_main.database.create_schema()
-
-        # Companion presence is reported through the mounted production HTTP
-        # endpoint, exactly as the real extension does; no direct heartbeat
-        # mutation is allowed in the positive chain.
-        async with client_factory(base_url="http://tripchord.test") as setup_client:
-            heartbeat = await setup_client.post(
-                "/browser-bridge/v1/companions/heartbeat",
-                headers={BRIDGE_TOKEN_HEADER: bridge_token},
-                json={
-                    "companion_id": companion_id,
-                    "providers": [
-                        BrowserProvider.CTRIP.value,
-                        BrowserProvider.QUNAR.value,
-                        BrowserProvider.TONGCHENG.value,
-                    ],
-                    "authorized_scope_keys": sorted(
-                        gate._CERTIFIED_OTA_SCOPES
-                    ),
-                    "adapter_version": "c4-formal-http-transport",
-                    "contract_version": "tripchord-browser-companion-v1",
-                    "build_identity": companion_build_identity,
-                    "runtime_instance_id": companion_runtime_id,
-                },
-            )
-            companion_heartbeat_status = heartbeat.status_code
-            heartbeat.raise_for_status()
-            prime = await setup_client.post(
-                "/browser-bridge/v1/tasks/claim",
-                headers={BRIDGE_TOKEN_HEADER: bridge_token},
-                json={
-                    "companion_id": companion_id,
-                    "providers": ["ctrip", "qunar", "tongcheng"],
-                    "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
-                    "adapter_version": "c4-formal-http-transport",
-                    "contract_version": "tripchord-browser-companion-v1",
-                    "build_identity": companion_build_identity,
-                    "runtime_instance_id": companion_runtime_id,
-                    "limit": 6,
-                },
-            )
-            prime.raise_for_status()
-
-        os.environ[_BUNDLE_ENV] = worker_bundle
-        serve_task = asyncio.create_task(serve_ready_chain_companion())
-        args = SimpleNamespace(
-            request=(
-                _C4_REPO_ROOT
-                / "benchmarks/scenarios/live-hgh-mle-aug-2026-v4.json"
-            ),
-            output=raw_output,
-            api_base="http://tripchord.test",
-            api_token="",
-            bridge_token=bridge_token,
-            gate_run_id=(
-                "test-c4-"
-                + hashlib.sha256(str(staging_dir).encode()).hexdigest()[:24]
-            ),
-            formal_source_control_token_file=_TEST_FORMAL_CONTROL_TOKEN_PATH,
-            request_timeout_seconds=3900.0,
-            maximum_quote_age_minutes=15,
-            minimum_recommendable_options=2,
-            require_model_enhancement=False,
-        )
-        code = await run_live_done_gate_v4._run(
-            args,
-            client_factory=client_factory,
-            now_factory=lambda: NOW,
-        )
-        assert code == 0, "formal live-v4 runner must complete and pass"
-        sealed = json.loads(raw_output.read_text(encoding="utf-8"))
-        sealed_challenge = sealed["formal_live_source_challenge"]
-        replay_context = {
-            key: sealed_challenge[key]
-            for key in (
-                "run_id",
-                "tested_commit_sha",
-                "runtime_identity",
-                "request_sha256",
-                "candidate_set_sha256",
-                "scenario_sha256",
-            )
-        }
-        async with client_factory(base_url="http://tripchord.test") as replay_client:
-            replay = await replay_client.post(
-                "/api/v1/internal/formal-live-source/finalize",
-                headers={
-                    "X-TripChord-Formal-Source-Control": (
-                        api_main._formal_source_control_token()
-                    ),
-                    "Idempotency-Key": "consumed-challenge-replay",
-                },
-                json={
-                    "context": replay_context,
-                    "execution_capability": {},
-                },
-            )
-        assert replay.status_code == 409, "a consumed challenge must fail closed"
-    finally:
-        if serve_task is not None:
-            serve_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await serve_task
-        if original_bundle is None:
-            os.environ.pop(_BUNDLE_ENV, None)
-        else:
-            os.environ[_BUNDLE_ENV] = original_bundle
-        icom_server.shutdown()
-        icom_server.server_close()
-        await icom_client.aclose()
-        app.router.routes[:] = original_routes
-        api_main._FORMAL_SOURCE_CONTROL_PATH = original_control_path
-        for name, value in original_state.items():
-            if value is missing:
-                delattr(app.state, name)
-            else:
-                setattr(app.state, name, value)
-        restored = {
-            "flexible_run": FlexibleLiveAgentSystem.run is _orig_run,
-            "live_run": LivePackageAgentSystem.run is _orig_live_run,
-            "completed_bundle": (
-                run_live_done_gate_v4._completed_evidence_bundle
-                is _orig_completed
-            ),
-            "write_bundle": (
-                run_live_done_gate_v4._write_evidence_bundle is _orig_write
-            ),
-            "app_routes": tuple(app.router.routes) == original_routes,
-            "app_state": all(
-                (
-                    not hasattr(app.state, name)
-                    if value is missing
-                    else getattr(app.state, name) is value
-                )
-                for name, value in original_state.items()
-            ),
-            "main_globals": (
-                api_main.model_router is original_model_router
-                and api_main.model_trace_sink is original_model_trace_sink
-            ),
-        }
-
-    actual_output = raw_output
-    raw_payload = json.loads(actual_output.read_text(encoding="utf-8"))
-    run = run_live_done_gate_v4.FlexibleLiveAgentRun.model_validate(
-        raw_payload["flexible_run"]
-    )
-    report = LiveV4DoneGateReport.model_validate(raw_payload["done_gate"])
-    publication_run = LivePackageAgentRun.model_validate(
-        raw_payload["selected_publication_run"]
-    )
-    event = LiveEventReplanRun.model_validate(raw_payload["event_run"])
-    binding = dict(raw_payload["pair_checkpoint_binding"])
-    formal_source_binding = dict(raw_payload["formal_live_source_binding"])
-    request_sha256 = str(raw_payload["request_identity"]["api_payload_sha256"])
-    observed_by_pair = {
-        execution.date_pair.id: tuple(task.id for task in execution.query_tasks)
-        for execution in run.pair_runs
-    }
-    return _RealChainArtifacts(
-        run=run,
-        cs=_frozen_candidate_set(),
-        request_sha256=request_sha256,
-        report=report,
-        publication_run=publication_run,
-        event=event,
-        head=str(raw_payload["repo_revision"]["commit_sha"]),
-        binding=binding,
-        observed_by_pair=observed_by_pair,
-        raw_output=actual_output,
-        raw_payload=raw_payload,
-        restored=restored,
-        composition_types=composition_types,
-        icom_http_paths=tuple(icom_harness.paths),
-        companion_heartbeat_status=companion_heartbeat_status,
-        formal_source_binding=formal_source_binding,
-    )
-
-
-_c4_chain_cache: dict[str, _RealChainArtifacts] = {}
-
-
-def _real_production_chain(staging_dir: Path) -> _RealChainArtifacts:
-    """Run the formal production chain once and share its persisted raw file.
-
-    C-146 P0-1: the production builder is NEVER replaced.  The flexible planning
-    route wraps the real operation in a ``LiveJobWorkerCommand`` and the formal
-    chain drives the REAL independent worker subprocess over REAL loopback HTTP
-    (Companion + iCom harness are reachable origins), so the sealed evidence is
-    produced by the exact production ready chain.
-    """
-    if "artifacts" not in _c4_chain_cache:
-        _c4_chain_cache["artifacts"] = asyncio.run(
-            _drive_real_production_chain(staging_dir)
-        )
-    return _c4_chain_cache["artifacts"]
-
-
-def _c4_raw_variant(
-    artifacts: _RealChainArtifacts,
-    *,
-    done_gate: dict[str, object] | None = None,
-    binding: dict[str, object] | None = None,
-) -> dict[str, object]:
-    """Mutate a deep copy of the formal runner's persisted raw payload."""
-    payload = copy.deepcopy(artifacts.raw_payload)
-    if done_gate is not None:
-        payload["done_gate"] = done_gate
-    if binding is not None:
-        payload["pair_checkpoint_binding"] = binding
-    return payload
-
-
-def _c4_rebuild_checkpoint(
-    entry: dict[str, object],
-    request_sha256: str,
-    query_ids: list[str],
-    sequence: int,
-) -> dict[str, object]:
-    """Rebuild one desensitized checkpoint binding entry through the checkpoint
-    model's authoritative ``create`` (which recomputes run_summary_sha256 /
-    checkpoint_sha256 from the carried fields) so a mutation keeps every digest
-    internally consistent and the ONLY deviation is the injected one."""
-    from tripchord.agents.live_jobs import (
-        LivePlanningPairCheckpoint,
-        LivePlanningPairCheckpointState,
-    )
-
-    checkpoint = LivePlanningPairCheckpoint.create(
-        sequence=sequence,
-        request_sha256=request_sha256,
-        date_pair_id=entry["date_pair_id"],
-        departure_date=date.fromisoformat(entry["departure_date"]),
-        return_date=date.fromisoformat(entry["return_date"]),
-        state=LivePlanningPairCheckpointState(entry["state"]),
-        query_task_ids=tuple(query_ids),
-        run_purpose=entry["run_purpose"],
-        finalization_state=entry["finalization_state"],
-        decision_state=entry["decision_state"],
-        source_task_count=entry["source_task_count"],
-        exploration_seal_passed=entry["exploration_seal_passed"],
-        all_platforms_complete=entry["all_platforms_complete"],
-        failure_class=entry.get("failure_class"),
-        captured_at=datetime.fromisoformat(entry["captured_at"]),
-    )
-    return {
-        "sequence": checkpoint.sequence,
-        "date_pair_id": checkpoint.date_pair_id,
-        "departure_date": checkpoint.departure_date.isoformat(),
-        "return_date": checkpoint.return_date.isoformat(),
-        "state": checkpoint.state.value,
-        "query_task_ids": list(checkpoint.query_task_ids),
-        "query_task_ids_sha256": gate._canonical_sha256(
-            list(checkpoint.query_task_ids)
-        ),
-        "run_purpose": checkpoint.run_purpose,
-        "finalization_state": checkpoint.finalization_state,
-        "decision_state": checkpoint.decision_state,
-        "source_task_count": checkpoint.source_task_count,
-        "exploration_seal_passed": checkpoint.exploration_seal_passed,
-        "all_platforms_complete": checkpoint.all_platforms_complete,
-        "failure_class": checkpoint.failure_class,
-        "run_summary_sha256": checkpoint.run_summary_sha256,
-        "captured_at": checkpoint.captured_at.isoformat(),
-        "checkpoint_sha256": checkpoint.checkpoint_sha256,
-        "request_sha256": checkpoint.request_sha256,
-    }
-
-
-def _c4_binding_container(
-    bindings: list[dict[str, object]],
-    request_sha256: str,
-) -> dict[str, object]:
-    ordered = [str(b["checkpoint_sha256"]) for b in bindings]
-    return {
-        "passed": True,
-        "count": len(bindings),
-        "ordered_checkpoint_sha256": ordered,
-        "checkpoint_chain_sha256": gate._canonical_sha256(ordered),
-        "request_sha256": request_sha256,
-        "bindings": bindings,
-    }
-
-
-def _c4_binding_drop(
-    binding: dict[str, object], index: int = 2
-) -> dict[str, object]:
-    """A MISSING checkpoint: one binding removed (chain recomputed), so the
-    sealed set no longer covers the frozen trio."""
-    bindings = list(binding["bindings"])
-    del bindings[index]
-    return _c4_binding_container(bindings, str(binding["request_sha256"]))
-
-
-def _c4_binding_extra(
-    binding: dict[str, object], index: int = 0
-) -> dict[str, object]:
-    """An EXTRA checkpoint: a well-formed 4th binding appended (chain
-    recomputed), so the sealed set over-covers the frozen trio."""
-    template = binding["bindings"][index]
-    extra = _c4_rebuild_checkpoint(
-        template,
-        str(binding["request_sha256"]),
-        list(template["query_task_ids"]),
-        sequence=4,
-    )
-    bindings = [*binding["bindings"], extra]
-    return _c4_binding_container(bindings, str(binding["request_sha256"]))
-
-
-def _c4_binding_cross_pair_swap(
-    binding: dict[str, object],
-) -> dict[str, object]:
-    """Runner-artifact vs run identity mismatch: the checkpoint binding seals
-    cross-pair-swapped query-task id sets (each binding internally consistent),
-    so the control-plane record disagrees with what the run actually sealed."""
-    bindings = list(binding["bindings"])
-    a_ids = list(bindings[0]["query_task_ids"])
-    b_ids = list(bindings[1]["query_task_ids"])
-    new_bindings = []
-    for index, entry in enumerate(bindings):
-        if index == 0:
-            ids = b_ids
-        elif index == 1:
-            ids = a_ids
-        else:
-            ids = list(entry["query_task_ids"])
-        new_bindings.append(
-            _c4_rebuild_checkpoint(
-                entry,
-                str(binding["request_sha256"]),
-                ids,
-                index + 1,
-            )
-        )
-    return _c4_binding_container(new_bindings, str(binding["request_sha256"]))
-
-
-def _c4_binding_foreign_request(
-    binding: dict[str, object],
-    foreign_request_sha256: str,
-) -> dict[str, object]:
-    """Runner-artifact vs run identity mismatch: every checkpoint carries a
-    FOREIGN request identity that does not bind to the compact's api_payload
-    (the real run's request SHA)."""
-    new_bindings = []
-    for index, entry in enumerate(binding["bindings"]):
-        new_bindings.append(
-            _c4_rebuild_checkpoint(
-                entry,
-                foreign_request_sha256,
-                list(entry["query_task_ids"]),
-                index + 1,
-            )
-        )
-    return _c4_binding_container(new_bindings, foreign_request_sha256)
-
-
-def _setup_real_bridge_state(
-    monkeypatch: pytest.MonkeyPatch, staging_dir: Path
-) -> None:
-    """Point the real compact writer at a real bridge-state file so the layer-6
-    compact's lease bindings carry a recomputable sha256 (never a None hash)."""
-    bridge_state_path = staging_dir / "done-gate-real-chain-bridge-state.json"
-    bridge_state_path.parent.mkdir(parents=True, exist_ok=True)
-    bridge_state_path.write_text(
-        json.dumps(
+    compact = _layer6_compact_fixture()
+    source_set = compact["source_execution_receipts"]
+    assert isinstance(source_set, dict)
+    receipts = source_set["receipts"]
+    assert isinstance(receipts, list) and receipts
+    hashes: list[str] = []
+    for receipt in receipts:
+        assert isinstance(receipt, dict)
+        receipt["execution_environment"] = "untrusted_external_executor"
+        receipt["receipt_sha256"] = gate._canonical_sha256(
             {
-                "schema_version": "tripchord-browser-bridge-state-v2",
-                "saved_at": "2026-08-10T00:00:00+00:00",
-                "tasks": [],
-                "reload_requests": [],
+                key: value
+                for key, value in receipt.items()
+                if key != "receipt_sha256"
             }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv(gate._BRIDGE_STATE_ENV, str(bridge_state_path))
-    gate._BRIDGE_STATE_SNAPSHOT = None
-    gate._BRIDGE_STATE_SNAPSHOT_AFTER = None
-
-
-def _compact_via_real_writer(
-    monkeypatch: pytest.MonkeyPatch, staging_dir: Path, raw_source: Path
-) -> dict[str, object]:
-    """Read a persisted formal raw file through the real compact writer."""
-    _setup_real_bridge_state(monkeypatch, staging_dir)
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    raw_target = staging_dir / "live-done-gate-v4.json"
-    raw_target.write_bytes(raw_source.read_bytes())
-    raw_target.chmod(0o600)
-    compact = gate._compact_live_e2e(staging_dir)
-    assert compact is not None, "real compact writer produced no layer-6 compact"
-    return compact
-
-
-def _persist_c4_raw_variant(
-    artifacts: _RealChainArtifacts,
-    staging_dir: Path,
-    payload: dict[str, object],
-) -> Path:
-    """Persist one adversarial derivative with the formal atomic 0600 writer."""
-    from benchmarks import run_live_done_gate_v4
-
-    captured_at = datetime.fromisoformat(str(artifacts.raw_payload["captured_at"]))
-    return run_live_done_gate_v4._write_evidence_bundle(
-        staging_dir.parent / "formal-run-variants" / "live-done-gate-v4.json",
-        payload,
-        passed=bool(payload.get("done_gate", {}).get("passed")),
-        captured_at=captured_at,
-    )
-
-
-def _persist_c4_raw_variant_unchecked(
-    artifacts: _RealChainArtifacts,
-    staging_dir: Path,
-    payload: dict[str, object],
-) -> Path:
-    """Plant bytes only to exercise downstream gates after writer rejection."""
-
-    target = staging_dir.parent / "formal-run-variants-unchecked" / "live-done-gate-v4.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload), encoding="utf-8")
-    target.chmod(0o600)
-    return target
-
-
-def _run_with_cross_pair_swap(run: Any) -> Any:
-    """Swap the FULL per-pair query-task id sets of the first two pairs — each
-    pair keeps its own task objects but seals the OTHER pair's ids, so every id
-    is still well-formed but the exact per-pair canonical set is violated."""
-    execs = list(run.pair_runs)
-    a_ids = tuple(task.id for task in execs[0].query_tasks)
-    b_ids = tuple(task.id for task in execs[1].query_tasks)
-    remap = dict(zip(a_ids, b_ids, strict=True)) | dict(
-        zip(b_ids, a_ids, strict=True)
-    )
-    new_execs = []
-    all_tasks: list[Any] = []
-    for execution in execs:
-        new_tasks = tuple(
-            task.model_copy(update={"id": remap.get(task.id, task.id)})
-            for task in execution.query_tasks
         )
-        new_execs.append(execution.model_copy(update={"query_tasks": new_tasks}))
-        all_tasks.extend(new_tasks)
-    return run.model_copy(
-        update={
-            "pair_runs": tuple(new_execs),
-            "query_plan": run.query_plan.model_copy(update={"tasks": tuple(all_tasks)}),
-        }
-    )
+        hashes.append(str(receipt["receipt_sha256"]))
+    source_set["ordered_receipt_sha256"] = hashes
+    source_set["receipt_chain_sha256"] = gate._canonical_sha256(hashes)
 
-
-def _run_with_dropped_query_task(run: Any, pair_index: int) -> Any:
-    """Drop one query task from the pair's set (13 → 12) — a missing member."""
-    execs = list(run.pair_runs)
-    drop_id = execs[pair_index].query_tasks[-1].id
-    new_execs = []
-    all_tasks: list[Any] = []
-    for index, execution in enumerate(execs):
-        tasks = execution.query_tasks
-        if index == pair_index:
-            tasks = tuple(task for task in tasks if task.id != drop_id)
-        new_execs.append(execution.model_copy(update={"query_tasks": tasks}))
-        all_tasks.extend(tasks)
-    return run.model_copy(
-        update={
-            "pair_runs": tuple(new_execs),
-            "query_plan": run.query_plan.model_copy(update={"tasks": tuple(all_tasks)}),
-        }
-    )
-
-
-def _run_with_extra_query_task(run: Any, pair_index: int) -> Any:
-    """Add a well-formed FOREIGN query-task id (computed for a non-frozen date)
-    to the pair's set (13 → 14) — an extra member."""
-    execs = list(run.pair_runs)
-    target = execs[pair_index]
-    foreign_id = frozen_v4_query_task_id(
-        target.date_pair.id,
-        "ctrip",
-        "flight",
-        date(2026, 8, 1),
-        date(2026, 8, 6),
-        None,
-        None,
-    )
-    new_execs = []
-    all_tasks: list[Any] = []
-    for index, execution in enumerate(execs):
-        tasks = execution.query_tasks
-        if index == pair_index:
-            tasks = (*tasks, tasks[0].model_copy(update={"id": foreign_id}))
-        new_execs.append(execution.model_copy(update={"query_tasks": tasks}))
-        all_tasks.extend(tasks)
-    return run.model_copy(
-        update={
-            "pair_runs": tuple(new_execs),
-            "query_plan": run.query_plan.model_copy(update={"tasks": tuple(all_tasks)}),
-        }
-    )
-
-
-def _run_with_rewritten_last_query_task(
-    run: Any, pair_index: int, new_id: str
-) -> Any:
-    """Rewrite the LAST query-task id of one pair to ``new_id`` (same count,
-    same task objects, same shapes) — no-digest / arbitrary-suffix / wrong-digest
-    / duplicate all collapse to a per-pair exact-set mismatch."""
-    execs = list(run.pair_runs)
-    new_execs = []
-    all_tasks: list[Any] = []
-    for index, execution in enumerate(execs):
-        tasks = execution.query_tasks
-        if index == pair_index:
-            rewritten = tuple(
-                task.model_copy(update={"id": new_id})
-                if task_index == len(tasks) - 1
-                else task
-                for task_index, task in enumerate(tasks)
-            )
-            tasks = rewritten
-        new_execs.append(execution.model_copy(update={"query_tasks": tasks}))
-        all_tasks.extend(tasks)
-    return run.model_copy(
-        update={
-            "pair_runs": tuple(new_execs),
-            "query_plan": run.query_plan.model_copy(update={"tasks": tuple(all_tasks)}),
-        }
-    )
-
-
-def test_verify_layer6_compact_contract_accepts_real_production_chain(
-    monkeypatch: pytest.MonkeyPatch, staging_dir: Path
-) -> None:
-    """The formal runner self-produces the positive raw evidence end to end.
-
-    Only transport, time, and the output path are injected.  The persisted
-    completed bundle is the black-box proof that the production run, per-pair
-    execution/checkpoints, 15-check producer, bundle builder, and 0600 writer
-    all completed with one run / pair / query identity.
-    """
-
-    artifacts = _real_production_chain(staging_dir)
-
-    # (1) The formal composition graph and the two permitted transport
-    # boundaries were actually exercised.  A provider stub, manually assembled
-    # system graph, or direct bridge heartbeat cannot produce these receipts.
-    _c4_validate_formal_transport_receipts(
-        composition_types=artifacts.composition_types,
-        icom_http_paths=artifacts.icom_http_paths,
-        companion_heartbeat_status=artifacts.companion_heartbeat_status,
-        formal_source_binding=artifacts.formal_source_binding,
-    )
-    assert all(
-        execution.run is not None
-        and execution.run.public_transfer_coverage.complete
-        and execution.run.public_transfer_coverage.usable_option_count > 0
-        for execution in artifacts.run.pair_runs
-    )
-
-    # (2) A formal completed bundle exists.  `_run` has no other success path:
-    # these fields are supplied by `_completed_evidence_bundle` only after the
-    # live run, checkpoint validation, event run, and 15-check evaluation.
-    assert artifacts.raw_payload["schema_version"] == "tripchord-live-evidence-v4"
-    assert artifacts.raw_payload["run_status"] == "completed"
-    assert artifacts.raw_payload["done_gate"]["passed"] is True
-    assert artifacts.raw_payload["flexible_run"]["pair_runs"]
-    assert artifacts.raw_payload["event_run"]["source_task_ids"]
-    # A fixed-anchor-authenticated job id/signature is public evidence.  Its
-    # random bytes may contain a credential-shaped substring, including while
-    # embedded in the signed status/events URL, without being a bearer secret.
-    gate._secret_scan_bytes(
-        artifacts.raw_output.read_bytes(),
-        gate._SecretNeedles(()),
-        "evidence",
-        "live-done-gate-v4.json",
-    )
-
-    # (3) The formal runner artifact has 3 real per-pair runs and 3 matching
-    # control-plane checkpoints, proving pair expansion and reporting occurred.
-    assert len(artifacts.run.pair_runs) == 3
-    assert artifacts.binding["count"] == 3
-    assert len(artifacts.binding["bindings"]) == 3
-
-    # (4) The official full producer passes 15/15.
-    assert artifacts.report.passed
-    assert sum(1 for c in artifacts.report.checks if c.passed) == 15
-
-    # (5) The formal atomic writer produced a private raw file, and no shared
-    # production function/class identity or in-process API state was changed.
-    assert stat.S_IMODE(artifacts.raw_output.stat().st_mode) == 0o600
-    assert artifacts.raw_payload["repo_revision"]["branch"] == (
-        subprocess.run(
-            ["git", "branch", "--show-current"],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=str(_C4_REPO_ROOT),
-        ).stdout.strip()
-    )
-    assert all(artifacts.restored.values()), artifacts.restored
-
-    # (6) Real compact writer → real consumer accepts, verified against the same
-    # real HEAD the runner artifact names.
-    compact = _compact_via_real_writer(
-        monkeypatch,
-        staging_dir,
-        artifacts.raw_output,
-    )
-    assert "formal_live_source_summary" in compact
-    assert "formal_live_source_binding" not in compact
-    assert "formal_live_source_authority_receipt" not in compact
-    assert "formal_live_source_challenge" not in compact
-    gate._verify_layer6_compact_contract(
-        "done-gate-layer6-compact.json",
-        compact,
-        tested_commit_sha=artifacts.head,
-    )
-
-    # (7) Identity binding: the checkpoint binding, the compact's per-pair ids
-    # and the run's ACTUAL observed query-task ids are the SAME per pair, and
-    # the request identity binds checkpoint → compact api_payload → run.
-    for check in compact["done_gate"]["checks"]:
-        if check["name"] != "v4_source_graph":
-            continue
-        evidence = check["evidence"]
-        for entry in evidence["checkpoint_binding"]["bindings"]:
-            pair_id = entry["date_pair_id"]
-            assert set(entry["query_task_ids"]) == set(
-                artifacts.observed_by_pair[pair_id]
-            ), f"checkpoint binding ids != run observed ids for {pair_id}"
-        for entry in evidence["per_pair"]:
-            pair_id = entry["pair_id"]
-            assert set(entry["query_task_ids"]) == set(
-                artifacts.observed_by_pair[pair_id]
-            ), f"compact per_pair ids != run observed ids for {pair_id}"
-    assert compact["api_payload_sha256"] == artifacts.request_sha256
-    assert artifacts.binding["request_sha256"] == artifacts.request_sha256
-    for entry in artifacts.binding["bindings"]:
-        assert entry["request_sha256"] == artifacts.request_sha256
+    with pytest.raises(
+        gate.GateStateChangedError,
+        match="invalid source execution receipt set",
+    ):
+        gate._verify_layer6_compact_contract(
+            "done-gate-layer6-compact.json",
+            compact,
+            tested_commit_sha="a" * 40,
+        )
 
 
 def test_c4_formal_entry_rejects_provider_and_companion_bypasses() -> None:
     """A domain provider stub or direct-heartbeat/manual-composition bypass
-    cannot satisfy the C-round4 positive's entry receipts."""
+    cannot satisfy the formal production entry contract."""
     from tripchord.agents.flexible_live_system import FlexibleLiveAgentSystem
     from tripchord.agents.live_system import LivePackageAgentSystem
     from tripchord.providers.browser_bridge import BrowserTaskBridge
@@ -15178,7 +14469,6 @@ def test_c4_formal_entry_rejects_self_consistent_manual_receipts() -> None:
 
 
 def test_c4_complete_self_consistent_binding_requires_production_capability(
-    monkeypatch: pytest.MonkeyPatch,
     staging_dir: Path,
 ) -> None:
     """A complete, correctly hashed and MACed hand forge fails all consumers.
@@ -15192,9 +14482,8 @@ def test_c4_complete_self_consistent_binding_requires_production_capability(
 
     from tripchord.formal_live_source import validate_formal_source_binding
 
-    artifacts = _real_production_chain(staging_dir)
     forged = _fixture_formal_source_binding(
-        artifacts.head,
+        "a" * 40,
         install_id="99999999-9999-4999-8999-999999999999",
         authority_secret="foreign-manual-authority-secret-000000000000000000000000",
         trust=False,
@@ -15202,70 +14491,23 @@ def test_c4_complete_self_consistent_binding_requires_production_capability(
 
     with pytest.raises(ValueError, match="foreign verification anchor"):
         validate_formal_source_binding(forged)
-    with pytest.raises(AssertionError, match="production source binding"):
-        _c4_validate_formal_transport_receipts(
-            composition_types=artifacts.composition_types,
-            icom_http_paths=artifacts.icom_http_paths,
-            companion_heartbeat_status=artifacts.companion_heartbeat_status,
-            formal_source_binding=forged,
-        )
-
-    raw_payload = _c4_raw_variant(artifacts)
+    raw_payload = _realistic_e2e_evidence()
     raw_payload["formal_live_source_binding"] = copy.deepcopy(forged)
-    from benchmarks import run_live_done_gate_v4
-
-    with pytest.raises(RuntimeError, match="formal production source binding"):
-        run_live_done_gate_v4._completed_evidence_bundle(
-            request=copy.deepcopy(artifacts.raw_payload["request"]),
-            report=artifacts.report,
-            captured_at=datetime.fromisoformat(
-                str(artifacts.raw_payload["captured_at"])
-            ),
-            context={
-                "formal_live_source_binding": copy.deepcopy(forged),
-                "formal_live_source_authority_receipt": copy.deepcopy(
-                    forged["authority_receipt"]
-                ),
-                "formal_live_source_challenge": copy.deepcopy(forged["challenge"]),
-            },
-        )
-    with pytest.raises(RuntimeError, match="formal production source binding"):
-        _persist_c4_raw_variant(artifacts, staging_dir, raw_payload)
-    forged_raw = _persist_c4_raw_variant_unchecked(
-        artifacts, staging_dir, raw_payload
+    raw_payload["formal_live_source_authority_receipt"] = copy.deepcopy(
+        forged["authority_receipt"]
     )
+    raw_payload["formal_live_source_challenge"] = copy.deepcopy(
+        forged["challenge"]
+    )
+    staging_dir.mkdir()
+    forged_raw = staging_dir / "live-done-gate-v4.json"
+    forged_raw.write_text(json.dumps(raw_payload), encoding="utf-8")
+    forged_raw.chmod(0o600)
     with pytest.raises(
         gate.GateStateChangedError,
         match="formal production source binding",
     ):
-        _compact_via_real_writer(monkeypatch, staging_dir, forged_raw)
-
-    compact = _compact_via_real_writer(
-        monkeypatch,
-        staging_dir,
-        artifacts.raw_output,
-    )
-    compact["formal_live_source_binding"] = copy.deepcopy(forged)
-    monkeypatch.setattr(gate, "_compact_canary", lambda _staging: None)
-    monkeypatch.setattr(
-        gate,
-        "_compact_live_e2e",
-        lambda _staging: copy.deepcopy(compact),
-    )
-    with pytest.raises(
-        gate.GateStateChangedError,
-        match=r"compact writer forbids raw formal source evidence",
-    ):
-        gate._generate_compact_evidence(staging_dir)
-    with pytest.raises(
-        gate.GateStateChangedError,
-        match="unknown top-level field",
-    ):
-        gate._verify_layer6_compact_contract(
-            "done-gate-layer6-compact.json",
-            compact,
-            tested_commit_sha=artifacts.head,
-        )
+        gate._compact_live_e2e(staging_dir)
 
 
 def test_c4_complete_binding_cannot_be_retrusted_with_bridge_token() -> None:
@@ -15376,14 +14618,14 @@ def _formal_companion_binding(
     runtime_instance_id: str = "formal-heartbeat-runtime-v1",
     manifest_version: str = "formal-heartbeat-build-v1",
     build_sha256: str = "9" * 64,
-    adapter_version: str = "formal-heartbeat-test-v1",
+    adapter_version: str = "0.2.0",
 ) -> dict[str, object]:
     identity: dict[str, object] = {
         "companion_id": companion_id,
         "providers": ["ctrip", "qunar", "tongcheng"],
         "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
         "adapter_version": adapter_version,
-        "contract_version": "tripchord-browser-companion-v1",
+        "contract_version": "tripchord-capability-v1",
         "runtime_instance_id": runtime_instance_id,
         "build_identity": {
             "protocol_version": "tripchord-companion-control-v1",
@@ -15572,8 +14814,8 @@ async def test_formal_activation_heartbeat_requires_real_companion_ack_path(
         "companion_id": "real-heartbeat-companion",
         "providers": ["ctrip", "qunar", "tongcheng"],
         "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
-        "adapter_version": "formal-heartbeat-test-v1",
-        "contract_version": "tripchord-browser-companion-v1",
+        "adapter_version": "0.2.0",
+        "contract_version": "tripchord-capability-v1",
         "runtime_instance_id": "formal-heartbeat-runtime-v1",
         "build_identity": binding["build_identity"],
     }
@@ -15769,7 +15011,7 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
         runtime_instance_id="two-phase-runtime-v1",
         manifest_version="two-phase-build-v1",
         build_sha256="8" * 64,
-        adapter_version="two-phase-adapter-v1",
+        adapter_version="0.2.0",
     )
     prepared = authority.begin_activation(
         job_id=job_id,
@@ -15796,7 +15038,7 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
                 runtime_instance_id="two-phase-runtime-v1",
                 manifest_version="two-phase-build-v1",
                 build_sha256="8" * 64,
-                adapter_version="two-phase-adapter-v1",
+                adapter_version="0.2.0",
             ),
         )
 
@@ -15804,8 +15046,8 @@ def test_formal_activation_two_phase_state_is_durable_and_idempotent(
         "companion_id": "two-phase-companion",
         "providers": ["ctrip", "qunar", "tongcheng"],
         "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
-        "adapter_version": "two-phase-adapter-v1",
-        "contract_version": "tripchord-browser-companion-v1",
+        "adapter_version": "0.2.0",
+        "contract_version": "tripchord-capability-v1",
         "runtime_instance_id": "two-phase-runtime-v1",
         "build_identity": binding["build_identity"],
     }
@@ -16277,19 +15519,44 @@ def test_formal_challenge_cold_restart_continues_and_finalizes_once(
 
     def replay(target: Any, event: dict[str, object]) -> None:
         clock[0] = datetime.fromisoformat(str(event["observed_at"]))
+        details = copy.deepcopy(event["details"])
+        assert isinstance(details, dict)
+        source_receipt = details.get("source_execution_receipt")
+        if isinstance(source_receipt, dict):
+            capability = issued["execution_capability"]
+            graph = context["job_graph"]
+            assert isinstance(capability, dict) and isinstance(graph, dict)
+            source_receipt.update(
+                {
+                    "capability_id": capability["capability_id"],
+                    "challenge_id": capability["challenge_id"],
+                    "run_id": capability["run_id"],
+                    "terminal_job_id": capability["terminal_job_id"],
+                    "request_sha256": capability["request_sha256"],
+                    "job_graph_sha256": capability["job_graph_sha256"],
+                    "attempt_digest": capability["attempt_digest"],
+                }
+            )
+            source_receipt["receipt_sha256"] = _c4_canonical_sha256(
+                {
+                    key: value
+                    for key, value in source_receipt.items()
+                    if key != "receipt_sha256"
+                }
+            )
         with target.execution_scope(issued["execution_capability"]):
             if event["kind"] == "icom_public_get":
                 target.record_icom_http(
                     str(event["path"]),
                     subject_ids=tuple(event["subject_ids"]),
                     response_sha256=str(event["response_sha256"]),
-                    details=event["details"],
+                    details=details,
                 )
             else:
                 target.record_browser_http(
                     str(event["kind"]),
                     subject_ids=tuple(event["subject_ids"]),
-                    details=event["details"],
+                    details=details,
                 )
 
     split = len(receipts) // 2
@@ -16332,6 +15599,12 @@ def test_formal_challenge_cold_restart_continues_and_finalizes_once(
         "publication_icom_query_membership_sha256": graph[
             "publication_icom_query_membership_sha256"
         ],
+        "worker_runtime_receipt_sha256": hashlib.sha256(
+            b"worker-runtime-receipt"
+        ).hexdigest(),
+        "model_execution_receipt_sha256": hashlib.sha256(
+            b"model-execution-receipt"
+        ).hexdigest(),
     }
     pair_binding = {
         "bindings": [
@@ -16468,6 +15741,9 @@ def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
     """e42a7e60: restart crosses the production HTTP entry and creates a fresh attempt."""
 
     import httpx
+    from tripchord.agents.companion_control_tools import (
+        verified_companion_build_identity,
+    )
     from tripchord.formal_live_source import (
         formal_job_graph_for_frozen_v4,
         provision_formal_source_trust_root,
@@ -16487,14 +15763,11 @@ def test_formal_authority_real_os_restart_rejects_old_and_issues_fresh_attempt(
         "companion_id": "os-api-restart-companion",
         "providers": ["ctrip", "qunar", "tongcheng"],
         "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
-        "adapter_version": "os-api-restart-http-v1",
-        "contract_version": "tripchord-browser-companion-v1",
-        "build_identity": {
-            "protocol_version": "tripchord-companion-control-v1",
-            "manifest_version": "os-api-restart-build-v1",
-            "build_sha256": "8" * 64,
-            "content_runtime_version": "os-api-restart-runtime-v1",
-        },
+        "adapter_version": "0.2.0",
+        "contract_version": "tripchord-capability-v1",
+        "build_identity": verified_companion_build_identity(
+            gate.ROOT / "apps/browser-companion"
+        ).model_dump(mode="json"),
         "runtime_instance_id": "os-api-restart-runtime-instance-0001",
     }
     scenario_path = gate.ROOT / "benchmarks/scenarios/live-hgh-mle-aug-2026-v4.json"
@@ -17027,6 +16300,9 @@ def test_formal_activation_interrupt_windows_fail_closed_over_real_http(
     real OS restart — never an HTTP 200 old QUEUED receipt, never committed."""
 
     import httpx
+    from tripchord.agents.companion_control_tools import (
+        verified_companion_build_identity,
+    )
     from tripchord.formal_live_source import (
         formal_job_graph_for_frozen_v4,
         provision_formal_source_trust_root,
@@ -17047,14 +16323,11 @@ def test_formal_activation_interrupt_windows_fail_closed_over_real_http(
         "companion_id": "cross-registry-fault-companion",
         "providers": ["ctrip", "qunar", "tongcheng"],
         "authorized_scope_keys": sorted(gate._CERTIFIED_OTA_SCOPES),
-        "adapter_version": "cross-registry-fault-http-v1",
-        "contract_version": "tripchord-browser-companion-v1",
-        "build_identity": {
-            "protocol_version": "tripchord-companion-control-v1",
-            "manifest_version": "cross-registry-fault-build-v1",
-            "build_sha256": "7" * 64,
-            "content_runtime_version": "cross-registry-fault-runtime-v1",
-        },
+        "adapter_version": "0.2.0",
+        "contract_version": "tripchord-capability-v1",
+        "build_identity": verified_companion_build_identity(
+            gate.ROOT / "apps/browser-companion"
+        ).model_dump(mode="json"),
         "runtime_instance_id": "cross-registry-fault-runtime-instance-0001",
     }
     scenario_path = gate.ROOT / "benchmarks/scenarios/live-hgh-mle-aug-2026-v4.json"
@@ -17974,6 +17247,33 @@ def _reseal_test_formal_binding(binding: dict[str, object]) -> dict[str, object]
     return candidate
 
 
+def test_formal_source_full_reseal_rejects_untrusted_executor() -> None:
+    """Even an authority-resealed raw binding cannot bless a non-extension source."""
+
+    from tripchord.formal_live_source import validate_formal_source_evidence
+
+    binding = copy.deepcopy(_fixture_formal_source_binding())
+    receipts = binding["receipts"]
+    assert isinstance(receipts, list)
+    for event in receipts:
+        if not isinstance(event, dict) or event.get("kind") != "browser_complete":
+            continue
+        details = event["details"]
+        source_receipt = details["source_execution_receipt"]
+        source_receipt["execution_environment"] = "untrusted_external_executor"
+        source_receipt["receipt_sha256"] = _c4_canonical_sha256(
+            {
+                key: value
+                for key, value in source_receipt.items()
+                if key != "receipt_sha256"
+            }
+        )
+
+    resealed = _reseal_test_formal_binding(binding)
+    with pytest.raises(ValueError, match="execution_environment"):
+        validate_formal_source_evidence(resealed)
+
+
 def test_formal_source_full_reseal_rejects_sensitive_search_url() -> None:
     from tripchord.formal_live_source import validate_formal_source_evidence
 
@@ -18199,65 +17499,34 @@ def test_layer6_raw_requires_exact_authority_receipt_and_challenge(
 
 
 def test_layer6_raw_formal_source_binding_presence_is_strict(
-    monkeypatch: pytest.MonkeyPatch,
     staging_dir: Path,
 ) -> None:
     """Missing/null/list formal source authority fails at the raw writer."""
 
-    artifacts = _real_production_chain(staging_dir)
-    from benchmarks import run_live_done_gate_v4
-
-    real_compact_live_e2e = gate._compact_live_e2e
+    staging_dir.mkdir()
     for marker in ("missing", None, []):
-        payload = _c4_raw_variant(artifacts)
+        payload = _realistic_e2e_evidence()
         if marker == "missing":
             payload.pop("formal_live_source_binding")
         else:
             payload["formal_live_source_binding"] = marker
-        context = {"formal_live_source_binding": marker}
-        if marker == "missing":
-            context.clear()
-        with pytest.raises(RuntimeError, match="formal_live_source_binding"):
-            run_live_done_gate_v4._completed_evidence_bundle(
-                request=copy.deepcopy(artifacts.raw_payload["request"]),
-                report=artifacts.report,
-                captured_at=datetime.fromisoformat(
-                    str(artifacts.raw_payload["captured_at"])
-                ),
-                context=context,
-            )
-        with pytest.raises(RuntimeError, match="formal_live_source_binding"):
-            _persist_c4_raw_variant(artifacts, staging_dir, payload)
-        raw_variant = _persist_c4_raw_variant_unchecked(
-            artifacts, staging_dir, payload
+        raw_path = staging_dir / "live-done-gate-v4.json"
+        raw_path.write_text(
+            json.dumps(payload),
+            encoding="utf-8",
         )
+        raw_path.chmod(0o600)
         with pytest.raises(
             gate.GateStateChangedError,
             match="formal_live_source_binding",
         ):
-            _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
+            gate._compact_live_e2e(staging_dir)
 
-        compact = _compact_via_real_writer(
-            monkeypatch,
-            staging_dir,
-            artifacts.raw_output,
-        )
+        compact = _layer6_compact_fixture()
         if marker == "missing":
             compact.pop("formal_live_source_summary")
         else:
             compact["formal_live_source_summary"] = marker
-        monkeypatch.setattr(gate, "_compact_canary", lambda _staging: None)
-        monkeypatch.setattr(
-            gate,
-            "_compact_live_e2e",
-            lambda _staging, value=compact: copy.deepcopy(value),
-        )
-        with pytest.raises(
-            gate.GateStateChangedError,
-            match="compact writer formal_live_source_summary",
-        ):
-            gate._generate_compact_evidence(staging_dir)
-        monkeypatch.setattr(gate, "_compact_live_e2e", real_compact_live_e2e)
         with pytest.raises(
             gate.GateStateChangedError,
             match=r"formal_live_source_summary|exact formal summary",
@@ -18265,133 +17534,98 @@ def test_layer6_raw_formal_source_binding_presence_is_strict(
             gate._verify_layer6_compact_contract(
                 "done-gate-layer6-compact.json",
                 compact,
-                tested_commit_sha=artifacts.head,
+                tested_commit_sha="a" * 40,
             )
 
 
 def test_layer6_raw_top_level_checkpoint_binding_presence_is_strict(
-    monkeypatch: pytest.MonkeyPatch,
     staging_dir: Path,
 ) -> None:
     """Missing/present-invalid binding must not fall back to legacy data."""
 
-    artifacts = _real_production_chain(staging_dir)
+    staging_dir.mkdir()
     for invalid in (None, []):
-        payload = _c4_raw_variant(artifacts)
+        payload = _realistic_e2e_evidence()
         payload["pair_checkpoint_binding"] = invalid
         payload["context"] = {
-            "pair_checkpoint_binding": copy.deepcopy(artifacts.binding)
+            "pair_checkpoint_binding": _fixture_checkpoint_binding()
         }
-        with pytest.raises(
-            RuntimeError,
-            match="formal pair checkpoint binding is not an exact object",
-        ):
-            _persist_c4_raw_variant(artifacts, staging_dir, payload)
-        # Bypass only the writer to exercise the independent compact boundary;
-        # production never takes this path.
-        raw_variant = _persist_c4_raw_variant_unchecked(
-            artifacts,
-            staging_dir,
-            payload,
-        )
+        raw_path = staging_dir / "live-done-gate-v4.json"
+        raw_path.write_text(json.dumps(payload), encoding="utf-8")
+        raw_path.chmod(0o600)
         with pytest.raises(
             gate.GateStateChangedError,
             match="top-level pair_checkpoint_binding",
         ):
-            _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
+            gate._compact_live_e2e(staging_dir)
 
-    missing_payload = _c4_raw_variant(artifacts)
+    missing_payload = _realistic_e2e_evidence()
     del missing_payload["pair_checkpoint_binding"]
     missing_payload["context"] = {
-        "pair_checkpoint_binding": copy.deepcopy(artifacts.binding)
+        "pair_checkpoint_binding": _fixture_checkpoint_binding()
     }
-    with pytest.raises(
-        RuntimeError,
-        match="formal pair checkpoint binding is not an exact object",
-    ):
-        _persist_c4_raw_variant(artifacts, staging_dir, missing_payload)
-    raw_variant = _persist_c4_raw_variant_unchecked(
-        artifacts,
-        staging_dir,
-        missing_payload,
-    )
+    raw_path = staging_dir / "live-done-gate-v4.json"
+    raw_path.write_text(json.dumps(missing_payload), encoding="utf-8")
+    raw_path.chmod(0o600)
     with pytest.raises(
         gate.GateStateChangedError,
         match="top-level pair_checkpoint_binding",
     ):
-        _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
+        gate._compact_live_e2e(staging_dir)
 
 
 def test_layer6_formal_source_binding_rejects_missing_mismatch_and_replacement(
-    monkeypatch: pytest.MonkeyPatch,
     staging_dir: Path,
 ) -> None:
     """Raw producer/compact and final consumer share one exact source contract."""
 
-    artifacts = _real_production_chain(staging_dir)
+    source = _fixture_formal_source_binding()
+    staging_dir.mkdir()
     raw_cases: dict[str, object] = {
         "foreign_install": {
-            **copy.deepcopy(artifacts.formal_source_binding),
+            **copy.deepcopy(source),
             "install_id": "11111111-1111-4111-8111-111111111111",
         },
         "foreign_composition": {
-            **copy.deepcopy(artifacts.formal_source_binding),
+            **copy.deepcopy(source),
             "composition": {
-                **copy.deepcopy(
-                    artifacts.formal_source_binding["composition"]
-                ),
+                **copy.deepcopy(source["composition"]),
                 "entrypoint": "tests.manual_composition",
             },
         },
         "missing_claim_receipt": {
-            **copy.deepcopy(artifacts.formal_source_binding),
+            **copy.deepcopy(source),
             "receipts": [
                 item
-                for item in copy.deepcopy(
-                    artifacts.formal_source_binding["receipts"]
-                )
+                for item in copy.deepcopy(source["receipts"])
                 if item["kind"] != "browser_claim"
             ],
         },
     }
     for source_binding in raw_cases.values():
-        payload = _c4_raw_variant(artifacts)
+        payload = _realistic_e2e_evidence()
         payload["formal_live_source_binding"] = source_binding
-        with pytest.raises(RuntimeError, match="formal production source binding"):
-            _persist_c4_raw_variant(artifacts, staging_dir, payload)
-        raw_variant = _persist_c4_raw_variant_unchecked(
-            artifacts, staging_dir, payload
-        )
+        raw_path = staging_dir / "live-done-gate-v4.json"
+        raw_path.write_text(json.dumps(payload), encoding="utf-8")
+        raw_path.chmod(0o600)
         with pytest.raises(
             gate.GateStateChangedError,
             match="formal production source binding",
         ):
-            _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
+            gate._compact_live_e2e(staging_dir)
 
-    missing_payload = _c4_raw_variant(artifacts)
+    missing_payload = _realistic_e2e_evidence()
     missing_payload.pop("formal_live_source_binding")
-    with pytest.raises(RuntimeError, match="formal_live_source_binding"):
-        _persist_c4_raw_variant(
-            artifacts,
-            staging_dir,
-            missing_payload,
-        )
-    missing_raw = _persist_c4_raw_variant_unchecked(
-        artifacts,
-        staging_dir,
-        missing_payload,
-    )
+    raw_path = staging_dir / "live-done-gate-v4.json"
+    raw_path.write_text(json.dumps(missing_payload), encoding="utf-8")
+    raw_path.chmod(0o600)
     with pytest.raises(
         gate.GateStateChangedError,
         match="formal_live_source_binding",
     ):
-        _compact_via_real_writer(monkeypatch, staging_dir, missing_raw)
+        gate._compact_live_e2e(staging_dir)
 
-    compact = _compact_via_real_writer(
-        monkeypatch,
-        staging_dir,
-        artifacts.raw_output,
-    )
+    compact = _layer6_compact_fixture()
     compact["formal_live_source_summary"]["binding_digest"] = "f" * 64
     with pytest.raises(
         gate.GateStateChangedError,
@@ -18400,169 +17634,62 @@ def test_layer6_formal_source_binding_rejects_missing_mismatch_and_replacement(
         gate._verify_layer6_compact_contract(
             "done-gate-layer6-compact.json",
             compact,
-            tested_commit_sha=artifacts.head,
+            tested_commit_sha="a" * 40,
         )
 
 
 def test_verify_layer6_compact_contract_real_production_chain_adversarial_matrix(
     monkeypatch: pytest.MonkeyPatch, staging_dir: Path
 ) -> None:
-    """C-round4 counterexamples on the SAME real production chain: foreign /
-    cross-pair query ids, a missing / extra checkpoint, runner-artifact vs
-    checkpoint/run identity mismatch and raw/compact injection all fail closed
-    at the official producer and/or the real compact writer → consumer."""
+    """The old cached fixture chain is only an adversarial contract fixture.
 
-    from tripchord.agents.live_done_gate_v4 import (
-        _check_v4_source_graph,
-        evaluate_live_v4_done_gate,
-    )
+    Its self-authored graph, request, source, and check set cannot survive a
+    mismatch at the independent compact consumer.  It is not a production
+    positive and intentionally never starts a local Companion/model harness.
+    """
 
-    artifacts = _real_production_chain(staging_dir)
-    canonical_run = artifacts.run
-    cs = artifacts.cs
+    _ = (monkeypatch, staging_dir)
+    cases: list[Callable[[dict[str, object]], None]] = []
 
-    def full_producer(mutated_run: Any) -> Any:
-        return evaluate_live_v4_done_gate(
-            mutated_run,
-            expected_candidate_set=cs,
-            selected_initial=artifacts.publication_run,
-            event=artifacts.event,
-            evaluated_at=NOW,
-            maximum_quote_age_minutes=15,
-            minimum_recommendable_options=2,
-            minimum_exact_providers_per_selected_segment=2,
+    def foreign_pair(compact: dict[str, object]) -> None:
+        checks = compact["done_gate"]["checks"]  # type: ignore[index]
+        source = next(item for item in checks if item["name"] == "v4_source_graph")
+        source["evidence"]["pair_ids"][0] = "date-pair:foreign"  # type: ignore[index]
+
+    def foreign_request(compact: dict[str, object]) -> None:
+        compact["api_payload_sha256"] = "9" * 64
+
+    def injected_check(compact: dict[str, object]) -> None:
+        checks = compact["done_gate"]["checks"]  # type: ignore[index]
+        checks.append(  # type: ignore[union-attr]
+            {
+                "name": "injected_foreign_check",
+                "passed": True,
+                "summary": "injected",
+                "evidence_refs": [],
+                "evidence": {"injected": True},
+            }
         )
+        compact["done_gate"]["check_count"] = 16  # type: ignore[index]
+        compact["done_gate"]["passed_check_count"] = 16  # type: ignore[index]
 
-    # --- Producer side: the official full producer fails closed on any
-    # foreign / cross-pair query-task-id forgery of the REAL run.
-    foreign_digest_id = frozen_v4_query_task_id(
-        canonical_run.pair_runs[0].date_pair.id,
-        "ctrip",
-        "flight",
-        date(2026, 8, 1),
-        date(2026, 8, 6),
-        None,
-        None,
-    )
-    run_cases: dict[str, Any] = {
-        "foreign_query_id": _run_with_rewritten_last_query_task(
-            canonical_run, 0, foreign_digest_id
-        ),
-        "cross_pair_query_id": _run_with_cross_pair_swap(canonical_run),
-        "missing_query_task": _run_with_dropped_query_task(canonical_run, 0),
-        "extra_query_task": _run_with_extra_query_task(canonical_run, 0),
-    }
-    for name, mutated_run in run_cases.items():
-        producer = full_producer(mutated_run)
-        assert producer.passed is False, (
-            f"full producer must fail closed on run-level forgery {name!r}"
-        )
-        assert any(
-            check.name == "v4_source_graph" and not check.passed
-            for check in producer.checks
-        ), f"v4_source_graph must be the failing check for {name!r}"
+    def empty_evidence(compact: dict[str, object]) -> None:
+        checks = compact["done_gate"]["checks"]  # type: ignore[index]
+        checks[0]["evidence"] = {}  # type: ignore[index]
 
-    # --- Consumer side: a FORGED passed=true bundle carrying the mutated
-    # per-pair ids (real compact writer) is rejected by the consumer.
-    for _name, mutated_run in run_cases.items():
-        mutated_evidence = _check_v4_source_graph(mutated_run, cs).evidence
-        forged_done_gate = copy.deepcopy(
-            artifacts.report.model_dump(mode="json")
-        )
-        for check in forged_done_gate["checks"]:
-            if check["name"] == "v4_source_graph":
-                check["evidence"] = dict(mutated_evidence)
-        payload = _c4_raw_variant(artifacts, done_gate=forged_done_gate)
-        raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
-        compact = _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
-        with pytest.raises(gate.GateStateChangedError):
+    cases.extend((foreign_pair, foreign_request, injected_check, empty_evidence))
+    for mutate in cases:
+        compact = _layer6_compact_fixture()
+        mutate(compact)
+        with pytest.raises(
+            gate.GateStateChangedError,
+            match=r".",
+        ):
             gate._verify_layer6_compact_contract(
                 "done-gate-layer6-compact.json",
                 compact,
-                tested_commit_sha=artifacts.head,
+                tested_commit_sha="a" * 40,
             )
-
-    # --- Consumer side: missing / extra checkpoint and runner-artifact vs
-    # checkpoint/run identity mismatch (cross-pair checkpoint ids, foreign
-    # request identity) all fail closed on the same real base bundle.
-    foreign_request_sha256 = hashlib.sha256(b"foreign-run-request").hexdigest()
-    binding_cases: dict[str, dict[str, object]] = {
-        "missing_checkpoint": _c4_binding_drop(artifacts.binding),
-        "extra_checkpoint": _c4_binding_extra(artifacts.binding),
-        "cross_pair_checkpoint_identity": _c4_binding_cross_pair_swap(
-            artifacts.binding
-        ),
-        "foreign_request_identity": _c4_binding_foreign_request(
-            artifacts.binding, foreign_request_sha256
-        ),
-    }
-    for _name, mutated_binding in binding_cases.items():
-        payload = _c4_raw_variant(artifacts, binding=mutated_binding)
-        with pytest.raises(RuntimeError, match="formal production source binding"):
-            _persist_c4_raw_variant(artifacts, staging_dir, payload)
-        raw_variant = _persist_c4_raw_variant_unchecked(
-            artifacts,
-            staging_dir,
-            payload,
-        )
-        with pytest.raises(gate.GateStateChangedError):
-            _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
-
-    # A legacy test-only context wrapper cannot contradict the formal runner's
-    # top-level checkpoint binding and make the compact writer choose whichever
-    # copy helps an attacker.
-    payload = _c4_raw_variant(artifacts)
-    payload["context"] = {
-        "pair_checkpoint_binding": _c4_binding_drop(artifacts.binding)
-    }
-    raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
-    with pytest.raises(
-        gate.GateStateChangedError,
-        match="conflicting top-level and legacy context",
-    ):
-        _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
-
-    # --- raw/compact injection: an injected foreign check (present-set
-    # mismatch) and a passed=true check with injected empty evidence both fail
-    # closed.
-    injected_done_gate = copy.deepcopy(artifacts.report.model_dump(mode="json"))
-    injected_done_gate["checks"].append(
-        {
-            "name": "injected_foreign_check",
-            "passed": True,
-            "summary": "injected",
-            "evidence_refs": [],
-            "evidence": {"injected": True},
-        }
-    )
-    injected_done_gate["check_count"] = len(injected_done_gate["checks"])
-    injected_done_gate["passed_check_count"] = len(injected_done_gate["checks"])
-    payload = _c4_raw_variant(artifacts, done_gate=injected_done_gate)
-    raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
-    compact = _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
-    with pytest.raises(gate.GateStateChangedError, match="check_count != 15"):
-        gate._verify_layer6_compact_contract(
-            "done-gate-layer6-compact.json",
-            compact,
-            tested_commit_sha=artifacts.head,
-        )
-
-    empty_evidence_done_gate = copy.deepcopy(
-        artifacts.report.model_dump(mode="json")
-    )
-    for check in empty_evidence_done_gate["checks"]:
-        check["passed"] = True
-        check["evidence"] = {}
-    payload = _c4_raw_variant(artifacts, done_gate=empty_evidence_done_gate)
-    raw_variant = _persist_c4_raw_variant(artifacts, staging_dir, payload)
-    compact = _compact_via_real_writer(monkeypatch, staging_dir, raw_variant)
-    with pytest.raises(gate.GateStateChangedError):
-        gate._verify_layer6_compact_contract(
-            "done-gate-layer6-compact.json",
-            compact,
-            tested_commit_sha=artifacts.head,
-        )
-
 def test_frozen_v4_pair_id_generation_enforces_time_contract() -> None:
     """C-122 supervision 18:13: the canonical generation entry point enforces
     the time contract BEFORE digest generation — ``frozen_v4_pair_id`` raises
@@ -19373,6 +18500,65 @@ def test_blob_readback_rejects_sha_mismatch(
         )
         compact["formal_live_source_summary"] = summary
         compact["runtime_identity_sha256"] = summary["runtime_identity_sha256"]
+        worker_receipt, model_receipt, _trace = _fixture_worker_model_receipts(
+            source
+        )
+        runtime_provenance = worker_receipt["runtime_provenance"]
+        worker_identity = worker_receipt["worker_runtime_identity"]
+        assert isinstance(runtime_provenance, dict)
+        assert isinstance(worker_identity, dict)
+        worker_summary = compact["worker_runtime_summary"]
+        assert isinstance(worker_summary, dict)
+        worker_summary.update(
+            {
+                "runtime_receipt_sha256": gate._canonical_sha256(
+                    worker_receipt
+                ),
+                "runtime_provenance": {
+                    key: runtime_provenance[key]
+                    for key in (
+                        "commit_sha",
+                        "dependency_lock_sha256",
+                        "live_system_source_sha256",
+                    )
+                },
+                "worker_runtime_identity": {
+                    key: worker_identity[key]
+                    for key in (
+                        "commit_sha",
+                        "dependency_lock_sha256",
+                        "live_system_source_sha256",
+                        "python_version",
+                        "started_at",
+                        "pid",
+                    )
+                },
+                "worker_runtime_identity_sha256": model_receipt[
+                    "worker_runtime_identity_sha256"
+                ],
+            }
+        )
+        worker_summary["summary_sha256"] = gate._canonical_sha256(
+            {
+                key: value
+                for key, value in worker_summary.items()
+                if key != "summary_sha256"
+            }
+        )
+        compact["model_execution_receipt"] = model_receipt
+        source_receipts = [
+            event["details"]["source_execution_receipt"]  # type: ignore[index]
+            for event in source["receipts"]  # type: ignore[union-attr]
+            if event["kind"] == "browser_complete"  # type: ignore[index]
+        ]
+        ordered = [item["receipt_sha256"] for item in source_receipts]
+        compact["source_execution_receipts"] = {
+            "schema_version": "tripchord-source-execution-receipt-set-v1",
+            "count": len(source_receipts),
+            "ordered_receipt_sha256": ordered,
+            "receipt_chain_sha256": gate._canonical_sha256(ordered),
+            "receipts": source_receipts,
+        }
         return compact
 
     with pytest.raises(

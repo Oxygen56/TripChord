@@ -2,19 +2,17 @@
 
 ## 结论
 
-C-round4 正式 raw 与 C-146 RETURN 5-P0 的代码返工已完成，结论为“可交不同 Agent 独立复审”，不是 Done-Gate 通过。旧 C-125 结论已撤销，C-124 保持 backlog；本轮交付后只把 C-146 转入 `in_review`，不由实现者启动审查或终验。
+C-146 已把正式 Layer 6 唯一正向收紧为“真实 API HTTP → 独立 worker → 父 API 持有的 production Companion/iCom 源 → worker 实际 production model → producer/compact/consumer”。代码与反例完成不是 Done-Gate 通过；只有同一 clean HEAD 的机器六层报告可以给出正向结论。旧 C-125 结论已撤销，C-124 保持 backlog；本轮交付后只把 C-146 转入 `in_review`，不由实现者启动审查或终验。
 
-## 本轮修复
+## 本轮正式链修复
 
-- 正向证据由正式 `_install_browser_bridge` composition 创建并绑定精确 `BrowserTaskBridge`、`IComTransferProvider`、`LivePackageAgentSystem` 与 `FlexibleLiveAgentSystem`，再以 `benchmarks.run_live_done_gate_v4._run` 为唯一 runner 入口。Companion 经 mounted HTTP heartbeat/claim/complete 上报；iCom 仅在 `httpx` transport 返回 schedules/base-fare/policy 原始 JSON，URL/schema/normalize/evidence/领域结果全部由真实 provider 产生。测试除此之外只提供冻结时钟和输出路径；request、runtime/Companion preflight、API job、三 pair checkpoint、事件重规划、15 项 producer、completed bundle 与 0600 原子 writer 都由正式代码产生。
-- compact 从正式 raw 的顶层 `pair_checkpoint_binding` 读取控制面绑定；旧 `context` 包装只保留兼容读取。两份同时存在且内容不同会 fail-closed，不能择一洗白。
-- query 的 foreign/cross-pair/missing/extra，checkpoint 的 missing/extra/cross-pair，foreign request identity、extra check、empty evidence 均从同一正式 raw 深拷贝，并经正式 `_write_evidence_bundle` 落盘后再进入 compact/consumer。
-- 测试不替换生产类或函数；结束时显式断言方法/函数 identity、FastAPI routes/state 与模块 globals 未改变。数据库与 bridge-state 由 pytest session 重定向到临时路径。
-- 追加快审评论 `1966f579-ade0-4428-9095-62a19b2d0e5d` 已在同一技术 run 消费：领域 provider 桩、空/缺 iCom HTTP 回执、手工 composition 回执和非 HTTP Companion heartbeat 均有 fail-closed 反例，不能满足正向测试。
-- 退回后的正式来源绑定改为生产 `FormalLiveSourceAuthority`：`_install_browser_bridge` 创建单一 installation 并绑定实际对象关系；mounted HTTP heartbeat/claim/complete 与真实 `IComTransferProvider` public GET 才能追加哈希链事件。runner 从运行前后 runtime 快照派生 delta，raw、compact 与 final 共同精确验证 installation/composition/source commit、事件形状与次序、claim-complete 对应以及三条 iCom 路径。仅手工拼接正确类名、成员、路径和 HTTP 200 不再构成证据。
-- `pair_checkpoint_binding` 改为 presence-sensitive：顶层字段缺席才读取 legacy `context`；顶层一旦出现，`null`、list 或其他非 object 值立即 fail-closed。正式测试同时保留“字段缺席 + 有效 legacy”兼容正例。
-- 已消费追加独审评论 `3d5717e4-913b-446a-ae7a-f92008bca8ea`：正式 installation 用 Browser bridge token 派生 installation/commit 专属 HMAC capability，snapshot、mounted HTTP/iCom 事件及 before/after binding 均带 capability MAC；token 不进入 runtime payload、raw、compact 或提交证据。攻击者即使完整填写新 schema、精确复刻事件顺序/路径/状态并重算全部公开 SHA，再用自选 foreign secret 生成自洽 MAC，仍无法取得生产 capability，直接 validator、raw writer 与 final consumer 三层均 fail-closed。
-- raw `formal_live_source_binding` 改为严格 presence：missing、`null`、list 或其他非 object 值均在 compact writer 读取 raw 时立即拒绝；正式 runner 生成时已用同一 capability 校验，final 再次验证，不能把失败后移或借 compact 洗白。
+- 撤销旧 R46 的 test-generated quote/`httpx.MockTransport`/测试自签正向，也撤销 `deterministic-blocking`、HUMAN_BLOCK、模型关闭成功替身。这些路径仅保留为 typed unit 或反例，不能认证 Layer 6。
+- 独立 worker 不再启动 Companion 看不见的第二 Browser HTTP 队列，也不复制 formal 签名私钥/账本。父 API 持有唯一 `BrowserTaskBridge`、真实 `IComTransferProvider` 和 `FormalLiveSourceAuthority`；worker 只持单向派生、与 Companion 令牌不可互换的 parent-source 凭据与签名 execution capability，经过普通 `httpx.AsyncClient` 回环 TCP 调用父 API 的 formal Browser/iCom 入口；该凭据访问 Companion heartbeat/claim/complete 会 401，Companion 原令牌访问 formal worker 入口也会 401。
+- worker 必须在自身进程启动 production model transport，并且模型 provider/base URL/primary/fast model 必须与父 API runtime identity 精确相等。正式完成要求至少一条实际成功 model trace，模型关闭、无调用、foreign model 或失败 trace 均拒绝。
+- 每条 Companion 完成必须附精确 release build/parser/runtime-instance/可见 DOM observation attestation，且 `execution_environment` 必须是 `chrome_extension_service_worker`。父 authority 用 challenge/run/job graph/capability/attempt 签发 source receipt；iCom 也由父 provider 在实际上游读取边界记录 receipt。
+- worker 回传的 progress 只允许 `interpreting=10`、`searching=25`、`caching=90`、`assembling=95`；pair checkpoint/source terminal event/barrier/cache snapshot 都由父 registry 按冻结图与公开 response 精确重放。缺失、多余、foreign 或自洽替换均不发布 terminal result。
+- runtime/model/source receipts 的哈希、execution capability/attempt、source receipt count、ordered task-set digest 与 receipt-chain digest 全部进入签名 `job_member_summary`。compact 与 consumer 各自重算；整份交换 worker/model receipt、调换 source member 或重算公开 hash 都 fail-closed。
+- 旧四项 scheduler/cold/qcap 安全门保持：clean/nonzero 整组死亡确认、冷启 authenticated/death-confirmed 事实、持续 confirm 异常饱和退避/唯一 owner、idcap 在任何构造/驱逐前原子拒绝。
 
 ## C-146 RETURN 5-P0 生产边界
 
@@ -26,8 +24,8 @@ C-round4 正式 raw 与 C-146 RETURN 5-P0 的代码返工已完成，结论为�
 
 ## 验证口径
 
-交付提交形成后，必须在 clean HEAD 上复跑正式正向/反例、gate 全量、相关 API/scripts 全量、clean-env 与 Ruff；随后受控重启 API，provenance 三哈希须绑定同一 HEAD，并从头运行六层门。精确 SHA、计数、run_id 与各层结果写入 C-146 唯一交付评论，避免再为记录结果制造尾部文档提交。独立复审除原样复跑完整 formal raw/capability 对抗矩阵外，还须复跑：真实 HTTP→worker ready 链、跨进程 observability/cache 绑定、clean/nonzero confirmation False/raise、连续冷启认证失败不漂移、持续 kill exception 固定窗口上界/异常消费、idcap 构造器零调用与 bytes 不变。
+交付提交形成后，必须在 clean HEAD 上复跑 formal 反例、gate 全量、相关 API/scripts 全量、clean-env、Companion release gate 与 Ruff；随后受控重启 API，provenance 三哈希须绑定同一 HEAD，并从头运行六层门。测试只能证明负向与绑定合同；正向不能由 pytest 产生。精确 SHA、计数、run_id 与各层结果写入 C-146 唯一交付评论，避免为记录结果制造尾部文档提交。
 
 ## 声明边界
 
-正式 raw 的冻结场景 15/15 与 C-146 工程回归通过都不等于机器六层 `passed=true`。若外部授权仍未满足，未通过层、`evidence_commit` 与 `gate_ref` 必须按实际结果保留失败/空值；当前不请求用户配对或模型费用动作，也不启动 C-125/C-124。
+C-146 工程回归通过不等于机器六层 `passed=true`。若外部 production Companion 未连接/未登录或官方源要求人机验证，未通过层、`evidence_commit` 与 `gate_ref` 必须按实际结果保留失败/空值；不能改回模拟源、空库存或模型关闭来制造绿灯。本轮不配对/启动 Companion，不启动 C-125/C-124。

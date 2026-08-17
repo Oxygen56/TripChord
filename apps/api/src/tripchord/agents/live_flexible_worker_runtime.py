@@ -30,9 +30,9 @@ import hashlib
 import hmac
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -56,6 +56,8 @@ _SPEC_FIELDS = frozenset(
         "bridge_token",
         "providers",
         "model_agents_required",
+        "model_runtime_identity",
+        "formal_parent_api_origin",
         "adaptive_agent_scaling_enabled",
         "now_iso",
         "http_host",
@@ -164,11 +166,46 @@ def _verified_runtime_spec(
         raise RuntimeError("live worker API runtime identity is invalid")
     if provenance_mismatches(api_runtime_identity, current_provenance):
         raise RuntimeError("live worker API runtime identity does not match live code")
+    formal_paths_present = any(
+        spec.get(field) is not None
+        for field in (
+            "formal_source_private_key_path",
+            "formal_source_ledger_path",
+        )
+    )
+    formal_parent_present = spec.get("formal_parent_api_origin") is not None
+    formal_runtime = formal_paths_present or formal_parent_present
+    if formal_runtime and spec.get("model_agents_required") is not True:
+        raise RuntimeError("formal live worker runtime requires model agents")
+    if formal_paths_present:
+        raise RuntimeError(
+            "formal live worker must use the parent-owned source authority"
+        )
+    model_identity = spec.get("model_runtime_identity")
+    expected_model_fields = {
+        "provider",
+        "base_url",
+        "primary_model",
+        "fast_model",
+    }
+    if formal_runtime and (
+        not isinstance(model_identity, dict)
+        or set(model_identity) != expected_model_fields
+        or model_identity.get("provider") not in {"anthropic", "openai_compatible"}
+        or any(
+            not isinstance(model_identity.get(field), str)
+            or not model_identity.get(field)
+            for field in ("base_url", "primary_model", "fast_model")
+        )
+    ):
+        raise RuntimeError("formal live worker model runtime identity is invalid")
     return spec, current_provenance, dict(api_runtime_identity)
 
 
 def _parse_clock(spec: dict[str, Any]) -> Callable[[], datetime]:
     now_iso = spec.get("now_iso")
+    if now_iso is None:
+        return lambda: datetime.now(UTC)
     if not isinstance(now_iso, str):
         raise RuntimeError("worker browser-bridge runtime requires now_iso")
     try:
@@ -288,7 +325,17 @@ class _CanonicalIComLoopbackTransport(httpx.AsyncBaseTransport):
         await self._inner.aclose()
 
 
-def install_runtime_bundle(target_app: Any, bundle: dict[str, Any]) -> dict[str, Any]:
+def install_runtime_bundle(
+    target_app: Any,
+    bundle: dict[str, Any],
+    *,
+    formal_execution_capability: dict[str, object] | None = None,
+    source_terminal_reporter: Callable[
+        [tuple[dict[str, Any], ...]],
+        Awaitable[None],
+    ]
+    | None = None,
+) -> dict[str, Any]:
     """Install the worker's ``runtime_bundle`` onto its reconstructed app.
 
     The worker subprocess imports ``tripchord.main`` fresh; with no browser
@@ -330,14 +377,30 @@ def install_runtime_bundle(target_app: Any, bundle: dict[str, Any]) -> dict[str,
     for field in ("model_agents_required", "adaptive_agent_scaling_enabled"):
         if type(spec.get(field)) is not bool:
             raise RuntimeError(f"worker browser-bridge runtime {field} must be boolean")
+    formal_parent_origin = spec.get("formal_parent_api_origin")
+    remote_formal_source = formal_parent_origin is not None
     host = spec.get("http_host")
     port = spec.get("http_port")
-    if host != "127.0.0.1":
-        raise RuntimeError("worker browser-bridge HTTP host must be loopback")
-    if type(port) is not int or not 1 <= port <= 65_535:
-        raise RuntimeError("worker browser-bridge HTTP port is invalid")
+    if remote_formal_source:
+        if host is not None or port is not None:
+            raise RuntimeError(
+                "formal parent source runtime cannot start a second browser HTTP queue"
+            )
+        if not isinstance(formal_execution_capability, dict):
+            raise RuntimeError(
+                "formal parent source runtime requires the signed execution capability"
+            )
+    else:
+        if host != "127.0.0.1":
+            raise RuntimeError("worker browser-bridge HTTP host must be loopback")
+        if type(port) is not int or not 1 <= port <= 65_535:
+            raise RuntimeError("worker browser-bridge HTTP port is invalid")
     icom_api_origin = spec.get("icom_api_origin")
     icom_http_client: httpx.AsyncClient | None = None
+    if remote_formal_source and icom_api_origin is not None:
+        raise RuntimeError(
+            "formal parent source runtime cannot install a worker-local iCom origin"
+        )
     if icom_api_origin is not None:
         if not isinstance(icom_api_origin, str):
             raise RuntimeError("worker iCom API origin is invalid")
@@ -358,10 +421,8 @@ def install_runtime_bundle(target_app: Any, bundle: dict[str, Any]) -> dict[str,
         )
     private_path = _path_or_none(spec.get("formal_source_private_key_path"))
     ledger_path = _path_or_none(spec.get("formal_source_ledger_path"))
-    if (private_path is None) != (ledger_path is None):
-        raise RuntimeError("worker formal source paths must be configured together")
-    if any(path is not None and not path.is_absolute() for path in (private_path, ledger_path)):
-        raise RuntimeError("worker formal source paths must be absolute")
+    if private_path is not None or ledger_path is not None:
+        raise RuntimeError("worker cannot load the parent formal signing authority")
     now = _parse_clock(spec)
     configured = api_main.settings.model_copy(
         update={
@@ -375,28 +436,58 @@ def install_runtime_bundle(target_app: Any, bundle: dict[str, Any]) -> dict[str,
             ],
         }
     )
+    model_identity = spec.get("model_runtime_identity")
+    if remote_formal_source:
+        primary = api_main.settings.model_client_config()
+        fast = api_main.settings.model_client_config(fast=True)
+        actual_model_identity = {
+            "provider": primary.provider.value if primary is not None else None,
+            "base_url": primary.base_url if primary is not None else None,
+            "primary_model": primary.model if primary is not None else None,
+            "fast_model": fast.model if fast is not None else None,
+        }
+        if model_identity != actual_model_identity or api_main.model_router is None:
+            raise RuntimeError(
+                "worker model runtime identity does not match the imported production router"
+            )
+    remote_source = None
+    if remote_formal_source:
+        from tripchord.providers.formal_parent_source import (
+            FormalParentSourceClient,
+        )
+
+        remote_source = FormalParentSourceClient(
+            parent_api_origin=str(formal_parent_origin),
+            source_token=token,
+            execution_capability=formal_execution_capability,
+        )
     bridge, live_system = api_main._install_browser_bridge(
         target_app,
         configured,
         now=now,
         sleep=asyncio.sleep,
+        model_router=api_main.model_router,
+        context_builder=api_main.context_builder,
+        memory_store=api_main.memory_store,
         icom_http_client=icom_http_client,
-        formal_source_private_key_path=private_path,
-        formal_source_ledger_path=ledger_path,
-        formal_source_runtime_identity=(
-            api_runtime_identity if private_path is not None else None
-        ),
+        source_terminal_reporter=source_terminal_reporter,
+        browser_bridge_override=remote_source,
+        icom_provider_override=remote_source,
+        mount_browser_bridge=not remote_formal_source,
+        formal_source_owned_by_parent=remote_formal_source,
     )
     if bridge is None or live_system is None:
         raise RuntimeError("worker browser-bridge install did not produce a live system")
     target_app.state.live_worker_fixed_clock = now
     target_app.state.live_worker_icom_http_client = icom_http_client
-    target_app.state.live_worker_http_host = host
-    target_app.state.live_worker_http_port = port
-    target_app.state.live_worker_http_server_task = asyncio.create_task(
-        _serve_loopback_http(target_app, host, port),
-        name="tripchord-live-worker-http",
-    )
+    target_app.state.live_worker_parent_source_client = remote_source
+    if not remote_formal_source:
+        target_app.state.live_worker_http_host = host
+        target_app.state.live_worker_http_port = port
+        target_app.state.live_worker_http_server_task = asyncio.create_task(
+            _serve_loopback_http(target_app, host, port),
+            name="tripchord-live-worker-http",
+        )
     return {
         "schema_version": _RUNTIME_RECEIPT_SCHEMA,
         "runtime": runtime,
@@ -407,7 +498,19 @@ def install_runtime_bundle(target_app: Any, bundle: dict[str, Any]) -> dict[str,
             _canonical_json(api_runtime_identity)
         ).hexdigest(),
         "worker_runtime_identity": PROVENANCE.to_dict(),
+        "model_agents_required": spec["model_agents_required"],
+        "model_runtime_identity": model_identity,
     }
+
+
+async def start_runtime_model_http(target_app: Any) -> None:
+    """Start the worker-owned production model transport before any agent call."""
+
+    import tripchord.main as api_main
+
+    runtime = api_main.model_http_runtime
+    await runtime.start()
+    target_app.state.live_worker_model_http_runtime = runtime
 
 
 async def shutdown_runtime_http(target_app: Any) -> None:
@@ -426,3 +529,17 @@ async def shutdown_runtime_http(target_app: Any) -> None:
     icom_client = getattr(target_app.state, "live_worker_icom_http_client", None)
     if isinstance(icom_client, httpx.AsyncClient):
         await icom_client.aclose()
+    parent_source = getattr(
+        target_app.state,
+        "live_worker_parent_source_client",
+        None,
+    )
+    if parent_source is not None:
+        await parent_source.aclose()
+    model_runtime = getattr(
+        target_app.state,
+        "live_worker_model_http_runtime",
+        None,
+    )
+    if model_runtime is not None:
+        await model_runtime.aclose()
