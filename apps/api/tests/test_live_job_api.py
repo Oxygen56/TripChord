@@ -242,6 +242,61 @@ async def test_runtime_status_returns_effective_flexible_timeout_setting(
 
 
 @pytest.mark.asyncio
+async def test_runtime_status_certifies_complete_worker_model_smoke_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = settings.model_copy(
+        update={
+            "model_provider": "openai_compatible",
+            "model_api_key": "local-runtime-placeholder",
+            "model_base_url": "http://127.0.0.1:11434/v1",
+            "model_name": "gpt-oss:20b",
+            "model_fast_name": "gpt-oss:20b",
+            "model_timeout_seconds": 300.0,
+            "model_agents_required": True,
+            "model_response_format_mode": "json_object",
+            "model_thinking_mode": "disabled",
+        }
+    )
+    identity = {
+        "provider": "openai_compatible",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "primary_model": "gpt-oss:20b",
+        "fast_model": "gpt-oss:20b",
+    }
+    monkeypatch.setattr(main_module, "settings", configured)
+    monkeypatch.setattr(main_module, "model_router", object())
+    monkeypatch.setattr(
+        main_module,
+        "_live_flexible_worker_runtime_bundle",
+        lambda: {
+            "spec": {
+                "model_agents_required": True,
+                "model_runtime_identity": identity,
+            },
+            "spec_sha256": "a" * 64,
+        },
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/api/v1/agents/runtime")
+
+    assert response.status_code == 200
+    assert response.json()["worker_model_runtime"] == {
+        "enabled": True,
+        "required": True,
+        **identity,
+        "timeout_seconds": 300.0,
+        "response_format_mode": "json_object",
+        "thinking_mode": "disabled",
+        "runtime_bundle_spec_sha256": "a" * 64,
+    }
+
+
+@pytest.mark.asyncio
 async def test_failed_async_job_retains_request_bound_model_trace_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

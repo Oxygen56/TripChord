@@ -1468,6 +1468,9 @@ async def agent_runtime_status_endpoint(
                 "enabled": True,
                 "required": True,
                 **worker_model_identity,
+                "timeout_seconds": settings.model_timeout_seconds,
+                "response_format_mode": settings.model_response_format_mode,
+                "thinking_mode": settings.model_thinking_mode,
                 "runtime_bundle_spec_sha256": worker_bundle["spec_sha256"],
             }
             if isinstance(worker_model_identity, dict)

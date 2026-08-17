@@ -18,8 +18,7 @@ Layer reference (contract section 六 v1.0):
      -> handoff -> user confirm -> protected replan;
   3. clean Chrome + local malicious fixture: permissions, pairing, background,
      URL and Prompt Injection;
-  4. OpenAI-compatible model (authorized env) required-model smoke + structured
-     Agent chain;
+  4. running API-certified required-model smoke + structured Agent chain;
   5. every declared-certified real provider x vertical has a fresh authorised
      read-only canary;
   6. full-platform real E2E only when all external conditions are met; when not
@@ -51,7 +50,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlsplit
+from urllib.request import Request, urlopen
 
 from tripchord._secret_redact import (
     _ARRAY_PATH_ELEMENT,
@@ -128,7 +129,6 @@ _GIT_ENV_OVERRIDES = frozenset(
     }
 )
 
-_MODEL_ENV_VARS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "TRIPCHORD_MODEL_API_KEY")
 # Priority order for resolving which environment variable actually holds the
 # model key.  The smoke reads the exact variable name we pass via --api-key-env,
 # so we must hand it the name where the key was found, not a hardcoded one.
@@ -137,6 +137,23 @@ _MODEL_API_KEY_ENV_CANDIDATES = (
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "TRIPCHORD_MODEL_API_KEY",
+)
+_MODEL_RUNTIME_STATUS_URL = "http://127.0.0.1:8000/api/v1/agents/runtime"
+_MODEL_RUNTIME_STATUS_MAX_BYTES = 256 * 1024
+_LOCAL_MODEL_SMOKE_KEY = "ollama-local"
+_MODEL_RUNTIME_FIELDS = frozenset(
+    {
+        "enabled",
+        "required",
+        "provider",
+        "base_url",
+        "primary_model",
+        "fast_model",
+        "timeout_seconds",
+        "response_format_mode",
+        "thinking_mode",
+        "runtime_bundle_spec_sha256",
+    }
 )
 
 
@@ -607,25 +624,151 @@ def layer3_clean_chrome_fixtures(staging_dir: Path) -> LayerResult:
     )
 
 
-def _resolve_model_smoke_args() -> tuple[list[str], str] | None:
-    """Resolve the required-model smoke invocation from the environment.
+def _validated_worker_model_runtime(payload: object) -> dict[str, Any]:
+    """Extract the exact model identity certified by the running API.
 
-    Returns ``(argv, api_key_env)`` when the model endpoint is fully resolvable
-    and the user has explicitly acknowledged bounded live model cost, else None.
+    Layer 4 must exercise the model runtime that Layer 6 will use.  Shell model
+    variables are caller-controlled and may describe a stale or entirely
+    different provider, so they are never an identity source.  The API status
+    is accepted only when its startup provenance matches the current checkout
+    and its top-level and worker model declarations agree exactly.
     """
-    if os.environ.get("TRIPCHORD_ACK_MODEL_COST") != "1":
-        return None
-    api_key_env = next(
-        (var for var in _MODEL_API_KEY_ENV_CANDIDATES if os.environ.get(var)),
-        None,
+    if not isinstance(payload, dict):
+        raise RuntimeError("running API runtime status is not a JSON object")
+    mismatches = provenance_mismatches(
+        payload.get("runtime_provenance"),
+        local_expected_provenance(repo_root=ROOT),
     )
-    if api_key_env is None:
-        return None
-    model = os.environ.get("TRIPCHORD_MODEL_NAME") or os.environ.get("ANTHROPIC_MODEL")
-    base_url = os.environ.get("TRIPCHORD_MODEL_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL")
-    if not model or not base_url:
-        return None
-    provider = "anthropic" if "anthropic" in (base_url or "").lower() else "openai_compatible"
+    if mismatches:
+        raise RuntimeError(
+            "running API provenance does not match the current checkout: "
+            + "; ".join(mismatches)
+        )
+    worker = payload.get("worker_model_runtime")
+    if not isinstance(worker, dict) or set(worker) != _MODEL_RUNTIME_FIELDS:
+        raise RuntimeError("running API worker model runtime has an invalid field contract")
+    if worker.get("enabled") is not True or worker.get("required") is not True:
+        raise RuntimeError("running API worker model runtime is not enabled and required")
+    provider = worker.get("provider")
+    base_url = worker.get("base_url")
+    primary_model = worker.get("primary_model")
+    fast_model = worker.get("fast_model")
+    timeout_seconds = worker.get("timeout_seconds")
+    response_format_mode = worker.get("response_format_mode")
+    thinking_mode = worker.get("thinking_mode")
+    spec_sha = worker.get("runtime_bundle_spec_sha256")
+    if provider not in {"anthropic", "openai_compatible"}:
+        raise RuntimeError("running API worker model provider is unsupported")
+    if not all(
+        isinstance(value, str) and value
+        for value in (base_url, primary_model, fast_model)
+    ):
+        raise RuntimeError("running API worker model identity is incomplete")
+    parsed = urlsplit(base_url)
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("running API worker model base URL has an invalid port") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("running API worker model base URL is invalid")
+    if (
+        not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or not 0 < timeout_seconds <= 300
+    ):
+        raise RuntimeError("running API worker model timeout is invalid")
+    if response_format_mode not in {
+        "auto",
+        "json_schema",
+        "json_object",
+        "prompt_only",
+    }:
+        raise RuntimeError("running API worker response-format mode is invalid")
+    if thinking_mode not in {"auto", "disabled", "enabled"}:
+        raise RuntimeError("running API worker thinking mode is invalid")
+    if not isinstance(spec_sha, str) or re.fullmatch(r"[0-9a-f]{64}", spec_sha) is None:
+        raise RuntimeError("running API worker runtime bundle digest is invalid")
+    if (
+        payload.get("model_enabled") is not True
+        or payload.get("model_required") is not True
+        or payload.get("model_provider") != provider
+        or payload.get("primary_model") != primary_model
+        or payload.get("fast_model") != fast_model
+    ):
+        raise RuntimeError(
+            "running API top-level and worker model runtime identities disagree"
+        )
+    return worker
+
+
+def _running_worker_model_runtime() -> dict[str, Any]:
+    """Read one bounded, duplicate-key-safe runtime status from the live API."""
+    request = Request(
+        _MODEL_RUNTIME_STATUS_URL,
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=5) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    f"running API runtime status returned HTTP {response.status}"
+                )
+            raw = response.read(_MODEL_RUNTIME_STATUS_MAX_BYTES + 1)
+    except (HTTPError, URLError, OSError, TimeoutError) as exc:
+        raise RuntimeError(
+            f"running API runtime status is unavailable ({type(exc).__name__})"
+        ) from exc
+    if len(raw) > _MODEL_RUNTIME_STATUS_MAX_BYTES:
+        raise RuntimeError("running API runtime status exceeds the bounded response size")
+    try:
+        payload = json_loads_no_dupes(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError("running API runtime status is not valid unique-key JSON") from exc
+    return _validated_worker_model_runtime(payload)
+
+
+def _isolated_model_smoke_env(api_key_env: str, api_key: str) -> dict[str, str]:
+    """Give the smoke exactly one credential and no inherited provider keys."""
+    child_env = dict(os.environ)
+    for variable in _MODEL_API_KEY_ENV_CANDIDATES:
+        child_env.pop(variable, None)
+    child_env[api_key_env] = api_key
+    return child_env
+
+
+def _resolve_model_smoke_args() -> tuple[list[str], dict[str, str]]:
+    """Build the smoke invocation from the running API's certified identity."""
+    if os.environ.get("TRIPCHORD_ACK_MODEL_COST") != "1":
+        raise RuntimeError("bounded live model cost is not acknowledged")
+    runtime = _running_worker_model_runtime()
+    base_url = str(runtime["base_url"])
+    parsed = urlsplit(base_url)
+    is_loopback = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+    if is_loopback:
+        api_key_env = "MODEL_API_KEY"
+        child_env = _isolated_model_smoke_env(api_key_env, _LOCAL_MODEL_SMOKE_KEY)
+    else:
+        api_key_env = next(
+            (var for var in _MODEL_API_KEY_ENV_CANDIDATES if os.environ.get(var)),
+            None,
+        )
+        if api_key_env is None:
+            raise RuntimeError(
+                "running API uses an external model endpoint but no model key "
+                "is authorised in the gate environment"
+            )
+        child_env = _isolated_model_smoke_env(
+            api_key_env,
+            os.environ[api_key_env],
+        )
     argv = [
         "uv",
         "run",
@@ -633,49 +776,53 @@ def _resolve_model_smoke_args() -> tuple[list[str], str] | None:
         "scripts/run_model_runtime_smoke.py",
         "--ack-live-cost",
         "--provider",
-        provider,
+        str(runtime["provider"]),
         "--model",
-        model,
+        str(runtime["primary_model"]),
         "--base-url",
         base_url,
         "--api-key-env",
         api_key_env,
+        "--timeout-seconds",
+        str(runtime["timeout_seconds"]),
+        "--response-format-mode",
+        str(runtime["response_format_mode"]),
+        "--thinking-mode",
+        str(runtime["thinking_mode"]),
         "--output",
         str(ROOT / "benchmarks" / "results" / "model-runtime-smoke-done-gate.json"),
     ]
-    return argv, api_key_env
+    return argv, child_env
 
 
 def layer4_model_smoke() -> LayerResult:
-    """OpenAI-compatible required-model smoke when a key is authorised.
+    """Smoke the exact required-model runtime certified by the running API.
 
     The smoke makes a bounded live model call, so it only runs when the user
     has explicitly acknowledged model cost (``TRIPCHORD_ACK_MODEL_COST=1``) and
     the endpoint is resolvable.  Without that acknowledgement the layer is
-    *skipped*, never failed — the gate stays honest about the boundary.
+    *skipped*, never failed.  Once acknowledged, an unavailable, stale, or
+    inconsistent API runtime is an engineering failure rather than a skip.
     """
-    authorized = any(os.environ.get(var) for var in _MODEL_ENV_VARS)
-    resolved = _resolve_model_smoke_args()
-    if not authorized:
-        return LayerResult(
-            name="4_model_smoke",
-            passed=False,
-            skipped=True,
-            detail="no model API key authorised in environment; skipped (not failed)",
-        )
-    if resolved is None:
+    if os.environ.get("TRIPCHORD_ACK_MODEL_COST") != "1":
         return LayerResult(
             name="4_model_smoke",
             passed=False,
             skipped=True,
             detail=(
-                "model key present but bounded live model cost not acknowledged; "
-                "set TRIPCHORD_ACK_MODEL_COST=1 (and a resolvable model endpoint) "
-                "to run the required-model smoke"
+                "bounded live model cost not acknowledged; set "
+                "TRIPCHORD_ACK_MODEL_COST=1 to run the required-model smoke"
             ),
         )
-    argv, _ = resolved
-    code, out = _run(argv, timeout=600)
+    try:
+        argv, child_env = _resolve_model_smoke_args()
+    except RuntimeError as exc:
+        return LayerResult(
+            name="4_model_smoke",
+            passed=False,
+            detail=str(exc),
+        )
+    code, out = _run(argv, env=child_env, timeout=600)
     return LayerResult(
         name="4_model_smoke",
         passed=code == 0,

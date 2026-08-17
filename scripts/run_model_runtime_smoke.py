@@ -25,6 +25,7 @@ from tripchord.agents.model_gateway import (
     ModelResponse,
     ModelResponseFormatMode,
     ModelRetryPolicy,
+    ModelThinkingMode,
     ModelTool,
     ModelToolResult,
     build_model_client,
@@ -350,6 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-usd-per-million", type=float, default=0)
     parser.add_argument("--output-usd-per-million", type=float, default=0)
     parser.add_argument("--response-format-mode", default="auto")
+    parser.add_argument("--thinking-mode", default="auto")
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -369,6 +371,10 @@ def validate_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace
         ModelResponseFormatMode(args.response_format_mode)
     except ValueError:
         parser.error("unsupported --response-format-mode")
+    try:
+        ModelThinkingMode(args.thinking_mode)
+    except ValueError:
+        parser.error("unsupported --thinking-mode")
 
 
 async def execute_from_arguments(
@@ -399,6 +405,7 @@ async def execute_from_arguments(
                 output_usd_per_million_tokens=args.output_usd_per_million,
             ),
             response_format_mode=ModelResponseFormatMode(args.response_format_mode),
+            thinking_mode=ModelThinkingMode(args.thinking_mode),
         ),
         http_client=http_client,
         trace_sink=trace_sink,

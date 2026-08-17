@@ -42,6 +42,105 @@ _TEST_FORMAL_CONTROL_TOKEN_PATH: Path | None = None
 _TEST_FORMAL_PUBLIC_KEY_DER: bytes | None = None
 
 
+def _certified_model_runtime(
+    *,
+    base_url: str = "http://127.0.0.1:11434/v1",
+) -> dict[str, object]:
+    return {
+        "enabled": True,
+        "required": True,
+        "provider": "openai_compatible",
+        "base_url": base_url,
+        "primary_model": "gpt-oss:20b",
+        "fast_model": "gpt-oss:20b",
+        "timeout_seconds": 300.0,
+        "response_format_mode": "json_object",
+        "thinking_mode": "disabled",
+        "runtime_bundle_spec_sha256": "a" * 64,
+    }
+
+
+def test_layer4_uses_running_api_identity_and_isolates_shell_model_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-146: stale shell provider variables cannot redirect Layer 4."""
+    monkeypatch.setenv("TRIPCHORD_ACK_MODEL_COST", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "old-external-secret")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://old-model.invalid")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "old-model")
+    monkeypatch.setattr(
+        gate,
+        "_running_worker_model_runtime",
+        lambda: _certified_model_runtime(),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], **kwargs: object) -> tuple[int, str]:
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        return 0, ""
+
+    monkeypatch.setattr(gate, "_run", fake_run)
+
+    result = gate.layer4_model_smoke()
+
+    assert result.passed is True
+    assert result.skipped is False
+    cmd = captured["cmd"]
+    assert isinstance(cmd, list)
+    assert cmd[cmd.index("--provider") + 1] == "openai_compatible"
+    assert cmd[cmd.index("--model") + 1] == "gpt-oss:20b"
+    assert cmd[cmd.index("--base-url") + 1] == "http://127.0.0.1:11434/v1"
+    assert cmd[cmd.index("--response-format-mode") + 1] == "json_object"
+    assert cmd[cmd.index("--thinking-mode") + 1] == "disabled"
+    assert "old-model" not in cmd
+    assert "old-external-secret" not in cmd
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert child_env["MODEL_API_KEY"] == gate._LOCAL_MODEL_SMOKE_KEY
+    assert "ANTHROPIC_API_KEY" not in child_env
+
+
+def test_layer4_rejects_stale_running_api_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-146: a self-consistent model status from another HEAD fails closed."""
+    payload = {
+        "model_enabled": True,
+        "model_required": True,
+        "model_provider": "openai_compatible",
+        "primary_model": "gpt-oss:20b",
+        "fast_model": "gpt-oss:20b",
+        "worker_model_runtime": _certified_model_runtime(),
+        "runtime_provenance": {"commit_sha": "b" * 40},
+    }
+    monkeypatch.setattr(
+        gate,
+        "provenance_mismatches",
+        lambda reported, expected: ["runtime provenance commit_sha is stale"],
+    )
+
+    with pytest.raises(RuntimeError, match=r"does not match.*stale"):
+        gate._validated_worker_model_runtime(payload)
+
+
+def test_layer4_external_runtime_requires_an_explicit_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-146: the local placeholder credential is never sent to an external host."""
+    monkeypatch.setenv("TRIPCHORD_ACK_MODEL_COST", "1")
+    for variable in gate._MODEL_API_KEY_ENV_CANDIDATES:
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setattr(
+        gate,
+        "_running_worker_model_runtime",
+        lambda: _certified_model_runtime(base_url="https://model.example/v1"),
+    )
+
+    with pytest.raises(RuntimeError, match="external model endpoint"):
+        gate._resolve_model_smoke_args()
+
+
 @pytest.fixture(scope="module", autouse=True)
 def isolated_formal_source_trust_root(
     tmp_path_factory: pytest.TempPathFactory,

@@ -23,6 +23,8 @@ def _arguments(tmp_path: Path) -> list[str]:
         "mock-model",
         "--base-url",
         "https://model.example/v1",
+        "--thinking-mode",
+        "disabled",
         "--output",
         str(tmp_path / "model-smoke.json"),
     ]
@@ -103,6 +105,7 @@ async def test_mock_smoke_emits_hashes_traces_and_no_secret_or_prompt_plaintext(
 
     serialized = json.dumps(report, ensure_ascii=False)
     assert len(call_bodies) == 3
+    assert all(body["thinking"] == {"type": "disabled"} for body in call_bodies)
     assert report["schema_version"] == "tripchord-model-runtime-smoke-v2"
     assert report["provider_adapter"] == "openai_compatible"
     assert report["model"] == "mock-model"
