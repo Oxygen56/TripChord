@@ -1482,10 +1482,12 @@ async def agent_runtime_status_endpoint(
         effective_flexible_timeout_seconds=_flexible_total_timeout_seconds(None),
         runtime_provenance=AgentRuntimeProvenance(**PROVENANCE.to_dict()),
         formal_live_source=(
-            cast(
-                FormalLiveSourceAuthority | None,
-                getattr(app.state, "formal_live_source_authority", None),
-            ).public_status()
+            _formal_source_public_status(
+                cast(
+                    FormalLiveSourceAuthority,
+                    app.state.formal_live_source_authority,
+                )
+            )
             if getattr(app.state, "formal_live_source_authority", None) is not None
             else None
         ),
@@ -1534,12 +1536,26 @@ _FORMAL_ACTIVATION_HEARTBEAT_TIMEOUT_SECONDS = 15.0
 _FORMAL_ACTIVATION_HEARTBEAT_POLL_SECONDS = 0.05
 
 
-def _formal_source_control_token() -> str:
+def _formal_source_control_path() -> Path:
     configured_path = _FORMAL_SOURCE_CONTROL_PATH
-    if configured_path is None:
-        configured_path = formal_source_trust_root() / "control-token"
+    if configured_path is not None:
+        return configured_path
+    return formal_source_trust_root() / "control-token"
+
+
+def _formal_source_public_status(
+    authority: FormalLiveSourceAuthority,
+) -> dict[str, object]:
+    """Publish the local control-file location, never its protected content."""
+    return {
+        **authority.public_status(),
+        "control_token_path": str(_formal_source_control_path()),
+    }
+
+
+def _formal_source_control_token() -> str:
     return read_owner_only_text(
-        configured_path,
+        _formal_source_control_path(),
         "formal source control token",
         minimum_length=64,
     )

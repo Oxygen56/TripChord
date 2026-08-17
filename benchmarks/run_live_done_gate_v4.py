@@ -283,7 +283,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument(
         "--formal-source-control-token-file",
         type=Path,
-        default=formal_source_trust_root() / "control-token",
+        default=None,
     )
     parser.add_argument(
         "--bridge-token",
@@ -769,6 +769,21 @@ def _formal_source_control_token(path: Path | None = None) -> str:
         "formal source control token",
         minimum_length=64,
     )
+
+
+def _formal_source_control_path_from_runtime(status: object) -> Path:
+    """Resolve only the control path certified by the provenance-bound API."""
+    if not isinstance(status, dict):
+        raise RuntimeError("runtime carries no formal live source control status")
+    raw_path = status.get("control_token_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise RuntimeError("runtime formal live source control path is missing")
+    path = Path(raw_path)
+    root = formal_source_trust_root(path.parent)
+    expected = root / "control-token"
+    if path != expected:
+        raise RuntimeError("runtime formal live source control path is not canonical")
+    return path
 
 
 async def _issue_formal_source_challenge_remote(
@@ -2200,6 +2215,11 @@ async def _run(
             )
             stage = "validate_runtime_provenance"
             _validate_runtime_provenance(runtime_before)
+            stage = "resolve_formal_source_control"
+            if getattr(args, "formal_source_control_token_file", None) is None:
+                args.formal_source_control_token_file = (
+                    _formal_source_control_path_from_runtime(formal_source_before)
+                )
             if not args.gate_run_id:
                 raise RuntimeError(
                     "formal live source requires the outer six-layer gate run_id"

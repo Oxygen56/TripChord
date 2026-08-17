@@ -3231,3 +3231,74 @@ async def test_cold_load_settles_confirmed_orphan_activation_to_restart_cancelle
     finally:
         with _suppress_os():
             os.killpg(pgid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+async def test_cold_load_settles_activation_when_worker_group_already_exited(
+    tmp_path: Path,
+) -> None:
+    """A worker may exit and remove its marker between parent death and recovery.
+
+    Current ESRCH proves there is no group to kill (so no marker authentication
+    is needed); the independent committed activation then proves the exact
+    restart-cancelled outcome. Readiness must not expose the stale QUEUED state.
+    """
+    state_path = tmp_path / "already-exited-live-jobs.json"
+    job_id = "live-job-cold-activation-already-exited"
+    missing_pgid = 2_147_483_647
+    activation_operation = {
+        "schema_version": "tripchord-live-activation-operation-v1",
+        "operation_id": "a" * 64,
+        "idempotency_key": f"formal-activate-{job_id}",
+        "request_digest": REQUEST_SHA256,
+        "job_id": job_id,
+        "challenge_id": f"challenge-{job_id}",
+        "attempt_digest": REQUEST_SHA256,
+        "capability_sha256": REQUEST_SHA256,
+        "companion_identity_sha256": REQUEST_SHA256,
+        "queued_result": {"job": {"id": job_id, "state": "queued"}},
+        "phase": "committed",
+        "dispatch_count": 1,
+    }
+    record = _v3_record(
+        "tenant-a",
+        _v3_snapshot(job_id, LivePlanningJobState.QUEUED, "queued", 0, 1),
+        worker_pgid=missing_pgid,
+        worker_marker="already-exited-worker-marker-00000001",
+    )
+    record["activation_operation"] = activation_operation
+    _write_registry_state(
+        {
+            "schema_version": "tripchord-live-job-registry-v3",
+            "records": [record],
+            "idempotency": [
+                _v3_idempotency_entry(
+                    "tenant-a",
+                    "cold-activation-already-exited-key",
+                    job_id,
+                )
+            ],
+        },
+        state_path,
+    )
+
+    registry = LivePlanningJobRegistry(state_path=state_path)
+    try:
+        assert registry._records[job_id].snapshot.state == LivePlanningJobState.QUEUED
+        await registry.restore_after_restart()
+        settled = registry._records[job_id]
+        assert settled.snapshot.state == LivePlanningJobState.CANCELLED
+        assert settled.snapshot.stage == "restart_cancelled"
+        assert settled.worker_pgid is None
+        assert settled.worker_marker is None
+        assert settled.quarantined is False
+    finally:
+        await registry.close()
+
+    restarted = LivePlanningJobRegistry(state_path=state_path)
+    try:
+        settled = restarted._records[job_id]
+        assert settled.snapshot.state == LivePlanningJobState.CANCELLED
+        assert settled.snapshot.stage == "restart_cancelled"
+    finally:
+        await restarted.close()

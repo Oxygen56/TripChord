@@ -40,6 +40,11 @@ from tripchord.runtime_provenance import local_expected_provenance
 from benchmarks import run_live_done_gate_v4
 
 SCENARIO = Path(__file__).parents[1] / "scenarios" / "live-hgh-mle-aug-2026-v4.json"
+_FIXTURE_CONTROL_PATH = (
+    Path(os.environ.get("TMPDIR", "/tmp")).resolve()
+    / "tripchord-fixture-formal-source"
+    / "control-token"
+)
 
 
 def _request() -> dict[str, Any]:
@@ -61,7 +66,10 @@ def _runtime_payload(*, model_trace_count: int = 7) -> dict[str, Any]:
         "effective_flexible_timeout_seconds": 3600,
         "rag_enabled": True,
         "runtime_provenance": _runtime_provenance_payload(),
-        "formal_live_source": {"fixture_anchor_available": True},
+        "formal_live_source": {
+            "fixture_anchor_available": True,
+            "control_token_path": str(_FIXTURE_CONTROL_PATH),
+        },
         "worker_model_runtime": None,
     }
 
@@ -161,6 +169,42 @@ def _install_failed_run_formal_control_double(
         "_abort_formal_source_challenge_remote",
         abort,
     )
+
+
+def test_v4_arguments_defer_formal_control_path_to_certified_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT", raising=False)
+    monkeypatch.setattr(sys, "argv", ["run_live_done_gate_v4.py"])
+
+    args = run_live_done_gate_v4._arguments()
+
+    assert args.formal_source_control_token_file is None
+
+
+def test_v4_formal_control_path_must_be_canonical_and_external(
+    tmp_path: Path,
+) -> None:
+    control_path = tmp_path / "formal-source" / "control-token"
+    assert run_live_done_gate_v4._formal_source_control_path_from_runtime(
+        {"control_token_path": str(control_path)}
+    ) == control_path
+
+    with pytest.raises(RuntimeError, match="outside the repository"):
+        run_live_done_gate_v4._formal_source_control_path_from_runtime(
+            {
+                "control_token_path": str(
+                    Path(__file__).resolve().parents[2]
+                    / ".runtime"
+                    / "formal-source"
+                    / "control-token"
+                )
+            }
+        )
+    with pytest.raises(RuntimeError, match="not canonical"):
+        run_live_done_gate_v4._formal_source_control_path_from_runtime(
+            {"control_token_path": str(tmp_path / "foreign-name")}
+        )
 
 
 def _api_payload_sha256() -> str:

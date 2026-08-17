@@ -296,6 +296,26 @@ async def test_runtime_status_certifies_complete_worker_model_smoke_identity(
     }
 
 
+def test_formal_source_public_status_exposes_only_control_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    control_path = tmp_path / "formal-source" / "control-token"
+
+    class Authority:
+        def public_status(self) -> dict[str, object]:
+            return {"schema_version": "fixture-formal-source", "challenge_active": False}
+
+    monkeypatch.setattr(main_module, "_FORMAL_SOURCE_CONTROL_PATH", control_path)
+    status = main_module._formal_source_public_status(Authority())  # type: ignore[arg-type]
+
+    assert status == {
+        "schema_version": "fixture-formal-source",
+        "challenge_active": False,
+        "control_token_path": str(control_path),
+    }
+
+
 @pytest.mark.asyncio
 async def test_failed_async_job_retains_request_bound_model_trace_summary(
     monkeypatch: pytest.MonkeyPatch,

@@ -3689,7 +3689,10 @@ class LivePlanningJobRegistry:
         not found in its command lines, or the ``ps`` query itself failed) is
         never killed and its record is still quarantined as an orphan so
         consecutive cold starts keep re-checking the same group; no terminal
-        resolver ever runs over an executor whose death was never confirmed."""
+        resolver ever runs over an executor whose death was never confirmed.
+        If a separate no-signal probe returns ESRCH, there is no live group to
+        authenticate or kill; the stale process identity is discarded and only
+        independent durable job facts may resolve the record."""
         candidates: list[tuple[int, str, Path | None, _RuntimeJob | None]] = []
         if self._state_path is not None:
             workers_dir = self._workers_dir()
@@ -3752,6 +3755,7 @@ class LivePlanningJobRegistry:
             # or the ps query itself failed) is NEVER killed — a reused PGID
             # owned by an unrelated process is never touched.
             confirmed = False
+            group_absent = False
             if authenticated:
                 with suppress(ProcessLookupError, PermissionError, OSError):
                     os.killpg(pgid, signal.SIGKILL)
@@ -3773,34 +3777,64 @@ class LivePlanningJobRegistry:
                             # the next startup.
                             pass
                         await asyncio.sleep(0.01)
-            elif runtime is not None and runtime.orphan_authenticated is True:
-                # A previous boot authenticated THIS exact marker/PGID but could
-                # not confirm its death.  Never use that historical fact to kill
-                # a currently-live group (the PGID may have been reused); do,
-                # however, accept current ESRCH as the missing death proof.  A
-                # live/EPERM group or a failed probe remains isolated for the
-                # next boot.
+            elif runtime is not None:
+                # A marker-free command scan can mean either a failed ``ps`` /
+                # reused live PGID OR that the old worker exited and removed its
+                # marker before this boot. Probe existence without signalling.
+                # ESRCH proves there is currently no process group to authenticate
+                # or kill; a live/EPERM group remains isolated. When an earlier
+                # boot authenticated this exact identity, ESRCH completes the
+                # durable authenticated-death proof. Otherwise the same current
+                # absence lets this boot discard the stale worker identity and
+                # resolve only from the record's independent durable facts.
                 try:
                     os.killpg(pgid, 0)
                 except ProcessLookupError:
-                    confirmed = True
+                    if runtime.orphan_authenticated is True:
+                        confirmed = True
+                    else:
+                        group_absent = True
                 except (PermissionError, OSError):
                     pass
             if runtime is not None:
                 # C-146 P0-3: quarantine EVERY cold-booted record with a durable
                 # worker identity — authenticated OR not. An unauthenticated
-                # group (marker not found in its command lines, or the ps query
-                # itself failed) is never killed, and its record stays ISOLATED
-                # (orphan quarantine) with the durable per-identity auth fact
-                # persisted, so consecutive cold starts keep re-checking the same
-                # group and no terminal resolver ever guesses a label over an
-                # executor whose death was never confirmed.
+                # group that still exists (marker not found in its command lines,
+                # or the ps query itself failed) is never killed, and its record
+                # stays ISOLATED with the durable per-identity auth fact persisted.
+                # A separately-proven ESRCH group takes the branch below instead.
                 async with self._lock:
                     current = self._records.get(runtime.snapshot.id)
                     if (
                         current is not None
                         and current.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
                     ):
+                        if group_absent:
+                            # The old group is already ESRCH, so no unrelated
+                            # process is signalled and marker authentication is
+                            # unnecessary. Clear the stale process identity, then
+                            # run the SAME cold-boot resolver used for records that
+                            # never carried a worker identity. Formal activation,
+                            # durable cancel intent, or deadline facts decide the
+                            # result; an ambiguous immediate job is still
+                            # quarantined rather than guessed terminal. Persist
+                            # before readiness so no request observes stale QUEUED.
+                            current.worker_pgid = None
+                            current.worker_marker = None
+                            current.worker_probe = None
+                            current.worker_execution_capability = None
+                            current.orphan_authenticated = None
+                            current.orphan_death_confirmed = None
+                            current.quarantined = False
+                            current.quarantine_stage = None
+                            current.hard_stopped = False
+                            self._resolve_cold_booted_record_locked(current)
+                            self._persist_locked()
+                            self._changed.notify_all()
+                            if marker_path is not None:
+                                with suppress(OSError):
+                                    marker_path.unlink(missing_ok=True)
+                            continue
                         # C-146 P0-3: the durable auth/death-confirm facts are
                         # MONOTONIC per identity — a cold start only ever STRENGTHENS
                         # them (a later boot's re-check that fails to authenticate,
