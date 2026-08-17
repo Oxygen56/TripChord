@@ -124,6 +124,41 @@ def test_layer4_rejects_stale_running_api_provenance(
         gate._validated_worker_model_runtime(payload)
 
 
+def test_layer4_binds_formal_verifier_to_provenance_checked_api_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-146: later Layer-6 consumers use the API path, not shell identity."""
+
+    runtime = {"commit_sha": "b" * 40}
+    trust_root = tmp_path / "api-certified-formal-root"
+    payload = {
+        "model_enabled": True,
+        "model_required": True,
+        "model_provider": "openai_compatible",
+        "primary_model": "gpt-oss:20b",
+        "fast_model": "gpt-oss:20b",
+        "worker_model_runtime": _certified_model_runtime(),
+        "runtime_provenance": runtime,
+        "formal_live_source": {
+            "schema_version": "tripchord-formal-live-source-v3",
+            "anchor_version": "tripchord-formal-source-anchor-v2:g1",
+            "authority_key_id": "c" * 64,
+            "runtime_identity": runtime,
+            "control_token_path": str(trust_root / "control-token"),
+        },
+    }
+    monkeypatch.setattr(gate, "provenance_mismatches", lambda *_: [])
+    token = gate._FORMAL_SOURCE_VERIFICATION_ROOT.set(None)
+    try:
+        assert gate._validated_worker_model_runtime(payload) == payload[
+            "worker_model_runtime"
+        ]
+        assert gate._FORMAL_SOURCE_VERIFICATION_ROOT.get() == trust_root
+    finally:
+        gate._FORMAL_SOURCE_VERIFICATION_ROOT.reset(token)
+
+
 def test_layer4_external_runtime_requires_an_explicit_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -139,6 +174,16 @@ def test_layer4_external_runtime_requires_an_explicit_key(
 
     with pytest.raises(RuntimeError, match="external model endpoint"):
         gate._resolve_model_smoke_args()
+
+
+def test_layer6_child_cannot_inherit_a_foreign_shell_trust_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT", "/foreign/root")
+
+    child_env = gate._bridge_env("bridge-token-" + "b" * 32)
+
+    assert "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT" not in child_env
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -14709,6 +14754,41 @@ def _fresh_installed_formal_authority(
         ),
     }
     return authority, context
+
+
+def test_formal_offline_validation_uses_explicit_api_certified_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-146: a foreign shell root cannot replace the API-selected anchor."""
+
+    from tripchord.formal_live_source import (
+        provision_formal_source_trust_root,
+        validate_formal_execution_capability,
+        validate_formal_source_challenge,
+    )
+
+    assert _TEST_FORMAL_CONTROL_TOKEN_PATH is not None
+    authority, context = _fresh_installed_formal_authority(tmp_path)
+    issued = authority.issue_challenge(context)
+    foreign_root = tmp_path / "foreign-shell-root"
+    provision_formal_source_trust_root(foreign_root)
+    monkeypatch.setenv("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT", str(foreign_root))
+
+    with pytest.raises(ValueError, match="foreign verification anchor"):
+        validate_formal_source_challenge(issued["challenge"])
+
+    certified_root = _TEST_FORMAL_CONTROL_TOKEN_PATH.parent
+    checked = validate_formal_source_challenge(
+        issued["challenge"],
+        trust_root=certified_root,
+    )
+    assert checked["challenge_id"] == issued["challenge"]["challenge_id"]
+    validate_formal_execution_capability(
+        issued["execution_capability"],
+        issued["challenge"],
+        trust_root=certified_root,
+    )
 
 
 def _formal_companion_binding(

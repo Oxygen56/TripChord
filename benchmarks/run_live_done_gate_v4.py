@@ -502,6 +502,7 @@ def _write_evidence_bundle(
     *,
     passed: bool,
     captured_at: datetime,
+    trust_root: Path | None = None,
 ) -> Path:
     if passed and bundle.get("run_status") == "completed":
         binding = bundle.get("formal_live_source_binding")
@@ -518,8 +519,9 @@ def _write_evidence_bundle(
                 receipt,
                 challenge,
                 expected_context=_formal_source_expected_context(bundle),
+                trust_root=trust_root,
             )
-            validate_formal_source_binding(binding)
+            validate_formal_source_binding(binding, trust_root=trust_root)
         except ValueError as exc:
             raise RuntimeError(
                 f"completed raw evidence has invalid formal production source binding: {exc}"
@@ -593,6 +595,7 @@ def _completed_evidence_bundle(
     captured_at: datetime,
     context: dict[str, Any],
     repo_revision: dict[str, Any] | None = None,
+    trust_root: Path | None = None,
 ) -> dict[str, Any]:
     """Materialize a completed run without dropping pre-run evidence context."""
 
@@ -614,8 +617,9 @@ def _completed_evidence_bundle(
                     context,
                     request=request,
                 ),
+                trust_root=trust_root,
             )
-            validate_formal_source_binding(binding)
+            validate_formal_source_binding(binding, trust_root=trust_root)
         except ValueError as exc:
             raise RuntimeError(
                 f"completed bundle has invalid formal production source binding: {exc}"
@@ -771,6 +775,22 @@ def _formal_source_control_token(path: Path | None = None) -> str:
     )
 
 
+def _formal_source_verification_root(
+    control_token_path: Path | None,
+) -> Path:
+    """Bind offline verification to the same externally selected control root."""
+
+    if control_token_path is None:
+        root = formal_source_trust_root()
+        path = root / "control-token"
+    else:
+        path = control_token_path
+        root = formal_source_trust_root(path.parent)
+    if path != root / "control-token":
+        raise RuntimeError("formal source control path is not canonical")
+    return root
+
+
 def _formal_source_control_path_from_runtime(status: object) -> Path:
     """Resolve only the control path certified by the provenance-bound API."""
     if not isinstance(status, dict):
@@ -812,8 +832,28 @@ async def _issue_formal_source_challenge_remote(
     capability = TypeAdapter(dict[str, object]).validate_python(
         payload.get("execution_capability")
     )
-    validate_formal_source_challenge(challenge)
-    validate_formal_execution_capability(capability, challenge)
+    trust_root = _formal_source_verification_root(control_token_path)
+    try:
+        validate_formal_source_challenge(challenge, trust_root=trust_root)
+        validate_formal_execution_capability(
+            capability,
+            challenge,
+            trust_root=trust_root,
+        )
+    except (RuntimeError, ValueError):
+        try:
+            await _abort_formal_source_challenge_remote(
+                client,
+                base,
+                challenge,
+                control_token_path,
+            )
+        except (RuntimeError, OSError, httpx.HTTPError) as abort_error:
+            raise RuntimeError(
+                "formal source challenge validation failed and its issued "
+                "authority lease could not be aborted"
+            ) from abort_error
+        raise
     return {"challenge": challenge, "execution_capability": capability}
 
 
@@ -848,11 +888,13 @@ async def _finalize_formal_source_binding_remote(
         payload.get("authority_receipt")
     )
     challenge = TypeAdapter(dict[str, object]).validate_python(payload.get("challenge"))
+    trust_root = _formal_source_verification_root(control_token_path)
     validate_formal_source_evidence(
         binding,
         receipt,
         challenge,
         expected_context=context,
+        trust_root=trust_root,
     )
     return {
         "binding": binding,
@@ -2141,6 +2183,7 @@ async def _run(
     event: LiveEventReplanRun | None = None
     stage = "load_request"
     context: dict[str, Any] = {}
+    formal_source_verification_root: Path | None = None
     base = args.api_base.rstrip("/")
     # Capture the repo revision BEFORE any work: every evidence bundle is later
     # checked against this marker, so a HEAD move or tracked-tree change during
@@ -2220,6 +2263,9 @@ async def _run(
                 args.formal_source_control_token_file = (
                     _formal_source_control_path_from_runtime(formal_source_before)
                 )
+            formal_source_verification_root = _formal_source_verification_root(
+                args.formal_source_control_token_file
+            )
             if not args.gate_run_id:
                 raise RuntimeError(
                     "formal live source requires the outer six-layer gate run_id"
@@ -2628,6 +2674,7 @@ async def _run(
         captured_at=captured_at,
         context=context,
         repo_revision=repo_revision,
+        trust_root=formal_source_verification_root,
     )
     bundle = TypeAdapter(dict[str, Any]).validate_python(
         _redact_explicit_secrets(bundle, _runner_secrets(args))
@@ -2637,6 +2684,7 @@ async def _run(
         bundle,
         passed=report.passed,
         captured_at=captured_at,
+        trust_root=formal_source_verification_root,
     )
     print(
         json.dumps(

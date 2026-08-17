@@ -46,6 +46,7 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Callable, Iterable
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -87,6 +88,7 @@ from tripchord._secret_redact import (
 from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
 from tripchord.formal_live_source import (
     formal_source_evidence_summary,
+    formal_source_trust_root,
     validate_formal_source_challenge,
     validate_formal_source_evidence,
     validate_formal_source_summary,
@@ -111,6 +113,10 @@ RESULTS_DIR = ROOT / "benchmarks" / "results"
 OUTPUT_PATH = RESULTS_DIR / "product-v1-done-gate.json"
 EVIDENCE_SCHEMA = "tripchord-product-v1-done-gate"
 RUNTIME_EVIDENCE_DIR = ROOT / ".runtime" / "done-gate-evidence"
+_FORMAL_SOURCE_VERIFICATION_ROOT: ContextVar[Path | None] = ContextVar(
+    "formal_source_verification_root",
+    default=None,
+)
 
 # Environment variables that redirect a ``git -C <root>`` invocation to a
 # different repository.  The Done-Gate evidence must name the repository it
@@ -705,6 +711,27 @@ def _validated_worker_model_runtime(payload: object) -> dict[str, Any]:
         raise RuntimeError(
             "running API top-level and worker model runtime identities disagree"
         )
+    formal_status = payload.get("formal_live_source")
+    if not isinstance(formal_status, dict):
+        raise RuntimeError("running API formal source status is missing")
+    control_path_value = formal_status.get("control_token_path")
+    if not isinstance(control_path_value, str) or not control_path_value:
+        raise RuntimeError("running API formal source control path is missing")
+    control_path = Path(control_path_value)
+    trust_root = formal_source_trust_root(control_path.parent)
+    if control_path != trust_root / "control-token":
+        raise RuntimeError("running API formal source control path is not canonical")
+    if (
+        formal_status.get("schema_version") != "tripchord-formal-live-source-v3"
+        or formal_status.get("runtime_identity") != payload.get("runtime_provenance")
+        or not isinstance(formal_status.get("anchor_version"), str)
+        or not formal_status.get("anchor_version")
+        or not isinstance(formal_status.get("authority_key_id"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", str(formal_status["authority_key_id"]))
+        is None
+    ):
+        raise RuntimeError("running API formal source identity is invalid")
+    _FORMAL_SOURCE_VERIFICATION_ROOT.set(trust_root)
     return worker
 
 
@@ -852,7 +879,12 @@ def _validate_formal_source_with_production_authority(
 
     if not isinstance(binding, dict):
         raise ValueError("formal source binding is not an object")
-    return validate_formal_source_evidence(binding, authority_receipt, challenge)
+    return validate_formal_source_evidence(
+        binding,
+        authority_receipt,
+        challenge,
+        trust_root=_FORMAL_SOURCE_VERIFICATION_ROOT.get(),
+    )
 
 
 def _bridge_env(bridge_token: str) -> dict[str, str]:
@@ -860,6 +892,9 @@ def _bridge_env(bridge_token: str) -> dict[str, str]:
     via the TRIPCHORD_BROWSER_BRIDGE_TOKEN variable — never argv, so the token
     stays out of the process list and command logs."""
     env = dict(os.environ)
+    # The runner must bind its verifier to the provenance-checked API response,
+    # never to a stale/foreign caller environment.
+    env.pop("TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT", None)
     env["TRIPCHORD_BROWSER_BRIDGE_TOKEN"] = bridge_token
     return env
 
@@ -3047,6 +3082,7 @@ def _formal_public_proofs(data: bytes, name: str) -> frozenset[str]:
                 receipt,
                 challenge,
                 expected_context=expected_context,
+                trust_root=_FORMAL_SOURCE_VERIFICATION_ROOT.get(),
             )
         except ValueError:
             # A failed/aborted runner legitimately has no final binding or
@@ -3055,7 +3091,10 @@ def _formal_public_proofs(data: bytes, name: str) -> frozenset[str]:
             # and terminal job id as proofs, and only after every signed context
             # field exactly matches the outer failure artifact.
             try:
-                checked_challenge = validate_formal_source_challenge(challenge)
+                checked_challenge = validate_formal_source_challenge(
+                    challenge,
+                    trust_root=_FORMAL_SOURCE_VERIFICATION_ROOT.get(),
+                )
             except ValueError:
                 return frozenset()
             expected_challenge = {
@@ -3091,6 +3130,7 @@ def _formal_public_proofs(data: bytes, name: str) -> frozenset[str]:
         checked = validate_formal_source_summary(
             summary,
             expected_context=expected_context,
+            trust_root=_FORMAL_SOURCE_VERIFICATION_ROOT.get(),
         )
     except ValueError:
         return frozenset()
@@ -6712,6 +6752,7 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
             formal_source_receipt,
             formal_source_challenge,
             expected_context=raw_expected_context,
+            trust_root=_FORMAL_SOURCE_VERIFICATION_ROOT.get(),
         )
     except ValueError as exc:
         raise GateStateChangedError(
@@ -6724,6 +6765,7 @@ def _compact_live_e2e(staging_dir: Path) -> dict[str, Any] | None:
             formal_source_receipt,
             formal_source_challenge,
             expected_context=raw_expected_context,
+            trust_root=_FORMAL_SOURCE_VERIFICATION_ROOT.get(),
         )
     except ValueError as exc:
         raise GateStateChangedError(
@@ -7012,6 +7054,7 @@ def _generate_compact_evidence(staging_dir: Path) -> None:
                 validate_formal_source_summary(
                     summary,
                     expected_context=expected_context,
+                    trust_root=_FORMAL_SOURCE_VERIFICATION_ROOT.get(),
                 )
             except ValueError as exc:
                 raise GateStateChangedError(
@@ -8964,6 +9007,7 @@ def _verify_layer6_compact_contract(
         validate_formal_source_summary(
             summary_value,
             expected_context=expected_formal_context,
+            trust_root=_FORMAL_SOURCE_VERIFICATION_ROOT.get(),
         )
     except ValueError as exc:
         raise GateStateChangedError(

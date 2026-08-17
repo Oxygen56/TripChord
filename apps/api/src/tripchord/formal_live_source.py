@@ -673,12 +673,12 @@ def _load_verification_anchor(
     return matches[0]
 
 
-def _anchor_version() -> str:
-    return str(_load_verification_anchor()["anchor_version"])
+def _anchor_version(root: Path | None = None) -> str:
+    return str(_load_verification_anchor(root)["anchor_version"])
 
 
-def _authority_key_id() -> str:
-    return str(_load_verification_anchor()["authority_key_id"])
+def _authority_key_id(root: Path | None = None) -> str:
+    return str(_load_verification_anchor(root)["authority_key_id"])
 
 
 def _sign(private_key: Ed25519PrivateKey, value: object) -> str:
@@ -690,6 +690,7 @@ def _verify_signature(
     signature: object,
     label: str,
     *,
+    trust_root: Path | None = None,
     anchor_version: object | None = None,
     authority_key_id: object | None = None,
 ) -> None:
@@ -701,6 +702,7 @@ def _verify_signature(
             anchor_version = value.get("anchor_version", anchor_version)
             authority_key_id = value.get("authority_key_id", authority_key_id)
         public_key = _load_verification_anchor(
+            trust_root,
             anchor_version=anchor_version,
             authority_key_id=authority_key_id,
         )["public_key"]
@@ -749,6 +751,7 @@ def _validate_execution_capability(
     capability: object,
     *,
     challenge: Mapping[str, object],
+    trust_root: Path | None = None,
 ) -> dict[str, object]:
     fields = {
         "schema_version",
@@ -799,6 +802,7 @@ def _validate_execution_capability(
         _execution_capability_proof_payload(capability),
         capability["signature"],
         "formal execution capability",
+        trust_root=trust_root,
     )
     return dict(capability)
 
@@ -1537,7 +1541,11 @@ def _job_member_summary(
     return summary
 
 
-def _validate_challenge(challenge: object) -> dict[str, object]:
+def _validate_challenge(
+    challenge: object,
+    *,
+    trust_root: Path | None = None,
+) -> dict[str, object]:
     fields = {
         "schema_version",
         "anchor_version",
@@ -1561,6 +1569,7 @@ def _validate_challenge(challenge: object) -> dict[str, object]:
         raise ValueError("formal source challenge schema is invalid")
     try:
         _load_verification_anchor(
+            trust_root,
             anchor_version=challenge["anchor_version"],
             authority_key_id=challenge["authority_key_id"],
         )
@@ -1603,6 +1612,7 @@ def _validate_challenge(challenge: object) -> dict[str, object]:
         _challenge_proof_payload(challenge),
         challenge["signature"],
         "formal source challenge",
+        trust_root=trust_root,
     )
     return dict(challenge)
 
@@ -1623,6 +1633,7 @@ def _validate_event(
     challenge: Mapping[str, object],
     install_id: str,
     composition_sha256: str,
+    trust_root: Path | None = None,
 ) -> dict[str, object]:
     fields = {
         "sequence",
@@ -1707,6 +1718,7 @@ def _validate_event(
         },
         event["signature"],
         "formal source event",
+        trust_root=trust_root,
         anchor_version=challenge["anchor_version"],
         authority_key_id=challenge["authority_key_id"],
     )
@@ -1714,7 +1726,10 @@ def _validate_event(
 
 
 def _validate_snapshot(
-    snapshot: object, challenge: Mapping[str, object]
+    snapshot: object,
+    challenge: Mapping[str, object],
+    *,
+    trust_root: Path | None = None,
 ) -> dict[str, object]:
     fields = {
         "schema_version",
@@ -1787,6 +1802,7 @@ def _validate_snapshot(
             challenge=challenge,
             install_id=install_id,
             composition_sha256=composition_sha256,
+            trust_root=trust_root,
         )
         previous = str(item["receipt_sha256"])
         checked.append(item)
@@ -1798,7 +1814,12 @@ def _validate_snapshot(
     )
     if snapshot["last_heartbeat"] != expected_heartbeat:
         raise ValueError("formal source snapshot heartbeat is not chain-bound")
-    _verify_signature(_signed_payload(snapshot), snapshot["signature"], "formal source snapshot")
+    _verify_signature(
+        _signed_payload(snapshot),
+        snapshot["signature"],
+        "formal source snapshot",
+        trust_root=trust_root,
+    )
     return dict(snapshot)
 
 
@@ -2713,6 +2734,7 @@ def validate_formal_source_evidence(
     challenge: object | None = None,
     *,
     expected_context: Mapping[str, object] | None = None,
+    trust_root: Path | None = None,
 ) -> dict[str, object]:
     if not isinstance(binding, dict):
         raise ValueError("formal source binding is missing or not an exact object")
@@ -2720,7 +2742,7 @@ def validate_formal_source_evidence(
         authority_receipt = binding.get("authority_receipt")
     if challenge is None:
         challenge = binding.get("challenge")
-    checked_challenge = _validate_challenge(challenge)
+    checked_challenge = _validate_challenge(challenge, trust_root=trust_root)
     graph = _validate_job_graph(checked_challenge["job_graph"])
     fields = {
         "schema_version",
@@ -2796,6 +2818,7 @@ def validate_formal_source_evidence(
             challenge=checked_challenge,
             install_id=install_id,
             composition_sha256=composition_sha256,
+            trust_root=trust_root,
         )
         previous = str(item["receipt_sha256"])
         checked_events.append(item)
@@ -2867,8 +2890,8 @@ def validate_formal_source_evidence(
         raise ValueError("formal source authority receipt differs from binding")
     expected_receipt = {
         "schema_version": _RECEIPT_SCHEMA_VERSION,
-        "anchor_version": _anchor_version(),
-        "authority_key_id": _authority_key_id(),
+        "anchor_version": _anchor_version(trust_root),
+        "authority_key_id": _authority_key_id(trust_root),
         "challenge_id": checked_challenge["challenge_id"],
         "nonce_digest": checked_challenge["nonce_digest"],
         "binding_digest": binding["binding_digest"],
@@ -3029,6 +3052,7 @@ def validate_formal_source_evidence(
         _receipt_proof_payload(authority_receipt),
         authority_receipt["signature"],
         "formal source authority receipt",
+        trust_root=trust_root,
     )
     if expected_context is not None:
         missing = _CHALLENGE_CONTEXT_FIELDS - set(expected_context)
@@ -3069,6 +3093,7 @@ def formal_source_evidence_summary(
     challenge: object,
     *,
     expected_context: Mapping[str, object],
+    trust_root: Path | None = None,
 ) -> dict[str, object]:
     """Validate raw evidence, then emit the only compact/final-safe projection."""
 
@@ -3077,8 +3102,9 @@ def formal_source_evidence_summary(
         authority_receipt,
         challenge,
         expected_context=expected_context,
+        trust_root=trust_root,
     )
-    checked_challenge = _validate_challenge(challenge)
+    checked_challenge = _validate_challenge(challenge, trust_root=trust_root)
     if not isinstance(authority_receipt, dict):
         raise ValueError("formal source authority receipt is invalid")
     runtime = _runtime_identity(checked_challenge["runtime_identity"])
@@ -3107,7 +3133,11 @@ def formal_source_evidence_summary(
         "challenge_signature": checked_challenge["signature"],
         "authority_receipt_signature": authority_receipt["signature"],
     }
-    validate_formal_source_summary(summary, expected_context=expected_context)
+    validate_formal_source_summary(
+        summary,
+        expected_context=expected_context,
+        trust_root=trust_root,
+    )
     return summary
 
 
@@ -3115,6 +3145,7 @@ def validate_formal_source_summary(
     summary: object,
     *,
     expected_context: Mapping[str, object],
+    trust_root: Path | None = None,
 ) -> dict[str, object]:
     fields = {
         "schema_version",
@@ -3157,8 +3188,8 @@ def validate_formal_source_summary(
             "formal source summary expected runtime digest",
         )
     expected_projection = {
-        "anchor_version": _anchor_version(),
-        "authority_key_id": _authority_key_id(),
+        "anchor_version": _anchor_version(trust_root),
+        "authority_key_id": _authority_key_id(trust_root),
         "run_id": expected_context["run_id"],
         "tested_commit_sha": expected_context["tested_commit_sha"],
         "runtime_identity_sha256": runtime_digest,
@@ -3288,6 +3319,7 @@ def validate_formal_source_summary(
         challenge_proof,
         summary["challenge_signature"],
         "formal source summary challenge",
+        trust_root=trust_root,
     )
     receipt_proof = {
         "purpose": "tripchord-formal-live-source-authority-receipt-proof-v1",
@@ -3313,6 +3345,7 @@ def validate_formal_source_summary(
         receipt_proof,
         summary["authority_receipt_signature"],
         "formal source summary authority receipt",
+        trust_root=trust_root,
     )
     verified = _require_aware_time(summary["verified_at"], "formal summary verified_at")
     issued = _require_aware_time(summary["issued_at"], "formal summary issued_at")
@@ -3322,33 +3355,52 @@ def validate_formal_source_summary(
     return dict(summary)
 
 
-def validate_formal_source_binding(binding: object) -> dict[str, object]:
+def validate_formal_source_binding(
+    binding: object,
+    *,
+    trust_root: Path | None = None,
+) -> dict[str, object]:
     """Offline validation using only the repository-fixed public anchor."""
-    return validate_formal_source_evidence(binding)
+    return validate_formal_source_evidence(binding, trust_root=trust_root)
 
 
-def validate_formal_source_challenge(challenge: object) -> dict[str, object]:
+def validate_formal_source_challenge(
+    challenge: object,
+    *,
+    trust_root: Path | None = None,
+) -> dict[str, object]:
     """Verify a challenge offline against the fixed public anchor."""
-    return _validate_challenge(challenge)
+    return _validate_challenge(challenge, trust_root=trust_root)
 
 
 def validate_formal_execution_capability(
     capability: object,
     challenge: object,
+    *,
+    trust_root: Path | None = None,
 ) -> dict[str, object]:
     """Verify one job-bound capability offline against its signed challenge."""
 
     return _validate_execution_capability(
         capability,
-        challenge=_validate_challenge(challenge),
+        challenge=_validate_challenge(challenge, trust_root=trust_root),
+        trust_root=trust_root,
     )
 
 
-def validate_formal_source_snapshot(snapshot: object) -> dict[str, object]:
+def validate_formal_source_snapshot(
+    snapshot: object,
+    *,
+    trust_root: Path | None = None,
+) -> dict[str, object]:
     if not isinstance(snapshot, dict):
         raise ValueError("formal source snapshot is not an object")
     challenge = snapshot.get("challenge")
-    return _validate_snapshot(snapshot, _validate_challenge(challenge))
+    return _validate_snapshot(
+        snapshot,
+        _validate_challenge(challenge, trust_root=trust_root),
+        trust_root=trust_root,
+    )
 
 
 class FormalLiveSourceAuthority:

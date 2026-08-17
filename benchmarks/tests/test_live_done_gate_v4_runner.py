@@ -207,6 +207,68 @@ def test_v4_formal_control_path_must_be_canonical_and_external(
         )
 
 
+def test_v4_invalid_issued_challenge_is_aborted_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local verifier failure cannot strand an authority lease."""
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/challenge"):
+            return httpx.Response(
+                200,
+                json={
+                    "challenge": {
+                        "challenge_id": "issued-challenge-id",
+                        "run_id": "issued-run-id",
+                    },
+                    "execution_capability": {"capability_id": "issued-capability"},
+                },
+            )
+        if request.url.path.endswith("/abort"):
+            body = json.loads(request.content)
+            assert body["challenge_id"] == "issued-challenge-id"
+            assert body["run_id"] == "issued-run-id"
+            return httpx.Response(200, json={"aborted": True})
+        raise AssertionError(f"unexpected request {request.url}")
+
+    monkeypatch.setattr(
+        run_live_done_gate_v4,
+        "_formal_source_control_token",
+        lambda _path=None: "control-token-" + "c" * 64,
+    )
+    monkeypatch.setattr(
+        run_live_done_gate_v4,
+        "validate_formal_source_challenge",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("foreign verification anchor")
+        ),
+    )
+    control_path = tmp_path / "formal-source" / "control-token"
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            with pytest.raises(ValueError, match="foreign verification anchor"):
+                await run_live_done_gate_v4._issue_formal_source_challenge_remote(
+                    client,
+                    "http://tripchord.test",
+                    {"run_id": "issued-run-id"},
+                    "challenge-idempotency-key",
+                    control_path,
+                )
+
+    asyncio.run(exercise())
+    assert calls == [
+        "/api/v1/internal/formal-live-source/challenge",
+        "/api/v1/internal/formal-live-source/abort",
+    ]
+
+
 def _api_payload_sha256() -> str:
     return run_live_done_gate_v4._canonical_sha256(run_live_done_gate_v4._api_payload(_request()))
 
