@@ -11,7 +11,7 @@
 - **基线 commit**：`0fa8f78`（chore: baseline productization contract and roadmap）
 - **工作目录**：`/Users/oxygen/Documents/个人项目/tripchord`
 - **最后完成的最小任务**：C-146 五项 RETURN P0——正式跨进程 ready 链与父 API 可观察回传；clean/nonzero leader 共享“整组退出确认为 True 才准终态”合同；冷启持久化每个 worker identity 的认证/死亡确认事实；持续 kill/confirm 异常按饱和+固定窗口上界重试并消费 task exception；idcap 在 UUID/runtime/worker command/驱逐前原子拒绝。
-- **最新六层门**：交付前权威报告仍是旧 HEAD 的 `passed=false`。本轮所有代码、测试、账本和阶段评审同一提交后，才在 clean HEAD 受控重启 API 并从头运行；精确 run_id/tested SHA/各层结果只写 C-146 唯一交付回执，避免尾部文档提交移动 HEAD。
+- **最新六层门**：回归候选 `2043384` 已生成 `run_id=23fbef3a3a27`：层 1/2/3 PASS、层 4 SKIP（模型费用未授权）、层 5/6 FAIL（缺少新鲜授权 Companion/全平台条件），`passed=false`、`evidence_commit=null`、`gate_ref=null`、工作树干净。账本与阶段评审同步提交会移动最终 HEAD，故提交后必须再次受控重启 API 并从头运行；最终精确 SHA/run_id 只写 C-146 唯一交付回执，避免尾部提交造成漂移。
 - **审查/终验状态**：C-125 本轮 RETURN 已由唯一实现者修复，C-125/C-124 仍保持 backlog。C-146 交付只转 `in_review`，不自批、不启动复审/终验/Companion；由总管另行启动不同 Agent 复审。
 
 ## 版本状态
@@ -381,6 +381,7 @@
 | 持续清理异常 | kill/confirm exception、False 与 qcap-full 均进入饱和退避 + 固定窗口调用上限；wrapper done callback 消费异常，cancel race 在 finally 释放 in-flight/reservation，无热循环、无未处理 task exception |
 | idcap 构造前硬门 | 新 key 在 UUID、runtime、worker command 构造及任何 eviction 前先检查满 identity 集合；拒绝时构造器零调用，内存 identity 映射与 durable bytes 逐字节不变 |
 | 提交前回归 | 新增边界反例、完整 worker HTTP 测试与 API 全量测试原生退出码均为 0；精确计数及 clean HEAD 的 scripts clean-env、Ruff、diff-check 结果写入 C-146 唯一交付回执 |
+| 回归断点收口（代码/SBOM 候选 `2043384`） | 合并 `scripts/tests + apps/api/tests + benchmarks/tests` 1790/1790 PASS；独立 scripts 626/626 PASS；clean-env 626/626 PASS；两种 interrupt-window 2/2 PASS；28.5MB 扫描、桥接状态污染、gitignored raw 与两项并发 Git 组合 5/5 PASS；离线锁定同步、全仓 Ruff、SBOM 漂移、diff-check、零残留均 PASS。文档同步提交后在最终 HEAD 原样重跑，不用候选结果替代最终证据 |
 | 最终运行与机器门 | 本表不预写最终 SHA/run_id。同一 clean HEAD 上受控重启 API、provenance 三哈希校验、从头运行六层门；精确结果只写交付回执，`passed=false` 仍保留空 evidence/ref 且不触发 C-125/C-124 |
 
 ## 当前可对外声明

@@ -1,6 +1,6 @@
-# v0.4 → v1.0 阶段评审：本轮实施延续进度（C-5）
+# v0.4 → v1.0 阶段评审：本轮实施延续进度（C-146）
 
-> 结论：**有条件通过（推进中）** —— v0.4 收尾、v0.2 偏差（provider selection DB）、v0.5/v0.6/v0.7 确定性核心、v1.0 六层 Done-Gate 机器可执行脚本已落地并有测试；v0.8/v0.9 与真实平台 canary 仍未完成，按合同第九节如实披露。
+> 结论：**有条件通过（推进中）** —— v0.2–v0.9 的确定性核心与生产接线已落地；v1.0 六层 Done-Gate 的本地工程层可复现。模型费用未确认、真实平台 canary 与全平台 E2E 尚未满足，仍按合同如实保持 `passed=false`。
 
 ## v0.4 收尾：方案 UI 覆盖解释 — 通过
 
@@ -54,6 +54,13 @@
 - **层 6 接入真实 E2E 执行器**：`layer6_full_e2e()` 改为运行 `benchmarks/run_live_done_gate_v4.py`（live job 提交/等待/取消 + 合成 sold_out 事件重规划 + `evaluate_live_v4_done_gate`），删除过时的「gated behind layer 5」占位文案；外部门（bridge token + `TRIPCHORD_ACK_MODEL_COST=1` + 新鲜 Companion）未满足时如实 FAIL（pending user authorization）。
 - **本机复跑**（`TRIPCHORD_ACK_MODEL_COST=1`）：层 1/2/3/4 PASS；层 5 FAIL（5 个浏览器 scope 无 Companion 心跳，`icom:transfer` 真实只读 canary PASS）；层 6 FAIL（Companion preflight 失败，未提交实时搜索）；`passed=false` 如实。
 - **证据**：`benchmarks/results/product-v1-done-gate.json`、`benchmarks/results/live-canary-certified.json`、`benchmarks/results/live-done-gate-v4.json`（`failed_before_done_gate` / `companion_preflight`）。
+
+### C-146 RETURN 5-P0：正式生产链与回归断点收口（第四十七轮）
+
+- **正式链边界保持**：真实 HTTP 持久任务经独立 worker 使用父 API 持有的 production Companion/Browser、iCom 与实际 model runtime；progress、checkpoint、source 终态、barrier、model trace、cache snapshot 与 signed compact 逐级绑定。C-125 已确认的业务来源、证据绑定、进程/回执一致性与去替身设计本轮不重开、不降级。
+- **四项回归闭环**：两个 registry-dispatch failpoint 仅在 Companion ack 200 已完成可观察回写后退出，恢复仍 fail-closed；28.5MB 正式秘密扫描通过线性候选预筛稳定守住原 15 秒预算；gate 测试逐项清除 Git override 并隔离 bridge snapshot；wheel 使用锁文件固定的 Hatchling 后端离线真实构建，随后从隔离目录真实 import 并访问 health。
+- **候选验证**：代码/SBOM 候选 `2043384` 上，合并 1790/1790、独立 scripts 626/626、clean-env 626/626、interrupt-window 2/2、扫描与污染/并发组合 5/5、全仓 Ruff、SBOM drift、diff-check 与零残留均通过。三份评审文档同步提交会移动最终 HEAD，故这些候选结果不替代提交后的最终 HEAD 复跑。
+- **机器门边界**：文档同步前 run `23fbef3a3a27` 为 L1–3 PASS、L4 SKIP、L5/L6 FAIL，`passed=false`、`evidence_commit=null`、`gate_ref=null`。最终提交后必须重新绑定 API 三哈希并从头运行；未获模型费用确认且未启动 Companion，不声明 Done-Gate 通过。
 
 ## 当前仍不能声称
 
