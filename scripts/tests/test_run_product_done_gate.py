@@ -16456,6 +16456,13 @@ def test_formal_authority_second_cold_start_detects_old_process_still_bound(
                         "127.0.0.1",
                         "--port",
                         str(port),
+                        # This second process is the transport collision probe,
+                        # not another durable-state recovery exercise (the
+                        # preceding real restart test owns that contract).  Skip
+                        # lifespan so shared startup work cannot consume the
+                        # entire bound before uvicorn checks socket ownership.
+                        "--lifespan",
+                        "off",
                         "--log-level",
                         "warning",
                     ],
@@ -16466,10 +16473,9 @@ def test_formal_authority_second_cold_start_detects_old_process_still_bound(
                 )
             processes.append(second_process)
             second_process.wait(timeout=10)
-            assert second_process.poll() is not None, (
-                "second process unexpectedly bound the still-held port:\n"
-                + second_log.read_text(encoding="utf-8", errors="replace")
-            )
+            second_output = second_log.read_text(encoding="utf-8", errors="replace")
+            assert second_process.returncode not in {None, 0}, second_output
+            assert "address already in use" in second_output.casefold(), second_output
 
             served = (
                 await client.get(f"{base}/api/v1/agents/runtime")
