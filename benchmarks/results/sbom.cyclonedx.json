@@ -1731,6 +1731,19 @@
       "version": "0.16.0"
     },
     {
+      "bom-ref": "pypi:hatchling@1.32.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "0bdbde4a52b06c37e3eca395f85a762bf0ef06fe374fd8ae429dc6be10230f5f"
+        }
+      ],
+      "name": "hatchling",
+      "purl": "pkg:pypi/hatchling@1.32.0",
+      "type": "library",
+      "version": "1.32.0"
+    },
+    {
       "bom-ref": "pypi:hf-xet@1.5.2",
       "hashes": [
         {
@@ -2667,6 +2680,19 @@
       "version": "0.22.2"
     },
     {
+      "bom-ref": "pypi:tomlkit@0.15.1",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "e25bbf38843005246210a12982776f27f99cb9be67160e14434d0c0d21ee1e97"
+        }
+      ],
+      "name": "tomlkit",
+      "purl": "pkg:pypi/tomlkit@0.15.1",
+      "type": "library",
+      "version": "0.15.1"
+    },
+    {
       "bom-ref": "pypi:torch@2.13.0",
       "hashes": [
         {
@@ -2730,6 +2756,19 @@
       "purl": "pkg:pypi/trl@1.9.1",
       "type": "library",
       "version": "1.9.1"
+    },
+    {
+      "bom-ref": "pypi:trove-classifiers@2026.6.1.19",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c5132b4b61a829d11cfbd2d72e97f20a45ed6edb95e45c5efdeb5e00836b2745"
+        }
+      ],
+      "name": "trove-classifiers",
+      "purl": "pkg:pypi/trove-classifiers@2026.6.1.19",
+      "type": "library",
+      "version": "2026.6.1.19"
     },
     {
       "bom-ref": "pypi:typer@0.27.0",
@@ -2885,16 +2924,16 @@
     "properties": [
       {
         "name": "tripchord:commit_sha",
-        "value": "f8f0b8611011788182c72ac84f8e1e88c04e9933"
+        "value": "6c5199b765ce752a8365909370af5b26fa4fbe8e"
       },
       {
         "name": "tripchord:committed_at",
-        "value": "2026-08-15T02:53:42+08:00"
+        "value": "2026-08-18T10:09:45+08:00"
       }
     ],
-    "timestamp": "2026-08-14T19:12:00Z"
+    "timestamp": "2026-08-18T03:24:22Z"
   },
-  "serialNumber": "urn:uuid:059336a2-129d-4cd3-92ac-6e85f6f40d30",
+  "serialNumber": "urn:uuid:c7e48ea3-ead8-4287-b0fd-928934a32538",
   "specVersion": "1.5",
   "version": 1
 }

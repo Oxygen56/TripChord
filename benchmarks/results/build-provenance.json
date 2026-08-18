@@ -1,18 +1,18 @@
 {
-  "commit_sha": "f8f0b8611011788182c72ac84f8e1e88c04e9933",
-  "committed_at": "2026-08-15T02:53:42+08:00",
+  "commit_sha": "6c5199b765ce752a8365909370af5b26fa4fbe8e",
+  "committed_at": "2026-08-18T10:09:45+08:00",
   "component_counts": {
     "npm": 103,
-    "pypi": 118,
-    "total": 221
+    "pypi": 121,
+    "total": 224
   },
-  "generated_at": "2026-08-14T19:12:00Z",
+  "generated_at": "2026-08-18T03:24:22Z",
   "sbom_file": "sbom.cyclonedx.json",
-  "sbom_sha256": "e46d200d5163c50fbc85caa33bf67ee2e28c18014b482ee98e9f24dcd5570a92",
+  "sbom_sha256": "9ea3987a392c8a94687469feed5cbd1e353958cc8ea7c39423ee21a851731a2f",
   "schema": "tripchord-build-provenance-v1",
   "source_digests": {
     "package-lock.json": "f5ece09cb2e9a8436ccf5722c3b8aadc4d5e724a677bbb071e624dcb1bb95eb0",
-    "uv.lock": "5d8122fec1a285350b06fb94c1d9d41dac6e56056ee8f185dba3b618a82fe06a"
+    "uv.lock": "26a5b0eb26310ed412b592c6bbebda5261ad92d00af742683cecd2f2fcac5612"
   },
   "sources": [
     "uv.lock",
