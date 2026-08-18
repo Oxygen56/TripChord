@@ -35,6 +35,30 @@ _EXTRA_SECRET_ENV = frozenset(
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gate_test_process_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep per-test Git overrides and bridge snapshots process-local.
+
+    The gate tests intentionally create alternate indexes and mutate the two
+    bridge-state snapshots.  Neither is allowed to leak into a sibling test:
+    full-suite scheduling and an inherited developer-shell ``GIT_*`` override
+    must behave exactly like an isolated invocation.
+    """
+
+    for variable in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setattr(gate, "_BRIDGE_STATE_SNAPSHOT", None)
+    monkeypatch.setattr(gate, "_BRIDGE_STATE_SNAPSHOT_AFTER", None)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _clear_secret_env() -> None:
     """Snapshot and clear every secret-bearing env var for the whole session.

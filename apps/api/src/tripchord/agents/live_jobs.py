@@ -2639,11 +2639,18 @@ class LivePlanningJobRegistry:
                 if activation is not None:
                     runtime.activation_operation = activation
                 raise
-            if (
-                os.environ.get("TRIPCHORD_TEST_FORMAL_ACTIVATION_FAILPOINT")
-                == "exit_after_registry_dispatch_persist"
-            ):
-                os._exit(86)
+            if os.environ.get("TRIPCHORD_TEST_FORMAL_ACTIVATION_FAILPOINT") in {
+                "exit_after_registry_dispatch_persist",
+                "exit_after_registry_dispatch",
+            }:
+                # The real-HTTP failpoint exits only after the Companion ack
+                # response has been observably written.  Leave the durable
+                # dispatch without an executor during that response flush: the
+                # old immediate ``os._exit`` never yielded the event loop after
+                # task creation either, and letting the task advance for the
+                # flush interval would change the interrupted durable facts.
+                self._changed.notify_all()
+                return runtime.snapshot
             runtime.task = asyncio.create_task(
                 self._run(runtime, runtime.operation),
                 name=f"tripchord:{job_id}",

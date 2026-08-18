@@ -2716,6 +2716,40 @@ def _is_exact_public_evidence_url(
 # is consumed, an otherwise exact percent-encoded ``[REDACTED]`` query value is
 # misread as having a trailing character when the URL sits in nested JSON.
 _TRACKING_URL_PATTERN = re.compile(r"(?i)https?://[^\s\\\"'<>)\[\]{}]+")
+_TRACKING_URL_TERMINATORS = frozenset("\\\"'<>)[]{}")
+
+
+def _iter_tracking_urls_linear(text: str) -> Iterable[str]:
+    """Yield URL spans with C-level literal search over large formal raws.
+
+    ``re``'s case-insensitive start matcher tested every byte of a 28.5MB safe
+    padding value.  Literal ``str.find`` locates the only two legal scheme
+    prefixes in linear time; the short Python loop walks only actual URL bytes.
+    If Unicode case-folding changes offsets, fall back to the original regex so
+    detection remains exact rather than guessing a slice.
+    """
+
+    folded = text.casefold()
+    if len(folded) != len(text):
+        yield from (match.group(0) for match in _TRACKING_URL_PATTERN.finditer(text))
+        return
+    cursor = 0
+    while cursor < len(text):
+        http = folded.find("http://", cursor)
+        https = folded.find("https://", cursor)
+        starts = tuple(position for position in (http, https) if position >= 0)
+        if not starts:
+            return
+        start = min(starts)
+        end = start
+        while (
+            end < len(text)
+            and not text[end].isspace()
+            and text[end] not in _TRACKING_URL_TERMINATORS
+        ):
+            end += 1
+        yield text[start:end]
+        cursor = max(end, start + 1)
 
 
 def _blank_nonleaking_tracking_urls(text: str) -> str:
@@ -2966,16 +3000,15 @@ _FORMAL_OR_HEX_VALUE_RE = re.compile(
     r"([A-Za-z0-9+/]{86}==)(\")|[0-9a-fA-F]{32,128}"
 )
 _LINEAR_BARE_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:"
-    r"[a-z]+[A-Z][A-Za-z0-9_]*[0-9]+[A-Za-z0-9_]*"
-    r"|(?i:refreshTokenCount|bookingReference|hotelAmenity|tokenization|"
-    r"secretariat|flightOption|provider|planner|day)(?:V[0-9]+|[0-9]+)"
-    r")(?![A-Za-z0-9_])"
+    r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*[0-9][A-Za-z0-9_]*"
+    r"(?![A-Za-z0-9_])"
 )
-_FORMAL_RAW_SENSITIVE_CANDIDATE_RE = re.compile(
-    r"(?P<header>(?i:authorization|proxy-authorization|cookie|set-cookie))"
-    r"|(?P<account>(?i:account|user|member|passenger|contact|order))"
-    r"|(?P<phone>(?<![A-Za-z0-9])1[3-9]\d{9}(?![A-Za-z0-9]))"
+_LINEAR_BARE_CAMEL_TOKEN_RE = re.compile(
+    r"[a-z]+[A-Z][A-Za-z0-9_]*[0-9]+[A-Za-z0-9_]*"
+)
+_LINEAR_BARE_REGISTERED_TOKEN_RE = re.compile(
+    r"(?i:refreshTokenCount|bookingReference|hotelAmenity|tokenization|"
+    r"secretariat|flightOption|provider|planner|day)(?:V[0-9]+|[0-9]+)"
 )
 
 
@@ -2984,25 +3017,71 @@ def _linear_bare_credential_match(text: str) -> re.Match[str] | None:
 
     for match in _LINEAR_BARE_TOKEN_RE.finditer(text):
         token = match.group(0)
+        if (
+            _LINEAR_BARE_CAMEL_TOKEN_RE.fullmatch(token) is None
+            and _LINEAR_BARE_REGISTERED_TOKEN_RE.fullmatch(token) is None
+        ):
+            continue
         if _is_bare_credential_token(token):
             return match
     return None
 
 
 def _formal_whole_text_sensitive_match(text: str) -> str | None:
-    """One token-aware pass for the authenticated artifact's raw backstop."""
+    """Linear authenticated-artifact backstop with literal prefilters.
 
-    for candidate in _FORMAL_RAW_SENSITIVE_CANDIDATE_RE.finditer(text):
-        if candidate.lastgroup == "phone":
-            return "phone number"
-        start = max(0, candidate.start() - 128)
-        end = min(len(text), candidate.end() + 1024)
-        window = text[start:end]
-        if candidate.lastgroup == "header":
-            if _AUTH_COOKIE_LEAK_SCAN.search(window):
-                return "Authorization/Cookie"
-        elif _ACCOUNT_ID_PATTERN.search(window):
+    The prior alternation regex evaluated three complex branches at every byte;
+    a legitimate 28.5MB padding span therefore spent most of the entire wall
+    budget proving that no candidate existed.  ``casefold`` plus C-level
+    literal membership is still linear and first proves whether each expensive
+    typed matcher can possibly match.  A present candidate receives the same
+    full matcher as before, so acceptance is unchanged and no threshold moves.
+    """
+
+    folded = text.casefold()
+
+    def candidate_windows(candidates: tuple[str, ...]) -> Iterable[str]:
+        for candidate in candidates:
+            cursor = 0
+            window_start: int | None = None
+            window_end = 0
+            while True:
+                position = folded.find(candidate, cursor)
+                if position < 0:
+                    break
+                start = max(0, position - 128)
+                end = min(len(folded), position + len(candidate) + 1024)
+                if window_start is None:
+                    window_start, window_end = start, end
+                elif start <= window_end:
+                    window_end = max(window_end, end)
+                else:
+                    yield folded[window_start:window_end]
+                    window_start, window_end = start, end
+                cursor = position + len(candidate)
+            if window_start is not None:
+                yield folded[window_start:window_end]
+
+    for window in candidate_windows(
+        ("authorization", "proxy-authorization", "cookie", "set-cookie")
+    ):
+        if _AUTH_COOKIE_LEAK_SCAN.search(window):
+            return "Authorization/Cookie"
+    for window in candidate_windows(
+        ("account", "user", "member", "passenger", "contact", "order")
+    ):
+        if _ACCOUNT_ID_PATTERN.search(window):
             return "account identifier"
+    cursor = 0
+    while True:
+        position = folded.find("1", cursor)
+        if position < 0:
+            break
+        start = max(0, position - 1)
+        end = min(len(folded), position + 13)
+        if _PHONE_PATTERN.search(folded[start:end]):
+            return "phone number"
+        cursor = position + 1
     return None
 
 
@@ -3494,8 +3573,8 @@ def _secret_scan_bytes_impl(
                         f"secret leak: {kind} in {label} file {name}"
                     )
     check_resource_budget("whole-text credential backstop")
-    for match in _TRACKING_URL_PATTERN.finditer(masked_text):
-        if _is_tracking_url_leak(match.group(0)):
+    for tracking_url in _iter_tracking_urls_linear(masked_text):
+        if _is_tracking_url_leak(tracking_url):
             raise GateStateChangedError(
                 f"secret leak: tracking URL in {label} file {name}"
             )
@@ -3503,8 +3582,8 @@ def _secret_scan_bytes_impl(
     # uppercase ``HTTPS://`` / full-width / Cf-obfuscated URL is the same leak
     # once NFKC + casefold + Cf-drop runs, decided by ``_is_tracking_url_leak``.
     if norm_masked is not masked_text:
-        for match in _TRACKING_URL_PATTERN.finditer(norm_masked):
-            if _is_tracking_url_leak(match.group(0)):
+        for tracking_url in _iter_tracking_urls_linear(norm_masked):
+            if _is_tracking_url_leak(tracking_url):
                 raise GateStateChangedError(
                     f"secret leak: tracking URL in {label} file {name}"
                 )

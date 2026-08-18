@@ -25,16 +25,32 @@ def _assert_subprocess_succeeded(
 def test_built_wheel_imports_and_serves_health_from_isolated_cwd(tmp_path: Path) -> None:
     wheel_directory = tmp_path / "wheel"
     wheel_directory.mkdir()
+    # Build with the exact backend installed from the repository lock instead
+    # of asking a PEP 517 isolation environment to resolve hatchling from PyPI.
+    # Dependency provisioning is an explicit preflight; the wheel build itself
+    # is deterministic and performs no network access.
+    backend_probe = """
+import json
+import sys
+from importlib.metadata import version
+from hatchling.build import build_wheel
+
+wheel = build_wheel(sys.argv[1])
+print(json.dumps({"backend_version": version("hatchling"), "wheel": wheel}))
+"""
     build = subprocess.run(
-        ["uv", "build", "--wheel", "--out-dir", str(wheel_directory)],
+        [sys.executable, "-c", backend_probe, str(wheel_directory)],
         cwd=ROOT,
         check=False,
         capture_output=True,
         text=True,
     )
     _assert_subprocess_succeeded(build, operation="wheel build")
+    build_receipt = json.loads(build.stdout.strip().splitlines()[-1])
+    assert build_receipt["backend_version"] == "1.32.0"
     wheels = tuple(wheel_directory.glob("tripchord-*.whl"))
     assert len(wheels) == 1
+    assert wheels[0].name == build_receipt["wheel"]
 
     installed = tmp_path / "installed"
     with zipfile.ZipFile(wheels[0]) as archive:

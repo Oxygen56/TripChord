@@ -4798,7 +4798,20 @@ def test_verify_gate_ref_rejects_gitignored_raw_leaked_into_e(
         clean_repo, _TEST_RUN_ID, tested_sha, evidence_commit
     )
     index = tmp_path / "leak-index"
-    env = dict(os.environ, GIT_INDEX_FILE=str(index))
+    default_index = Path(
+        subprocess.run(
+            ["git", "-C", str(clean_repo), "rev-parse", "--git-path", "index"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+    if not default_index.is_absolute():
+        default_index = clean_repo / default_index
+    default_index_before = default_index.read_bytes()
+    head_before = _head(clean_repo)
+    env = gate._git_safe_env()
+    env["GIT_INDEX_FILE"] = str(index)
     subprocess.run(
         ["git", "-C", str(clean_repo), "read-tree", evidence_commit], env=env, check=True
     )
@@ -4932,6 +4945,18 @@ def test_verify_gate_ref_rejects_gitignored_raw_leaked_into_e(
     assert any(
         "committed=false" in problem and "carries it" in problem
         for problem in verdict["problems"]
+    )
+    assert os.environ.get("GIT_INDEX_FILE") is None
+    assert default_index.read_bytes() == default_index_before
+    assert _head(clean_repo) == head_before
+    assert (
+        subprocess.run(
+            ["git", "-C", str(clean_repo), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        == ""
     )
 
 
@@ -16687,7 +16712,15 @@ def test_formal_activation_interrupt_windows_fail_closed_over_real_http(
                         headers={"X-TripChord-Bridge-Token": bridge_token},
                         json={**companion_payload, "formal_activation_ack": pending},
                     )
-                    acknowledged.raise_for_status()
+                    assert acknowledged.status_code == 200, (
+                        "Companion activation ack must be observably committed over HTTP "
+                        f"before the scheduled failpoint exits: {acknowledged.text}"
+                    )
+                    acknowledged_payload = acknowledged.json()
+                    assert acknowledged_payload["companion_id"] == companion_payload[
+                        "companion_id"
+                    ]
+                    assert acknowledged_payload["formal_activation_request"] is None
                     break
                 await asyncio.sleep(0.05)
             else:

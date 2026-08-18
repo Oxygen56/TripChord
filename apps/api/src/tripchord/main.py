@@ -747,6 +747,10 @@ def _install_browser_bridge(
     mount_browser_bridge: bool = True,
     formal_source_owned_by_parent: bool = False,
 ) -> tuple[BrowserTaskBridge | None, LivePackageAgentSystem | None]:
+    formal_activation_failpoint_events: dict[str, asyncio.Event] = {}
+    target_app.state.formal_activation_failpoint_events = (
+        formal_activation_failpoint_events
+    )
     token = configured_settings.browser_bridge_token
     if not configured_settings.browser_bridge_enabled or token is None or len(token) < 32:
         target_app.state.browser_task_bridge = None
@@ -860,6 +864,7 @@ def _install_browser_bridge(
                 allowed_origin_regex=configured_settings.browser_bridge_allowed_origin_regex,
                 source_authority=source_authority,
                 icom_provider=icom_provider,
+                formal_activation_failpoint_events=formal_activation_failpoint_events,
             ),
         )
     target_app.state.browser_task_bridge = bridge
@@ -1652,6 +1657,22 @@ async def activate_formal_live_source_job_endpoint(
     try:
         if set(payload) != {"execution_capability", "companion_binding"}:
             raise ValueError("formal source activation payload is invalid")
+        failpoint = os.environ.get("TRIPCHORD_TEST_FORMAL_ACTIVATION_FAILPOINT")
+        failpoint_event: asyncio.Event | None = None
+        if failpoint in {
+            "exit_after_registry_dispatch_persist",
+            "exit_after_registry_dispatch",
+        }:
+            events = getattr(
+                request.app.state,
+                "formal_activation_failpoint_events",
+                None,
+            )
+            if not isinstance(events, dict):
+                raise RuntimeError("formal activation failpoint coordinator is unavailable")
+            failpoint_event = asyncio.Event()
+            if events.setdefault(job_id, failpoint_event) is not failpoint_event:
+                raise RuntimeError("formal activation failpoint already owns this job")
         capability = payload["execution_capability"]
         companion_binding = payload["companion_binding"]
         activation_lock = getattr(
@@ -1802,11 +1823,13 @@ async def activate_formal_live_source_job_endpoint(
                     separators=(",", ":"),
                 ):
                     raise ValueError("formal source activation queued receipt differs")
-                failpoint = os.environ.get(
-                    "TRIPCHORD_TEST_FORMAL_ACTIVATION_FAILPOINT"
-                )
-                if dispatched_now and failpoint == "exit_after_registry_dispatch":
-                    os._exit(86)
+                if dispatched_now and failpoint_event is not None:
+                    failpoint_event.set()
+                    # The Companion heartbeat response owns the deferred
+                    # process exit as a response background task.  Suspending
+                    # here preserves the exact pre-ledger interrupt window and
+                    # prevents a false successful activation response.
+                    await asyncio.Event().wait()
                 trust_root_mode: int | None = None
                 if (
                     dispatched_now

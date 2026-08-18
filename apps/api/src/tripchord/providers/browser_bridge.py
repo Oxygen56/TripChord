@@ -19,7 +19,7 @@ from urllib.parse import ParseResult, parse_qsl, urlencode, urlparse
 from urllib.parse import quote as url_quote
 from uuid import uuid4
 
-from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import Field, JsonValue, ValidationInfo, field_validator, model_validator
 
@@ -41,6 +41,7 @@ UNTRUSTED_SOURCE_EXECUTION_ENVIRONMENT = "untrusted_external_executor"
 _FORMAL_WORKER_SOURCE_TOKEN_CONTEXT = (
     b"tripchord-formal-worker-parent-source-v1"
 )
+_FORMAL_ACTIVATION_FAILPOINT_ACK_FLUSH_SECONDS = 0.05
 DEFAULT_TERMINAL_RECORD_RETENTION_SECONDS = 3600
 DEFAULT_MAX_TERMINAL_RECORDS = 256
 DEFAULT_MAX_COMPANION_CONTROL_RECORDS = 64
@@ -3907,6 +3908,7 @@ def create_browser_bridge_app(
     ),
     source_authority: FormalLiveSourceAuthority | None = None,
     icom_provider: Any | None = None,
+    formal_activation_failpoint_events: dict[str, asyncio.Event] | None = None,
 ) -> FastAPI:
     if len(bridge_token) < 32:
         raise ValueError("bridge_token must contain at least 32 characters")
@@ -4234,6 +4236,7 @@ def create_browser_bridge_app(
     async def companion_heartbeat(
         payload: BrowserCompanionHeartbeatRequest,
         request: Request,
+        background_tasks: BackgroundTasks,
         token: Annotated[str | None, Header(alias=BRIDGE_TOKEN_HEADER)] = None,
     ) -> BrowserCompanionHeartbeatResponse:
         await authorize(request, token)
@@ -4276,6 +4279,29 @@ def create_browser_bridge_app(
                     request_details=request_details,
                     heartbeat=heartbeat.model_dump(mode="json"),
                 )
+            failpoint_event = (
+                formal_activation_failpoint_events.get(str(acknowledgment["job_id"]))
+                if formal_activation_failpoint_events is not None
+                and acknowledgment is not None
+                else None
+            )
+            if failpoint_event is not None:
+                try:
+                    await asyncio.wait_for(failpoint_event.wait(), timeout=10.0)
+                except TimeoutError as exc:
+                    raise RuntimeError(
+                        "formal activation failpoint did not reach durable dispatch"
+                    ) from exc
+
+                async def exit_after_ack_response() -> None:
+                    # Starlette runs response background tasks only after the
+                    # final ASGI body frame.  The short yield lets uvicorn flush
+                    # that already-written 200 response to the loopback client
+                    # before reproducing the intended process interruption.
+                    await asyncio.sleep(_FORMAL_ACTIVATION_FAILPOINT_ACK_FLUSH_SECONDS)
+                    os._exit(86)
+
+                background_tasks.add_task(exit_after_ack_response)
             pending = (
                 source_authority.pending_activation_request()
                 if source_authority is not None
