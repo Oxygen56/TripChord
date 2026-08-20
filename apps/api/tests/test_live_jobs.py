@@ -4904,9 +4904,12 @@ async def test_cleanup_owner_retries_terminal_persist_fail_once_deadline(
             operation=_make_stubborn_swallow_cancel(stop, started, swallowed),
             idempotency_key="owner-fail-once-deadline",
             request_digest=REQUEST_SHA256,
-            deadline_seconds=0.05,
+            deadline_seconds=0.5,
         )
         runtime = registry._records[snap.id]
+        # Ensure the stubborn operation has entered its cancellation-swallowing
+        # body before the deadline cleanup can race it on a loaded CI runner.
+        await asyncio.wait_for(started.wait(), timeout=3)
         await asyncio.wait_for(runtime.task, timeout=5)
         assert runtime.task.done()
         assert swallowed.is_set()
