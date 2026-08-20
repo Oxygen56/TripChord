@@ -82,7 +82,9 @@ Docker / Nginx / Transformers / TRL / PEFT
   调用、Context 裁剪、候选空间与证据链；将长耗时 live 搜索改为 `POST 202 + job_id → GET/SSE
   进度 → DELETE 取消`，支持五态、tenant 隔离、容量/TTL、错误脱敏与 `Idempotency-Key`，取消
   可传播到 browser bridge；strict runner 使用异步轮询、日期对 checkpoint 与冻结 3600 秒预算。
-  该队列为进程内有界实现，主动披露重启不恢复而不包装生产 SLA。
+  正式 live 任务已把幂等身份、租约、取消意图和逐日期结果写入 PostgreSQL，同机 API/worker
+  中断后只恢复未完成日期；浏览器采集、短期报价和偏好仍未纳入同一恢复链，因此不包装跨主机
+  恢复、平台副作用恰好一次或生产 SLA。
 - 为 Chrome Companion 设计受限后台自动重载：当前 `0.1.16` 只有 source SHA、manifest/runtime、
   0600 release seal 与当前 runtime instance 全部匹配时才允许一次有界幂等 reload，并验证新实例；
   不打开/聚焦页面，也不能安装扩展、扩大域名权限、恢复登录或绕验证码。

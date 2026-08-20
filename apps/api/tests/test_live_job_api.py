@@ -15,6 +15,8 @@ import tripchord.main as main_module
 from httpx import ASGITransport, AsyncClient
 from tripchord.agents.flexible_live_system import FlexibleLiveAgentSystem
 from tripchord.agents.live_jobs import (
+    DURABLE_LIVE_PLANNING_BOUNDARY,
+    NON_DURABLE_LIVE_PLANNING_BOUNDARY,
     LivePlanningJobInactiveError,
     LivePlanningJobRegistry,
     LivePlanningPairCheckpoint,
@@ -29,11 +31,12 @@ from tripchord.agents.model_gateway import (
     OpenAICompatibleChatClient,
 )
 from tripchord.agents.models import AgentRole
-from tripchord.api import LiveFlexibleFromTextPlanningRequest
+from tripchord.api import LiveFlexibleFromTextPlanningRequest, StartLiveFlexibleFromTextJobResponse
 from tripchord.main import (
     LiveRunCache,
     _cache_flexible_pair_runs,
     _live_flexible_from_text_request_sha256,
+    _live_planning_job_boundary,
     app,
     package_requirement_agent,
     settings,
@@ -44,6 +47,16 @@ from tripchord.providers.browser_bridge import (
     BrowserTaskState,
     BrowserTaskSubmission,
 )
+
+
+def test_live_planning_boundary_helper_is_fail_closed_by_registry_mode() -> None:
+    non_durable = LivePlanningJobRegistry()
+    durable = LivePlanningJobRegistry(durable_store=object())
+    assert _live_planning_job_boundary(non_durable) == NON_DURABLE_LIVE_PLANNING_BOUNDARY
+    assert _live_planning_job_boundary(durable) == DURABLE_LIVE_PLANNING_BOUNDARY
+    assert StartLiveFlexibleFromTextJobResponse.model_fields["boundary"].default == (
+        NON_DURABLE_LIVE_PLANNING_BOUNDARY
+    )
 
 NOW = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
 

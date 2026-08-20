@@ -12,7 +12,10 @@ from tripchord.agents.flexible_live_system import (
     FlexibleLiveAgentRun,
     FlexiblePackageConstraints,
 )
-from tripchord.agents.live_jobs import LivePlanningJobSnapshot
+from tripchord.agents.live_jobs import (
+    NON_DURABLE_LIVE_PLANNING_BOUNDARY,
+    LivePlanningJobSnapshot,
+)
 from tripchord.agents.live_monitor import LiveMonitorStatus
 from tripchord.agents.live_system import (
     LiveCoverageMode,
@@ -646,10 +649,7 @@ class StartLiveFlexibleFromTextJobResponse(ApiModel):
     replayed: bool = False
     status_url: str = Field(min_length=1)
     events_url: str = Field(min_length=1)
-    boundary: str = (
-        "POST 只创建本机进程内任务并快速返回；GET/SSE 读取状态，DELETE 请求取消。"
-        "任务不会跨进程重启恢复，也不是持久化生产队列。"
-    )
+    boundary: str = NON_DURABLE_LIVE_PLANNING_BOUNDARY
 
 
 class LiveAgentEventReplanRequest(ApiModel):

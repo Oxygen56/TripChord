@@ -7,6 +7,22 @@ on:
 jobs:
   api:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: tripchord_ci
+          POSTGRES_USER: tripchord
+          POSTGRES_PASSWORD: tripchord
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tripchord -d tripchord_ci"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      TRIPCHORD_POSTGRES_TEST_URL: postgresql+asyncpg://tripchord:tripchord@127.0.0.1:5432/tripchord_ci
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
@@ -16,7 +32,7 @@ jobs:
       - run: uv sync --locked --all-groups
       - run: uv run ruff check .
       - run: uv run mypy apps/api/src
-      - run: uv run pytest
+      - run: uv run pytest -m 'not integration'
       - run: uv run python -m training.train_sft --validate-only
       - run: uv run python -m training.train_dpo --validate-only
       - run: uv run python -m training.policy_reranker
@@ -29,6 +45,11 @@ jobs:
           migration_db=$(mktemp /tmp/tripchord-migration-XXXXXX.db)
           TRIPCHORD_DATABASE_URL="sqlite+aiosqlite:///$migration_db" uv run alembic upgrade head
           TRIPCHORD_DATABASE_URL="sqlite+aiosqlite:///$migration_db" uv run alembic check
+      - name: PostgreSQL durable live-job integration
+        run: |
+          TRIPCHORD_DATABASE_URL="$TRIPCHORD_POSTGRES_TEST_URL" uv run alembic upgrade head
+          TRIPCHORD_DATABASE_URL="$TRIPCHORD_POSTGRES_TEST_URL" uv run alembic check
+          uv run pytest -m integration apps/api/tests/test_live_planning_jobs_postgres.py
       - run: uv run python benchmarks/evaluate.py
       - run: uv run python benchmarks/evaluate_planning.py
       - run: uv run python benchmarks/evaluate_repair.py

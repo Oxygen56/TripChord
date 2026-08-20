@@ -27,6 +27,15 @@ from tripchord.domain.common import DomainModel
 
 logger = logging.getLogger(__name__)
 
+NON_DURABLE_LIVE_PLANNING_BOUNDARY = (
+    "本机进程内、单服务进程的长任务控制面；最多并行执行有限个任务，"
+    "终态按容量和 TTL 有界保存。进程重启不恢复任务，不能视为持久化生产队列。"
+)
+DURABLE_LIVE_PLANNING_BOUNDARY = (
+    "使用数据库持久化控制面；任务状态和已完成日期结果可跨 API 重启恢复，"
+    "但不承诺跨主机 worker，也不承诺外部平台副作用已经完成。"
+)
+
 
 @dataclass(frozen=True)
 class OrphanDeathProof:
@@ -62,8 +71,11 @@ class LivePlanningDurableStore(Protocol):
         proof_generation: int,
     ) -> LivePlanningJobSnapshot | None: ...
     async def request_cancel(self, job_id: str, *, tenant_id: str) -> LivePlanningJobSnapshot: ...
-    async def claim_with_identity(self, job_id: str, *, tenant_id: str) -> Any: ...
+    async def claim_with_identity(
+        self, job_id: str, *, tenant_id: str, lease_seconds: int = 300
+    ) -> Any: ...
     async def list_recoverable(self, *, tenant_id: str) -> tuple[str, ...]: ...
+    async def list_expired_reaping(self, *, tenant_id: str) -> tuple[str, ...]: ...
     async def recovery_record(self, job_id: str, *, tenant_id: str) -> Any: ...
     async def list_tenants(self) -> tuple[str, ...]: ...
     async def authorize_orphan_reap(
@@ -73,7 +85,35 @@ class LivePlanningDurableStore(Protocol):
         tenant_id: str,
         owner: str | None,
         generation: int | None,
+        reaper_id: str,
+    ) -> str | None: ...
+    async def quarantine_orphan_identity(
+        self, job_id: str, *, reaper_id: str
     ) -> bool: ...
+    async def complete_orphan_reap(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        owner: str,
+        generation: int,
+        reap_token: str,
+    ) -> bool: ...
+    async def record_orphan_reap_proof(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        owner: str,
+        generation: int,
+        reap_token: str,
+        pgid: int | None,
+        marker_digest: str,
+        proof_kind: str = "worker_death",
+    ) -> bool: ...
+    async def consume_expired_orphan_reap_proof(
+        self, job_id: str, *, tenant_id: str
+    ) -> LivePlanningJobSnapshot | None: ...
     async def renew_lease(self, job_id: str, *, tenant_id: str, **kwargs: Any) -> bool: ...
     async def release_lease(self, job_id: str, *, tenant_id: str, **kwargs: Any) -> bool: ...
 
@@ -848,10 +888,7 @@ class LivePlanningJobSnapshot(DomainModel):
     updated_at: datetime
     deadline_at: datetime
     expires_at: datetime | None = None
-    boundary: str = (
-        "本机进程内、单服务进程的长任务控制面；最多并行执行有限个任务，"
-        "终态按容量和 TTL 有界保存。进程重启不恢复任务，不能视为持久化生产队列。"
-    )
+    boundary: str = NON_DURABLE_LIVE_PLANNING_BOUNDARY
 
     _validate_created_at = field_validator("created_at")(lambda value: _aware(value, "created_at"))
     _validate_updated_at = field_validator("updated_at")(lambda value: _aware(value, "updated_at"))
@@ -1437,6 +1474,7 @@ class LivePlanningJobRegistry:
         # watchdog. Both are test-controllable.
         hard_stop_confirm_budget_window_seconds: float = 2.0,
         hard_stop_confirm_budget_window_calls: int = 8,
+        durable_lease_seconds: int = 300,
         durable_store: LivePlanningDurableStore | None = None,
     ) -> None:
         if capacity < 1:
@@ -1473,6 +1511,8 @@ class LivePlanningJobRegistry:
             raise ValueError("hard_stop_confirm_budget_window_seconds must be positive")
         if hard_stop_confirm_budget_window_calls < 1:
             raise ValueError("hard_stop_confirm_budget_window_calls must be at least one")
+        if durable_lease_seconds < 1:
+            raise ValueError("durable_lease_seconds must be at least one second")
         self._capacity = capacity
         self._terminal_ttl = terminal_ttl
         self._now = now or (lambda: datetime.now(UTC))
@@ -1495,8 +1535,10 @@ class LivePlanningJobRegistry:
         self._hard_stop_defer_retry_seconds = hard_stop_defer_retry_seconds
         self._hard_stop_confirm_budget_window_seconds = hard_stop_confirm_budget_window_seconds
         self._hard_stop_confirm_budget_window_calls = hard_stop_confirm_budget_window_calls
+        self._durable_lease_seconds = durable_lease_seconds
         self._durable_store = durable_store
         self._confirmed_stopped_job_ids: dict[str, OrphanDeathProof] = {}
+        self._reaper_id = f"registry:{uuid4()}"
         self._worker_python = worker_python or sys.executable
         self._worker_module = worker_module or _default_worker_module()
         self._idempotency_capacity = idempotency_capacity
@@ -1542,6 +1584,11 @@ class LivePlanningJobRegistry:
         # would create a second authority beside the database.
         if self._state_path is not None and self._durable_store is None:
             self._load_state()
+
+    @property
+    def durable_store_configured(self) -> bool:
+        """Whether this registry can recover jobs from the durable control plane."""
+        return self._durable_store is not None
 
     @staticmethod
     def _public_command_args(args: dict[str, Any]) -> dict[str, Any]:
@@ -2466,7 +2513,7 @@ class LivePlanningJobRegistry:
         async def heartbeat() -> None:
             try:
                 while runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(min(1.0, self._durable_lease_seconds / 3))
                     authoritative = await store.get(
                         runtime.snapshot.id, tenant_id=runtime.tenant_id
                     )
@@ -2505,7 +2552,7 @@ class LivePlanningJobRegistry:
                         tenant_id=runtime.tenant_id,
                         owner=runtime.durable_lease_owner,
                         lease_generation=runtime.durable_lease_generation,
-                        lease_seconds=300,
+                        lease_seconds=self._durable_lease_seconds,
                     )
                     if not renewed:
                         if runtime.task is not None and not runtime.task.done():
@@ -2709,6 +2756,11 @@ class LivePlanningJobRegistry:
                     created_at=now,
                     updated_at=now,
                     deadline_at=deadline_at,
+                    boundary=(
+                        DURABLE_LIVE_PLANNING_BOUNDARY
+                        if self._durable_store is not None
+                        else NON_DURABLE_LIVE_PLANNING_BOUNDARY
+                    ),
                 ),
                 operation=resolved_operation,
                 prepared=defer_start,
@@ -2773,7 +2825,9 @@ class LivePlanningJobRegistry:
                         return durable_created, True
                     if not defer_start:
                         lease = await self._durable_store.claim_with_identity(
-                            job_id, tenant_id=tenant_id
+                            job_id,
+                            tenant_id=tenant_id,
+                            lease_seconds=self._durable_lease_seconds,
                         )
                         if lease is None:
                             self._remove_locked(job_id)
@@ -3583,6 +3637,18 @@ class LivePlanningJobRegistry:
         store = self._durable_store
         if store is None:
             return ()
+        # Expired cleanup fences are intentionally observable but not
+        # claimable: without a marker/death receipt, TTL alone is never proof
+        # that the old worker stopped.  A later startup can reconcile them when
+        # the process identity becomes verifiable.
+        for stuck_job_id in await store.list_expired_reaping(tenant_id=tenant_id):
+            consumed_proof = await store.consume_expired_orphan_reap_proof(
+                stuck_job_id, tenant_id=tenant_id
+            )
+            if consumed_proof is None:
+                logger.warning(
+                    "durable live job cleanup fence awaiting death proof: %s", stuck_job_id
+                )
         recovered: list[str] = []
         for job_id in await store.list_recoverable(tenant_id=tenant_id):
             record = await store.recovery_record(job_id, tenant_id=tenant_id)
@@ -3624,7 +3690,18 @@ class LivePlanningJobRegistry:
                     except OSError:
                         continue
                 self._confirmed_stopped_job_ids.pop(job_id, None)
-            lease = await store.claim_with_identity(job_id, tenant_id=tenant_id)
+            # Do not claim a durable lease when this registry already owns the
+            # runtime.  The check is intentionally repeated after claim below:
+            # another local path may have installed the record between the
+            # preflight and the database transaction.
+            async with self._lock:
+                if job_id in self._records:
+                    continue
+            lease = await store.claim_with_identity(
+                job_id,
+                tenant_id=tenant_id,
+                lease_seconds=self._durable_lease_seconds,
+            )
             if lease is None:
                 continue
             command = command_resolver(record.command_spec)
@@ -3642,6 +3719,12 @@ class LivePlanningJobRegistry:
             runtime.durable_lease_generation = lease.generation
             async with self._changed:
                 if job_id in self._records:
+                    await store.release_lease(
+                        job_id,
+                        tenant_id=tenant_id,
+                        owner=lease.owner,
+                        lease_generation=lease.generation,
+                    )
                     continue
                 self._records[job_id] = runtime
                 runtime.task = asyncio.create_task(
@@ -4055,6 +4138,53 @@ class LivePlanningJobRegistry:
             return None
         return workers_dir / f"{job_id}.death-proof.json"
 
+    def _write_authenticated_cleanup_receipt(
+        self,
+        job_id: str,
+        marker: str,
+        pgid: int,
+        *,
+        tenant_id: str,
+        lease_owner: str,
+        lease_generation: int,
+    ) -> str:
+        path = self._marker_file_for(job_id)
+        if path is None:
+            raise OSError("durable worker marker path unavailable")
+        payload: dict[str, object] = {
+            "schema": "tripchord.live-authenticated-cleanup.v1",
+            "job_id": job_id,
+            "marker": marker,
+            "pgid": pgid,
+            "tenant_id": tenant_id,
+            "lease_owner": lease_owner,
+            "lease_generation": lease_generation,
+            "authenticated_cleanup": True,
+            "authenticated_at": datetime.now(UTC).isoformat(),
+            "digest": "",
+        }
+        payload["digest"] = self._proof_digest(payload)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
+        directory_stat = path.parent.stat()
+        if (
+            path.parent.is_symlink()
+            or directory_stat.st_uid != os.getuid()
+            or directory_stat.st_mode & 0o777 != 0o700
+        ):
+            raise OSError("unsafe live-worker receipt directory")
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        assert isinstance(payload["digest"], str)
+        return payload["digest"]
+
     @staticmethod
     def _proof_digest(payload: dict[str, object]) -> str:
         canonical = json.dumps(
@@ -4063,6 +4193,63 @@ class LivePlanningJobRegistry:
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(canonical).hexdigest()
+
+    @classmethod
+    def _validate_worker_receipt(cls, payload: dict[str, object], job_id: str) -> bool:
+        schema = payload.get("schema")
+        is_cleanup = payload.get("authenticated_cleanup") is True
+        is_terminal = payload.get("terminal_exit") is True
+        if cls._canonical_job_id(job_id) != job_id or payload.get("job_id") != job_id:
+            return False
+        if schema == "tripchord.live-authenticated-cleanup.v1" and is_cleanup:
+            expected_keys = {
+                "schema", "job_id", "marker", "pgid", "tenant_id",
+                "lease_owner", "lease_generation", "authenticated_cleanup",
+                "authenticated_at", "digest",
+            }
+        elif schema == "tripchord.live-terminal-exit.v1" and is_terminal:
+            expected_keys = {
+                "schema", "job_id", "pid", "pgid", "marker", "probe_path",
+                "tenant_id", "lease_owner", "lease_generation", "terminal_exit",
+                "exit_code", "exited_at", "digest",
+            }
+        else:
+            return False
+        if set(payload) != expected_keys:
+            return False
+        pgid = payload.get("pgid")
+        if type(pgid) is not int or pgid <= 0:
+            return False
+        tenant_id = payload.get("tenant_id")
+        if type(tenant_id) is not str or not tenant_id:
+            return False
+        lease_owner = payload.get("lease_owner")
+        if type(lease_owner) is not str or not lease_owner:
+            return False
+        lease_generation = payload.get("lease_generation")
+        if type(lease_generation) is not int or lease_generation < 1:
+            return False
+        if type(payload.get("marker")) is not str or not payload["marker"]:
+            return False
+        time_key = "authenticated_at" if is_cleanup else "exited_at"
+        timestamp = payload.get(time_key)
+        if type(timestamp) is not str:
+            return False
+        try:
+            parsed = datetime.fromisoformat(timestamp)
+        except (TypeError, ValueError):
+            return False
+        if parsed.tzinfo is None or parsed > datetime.now(UTC) + timedelta(minutes=5):
+            return False
+        digest = payload.get("digest")
+        if type(digest) is not str or digest != cls._proof_digest(payload):
+            return False
+        if is_cleanup:
+            return True
+        pid = payload.get("pid")
+        if type(pid) is not int or pid <= 0:
+            return False
+        return type(payload.get("probe_path")) is str and type(payload.get("exit_code")) is int
 
     def _write_death_proof(
         self,
@@ -4261,7 +4448,7 @@ class LivePlanningJobRegistry:
         return [line for line in completed.stdout.splitlines() if line]
 
     @staticmethod
-    def _find_pgid_by_marker(marker: str) -> int | None:
+    def _find_pgid_by_marker(marker: str) -> tuple[str, int | None]:
         """Recover the PGID of a live process whose command line carries ``marker``.
 
         C-146 P0-2: a parent-API crash can land between
@@ -4273,7 +4460,11 @@ class LivePlanningJobRegistry:
         if sys.platform == "linux":
             proc_dir = Path("/proc")
             if proc_dir.is_dir():
-                for entry in proc_dir.iterdir():
+                try:
+                    entries = tuple(proc_dir.iterdir())
+                except OSError:
+                    entries = ()
+                for entry in entries:
                     if not entry.name.isdigit():
                         continue
                     try:
@@ -4282,10 +4473,18 @@ class LivePlanningJobRegistry:
                             continue
                         stat_text = (entry / "stat").read_text(encoding="ascii")
                         _, remainder = stat_text.split(") ", 1)
-                        return int(remainder.split()[2])
-                    except (FileNotFoundError, PermissionError, OSError, ValueError):
+                        return ("found", int(remainder.split()[2]))
+                    except FileNotFoundError:
+                        # Normal process churn while enumerating /proc is not
+                        # evidence that the nonce is present or unreadable.
                         continue
-            return None
+                    except (PermissionError, OSError, ValueError, UnicodeDecodeError):
+                        # Let a complete ps snapshot decide whether the nonce
+                        # is absent; do not turn one unrelated entry into a
+                        # permanent UNKNOWN quarantine.
+                        continue
+            # /proc can race or be unavailable. A successful full ps snapshot
+            # is the authoritative fallback for the absence decision.
         try:
             completed = subprocess.run(
                 ["ps", "-e", "-o", "pid=,pgid=,command="],
@@ -4294,20 +4493,20 @@ class LivePlanningJobRegistry:
                 check=False,
             )
         except OSError:
-            return None
+            return ("unknown", None)
         if completed.returncode != 0:
-            return None
+            return ("unknown", None)
         for line in completed.stdout.splitlines():
             parts = line.split(None, 2)
             if len(parts) != 3:
-                continue
+                return ("unknown", None)
             _pid_str, pgid_str, command = parts
             if marker in command:
                 try:
-                    return int(pgid_str)
+                    return ("found", int(pgid_str))
                 except ValueError:
-                    continue
-        return None
+                    return ("unknown", None)
+        return ("absent", None)
 
     @staticmethod
     def _write_spawn_intent(
@@ -4398,6 +4597,18 @@ class LivePlanningJobRegistry:
         confirmed_stopped_job_ids: set[str] = set()
         candidates: list[tuple[int, str, Path | None, _RuntimeJob | None]] = []
         marker_lease_identity: dict[tuple[int, str], tuple[str | None, str | None, int | None]] = {}
+        marker_exit_receipt_valid: dict[tuple[int, str], bool] = {}
+        marker_exit_receipt_digest: dict[tuple[int, str], str] = {}
+
+        async def quarantine_marker_job(marker_path: Path) -> None:
+            if self._durable_store is None:
+                return
+            canonical_job_id = self._canonical_job_id(marker_path.stem)
+            if canonical_job_id is not None:
+                await self._durable_store.quarantine_orphan_identity(
+                    canonical_job_id, reaper_id=self._reaper_id
+                )
+
         if self._state_path is not None:
             workers_dir = self._workers_dir()
             if workers_dir is not None and workers_dir.is_dir():
@@ -4411,10 +4622,15 @@ class LivePlanningJobRegistry:
                     try:
                         info = json.loads(marker_path.read_text(encoding="utf-8"))
                     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        await quarantine_marker_job(marker_path)
+                        continue
+                    if not isinstance(info, dict):
+                        await quarantine_marker_job(marker_path)
                         continue
                     pgid = info.get("pgid")
                     marker = info.get("marker")
                     if not isinstance(marker, str) or not marker:
+                        await quarantine_marker_job(marker_path)
                         continue
                     if not isinstance(pgid, int) or pgid <= 0:
                         # C-146 P0-2: spawn-intent only — the parent crashed
@@ -4423,11 +4639,69 @@ class LivePlanningJobRegistry:
                         # the nonce; when no live process carries it, the spawn
                         # never happened (or the worker exited without ever
                         # writing a full marker) and the stale intent is dropped.
-                        pgid = self._find_pgid_by_marker(marker)
-                        if pgid is None:
+                        scan_status, found_pgid = self._find_pgid_by_marker(marker)
+                        if scan_status == "unknown":
+                            await quarantine_marker_job(marker_path)
+                            continue
+                        if scan_status == "absent":
+                            if self._durable_store is None:
+                                # A non-durable spawn intent has no control
+                                # plane to fence; an entirely successful scan
+                                # proves that the process never materialized.
+                                with suppress(OSError):
+                                    marker_path.unlink(missing_ok=True)
+                                continue
+                            tenant_id = info.get("tenant_id")
+                            lease_owner = info.get("lease_owner")
+                            lease_generation = info.get("lease_generation")
+                            canonical_job_id = self._canonical_job_id(marker_path.stem)
+                            if (
+                                canonical_job_id is None
+                                or not isinstance(tenant_id, str)
+                                or not isinstance(lease_owner, str)
+                                or type(lease_generation) is not int
+                            ):
+                                await quarantine_marker_job(marker_path)
+                                continue
+                            spawn_reap_token = await self._durable_store.authorize_orphan_reap(
+                                canonical_job_id,
+                                tenant_id=tenant_id,
+                                owner=lease_owner,
+                                generation=lease_generation,
+                                reaper_id=self._reaper_id,
+                            )
+                            spawn_digest = self._proof_digest(info)
+                            if spawn_reap_token is None:
+                                await quarantine_marker_job(marker_path)
+                                continue
+                            reap_recorded = await self._durable_store.record_orphan_reap_proof(
+                                canonical_job_id,
+                                tenant_id=tenant_id,
+                                owner=lease_owner,
+                                generation=lease_generation,
+                                reap_token=spawn_reap_token,
+                                pgid=None,
+                                marker_digest=spawn_digest,
+                                proof_kind="spawn_absent",
+                            )
+                            reap_completed = (
+                                reap_recorded
+                                and await self._durable_store.complete_orphan_reap(
+                                    canonical_job_id,
+                                    tenant_id=tenant_id,
+                                    owner=lease_owner,
+                                    generation=lease_generation,
+                                    reap_token=spawn_reap_token,
+                                )
+                            )
+                            if not reap_completed:
+                                await quarantine_marker_job(marker_path)
+                                continue
                             with suppress(OSError):
                                 marker_path.unlink(missing_ok=True)
                             continue
+                        assert found_pgid is not None
+                        pgid = found_pgid
                     marker_lease_identity[(pgid, marker)] = (
                         info.get("tenant_id") if isinstance(info.get("tenant_id"), str) else None,
                         info.get("lease_owner")
@@ -4437,6 +4711,11 @@ class LivePlanningJobRegistry:
                         if isinstance(info.get("lease_generation"), int)
                         else None,
                     )
+                    marker_job_id = marker_path.stem
+                    receipt_valid = self._validate_worker_receipt(info, marker_job_id)
+                    marker_exit_receipt_valid[(pgid, marker)] = receipt_valid
+                    if receipt_valid and isinstance(info.get("digest"), str):
+                        marker_exit_receipt_digest[(pgid, marker)] = info["digest"]
                     candidates.append((pgid, marker, marker_path, None))
         async with self._lock:
             runtimes = list(self._records.values())
@@ -4477,6 +4756,9 @@ class LivePlanningJobRegistry:
                     candidate_runtime,
                 )
         for unique_pgid, unique_marker, unique_marker_path, unique_runtime in unique:
+            reap_token: str | None = None
+            reap_completed = self._durable_store is None
+            reap_proof_digest = marker_exit_receipt_digest.get((unique_pgid, unique_marker))
             if self._durable_store is not None:
                 tenant_id, lease_owner, lease_generation = marker_lease_identity.get(
                     (unique_pgid, unique_marker),
@@ -4495,13 +4777,19 @@ class LivePlanningJobRegistry:
                     tenant_id is None
                     or lease_owner is None
                     or lease_generation is None
-                    or not await self._durable_store.authorize_orphan_reap(
+                    or (reap_token := await self._durable_store.authorize_orphan_reap(
                         marker_job_id,
                         tenant_id=tenant_id,
                         owner=lease_owner,
                         generation=lease_generation,
-                    )
+                        reaper_id=self._reaper_id,
+                    )) is None
                 ):
+                    canonical_marker_job_id = self._canonical_job_id(marker_job_id)
+                    if canonical_marker_job_id is not None and self._durable_store is not None:
+                        await self._durable_store.quarantine_orphan_identity(
+                            canonical_marker_job_id, reaper_id=self._reaper_id
+                        )
                     continue
             commands = self._group_commands(unique_pgid)
             authenticated = any(unique_marker in line for line in commands)
@@ -4512,8 +4800,40 @@ class LivePlanningJobRegistry:
             confirmed = False
             group_absent = False
             if authenticated:
-                with suppress(ProcessLookupError, PermissionError, OSError):
+                if self._durable_store is not None:
+                    cleanup_job_id = (
+                        unique_marker_path.stem
+                        if unique_marker_path is not None
+                        else (unique_runtime.snapshot.id if unique_runtime is not None else "")
+                    )
+                    cleanup_tenant, cleanup_owner, cleanup_generation = marker_lease_identity.get(
+                        (unique_pgid, unique_marker),
+                        (None, None, None),
+                    )
+                    if (
+                        cleanup_job_id
+                        and cleanup_tenant is not None
+                        and cleanup_owner is not None
+                        and cleanup_generation is not None
+                    ):
+                        reap_proof_digest = self._write_authenticated_cleanup_receipt(
+                            cleanup_job_id,
+                            unique_marker,
+                            unique_pgid,
+                            tenant_id=cleanup_tenant,
+                            lease_owner=cleanup_owner,
+                            lease_generation=cleanup_generation,
+                        )
+                try:
                     os.killpg(unique_pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    # The authenticated worker exited between authentication
+                    # and SIGKILL. ESRCH is positive death proof for this
+                    # exact authenticated process group.
+                    confirmed = not self._group_commands(unique_pgid)
+                except (PermissionError, OSError):
+                    pass
+                else:
                     deadline = asyncio.get_running_loop().time() + self._hard_stop_confirm_seconds
                     while asyncio.get_running_loop().time() < deadline:
                         linux_live = _linux_group_has_live_member(unique_pgid)
@@ -4542,7 +4862,7 @@ class LivePlanningJobRegistry:
                             # the next startup.
                             pass
                         await asyncio.sleep(0.01)
-            elif unique_runtime is not None:
+            else:
                 # A marker-free command scan can mean either a failed ``ps`` /
                 # reused live PGID OR that the old worker exited and removed its
                 # marker before this boot. Probe existence without signalling.
@@ -4555,7 +4875,23 @@ class LivePlanningJobRegistry:
                 try:
                     os.killpg(unique_pgid, 0)
                 except ProcessLookupError:
-                    if unique_runtime.orphan_authenticated is True:
+                    commands_after_probe = self._group_commands(unique_pgid)
+                    if commands_after_probe:
+                        # A stale PGID probe must not overrule a live process
+                        # visible in the command snapshot.
+                        continue
+                    if (
+                        self._durable_store is not None
+                        and reap_token is not None
+                        and marker_exit_receipt_valid.get((unique_pgid, unique_marker), False)
+                    ):
+                        # A durable reaping fence is already proof that this
+                        # marker was tied to the target lease.  ESRCH is the
+                        # positive death proof after a reaper crashed between
+                        # kill confirmation and DB completion.  Never apply
+                        # this shortcut to a live/unknown group.
+                        confirmed = True
+                    elif unique_runtime is not None and unique_runtime.orphan_authenticated is True:
                         confirmed = True
                     else:
                         group_absent = True
@@ -4566,7 +4902,6 @@ class LivePlanningJobRegistry:
             )
             canonical_job_id = self._canonical_job_id(marker_job_id)
             if confirmed and canonical_job_id is not None:
-                confirmed_stopped_job_ids.add(canonical_job_id)
                 proof_identity = marker_lease_identity.get(
                     (unique_pgid, unique_marker),
                     (
@@ -4577,6 +4912,39 @@ class LivePlanningJobRegistry:
                         else None,
                     ),
                 )
+                if self._durable_store is not None:
+                    proof_tenant, proof_owner, proof_generation = proof_identity
+                    if (
+                        proof_tenant is None
+                        or proof_owner is None
+                        or proof_generation is None
+                        or reap_token is None
+                    ):
+                        # Keep the row non-claimable.  A later sweep may retry
+                        # the authenticated/death-confirmed transition.
+                        continue
+                    if reap_proof_digest is None:
+                        continue
+                    if not await self._durable_store.record_orphan_reap_proof(
+                        canonical_job_id,
+                        tenant_id=proof_tenant,
+                        owner=proof_owner,
+                        generation=proof_generation,
+                        reap_token=reap_token,
+                        pgid=unique_pgid,
+                        marker_digest=reap_proof_digest,
+                    ):
+                        continue
+                    if not await self._durable_store.complete_orphan_reap(
+                        canonical_job_id,
+                        tenant_id=proof_tenant,
+                        owner=proof_owner,
+                        generation=proof_generation,
+                        reap_token=reap_token,
+                    ):
+                        continue
+                    reap_completed = True
+                confirmed_stopped_job_ids.add(canonical_job_id)
                 self._write_death_proof(
                     canonical_job_id,
                     unique_marker,
@@ -4677,7 +5045,7 @@ class LivePlanningJobRegistry:
                             with suppress(Exception):
                                 self._persist_locked()
                             self._changed.notify_all()
-            if unique_marker_path is not None and (authenticated or confirmed):
+            if unique_marker_path is not None and (authenticated or confirmed) and reap_completed:
                 with suppress(OSError):
                     unique_marker_path.unlink(missing_ok=True)
         return confirmed_stopped_job_ids
@@ -4738,19 +5106,32 @@ class LivePlanningJobRegistry:
             try:
                 info = json.loads(marker_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                with suppress(OSError):
-                    marker_path.unlink(missing_ok=True)
+                # A corrupt marker is still a durable job-id anchor. Discovery
+                # owns quarantine; generic stale cleanup must never erase it.
+                continue
+            if not isinstance(info, dict):
+                continue
+            if self._durable_store is not None and (
+                info.get("terminal_exit") is True
+                or info.get("authenticated_cleanup") is True
+            ):
+                # A terminal receipt is a durable proof input, not a stale
+                # marker. Only the successful DB reaping transition may remove
+                # it; ESRCH alone must not destroy the recovery evidence.
                 continue
             pgid = info.get("pgid")
             if not isinstance(pgid, int):
-                with suppress(OSError):
-                    marker_path.unlink(missing_ok=True)
                 continue
             try:
                 os.killpg(pgid, 0)
             except ProcessLookupError:
-                with suppress(OSError):
-                    marker_path.unlink(missing_ok=True)
+                # In durable mode only orphan discovery, after the DB reaping
+                # transition, may remove a marker. ESRCH alone is not enough:
+                # a stale PGID can otherwise erase evidence while an old
+                # worker is still running under a changed process identity.
+                if self._durable_store is None:
+                    with suppress(OSError):
+                        marker_path.unlink(missing_ok=True)
             except PermissionError:
                 continue
 
@@ -5009,6 +5390,14 @@ class LivePlanningJobRegistry:
         # backoff inside ``_confirm_worker_group_exit`` — the failure/result is
         # only surfaced AFTER the executor is provably gone.
         await self._confirm_worker_group_exit(runtime)
+        # The worker converts its marker into a terminal-exit receipt on a
+        # clean exit. Remove that receipt only after the whole process group
+        # has been confirmed dead; if the parent crashes first, restart can
+        # validate the receipt against the durable target identity.
+        marker_file = self._marker_file_for(runtime.snapshot.id)
+        if marker_file is not None:
+            with suppress(OSError):
+                marker_file.unlink(missing_ok=True)
         if process.returncode != 0:
             # C-146 P0-1: surface the REAL operation's failure provenance. The
             # worker emits a structured marker (exception CLASS + HTTP status

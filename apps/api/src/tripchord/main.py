@@ -46,6 +46,8 @@ from tripchord.agents.flexible_live_system import (
 )
 from tripchord.agents.live_advisory import AgenticRunSummary
 from tripchord.agents.live_jobs import (
+    DURABLE_LIVE_PLANNING_BOUNDARY,
+    NON_DURABLE_LIVE_PLANNING_BOUNDARY,
     TERMINAL_LIVE_PLANNING_JOB_STATES,
     LiveJobProgressReporter,
     LiveJobWorkerCommand,
@@ -1159,6 +1161,11 @@ async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
             if live_job_registry_startup is None:
                 continue
             try:
+                # Re-scan authenticated worker markers before every recovery
+                # claim.  A supervisor may start while an older lease is still
+                # valid; claiming after expiry must first prove/stop the old
+                # worker, rather than allowing a second executor to overlap it.
+                await live_job_registry_startup.restore_after_restart()
                 for tenant_id in await live_planning_job_store.list_tenants():
                     await live_job_registry_startup.recover_durable(
                         tenant_id=tenant_id,
@@ -3276,6 +3283,14 @@ def _build_live_flexible_from_text_worker_command(
     )
 
 
+def _live_planning_job_boundary(registry: LivePlanningJobRegistry) -> str:
+    return (
+        DURABLE_LIVE_PLANNING_BOUNDARY
+        if registry.durable_store_configured
+        else NON_DURABLE_LIVE_PLANNING_BOUNDARY
+    )
+
+
 @app.post(
     "/api/v1/agents/live-flexible-plan-from-text/jobs",
     response_model=StartLiveFlexibleFromTextJobResponse,
@@ -3397,6 +3412,7 @@ async def start_live_flexible_from_text_job_endpoint(
                     replayed=False,
                     status_url=status_url,
                     events_url=f"{status_url}/events",
+                    boundary=_live_planning_job_boundary(registry),
                 )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3408,6 +3424,7 @@ async def start_live_flexible_from_text_job_endpoint(
         replayed=replayed,
         status_url=status_url,
         events_url=f"{status_url}/events",
+        boundary=_live_planning_job_boundary(registry),
     )
 
 

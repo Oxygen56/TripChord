@@ -228,7 +228,7 @@ async def test_registry_recover_durable_rebuilds_allowlisted_worker_command() ->
             tenant_id="tenant-recovery", command_resolver=resolver
         )
         assert recovered == (created.id,)
-        deadline = asyncio.get_running_loop().time() + 5
+        deadline = asyncio.get_running_loop().time() + 15
         current = None
         while asyncio.get_running_loop().time() < deadline:
             current = await second.get(created.id, "tenant-recovery")

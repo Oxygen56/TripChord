@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -67,6 +68,18 @@ def _atomic_write(path: Path, payload: dict[str, object]) -> None:
         os.fsync(handle.fileno())
     os.chmod(temporary, 0o600)
     os.replace(temporary, path)
+
+
+_RECEIPT_IDENTITY_KEYS = (
+    "pid",
+    "pgid",
+    "marker",
+    "probe_path",
+    "tenant_id",
+    "lease_owner",
+    "lease_generation",
+    "job_id",
+)
 
 
 def _load_entry(module_path: str, entry: str) -> Any:
@@ -119,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
                 "pgid": os.getpgrp(),
                 "marker": args.marker,
                 "probe_path": args.probe_path,
+                "job_id": marker_kwargs.get("job_id"),
                 "tenant_id": marker_kwargs.get("tenant_id"),
                 "lease_owner": marker_kwargs.get("lease_owner"),
                 "lease_generation": marker_kwargs.get("lease_generation"),
@@ -183,11 +197,41 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("live planning job worker failed\n")
         exit_code = 1
     finally:
-        # Clean exit removes the durable orphan marker. An abrupt kill leaves it
-        # so a cold start can discover + clean the orphan.
+        # A clean worker exit leaves an authenticated terminal receipt. The
+        # parent removes it only after it proves the whole process group is
+        # gone; an abrupt kill leaves the original live marker instead.
         if marker_file is not None:
+            # Never inherit the on-disk marker: a reaper may have replaced it
+            # with an authenticated-cleanup receipt lacking worker identity.
+            source = {
+                "pid": os.getpid(),
+                "pgid": os.getpgrp(),
+                "marker": args.marker,
+                "probe_path": args.probe_path,
+                "tenant_id": marker_kwargs.get("tenant_id"),
+                "lease_owner": marker_kwargs.get("lease_owner"),
+                "lease_generation": marker_kwargs.get("lease_generation"),
+                "job_id": marker_kwargs.get("job_id"),
+            }
+            receipt = {key: source.get(key) for key in _RECEIPT_IDENTITY_KEYS}
+            receipt.update(
+                {
+                    "schema": "tripchord.live-terminal-exit.v1",
+                    "job_id": marker_kwargs.get("job_id"),
+                    "terminal_exit": True,
+                    "exit_code": exit_code,
+                    "exited_at": datetime.now(UTC).isoformat(),
+                    "digest": "",
+                }
+            )
+            canonical = json.dumps(
+                {key: value for key, value in receipt.items() if key != "digest"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            receipt["digest"] = hashlib.sha256(canonical).hexdigest()
             with suppress(OSError):
-                marker_file.unlink(missing_ok=True)
+                _atomic_write(marker_file, receipt)
     return exit_code
 
 

@@ -65,6 +65,7 @@ packages = ["apps/api/src/tripchord"]
 testpaths = ["apps/api/tests", "benchmarks/tests"]
 pythonpath = [".", "apps/api/src"]
 addopts = "-q"
+markers = ["integration: requires an external service such as PostgreSQL"]
 
 [tool.ruff]
 target-version = "py312"

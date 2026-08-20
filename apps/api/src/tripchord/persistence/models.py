@@ -230,6 +230,28 @@ class LivePlanningJobRow(Base):
     lease_generation: Mapped[int] = mapped_column(Integer, default=0)
     cancel_target_owner: Mapped[str | None] = mapped_column(String(200), nullable=True)
     cancel_target_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # A reaper owns this fence while it authenticates and stops an orphaned
+    # worker.  A row with an active reaper is deliberately not claimable.
+    reap_owner: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    reap_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reap_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reap_target_owner: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    reap_target_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reap_controller: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    reap_pgid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reap_marker_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reap_proof_kind: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    reap_proof_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reap_authenticated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reap_death_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class LivePlanningPairResultRow(Base):

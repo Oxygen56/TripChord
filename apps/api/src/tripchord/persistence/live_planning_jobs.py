@@ -8,6 +8,7 @@ the repository and can only publish through these guarded transitions.
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -118,6 +119,7 @@ class DurableLivePlanningJobRepository:
                 select(LivePlanningJobRow).where(
                     LivePlanningJobRow.tenant_id == self._tenant_id,
                     LivePlanningJobRow.state == LivePlanningJobState.QUEUED.value,
+                    LivePlanningJobRow.reap_owner.is_(None),
                 )
             )
         ).all()
@@ -126,12 +128,25 @@ class DurableLivePlanningJobRepository:
                 select(LivePlanningJobRow).where(
                     LivePlanningJobRow.tenant_id == self._tenant_id,
                     LivePlanningJobRow.state == LivePlanningJobState.RUNNING.value,
+                    LivePlanningJobRow.reap_owner.is_(None),
                     (LivePlanningJobRow.lease_expires_at.is_(None))
                     | (LivePlanningJobRow.lease_expires_at < now),
                 )
             )
         ).all()
         return tuple(row.id for row in (*queued, *expired))
+
+    async def list_expired_reaping(self) -> tuple[str, ...]:
+        now = utc_now()
+        rows = await self._session.scalars(
+            select(LivePlanningJobRow).where(
+                LivePlanningJobRow.tenant_id == self._tenant_id,
+                LivePlanningJobRow.reap_owner.is_not(None),
+                LivePlanningJobRow.reap_expires_at.is_not(None),
+                LivePlanningJobRow.reap_expires_at < now,
+            )
+        )
+        return tuple(row.id for row in rows.all())
 
     async def list_tenants(self) -> tuple[str, ...]:
         rows = await self._session.scalars(select(LivePlanningJobRow.tenant_id).distinct())
@@ -257,6 +272,9 @@ class DurableLivePlanningJobRepository:
         row = await self._locked(job_id)
         snapshot = LivePlanningJobSnapshot.model_validate(row.snapshot)
         now = utc_now()
+        if row.reap_owner is not None:
+            await self._session.rollback()
+            return None
         if snapshot.state == LivePlanningJobState.QUEUED or (
             snapshot.state == LivePlanningJobState.RUNNING
             and (row.lease_expires_at is None or _aware(row.lease_expires_at) < now)
@@ -531,8 +549,11 @@ class DurableLivePlanningJobStore:
     retain coroutine handles, but never a second in-memory snapshot authority.
     """
 
-    def __init__(self, database: Any) -> None:
+    def __init__(self, database: Any, *, reap_lease_seconds: int = 300) -> None:
         self._database = database
+        if reap_lease_seconds < 1:
+            raise ValueError("reap_lease_seconds must be at least one second")
+        self._reap_lease_seconds = reap_lease_seconds
 
     def _repo(self, session: AsyncSession, tenant_id: str) -> DurableLivePlanningJobRepository:
         return DurableLivePlanningJobRepository(session, tenant_id)
@@ -555,14 +576,30 @@ class DurableLivePlanningJobStore:
         async with self._database.sessions() as session:
             return await self._repo(session, tenant_id).list_recoverable()
 
+    async def list_expired_reaping(self, *, tenant_id: str) -> tuple[str, ...]:
+        async with self._database.sessions() as session:
+            return await self._repo(session, tenant_id).list_expired_reaping()
+
     async def list_tenants(self) -> tuple[str, ...]:
         async with self._database.sessions() as session:
             return await self._repo(session, "anonymous").list_tenants()
 
     async def authorize_orphan_reap(
-        self, job_id: str, *, tenant_id: str, owner: str | None, generation: int | None
-    ) -> bool:
-        """Authorize killing a marker only when its exact lease is not active."""
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        owner: str | None,
+        generation: int | None,
+        reaper_id: str,
+    ) -> str | None:
+        """Acquire an atomic, non-claimable fence for orphan cleanup.
+
+        The lease is fenced immediately, but the row remains blocked from
+        claiming until the caller proves authentication and process death via
+        :meth:`complete_orphan_reap`.  This closes the window between the
+        database check and the actual process kill.
+        """
         async with self._database.sessions() as session:
             row = await session.scalar(
                 select(LivePlanningJobRow)
@@ -573,21 +610,53 @@ class DurableLivePlanningJobStore:
                 )
             )
             if row is None:
-                return False
+                return None
             if owner is None or generation is None:
                 await session.rollback()
-                return False
+                return None
+            now = utc_now()
+            expired_reap = False
+            if row.reap_owner is not None:
+                if row.reap_expires_at is not None and _aware(row.reap_expires_at) <= now:
+                    # A crashed cleanup owner may be replaced, but only under
+                    # the same row lock used by claim/lease fencing.
+                    expired_reap = True
+                    if (
+                        row.reap_target_owner != owner
+                        or row.reap_target_generation != generation
+                        or row.lease_generation != generation + 1
+                    ):
+                        await session.rollback()
+                        return None
+                else:
+                    # A previous reaper may have died after confirming the
+                    # process group but before clearing this row.  Returning
+                    # the still-valid token lets the next startup complete
+                    # the same fenced transition; it does not grant claim.
+                    if (
+                        row.reap_target_owner != owner
+                        or row.reap_target_generation != generation
+                        or row.reap_controller != reaper_id
+                    ):
+                        await session.rollback()
+                        return None
+                    token = row.reap_owner if isinstance(row.reap_owner, str) else None
+                    await session.rollback()
+                    return token
             snapshot = LivePlanningJobSnapshot.model_validate(row.snapshot)
             exact_generation = row.lease_generation == generation
             cancelled_generation = (
                 snapshot.cancel_pending and row.lease_generation == generation + 1
             )
-            if (not exact_generation and not cancelled_generation) or row.lease_owner not in {
+            if (
+                not expired_reap
+                and ((not exact_generation and not cancelled_generation) or row.lease_owner not in {
                 owner,
                 None,
-            }:
+                })
+            ):
                 await session.rollback()
-                return False
+                return None
             if (
                 row.lease_owner == owner
                 and row.lease_expires_at is not None
@@ -595,13 +664,238 @@ class DurableLivePlanningJobStore:
                 and not snapshot.cancel_pending
             ):
                 await session.rollback()
-                return False
-            if not cancelled_generation:
+                return None
+            if not expired_reap and not cancelled_generation:
                 row.lease_generation += 1
             row.lease_owner = None
-            row.lease_expires_at = utc_now()
+            row.lease_expires_at = now
+            reap_token = f"reaper:{secrets.token_urlsafe(24)}"
+            row.reap_owner = reap_token
+            row.reap_generation = generation
+            row.reap_expires_at = now + timedelta(seconds=self._reap_lease_seconds)
+            row.reap_target_owner = owner
+            row.reap_target_generation = generation
+            row.reap_controller = reaper_id
+            updated = snapshot.model_copy(
+                update={
+                    "stage": "reaping",
+                    "error": "worker cleanup is pending confirmed process death",
+                    "revision": snapshot.revision + 1,
+                    "updated_at": now,
+                }
+            )
+            row.state = updated.state.value
+            row.version = updated.revision
+            row.snapshot = updated.model_dump(mode="json")
+            await session.commit()
+            return reap_token
+
+    async def quarantine_orphan_identity(self, job_id: str, *, reaper_id: str) -> bool:
+        """Fence a non-terminal job whose marker identity cannot be trusted."""
+        async with self._database.sessions() as session:
+            row = await session.scalar(
+                select(LivePlanningJobRow).with_for_update().where(
+                    LivePlanningJobRow.id == job_id
+                )
+            )
+            if row is None or row.reap_owner is not None:
+                await session.rollback()
+                return False
+            snapshot = LivePlanningJobSnapshot.model_validate(row.snapshot)
+            now = utc_now()
+            if snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES or (
+                row.lease_expires_at is not None and _aware(row.lease_expires_at) > now
+            ):
+                await session.rollback()
+                return False
+            target_owner = row.lease_owner
+            target_generation = row.lease_generation
+            if target_owner is None or target_generation < 1:
+                await session.rollback()
+                return False
+            row.lease_generation += 1
+            row.lease_owner = None
+            row.lease_expires_at = now
+            row.reap_owner = f"reaper:{secrets.token_urlsafe(24)}"
+            row.reap_generation = target_generation
+            row.reap_expires_at = now + timedelta(minutes=5)
+            row.reap_target_owner = target_owner
+            row.reap_target_generation = target_generation
+            row.reap_controller = reaper_id
+            updated = snapshot.model_copy(
+                update={
+                    "stage": "reaping",
+                    "error": "worker marker identity mismatch; manual cleanup required",
+                    "revision": snapshot.revision + 1,
+                    "updated_at": now,
+                }
+            )
+            row.state = updated.state.value
+            row.version = updated.revision
+            row.snapshot = updated.model_dump(mode="json")
             await session.commit()
             return True
+
+    async def complete_orphan_reap(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        owner: str,
+        generation: int,
+        reap_token: str,
+    ) -> bool:
+        """Release a reaping fence only after confirmed orphan death."""
+        async with self._database.sessions() as session:
+            row = await session.scalar(
+                select(LivePlanningJobRow)
+                .with_for_update()
+                .where(
+                    LivePlanningJobRow.id == job_id,
+                    LivePlanningJobRow.tenant_id == tenant_id,
+                )
+            )
+            if (
+                row is None
+                or row.reap_owner != reap_token
+                or row.reap_generation != generation
+                or row.reap_target_owner != owner
+                or row.reap_target_generation != generation
+                or row.reap_marker_digest is None
+                or row.reap_proof_kind not in {"worker_death", "spawn_absent"}
+                or row.reap_proof_verified_at is None
+                or (
+                    row.reap_proof_kind == "worker_death"
+                    and (
+                        row.reap_pgid is None
+                        or row.reap_authenticated_at is None
+                        or row.reap_death_confirmed_at is None
+                    )
+                )
+                or (
+                    row.reap_proof_kind == "spawn_absent"
+                    and (
+                        row.reap_pgid is not None
+                        or row.reap_authenticated_at is not None
+                        or row.reap_death_confirmed_at is not None
+                    )
+                )
+            ):
+                await session.rollback()
+                return False
+            row.reap_owner = None
+            row.reap_generation = None
+            row.reap_expires_at = None
+            row.reap_target_owner = None
+            row.reap_target_generation = None
+            row.reap_controller = None
+            row.reap_pgid = None
+            row.reap_marker_digest = None
+            row.reap_proof_kind = None
+            row.reap_proof_verified_at = None
+            row.reap_authenticated_at = None
+            row.reap_death_confirmed_at = None
+            await session.commit()
+            return True
+
+    async def record_orphan_reap_proof(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        owner: str,
+        generation: int,
+        reap_token: str,
+        pgid: int | None,
+        marker_digest: str,
+        proof_kind: str = "worker_death",
+    ) -> bool:
+        """Atomically persist authenticated and confirmed death evidence."""
+        async with self._database.sessions() as session:
+            row = await session.scalar(
+                select(LivePlanningJobRow).with_for_update().where(
+                    LivePlanningJobRow.id == job_id,
+                    LivePlanningJobRow.tenant_id == tenant_id,
+                )
+            )
+            if (
+                row is None
+                or row.reap_owner != reap_token
+                or row.reap_target_owner != owner
+                or row.reap_target_generation != generation
+                or proof_kind not in {"worker_death", "spawn_absent"}
+                or (proof_kind == "worker_death" and (type(pgid) is not int or pgid <= 0))
+                or (proof_kind == "spawn_absent" and pgid is not None)
+                or len(marker_digest) != 64
+                or any(char not in "0123456789abcdef" for char in marker_digest.lower())
+            ):
+                await session.rollback()
+                return False
+            now = utc_now()
+            row.reap_pgid = pgid
+            row.reap_marker_digest = marker_digest
+            row.reap_proof_kind = proof_kind
+            row.reap_proof_verified_at = now
+            row.reap_authenticated_at = now if proof_kind == "worker_death" else None
+            row.reap_death_confirmed_at = now if proof_kind == "worker_death" else None
+            await session.commit()
+            return True
+
+    async def consume_expired_orphan_reap_proof(
+        self, job_id: str, *, tenant_id: str
+    ) -> LivePlanningJobSnapshot | None:
+        """Consume a DB-backed proof after a reaper crashed before completion."""
+        async with self._database.sessions() as session:
+            row = await session.scalar(
+                select(LivePlanningJobRow).with_for_update().where(
+                    LivePlanningJobRow.id == job_id,
+                    LivePlanningJobRow.tenant_id == tenant_id,
+                )
+            )
+            if row is None or row.reap_owner is None:
+                await session.rollback()
+                return None
+            if row.reap_expires_at is None or _aware(row.reap_expires_at) > utc_now():
+                await session.rollback()
+                return None
+            if not (
+                row.reap_proof_verified_at is not None
+                and row.reap_marker_digest is not None
+                and row.reap_proof_kind in {"worker_death", "spawn_absent"}
+                and (
+                    (
+                        row.reap_proof_kind == "worker_death"
+                        and row.reap_pgid is not None
+                        and row.reap_authenticated_at is not None
+                        and row.reap_death_confirmed_at is not None
+                    )
+                    or (
+                        row.reap_proof_kind == "spawn_absent"
+                        and row.reap_pgid is None
+                        and row.reap_authenticated_at is None
+                        and row.reap_death_confirmed_at is None
+                    )
+                )
+                and row.reap_target_owner is not None
+                and row.reap_target_generation is not None
+            ):
+                await session.rollback()
+                return None
+            snapshot = LivePlanningJobSnapshot.model_validate(row.snapshot)
+            row.reap_owner = None
+            row.reap_generation = None
+            row.reap_expires_at = None
+            row.reap_target_owner = None
+            row.reap_target_generation = None
+            row.reap_controller = None
+            row.reap_pgid = None
+            row.reap_marker_digest = None
+            row.reap_proof_kind = None
+            row.reap_proof_verified_at = None
+            row.reap_authenticated_at = None
+            row.reap_death_confirmed_at = None
+            await session.commit()
+            return snapshot
 
     async def recovery_record(
         self, job_id: str, *, tenant_id: str

@@ -195,11 +195,19 @@ attempt, and refreshes its lease at stage transitions. Startup recovery enqueues
 persisted work again, while the database claim prevents a healthy job from being
 executed twice.
 
-This is separate from `POST /api/v1/agents/live-flexible-plan-from-text/jobs`.
-The latter is the cancellable browser-search control plane: it also supports a
-tenant-scoped `Idempotency-Key`, but its job registry and idempotency map are
-process-local. A restart loses those job records; it must not be described as
-database-backed recovery or a durable production queue.
+`POST /api/v1/agents/live-flexible-plan-from-text/jobs` uses the same durable
+control-plane principles when its registry is configured with PostgreSQL. The
+endpoint requires a tenant-scoped `Idempotency-Key`; job state, lease ownership,
+cancellation intent, the reconstructable no-secret worker command, and completed
+date-pair results survive an API restart. A replacement process may reclaim an
+expired lease and continue the unfinished date pairs, while owner/generation
+fencing rejects late writes from an older worker.
+
+This recovery contract is currently same-host and does not yet include the
+BrowserTaskBridge ledger, short-lived quote reuse, live-run projections, or
+preference storage. It must not be described as cross-host recovery,
+exactly-once provider side effects, or a delivery SLA. A registry created
+without the durable store reports an explicitly non-durable boundary.
 
 ## Data-source checklist
 

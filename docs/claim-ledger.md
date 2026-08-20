@@ -69,7 +69,7 @@
 | 历史 v3/canary 注入事件页面重查 | `benchmarks/results/live-flight-only-final-done-gate-2026-08-03.json` | 旧合同下由验收器注入携程住宿 `price_changed` 后仅重查一个精确住宿 Source，候选 v1→v2，保留率 75% | 不是平台自然涨价 push，也没有走当前 request-wide event ledger、global preflight 与 summary-combine 合同；不能作为当前事件预算链的真实 OTA 验证 |
 | synthetic `sold_out` 严格闭环 | `apps/api/tests/test_live_agent_system.py`、`benchmarks/tests/test_live_done_gate_v4_runner.py` | 离线测试覆盖排除原商品、同 provider 替换、确定性 Repair 删除 1/新增 1、主 Verifier、`EVENT_REVERIFICATION`、独立审计和事件安全门；contract 明示 `platform_sold_out_observed=false` | 不是平台售罄证据；当前 live strict 尚无可推荐初案，未进入该 live 事件阶段 |
 | 周期重核价 monitor | `apps/api/src/tripchord/agents/live_monitor.py`、`apps/api/tests/test_live_monitor.py`、`apps/api/tests/test_live_api.py` | 用户显式开启；进程内、租户隔离、有界、可取消；每轮重查一个组件并进入事件闭环 | 代码/测试层；不是供应商推送、后台常驻或生产监控 |
-| live 长任务控制面 | `apps/api/src/tripchord/agents/live_jobs.py`、`apps/api/tests/test_live_jobs.py`、`apps/api/tests/test_live_job_api.py`、`apps/web/src/api.test.ts` | POST 202、GET、SSE、DELETE；五态、tenant 隔离、容量/TTL、错误脱敏、取消传播；同 tenant 相同 key+payload 幂等复用，不同 payload 409 | 进程内，重启不恢复；不是持久化生产队列或交付 SLA |
+| live 长任务控制面 | `apps/api/src/tripchord/agents/live_jobs.py`、`apps/api/src/tripchord/persistence/live_planning_jobs.py`、`apps/api/tests/test_live_job_api.py`、`apps/api/tests/test_live_job_worker_http.py`、`apps/api/tests/test_live_planning_jobs_persistence.py`、`apps/api/tests/test_live_planning_jobs_postgres.py`、`apps/web/src/api.test.ts` | POST 202、GET、SSE、DELETE；tenant 隔离、幂等提交、租约代次、取消传播、逐日期结果持久化；同机 API/worker 中断后只恢复未完成日期，旧代迟到写入被拒绝 | PostgreSQL 17 集成测试与同机多进程边界；浏览器采集、短期报价和偏好存储尚未统一，不证明跨主机恢复、平台外部副作用恰好一次或交付 SLA |
 
 ## 评测与真实数据
 

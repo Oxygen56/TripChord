@@ -46,6 +46,7 @@ import pytest
 import tripchord.agents.live_jobs as live_jobs_module
 import tripchord.main as main_module
 from httpx import ASGITransport, AsyncClient
+from tripchord.agents import live_job_worker
 from tripchord.agents.live_jobs import (
     _QUARANTINE_HARD_STOPPED_STAGE,
     _QUARANTINE_ORPHAN_STAGE,
@@ -3330,3 +3331,107 @@ async def test_cold_load_settles_activation_when_worker_group_already_exited(
         assert settled.snapshot.stage == "restart_cancelled"
     finally:
         await restarted.close()
+
+
+def _receipt_allowlist_entry(
+    corrupt_marker_path: str | None = None,
+    cleanup_marker_path: str | None = None,
+    job_id: str | None = None,
+    tenant_id: str | None = None,
+    lease_owner: str | None = None,
+    lease_generation: int | None = None,
+    **_: object,
+) -> dict[str, str]:
+    if corrupt_marker_path is not None:
+        Path(corrupt_marker_path).write_text("{not-json", encoding="utf-8")
+    if cleanup_marker_path is not None and job_id is not None:
+        receipt: dict[str, object] = {
+            "schema": "tripchord.live-authenticated-cleanup.v1",
+            "job_id": job_id,
+            "marker": "nonce",
+            "pgid": os.getpgrp(),
+            "tenant_id": tenant_id,
+            "lease_owner": lease_owner,
+            "lease_generation": lease_generation,
+            "authenticated_cleanup": True,
+            "authenticated_at": datetime.now(UTC).isoformat(),
+            "digest": "",
+        }
+        receipt["digest"] = hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in receipt.items() if key != "digest"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        Path(cleanup_marker_path).write_text(json.dumps(receipt), encoding="utf-8")
+    return {"status": "ok"}
+
+
+@pytest.mark.parametrize("corrupt_marker", [False, True])
+def test_terminal_receipt_drops_runtime_args_and_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corrupt_marker: bool
+) -> None:
+    marker_file = tmp_path / "worker.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "live_job_worker",
+            "--module-path",
+            __file__,
+            "--entry",
+            "_receipt_allowlist_entry",
+            "--args-json",
+            json.dumps(
+                {
+                    "tenant_id": "tenant",
+                    "lease_owner": "owner",
+                    "lease_generation": 2,
+                    "payload": {"bridge_token": "SECRET"},
+                    "runtime_bundle": {"cookie": "SECRET"},
+                    "corrupt_marker_path": str(marker_file) if corrupt_marker else None,
+                }
+            ),
+            "--marker",
+            "nonce",
+            "--marker-file",
+            str(marker_file),
+        ],
+    )
+    assert live_job_worker.main() == 0
+    receipt = json.loads(marker_file.read_text(encoding="utf-8"))
+    assert set(receipt) == {
+        "pid", "pgid", "marker", "probe_path", "tenant_id", "lease_owner",
+        "lease_generation", "job_id", "schema", "terminal_exit", "exit_code",
+        "exited_at", "digest",
+    }
+    assert "SECRET" not in json.dumps(receipt)
+
+
+def test_terminal_receipt_rebuilds_identity_after_cleanup_receipt_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker_file = tmp_path / "worker.json"
+    job_id = "live-job-550e8400-e29b-41d4-a716-446655440000"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "live_job_worker", "--module-path", __file__, "--entry", "_receipt_allowlist_entry",
+            "--args-json", json.dumps({
+                "job_id": job_id, "tenant_id": "tenant", "lease_owner": "owner",
+                "lease_generation": 2, "cleanup_marker_path": str(marker_file),
+                "payload": {"bridge_token": "SECRET"},
+            }),
+            "--marker", "nonce", "--marker-file", str(marker_file),
+        ],
+    )
+    assert live_job_worker.main() == 0
+    receipt = json.loads(marker_file.read_text(encoding="utf-8"))
+    assert receipt["schema"] == "tripchord.live-terminal-exit.v1"
+    assert receipt["job_id"] == job_id
+    assert type(receipt["pid"]) is int and receipt["pid"] > 0
+    assert type(receipt["pgid"]) is int and receipt["pgid"] > 0
+    assert LivePlanningJobRegistry._validate_worker_receipt(receipt, job_id)
+    assert "SECRET" not in json.dumps(receipt)
