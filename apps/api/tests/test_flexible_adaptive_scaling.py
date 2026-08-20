@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import json
 from datetime import UTC, date, datetime
+from types import SimpleNamespace
 
 import pytest
 from tripchord.agents.adaptive_control import (
@@ -22,11 +23,14 @@ from tripchord.agents.agent_templates import AgentTemplateId, build_agent_templa
 from tripchord.agents.flexible_live_system import (
     FlexibleLiveAgentSystem,
     FlexiblePairExecution,
+    FlexiblePerformanceReport,
 )
+from tripchord.agents.live_advisory import AgenticRunSummary
 from tripchord.agents.live_system import (
     CandidateShardAgentRecord,
     CandidateShardMergeAudit,
     LiveCoverageMode,
+    LiveEvidenceScope,
     LivePackageAgentRun,
     LivePackageAgentSystem,
     LiveRunPurpose,
@@ -97,6 +101,23 @@ class _FullUniverseLiveRunner:
             )
         finally:
             self.active -= 1
+
+
+class _ConcreteModelFlagRunner(LivePackageAgentSystem):
+    """Concrete live-system shape that records scheduler model admission."""
+
+    def __init__(self) -> None:
+        self.model_flags: list[bool] = []
+
+    async def run(self, intent, query, *, model_agents_enabled=True, **kwargs):
+        self.model_flags.append(model_agents_enabled)
+        return _accepted_run(
+            intent,
+            query,
+            kwargs.get("mode", LiveCoverageMode.STRICT),
+            total_cents=900_000,
+            complete=True,
+        )
 
 
 class _AdaptiveQueryModel:
@@ -429,6 +450,159 @@ async def test_full_v4_window_runs_with_contiguous_acquisition_budget() -> None:
         for execution in result.pair_runs
         for item in execution.query_tasks
     ) == 290_000
+    assert result.performance_report is not None
+    assert result.performance_report.measurement_basis == "planned_only"
+    assert result.performance_report.planned_logical_query_count == 858
+    assert result.performance_report.planned_unique_acquisition_count == 648
+    assert result.performance_report.planned_deduplicated_query_count == 210
+    assert result.performance_report.executed_logical_query_count is None
+    assert result.performance_report.delegated_acquisition_count is None
+    assert result.performance_report.executed_deduplicated_query_count is None
+    assert result.performance_report.date_pair_count == 66
+    assert result.performance_report.completed_date_pair_count == 66
+    assert result.performance_report.failed_date_pair_count == 0
+    assert result.performance_report.max_source_start_delay_ms <= 290_000
+    assert result.performance_report.wall_time_seconds >= 0
+    assert result.performance_report.process_peak_rss_bytes > 0
+    assert result.performance_report.platform_acquisition_attempt_count is None
+    assert result.performance_report.recent_quote_reuse_count is None
+
+
+@pytest.mark.asyncio
+async def test_internal_benchmark_budget_is_530_seconds_without_changing_product_cap() -> None:
+    window = FlexibleTravelWindow(
+        origin="HGH",
+        destination="Tokyo",
+        earliest_departure=date(2026, 8, 1),
+        latest_departure=date(2026, 8, 1),
+        min_nights=3,
+        max_nights=3,
+        max_pairs=1,
+        adults=2,
+        rooms=1,
+    )
+    system = FlexibleLiveAgentSystem(
+        _FullUniverseLiveRunner(),
+        now=lambda: datetime(2026, 7, 1, tzinfo=UTC),
+    )
+    with pytest.raises(ValueError, match="530s"):
+        await system.run(
+            window,
+            max_pairs=1,
+            total_timeout_seconds=531,
+            internal_benchmark=True,
+        )
+    result = await system.run(
+        window,
+        max_pairs=1,
+        total_timeout_seconds=530,
+        internal_benchmark=True,
+    )
+    assert result.performance_report is not None
+    assert result.performance_report.internal_benchmark_budget_seconds == 530
+
+
+@pytest.mark.asyncio
+async def test_full_window_disables_concrete_per_pair_model_pipeline_even_without_refresh() -> None:
+    window = FlexibleTravelWindow(
+        origin="HGH",
+        destination="Tokyo",
+        earliest_departure=date(2026, 8, 1),
+        latest_departure=date(2026, 8, 11),
+        min_nights=3,
+        max_nights=8,
+        max_pairs=66,
+        adults=2,
+        rooms=1,
+    )
+    runner = _ConcreteModelFlagRunner()
+    result = await FlexibleLiveAgentSystem(
+        runner,
+        now=lambda: datetime(2026, 7, 1, tzinfo=UTC),
+    ).run(
+        window,
+        max_pairs=66,
+        publication_refresh_minimum_options=0,
+    )
+    assert len(result.pair_runs) == 66
+    assert runner.model_flags == [False] * 66
+    assert result.query_agentic.model_call_count == 0
+
+
+def test_performance_model_accounting_deduplicates_stable_run_identity_across_pairs() -> None:
+    summary = AgenticRunSummary.model_construct(
+        enabled=True,
+        required=True,
+        logical_request_count=2,
+        total_estimated_cost_usd=0.25,
+    )
+    shared = SimpleNamespace(
+        intent=SimpleNamespace(trip_id="shared-run"),
+        run_purpose=LiveRunPurpose.EXPLORATION_SELECTION,
+        evidence_scope=LiveEvidenceScope.FULL_SEARCH,
+        source_task_ids=("source-shared",),
+        agentic=summary,
+    )
+    execution = SimpleNamespace(exploration_run=shared, run=None)
+    assert FlexibleLiveAgentSystem._performance_model_metrics(
+        AgenticRunSummary(enabled=False, required=False),
+        (execution, execution),
+    ) == (2, 0.25)
+    distinct = SimpleNamespace(
+        intent=SimpleNamespace(trip_id="shared-run"),
+        run_purpose=LiveRunPurpose.EXPLORATION_SELECTION,
+        evidence_scope=LiveEvidenceScope.FULL_SEARCH,
+        source_task_ids=("source-distinct",),
+        agentic=summary,
+    )
+    assert FlexibleLiveAgentSystem._performance_model_metrics(
+        AgenticRunSummary(enabled=False, required=False),
+        (execution, SimpleNamespace(exploration_run=distinct, run=None)),
+    ) == (4, 0.5)
+    different_trip_same_sources = SimpleNamespace(
+        intent=SimpleNamespace(trip_id="different-trip"),
+        run_purpose=LiveRunPurpose.EXPLORATION_SELECTION,
+        evidence_scope=LiveEvidenceScope.FULL_SEARCH,
+        source_task_ids=("source-shared",),
+        agentic=summary,
+    )
+    assert FlexibleLiveAgentSystem._performance_model_metrics(
+        AgenticRunSummary(enabled=False, required=False),
+        (execution, SimpleNamespace(exploration_run=different_trip_same_sources, run=None)),
+    ) == (4, 0.5)
+
+
+def test_performance_report_keeps_retry_submit_calls_out_of_business_logical_count() -> None:
+    report = FlexiblePerformanceReport(
+        measurement_basis="observed",
+        wall_time_seconds=1,
+        planned_logical_query_count=1,
+        planned_unique_acquisition_count=1,
+        planned_deduplicated_query_count=0,
+        executed_logical_query_count=1,
+        delegate_submit_call_count=2,
+        delegated_acquisition_count=1,
+        executed_deduplicated_query_count=0,
+        ledger_shared_return_count=1,
+        platform_acquisition_attempt_count=1,
+        model_call_count=0,
+        model_cost_usd=0,
+        publication_refresh_delegated_acquisition_count=0,
+        publication_refresh_platform_acquisition_attempt_count=0,
+        recent_quote_reuse_count=0,
+        inflight_coalesced_count=0,
+        unclaimed_cancelled_count=0,
+        process_peak_rss_bytes=1,
+        cpu_time_seconds=0,
+        max_source_start_delay_ms=0,
+        date_pair_count=1,
+        completed_date_pair_count=1,
+        failed_date_pair_count=0,
+    )
+    assert report.executed_logical_query_count == 1
+    assert report.executed_deduplicated_query_count == 0
+    assert report.delegate_submit_call_count == 2
+    assert report.ledger_shared_return_count == 1
 
 
 @pytest.mark.asyncio

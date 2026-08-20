@@ -794,6 +794,12 @@ async def test_publication_refresh_bypasses_run_acquisition_ledger() -> None:
     )
     (first,) = await ledger.submit_many((exploration,))
     (second,) = await ledger.submit_many((refresh,))
+    assert ledger.metrics() == {
+        "delegate_submit_call_count": 1,
+        "exploration_delegated_acquisitions": 1,
+        "ledger_shared_return_count": 0,
+        "publication_refresh_delegated_acquisitions": 1,
+    }
     assert second.id != first.id
     assert len(bridge._records) == 2
     leases = await bridge.claim(
@@ -823,6 +829,115 @@ async def test_publication_refresh_bypasses_run_acquisition_ledger() -> None:
         BrowserTaskState.FAILED,
         BrowserTaskState.FAILED,
     ]
+    detailed = ledger.detailed_metrics()
+    assert detailed["platform_acquisition_attempt_count"] == 1
+    assert detailed["publication_refresh_platform_acquisition_attempt_count"] == 1
+
+
+def test_acquisition_ledger_attempt_metrics_distinguish_reuse_cancel_and_claim() -> None:
+    from tripchord.agents.flexible_live_system import _FlexibleAcquisitionLedger
+
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    ledger = _FlexibleAcquisitionLedger(bridge)
+    ledger.reset()
+    query = BrowserSearchQuery(
+        origin="HGH",
+        destination="MLE",
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 8),
+    )
+
+    def snapshot(task_id: str, *, attempts: int, state: BrowserTaskState) -> BrowserTaskSnapshot:
+        return BrowserTaskSnapshot(
+            id=task_id,
+            provider=BrowserProvider.CTRIP,
+            kind=BrowserVertical.FLIGHT,
+            query=query,
+            state=state,
+            created_at=NOW,
+            updated_at=NOW,
+            attempt_count=attempts,
+            reused_from_task_id=("prior-task" if task_id == "reuse" else None),
+        )
+
+    state = ledger._state.get()
+    assert state is not None
+    state[4].update(
+        {
+            "reuse": snapshot("reuse", attempts=0, state=BrowserTaskState.SUCCEEDED),
+            "cancel": snapshot("cancel", attempts=0, state=BrowserTaskState.CANCELLED),
+            "claimed-failure": snapshot(
+                "claimed-failure", attempts=1, state=BrowserTaskState.FAILED
+            ),
+            "refresh": snapshot("refresh", attempts=1, state=BrowserTaskState.FAILED),
+        }
+    )
+    state[5].add("refresh")
+    metrics = ledger.detailed_metrics()
+    assert metrics["platform_acquisition_attempt_count"] == 1
+    assert metrics["publication_refresh_platform_acquisition_attempt_count"] == 1
+    assert metrics["recent_quote_reuse_count"] == 1
+    assert metrics["inflight_coalesced_count"] == 0
+    assert metrics["unclaimed_cancelled_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_acquisition_ledger_records_real_reuse_and_unclaimed_cancel() -> None:
+    from tripchord.agents.flexible_live_system import _FlexibleAcquisitionLedger
+
+    from apps.api.tests.test_browser_bridge import quote
+
+    query = BrowserSearchQuery(
+        origin="HGH",
+        destination="MLE",
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 8),
+        options={"__tripchord_allow_recent_quote_reuse": True},
+    )
+    submission = BrowserTaskSubmission(
+        provider=BrowserProvider.CTRIP,
+        kind=BrowserVertical.FLIGHT,
+        reuse_partition_sha256="b" * 64,
+        query=query,
+    )
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    first_ledger = _FlexibleAcquisitionLedger(bridge)
+    first_ledger.reset()
+    (first,) = await first_ledger.submit_many((submission,))
+    (lease,) = await bridge.claim("reuse-seed", providers=(BrowserProvider.CTRIP,), limit=1)
+    await bridge.complete(
+        lease.task_id,
+        lease.claim_token,
+        BrowserTaskCompletion(
+            state=BrowserTaskState.SUCCEEDED,
+            quotes=(
+                quote(BrowserProvider.CTRIP, BrowserVertical.FLIGHT).model_copy(
+                    update={"captured_at": NOW}
+                ),
+            ),
+        ),
+    )
+    await first_ledger.wait_many((first.id,), timeout_seconds=2)
+
+    reuse_ledger = _FlexibleAcquisitionLedger(bridge)
+    reuse_ledger.reset()
+    (reused,) = await reuse_ledger.submit_many((submission,))
+    assert reused.attempt_count == 0
+    assert reused.reused_from_task_id == first.id
+    await reuse_ledger.wait_many((reused.id,), timeout_seconds=2)
+    reuse_metrics = reuse_ledger.detailed_metrics()
+    assert reuse_metrics["platform_acquisition_attempt_count"] == 0
+    assert reuse_metrics["recent_quote_reuse_count"] == 1
+
+    cancel_bridge = BrowserTaskBridge(now=lambda: NOW)
+    cancel_ledger = _FlexibleAcquisitionLedger(cancel_bridge)
+    cancel_ledger.reset()
+    (cancelled,) = await cancel_ledger.submit_many((submission,))
+    await cancel_ledger.cancel_many((cancelled.id,), reason="unclaimed cancellation probe")
+    (cancelled_terminal,) = await cancel_ledger.wait_many((cancelled.id,), timeout_seconds=2)
+    assert cancelled_terminal.attempt_count == 0
+    assert cancelled_terminal.state == BrowserTaskState.CANCELLED
+    assert cancel_ledger.detailed_metrics()["unclaimed_cancelled_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -869,6 +984,14 @@ async def test_acquisition_ledger_reuses_terminal_failure_and_cancelled_task() -
     (after_cancel,) = await ledger.submit_many((submission,))
     assert after_cancel.id == first.id
     assert len(bridge._records) == 1
+    assert ledger.metrics() == {
+        "delegate_submit_call_count": 3,
+        "exploration_delegated_acquisitions": 1,
+        "ledger_shared_return_count": 2,
+        "publication_refresh_delegated_acquisitions": 0,
+    }
+    await asyncio.sleep(0.01)
+    assert ledger.detailed_metrics()["platform_acquisition_attempt_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -1067,6 +1190,12 @@ async def test_acquisition_ledger_retains_648_terminal_outcomes_for_858_logical_
             for index in range(858)
         )
         snapshots = await ledger.submit_many(submissions)
+        assert ledger.metrics() == {
+            "delegate_submit_call_count": 858,
+            "exploration_delegated_acquisitions": 648,
+            "ledger_shared_return_count": 210,
+            "publication_refresh_delegated_acquisitions": 0,
+        }
         claimed = 0
         while claimed < 648:
             leases = await bridge.claim(
@@ -1100,6 +1229,10 @@ async def test_acquisition_ledger_retains_648_terminal_outcomes_for_858_logical_
         assert claimed == 648
         assert len(outcomes) == 858
         assert all(item.state == BrowserTaskState.FAILED for item in outcomes)
+        detailed = ledger.detailed_metrics()
+        assert detailed["platform_acquisition_attempt_count"] == 648
+        assert detailed["recent_quote_reuse_count"] == 0
+        assert detailed["unclaimed_cancelled_count"] == 0
 
 
 @pytest.mark.asyncio

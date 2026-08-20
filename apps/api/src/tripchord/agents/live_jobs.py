@@ -573,7 +573,9 @@ class LivePlanningPairCheckpoint(DomainModel):
 
     schema_version: str = "live-pair-checkpoint-v1"
     request_sha256: _Sha256
-    sequence: int = Field(ge=1, le=8)
+    # Keep the item boundary aligned with the durable snapshot capacity; the
+    # registry additionally enforces the same cap at the lifecycle boundary.
+    sequence: int = Field(ge=1, le=400)
     date_pair_id: _CheckpointId
     departure_date: date
     return_date: date
@@ -782,7 +784,10 @@ class LivePlanningJobSnapshot(DomainModel):
     model_trace_failure_count: int = Field(default=0, ge=0)
     pair_checkpoints: tuple[LivePlanningPairCheckpoint, ...] = Field(
         default=(),
-        max_length=8,
+        # Flexible-date runs persist one checkpoint per executed date pair;
+        # the public runner accepts up to 400 pairs, so the durable snapshot
+        # must not silently cap the internal 66-pair benchmark at eight.
+        max_length=400,
     )
     source_terminal_events: tuple[LiveSourceTerminalEvent, ...] = Field(
         default=(),
@@ -4478,6 +4483,8 @@ class LivePlanningJobRegistry:
             "error_class",
         }
         request_sha256 = runtime.snapshot.request_sha256
+        if request_sha256 is None:
+            raise RuntimeError("formal worker job request SHA-256 is missing")
         model_identity = spec.get("model_runtime_identity")
         allowed_models = (
             {
@@ -4607,31 +4614,53 @@ class LivePlanningJobRegistry:
             for item in raw_checkpoints
         )
         executions = response.run.pair_runs
-        if (
-            len(checkpoints) != len(executions)
-            or tuple(item.sequence for item in checkpoints)
-            != tuple(range(1, len(executions) + 1))
-            or any(
-                checkpoint.date_pair_id != execution.date_pair.id
-                or checkpoint.departure_date != execution.date_pair.departure_date
-                or checkpoint.return_date != execution.date_pair.return_date
-                or checkpoint.request_sha256 != request_sha256
-                for checkpoint, execution in zip(
-                    checkpoints,
-                    executions,
-                    strict=True,
-                )
-            )
-        ):
-            raise RuntimeError(
-                "formal worker pair checkpoints differ from its executed pairs"
-            )
+        LivePlanningJobRegistry._validate_formal_pair_checkpoint_alignment(
+            checkpoints,
+            executions,
+            request_sha256=request_sha256,
+        )
         capability = runtime.worker_execution_capability
         if capability is not None and (
             capability.get("terminal_job_id") != receipt["job_id"]
             or capability.get("request_sha256") != receipt["request_sha256"]
         ):
             raise RuntimeError("formal worker model receipt is bound to a foreign capability")
+
+    @staticmethod
+    def _validate_formal_pair_checkpoint_alignment(
+        checkpoints: tuple[LivePlanningPairCheckpoint, ...],
+        executions: Any,
+        *,
+        request_sha256: str,
+    ) -> None:
+        """Bind parallel checkpoint completion records to planned pairs.
+
+        The durable pair list is intentionally stable plan order, whereas
+        checkpoint records arrive in worker completion order.  Sequence and
+        uniqueness are checked on the checkpoint stream; immutable pair ids
+        bind it to the execution stream without requiring the two orders to
+        match.
+        """
+        execution_ids = tuple(execution.date_pair.id for execution in executions)
+        checkpoint_ids = tuple(checkpoint.date_pair_id for checkpoint in checkpoints)
+        executions_by_id = {execution.date_pair.id: execution for execution in executions}
+        if (
+            len(checkpoints) != len(executions)
+            or tuple(checkpoint.sequence for checkpoint in checkpoints)
+            != tuple(range(1, len(checkpoints) + 1))
+            or len(set(checkpoint_ids)) != len(checkpoint_ids)
+            or len(set(execution_ids)) != len(execution_ids)
+            or set(checkpoint_ids) != set(execution_ids)
+            or any(
+                checkpoint.request_sha256 != request_sha256
+                or checkpoint.departure_date
+                != executions_by_id[checkpoint.date_pair_id].date_pair.departure_date
+                or checkpoint.return_date
+                != executions_by_id[checkpoint.date_pair_id].date_pair.return_date
+                for checkpoint in checkpoints
+            )
+        ):
+            raise RuntimeError("formal worker pair checkpoints differ from its executed pairs")
 
     async def _replay_worker_observability(
         self,
@@ -5908,7 +5937,7 @@ class LivePlanningJobRegistry:
                 runtime.snapshot.request_sha256,
             ):
                 raise ValueError("live pair checkpoint request SHA-256 does not match its job")
-            if len(existing) >= 8:
+            if len(existing) >= 400:
                 raise ValueError("live pair checkpoint capacity exceeded")
             if validated.sequence != len(existing) + 1:
                 raise ValueError("live pair checkpoint sequence is not contiguous")

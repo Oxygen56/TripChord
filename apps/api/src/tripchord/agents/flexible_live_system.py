@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import json
 import os
+import resource
+import sys
 from collections.abc import Awaitable, Callable, Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -112,6 +114,7 @@ from tripchord.providers.browser_bridge import (
     BrowserProvider,
     BrowserSearchQuery,
     BrowserTaskSnapshot,
+    BrowserTaskState,
     BrowserTaskSubmission,
 )
 
@@ -143,6 +146,7 @@ _QUERY_STRATEGY_FRONTIER_LIMIT = 12
 _PUBLICATION_REFRESH_MODEL_AGENT_COUNT = 8
 _MAX_SOURCE_START_DELAY_MS = 900_000
 _FULL_WINDOW_FINALIZATION_BUFFER_SECONDS = 60
+INTERNAL_BENCHMARK_TOTAL_TIMEOUT_SECONDS = 530
 
 PairCheckpointReporter = Callable[[LivePlanningPairCheckpoint], Awaitable[None]]
 
@@ -175,12 +179,85 @@ class _FlexibleAcquisitionLedger:
                 asyncio.Lock,
                 dict[str, _FlexibleAcquisitionEntry],
                 dict[str, _FlexibleAcquisitionEntry],
+                dict[str, int],
+                dict[str, BrowserTaskSnapshot],
+                set[str],
             ]
             | None
         ] = ContextVar("flexible_acquisition_ledger_state", default=None)
 
     def reset(self) -> None:
-        self._state.set((asyncio.Lock(), {}, {}))
+        self._state.set(
+            (
+                asyncio.Lock(),
+                {},
+                {},
+                {
+                    "delegate_submit_call_count": 0,
+                    "exploration_delegated_acquisitions": 0,
+                    "ledger_shared_return_count": 0,
+                    "publication_refresh_delegated_acquisitions": 0,
+                },
+                {},
+                set(),
+            )
+        )
+
+    def metrics(self) -> dict[str, int]:
+        state = self._state.get()
+        if state is None:
+            return {
+                "delegate_submit_call_count": 0,
+                "exploration_delegated_acquisitions": 0,
+                "ledger_shared_return_count": 0,
+                "publication_refresh_delegated_acquisitions": 0,
+            }
+        return dict(state[3])
+
+    def detailed_metrics(self) -> dict[str, int]:
+        """Return scheduler counts plus terminal browser-attempt semantics."""
+        state = self._state.get()
+        if state is None:
+            return {
+                **self.metrics(),
+                "platform_acquisition_attempt_count": 0,
+                "publication_refresh_platform_acquisition_attempt_count": 0,
+                "recent_quote_reuse_count": 0,
+                "inflight_coalesced_count": 0,
+                "unclaimed_cancelled_count": 0,
+            }
+        _, _, _, base, terminal_snapshots, publication_task_ids = state
+        exploration_snapshots = tuple(
+            snapshot
+            for task_id, snapshot in terminal_snapshots.items()
+            if task_id not in publication_task_ids
+        )
+        publication_snapshots = tuple(
+            snapshot
+            for task_id, snapshot in terminal_snapshots.items()
+            if task_id in publication_task_ids
+        )
+        return {
+            **base,
+            "platform_acquisition_attempt_count": sum(
+                snapshot.attempt_count for snapshot in exploration_snapshots
+            ),
+            "publication_refresh_platform_acquisition_attempt_count": sum(
+                snapshot.attempt_count for snapshot in publication_snapshots
+            ),
+            "recent_quote_reuse_count": sum(
+                snapshot.reused_from_task_id is not None
+                for snapshot in exploration_snapshots
+            ),
+            "inflight_coalesced_count": sum(
+                snapshot.inflight_coalesced for snapshot in exploration_snapshots
+            ),
+            "unclaimed_cancelled_count": sum(
+                snapshot.state == BrowserTaskState.CANCELLED
+                and snapshot.attempt_count == 0
+                for snapshot in exploration_snapshots
+            ),
+        }
 
     @staticmethod
     def _key(submission: BrowserTaskSubmission) -> str:
@@ -216,7 +293,14 @@ class _FlexibleAcquisitionLedger:
         state = self._state.get()
         if state is None:
             return cast(tuple[BrowserTaskSnapshot, ...], await self._delegate.submit_many(values))
-        lock, entries_by_key, entries_by_task_id = state
+        (
+            lock,
+            entries_by_key,
+            entries_by_task_id,
+            metrics,
+            _terminal_snapshots,
+            publication_task_ids,
+        ) = state
         async with lock:
             snapshots: list[BrowserTaskSnapshot] = []
             for submission in values:
@@ -229,8 +313,11 @@ class _FlexibleAcquisitionLedger:
                     is False
                 ):
                     (snapshot,) = await self._delegate.submit_many((submission,))
+                    metrics["publication_refresh_delegated_acquisitions"] += 1
+                    publication_task_ids.add(snapshot.id)
                     snapshots.append(snapshot)
                     continue
+                metrics["delegate_submit_call_count"] += 1
                 key = self._key(submission)
                 entry = entries_by_key.get(key)
                 if entry is None:
@@ -247,6 +334,7 @@ class _FlexibleAcquisitionLedger:
                         }
                     )
                     (snapshot,) = await self._delegate.submit_many((ledger_submission,))
+                    metrics["exploration_delegated_acquisitions"] += 1
                     outcome: asyncio.Future[BrowserTaskSnapshot] = (
                         asyncio.get_running_loop().create_future()
                     )
@@ -260,6 +348,7 @@ class _FlexibleAcquisitionLedger:
                     snapshots.append(snapshot)
                     continue
                 entry.consumer_count += 1
+                metrics["ledger_shared_return_count"] += 1
                 snapshots.append(entry.initial_snapshot)
             return tuple(snapshots)
 
@@ -274,6 +363,9 @@ class _FlexibleAcquisitionLedger:
                 entry.outcome.set_exception(exc)
             return
         entry.terminal_snapshot = snapshot
+        state = self._state.get()
+        if state is not None:
+            state[4][snapshot.id] = snapshot
         if not entry.outcome.done():
             entry.outcome.set_result(snapshot)
 
@@ -294,7 +386,7 @@ class _FlexibleAcquisitionLedger:
                 tuple[BrowserTaskSnapshot, ...],
                 await self._delegate.wait_many(task_ids, timeout_seconds=timeout_seconds),
             )
-        _, _, entries_by_task_id = state
+        _, _, entries_by_task_id, _, terminal_snapshots, _ = state
         results: list[BrowserTaskSnapshot] = []
         for task_id in task_ids:
             entry = entries_by_task_id.get(task_id)
@@ -303,6 +395,7 @@ class _FlexibleAcquisitionLedger:
                     (task_id,),
                     timeout_seconds=timeout_seconds,
                 )
+                terminal_snapshots[direct_snapshot.id] = direct_snapshot
                 results.append(direct_snapshot)
                 continue
             try:
@@ -319,7 +412,7 @@ class _FlexibleAcquisitionLedger:
         state = self._state.get()
         if state is None:
             return await self._delegate.cancel_many(task_ids, reason=reason)
-        _, _, entries_by_task_id = state
+        _, _, entries_by_task_id, _, _, _ = state
         for task_id in task_ids:
             entry = entries_by_task_id.get(task_id)
             if entry is not None:
@@ -637,6 +730,101 @@ class FlexiblePairExecution(DomainModel):
         return self
 
 
+class FlexiblePerformanceReport(DomainModel):
+    """Run-level accounting for the internal flexible-search scheduler.
+
+    These counters describe TripChord's own orchestration, not provider
+    latency or a claim about how quickly an external platform responds.  The
+    report is attached to the durable run result so a benchmark and the
+    product API consume the same accounting rather than reconstructing it
+    from logs.
+    """
+
+    schema_version: str = Field(
+        default="tripchord-flexible-performance-v1",
+        pattern="^tripchord-flexible-performance-v1$",
+    )
+    measurement_basis: str = Field(pattern="^(observed|planned_only)$")
+    wall_time_seconds: float = Field(ge=0)
+    internal_benchmark_budget_seconds: int | None = Field(default=None, ge=1, le=600)
+    planned_logical_query_count: int = Field(ge=0)
+    planned_unique_acquisition_count: int = Field(ge=0)
+    planned_deduplicated_query_count: int = Field(ge=0)
+    executed_logical_query_count: int | None = Field(default=None, ge=0)
+    delegate_submit_call_count: int | None = Field(default=None, ge=0)
+    delegated_acquisition_count: int | None = Field(default=None, ge=0)
+    executed_deduplicated_query_count: int | None = Field(default=None, ge=0)
+    ledger_shared_return_count: int | None = Field(default=None, ge=0)
+    platform_acquisition_attempt_count: int | None = Field(default=None, ge=0)
+    model_call_count: int = Field(ge=0)
+    model_cost_usd: float = Field(ge=0)
+    publication_refresh_delegated_acquisition_count: int | None = Field(default=None, ge=0)
+    publication_refresh_platform_acquisition_attempt_count: int | None = Field(
+        default=None, ge=0
+    )
+    recent_quote_reuse_count: int | None = Field(default=None, ge=0)
+    inflight_coalesced_count: int | None = Field(default=None, ge=0)
+    unclaimed_cancelled_count: int | None = Field(default=None, ge=0)
+    process_peak_rss_bytes: int = Field(ge=0)
+    cpu_time_seconds: float = Field(ge=0)
+    max_source_start_delay_ms: int = Field(ge=0, le=_MAX_SOURCE_START_DELAY_MS)
+    date_pair_count: int = Field(ge=0)
+    completed_date_pair_count: int = Field(ge=0)
+    failed_date_pair_count: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> FlexiblePerformanceReport:
+        runtime_fields = (
+            self.executed_logical_query_count,
+            self.delegate_submit_call_count,
+            self.delegated_acquisition_count,
+            self.executed_deduplicated_query_count,
+            self.ledger_shared_return_count,
+            self.platform_acquisition_attempt_count,
+            self.publication_refresh_delegated_acquisition_count,
+            self.publication_refresh_platform_acquisition_attempt_count,
+            self.recent_quote_reuse_count,
+            self.inflight_coalesced_count,
+            self.unclaimed_cancelled_count,
+        )
+        if self.measurement_basis == "planned_only":
+            if any(value is not None for value in runtime_fields):
+                raise ValueError("planned-only report cannot contain runtime acquisition metrics")
+        elif any(value is None for value in runtime_fields):
+            raise ValueError("observed report requires all runtime acquisition metrics")
+        else:
+            assert self.executed_logical_query_count is not None
+            assert self.delegate_submit_call_count is not None
+            assert self.delegated_acquisition_count is not None
+            assert self.executed_deduplicated_query_count is not None
+            assert self.ledger_shared_return_count is not None
+            if self.delegated_acquisition_count > self.executed_logical_query_count:
+                raise ValueError("delegated acquisitions cannot exceed executed queries")
+            if self.delegate_submit_call_count < self.delegated_acquisition_count:
+                raise ValueError("delegate submit calls cannot be below acquisitions")
+            if self.ledger_shared_return_count != (
+                self.delegate_submit_call_count - self.delegated_acquisition_count
+            ):
+                raise ValueError("ledger shared returns must reconcile with delegate calls")
+            if self.executed_deduplicated_query_count + self.delegated_acquisition_count != (
+                self.executed_logical_query_count
+            ):
+                raise ValueError("executed query counts must reconcile")
+        if self.completed_date_pair_count + self.failed_date_pair_count > self.date_pair_count:
+            raise ValueError("date-pair result counts exceed planned date pairs")
+        if (
+            self.executed_logical_query_count is not None
+            and self.executed_logical_query_count > self.planned_logical_query_count
+        ):
+            raise ValueError("executed logical queries exceed the plan")
+        if (
+            self.delegated_acquisition_count is not None
+            and self.delegated_acquisition_count > self.planned_unique_acquisition_count
+        ):
+            raise ValueError("delegated acquisitions exceed the unique-acquisition plan")
+        return self
+
+
 class FlexibleRankedOption(DomainModel):
     rank: int = Field(ge=1)
     date_pair_id: str = Field(min_length=1)
@@ -719,6 +907,7 @@ class FlexibleLiveAgentRun(DomainModel):
     optimality_status: DateOptimalityStatus = DateOptimalityStatus.BEST_VERIFIED_IN_EVALUATED_SET
     admissible_bounds: tuple[AdmissibleCostBound, ...] = ()
     claim_boundary: str = Field(min_length=1)
+    performance_report: FlexiblePerformanceReport | None = None
 
     @model_validator(mode="after")
     def validate_adaptive_control_audit(self) -> FlexibleLiveAgentRun:
@@ -964,6 +1153,52 @@ class FlexibleLiveAgentSystem:
                 self._acquisition_ledger = _FlexibleAcquisitionLedger(bridge)
                 cast(Any, live_system)._bridge = self._acquisition_ledger
 
+    @staticmethod
+    def _process_peak_rss_bytes() -> int:
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # macOS reports bytes; Linux and most other Unix platforms report KiB.
+        return value if sys.platform == "darwin" else value * 1024
+
+    @staticmethod
+    def _process_cpu_seconds() -> float:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return max(0.0, float(usage.ru_utime + usage.ru_stime))
+
+    @staticmethod
+    def _performance_model_metrics(
+        query_agentic: AgenticRunSummary,
+        executions: tuple[FlexiblePairExecution, ...],
+    ) -> tuple[int, float]:
+        """Aggregate model facts without counting an execution twice."""
+
+        model_calls = query_agentic.logical_request_count
+        model_cost = query_agentic.total_estimated_cost_usd
+        seen: set[tuple[str, LiveRunPurpose, LiveEvidenceScope, object]] = set()
+        for execution in executions:
+            for live_run in (execution.exploration_run, execution.run):
+                if live_run is None:
+                    continue
+                # A publication refresh keeps the exploration run on the
+                # execution for auditability.  Source task IDs are the stable
+                # run receipt identity; unlike object ids, they survive
+                # serialization and distinguish separate date-pair runs that
+                # happen to share a trip id.
+                source_task_ids = tuple(getattr(live_run, "source_task_ids", ()))
+                run_key = (
+                    live_run.intent.trip_id,
+                    live_run.run_purpose,
+                    live_run.evidence_scope,
+                    source_task_ids
+                    if source_task_ids
+                    else live_run.intent.trip_id,
+                )
+                if run_key in seen:
+                    continue
+                seen.add(run_key)
+                model_calls += live_run.agentic.logical_request_count
+                model_cost += live_run.agentic.total_estimated_cost_usd
+        return model_calls, model_cost
+
     @request_agent_budgeted
     async def run(
         self,
@@ -983,7 +1218,10 @@ class FlexibleLiveAgentSystem:
         checkpoint_request_sha256: str | None = None,
         search_run_recorder: SearchRunRecorder | None = None,
         reference_date: date | None = None,
+        internal_benchmark: bool = False,
     ) -> FlexibleLiveAgentRun:
+        run_started = self._monotonic()
+        cpu_started = self._process_cpu_seconds()
         if self._acquisition_ledger is not None:
             self._acquisition_ledger.reset()
         budget_ledger = current_agent_budget()
@@ -1015,6 +1253,11 @@ class FlexibleLiveAgentSystem:
             )
         if not 60 <= total_timeout_seconds <= 600:
             raise ValueError("flexible total timeout supports 60 to 600 seconds")
+        if internal_benchmark and total_timeout_seconds > INTERNAL_BENCHMARK_TOTAL_TIMEOUT_SECONDS:
+            raise ValueError(
+                "internal flexible benchmark hard budget is "
+                f"{INTERNAL_BENCHMARK_TOTAL_TIMEOUT_SECONDS}s"
+            )
         if not 0 <= publication_refresh_minimum_options <= 2:
             raise ValueError("publication refresh supports zero to two final options")
         if pair_checkpoint_reporter is not None and (
@@ -1236,7 +1479,6 @@ class FlexibleLiveAgentSystem:
         bulk_exploration = (
             isinstance(self._live, LivePackageAgentSystem)
             and effective_exact_pair_budget == exploration.universe_size
-            and publication_refresh_minimum_options > 0
         )
         provider_lane_lock = asyncio.Lock()
         provider_next_available_ms = {
@@ -1896,6 +2138,108 @@ class FlexibleLiveAgentSystem:
             f"{optimality_status.value}。没有同时证明本次旅客总价和其余必要成本均为非负"
             "的 admissible bound 时，不进行日期分支剪枝。"
         )
+        model_call_count, model_cost_usd = self._performance_model_metrics(
+            query_agentic,
+            executions,
+        )
+        source_delays = tuple(
+            delay
+            for execution in executions
+            for delay in execution.source_start_delays_ms.values()
+        )
+        planned_logical_query_count = query_plan.logical_task_count
+        planned_unique_acquisition_count = query_plan.unique_acquisition_count
+        acquisition_metrics = (
+            self._acquisition_ledger.detailed_metrics()
+            if self._acquisition_ledger is not None
+            else {}
+        )
+        observed = bool(acquisition_metrics)
+        # The public logical-query denominator is the frozen execution plan.
+        # A retryable terminal failure may call submit_many again; that
+        # diagnostic submission count must not inflate the plan's logical
+        # query count or make an otherwise valid report self-invalidate.
+        logical_query_count = planned_logical_query_count
+        delegated_acquisition_count = acquisition_metrics.get(
+            "exploration_delegated_acquisitions", 0
+        )
+        if not observed:
+            delegated_acquisition_count = planned_unique_acquisition_count
+        if delegated_acquisition_count > logical_query_count:
+            raise RuntimeError(
+                "acquisition ledger observed more delegated acquisitions than logical submissions"
+            )
+        deduplicated_query_count = logical_query_count - delegated_acquisition_count
+        platform_acquisition_attempt_count = (
+            acquisition_metrics.get("platform_acquisition_attempt_count")
+            if observed
+            else None
+        )
+        publication_refresh_platform_acquisition_attempt_count = (
+            acquisition_metrics.get(
+                "publication_refresh_platform_acquisition_attempt_count"
+            )
+            if observed
+            else None
+        )
+        performance_report = FlexiblePerformanceReport(
+            wall_time_seconds=max(0.0, self._monotonic() - run_started),
+            internal_benchmark_budget_seconds=(
+                INTERNAL_BENCHMARK_TOTAL_TIMEOUT_SECONDS if internal_benchmark else None
+            ),
+            measurement_basis="observed" if observed else "planned_only",
+            planned_logical_query_count=planned_logical_query_count,
+            planned_unique_acquisition_count=planned_unique_acquisition_count,
+            planned_deduplicated_query_count=(
+                planned_logical_query_count - planned_unique_acquisition_count
+            ),
+            executed_logical_query_count=logical_query_count if observed else None,
+            delegate_submit_call_count=(
+                acquisition_metrics.get("delegate_submit_call_count") if observed else None
+            ),
+            delegated_acquisition_count=delegated_acquisition_count if observed else None,
+            executed_deduplicated_query_count=(
+                deduplicated_query_count if observed else None
+            ),
+            ledger_shared_return_count=(
+                acquisition_metrics.get("ledger_shared_return_count") if observed else None
+            ),
+            platform_acquisition_attempt_count=platform_acquisition_attempt_count,
+            model_call_count=model_call_count,
+            model_cost_usd=model_cost_usd,
+            publication_refresh_delegated_acquisition_count=(
+                acquisition_metrics.get("publication_refresh_delegated_acquisitions")
+                if observed
+                else None
+            ),
+            publication_refresh_platform_acquisition_attempt_count=(
+                publication_refresh_platform_acquisition_attempt_count
+            ),
+            recent_quote_reuse_count=(
+                acquisition_metrics.get("recent_quote_reuse_count") if observed else None
+            ),
+            inflight_coalesced_count=(
+                acquisition_metrics.get("inflight_coalesced_count") if observed else None
+            ),
+            unclaimed_cancelled_count=(
+                acquisition_metrics.get("unclaimed_cancelled_count") if observed else None
+            ),
+            process_peak_rss_bytes=self._process_peak_rss_bytes(),
+            cpu_time_seconds=max(0.0, self._process_cpu_seconds() - cpu_started),
+            max_source_start_delay_ms=max(source_delays, default=0),
+            date_pair_count=len(query_plan.selected_pair_ids),
+            completed_date_pair_count=completed_exploration_count,
+            failed_date_pair_count=failed_exploration_count,
+        )
+        if (
+            internal_benchmark
+            and performance_report.wall_time_seconds
+            > INTERNAL_BENCHMARK_TOTAL_TIMEOUT_SECONDS
+        ):
+            raise TimeoutError(
+                "internal flexible benchmark exceeded its 530s wall-clock budget: "
+                f"{performance_report.wall_time_seconds:.3f}s"
+            )
         return FlexibleLiveAgentRun(
             requested_window=window,
             effective_window=effective_window,
@@ -1924,6 +2268,7 @@ class FlexibleLiveAgentSystem:
             optimality_status=optimality_status,
             admissible_bounds=admissible_bounds,
             claim_boundary=claim_boundary,
+            performance_report=performance_report,
         )
 
     async def _refresh_execution_for_publication(

@@ -7,6 +7,7 @@ import os
 from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -55,11 +56,11 @@ def _pair_checkpoint(
         "sequence": sequence,
         "request_sha256": request_sha256,
         "date_pair_id": f"date-pair:{sequence}",
-        "departure_date": date(2026, 8, sequence),
-        "return_date": date(2026, 8, sequence + 5),
+        "departure_date": date(2026, 1, 1) + timedelta(days=sequence),
+        "return_date": date(2026, 1, 1) + timedelta(days=sequence + 5),
         "state": state,
         "query_task_ids": tuple(f"source-{sequence}-{index}" for index in range(11)),
-        "captured_at": datetime(2026, 8, 4, 8, sequence, tzinfo=UTC),
+        "captured_at": datetime(2026, 8, 4, 8, tzinfo=UTC) + timedelta(minutes=sequence),
     }
     if state == LivePlanningPairCheckpointState.FAILED:
         return LivePlanningPairCheckpoint.create(
@@ -318,6 +319,120 @@ async def test_pair_checkpoints_accumulate_and_survive_terminal_failure_with_ten
     assert "provider.invalid" not in serialized
     assert failed.pair_checkpoints[1].failure_class == "TimeoutError"
     await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_formal_job_retains_all_sixty_six_pair_checkpoints_and_rejects_401st() -> None:
+    registry = LivePlanningJobRegistry()
+
+    async def operation(report: Any) -> dict[str, Any]:
+        for sequence in range(1, 67):
+            await report.report_pair_checkpoint(_pair_checkpoint(sequence))
+        return {}
+
+    job = await registry.start(
+        tenant_id="tenant-a",
+        operation=operation,
+        request_digest=REQUEST_SHA256,
+    )
+    await asyncio.sleep(0.05)
+    await _wait_for_state(registry, job.id, "tenant-a", LivePlanningJobState.SUCCEEDED)
+    completed = await registry.get(job.id, "tenant-a")
+    assert completed is not None
+    assert tuple(item.sequence for item in completed.pair_checkpoints) == tuple(range(1, 67))
+    assert tuple(item.date_pair_id for item in completed.pair_checkpoints) == tuple(
+        f"date-pair:{sequence}" for sequence in range(1, 67)
+    )
+    reloaded = LivePlanningJobSnapshot.model_validate_json(completed.model_dump_json())
+    assert len(reloaded.pair_checkpoints) == 66
+
+    rejected = asyncio.Event()
+
+    async def overflow_operation(report: Any) -> dict[str, Any]:
+        for sequence in range(1, 402):
+            try:
+                await report.report_pair_checkpoint(_pair_checkpoint(sequence))
+            except ValueError as exc:
+                if sequence == 401 and "less than or equal to 400" in str(exc):
+                    rejected.set()
+                    break
+                raise
+        return {}
+
+    await registry.close()
+    overflow_registry = LivePlanningJobRegistry()
+    overflow = await overflow_registry.start(
+        tenant_id="tenant-a",
+        operation=overflow_operation,
+        request_digest=REQUEST_SHA256,
+    )
+    await asyncio.sleep(0.05)
+    await _wait_for_state(
+        overflow_registry,
+        overflow.id,
+        "tenant-a",
+        LivePlanningJobState.SUCCEEDED,
+    )
+    assert rejected.is_set()
+    overflow_snapshot = await overflow_registry.get(overflow.id, "tenant-a")
+    assert overflow_snapshot is not None
+    assert len(overflow_snapshot.pair_checkpoints) == 400
+    await overflow_registry.close()
+
+
+def test_formal_worker_binds_parallel_checkpoints_by_pair_id_not_position() -> None:
+    executions = tuple(
+        SimpleNamespace(
+            date_pair=SimpleNamespace(
+                id=f"date-pair:{pair}",
+                departure_date=date(2026, 1, 1) + timedelta(days=pair),
+                return_date=date(2026, 1, 1) + timedelta(days=pair + 5),
+            )
+        )
+        for pair in (1, 2, 3)
+    )
+    by_pair = {execution.date_pair.id: execution for execution in executions}
+    # Completion order is 3, 1, 2, but checkpoint sequence remains the
+    # contiguous completion sequence 1, 2, 3.  Final pair_runs stay plan
+    # order and must still bind successfully.
+    checkpoints = tuple(
+        _pair_checkpoint(sequence).model_copy(
+            update={
+                "date_pair_id": pair_id,
+                "departure_date": by_pair[pair_id].date_pair.departure_date,
+                "return_date": by_pair[pair_id].date_pair.return_date,
+            }
+        )
+        for sequence, pair_id in enumerate(
+            ("date-pair:3", "date-pair:1", "date-pair:2"),
+            start=1,
+        )
+    )
+    LivePlanningJobRegistry._validate_formal_pair_checkpoint_alignment(
+        checkpoints,
+        executions,
+        request_sha256=REQUEST_SHA256,
+    )
+
+    for invalid in (
+        checkpoints[:-1],  # missing planned pair
+        (
+            *checkpoints[:-1],
+            checkpoints[-1].model_copy(update={"date_pair_id": "date-pair:1"}),
+        ),
+        (
+            *checkpoints[:-1],
+            checkpoints[-1].model_copy(
+                update={"departure_date": date(2030, 1, 1)},
+            ),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="checkpoints differ"):
+            LivePlanningJobRegistry._validate_formal_pair_checkpoint_alignment(
+                invalid,
+                executions,
+                request_sha256=REQUEST_SHA256,
+            )
 
 
 @pytest.mark.asyncio
