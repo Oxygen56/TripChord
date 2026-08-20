@@ -1,6 +1,8 @@
 # TripChord Done-Gate
 
-> 当前结论（2026-08-05）：**最新 strict required-model Done-Gate 尚未通过。**
+> 最新已保存的产品发布检查（2026-08-18，绑定当时的代码和环境）仍未通过：模型调用检查未获当次成本授权而跳过，真实平台检查缺少新鲜、已授权的 Companion 连接，完整真实规划因此没有执行。它不是对当前浏览器状态的实时探测，但足以说明仓库尚不能宣称达到 Beta、RC 或 1.0。
+
+> 存档结论（2026-08-05）：**该次 strict required-model Done-Gate 尚未通过。**
 > 三日期 Round 17 已真实走完异步 job/polling、日期对 checkpoint 与 3600 秒服务端预算：job 为
 > `succeeded/complete`，47/47 次 DeepSeek 调用成功，三个 checkpoint 依次为
 > completed / failed / completed；runner 仍正确输出 `run_status=done_gate_failed`。证据包：
@@ -26,7 +28,7 @@
 本文件把“代码存在”“离线测试通过”“单日期真实观察”和“当前 strict Done-Gate 通过”拆开。
 只有退出码为 0 且证据包中的 `done_gate.passed=true`，才允许说当前版本通过最终验收。
 
-## 当前判定
+## 2026-08-05 历史判定
 
 - 离线 Agent / 规划 / 后训练 / 全栈工程门：已有独立冻结证据，按各自声明边界报告。
 - 当前 strict 代码门：已实现本地只读 Browser Companion、每日期对 13 路浏览器搜索 +
