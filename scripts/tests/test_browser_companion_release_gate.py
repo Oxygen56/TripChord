@@ -84,6 +84,61 @@ def test_gate_accepts_exact_current_build_metadata(tmp_path: Path) -> None:
     assert release_gate.verify_build_metadata(tmp_path) == build_sha256
 
 
+def test_default_gate_requires_the_owner_only_runtime_seal(tmp_path: Path) -> None:
+    companion, _ = _write_repository_fixture(tmp_path)
+    (companion / COMPANION_RELEASE_SEAL_RELATIVE_PATH).unlink()
+
+    with pytest.raises(release_gate.ReleaseGateError, match="发布 seal 无效"):
+        release_gate.run_release_gate(repository=tmp_path)
+
+
+def test_ci_key_free_gate_verifies_ephemeral_source_derived_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    companion, build_sha256 = _write_repository_fixture(tmp_path)
+    seal_path = companion / COMPANION_RELEASE_SEAL_RELATIVE_PATH
+    seal_path.unlink()
+    monkeypatch.setattr(release_gate, "_run_contracts", lambda _repository: None)
+
+    assert (
+        release_gate.run_release_gate(
+            repository=tmp_path,
+            ci_verify_key_free=True,
+        )
+        == build_sha256
+    )
+    assert not seal_path.exists()
+
+
+def test_ci_key_free_gate_rejects_source_hash_drift_before_contracts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    companion, _ = _write_repository_fixture(tmp_path)
+    (companion / COMPANION_RELEASE_SEAL_RELATIVE_PATH).unlink()
+    (companion / "popup.js").write_text("changed source", encoding="utf-8")
+    launched: list[str] = []
+    monkeypatch.setattr(
+        release_gate,
+        "_run_contracts",
+        lambda _repository: launched.append("contracts"),
+    )
+
+    with pytest.raises(release_gate.ReleaseGateError, match="build-meta 不是当前构建"):
+        release_gate.run_release_gate(repository=tmp_path, ci_verify_key_free=True)
+    assert launched == []
+
+
+def test_release_gate_rejects_ambiguous_ci_and_update_modes(tmp_path: Path) -> None:
+    with pytest.raises(release_gate.ReleaseGateError, match="不能同时使用"):
+        release_gate.run_release_gate(
+            repository=tmp_path,
+            update_build_meta=True,
+            ci_verify_key_free=True,
+        )
+
+
 def test_gate_fails_closed_on_stale_metadata_before_running_contracts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

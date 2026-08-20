@@ -57,7 +57,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: uv sync --locked --all-groups
-      - run: uv run python scripts/browser_companion_release_gate.py
+      - run: uv run python scripts/browser_companion_release_gate.py --ci-verify-key-free
         env:
           ANTHROPIC_API_KEY: ""
           MODEL_API_KEY: ""

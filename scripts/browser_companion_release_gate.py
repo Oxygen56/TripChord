@@ -6,9 +6,14 @@ import secrets
 import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tripchord.providers.browser_bridge import BrowserCompanionBuildIdentity
 
 _JS_CONTRACTS = (
     "apps/browser-companion/tests/companion-config.test.mjs",
@@ -56,6 +61,14 @@ def _arguments() -> argparse.Namespace:
         help=(
             "explicitly regenerate src/build-meta.js before verification; "
             "manifest and runtime versions are never changed"
+        ),
+    )
+    parser.add_argument(
+        "--ci-verify-key-free",
+        action="store_true",
+        help=(
+            "explicitly verify a source-derived release seal in a temporary copy; "
+            "never writes the workstation runtime seal"
         ),
     )
     return parser.parse_args()
@@ -238,6 +251,89 @@ def _candidate_release_seal(repository: Path) -> bytes:
         raise ReleaseGateError(f"无法生成候选发布 seal：{exc}") from exc
 
 
+def _verify_ci_candidate_without_runtime_seal(
+    repository: Path,
+    *,
+    expected_build_sha256: str,
+    candidate_seal: bytes,
+) -> None:
+    """Run the normal sealed verifier against an ephemeral source-derived tree.
+
+    CI must prove the exact same seal contract as a workstation without
+    materialising the owner-only runtime seal in the checkout.  The copied
+    tree contains only the fixed release inputs and generated metadata; the
+    temporary seal is mode 0600 and is removed with the temporary directory.
+    """
+
+    _ensure_api_source(repository)
+    try:
+        from tripchord.agents.companion_control_tools import (
+            COMPANION_BUILD_FILE_ALLOWLIST,
+            CompanionControlToolError,
+            verified_companion_build_identity,
+        )
+    except ImportError as exc:
+        raise ReleaseGateError("无法加载生产构建验证器；请先安装项目依赖") from exc
+
+    source = _companion_directory(repository)
+    with tempfile.TemporaryDirectory(prefix="tripchord-companion-ci-") as temporary_root:
+        temporary_companion = Path(temporary_root)
+        for relative_path in (*COMPANION_BUILD_FILE_ALLOWLIST, "src/build-meta.js"):
+            source_path = source / relative_path
+            destination = temporary_companion / relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                source_stat = source_path.lstat()
+                if stat.S_ISLNK(source_stat.st_mode) or not stat.S_ISREG(source_stat.st_mode):
+                    raise ReleaseGateError(
+                        f"CI 发布校验拒绝非普通文件：{source_path}"
+                    )
+                destination.write_bytes(source_path.read_bytes())
+            except OSError as exc:
+                raise ReleaseGateError(f"无法准备 CI 临时构建输入：{source_path}") from exc
+        seal_path = temporary_companion / _RELEASE_SEAL_RELATIVE_PATH
+        try:
+            seal_path.write_bytes(candidate_seal)
+            seal_path.chmod(0o600)
+        except OSError as exc:
+            raise ReleaseGateError("无法写入 CI 临时发布 seal") from exc
+        try:
+            identity = verified_companion_build_identity(temporary_companion)
+        except CompanionControlToolError as exc:
+            # Preserve the fail-closed production error boundary while adding
+            # enough context to distinguish CI candidate verification failures.
+            raise ReleaseGateError(f"CI 临时发布 seal 无效：{exc}") from exc
+        if identity.build_sha256 != expected_build_sha256:
+            raise ReleaseGateError("CI 临时发布 seal 验证了错误的构建")
+
+
+def verify_ci_candidate_build_metadata(repository: Path) -> BrowserCompanionBuildIdentity:
+    """Verify a source-derived candidate seal without requiring local runtime state.
+
+    This is for key-free CI and deterministic tests only.  It deliberately
+    never writes the repository's owner-only runtime seal.
+    """
+
+    _ensure_api_source(repository)
+    try:
+        from tripchord.agents.companion_control_tools import (
+            CompanionControlToolError,
+            candidate_companion_build_identity,
+        )
+    except ImportError as exc:
+        raise ReleaseGateError("无法加载生产构建验证器；请先安装项目依赖") from exc
+    try:
+        identity = candidate_companion_build_identity(_companion_directory(repository))
+    except CompanionControlToolError as exc:
+        raise ReleaseGateError(f"Browser Companion build-meta 不是当前构建：{exc}") from exc
+    _verify_ci_candidate_without_runtime_seal(
+        repository,
+        expected_build_sha256=identity.build_sha256,
+        candidate_seal=_candidate_release_seal(repository),
+    )
+    return identity
+
+
 def _run_contracts(repository: Path) -> None:
     environment = _test_environment()
     for contract in _JS_CONTRACTS:
@@ -255,7 +351,25 @@ def _run_contracts(repository: Path) -> None:
     )
 
 
-def run_release_gate(*, repository: Path, update_build_meta: bool = False) -> str:
+def run_release_gate(
+    *,
+    repository: Path,
+    update_build_meta: bool = False,
+    ci_verify_key_free: bool = False,
+) -> str:
+    if update_build_meta and ci_verify_key_free:
+        raise ReleaseGateError("--update-build-meta 与 --ci-verify-key-free 不能同时使用")
+    if ci_verify_key_free:
+        print("[release-gate] CI key-free 临时核对 build-meta + release seal", flush=True)
+        build_sha256 = verify_ci_candidate_build_metadata(repository).build_sha256
+        candidate_seal = _candidate_release_seal(repository)
+        _run_contracts(repository)
+        if verify_candidate_build_metadata(repository) != build_sha256:
+            raise ReleaseGateError("候选构建在发布合同执行期间发生变化")
+        if _candidate_release_seal(repository) != candidate_seal:
+            raise ReleaseGateError("候选发布身份在合同执行期间发生变化")
+        print(f"[release-gate] PASS CI key-free build_sha256={build_sha256}", flush=True)
+        return build_sha256
     if not update_build_meta:
         print("[release-gate] 只读核对 build-meta + release seal", flush=True)
         build_sha256 = verify_build_metadata(repository)
@@ -307,6 +421,7 @@ def main() -> None:
         run_release_gate(
             repository=_repository(),
             update_build_meta=args.update_build_meta,
+            ci_verify_key_free=args.ci_verify_key_free,
         )
     except ReleaseGateError as exc:
         print(f"[release-gate] FAIL: {exc}", file=sys.stderr, flush=True)

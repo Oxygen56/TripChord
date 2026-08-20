@@ -2,15 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib.util
 import json
 import os
-import subprocess
-import sys
 from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 import pytest
@@ -2928,42 +2924,6 @@ async def _hard_teardown_registry(
             task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(task, timeout=3)
-
-
-async def _hard_teardown_old_registry(
-    registry: Any,
-    stop: asyncio.Event,
-    runtime: Any,
-) -> None:
-    """Hard-teardown an OLD-schema (pre-P0) registry while preserving the exact
-    disk state it wrote: cancel the reaper FIRST so it can never re-spawn a
-    cleanup owner that would settle the stuck record and rewrite the disk, then
-    the cleanup owner (while the operation is still alive, so it cannot settle),
-    and only then stop the operation. The operation's done-callback just releases
-    the admission slot — no disk write — so the stuck shape survives."""
-    if runtime is None:
-        return
-    reaper = getattr(registry, "_reaper_task", None)
-    if reaper is not None and not reaper.done():
-        reaper.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await asyncio.wait_for(reaper, timeout=2)
-    owner = runtime.cleanup_owner
-    if owner is not None and not owner.done():
-        owner.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await asyncio.wait_for(owner, timeout=2)
-    stop.set()
-    operation_task = runtime.operation_task
-    if operation_task is not None and not operation_task.done():
-        operation_task.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await asyncio.wait_for(operation_task, timeout=2)
-    task = runtime.task
-    if task is not None and not task.done() and task is not asyncio.current_task():
-        task.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await asyncio.wait_for(task, timeout=2)
 
 
 @pytest.mark.asyncio
@@ -6627,29 +6587,6 @@ async def test_isolated_ambiguous_cancel_survives_explicit_cancel_and_cold_boot(
 # -------------------------------------------------------------------------------
 
 
-def _load_old_producer(tmp_path: Path) -> ModuleType:
-    """Load the pre-P0 producer module (commit 8cba6bc) so a test can produce
-    REAL old-producer disk state through its own public API — the b119 gate
-    forbids hand-built JSON for the legacy-migration counter-example."""
-    repo_root = Path(__file__).resolve().parents[3]
-    try:
-        old_source = subprocess.check_output(
-            ["git", "show", "8cba6bc:apps/api/src/tripchord/agents/live_jobs.py"],
-            cwd=str(repo_root),
-            text=True,
-        )
-    except OSError as exc:
-        pytest.skip(f"old producer source unavailable: {exc}")
-    module_path = tmp_path / "old_producer_live_jobs.py"
-    module_path.write_text(old_source, encoding="utf-8")
-    spec = importlib.util.spec_from_file_location("old_producer_live_jobs", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 @pytest.mark.asyncio
 async def test_hard_stop_permanent_failure_bounds_side_effects_and_quarantines(
     monkeypatch: pytest.MonkeyPatch,
@@ -7250,67 +7187,167 @@ async def test_legacy_v3_none_cancellation_real_old_producer_migrates_atomic(
 ) -> None:
     """C-146 P0 supplement (P0-4) / b119 gate (P0-A): the loader's
     ``legacy_v3_none_cancellation`` branch is REAL and reachable — it is
-    exercised with ACTUAL old-producer disk state (the pre-P0 implementation at
-    8cba6bc writing through its own cancel/deadline paths), not hand-built JSON.
+    exercised with checked-in, exact old-producer disk fixtures rather than an
+    unreachable Git object.
     The exact old cancel stuck shape (``cancellation_requested: null`` at
     ``cancel_timed_out``, no quarantine marker) is accepted ONLY via the legacy
     discriminator, converted to the explicit True semantics, atomically
     rewritten to new-v3, and stable across two cold boots. The deadline old stuck
     shape (``timeout_pending``) migrates to FAILED/deadline_exceeded. A
     new-schema ``None`` (quarantine marker present) stays rejected fail-closed."""
-    old = _load_old_producer(tmp_path)
     tenant_id = "tenant-a"
 
-    # -- REAL old-producer cancel-stuck shape (cancellation_requested null) ---
-    cancel_path = tmp_path / "old-cancel.json"
-    # The migration reads a byte-identical COPY of the stuck disk state: the
-    # teardown below must stop the stubborn operation, and the old producer's
-    # own done-callback then settles the record — so the untouched stuck shape is
-    # captured before the teardown runs.
-    cancel_upgrade_path = tmp_path / "old-cancel-upgrade.json"
-    stop_cancel = asyncio.Event()
-
-    async def stubborn(_: Any) -> dict[str, Any]:
-        while not stop_cancel.is_set():
-            with suppress(asyncio.CancelledError):
-                await asyncio.sleep(0.001)
-        return {"stopped": True}
-
-    old_cancel = old.LivePlanningJobRegistry(
-        state_path=cancel_path, capacity=8, cancel_wait_seconds=0.05
-    )
-    old_cancel_runtime: Any = None
-    try:
-        snap, _replayed = await old_cancel.start_idempotent(
-            tenant_id=tenant_id,
-            operation=stubborn,
-            idempotency_key="old-cancel",
-            request_digest=REQUEST_SHA256,
-            defer_start=False,
-            deadline_seconds=30,
+    def assert_old_v3_shape(
+        payload: dict[str, Any],
+        *,
+        job_id: str,
+        stage: str,
+        revision: int,
+        snapshot_error: str | None,
+        pending_state: str,
+        pending_stage: str,
+        pending_error: str | None,
+        pending_cancellation_requested: bool | None,
+    ) -> None:
+        assert payload["schema_version"] == "tripchord-live-job-registry-v3"
+        assert len(payload["records"]) == 1
+        assert len(payload["idempotency"]) == 1
+        record = payload["records"][0]
+        assert set(record) == {
+            "activation_operation",
+            "pending_terminal",
+            "prepared",
+            "snapshot",
+            "tenant_partition",
+        }
+        assert record["tenant_partition"] == LivePlanningJobRegistry._tenant_partition(tenant_id)
+        assert record["prepared"] is False
+        assert record["activation_operation"] is None
+        snapshot = record["snapshot"]
+        assert set(snapshot) == {
+            "barrier_released_at",
+            "boundary",
+            "cancel_pending",
+            "cancellation_requested",
+            "created_at",
+            "deadline_at",
+            "error",
+            "expires_at",
+            "id",
+            "model_trace_count",
+            "model_trace_failure_count",
+            "model_trace_scope_sha256",
+            "model_trace_success_count",
+            "pair_checkpoints",
+            "progress",
+            "request_sha256",
+            "result",
+            "revision",
+            "safe_failure_code",
+            "safe_failure_details",
+            "safe_failure_details_digest",
+            "source_terminal_events",
+            "stage",
+            "state",
+            "updated_at",
+        }
+        assert snapshot["id"] == job_id
+        assert snapshot["state"] == "running"
+        assert snapshot["stage"] == stage
+        assert snapshot["progress"] == 5
+        assert snapshot["revision"] == revision
+        assert snapshot["cancellation_requested"] is True
+        assert snapshot["cancel_pending"] is True
+        assert snapshot["error"] == snapshot_error
+        assert snapshot["result"] is None
+        assert snapshot["safe_failure_code"] is None
+        assert snapshot["safe_failure_details"] is None
+        assert snapshot["safe_failure_details_digest"] is None
+        assert snapshot["model_trace_count"] == 0
+        assert snapshot["model_trace_success_count"] == 0
+        assert snapshot["model_trace_failure_count"] == 0
+        assert snapshot["pair_checkpoints"] == []
+        assert snapshot["source_terminal_events"] == []
+        assert snapshot["barrier_released_at"] is None
+        assert snapshot["expires_at"] is None
+        assert snapshot["boundary"] == (
+            "本机进程内、单服务进程的长任务控制面；最多并行执行有限个任务，"
+            "终态按容量和 TTL 有界保存。进程重启不恢复任务，不能视为持久化生产队列。"
         )
-        old_cancel_runtime = old_cancel._records[snap.id]
-        await _wait_for_state(old_cancel, snap.id, tenant_id, old.LivePlanningJobState.RUNNING)
-        await old_cancel.cancel(snap.id, tenant_id)
-        for _ in range(300):
-            if old_cancel_runtime.snapshot.stage == "cancel_timed_out":
-                break
-            await asyncio.sleep(0.01)
-        assert old_cancel_runtime.snapshot.stage == "cancel_timed_out"
-        assert old_cancel_runtime.snapshot.cancel_pending is True
-        assert old_cancel_runtime.pending_terminal is not None
-        assert old_cancel_runtime.pending_terminal.cancellation_requested is None
-        # Capture the exact stuck disk state for the migration below (the new
-        # loader validates the owner-only 0600 mode, so preserve it).
-        cancel_upgrade_path.write_bytes(cancel_path.read_bytes())
-        cancel_upgrade_path.chmod(0o600)
-    finally:
-        await _hard_teardown_old_registry(old_cancel, stop_cancel, old_cancel_runtime)
+        assert snapshot["request_sha256"] == REQUEST_SHA256
+        assert snapshot["model_trace_scope_sha256"] == REQUEST_SHA256
+        pending = record["pending_terminal"]
+        assert set(pending) == {
+            "cancellation_requested",
+            "error",
+            "result",
+            "safe_failure_code",
+            "safe_failure_details",
+            "safe_failure_details_digest",
+            "stage",
+            "state",
+        }
+        assert pending["state"] == pending_state
+        assert pending["stage"] == pending_stage
+        assert pending["error"] == pending_error
+        assert pending["result"] is None
+        assert pending["cancellation_requested"] is pending_cancellation_requested
+        if pending_state == "failed":
+            assert pending["safe_failure_code"] == "deadline_exceeded"
+            assert pending["safe_failure_details"] == {
+                "exception_class": "TimeoutError",
+                "message_sha256": None,
+                "validation_errors": [],
+                "validation_model": None,
+            }
+            assert (
+                pending["safe_failure_details_digest"]
+                == "526ada13001d3e22d8bc548852098af7b5eaa822e7f13b6a3f712ce3d8afc096"
+            )
+        else:
+            assert pending["safe_failure_code"] is None
+            assert pending["safe_failure_details"] is None
+            assert pending["safe_failure_details_digest"] is None
+        binding = payload["idempotency"][0]
+        assert set(binding) == {
+            "defer_start",
+            "job_id",
+            "legacy_isolated",
+            "partition",
+            "request_digest",
+        }
+        assert binding["job_id"] == job_id
+        assert binding["request_digest"] == REQUEST_SHA256
+        assert binding["defer_start"] is False
+        assert binding["legacy_isolated"] is False
+
+    # -- Old-producer cancel-stuck shape (cancellation_requested null) ---------
+    cancel_upgrade_path = tmp_path / "old-cancel-upgrade.json"
+    fixture_root = Path(__file__).parent / "fixtures" / "live_jobs"
+    cancel_upgrade_path.write_bytes(
+        (fixture_root / "legacy-v3-cancel-timed-out.json").read_bytes()
+    )
+    cancel_upgrade_path.chmod(0o600)
 
     old_disk = json.loads(cancel_upgrade_path.read_text(encoding="utf-8"))
-    old_record = next(
-        record for record in old_disk["records"] if record["snapshot"]["id"] == snap.id
+    assert_old_v3_shape(
+        old_disk,
+        job_id="legacy-v3-cancel",
+        stage="cancel_timed_out",
+        revision=3,
+        snapshot_error=(
+            "live planning operation did not stop within the bounded cancellation "
+            "budget; the job stays non-terminal and the operation is isolated"
+        ),
+        pending_state="cancelled",
+        pending_stage="cancelled",
+        pending_error=None,
+        pending_cancellation_requested=None,
     )
+    old_record = next(
+        record for record in old_disk["records"] if record["snapshot"]["id"] == "legacy-v3-cancel"
+    )
+    snap_id = old_record["snapshot"]["id"]
     assert old_record["snapshot"]["stage"] == "cancel_timed_out"
     assert old_record["snapshot"]["cancel_pending"] is True
     assert old_record["pending_terminal"]["cancellation_requested"] is None
@@ -7320,7 +7357,7 @@ async def test_legacy_v3_none_cancellation_real_old_producer_migrates_atomic(
     # cold-starts to the DURABLE cancel intent (CANCELLED/cancelled).
     first = LivePlanningJobRegistry(state_path=cancel_upgrade_path, capacity=8)
     try:
-        recovered = await first.get(snap.id, tenant_id)
+        recovered = await first.get(snap_id, tenant_id)
         assert recovered is not None
         assert recovered.state == LivePlanningJobState.CANCELLED
         assert recovered.stage == "cancelled"
@@ -7330,7 +7367,7 @@ async def test_legacy_v3_none_cancellation_real_old_producer_migrates_atomic(
     # The file was atomically rewritten to new-v3 — terminal facts, no null.
     migrated_disk = json.loads(cancel_upgrade_path.read_text(encoding="utf-8"))
     migrated_record = next(
-        record for record in migrated_disk["records"] if record["snapshot"]["id"] == snap.id
+        record for record in migrated_disk["records"] if record["snapshot"]["id"] == snap_id
     )
     assert migrated_record["snapshot"]["state"] == "cancelled"
     assert migrated_record["snapshot"]["stage"] == "cancelled"
@@ -7339,57 +7376,38 @@ async def test_legacy_v3_none_cancellation_real_old_producer_migrates_atomic(
     # A second cold boot reads the same terminal facts — no drift.
     second = LivePlanningJobRegistry(state_path=cancel_upgrade_path, capacity=8)
     try:
-        again = await second.get(snap.id, tenant_id)
+        again = await second.get(snap_id, tenant_id)
         assert again is not None
         assert again.state == LivePlanningJobState.CANCELLED
         assert again.stage == "cancelled"
     finally:
         await second.close()
 
-    # -- REAL old-producer deadline-stuck shape (timeout_pending, True) -------
-    deadline_path = tmp_path / "old-deadline.json"
+    # -- Old-producer deadline-stuck shape (timeout_pending, True) -------------
     deadline_upgrade_path = tmp_path / "old-deadline-upgrade.json"
-    stop_deadline = asyncio.Event()
-
-    async def stubborn_deadline(_: Any) -> dict[str, Any]:
-        while not stop_deadline.is_set():
-            with suppress(asyncio.CancelledError):
-                await asyncio.sleep(0.001)
-        return {"stopped": True}
-
-    old_deadline = old.LivePlanningJobRegistry(
-        state_path=deadline_path, capacity=8, cancel_wait_seconds=0.05
+    deadline_upgrade_path.write_bytes(
+        (fixture_root / "legacy-v3-timeout-pending.json").read_bytes()
     )
-    old_deadline_runtime: Any = None
-    try:
-        snap2, _replayed = await old_deadline.start_idempotent(
-            tenant_id=tenant_id,
-            operation=stubborn_deadline,
-            idempotency_key="old-deadline",
-            request_digest=REQUEST_SHA256,
-            defer_start=False,
-            deadline_seconds=0.15,
-        )
-        old_deadline_runtime = old_deadline._records[snap2.id]
-        for _ in range(300):
-            if old_deadline_runtime.snapshot.stage == "timeout_pending":
-                break
-            await asyncio.sleep(0.01)
-        assert old_deadline_runtime.snapshot.stage == "timeout_pending"
-        assert old_deadline_runtime.snapshot.cancel_pending is True
-        assert old_deadline_runtime.pending_terminal is not None
-        assert old_deadline_runtime.pending_terminal.cancellation_requested is True
-        assert old_deadline_runtime.pending_terminal.state == old.LivePlanningJobState.FAILED
-        # Capture the exact stuck disk state for the migration below.
-        deadline_upgrade_path.write_bytes(deadline_path.read_bytes())
-        deadline_upgrade_path.chmod(0o600)
-    finally:
-        await _hard_teardown_old_registry(old_deadline, stop_deadline, old_deadline_runtime)
+    deadline_upgrade_path.chmod(0o600)
 
     old_deadline_disk = json.loads(deadline_upgrade_path.read_text(encoding="utf-8"))
-    old_deadline_record = next(
-        record for record in old_deadline_disk["records"] if record["snapshot"]["id"] == snap2.id
+    assert_old_v3_shape(
+        old_deadline_disk,
+        job_id="legacy-v3-deadline",
+        stage="timeout_pending",
+        revision=2,
+        snapshot_error=None,
+        pending_state="failed",
+        pending_stage="deadline_exceeded",
+        pending_error="TimeoutError: live planning job deadline exceeded",
+        pending_cancellation_requested=True,
     )
+    old_deadline_record = next(
+        record
+        for record in old_deadline_disk["records"]
+        if record["snapshot"]["id"] == "legacy-v3-deadline"
+    )
+    snap2_id = old_deadline_record["snapshot"]["id"]
     assert old_deadline_record["snapshot"]["stage"] == "timeout_pending"
     assert old_deadline_record["snapshot"]["cancel_pending"] is True
     assert old_deadline_record["pending_terminal"]["cancellation_requested"] is True
@@ -7397,7 +7415,7 @@ async def test_legacy_v3_none_cancellation_real_old_producer_migrates_atomic(
 
     first_dl = LivePlanningJobRegistry(state_path=deadline_upgrade_path, capacity=8)
     try:
-        recovered_dl = await first_dl.get(snap2.id, tenant_id)
+        recovered_dl = await first_dl.get(snap2_id, tenant_id)
         assert recovered_dl is not None
         assert recovered_dl.state == LivePlanningJobState.FAILED
         assert recovered_dl.stage == "deadline_exceeded"
@@ -7406,7 +7424,7 @@ async def test_legacy_v3_none_cancellation_real_old_producer_migrates_atomic(
 
     second_dl = LivePlanningJobRegistry(state_path=deadline_upgrade_path, capacity=8)
     try:
-        again_dl = await second_dl.get(snap2.id, tenant_id)
+        again_dl = await second_dl.get(snap2_id, tenant_id)
         assert again_dl is not None
         assert again_dl.state == LivePlanningJobState.FAILED
         assert again_dl.stage == "deadline_exceeded"

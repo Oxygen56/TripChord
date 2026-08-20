@@ -14,9 +14,6 @@ from typing import Any
 import httpx
 import pytest
 from pydantic import TypeAdapter
-from tripchord.agents.companion_control_tools import (
-    verified_companion_build_identity,
-)
 from tripchord.agents.live_jobs import LivePlanningPairCheckpoint
 from tripchord.agents.live_system import (
     LiveDataProvider,
@@ -38,6 +35,7 @@ from tripchord.planning.stay_plans import system_stay_plan_candidate_set
 from tripchord.runtime_provenance import local_expected_provenance
 
 from benchmarks import run_live_done_gate_v4
+from scripts.browser_companion_release_gate import verify_ci_candidate_build_metadata
 
 SCENARIO = Path(__file__).parents[1] / "scenarios" / "live-hgh-mle-aug-2026-v4.json"
 _FIXTURE_CONTROL_PATH = (
@@ -74,7 +72,21 @@ def _runtime_payload(*, model_trace_count: int = 7) -> dict[str, Any]:
     }
 
 
-def _companion_preflight_payload() -> dict[str, Any]:
+def _verified_test_companion_build_identity() -> dict[str, Any]:
+    return verify_ci_candidate_build_metadata(
+        Path(__file__).resolve().parents[2]
+    ).model_dump(mode="json")
+
+
+def _companion_preflight_payload(
+    *,
+    build_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    verified_build = (
+        build_identity
+        if build_identity is not None
+        else _verified_test_companion_build_identity()
+    )
     return {
         "status": "connected",
         "server_time": "2026-08-15T00:00:00+00:00",
@@ -93,11 +105,7 @@ def _companion_preflight_payload() -> dict[str, Any]:
                 "adapter_version": "0.2.0",
                 "contract_version": "tripchord-capability-v1",
                 "runtime_instance_id": "formal-companion-runtime-v1",
-                "build_identity": verified_companion_build_identity(
-                    Path(__file__).resolve().parents[2]
-                    / "apps"
-                    / "browser-companion"
-                ).model_dump(mode="json"),
+                "build_identity": verified_build,
                 "last_seen": "2026-08-15T00:00:00+00:00",
                 "age_seconds": 0.0,
                 "is_fresh": True,
@@ -1559,10 +1567,17 @@ def test_formal_control_context_budget_isolated_and_reset() -> None:
     assert run_live_done_gate_v4._FORMAL_CONTROL_RETRY_BUDGET.get() is None
 
 
-def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
-    from tripchord.agents.companion_control_tools import (
-        verified_companion_build_identity,
-    )
+def test_formal_companion_binding_requires_one_exact_fresh_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_build_identity = _verified_test_companion_build_identity()
+
+    def bind(preflight: object) -> dict[str, object]:
+        return run_live_done_gate_v4._formal_companion_binding_from_preflight(
+            preflight,
+            expected_build_identity=expected_build_identity,
+        )
 
     companion = {
         "companion_id": "formal-companion-v1",
@@ -1577,9 +1592,7 @@ def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
         "adapter_version": "0.2.0",
         "contract_version": "tripchord-capability-v1",
         "runtime_instance_id": "formal-companion-runtime-v1",
-        "build_identity": verified_companion_build_identity(
-            run_live_done_gate_v4._REPO_ROOT / "apps/browser-companion"
-        ).model_dump(mode="json"),
+        "build_identity": expected_build_identity,
         "last_seen": "2026-08-15T00:00:00+00:00",
         "age_seconds": 0.0,
         "is_fresh": True,
@@ -1589,7 +1602,7 @@ def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
         "stale_after_seconds": 45,
         "companions": [companion],
     }
-    binding = run_live_done_gate_v4._formal_companion_binding_from_preflight(preflight)
+    binding = bind(preflight)
     assert binding["companion_id"] == companion["companion_id"]
     assert binding["runtime_instance_id"] == companion["runtime_instance_id"]
     assert binding["build_identity"] == companion["build_identity"]
@@ -1601,14 +1614,14 @@ def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
         ("contract_version", "test-contract-v1", "production adapter/contract"),
     ):
         with pytest.raises(RuntimeError, match=message):
-            run_live_done_gate_v4._formal_companion_binding_from_preflight(
+            bind(
                 {
                     **preflight,
                     "companions": [{**companion, field: foreign}],
                 }
             )
     with pytest.raises(RuntimeError, match="verified release"):
-        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+        bind(
             {
                 **preflight,
                 "companions": [
@@ -1623,11 +1636,11 @@ def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
             }
         )
     with pytest.raises(RuntimeError, match="exactly one"):
-        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+        bind(
             {**preflight, "companions": [companion, copy.deepcopy(companion)]}
         )
     with pytest.raises(RuntimeError, match="exactly one"):
-        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+        bind(
             {**preflight, "companions": [{**companion, "is_fresh": False}]}
         )
 
@@ -1642,7 +1655,7 @@ def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
     }
     stale_selected = {**companion, "is_fresh": False, "age_seconds": 46.0}
     with pytest.raises(RuntimeError, match="exactly one"):
-        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+        bind(
             {**preflight, "companions": [stale_selected, fresh_foreign]}
         )
 
@@ -1651,7 +1664,7 @@ def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
         "authorized_scope_keys": companion["authorized_scope_keys"][:-1],
     }
     with pytest.raises(RuntimeError, match="exactly one"):
-        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+        bind(
             {**preflight, "companions": [incomplete_selected, fresh_foreign]}
         )
 
@@ -1660,12 +1673,12 @@ def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
         "companion_id": "impersonating-companion-v1",
     }
     with pytest.raises(RuntimeError, match="exactly one"):
-        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+        bind(
             {**preflight, "companions": [companion, impersonating]}
         )
 
     with pytest.raises(RuntimeError, match="freshness"):
-        run_live_done_gate_v4._formal_companion_binding_from_preflight(
+        bind(
             {
                 **preflight,
                 "companions": [
@@ -1677,6 +1690,10 @@ def test_formal_companion_binding_requires_one_exact_fresh_identity() -> None:
                 ],
             }
         )
+
+    monkeypatch.setattr(run_live_done_gate_v4, "_REPO_ROOT", tmp_path)
+    with pytest.raises(RuntimeError, match="build input is missing"):
+        run_live_done_gate_v4._formal_companion_binding_from_preflight(preflight)
 
 
 def test_v4_completed_bundle_rejects_context_without_formal_receipt() -> None:
@@ -1943,7 +1960,13 @@ async def test_v4_required_model_gate_fails_before_live_network_when_runtime_is_
         require_model_enhancement=True,
     )
 
-    assert await run_live_done_gate_v4._run(args) == 2
+    assert (
+        await run_live_done_gate_v4._run(
+            args,
+            expected_companion_build_identity=_verified_test_companion_build_identity(),
+        )
+        == 2
+    )
     evidence_text = output.read_text(encoding="utf-8")
     evidence = json.loads(evidence_text)
     captured = capsys.readouterr()
@@ -2158,7 +2181,13 @@ async def test_v4_run_without_recommendation_emits_gate_failure_and_skips_event(
         formal_source_control_token_file=None,
     )
 
-    assert await run_live_done_gate_v4._run(args) == 2
+    assert (
+        await run_live_done_gate_v4._run(
+            args,
+            expected_companion_build_identity=_verified_test_companion_build_identity(),
+        )
+        == 2
+    )
     evidence = json.loads(output.read_text(encoding="utf-8"))
 
     assert [item["url"] for item in posts] == [
@@ -2313,7 +2342,13 @@ async def test_v4_required_model_gate_rejects_silent_deterministic_fallback(
         formal_source_control_token_file=None,
     )
 
-    assert await run_live_done_gate_v4._run(args) == 2
+    assert (
+        await run_live_done_gate_v4._run(
+            args,
+            expected_companion_build_identity=_verified_test_companion_build_identity(),
+        )
+        == 2
+    )
     evidence = json.loads(output.read_text(encoding="utf-8"))
     assert evidence["failure"]["stage"] == "validate_flexible_live_job_result"
     assert "expected model enhancement to be enabled" in evidence["failure"]["message"]
@@ -2453,7 +2488,13 @@ async def test_v4_job_bound_trace_receipt_ignores_non_positive_global_delta(
         formal_source_control_token_file=None,
     )
 
-    assert await run_live_done_gate_v4._run(args) == 2
+    assert (
+        await run_live_done_gate_v4._run(
+            args,
+            expected_companion_build_identity=_verified_test_companion_build_identity(),
+        )
+        == 2
+    )
     evidence = json.loads(output.read_text(encoding="utf-8"))
     expected_delta = after_count - before_count
 

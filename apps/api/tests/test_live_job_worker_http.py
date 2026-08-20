@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import tripchord.agents.live_jobs as live_jobs_module
 import tripchord.main as main_module
 from httpx import ASGITransport, AsyncClient
 from tripchord.agents.live_jobs import (
@@ -55,6 +56,7 @@ from tripchord.agents.live_jobs import (
     LivePlanningJobSnapshot,
     LivePlanningJobState,
     LivePlanningSafeFailureCode,
+    _linux_group_has_live_member,
     _PendingTerminalOutcome,
     _safe_failure_diagnostic,
 )
@@ -130,6 +132,9 @@ def _stubborn_command(
 
 
 def _group_alive(pgid: int) -> bool:
+    linux_live = _linux_group_has_live_member(pgid)
+    if linux_live is not None:
+        return linux_live
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -137,6 +142,24 @@ def _group_alive(pgid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux procfs group semantics")
+@pytest.mark.parametrize(
+    ("states", "expected"),
+    [((), None), (("Z", "Z"), False), (("Z", "R"), True), (None, None)],
+)
+def test_linux_group_liveness_distinguishes_zombies_and_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    states: tuple[str, ...] | None,
+    expected: bool | None,
+) -> None:
+    monkeypatch.setattr(
+        live_jobs_module,
+        "_linux_process_group_states",
+        lambda _pgid: states,
+    )
+    assert _linux_group_has_live_member(12345) is expected
 
 
 def _probe_grows(probe: Path, wait: float = 0.2) -> bool:

@@ -28,6 +28,72 @@ from tripchord.domain.common import DomainModel
 logger = logging.getLogger(__name__)
 
 
+def _linux_process_group_pids(pgid: int) -> tuple[int, ...]:
+    """Return the current PIDs in a Linux process group."""
+    if sys.platform != "linux":
+        return ()
+    proc_dir = Path("/proc")
+    if not proc_dir.is_dir():
+        return ()
+    pids: list[int] = []
+    for entry in proc_dir.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat_text = (entry / "stat").read_text(encoding="ascii")
+            _, remainder = stat_text.split(") ", 1)
+            fields = remainder.split()
+            if len(fields) >= 3 and int(fields[2]) == pgid:
+                pids.append(int(entry.name))
+        except (FileNotFoundError, PermissionError, ValueError, OSError):
+            continue
+    return tuple(pids)
+
+
+def _linux_group_has_live_member(pgid: int) -> bool | None:
+    """Return whether a PGID contains an executable member.
+
+    Linux keeps unreaped SIGKILLed children visible to ``killpg(pgid, 0)`` as
+    zombies.  They cannot produce side effects and must not block terminal
+    cleanup. ``None`` means procfs gave no authoritative answer; callers then
+    fail closed using the signal probe.
+    """
+    if sys.platform != "linux":
+        return None
+    states = _linux_process_group_states(pgid)
+    if states is None or not states:
+        return None
+    return any(state != "Z" for state in states)
+
+
+def _linux_process_group_states(pgid: int) -> tuple[str, ...] | None:
+    """Read every visible member state for one PGID in a single procfs pass."""
+    proc_dir = Path("/proc")
+    if not proc_dir.is_dir():
+        return None
+    states: list[str] = []
+    try:
+        entries = tuple(proc_dir.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat_text = (entry / "stat").read_text(encoding="ascii")
+            _, remainder = stat_text.split(") ", 1)
+            fields = remainder.split()
+            if len(fields) < 3:
+                return None
+            if int(fields[2]) == pgid:
+                states.append(fields[0])
+        except FileNotFoundError:
+            continue
+        except (PermissionError, OSError, ValueError):
+            return None
+    return tuple(states)
+
+
 class LivePlanningJobState(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -925,9 +991,10 @@ class _SubprocessWorkerHandle:
     The worker runs as the leader of its OWN process group (``os.setsid()`` in
     the script and ``start_new_session=True`` at spawn), so any grandchild it
     forks shares the group. ``kill_and_confirm`` SIGKILLs the WHOLE GROUP and —
-    after the leader is reaped via ``wait()`` — confirms every group member is
-    gone with ``os.killpg(pgid, 0)`` raising ``ProcessLookupError`` within a
-    bounded budget. A dead parent worker therefore never leaves a live
+    after the leader is reaped via ``wait()`` — confirms the group has no
+    executable member within a bounded budget. On Linux an unreaped zombie can
+    keep ``killpg(pgid, 0)`` successful even though it cannot run; procfs state
+    distinguishes that case. A dead parent worker therefore never leaves a live
     grandchild behind, and the registry PROVES the operation's external side
     effects froze BEFORE it releases any permit / opens new admission / writes a
     terminal label.
@@ -955,7 +1022,10 @@ class _SubprocessWorkerHandle:
         self.death_confirmed = False
 
     def group_alive(self) -> bool:
-        """True while ANY process still exists in the worker's process group."""
+        """True while an executable process remains in the worker's group."""
+        linux_live = _linux_group_has_live_member(self.pgid)
+        if linux_live is not None:
+            return linux_live
         try:
             os.killpg(self.pgid, 0)
         except ProcessLookupError:
@@ -968,9 +1038,9 @@ class _SubprocessWorkerHandle:
     async def kill_and_confirm(self, timeout: float) -> bool:
         """SIGKILL the whole group and confirm every member is dead in ``timeout``.
 
-        Returns True only when the leader is reaped AND ``os.killpg(pgid, 0)``
-        reports the group is empty — the executor (and any grandchild it forked)
-        is provably gone and its external side effects are permanently frozen."""
+        Returns True only when the leader is reaped and no executable group
+        member remains. The executor (and any grandchild it forked) is then
+        provably unable to produce further external side effects."""
         if self.process.returncode is not None and not self.group_alive():
             self.death_confirmed = True
             return True
@@ -984,8 +1054,8 @@ class _SubprocessWorkerHandle:
             await asyncio.wait_for(self.process.wait(), timeout=remaining)
         except TimeoutError:
             return False
-        # Confirm EVERY descendant exited: the group is empty only when every
-        # member (including a stubborn grandchild) has been reaped by the kernel.
+        # Confirm every descendant stopped executing. Linux may retain a dead
+        # descendant as a zombie until its external parent reaps it.
         while asyncio.get_running_loop().time() < deadline:
             if not self.group_alive():
                 self.death_confirmed = True
@@ -3607,9 +3677,45 @@ class LivePlanningJobRegistry:
         marker nonce the registry handed that job — a reused PGID owned by an
         unrelated process is never touched. ``ps`` is POSIX-standard on both
         Linux and macOS."""
+        if sys.platform == "linux":
+            commands: list[str] = []
+            for pid in _linux_process_group_pids(pgid):
+                try:
+                    command = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+                    if command:
+                        commands.append(command.replace(b"\0", b" ").decode("utf-8", "replace"))
+                except (FileNotFoundError, PermissionError, OSError):
+                    continue
+            if commands:
+                return commands
+            # procfs can briefly race a just-reparented process.  The procps
+            # all-process listing is a bounded fallback for that window.
+            try:
+                completed = subprocess.run(
+                    ["ps", "-e", "-o", "pgid=,command="],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                return []
+            if completed.returncode != 0:
+                return []
+            prefix = str(pgid)
+            return [
+                line.split(None, 1)[1]
+                for line in completed.stdout.splitlines()
+                if line.startswith(prefix) and len(line.split(None, 1)) == 2
+            ]
         try:
+            # procps ``ps -g`` means real *user* group on Linux, unlike the
+            # BSD/macOS spelling where it selects process groups.  Using the
+            # explicit procps selector is required for cold-boot orphan
+            # authentication on Linux; an empty result must never be treated
+            # as proof that the durable worker identity is safe to kill.
+            group_selector = "--pgrp" if sys.platform == "linux" else "-g"
             completed = subprocess.run(
-                ["ps", "-o", "command=", "-g", str(pgid)],
+                ["ps", "-o", "command=", group_selector, str(pgid)],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -3630,6 +3736,22 @@ class LivePlanningJobRegistry:
         spawn-intent marker nonce (no PGID). Scanning every process command line
         for the 32-hex nonce — which never appears in an unrelated argv —
         recovers the process group so it can be authenticated and cleaned."""
+        if sys.platform == "linux":
+            proc_dir = Path("/proc")
+            if proc_dir.is_dir():
+                for entry in proc_dir.iterdir():
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        command = (entry / "cmdline").read_bytes()
+                        if marker not in command.decode("utf-8", "replace"):
+                            continue
+                        stat_text = (entry / "stat").read_text(encoding="ascii")
+                        _, remainder = stat_text.split(") ", 1)
+                        return int(remainder.split()[2])
+                    except (FileNotFoundError, PermissionError, OSError, ValueError):
+                        continue
+            return None
         try:
             completed = subprocess.run(
                 ["ps", "-e", "-o", "pid=,pgid=,command="],
@@ -3794,8 +3916,12 @@ class LivePlanningJobRegistry:
                     os.killpg(unique_pgid, signal.SIGKILL)
                     deadline = asyncio.get_running_loop().time() + self._hard_stop_confirm_seconds
                     while asyncio.get_running_loop().time() < deadline:
+                        linux_live = _linux_group_has_live_member(unique_pgid)
+                        if linux_live is False:
+                            confirmed = True
+                            break
                         try:
-                            os.killpg(pgid, 0)
+                            os.killpg(unique_pgid, 0)
                         except ProcessLookupError:
                             confirmed = True
                             break
@@ -3939,6 +4065,10 @@ class LivePlanningJobRegistry:
             os.killpg(pgid, signal.SIGKILL)
             deadline = asyncio.get_running_loop().time() + self._hard_stop_confirm_seconds
             while asyncio.get_running_loop().time() < deadline:
+                linux_live = _linux_group_has_live_member(pgid)
+                if linux_live is False:
+                    confirmed = True
+                    break
                 try:
                     os.killpg(pgid, 0)
                 except ProcessLookupError:

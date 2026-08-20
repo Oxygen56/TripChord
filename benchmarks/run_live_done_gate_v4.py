@@ -1453,6 +1453,8 @@ async def _activate_prepared_flexible_live_job(
 
 def _formal_companion_binding_from_preflight(
     preflight: object,
+    *,
+    expected_build_identity: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     if not isinstance(preflight, dict) or not isinstance(
         preflight.get("companions"), list
@@ -1558,9 +1560,17 @@ def _formal_companion_binding_from_preflight(
         or not re.fullmatch(r"[0-9a-f]{64}", str(build.get("build_sha256")))
     ):
         raise RuntimeError("formal Companion preflight binding is invalid")
-    expected_build = verified_companion_build_identity(
-        _REPO_ROOT / "apps/browser-companion"
-    ).model_dump(mode="json")
+    # Production/formal runs never receive an override and therefore require
+    # the workstation's current-user 0600 release seal.  The keyword-only
+    # dependency exists solely so clean-clone tests can inject an identity
+    # already checked with the same production verifier and an ephemeral seal.
+    expected_build = (
+        dict(expected_build_identity)
+        if expected_build_identity is not None
+        else verified_companion_build_identity(
+            _REPO_ROOT / "apps/browser-companion"
+        ).model_dump(mode="json")
+    )
     if build != expected_build:
         raise RuntimeError(
             "formal Companion preflight build differs from the verified release"
@@ -2177,6 +2187,7 @@ async def _run(
     *,
     client_factory: Callable[..., httpx.AsyncClient] | None = None,
     now_factory: Callable[[], datetime] = _utc_now,
+    expected_companion_build_identity: Mapping[str, object] | None = None,
 ) -> int:
     request: dict[str, Any] | None = None
     publication_run: LivePackageAgentRun | None = None
@@ -2328,7 +2339,10 @@ async def _run(
                 args.bridge_token,
             )
             context["companion_preflight"] = companion
-            companion_binding = _formal_companion_binding_from_preflight(companion)
+            companion_binding = _formal_companion_binding_from_preflight(
+                companion,
+                expected_build_identity=expected_companion_build_identity,
+            )
             context["formal_companion_binding"] = companion_binding
             stage = "activate_flexible_live_job"
             await _activate_prepared_flexible_live_job(
