@@ -1149,6 +1149,16 @@ export function setApiCredential(credential: string): void {
   else storage.removeItem("tripchord-api-key");
 }
 
+export class ApiError extends Error {
+  readonly status: number | null;
+
+  constructor(message: string, status: number | null = null) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -1160,7 +1170,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as { detail?: string } | null;
-    throw new Error(body?.detail ?? `请求失败 (${response.status})`);
+    throw new ApiError(body?.detail ?? `请求失败 (${response.status})`, response.status);
   }
   return response.json() as Promise<T>;
 }
@@ -1349,13 +1359,18 @@ export function cancelLiveFlexiblePlanningJob(
   );
 }
 
+export function retryDelayMs(attempt: number): number {
+  return Math.min(8_000, 500 * 2 ** Math.max(0, attempt - 1));
+}
+
 export function subscribeToLiveFlexiblePlanningJob(
   jobId: string,
   onJob: (job: LivePlanningJobSnapshot) => void,
-  onError: (message: string) => void,
+  onError: (message: string, status?: number | null) => void,
 ): () => void {
   let active = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let retryAttempt = 0;
   const terminalStates = new Set<LivePlanningJobState>([
     "succeeded",
     "failed",
@@ -1366,14 +1381,19 @@ export function subscribeToLiveFlexiblePlanningJob(
       const job = await getLiveFlexiblePlanningJob(jobId);
       if (!active) return;
       onJob(job);
+      retryAttempt = 0;
       if (!terminalStates.has(job.state)) timer = setTimeout(poll, 500);
     } catch (caught) {
       if (!active) return;
       onError(
-        caught instanceof Error
-          ? caught.message
-          : "实时规划进度查询中断，请稍后重试",
+        caught instanceof Error ? caught.message : "实时规划进度查询中断，请稍后重试",
+        caught instanceof ApiError ? caught.status : null,
       );
+      const status = caught instanceof ApiError ? caught.status : null;
+      if (active && status !== 401 && status !== 404 && status !== 410) {
+        retryAttempt += 1;
+        timer = setTimeout(poll, retryDelayMs(retryAttempt));
+      }
     }
   };
   void poll();

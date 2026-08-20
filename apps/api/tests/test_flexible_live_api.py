@@ -241,7 +241,7 @@ async def test_flexible_live_plan_enforces_strict_server_policy(
 
 
 @pytest.mark.asyncio
-async def test_flexible_live_success_caches_each_pair_for_event_replanning(
+async def test_human_block_without_publishable_plan_does_not_cache_pair_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pair_runner = _FakePairRunner()
@@ -271,9 +271,5 @@ async def test_flexible_live_success_caches_each_pair_for_event_replanning(
     assert body["run"]["sampled_not_exhaustive"] is False
     assert "不得声称全月最低价" in body["run"]["claim_boundary"]
     assert body["run"]["final_decision"]["state"] == "human_block"
-    assert len(body["cached_pair_runs"]) == 1
-    handle = body["cached_pair_runs"][0]
-    assert handle["date_pair_id"] == body["run"]["pair_runs"][0]["date_pair"]["id"]
-    assert await cache.get(handle["run_id"], "anonymous") is not None
-    assert await cache.get(handle["run_id"], "another-tenant") is None
+    assert body["cached_pair_runs"] == []
     assert pair_runner.calls == 1

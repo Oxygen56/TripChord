@@ -198,6 +198,67 @@ class JobRow(Base):
     workspace: Mapped[WorkspaceRow] = relationship(back_populates="jobs")
 
 
+class LivePlanningJobRow(Base):
+    """Authoritative JSON snapshot for the long-running live planner control plane."""
+
+    __tablename__ = "live_planning_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uq_live_planning_job_tenant_idempotency",
+        ),
+        Index("ix_live_planning_jobs_tenant_updated", "tenant_id", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(100), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(200))
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(30), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON)
+    command_spec: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lease_generation: Mapped[int] = mapped_column(Integer, default=0)
+    cancel_target_owner: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    cancel_target_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class LivePlanningPairResultRow(Base):
+    """Durable per-date-pair result/checkpoint used for restart resume."""
+
+    __tablename__ = "live_planning_pair_results"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "job_id", "date_pair_id", name="uq_live_pair_result_identity"
+        ),
+        Index("ix_live_pair_results_job_sequence", "tenant_id", "job_id", "sequence"),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    date_pair_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    checkpoint: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    execution: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    execution_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    lease_owner: Mapped[str] = mapped_column(String(200), nullable=False)
+    lease_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
 class LiveMonitorRow(Base):
     """Persisted :class:`tripchord.agents.live_monitor.LiveMonitorStatus`.
 

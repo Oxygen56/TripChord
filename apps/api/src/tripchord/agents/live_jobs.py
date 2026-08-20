@@ -19,13 +19,63 @@ from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Protocol, Self, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from tripchord.domain.common import DomainModel
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class OrphanDeathProof:
+    job_id: str
+    marker: str
+    pgid: int
+    tenant_id: str
+    lease_owner: str
+    lease_generation: int
+    authenticated_at: str
+    death_confirmed_at: str
+    digest: str
+
+
+class LivePlanningDurableStore(Protocol):
+    async def create_or_get(
+        self, *, tenant_id: str, **kwargs: Any
+    ) -> LivePlanningJobSnapshot: ...
+    async def get(self, job_id: str, *, tenant_id: str) -> LivePlanningJobSnapshot | None: ...
+    async def get_by_idempotency(
+        self, key: str, *, tenant_id: str
+    ) -> LivePlanningJobSnapshot | None: ...
+    async def replace_snapshot(
+        self, job_id: str, snapshot: LivePlanningJobSnapshot, *, tenant_id: str, **kwargs: Any
+    ) -> LivePlanningJobSnapshot: ...
+    async def cancel(self, job_id: str, *, tenant_id: str) -> LivePlanningJobSnapshot: ...
+    async def consume_orphan_death_proof(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        proof_owner: str,
+        proof_generation: int,
+    ) -> LivePlanningJobSnapshot | None: ...
+    async def request_cancel(self, job_id: str, *, tenant_id: str) -> LivePlanningJobSnapshot: ...
+    async def claim_with_identity(self, job_id: str, *, tenant_id: str) -> Any: ...
+    async def list_recoverable(self, *, tenant_id: str) -> tuple[str, ...]: ...
+    async def recovery_record(self, job_id: str, *, tenant_id: str) -> Any: ...
+    async def list_tenants(self) -> tuple[str, ...]: ...
+    async def authorize_orphan_reap(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        owner: str | None,
+        generation: int | None,
+    ) -> bool: ...
+    async def renew_lease(self, job_id: str, *, tenant_id: str, **kwargs: Any) -> bool: ...
+    async def release_lease(self, job_id: str, *, tenant_id: str, **kwargs: Any) -> bool: ...
 
 
 def _linux_process_group_pids(pgid: int) -> tuple[int, ...]:
@@ -1149,15 +1199,20 @@ class _RuntimeJob:
         snapshot: LivePlanningJobSnapshot,
         deadline_monotonic: float,
         operation: LiveJobOperation | LiveJobWorkerCommand,
+        tenant_id: str = "",
         prepared: bool = False,
     ) -> None:
         self.tenant_partition = tenant_partition
+        self.tenant_id = tenant_id
         self.snapshot = snapshot
         self.deadline_monotonic = deadline_monotonic
         self.operation = operation
         self.prepared = prepared
         self.activation_operation: dict[str, Any] | None = None
         self.generation = 1
+        self.durable_lease_owner: str | None = None
+        self.durable_lease_generation: int | None = None
+        self.lease_heartbeat_task: asyncio.Task[None] | None = None
         self.task: asyncio.Task[None] | None = None
         self.operation_task: asyncio.Task[dict[str, Any]] | None = None
         self.model_trace_summary_reported = False
@@ -1382,6 +1437,7 @@ class LivePlanningJobRegistry:
         # watchdog. Both are test-controllable.
         hard_stop_confirm_budget_window_seconds: float = 2.0,
         hard_stop_confirm_budget_window_calls: int = 8,
+        durable_store: LivePlanningDurableStore | None = None,
     ) -> None:
         if capacity < 1:
             raise ValueError("capacity must be positive")
@@ -1439,6 +1495,8 @@ class LivePlanningJobRegistry:
         self._hard_stop_defer_retry_seconds = hard_stop_defer_retry_seconds
         self._hard_stop_confirm_budget_window_seconds = hard_stop_confirm_budget_window_seconds
         self._hard_stop_confirm_budget_window_calls = hard_stop_confirm_budget_window_calls
+        self._durable_store = durable_store
+        self._confirmed_stopped_job_ids: dict[str, OrphanDeathProof] = {}
         self._worker_python = worker_python or sys.executable
         self._worker_module = worker_module or _default_worker_module()
         self._idempotency_capacity = idempotency_capacity
@@ -1480,8 +1538,25 @@ class LivePlanningJobRegistry:
         # no owner or reaper.
         self._deferred_cleanup_owners: list[_RuntimeJob] = []
         self._state_path = state_path
-        if self._state_path is not None:
+        # In durable mode this path is marker-only.  Loading legacy JSON here
+        # would create a second authority beside the database.
+        if self._state_path is not None and self._durable_store is None:
             self._load_state()
+
+    @staticmethod
+    def _public_command_args(args: dict[str, Any]) -> dict[str, Any]:
+        blocked = ("token", "credential", "private_key", "cookie", "session", "authorization")
+        def clean(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: clean(item)
+                    for key, item in value.items()
+                    if not any(word in key.lower() for word in blocked)
+                }
+            if isinstance(value, list):
+                return [clean(item) for item in value]
+            return value
+        return cast(dict[str, Any], clean(args))
 
     @staticmethod
     async def _unrecoverable_operation(
@@ -2200,6 +2275,10 @@ class LivePlanningJobRegistry:
         live in-memory snapshot — used to keep the DURABLE state at QUEUED while
         the live snapshot has advanced to RUNNING (see ``_run_worker_command``).
         """
+        # A configured durable store is the sole state authority.  The legacy
+        # JSON writer is deliberately disabled instead of being kept in sync.
+        if self._durable_store is not None:
+            return
         path = self._state_path
         if path is None:
             return
@@ -2367,6 +2446,85 @@ class LivePlanningJobRegistry:
                 temporary.unlink()
             raise
 
+    async def _publish_durable(self, runtime: _RuntimeJob) -> None:
+        store = self._durable_store
+        if store is None:
+            return
+        await store.replace_snapshot(
+            runtime.snapshot.id,
+            runtime.snapshot,
+            owner=runtime.durable_lease_owner,
+            lease_generation=runtime.durable_lease_generation,
+            tenant_id=runtime.tenant_id,
+        )
+
+    def _start_lease_heartbeat(self, runtime: _RuntimeJob) -> None:
+        store = self._durable_store
+        if store is None or runtime.durable_lease_owner is None:
+            return
+
+        async def heartbeat() -> None:
+            try:
+                while runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                    await asyncio.sleep(1.0)
+                    authoritative = await store.get(
+                        runtime.snapshot.id, tenant_id=runtime.tenant_id
+                    )
+                    if authoritative is None:
+                        return
+                    if authoritative.cancellation_requested or authoritative.cancel_pending:
+                        # Drain both executors before publishing terminal state;
+                        # a swallowed cancellation remains non-terminal.
+                        operation_task = runtime.operation_task
+                        if operation_task is not None and not operation_task.done():
+                            operation_task.cancel()
+                        task = runtime.task
+                        if (
+                            task is not None
+                            and not task.done()
+                            and task is not asyncio.current_task()
+                        ):
+                            task.cancel()
+                        waitables = tuple(
+                            item
+                            for item in (operation_task, task)
+                            if item is not None and item is not asyncio.current_task()
+                        )
+                        if waitables:
+                            with suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                                async with asyncio.timeout(self._cancel_wait_seconds):
+                                    await asyncio.gather(*waitables, return_exceptions=True)
+                        stopped = all(item.done() for item in waitables)
+                        if stopped:
+                            await store.cancel(
+                                runtime.snapshot.id, tenant_id=runtime.tenant_id
+                            )
+                        return
+                    renewed = await store.renew_lease(
+                        runtime.snapshot.id,
+                        tenant_id=runtime.tenant_id,
+                        owner=runtime.durable_lease_owner,
+                        lease_generation=runtime.durable_lease_generation,
+                        lease_seconds=300,
+                    )
+                    if not renewed:
+                        if runtime.task is not None and not runtime.task.done():
+                            runtime.task.cancel()
+                        return
+            except Exception:
+                logger.exception(
+                    "durable live planning lease heartbeat failed",
+                    extra={"job_id": runtime.snapshot.id},
+                )
+                if runtime.task is not None and not runtime.task.done():
+                    runtime.task.cancel()
+            except asyncio.CancelledError:
+                return
+
+        runtime.lease_heartbeat_task = asyncio.create_task(
+            heartbeat(), name=f"tripchord:lease:{runtime.snapshot.id}"
+        )
+
     async def start(
         self,
         *,
@@ -2402,6 +2560,8 @@ class LivePlanningJobRegistry:
             raise ValueError("deadline_seconds must be a finite positive number")
         if (operation is None) == (operation_factory is None):
             raise ValueError("exactly one live planning operation source is required")
+        if self._durable_store is not None and idempotency_key is None:
+            raise ValueError("durable live planning jobs require an idempotency key")
         idempotency_partition: str | None = None
         if request_digest is not None and not self._valid_request_digest(request_digest):
             raise ValueError("request_digest must be a lowercase SHA-256 hex digest")
@@ -2416,6 +2576,16 @@ class LivePlanningJobRegistry:
                 raise RuntimeError("live planning job registry is closed")
             now = self._utc_now()
             self._prune_locked(now)
+            if self._durable_store is not None and idempotency_key is not None:
+                durable_existing = await self._durable_store.get_by_idempotency(
+                    idempotency_key, tenant_id=tenant_id
+                )
+                if durable_existing is not None:
+                    if request_digest is None or durable_existing.request_sha256 != request_digest:
+                        raise LivePlanningJobIdempotencyConflictError(
+                            "idempotency key was already used with a different request"
+                        )
+                    return durable_existing, True
             if idempotency_partition is not None:
                 existing = self._idempotency.get(idempotency_partition)
                 if existing is not None:
@@ -2524,6 +2694,7 @@ class LivePlanningJobRegistry:
             job_id = f"live-job-{uuid4()}"
             runtime = _RuntimeJob(
                 tenant_partition=self._tenant_partition(tenant_id),
+                tenant_id=tenant_id,
                 deadline_monotonic=(
                     asyncio.get_running_loop().time() + deadline_seconds
                 ),
@@ -2566,6 +2737,53 @@ class LivePlanningJobRegistry:
             # deadline, and the loop would sleep straight past it.
             self._wake_hard_stop_watchdog()
             try:
+                if self._durable_store is not None and idempotency_key is not None:
+                    command_spec = (
+                        {
+                            "kind": "worker_command",
+                            "module_path": resolved_operation.module_path,
+                            "entry": resolved_operation.entry,
+                            # Persist only the replayable request envelope.  In
+                            # particular, never put the short-lived runtime
+                            # bundle (bridge/model credentials) in the durable
+                            # command spec; recovery rebuilds it from current
+                            # process settings.
+                            "args": {
+                                "payload": resolved_operation.args.get("payload"),
+                                "request_digest": resolved_operation.args.get(
+                                    "request_digest"
+                                ),
+                                "tenant_id": resolved_operation.args.get("tenant_id"),
+                            },
+                            "probe_path": resolved_operation.probe_path,
+                        }
+                        if isinstance(resolved_operation, LiveJobWorkerCommand)
+                        else None
+                    )
+                    durable_created = await self._durable_store.create_or_get(
+                        tenant_id=tenant_id,
+                        idempotency_key=idempotency_key,
+                        request_sha256=request_digest or "",
+                        snapshot=runtime.snapshot,
+                        command_spec=command_spec,
+                    )
+                    if durable_created.id != job_id:
+                        self._remove_locked(job_id)
+                        self._restore_capacity_locked(evicted_runtime, evicted_entries)
+                        return durable_created, True
+                    if not defer_start:
+                        lease = await self._durable_store.claim_with_identity(
+                            job_id, tenant_id=tenant_id
+                        )
+                        if lease is None:
+                            self._remove_locked(job_id)
+                            self._restore_capacity_locked(evicted_runtime, evicted_entries)
+                            raise LivePlanningJobCapacityError(
+                                "live planning job lease was already claimed"
+                            )
+                        runtime.durable_lease_owner = lease.owner
+                        runtime.durable_lease_generation = lease.generation
+                        runtime.snapshot = lease.snapshot
                 self._persist_locked()
             except LivePlanningJobRegistryPostCommitError as exc:
                 # The new record was already committed to disk. A committed
@@ -2595,6 +2813,7 @@ class LivePlanningJobRegistry:
                     self._run(runtime, resolved_operation),
                     name=f"tripchord:{job_id}",
                 )
+                self._start_lease_heartbeat(runtime)
             self._changed.notify_all()
             return runtime.snapshot, False
 
@@ -2619,6 +2838,18 @@ class LivePlanningJobRegistry:
             runtime = self._owned_locked(job_id, tenant_id)
             if runtime is None:
                 return None
+            if self._durable_store is not None:
+                authoritative = await self._durable_store.get(job_id, tenant_id=tenant_id)
+                if authoritative is None:
+                    return None
+                runtime.snapshot = authoritative
+                if (
+                    authoritative.state in TERMINAL_LIVE_PLANNING_JOB_STATES
+                    or authoritative.cancel_pending
+                ):
+                    raise LivePlanningJobInactiveError(
+                        "live planning job is no longer activatable"
+                    )
             activation = runtime.activation_operation
             if activation is not None and operation_id != activation["operation_id"]:
                 raise LivePlanningJobInactiveError(
@@ -2964,10 +3195,21 @@ class LivePlanningJobRegistry:
         tenant_id: str,
     ) -> LivePlanningJobSnapshot | None:
         self._spawn_deferred_cleanup_owners()
+        durable_snapshot: LivePlanningJobSnapshot | None = None
+        if self._durable_store is not None:
+            durable_snapshot = await self._durable_store.get(
+                job_id, tenant_id=tenant_id
+            )
         async with self._lock:
             self._prune_locked(self._utc_now())
             runtime = self._owned_locked(job_id, tenant_id)
-            return runtime.snapshot if runtime is not None else None
+            if runtime is not None:
+                if durable_snapshot is None:
+                    return runtime.snapshot
+                return durable_snapshot
+        if durable_snapshot is not None:
+            return durable_snapshot
+        return None
 
     async def cancel(
         self,
@@ -2987,6 +3229,28 @@ class LivePlanningJobRegistry:
         repeat its side effects.
         """
         self._spawn_deferred_cleanup_owners()
+        if self._durable_store is not None:
+            async with self._lock:
+                local_runtime = self._owned_locked(job_id, tenant_id)
+            if local_runtime is None:
+                requested = await self._durable_store.request_cancel(
+                    job_id, tenant_id=tenant_id
+                )
+                if requested.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
+                    return requested
+                deadline = asyncio.get_running_loop().time() + self._cancel_wait_seconds
+                peer_current: LivePlanningJobSnapshot | None = requested
+                while asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.05)
+                    peer_current = await self._durable_store.get(
+                        job_id, tenant_id=tenant_id
+                    )
+                    if (
+                        peer_current is None
+                        or peer_current.state in TERMINAL_LIVE_PLANNING_JOB_STATES
+                    ):
+                        return peer_current
+                return peer_current
         async with self._changed:
             self._prune_locked(self._utc_now())
             runtime = self._owned_locked(job_id, tenant_id)
@@ -3188,6 +3452,8 @@ class LivePlanningJobRegistry:
                     self._prune_locked(self._utc_now())
                     runtime = self._owned_locked(job_id, tenant_id)
                     if runtime is None:
+                        if self._durable_store is not None:
+                            return await self._durable_store.get(job_id, tenant_id=tenant_id)
                         return None
                     if runtime.snapshot.revision > after_revision:
                         return runtime.snapshot
@@ -3222,7 +3488,9 @@ class LivePlanningJobRegistry:
         Idempotent and safe to call again: a second call only re-scans for
         workers that (re)appeared after the first boot.
         """
+        self._confirmed_stopped_job_ids = self._load_death_proofs()
         await self._discover_and_stop_orphan_workers()
+        self._confirmed_stopped_job_ids.update(self._load_death_proofs())
         self._reap_stale_marker_files()
         self._spawn_deferred_cleanup_owners()
         async with self._lock:
@@ -3304,6 +3572,114 @@ class LivePlanningJobRegistry:
                                     self._persist_locked()
                                 self._changed.notify_all()
                         self._ensure_cleanup_owner(runtime)
+
+    async def recover_durable(
+        self,
+        *,
+        tenant_id: str,
+        command_resolver: Callable[[dict[str, Any]], LiveJobWorkerCommand],
+    ) -> tuple[str, ...]:
+        """Claim recoverable durable commands and restart only allowlisted workers."""
+        store = self._durable_store
+        if store is None:
+            return ()
+        recovered: list[str] = []
+        for job_id in await store.list_recoverable(tenant_id=tenant_id):
+            record = await store.recovery_record(job_id, tenant_id=tenant_id)
+            if record is None:
+                continue
+            if record.snapshot.cancel_pending or record.snapshot.cancellation_requested:
+                # Recovery cannot infer executor death from elapsed time.  Keep
+                # the cancelled record isolated until marker authentication and
+                # process-group death confirmation (or an owner drain ACK) has
+                # produced a positive proof.
+                if job_id in self._confirmed_stopped_job_ids:
+                    proof = self._death_proof_file_for(job_id)
+                    proof_object = self._confirmed_stopped_job_ids.get(job_id)
+                    if proof_object is None or proof_object.tenant_id != tenant_id:
+                        continue
+                    consumed = await store.consume_orphan_death_proof(
+                        job_id,
+                        tenant_id=tenant_id,
+                        proof_owner=proof_object.lease_owner,
+                        proof_generation=proof_object.lease_generation,
+                    )
+                    if consumed is not None:
+                        self._confirmed_stopped_job_ids.pop(job_id, None)
+                        if proof is not None:
+                            with suppress(OSError):
+                                proof.unlink(missing_ok=True)
+                continue
+            # A death proof belongs to the worker generation that was just
+            # reaped.  It must never survive into a newly claimed generation:
+            # otherwise a later cancellation could mistake the old orphan's
+            # proof for proof that the new worker has stopped.  Consume the
+            # durable file before claiming/spawning the replacement and fail
+            # closed if it cannot be removed.
+            if job_id in self._confirmed_stopped_job_ids:
+                proof = self._death_proof_file_for(job_id)
+                if proof is not None and proof.exists():
+                    try:
+                        proof.unlink()
+                    except OSError:
+                        continue
+                self._confirmed_stopped_job_ids.pop(job_id, None)
+            lease = await store.claim_with_identity(job_id, tenant_id=tenant_id)
+            if lease is None:
+                continue
+            command = command_resolver(record.command_spec)
+            if not isinstance(command, LiveJobWorkerCommand):
+                raise ValueError("durable recovery resolver returned an invalid command")
+            deadline = max(1.0, (record.snapshot.deadline_at - self._utc_now()).total_seconds())
+            runtime = _RuntimeJob(
+                tenant_partition=self._tenant_partition(tenant_id),
+                tenant_id=tenant_id,
+                snapshot=lease.snapshot,
+                deadline_monotonic=asyncio.get_running_loop().time() + deadline,
+                operation=command,
+            )
+            runtime.durable_lease_owner = lease.owner
+            runtime.durable_lease_generation = lease.generation
+            async with self._changed:
+                if job_id in self._records:
+                    continue
+                self._records[job_id] = runtime
+                runtime.task = asyncio.create_task(
+                    self._run(runtime, command), name=f"tripchord:recovered:{job_id}"
+                )
+                self._start_lease_heartbeat(runtime)
+            recovered.append(job_id)
+        return tuple(recovered)
+
+    async def suspend_for_restart(self) -> None:
+        """Detach local executors without publishing user cancellation."""
+        if self._durable_store is None:
+            await self.close()
+            return
+        store = self._durable_store
+        async with self._lock:
+            runtimes = tuple(self._records.values())
+        for runtime in runtimes:
+            if runtime.lease_heartbeat_task is not None:
+                runtime.lease_heartbeat_task.cancel()
+                runtime.lease_heartbeat_task = None
+            if runtime.task is not None and not runtime.task.done():
+                runtime.task.cancel()
+            if runtime.operation_task is not None and not runtime.operation_task.done():
+                runtime.operation_task.cancel()
+            if runtime.task is not None:
+                with suppress(asyncio.CancelledError, Exception):
+                    await runtime.task
+            if runtime.operation_task is not None:
+                with suppress(asyncio.CancelledError, Exception):
+                    await runtime.operation_task
+            if runtime.durable_lease_owner is not None:
+                await store.release_lease(
+                    runtime.snapshot.id,
+                    tenant_id=runtime.tenant_id,
+                    owner=runtime.durable_lease_owner,
+                    lease_generation=runtime.durable_lease_generation,
+                )
 
     async def close(self) -> None:
         """Close the registry, reusing the exact durable drain state machine as a
@@ -3673,6 +4049,159 @@ class LivePlanningJobRegistry:
             return None
         return workers_dir / f"{job_id}.json"
 
+    def _death_proof_file_for(self, job_id: str) -> Path | None:
+        workers_dir = self._workers_dir()
+        if workers_dir is None:
+            return None
+        return workers_dir / f"{job_id}.death-proof.json"
+
+    @staticmethod
+    def _proof_digest(payload: dict[str, object]) -> str:
+        canonical = json.dumps(
+            {key: value for key, value in payload.items() if key != "digest"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def _write_death_proof(
+        self,
+        job_id: str,
+        marker: str,
+        pgid: int,
+        *,
+        tenant_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> None:
+        path = self._death_proof_file_for(job_id)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
+        directory_stat = path.parent.stat()
+        if (
+            path.parent.is_symlink()
+            or directory_stat.st_uid != os.getuid()
+            or directory_stat.st_mode & 0o777 != 0o700
+        ):
+            raise OSError("unsafe live-worker proof directory")
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            now = datetime.now(UTC).isoformat()
+            json.dump(
+                {
+                    "schema": "tripchord.live-death-proof.v1",
+                    "job_id": job_id,
+                    "marker": marker,
+                    "pgid": pgid,
+                    "tenant_id": tenant_id,
+                    "lease_owner": lease_owner,
+                    "lease_generation": lease_generation,
+                    "authenticated_at": now,
+                    "death_confirmed_at": now,
+                    "authenticated": True,
+                    "death_confirmed": True,
+                },
+                handle,
+                separators=(",", ":"),
+            )
+            handle.flush()
+            handle.seek(0)
+            payload = json.loads(Path(temporary).read_text(encoding="utf-8"))
+            handle.seek(0)
+            handle.truncate(0)
+            payload["digest"] = self._proof_digest(payload)
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+
+    def _load_death_proofs(self) -> dict[str, OrphanDeathProof]:
+        workers_dir = self._workers_dir()
+        if workers_dir is None or not workers_dir.is_dir():
+            return {}
+        proofs: dict[str, OrphanDeathProof] = {}
+        for path in workers_dir.glob("live-job-*.death-proof.json"):
+            job_id = path.name.removesuffix(".death-proof.json")
+            try:
+                stat = path.stat()
+                if path.is_symlink():
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                marker = payload.get("marker")
+                pgid = payload.get("pgid")
+                authenticated_at = payload.get("authenticated_at")
+                death_confirmed_at = payload.get("death_confirmed_at")
+                authenticated_dt = (
+                    datetime.fromisoformat(authenticated_at)
+                    if isinstance(authenticated_at, str)
+                    else None
+                )
+                death_confirmed_dt = (
+                    datetime.fromisoformat(death_confirmed_at)
+                    if isinstance(death_confirmed_at, str)
+                    else None
+                )
+                now = datetime.now(UTC)
+                if (
+                    stat.st_uid == os.getuid()
+                    and stat.st_nlink == 1
+                    and stat.st_mode & 0o777 == 0o600
+                    and payload.get("schema") == "tripchord.live-death-proof.v1"
+                    and payload.get("job_id") == job_id
+                    and isinstance(marker, str)
+                    and bool(marker)
+                    and isinstance(pgid, int)
+                    and pgid > 0
+                    and isinstance(authenticated_at, str)
+                    and isinstance(death_confirmed_at, str)
+                    and isinstance(payload.get("tenant_id"), str)
+                    and bool(payload.get("tenant_id"))
+                    and isinstance(payload.get("lease_owner"), str)
+                    and bool(payload.get("lease_owner"))
+                    and isinstance(payload.get("lease_generation"), int)
+                    and payload["lease_generation"] >= 1
+                    and authenticated_dt is not None
+                    and death_confirmed_dt is not None
+                    and authenticated_dt <= now + timedelta(minutes=5)
+                    and death_confirmed_dt <= now + timedelta(minutes=5)
+                    and death_confirmed_dt >= authenticated_dt
+                    and payload.get("authenticated") is True
+                    and payload.get("death_confirmed") is True
+                    and str(UUID(job_id.removeprefix("live-job-")))
+                    == job_id.removeprefix("live-job-")
+                    and payload.get("digest") == self._proof_digest(payload)
+                ):
+                    proofs[job_id] = OrphanDeathProof(
+                        job_id=job_id,
+                        marker=marker,
+                        pgid=pgid,
+                        tenant_id=payload["tenant_id"],
+                        lease_owner=payload["lease_owner"],
+                        lease_generation=payload["lease_generation"],
+                        authenticated_at=authenticated_at,
+                        death_confirmed_at=death_confirmed_at,
+                        digest=payload["digest"],
+                    )
+            except (OSError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+        return proofs
+
+    @staticmethod
+    def _canonical_job_id(value: str) -> str | None:
+        if not value.startswith("live-job-"):
+            return None
+        raw = value.removeprefix("live-job-")
+        try:
+            canonical = str(UUID(raw))
+        except ValueError:
+            return None
+        return f"live-job-{canonical}" if canonical == raw else None
+
     @staticmethod
     def _group_commands(pgid: int) -> list[str]:
         """The command lines of every process in group ``pgid`` via ``ps``.
@@ -3781,7 +4310,14 @@ class LivePlanningJobRegistry:
         return None
 
     @staticmethod
-    def _write_spawn_intent(marker_file: Path, marker: str) -> None:
+    def _write_spawn_intent(
+        marker_file: Path,
+        marker: str,
+        *,
+        tenant_id: str | None = None,
+        lease_owner: str | None = None,
+        lease_generation: int | None = None,
+    ) -> None:
         """Atomically write the durable spawn-intent marker (nonce, NO pgid).
 
         C-146 P0-2: written BEFORE the worker subprocess exists so a parent-API
@@ -3790,11 +4326,28 @@ class LivePlanningJobRegistry:
         startup, so a cold start can authenticate + kill the real group either
         from the full marker file or, when only the intent survived, by scanning
         process command lines for the nonce."""
-        marker_file.parent.mkdir(parents=True, exist_ok=True)
-        temporary = marker_file.parent / f".{marker_file.name}.{os.getpid()}.intent.tmp"
-        with open(temporary, "w", encoding="utf-8") as handle:
+        marker_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(marker_file.parent, 0o700)
+        directory_stat = marker_file.parent.stat()
+        if (
+            marker_file.parent.is_symlink()
+            or directory_stat.st_uid != os.getuid()
+            or directory_stat.st_mode & 0o777 != 0o700
+        ):
+            raise OSError("unsafe live-worker marker directory")
+        temporary = marker_file.parent / (
+            f".{marker_file.name}.{os.getpid()}.{secrets.token_hex(8)}.intent.tmp"
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(
-                {"marker": marker},
+                {
+                    "marker": marker,
+                    "tenant_id": tenant_id,
+                    "lease_owner": lease_owner,
+                    "lease_generation": lease_generation,
+                },
                 handle,
                 ensure_ascii=False,
                 sort_keys=True,
@@ -3802,6 +4355,7 @@ class LivePlanningJobRegistry:
             )
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
         os.replace(temporary, marker_file)
 
     def _wake_hard_stop_watchdog(self) -> None:
@@ -3816,7 +4370,7 @@ class LivePlanningJobRegistry:
         if wake is not None:
             wake.set()
 
-    async def _discover_and_stop_orphan_workers(self) -> None:
+    async def _discover_and_stop_orphan_workers(self) -> set[str]:
         """Cold-start / parent-API-crash recovery: stop real orphaned workers.
 
         C-146 hard-stop gate (12e35d45 门 2): the API process may be SIGKILLed
@@ -3841,12 +4395,18 @@ class LivePlanningJobRegistry:
         If a separate no-signal probe returns ESRCH, there is no live group to
         authenticate or kill; the stale process identity is discarded and only
         independent durable job facts may resolve the record."""
+        confirmed_stopped_job_ids: set[str] = set()
         candidates: list[tuple[int, str, Path | None, _RuntimeJob | None]] = []
+        marker_lease_identity: dict[tuple[int, str], tuple[str | None, str | None, int | None]] = {}
         if self._state_path is not None:
             workers_dir = self._workers_dir()
             if workers_dir is not None and workers_dir.is_dir():
                 for marker_path in workers_dir.iterdir():
-                    if not marker_path.is_file() or marker_path.suffix != ".json":
+                    if (
+                        not marker_path.is_file()
+                        or marker_path.suffix != ".json"
+                        or marker_path.name.endswith(".death-proof.json")
+                    ):
                         continue
                     try:
                         info = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -3868,6 +4428,15 @@ class LivePlanningJobRegistry:
                             with suppress(OSError):
                                 marker_path.unlink(missing_ok=True)
                             continue
+                    marker_lease_identity[(pgid, marker)] = (
+                        info.get("tenant_id") if isinstance(info.get("tenant_id"), str) else None,
+                        info.get("lease_owner")
+                        if isinstance(info.get("lease_owner"), str)
+                        else None,
+                        info.get("lease_generation")
+                        if isinstance(info.get("lease_generation"), int)
+                        else None,
+                    )
                     candidates.append((pgid, marker, marker_path, None))
         async with self._lock:
             runtimes = list(self._records.values())
@@ -3908,6 +4477,32 @@ class LivePlanningJobRegistry:
                     candidate_runtime,
                 )
         for unique_pgid, unique_marker, unique_marker_path, unique_runtime in unique:
+            if self._durable_store is not None:
+                tenant_id, lease_owner, lease_generation = marker_lease_identity.get(
+                    (unique_pgid, unique_marker),
+                    (
+                        unique_runtime.tenant_id if unique_runtime is not None else None,
+                        unique_runtime.durable_lease_owner if unique_runtime is not None else None,
+                        unique_runtime.durable_lease_generation
+                        if unique_runtime is not None
+                        else None,
+                    ),
+                )
+                marker_job_id = unique_marker_path.stem if unique_marker_path is not None else (
+                    unique_runtime.snapshot.id if unique_runtime is not None else ""
+                )
+                if (
+                    tenant_id is None
+                    or lease_owner is None
+                    or lease_generation is None
+                    or not await self._durable_store.authorize_orphan_reap(
+                        marker_job_id,
+                        tenant_id=tenant_id,
+                        owner=lease_owner,
+                        generation=lease_generation,
+                    )
+                ):
+                    continue
             commands = self._group_commands(unique_pgid)
             authenticated = any(unique_marker in line for line in commands)
             # Kill the whole authenticated group; confirm every member died.
@@ -3923,6 +4518,12 @@ class LivePlanningJobRegistry:
                     while asyncio.get_running_loop().time() < deadline:
                         linux_live = _linux_group_has_live_member(unique_pgid)
                         if linux_live is False:
+                            confirmed = True
+                            break
+                        if linux_live is None and self._group_commands(unique_pgid) == []:
+                            # macOS does not expose the Linux /proc probe.  An
+                            # empty, successful ps result is the equivalent
+                            # confirmation that no member remains in the group.
                             confirmed = True
                             break
                         try:
@@ -3960,6 +4561,30 @@ class LivePlanningJobRegistry:
                         group_absent = True
                 except (PermissionError, OSError):
                     pass
+            marker_job_id = (
+                unique_marker_path.stem if unique_marker_path is not None else ""
+            )
+            canonical_job_id = self._canonical_job_id(marker_job_id)
+            if confirmed and canonical_job_id is not None:
+                confirmed_stopped_job_ids.add(canonical_job_id)
+                proof_identity = marker_lease_identity.get(
+                    (unique_pgid, unique_marker),
+                    (
+                        unique_runtime.tenant_id if unique_runtime is not None else None,
+                        unique_runtime.durable_lease_owner if unique_runtime is not None else None,
+                        unique_runtime.durable_lease_generation
+                        if unique_runtime is not None
+                        else None,
+                    ),
+                )
+                self._write_death_proof(
+                    canonical_job_id,
+                    unique_marker,
+                    unique_pgid,
+                    tenant_id=proof_identity[0],
+                    lease_owner=proof_identity[1],
+                    lease_generation=proof_identity[2],
+                )
             if unique_runtime is not None:
                 # C-146 P0-3: quarantine EVERY cold-booted record with a durable
                 # worker identity — authenticated OR not. An unauthenticated
@@ -4055,6 +4680,7 @@ class LivePlanningJobRegistry:
             if unique_marker_path is not None and (authenticated or confirmed):
                 with suppress(OSError):
                     unique_marker_path.unlink(missing_ok=True)
+        return confirmed_stopped_job_ids
 
     async def _kill_orphan_group(self, pgid: int, marker: str) -> bool:
         """SIGKILL a cold-booted orphan group and confirm it died in budget.
@@ -4072,6 +4698,9 @@ class LivePlanningJobRegistry:
             while asyncio.get_running_loop().time() < deadline:
                 linux_live = _linux_group_has_live_member(pgid)
                 if linux_live is False:
+                    confirmed = True
+                    break
+                if linux_live is None and LivePlanningJobRegistry._group_commands(pgid) == []:
                     confirmed = True
                     break
                 try:
@@ -4100,7 +4729,11 @@ class LivePlanningJobRegistry:
         if workers_dir is None or not workers_dir.is_dir():
             return
         for marker_path in workers_dir.iterdir():
-            if not marker_path.is_file() or marker_path.suffix != ".json":
+            if (
+                not marker_path.is_file()
+                or marker_path.suffix != ".json"
+                or marker_path.name.endswith(".death-proof.json")
+            ):
                 continue
             try:
                 info = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -4264,7 +4897,13 @@ class LivePlanningJobRegistry:
             # durable trace is this intent file; a cold start recovers the real
             # group by scanning process command lines for the nonce. The worker
             # overwrites this same path atomically with its pid/pgid on startup.
-            self._write_spawn_intent(marker_file, marker)
+            self._write_spawn_intent(
+                marker_file,
+                marker,
+                tenant_id=runtime.tenant_id,
+                lease_owner=runtime.durable_lease_owner,
+                lease_generation=runtime.durable_lease_generation,
+            )
         # C-146 P0-1 (RETURN 7de8cf3e): the worker needs the durable job identity
         # to bind its model-trace scope / checkpoint request digest to the job the
         # parent registry owns (the same ``job_id`` the in-process reporter
@@ -4272,6 +4911,12 @@ class LivePlanningJobRegistry:
         # job id, so the registry injects it here at spawn time.
         worker_args = dict(command.args)
         worker_args["job_id"] = runtime.snapshot.id
+        if runtime.tenant_id:
+            worker_args["tenant_id"] = runtime.tenant_id
+        if runtime.durable_lease_owner is not None:
+            worker_args["lease_owner"] = runtime.durable_lease_owner
+        if runtime.durable_lease_generation is not None:
+            worker_args["lease_generation"] = runtime.durable_lease_generation
         if runtime.worker_execution_capability is not None:
             if "formal_execution_capability" in worker_args:
                 raise RuntimeError("worker command already carries a formal capability")
@@ -5919,6 +6564,7 @@ class LivePlanningJobRegistry:
                     "updated_at": self._utc_now(),
                 }
             )
+            await self._publish_durable(runtime)
             self._changed.notify_all()
 
     async def _update_pair_checkpoint(
@@ -5950,6 +6596,7 @@ class LivePlanningJobRegistry:
                     "updated_at": self._utc_now(),
                 }
             )
+            await self._publish_durable(runtime)
             self._changed.notify_all()
 
     async def _update_model_trace_summary(
@@ -5993,6 +6640,7 @@ class LivePlanningJobRegistry:
                 }
             )
             runtime.model_trace_summary_reported = True
+            await self._publish_durable(runtime)
             self._changed.notify_all()
 
     async def _update_source_terminal_events(
@@ -6023,6 +6671,7 @@ class LivePlanningJobRegistry:
                     "updated_at": self._utc_now(),
                 }
             )
+            await self._publish_durable(runtime)
             self._changed.notify_all()
 
     async def _mark_barrier_released(
@@ -6044,6 +6693,7 @@ class LivePlanningJobRegistry:
                     "updated_at": self._utc_now(),
                 }
             )
+            await self._publish_durable(runtime)
             self._changed.notify_all()
 
     async def _finish(
@@ -6066,6 +6716,9 @@ class LivePlanningJobRegistry:
         settle_quarantined: bool = False,
     ) -> None:
         async with self._changed:
+            if runtime.lease_heartbeat_task is not None:
+                runtime.lease_heartbeat_task.cancel()
+                runtime.lease_heartbeat_task = None
             if runtime.quarantined and not settle_quarantined:
                 # C-146 P0 supplement (P0-4): a quarantined record is
                 # NON-terminal by contract — no path may terminalize it. Only
@@ -6108,6 +6761,7 @@ class LivePlanningJobRegistry:
             # a close / same-key retry / cold start.
             runtime.pending_terminal = None
             try:
+                await self._publish_durable(runtime)
                 self._persist_locked()
             except LivePlanningJobRegistryPostCommitError:
                 # The terminalized state was already committed to disk; the

@@ -315,16 +315,55 @@ async def run_live_flexible_from_text(
     probe_path: str | None = None,
     runtime_bundle: dict[str, Any] | None = None,
     formal_execution_capability: dict[str, Any] | None = None,
+    lease_owner: str | None = None,
+    lease_generation: int | None = None,
 ) -> dict[str, Any]:
     # Delayed import: only an actual worker execution pulls in ``tripchord.main``
     # (and, under TRIPCHORD_LIVE_WORKER_SUBPROCESS=1, no second job registry).
     import tripchord.main as api_main
+    from tripchord.agents.flexible_live_system import FlexiblePairExecution
     from tripchord.api import LiveFlexibleFromTextPlanningRequest
     from tripchord.auth import Principal
     from tripchord.main import _execute_live_flexible_from_text, app, live_run_cache
 
     runtime_receipt: dict[str, Any] | None = None
     observability = _WorkerObservability(job_id=job_id or "")
+    recovered_pair_executions: tuple[FlexiblePairExecution, ...] = ()
+    if job_id and lease_owner is not None and lease_generation is not None:
+        store = getattr(api_main, "live_planning_job_store", None)
+        if store is not None:
+            raw_results = await store.load_pair_results(job_id, tenant_id=tenant_id)
+            recovered_pair_executions = tuple(
+                FlexiblePairExecution.model_validate(item) for item in raw_results
+            )
+    pair_sequence = len(recovered_pair_executions)
+
+    async def report_execution(execution: FlexiblePairExecution) -> None:
+        nonlocal pair_sequence
+        if not job_id or lease_owner is None or lease_generation is None:
+            return
+        pair_sequence += 1
+        system = api_main._flexible_live_agent_system_from_app(app)
+        checkpoint = system._pair_checkpoint(
+            execution, sequence=pair_sequence, request_sha256=request_digest
+        )
+        store = getattr(api_main, "live_planning_job_store", None)
+        if store is None:
+            return
+        digest = hashlib.sha256(
+            json.dumps(execution.model_dump(mode="json"), sort_keys=True).encode()
+        ).hexdigest()
+        accepted = await store.store_pair_result(
+            job_id,
+            tenant_id=tenant_id,
+            checkpoint=checkpoint,
+            execution=execution.model_dump(mode="json"),
+            execution_sha256=digest,
+            owner=lease_owner,
+            lease_generation=lease_generation,
+        )
+        if not accepted:
+            raise RuntimeError("live planning lease expired while writing pair result")
     if runtime_bundle is not None:
         # C-146 P0-1 (RETURN 7de8cf3e): the API process handed this worker a
         # runtime bundle so the ready chain runs in THIS process against a REAL
@@ -386,6 +425,8 @@ async def run_live_flexible_from_text(
             expected_request_sha256=request_digest,
             model_trace_scope_id=job_id or None,
             report_model_trace_summary=observability.report_model_trace_summary,
+            recovered_pair_executions=recovered_pair_executions,
+            pair_execution_reporter=report_execution,
         )
 
     try:

@@ -198,7 +198,7 @@ def _payload(
 
 
 @pytest.mark.asyncio
-async def test_ready_text_maps_constraints_runs_flexible_search_and_caches_pairs(
+async def test_ready_text_maps_constraints_does_not_cache_without_publishable_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pair_runner = _RecordingPairRunner()
@@ -266,7 +266,7 @@ async def test_ready_text_maps_constraints_runs_flexible_search_and_caches_pairs
         frozen.candidate_set_sha256
     )
     assert len(body["run"]["pair_runs"]) == 2
-    assert len(body["cached_pair_runs"]) == 2
+    assert body["cached_pair_runs"] == []
     assert len(pair_runner.calls) == 2
     for intent, query, mode, timeout_seconds, delays in pair_runner.calls:
         assert mode == LiveCoverageMode.STRICT
@@ -289,9 +289,6 @@ async def test_ready_text_maps_constraints_runs_flexible_search_and_caches_pairs
         assert isinstance(query_candidate_set, dict)
         assert query_candidate_set["candidate_set_sha256"] == frozen.candidate_set_sha256
         assert delays is not None and len(delays) == 13
-    for handle in body["cached_pair_runs"]:
-        assert await cache.get(handle["run_id"], "anonymous") is not None
-        assert await cache.get(handle["run_id"], "another-tenant") is None
 
 
 @pytest.mark.asyncio

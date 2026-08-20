@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 
 import {
   advanceLiveRunAfterEvent,
+  ApiError,
   type AgenticRunSummary,
   type AgentRun,
   cancelLiveFlexiblePlanningJob,
@@ -17,12 +18,14 @@ import {
   getBreakfastPreferenceApplication,
   getLiveMonitor,
   getLivePackage,
+  getLiveFlexiblePlanningJob,
   type Job,
   type JsonValue,
   type LiveBridgeHealth,
   type LiveEventReplanRun,
   type FinalPlanProjection,
   type LiveFlexibleFromTextResponse,
+  type LiveFlexibleFromTextInput,
   type LiveMonitorStatus,
   type LivePackageAgentRun,
   type LivePlanningJobSnapshot,
@@ -54,6 +57,7 @@ import {
   type TripSpec,
   type Workspace,
 } from "./api";
+export { ApiError } from "./api";
 import {
   componentCoverageExplanations,
   priceLabel,
@@ -2024,6 +2028,109 @@ function LiveMonitorPanel({
   );
 }
 
+type LiveSubmissionIdentity = {
+  tripId: string;
+  idempotencyKey: string;
+  storageKey: string;
+  jobId?: string;
+};
+
+export function canonicalLiveInput(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalLiveInput);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, canonicalLiveInput(item)]),
+    );
+  }
+  return value;
+}
+
+export async function liveSubmissionIdentity(
+  input: LiveFlexibleFromTextInput,
+): Promise<LiveSubmissionIdentity> {
+  const identityInput = {
+    ...input,
+    requirement: { ...input.requirement, trip_id: "pending" },
+  };
+  const normalized = JSON.stringify(canonicalLiveInput(identityInput));
+  const digestBytes = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(normalized),
+  );
+  const digest = Array.from(new Uint8Array(digestBytes), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  const storageKey = `tripchord-live-submission:${digest}`;
+  const existing = window.localStorage.getItem(storageKey);
+  if (existing) {
+    try {
+      const parsed = JSON.parse(existing) as LiveSubmissionIdentity;
+      if (parsed.tripId && parsed.idempotencyKey) {
+        return { ...parsed, storageKey };
+      }
+    } catch {
+      // Replace malformed local state with a fresh active identity.
+    }
+  }
+  const identity = {
+    tripId: `ui-live-flexible-${crypto.randomUUID()}`,
+    idempotencyKey: `live-${crypto.randomUUID()}`,
+    storageKey,
+  };
+  window.localStorage.setItem(storageKey, JSON.stringify(identity));
+  return identity;
+}
+
+export function clearLiveSubmissionIdentity(storageKey: string | null): void {
+  if (storageKey) window.localStorage.removeItem(storageKey);
+}
+
+export function shouldClearLiveSubmissionIdentity(error: unknown): boolean {
+  return error instanceof ApiError && [404, 410].includes(error.status ?? 0);
+}
+
+export type LiveJobApplication = {
+  terminal: boolean;
+  clearIdentity: boolean;
+  response: LiveFlexibleFromTextResponse | null;
+  selectedDatePairId: string;
+  error: string | null;
+};
+
+export function applyLivePlanningJob(job: LivePlanningJobSnapshot): LiveJobApplication {
+  if (job.state === "succeeded") {
+    if (!job.result) {
+      return {
+        terminal: true,
+        clearIdentity: true,
+        response: null,
+        selectedDatePairId: "",
+        error: "实时任务已结束，但没有返回可验证的规划结果。",
+      };
+    }
+    return {
+      terminal: true,
+      clearIdentity: true,
+      response: job.result,
+      selectedDatePairId:
+        job.result.final_plan?.date_pair_id ??
+        job.result.run?.recommended_option_ids[0] ??
+        job.result.run?.ranked_options[0]?.date_pair_id ??
+        "",
+      error: null,
+    };
+  }
+  if (job.state === "failed") {
+    return { terminal: true, clearIdentity: true, response: null, selectedDatePairId: "", error: job.error ?? "实时多平台规划失败" };
+  }
+  if (job.state === "cancelled") {
+    return { terminal: true, clearIdentity: true, response: null, selectedDatePairId: "", error: "实时多平台规划已取消，未生成或发布部分方案。" };
+  }
+  return { terminal: false, clearIdentity: false, response: null, selectedDatePairId: "", error: null };
+}
+
 function App() {
   const [origin, setOrigin] = useState("杭州");
   const [destination, setDestination] = useState("马累");
@@ -2041,6 +2148,7 @@ function App() {
   const liveMaxPairs = 400;
   const [bridgeToken, setBridgeToken] = useState("");
   const [liveBridgeHealth, setLiveBridgeHealth] = useState<LiveBridgeHealth | null>(null);
+  const [liveSubmissionStorageKey, setLiveSubmissionStorageKey] = useState<string | null>(null);
   const [liveHealthChecking, setLiveHealthChecking] = useState(false);
   const [liveFlexibleResponse, setLiveFlexibleResponse] =
     useState<LiveFlexibleFromTextResponse | null>(null);
@@ -2066,6 +2174,49 @@ function App() {
   const [agentBoundary, setAgentBoundary] = useState("");
   const [breakfastMode, setBreakfastMode] = useState<PreferenceMode>("indifferent");
   const [breakfastWeight, setBreakfastWeight] = useState(0.7);
+
+  useEffect(() => {
+    let cancelled = false;
+    const restore = async () => {
+      const prefix = "tripchord-live-submission:";
+      const records: Array<[string, LiveSubmissionIdentity]> = [];
+      for (let index = 0; index < window.localStorage.length; index += 1) {
+        const key = window.localStorage.key(index);
+        if (!key?.startsWith(prefix)) continue;
+        try {
+          const value = JSON.parse(window.localStorage.getItem(key) ?? "null") as LiveSubmissionIdentity;
+          if (value.jobId) records.push([key, value]);
+        } catch {
+          window.localStorage.removeItem(key);
+        }
+      }
+      const active = records.at(-1);
+      if (!active) return;
+      try {
+        const restored = await getLiveFlexiblePlanningJob(active[1].jobId as string);
+        if (cancelled) return;
+        setPlanningMode("live");
+        setLiveSubmissionStorageKey(active[0]);
+        setLivePlanningJob(restored);
+        const applied = applyLivePlanningJob(restored);
+        if (applied.terminal) {
+          clearLiveSubmissionIdentity(active[0]);
+          if (applied.response) setLiveFlexibleResponse(applied.response);
+          setSelectedLiveDatePairId(applied.selectedDatePairId);
+          if (applied.error) setError(applied.error);
+          return;
+        }
+      } catch (caught) {
+        if (shouldClearLiveSubmissionIdentity(caught)) {
+          clearLiveSubmissionIdentity(active[0]);
+        }
+      }
+    };
+    void restore();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const selectedFlexibleOption = useMemo(
     () =>
       liveFlexibleResponse?.final_plan
@@ -2132,27 +2283,27 @@ function App() {
       livePlanningJob.id,
       (nextJob) => {
         setLivePlanningJob(nextJob);
-        if (nextJob.state === "succeeded") {
-          if (!nextJob.result) {
-            setError("实时任务已结束，但没有返回可验证的规划结果。");
-            return;
-          }
-          setLiveFlexibleResponse(nextJob.result);
-          setSelectedLiveDatePairId(
-            nextJob.result.final_plan?.date_pair_id ??
-              nextJob.result.run?.recommended_option_ids[0] ??
-              nextJob.result.run?.ranked_options[0]?.date_pair_id ??
-              "",
-          );
-        } else if (nextJob.state === "failed") {
-          setError(nextJob.error ?? "实时多平台规划失败");
-        } else if (nextJob.state === "cancelled") {
-          setError("实时多平台规划已取消，未生成或发布部分方案。");
+        const applied = applyLivePlanningJob(nextJob);
+        if (applied.clearIdentity) {
+          clearLiveSubmissionIdentity(liveSubmissionStorageKey);
+          setLiveSubmissionStorageKey(null);
         }
+        if (applied.response) setLiveFlexibleResponse(applied.response);
+        setSelectedLiveDatePairId(applied.selectedDatePairId);
+        if (applied.error) setError(applied.error);
       },
-      setError,
+      (message: string, status?: number | null) => {
+        if (shouldClearLiveSubmissionIdentity(new ApiError(message, status ?? null))) {
+          clearLiveSubmissionIdentity(liveSubmissionStorageKey);
+          setLiveSubmissionStorageKey(null);
+          setLivePlanningJob(null);
+          setError("实时任务已失效，可以重新提交需求。");
+          return;
+        }
+        setError(message);
+      },
     );
-  }, [livePlanningJob?.id, livePlanningJob?.state]);
+  }, [livePlanningJob?.id, livePlanningJob?.state, liveSubmissionStorageKey]);
 
   useEffect(() => {
     if (!workspace || selectedVersion <= 1) {
@@ -2210,22 +2361,38 @@ function App() {
       if (planningMode === "live") {
         const health = await refreshLiveHealth();
         requireLiveBridgeAvailability(health);
-        const started = await startLiveFlexiblePlanningFromTextJob(
-          {
-            requirement: {
-              text: liveRequirementText,
-              trip_id: `ui-live-flexible-${crypto.randomUUID()}`,
-              breakfast_mode: breakfastMode,
-              breakfast_weight: normalizeBreakfastWeight(breakfastMode, breakfastWeight),
-            },
-            coverage_mode: "strict",
-            timeout_seconds: 120,
-            total_timeout_seconds: 600,
-            max_pairs: liveMaxPairs,
+        const liveInput: LiveFlexibleFromTextInput = {
+          requirement: {
+            text: liveRequirementText,
+            trip_id: "pending",
+            breakfast_mode: breakfastMode,
+            breakfast_weight: normalizeBreakfastWeight(breakfastMode, breakfastWeight),
           },
-          `ui-live-job-${crypto.randomUUID()}`,
+          coverage_mode: "strict",
+          timeout_seconds: 120,
+          total_timeout_seconds: 600,
+          max_pairs: liveMaxPairs,
+        };
+        const identity = await liveSubmissionIdentity(liveInput);
+        liveInput.requirement.trip_id = identity.tripId;
+        const started = await startLiveFlexiblePlanningFromTextJob(
+          liveInput,
+          identity.idempotencyKey,
         );
+        window.localStorage.setItem(
+          identity.storageKey,
+          JSON.stringify({ ...identity, jobId: started.job.id }),
+        );
+        setLiveSubmissionStorageKey(identity.storageKey);
         setLivePlanningJob(started.job);
+        const applied = applyLivePlanningJob(started.job);
+        if (applied.terminal) {
+          clearLiveSubmissionIdentity(identity.storageKey);
+          setLiveSubmissionStorageKey(null);
+          if (applied.response) setLiveFlexibleResponse(applied.response);
+          setSelectedLiveDatePairId(applied.selectedDatePairId);
+          if (applied.error) setError(applied.error);
+        }
         return;
       }
       const [started, foundOffers, agentResponse] = await Promise.all([
@@ -2252,7 +2419,16 @@ function App() {
     if (!livePlanningJob) return;
     setError("");
     try {
-      setLivePlanningJob(await cancelLiveFlexiblePlanningJob(livePlanningJob.id));
+      const cancelled = await cancelLiveFlexiblePlanningJob(livePlanningJob.id);
+      setLivePlanningJob(cancelled);
+      const applied = applyLivePlanningJob(cancelled);
+      if (applied.clearIdentity) {
+        clearLiveSubmissionIdentity(liveSubmissionStorageKey);
+        setLiveSubmissionStorageKey(null);
+      }
+      if (applied.response) setLiveFlexibleResponse(applied.response);
+      setSelectedLiveDatePairId(applied.selectedDatePairId);
+      if (applied.error) setError(applied.error);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "无法取消实时规划任务");
     }

@@ -40,6 +40,7 @@ from tripchord.agents.flexible_live_system import (
     FlexibleLiveAgentRun,
     FlexibleLiveAgentSystem,
     FlexiblePackageConstraints,
+    FlexiblePairExecution,
     LiveDatePairRunner,
     PairCheckpointReporter,
 )
@@ -180,6 +181,7 @@ from tripchord.persistence import Database, WorkspaceRepository
 from tripchord.persistence.booking_ledger import BookingLedgerStore
 from tripchord.persistence.handoff_store import HandoffStore
 from tripchord.persistence.live_monitors import DbLiveMonitorStore, LiveMonitorNotFoundError
+from tripchord.persistence.live_planning_jobs import DurableLivePlanningJobStore
 from tripchord.persistence.repository import (
     WorkspaceConflictError,
     WorkspaceNotFoundError,
@@ -1017,6 +1019,7 @@ context_builder = BudgetedAgentContextBuilder(EvidenceRagRetriever(memory_store)
 providers = build_provider_registry(settings)
 amap = build_amap_provider(settings)
 database = Database(settings.database_url)
+live_planning_job_store = DurableLivePlanningJobStore(database)
 live_monitor_store = DbLiveMonitorStore(database)
 job_runner = PlanningJobRunner(database)
 rate_limiter = RateLimiter(
@@ -1044,11 +1047,12 @@ _LIVE_WORKER_SUBPROCESS = os.environ.get("TRIPCHORD_LIVE_WORKER_SUBPROCESS") == 
 live_planning_job_registry: LivePlanningJobRegistry | None
 if not _LIVE_WORKER_SUBPROCESS:
     live_planning_job_registry = LivePlanningJobRegistry(
-        state_path=(
-            Path(configured_job_registry_path)
-            if configured_job_registry_path is not None
-            else None
-        )
+        # Durable DB is the state authority; this path is retained only for
+        # authenticated subprocess marker files used by crash recovery.
+        state_path=Path(configured_job_registry_path)
+        if configured_job_registry_path
+        else (Path(".runtime") / "live-planning-jobs.json").resolve(strict=False),
+        durable_store=live_planning_job_store,
     )
 else:
     live_planning_job_registry = None
@@ -1131,22 +1135,49 @@ async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
         live_job_registry_startup, "restore_after_restart"
     ):
         await live_job_registry_startup.restore_after_restart()
+        if live_planning_job_store is not None:
+            for tenant_id in await live_planning_job_store.list_tenants():
+                await live_job_registry_startup.recover_durable(
+                    tenant_id=tenant_id,
+                    command_resolver=_resolve_persisted_live_worker_command,
+                )
     shared_model_http = cast(
         ManagedModelHTTPRuntime | None,
         getattr(target_app.state, "model_http_runtime", None),
     )
     model_enabled = getattr(target_app.state, "model_router", None) is not None
     model_http_started = False
+    durable_recovery_task: asyncio.Task[None] | None = None
     companion_supervisor = cast(
         BrowserCompanionRuntimeSupervisor | None,
         getattr(target_app.state, "browser_companion_runtime_supervisor", None),
     )
+
+    async def durable_recovery_loop() -> None:
+        while True:
+            await asyncio.sleep(30)
+            if live_job_registry_startup is None:
+                continue
+            try:
+                for tenant_id in await live_planning_job_store.list_tenants():
+                    await live_job_registry_startup.recover_durable(
+                        tenant_id=tenant_id,
+                        command_resolver=_resolve_persisted_live_worker_command,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("durable live planning recovery sweep failed")
     try:
         if shared_model_http is not None and model_enabled:
             await shared_model_http.start()
             model_http_started = True
         if companion_supervisor is not None:
             companion_supervisor.start()
+        if live_job_registry_startup is not None and live_planning_job_store is not None:
+            durable_recovery_task = asyncio.create_task(
+                durable_recovery_loop(), name="tripchord:durable-recovery"
+            )
         yield
     finally:
         # Cancel long-running live jobs before closing providers so cancellation
@@ -1165,13 +1196,25 @@ async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
             LiveQuoteMonitorRegistry | None,
             getattr(target_app.state, "live_quote_monitor_registry", None),
         )
+        if durable_recovery_task is not None:
+            durable_recovery_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await durable_recovery_task
         # Every model consumer is stopped before the shared connection pool.
         # Closing earlier can deadlock while an in-flight monitor waits on HTTP.
         shutdown_steps: list[tuple[str, Callable[[], Awaitable[None]]]] = []
         if companion_supervisor is not None:
             shutdown_steps.append(("browser_companion_supervisor", companion_supervisor.close))
         if live_job_registry is not None:
-            shutdown_steps.append(("live_planning_jobs", live_job_registry.close))
+            shutdown_steps.append(
+                (
+                        "live_planning_jobs",
+                        live_job_registry.suspend_for_restart
+                        if live_planning_job_store is not None
+                        and hasattr(live_job_registry, "suspend_for_restart")
+                        else live_job_registry.close,
+                )
+            )
         if provider is not None:
             shutdown_steps.append(("icom_transfer_provider", provider.aclose))
         if monitor_registry is not None:
@@ -2510,9 +2553,19 @@ async def _cache_flexible_pair_runs(
     ensure_active: Callable[[], Awaitable[None]] | None = None,
     search_run_recorder: Callable[[LivePackageAgentRun], Awaitable[SearchRun | None]] | None = None,
 ) -> tuple[LiveFlexiblePairRunHandle, ...]:
+    if ensure_active is not None:
+        await ensure_active()
     handles: list[LiveFlexiblePairRunHandle] = []
+    final_projection = build_final_plan_projection(run)
+    selected_pair_id = final_projection.date_pair_id if final_projection is not None else None
+    if selected_pair_id is None:
+        return ()
     for pair_run in run.pair_runs:
         if pair_run.run is None:
+            continue
+        # Exploration remains in the durable run/result, but the short-lived
+        # re-planning cache receives only the one published final option.
+        if selected_pair_id is not None and pair_run.date_pair.id != selected_pair_id:
             continue
         if ensure_active is not None:
             await ensure_active()
@@ -2644,6 +2697,45 @@ def _live_flexible_from_text_request_sha256(
     ).hexdigest()
 
 
+def _resolve_persisted_live_worker_command(spec: dict[str, Any]) -> LiveJobWorkerCommand:
+    allowed_module = str(Path(live_flexible_from_text_worker.__file__).resolve())
+    if spec.get("kind") != "worker_command" or spec.get("module_path") != allowed_module:
+        raise RuntimeError("persisted live worker command is not allowlisted")
+    if spec.get("entry") != "run_live_flexible_from_text":
+        raise RuntimeError("persisted live worker entry is not allowlisted")
+    persisted = spec.get("args")
+    if not isinstance(persisted, dict):
+        raise RuntimeError("persisted live worker arguments are invalid")
+    payload_raw = persisted.get("payload")
+    request_digest = persisted.get("request_digest")
+    tenant_id = persisted.get("tenant_id")
+    if not isinstance(payload_raw, dict) or not isinstance(request_digest, str):
+        raise RuntimeError("persisted live worker request envelope is invalid")
+    if not isinstance(tenant_id, str) or not tenant_id:
+        raise RuntimeError("persisted live worker tenant is invalid")
+    payload = LiveFlexibleFromTextPlanningRequest.model_validate(payload_raw)
+    if _live_flexible_from_text_request_sha256(payload) != request_digest:
+        raise RuntimeError("persisted live worker request digest does not match payload")
+    args: dict[str, Any] = {
+        "payload": payload.model_dump(mode="json"),
+        "request_digest": request_digest,
+        "tenant_id": tenant_id,
+    }
+    # Runtime credentials are deliberately regenerated from current process
+    # settings.  They are never read from the durable command spec.
+    runtime_bundle = _live_flexible_worker_runtime_bundle()
+    if runtime_bundle is not None:
+        args["runtime_bundle"] = runtime_bundle
+    return LiveJobWorkerCommand(
+        module_path=allowed_module,
+        entry="run_live_flexible_from_text",
+        args=dict(args),
+        result_importer=_build_live_worker_result_importer(
+            cache=live_run_cache, tenant_id=tenant_id
+        ),
+    )
+
+
 async def _execute_live_flexible_from_text_body(
     payload: LiveFlexibleFromTextPlanningRequest,
     *,
@@ -2654,6 +2746,8 @@ async def _execute_live_flexible_from_text_body(
     report_progress: LiveJobProgressReporter | None = None,
     report_pair_checkpoint: PairCheckpointReporter | None = None,
     checkpoint_request_sha256: str | None = None,
+    recovered_pair_executions: tuple[FlexiblePairExecution, ...] = (),
+    pair_execution_reporter: Callable[[FlexiblePairExecution], Awaitable[None]] | None = None,
 ) -> LiveFlexibleFromTextPlanningResponse:
     async def report(stage: str, progress: int) -> None:
         if report_progress is not None:
@@ -2814,6 +2908,8 @@ async def _execute_live_flexible_from_text_body(
                     pair_checkpoint_reporter=report_pair_checkpoint,
                     checkpoint_request_sha256=checkpoint_request_sha256,
                     reference_date=pinned_reference_date,
+                    recovered_pair_executions=recovered_pair_executions,
+                    pair_execution_reporter=pair_execution_reporter,
                 )
             else:
                 run = await flexible_system.run(
@@ -2915,6 +3011,8 @@ async def _execute_live_flexible_from_text(
     expected_request_sha256: str | None = None,
     model_trace_scope_id: str | None = None,
     report_model_trace_summary: Callable[[str, str, int, int, int], Awaitable[None]] | None = None,
+    recovered_pair_executions: tuple[FlexiblePairExecution, ...] = (),
+    pair_execution_reporter: Callable[[FlexiblePairExecution], Awaitable[None]] | None = None,
 ) -> LiveFlexibleFromTextPlanningResponse:
     request_sha256 = _live_flexible_from_text_request_sha256(payload)
     if expected_request_sha256 is not None and not hmac.compare_digest(
@@ -2942,6 +3040,8 @@ async def _execute_live_flexible_from_text(
                 checkpoint_request_sha256=(
                     request_sha256 if report_pair_checkpoint is not None else None
                 ),
+                recovered_pair_executions=recovered_pair_executions,
+                pair_execution_reporter=pair_execution_reporter,
             )
         finally:
             trace_summary = trace_sink.scope_summary(trace_scope)
@@ -3072,33 +3172,15 @@ def _live_flexible_worker_runtime_bundle() -> dict[str, Any] | None:
     return build_authenticated_runtime_bundle(parsed)
 
 
-def _build_live_flexible_from_text_worker_command(
-    payload: LiveFlexibleFromTextPlanningRequest,
-    *,
-    request_digest: str,
-    target_app: FastAPI,
-    cache: LiveRunCache,
-    principal: Principal,
-) -> LiveJobWorkerCommand:
-    """Wrap the real planning operation for execution in an independent worker.
+def _build_live_worker_result_importer(
+    *, cache: LiveRunCache, tenant_id: str
+) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
+    """Build the parent-side importer for a recovered worker result.
 
-    C-146 P0-1: the production persistent-task entry must reach an independent
-    worker/process — not a coroutine inside the API process. The command's
-    ``module_path`` points at the production worker entry, which reconstructs the
-    durable request and runs the SAME ``_execute_live_flexible_from_text`` path
-    the API uses. Query / cancel / retry / cold-start recovery stay bound to the
-    durable job identity owned by the registry. When a runtime bundle is
-    configured it is forwarded to the worker so the ready chain builds its OWN
-    real system in the worker process.
+    Worker processes cannot publish handles into the API cache.  Keeping this
+    importer as a factory makes the normal and cold-recovery paths identical,
+    while the returned closure remains process-local and is never serialized.
     """
-    args: dict[str, Any] = {
-        "payload": payload.model_dump(mode="json"),
-        "request_digest": request_digest,
-        "tenant_id": principal.tenant_id,
-    }
-    runtime_bundle = _live_flexible_worker_runtime_bundle()
-    if runtime_bundle is not None:
-        args["runtime_bundle"] = runtime_bundle
 
     async def import_result(result: dict[str, Any]) -> dict[str, Any]:
         raw_runs = result.pop("_worker_cache_runs", None)
@@ -3137,32 +3219,60 @@ def _build_live_flexible_from_text_worker_command(
             parsed.append((pair_id, LivePackageAgentRun.model_validate(item["run"])))
             worker_pair_ids.append(pair_id)
         handle_pair_ids = [handle.date_pair_id for handle in response.cached_pair_runs]
-        expected_pair_ids = [pair_id for pair_id, _run in expected_pair_runs]
-        if worker_pair_ids != handle_pair_ids or worker_pair_ids != expected_pair_ids:
+        expected_by_id = dict(expected_pair_runs)
+        if worker_pair_ids != handle_pair_ids or len(set(worker_pair_ids)) != len(worker_pair_ids):
             raise RuntimeError("live planning worker cache handles do not match runs")
+        if any(pair_id not in expected_by_id for pair_id in worker_pair_ids):
+            raise RuntimeError("live planning worker cache handle references unknown run")
         if any(
-            cached_run != expected_run
-            for (_pair_id, cached_run), (_expected_id, expected_run) in zip(
-                parsed,
-                expected_pair_runs,
-                strict=True,
-            )
+            cached_run != expected_by_id[pair_id]
+            for pair_id, cached_run in parsed
         ):
             raise RuntimeError("live planning worker cache entries do not match result")
-        parent_handles = await cache.import_worker_runs(
-            principal.tenant_id,
-            tuple(parsed),
-        )
+        parent_handles = await cache.import_worker_runs(tenant_id, tuple(parsed))
         result["cached_pair_runs"] = [
             handle.model_dump(mode="json") for handle in parent_handles
         ]
         return result
 
+    return import_result
+
+
+def _build_live_flexible_from_text_worker_command(
+    payload: LiveFlexibleFromTextPlanningRequest,
+    *,
+    request_digest: str,
+    target_app: FastAPI,
+    cache: LiveRunCache,
+    principal: Principal,
+) -> LiveJobWorkerCommand:
+    """Wrap the real planning operation for execution in an independent worker.
+
+    C-146 P0-1: the production persistent-task entry must reach an independent
+    worker/process — not a coroutine inside the API process. The command's
+    ``module_path`` points at the production worker entry, which reconstructs the
+    durable request and runs the SAME ``_execute_live_flexible_from_text`` path
+    the API uses. Query / cancel / retry / cold-start recovery stay bound to the
+    durable job identity owned by the registry. When a runtime bundle is
+    configured it is forwarded to the worker so the ready chain builds its OWN
+    real system in the worker process.
+    """
+    args: dict[str, Any] = {
+        "payload": payload.model_dump(mode="json"),
+        "request_digest": request_digest,
+        "tenant_id": principal.tenant_id,
+    }
+    runtime_bundle = _live_flexible_worker_runtime_bundle()
+    if runtime_bundle is not None:
+        args["runtime_bundle"] = runtime_bundle
+
     return LiveJobWorkerCommand(
         module_path=str(Path(live_flexible_from_text_worker.__file__)),
         entry="run_live_flexible_from_text",
         args=args,
-        result_importer=import_result,
+        result_importer=_build_live_worker_result_importer(
+            cache=cache, tenant_id=principal.tenant_id
+        ),
     )
 
 
@@ -3178,9 +3288,9 @@ async def start_live_flexible_from_text_job_endpoint(
     registry: LivePlanningJobRegistryDep,
     principal: PrincipalDep,
     idempotency_key: Annotated[
-        str | None,
-        Header(alias="Idempotency-Key", max_length=200),
-    ] = None,
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=200),
+    ],
     formal_prepare_credential: Annotated[
         str | None,
         Header(alias="X-TripChord-Formal-Source-Control"),

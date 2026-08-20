@@ -38,6 +38,7 @@ import importlib.util
 import inspect
 import json
 import os
+import secrets
 import sys
 from collections.abc import Coroutine
 from contextlib import suppress
@@ -48,11 +49,23 @@ from typing import Any, cast
 
 def _atomic_write(path: Path, payload: dict[str, object]) -> None:
     """Atomically write ``payload`` as JSON to ``path`` (temp + fsync + replace)."""
-    temporary = path.parent / f".{path.name}.{os.getpid()}.tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    parent_stat = path.parent.stat()
+    if (
+        path.parent.is_symlink()
+        or parent_stat.st_uid != os.getuid()
+        or parent_stat.st_mode & 0o777 != 0o700
+    ):
+        raise OSError("unsafe worker marker directory")
+    temporary = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         handle.flush()
         os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
     os.replace(temporary, path)
 
 
@@ -90,6 +103,12 @@ def main(argv: list[str] | None = None) -> int:
     if os.getpgrp() != os.getpid():
         os.setsid()
     marker_file: Path | None = None
+    try:
+        marker_kwargs = json.loads(args.args_json)
+    except json.JSONDecodeError:
+        marker_kwargs = {}
+    if not isinstance(marker_kwargs, dict):
+        marker_kwargs = {}
     if args.marker and args.marker_file:
         marker_file = Path(args.marker_file)
         marker_file.parent.mkdir(parents=True, exist_ok=True)
@@ -100,6 +119,9 @@ def main(argv: list[str] | None = None) -> int:
                 "pgid": os.getpgrp(),
                 "marker": args.marker,
                 "probe_path": args.probe_path,
+                "tenant_id": marker_kwargs.get("tenant_id"),
+                "lease_owner": marker_kwargs.get("lease_owner"),
+                "lease_generation": marker_kwargs.get("lease_generation"),
                 "started_at": datetime.now(UTC).isoformat(),
             },
         )

@@ -152,6 +152,7 @@ async def test_async_live_job_returns_202_then_exposes_result_and_status_only_ss
         created = await client.post(
             "/api/v1/agents/live-flexible-plan-from-text/jobs",
             json=_payload(ready=False),
+            headers={"Idempotency-Key": "lifecycle-human-block"},
         )
         assert created.status_code == 202
         created_job = created.json()["job"]
@@ -363,6 +364,7 @@ async def test_failed_async_job_retains_request_bound_model_trace_summary(
             created = await client.post(
                 "/api/v1/agents/live-flexible-plan-from-text/jobs",
                 json=_payload(ready=False),
+                headers={"Idempotency-Key": "trace-failure"},
             )
             assert created.status_code == 202
             initial = created.json()["job"]
@@ -386,6 +388,19 @@ async def test_failed_async_job_retains_request_bound_model_trace_summary(
         assert sink.records[0].scope_request_digest == terminal["request_sha256"]
         assert "raw prompt" not in str(terminal)
         await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_async_live_job_requires_idempotency_key() -> None:
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text/jobs",
+            json=_payload(ready=False),
+        )
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -447,10 +462,12 @@ async def test_concurrent_identical_jobs_keep_model_trace_counts_isolated(
             first = await client.post(
                 "/api/v1/agents/live-flexible-plan-from-text/jobs",
                 json=_payload(ready=False),
+                headers={"Idempotency-Key": "concurrent-first"},
             )
             second = await client.post(
                 "/api/v1/agents/live-flexible-plan-from-text/jobs",
                 json=_payload(ready=False),
+                headers={"Idempotency-Key": "concurrent-second"},
             )
             assert first.status_code == second.status_code == 202
             await asyncio.wait_for(both_entered.wait(), timeout=1)
@@ -532,7 +549,10 @@ async def test_async_timeout_keeps_completed_pair_checkpoint_visible_and_tenant_
         created = await client.post(
             "/api/v1/agents/live-flexible-plan-from-text/jobs",
             json=_payload(ready=True),
-            headers={"Authorization": "Bearer token-a"},
+            headers={
+                "Authorization": "Bearer token-a",
+                "Idempotency-Key": "tenant-a-timeout",
+            },
         )
         assert created.status_code == 202
         job_id = created.json()["job"]["id"]
@@ -603,6 +623,7 @@ async def test_async_live_job_cancel_reaches_running_operation_and_is_repeat_saf
             created = await client.post(
                 "/api/v1/agents/live-flexible-plan-from-text/jobs",
                 json=_payload(ready=True),
+                headers={"Idempotency-Key": "timeout-checkpoint"},
             )
         assert created.status_code == 202
         job_id = created.json()["job"]["id"]
@@ -664,6 +685,7 @@ async def test_http_cancel_propagates_through_flexible_run_to_browser_bridge(
         created = await client.post(
             "/api/v1/agents/live-flexible-plan-from-text/jobs",
             json=_payload(ready=True),
+            headers={"Idempotency-Key": "cancel-live-job"},
         )
         assert created.status_code == 202
         job_id = created.json()["job"]["id"]
@@ -710,7 +732,10 @@ async def test_async_live_job_api_is_tenant_isolated_and_capacity_bounded(
         created = await client.post(
             "/api/v1/agents/live-flexible-plan-from-text/jobs",
             json=_payload(ready=True),
-            headers={"Authorization": "Bearer token-a"},
+            headers={
+                "Authorization": "Bearer token-a",
+                "Idempotency-Key": "tenant-a-job",
+            },
         )
         assert created.status_code == 202
         job_id = created.json()["job"]["id"]
@@ -723,7 +748,10 @@ async def test_async_live_job_api_is_tenant_isolated_and_capacity_bounded(
         full = await client.post(
             "/api/v1/agents/live-flexible-plan-from-text/jobs",
             json=_payload(ready=True),
-            headers={"Authorization": "Bearer token-b"},
+            headers={
+                "Authorization": "Bearer token-b",
+                "Idempotency-Key": "tenant-b-job",
+            },
         )
         assert full.status_code == 503
         assert full.headers["retry-after"] == "30"
@@ -746,6 +774,7 @@ async def test_async_live_job_creation_remains_loopback_only() -> None:
         response = await client.post(
             "/api/v1/agents/live-flexible-plan-from-text/jobs",
             json=_payload(ready=False),
+            headers={"Idempotency-Key": "remote-loopback"},
         )
     assert response.status_code == 403
 

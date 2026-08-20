@@ -357,6 +357,7 @@ async def test_http_route_runs_real_worker_subprocess_with_durable_identity(
             created = await client.post(
                 "/api/v1/agents/live-flexible-plan-from-text/jobs",
                 json=_payload(ready=False),
+                headers={"Idempotency-Key": "worker-real-subprocess"},
             )
             assert created.status_code == 202, created.text
             job_id = created.json()["job"]["id"]
@@ -401,6 +402,7 @@ async def test_http_cancel_really_stops_the_worker_process_group(
             created = await client.post(
                 "/api/v1/agents/live-flexible-plan-from-text/jobs",
                 json=_payload(ready=False),
+                headers={"Idempotency-Key": "worker-cancel-process"},
             )
             assert created.status_code == 202, created.text
             job_id = created.json()["job"]["id"]
@@ -1189,6 +1191,7 @@ async def test_http_route_runs_real_ready_chain_and_surfaces_real_provenance(
             created = await client.post(
                 "/api/v1/agents/live-flexible-plan-from-text/jobs",
                 json=_payload(ready=True),
+                headers={"Idempotency-Key": "worker-real-ready"},
             )
             assert created.status_code == 202, created.text
             job_id = created.json()["job"]["id"]
@@ -1540,6 +1543,7 @@ async def test_worker_clean_return_confirms_whole_group_empty_before_terminal(
             created = await client.post(
                 "/api/v1/agents/live-flexible-plan-from-text/jobs",
                 json=_payload(ready=False),
+                headers={"Idempotency-Key": "worker-clean-return"},
             )
             assert created.status_code == 202, created.text
             job_id = created.json()["job"]["id"]
@@ -2039,6 +2043,7 @@ async def test_http_route_rejects_formal_worker_with_models_disabled(
             created = await client.post(
                 "/api/v1/agents/live-flexible-plan-from-text/jobs",
                 json=_payload(ready=True),
+                headers={"Idempotency-Key": "worker-models-disabled"},
             )
             assert created.status_code == 202, created.text
             job_id = created.json()["job"]["id"]

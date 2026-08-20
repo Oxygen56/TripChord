@@ -1219,6 +1219,9 @@ class FlexibleLiveAgentSystem:
         search_run_recorder: SearchRunRecorder | None = None,
         reference_date: date | None = None,
         internal_benchmark: bool = False,
+        recovered_pair_executions: tuple[FlexiblePairExecution, ...] = (),
+        pair_execution_reporter: Callable[[FlexiblePairExecution], Awaitable[None]] | None = None,
+        pair_worker_count_override: int | None = None,
     ) -> FlexibleLiveAgentRun:
         run_started = self._monotonic()
         cpu_started = self._process_cpu_seconds()
@@ -1468,7 +1471,7 @@ class FlexibleLiveAgentSystem:
         # one at a time so Verifier always sees a coherent fresh evidence window.
         # Three domain/date workers may overlap; the browser bridge and each
         # provider still enforce their own bounded leases and rate lanes.
-        pair_worker_count = 3
+        pair_worker_count = pair_worker_count_override or 3
         worker_pool_enabled = (
             scale_directive is not None
             and effective_exact_pair_budget > DIRECT_DATE_PAIR_LIMIT
@@ -1664,6 +1667,13 @@ class FlexibleLiveAgentSystem:
             item.model_copy(update={"rank": index})
             for index, item in enumerate(planned_pairs, start=1)
         )
+        planned_pair_ids = {pair.id for pair in planned_pairs}
+        recovered_by_id = {item.date_pair.id: item for item in recovered_pair_executions}
+        if len(recovered_by_id) != len(recovered_pair_executions):
+            raise ValueError("recovered pair executions must be unique")
+        if not set(recovered_by_id).issubset(planned_pair_ids):
+            raise ValueError("recovered pair execution is outside the current date universe")
+        execution_by_pair.update(recovered_by_id)
 
         async def record_execution(
             pair: AuditableDatePair,
@@ -1671,6 +1681,8 @@ class FlexibleLiveAgentSystem:
         ) -> None:
             execution_by_pair[pair.id] = execution
             execution_order.append(pair.id)
+            if pair_execution_reporter is not None:
+                await pair_execution_reporter(execution)
             if pair_checkpoint_reporter is not None:
                 await pair_checkpoint_reporter(
                     self._pair_checkpoint(
@@ -1729,7 +1741,11 @@ class FlexibleLiveAgentSystem:
         if effective_exact_pair_budget > 1 and isinstance(
             self._date_refiner, RankedTopKDateRefiner
         ):
-            batch = planned_pairs[:effective_exact_pair_budget]
+            batch = tuple(
+                pair
+                for pair in planned_pairs[:effective_exact_pair_budget]
+                if pair.id not in execution_by_pair
+            )
             pair_queue: asyncio.Queue[tuple[int, AuditableDatePair] | None] = asyncio.Queue()
             for schedule_index, pair in enumerate(batch):
                 pair_queue.put_nowait((schedule_index, pair))
