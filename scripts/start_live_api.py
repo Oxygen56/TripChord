@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import os
 import re
 import secrets
@@ -152,6 +154,45 @@ def _load_model_api_key(runtime_directory: Path, environment: dict[str, str]) ->
         environment["TRIPCHORD_MODEL_API_KEY"] = key
 
 
+def _load_browser_bridge_control_token(
+    runtime_directory: Path,
+    environment: dict[str, str],
+) -> None:
+    """Derive a separate local control capability without putting it in launchd.
+
+    The formal-source control file is already a current-user-owned 0600 secret
+    in this local setup.  Domain separation gives the browser reload endpoint a
+    distinct capability while keeping both credentials out of the plist, logs,
+    renderer, and command line.
+    """
+    if environment.get("TRIPCHORD_BROWSER_BRIDGE_CONTROL_TOKEN"):
+        return
+    key_file = runtime_directory / "formal-source-control-token"
+    try:
+        before = key_file.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.getuid()
+        or stat.S_IMODE(before.st_mode) != 0o600
+    ):
+        return
+    try:
+        source = key_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if not _TOKEN_PATTERN.fullmatch(source):
+        return
+    derived = hmac.new(
+        source.encode("ascii"),
+        b"tripchord-browser-companion-control-v1",
+        hashlib.sha256,
+    ).hexdigest()
+    environment["TRIPCHORD_BROWSER_BRIDGE_CONTROL_TOKEN"] = derived
+
+
 def run_live_api(*, port: int, repository: Path | None = None) -> int:
     if not 1 <= port <= 65_535:
         raise SystemExit("--port must be between 1 and 65535")
@@ -171,6 +212,7 @@ def run_live_api(*, port: int, repository: Path | None = None) -> int:
         f"http://127.0.0.1:{port}"
     )
     _load_model_api_key(runtime_directory, environment)
+    _load_browser_bridge_control_token(runtime_directory, environment)
 
     print("TripChord 实时只读服务即将启动。", flush=True)
     print(f"Chrome 加载目录：{companion}", flush=True)

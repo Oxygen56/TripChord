@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from enum import StrEnum
+from itertools import pairwise
 from typing import Self
 from urllib.parse import urlparse
 
@@ -127,7 +129,7 @@ class NormalizedQuote(DomainModel):
     id: str = Field(min_length=1)
     provider: str = Field(min_length=1)
     currency: str = Field(default="CNY", min_length=3, max_length=3)
-    total_for_party_cents: int = Field(ge=0)
+    total_for_party_cents: int | None = Field(default=None, ge=0)
     taxes_and_fees_included: bool | None
     captured_at: datetime
     expires_at: datetime
@@ -162,11 +164,93 @@ class NormalizedQuote(DomainModel):
         return self.captured_at <= reference < self.expires_at
 
 
+class NormalizedFlightSegment(DomainModel):
+    """One observed flight segment, including its airport-level identity."""
+
+    flight_number: str = Field(min_length=2, max_length=12)
+    departure_airport_code: str = Field(min_length=3, max_length=3)
+    arrival_airport_code: str = Field(min_length=3, max_length=3)
+    departure_at: datetime
+    arrival_at: datetime
+
+    @field_validator("departure_airport_code", "arrival_airport_code")
+    @classmethod
+    def normalize_airport_code(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", normalized):
+            raise ValueError("flight segment airport must be a three-letter IATA code")
+        return normalized
+
+    @field_validator("flight_number")
+    @classmethod
+    def normalize_flight_number(cls, value: str) -> str:
+        normalized = value.strip().upper().replace(" ", "")
+        if not re.fullmatch(r"[A-Z0-9]{2,12}", normalized):
+            raise ValueError("flight segment number must be an explicit provider identifier")
+        return normalized
+
+    @field_validator("departure_at", "arrival_at")
+    @classmethod
+    def require_segment_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("flight segment timestamps must be timezone-aware")
+        return value
+
+    @model_validator(mode="after")
+    def validate_segment_interval(self) -> Self:
+        if self.arrival_at <= self.departure_at:
+            raise ValueError("flight segment arrival must be after departure")
+        return self
+
+
+class FlightGroundTransferContract(DomainModel):
+    """Explicit contract for a connection that changes airports."""
+
+    from_airport_code: str = Field(min_length=3, max_length=3)
+    to_airport_code: str = Field(min_length=3, max_length=3)
+    mode: str = Field(min_length=1, max_length=80)
+    minimum_buffer_minutes: int = Field(ge=1, le=2_880)
+    actual_buffer_minutes: int = Field(ge=0, le=2_880)
+    baggage_recheck_required: bool
+    through_ticket_protected: bool
+    evidence_refs: tuple[str, ...] = Field(min_length=1)
+
+    @field_validator("from_airport_code", "to_airport_code")
+    @classmethod
+    def normalize_transfer_airport_code(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", normalized):
+            raise ValueError("ground transfer airport must be a three-letter IATA code")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_ground_transfer(self) -> Self:
+        if self.from_airport_code == self.to_airport_code:
+            raise ValueError("ground transfer contract must connect different airports")
+        if self.actual_buffer_minutes < self.minimum_buffer_minutes:
+            raise ValueError("ground transfer buffer is below the required minimum")
+        if not self.mode.strip():
+            raise ValueError("ground transfer mode is required")
+        return self
+
+
 class NormalizedFlightQuote(NormalizedQuote):
+    total_for_party_cents: int | None = Field(default=None, ge=0)
     origin: str = Field(min_length=1)
     destination: str = Field(min_length=1)
     adults: int = Field(ge=1, le=20)
+    children: int = Field(default=0, ge=0, le=20)
+    children_ages: tuple[int, ...] = ()
+    infants: int = Field(default=0, ge=0, le=10)
     party_availability_confirmed: bool = True
+    # A visible per-adult fare may describe the route and availability without
+    # proving the requested party total.  Keep that amount for comparison, but
+    # never let it enter a package total unless this flag is true.
+    party_total_known: bool = True
+    price_basis: str = "total_party"
+    # Preserve a visible provider amount for comparison without representing it
+    # as a party total when the provider contract did not prove one.
+    display_amount_cents: int | None = Field(default=None, ge=0)
     outbound_depart_at: datetime
     outbound_arrive_at: datetime
     return_depart_at: datetime
@@ -175,6 +259,12 @@ class NormalizedFlightQuote(NormalizedQuote):
     provider_itinerary_id: str | None = Field(default=None, min_length=1, max_length=500)
     outbound_flight_numbers: tuple[str, ...] = ()
     return_flight_numbers: tuple[str, ...] = ()
+    outbound_segments: tuple[NormalizedFlightSegment, ...] = ()
+    return_segments: tuple[NormalizedFlightSegment, ...] = ()
+    outbound_ground_transfers: tuple[FlightGroundTransferContract, ...] = ()
+    return_ground_transfers: tuple[FlightGroundTransferContract, ...] = ()
+    origin_airport_code: str | None = Field(default=None, min_length=3, max_length=3)
+    destination_airport_code: str | None = Field(default=None, min_length=3, max_length=3)
     carrier_summary: str | None = Field(default=None, min_length=1, max_length=1000)
     cabin_class: str | None = Field(default=None, min_length=1, max_length=100)
     fare_basis_codes: tuple[str, ...] = ()
@@ -202,13 +292,99 @@ class NormalizedFlightQuote(NormalizedQuote):
             raise ValueError("return departure must be after outbound arrival")
         return self
 
+    @property
+    def has_publishable_execution_contract(self) -> bool:
+        """Whether this quote is safe to put into a user-facing package.
+
+        A visible comparison price is not a purchasable flight identity.  The
+        package layer therefore requires a proven party total and a complete
+        segment/airport contract before it can select or rank the quote.
+        """
+
+        if (
+            not self.party_total_known
+            or self.total_for_party_cents is None
+            or self.total_for_party_cents <= 0
+        ):
+            return False
+        if self.availability != QuoteAvailability.AVAILABLE:
+            return False
+        if not self.origin_airport_code or not self.destination_airport_code:
+            return False
+        for (
+            numbers,
+            segments,
+            ground_transfers,
+            start,
+            end,
+            expected_departure,
+            expected_arrival,
+        ) in (
+            (
+                self.outbound_flight_numbers,
+                self.outbound_segments,
+                self.outbound_ground_transfers,
+                self.outbound_depart_at,
+                self.outbound_arrive_at,
+                self.origin_airport_code,
+                self.destination_airport_code,
+            ),
+            (
+                self.return_flight_numbers,
+                self.return_segments,
+                self.return_ground_transfers,
+                self.return_depart_at,
+                self.return_arrive_at,
+                self.destination_airport_code,
+                self.origin_airport_code,
+            ),
+        ):
+            if not numbers or len(numbers) != len(segments):
+                return False
+            if not segments or segments[0].departure_airport_code != expected_departure:
+                return False
+            if segments[-1].arrival_airport_code != expected_arrival:
+                return False
+            if segments[0].departure_at != start or segments[-1].arrival_at != end:
+                return False
+            if tuple(segment.flight_number for segment in segments) != tuple(numbers):
+                return False
+            for previous, current in pairwise(segments):
+                if previous.arrival_airport_code != current.departure_airport_code:
+                    matching_transfers = tuple(
+                        item
+                        for item in ground_transfers
+                        if item.from_airport_code == previous.arrival_airport_code
+                        and item.to_airport_code == current.departure_airport_code
+                    )
+                    if len(matching_transfers) != 1:
+                        return False
+                    transfer = matching_transfers[0]
+                    if (
+                        not transfer.through_ticket_protected
+                        or transfer.actual_buffer_minutes
+                        < transfer.minimum_buffer_minutes
+                        or transfer.actual_buffer_minutes
+                        != int((current.departure_at - previous.arrival_at).total_seconds() // 60)
+                    ):
+                        return False
+                elif ground_transfers:
+                    return False
+                if current.departure_at < previous.arrival_at:
+                    return False
+        return True
+
 
 class NormalizedLodgingQuote(NormalizedQuote):
+    total_for_party_cents: int = Field(ge=0)
     property_name: str = Field(min_length=1)
     area: PackageArea
     check_in: date
     check_out: date
     adults: int = Field(ge=1, le=20)
+    children: int = Field(default=0, ge=0, le=20)
+    children_ages: tuple[int, ...] = ()
+    infants: int = Field(default=0, ge=0, le=10)
     rooms: int = Field(ge=1, le=8)
     breakfast_included: bool | None = None
     place_key: PackagePlaceKey | None = None
@@ -243,11 +419,15 @@ class NormalizedLodgingQuote(NormalizedQuote):
 
 
 class TransferOption(NormalizedQuote):
+    total_for_party_cents: int = Field(ge=0)
     origin_area: PackageArea
     destination_area: PackageArea
     origin_place_key: PackagePlaceKey | None = None
     destination_place_key: PackagePlaceKey | None = None
     adults: int = Field(ge=1, le=20)
+    children: int = Field(default=0, ge=0, le=20)
+    children_ages: tuple[int, ...] = ()
+    infants: int = Field(default=0, ge=0, le=10)
     service_date: date
     schedule_mode: TransferScheduleMode
     duration_minutes: int = Field(gt=0, le=1440)
@@ -449,6 +629,26 @@ def transfer_place_error(
     transfer: TransferOption,
     lodgings: tuple[NormalizedLodgingQuote, ...],
 ) -> str | None:
+    expected_by_area: dict[PackageArea, PackagePlaceKey] = {
+        PackageArea.AIRPORT: PackagePlaceKey.VELANA_AIRPORT,
+    }
+    for area in (PackageArea.DESTINATION_ISLAND, PackageArea.AIRPORT_ISLAND):
+        place_keys = {
+            lodging.place_key
+            for lodging in lodgings
+            if lodging.area == area and lodging.place_key is not None
+        }
+        if len(place_keys) == 1:
+            expected_by_area[area] = next(iter(place_keys))
+    for area, place_key in (
+        (transfer.origin_area, transfer.origin_place_key),
+        (transfer.destination_area, transfer.destination_place_key),
+    ):
+        expected_place = expected_by_area.get(area)
+        if expected_place is None:
+            return "接驳端点无法绑定到整包中的确定地点"
+        if place_key != expected_place:
+            return "接驳端点地点与整包住宿或机场身份不一致"
     if transfer.price_guarantee != TransferPriceGuarantee.PUBLISHED_BASE_FARE:
         return None
     if intent.destination_place_key not in {None, PackagePlaceKey.MAAFUSHI}:
@@ -499,7 +699,11 @@ class PackageIntent(DomainModel):
     destination_place_key: PackagePlaceKey | None = None
     start_date: date
     end_date: date
+    latest_arrival_date: date | None = None
     adults: int = Field(default=2, ge=1, le=20)
+    children: int = Field(default=0, ge=0, le=20)
+    children_ages: tuple[int, ...] = ()
+    infants: int = Field(default=0, ge=0, le=10)
     rooms: int = Field(default=1, ge=1, le=8)
     currency: str = Field(default="CNY", min_length=3, max_length=3)
     budget_cents: int | None = Field(default=None, ge=0)
@@ -520,6 +724,15 @@ class PackageIntent(DomainModel):
 
     @model_validator(mode="after")
     def validate_dates(self) -> Self:
+        from tripchord.domain.trip import TravelParty
+
+        TravelParty(
+            adults=self.adults,
+            children=self.children,
+            children_ages=self.children_ages,
+            infants=self.infants,
+            rooms=self.rooms,
+        )
         if self.end_date <= self.start_date:
             raise ValueError("package end_date must be after start_date")
         mode = self.breakfast_preference_mode
@@ -712,7 +925,22 @@ class TravelPackageCandidate(DomainModel):
         if len(ids) != len(set(ids)):
             raise ValueError("package component ids must be unique")
 
-        start_date = self.flight.outbound_depart_at.date()
+        # A package total is meaningful only when every component describes
+        # the same traveller shape.  Adult-only legacy quotes remain valid
+        # because the new fields default to zero.
+        party = (self.flight.adults, self.flight.children, self.flight.infants)
+        for quote in self.lodgings:
+            if (quote.adults, quote.children, quote.infants) != party:
+                raise ValueError("package components must use one shared traveller shape")
+            if quote.children_ages != self.flight.children_ages:
+                raise ValueError("package components must use one shared child-age shape")
+        for transfer in self.transfers:
+            if (transfer.adults, transfer.children, transfer.infants) != party:
+                raise ValueError("package components must use one shared traveller shape")
+            if transfer.children_ages != self.flight.children_ages:
+                raise ValueError("package components must use one shared child-age shape")
+
+        start_date = self.flight.outbound_arrive_at.date()
         end_date = self.flight.return_depart_at.date()
         if self.kind == PackageCandidateKind.CONTINUOUS_ISLAND:
             expected_lodgings = Counter(
@@ -792,13 +1020,18 @@ class TravelPackageCandidate(DomainModel):
 
     @property
     def computed_total_cents(self) -> int:
-        return (
+        flight_total = (
             self.flight.total_for_party_cents
-            + sum(lodging.total_for_party_cents for lodging in self.lodgings)
-            + transfer_contract_total_cents(
-                self.transfers,
-                currency=self.currency,
-            )
+            if self.flight.party_total_known and self.flight.total_for_party_cents is not None
+            else 0
+        )
+        return flight_total + sum(
+            lodging.total_for_party_cents
+            for lodging in self.lodgings
+            if lodging.currency == self.currency
+        ) + transfer_contract_total_cents(
+            self.transfers,
+            currency=self.currency,
         )
 
     @property
@@ -839,6 +1072,18 @@ class PackageSupplementalPublishedFare(DomainModel):
         return self
 
 
+class PackageForeignCurrencySubtotal(DomainModel):
+    currency: str = Field(min_length=3, max_length=3)
+    adults: int = Field(ge=1, le=20)
+    total_for_party_cents: int = Field(ge=0)
+    component_ids: tuple[str, ...] = Field(min_length=1)
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str) -> str:
+        return value.upper()
+
+
 class PackageBudgetBreakdown(DomainModel):
     currency: str
     adults: int
@@ -847,7 +1092,9 @@ class PackageBudgetBreakdown(DomainModel):
     transfer_cents: int = Field(ge=0)
     total_cents: int = Field(ge=0)
     confirmed_subtotal_cents: int = Field(ge=0)
+    flight_total_known: bool = True
     supplemental_published_base_fares: tuple[PackageSupplementalPublishedFare, ...] = ()
+    foreign_currency_subtotals: tuple[PackageForeignCurrencySubtotal, ...] = ()
     budget_compliance_fully_verified: bool = True
     is_all_in_total: bool = True
     formula: str = Field(min_length=1)
@@ -860,6 +1107,8 @@ class PackageBudgetBreakdown(DomainModel):
             raise ValueError("budget truth flags conflict with supplemental fares")
         if self.supplemental_published_base_fares and self.is_all_in_total:
             raise ValueError("supplemental fares forbid an all-in budget claim")
+        if self.foreign_currency_subtotals and self.is_all_in_total:
+            raise ValueError("foreign currency subtotals forbid an all-in budget claim")
         return self
 
 
@@ -1216,32 +1465,81 @@ def published_base_fare_contract_count(
 
 
 def package_budget(candidate: TravelPackageCandidate) -> PackageBudgetBreakdown:
-    flight = candidate.flight.total_for_party_cents
-    lodging = sum(item.total_for_party_cents for item in candidate.lodgings)
+    flight_known = candidate.flight.party_total_known
+    flight = (
+        candidate.flight.total_for_party_cents
+        if flight_known and candidate.flight.total_for_party_cents is not None
+        else 0
+    )
+    lodging = sum(
+        item.total_for_party_cents
+        for item in candidate.lodgings
+        if item.currency == candidate.currency
+    )
     transfer = transfer_contract_total_cents(
         candidate.transfers,
         currency=candidate.currency,
     )
     total = flight + lodging + transfer
+    party_label = (
+        f"{candidate.flight.adults}名成人"
+        if candidate.flight.children == 0 and candidate.flight.infants == 0
+        else f"{candidate.flight.adults}名成人、{candidate.flight.children}名儿童、"
+        f"{candidate.flight.infants}名婴儿"
+    )
     supplemental = supplemental_published_base_fares(candidate.transfers)
-    all_in_total = not supplemental and all(
+    foreign_groups: dict[str, list[NormalizedLodgingQuote]] = {}
+    for item in candidate.lodgings:
+        if item.currency != candidate.currency:
+            foreign_groups.setdefault(item.currency, []).append(item)
+    foreign_subtotals = tuple(
+        PackageForeignCurrencySubtotal(
+            currency=currency,
+            adults=items[0].adults,
+            total_for_party_cents=sum(item.total_for_party_cents for item in items),
+            component_ids=tuple(item.id for item in items),
+        )
+        for currency, items in sorted(foreign_groups.items())
+    )
+    all_in_total = flight_known and not supplemental and all(
         quote.currency == candidate.currency and quote.taxes_and_fees_included is True
         for quote in (candidate.flight, *candidate.lodgings, *candidate.transfers)
-    )
-    formula = (
-        f"航班 {_money(candidate.currency, flight)} + "
-        f"住宿 {_money(candidate.currency, lodging)} + "
-        f"接驳 {_money(candidate.currency, transfer)} = "
-        f"{_money(candidate.currency, total)}（{candidate.flight.adults}名成人）"
-    )
-    if supplemental:
+    ) and not foreign_subtotals
+    if flight_known:
         formula = (
             f"航班 {_money(candidate.currency, flight)} + "
             f"住宿 {_money(candidate.currency, lodging)} + "
-            f"全包接驳 {_money(candidate.currency, transfer)} = "
-            f"{_money(candidate.currency, total)} 已确认小计"
-            f"（{candidate.flight.adults}名成人）"
+            f"接驳 {_money(candidate.currency, transfer)} = "
+            f"{_money(candidate.currency, total)}（{party_label}）"
         )
+    else:
+        displayed_flight_amount = candidate.flight.display_amount_cents or 0
+        formula = (
+            f"航班搜索上下文显示价 {_money(candidate.flight.currency, displayed_flight_amount)}"
+            f"（本次旅客总价未由同一产品的完整人数对照证明，未计入）；"
+            f"住宿 {_money(candidate.currency, lodging)} + "
+            f"接驳 {_money(candidate.currency, transfer)}"
+            f" = {_money(candidate.currency, total)} 已确认小计"
+        )
+    if supplemental:
+        if flight_known:
+            formula = (
+                f"航班 {_money(candidate.currency, flight)} + "
+                f"住宿 {_money(candidate.currency, lodging)} + "
+                f"全包接驳 {_money(candidate.currency, transfer)} = "
+                f"{_money(candidate.currency, total)} 已确认小计（{party_label}）"
+            )
+        else:
+            displayed_flight = _money(
+                candidate.flight.currency,
+                candidate.flight.display_amount_cents or 0,
+            )
+            formula = (
+                f"航班观察价 {displayed_flight}"
+                f"（本次旅客总价未知，未计入）；住宿 {_money(candidate.currency, lodging)} + "
+                f"全包接驳 {_money(candidate.currency, transfer)} = "
+                f"{_money(candidate.currency, total)} 已确认小计"
+            )
         supplemental_formula = "；".join(
             (
                 f"另有公开基础价 {_money(item.currency, item.total_for_party_cents)}"
@@ -1253,6 +1551,13 @@ def package_budget(candidate: TravelPackageCandidate) -> PackageBudgetBreakdown:
             f"{formula}；{supplemental_formula}，税费未知，未换汇且未计入 "
             f"{candidate.currency} 已确认小计"
         )
+    if foreign_subtotals:
+        foreign_formula = "；".join(
+            f"另有住宿 {item.currency} {Decimal(item.total_for_party_cents) / Decimal(100):.2f}"
+            f"（{item.adults}名成人，未换汇未计入 {candidate.currency} 小计）"
+            for item in foreign_subtotals
+        )
+        formula = f"{formula}；{foreign_formula}"
     return PackageBudgetBreakdown(
         currency=candidate.currency,
         adults=candidate.flight.adults,
@@ -1261,7 +1566,9 @@ def package_budget(candidate: TravelPackageCandidate) -> PackageBudgetBreakdown:
         transfer_cents=transfer,
         total_cents=total,
         confirmed_subtotal_cents=total,
+        flight_total_known=flight_known,
         supplemental_published_base_fares=supplemental,
+        foreign_currency_subtotals=foreign_subtotals,
         budget_compliance_fully_verified=all_in_total,
         is_all_in_total=all_in_total,
         formula=formula,
@@ -1314,7 +1621,12 @@ def _transfer_connection_limits(
 ) -> tuple[datetime | None, datetime | None]:
     not_before: datetime | None = None
     arrive_by: datetime | None = None
-    if transfer.origin_area == PackageArea.AIRPORT and transfer.travel_date == intent.start_date:
+    actual_departure_date = flight.outbound_arrive_at.date()
+    actual_return_date = flight.return_depart_at.date()
+    if (
+        transfer.origin_area == PackageArea.AIRPORT
+        and transfer.travel_date == actual_departure_date
+    ):
         required_buffer = (
             intent.minimum_arrival_to_boat_minutes
             if kind == PackageCandidateKind.CONTINUOUS_ISLAND
@@ -1322,7 +1634,10 @@ def _transfer_connection_limits(
             else 0
         )
         not_before = flight.outbound_arrive_at + timedelta(minutes=required_buffer)
-    if transfer.destination_area == PackageArea.AIRPORT and transfer.travel_date == intent.end_date:
+    if (
+        transfer.destination_area == PackageArea.AIRPORT
+        and transfer.travel_date == actual_return_date
+    ):
         arrive_by = flight.return_depart_at - timedelta(
             minutes=intent.minimum_airport_buffer_minutes
         )
@@ -1332,36 +1647,43 @@ def _transfer_connection_limits(
 def _required_transfer_legs(
     intent: PackageIntent,
     kind: PackageCandidateKind,
+    *,
+    flight: NormalizedFlightQuote | None = None,
 ) -> tuple[tuple[PackageArea, PackageArea, date], ...]:
+    stay_start = flight.outbound_arrive_at.date() if flight is not None else intent.start_date
+    stay_end = flight.return_depart_at.date() if flight is not None else intent.end_date
     if kind == PackageCandidateKind.CONTINUOUS_ISLAND:
         return (
-            (PackageArea.AIRPORT, PackageArea.DESTINATION_ISLAND, intent.start_date),
-            (PackageArea.DESTINATION_ISLAND, PackageArea.AIRPORT, intent.end_date),
+            (PackageArea.AIRPORT, PackageArea.DESTINATION_ISLAND, stay_start),
+            (PackageArea.DESTINATION_ISLAND, PackageArea.AIRPORT, stay_end),
         )
     if kind == PackageCandidateKind.CONTINUOUS_AIRPORT_ISLAND:
         return (
-            (PackageArea.AIRPORT, PackageArea.AIRPORT_ISLAND, intent.start_date),
-            (PackageArea.AIRPORT_ISLAND, PackageArea.AIRPORT, intent.end_date),
+            (PackageArea.AIRPORT, PackageArea.AIRPORT_ISLAND, stay_start),
+            (PackageArea.AIRPORT_ISLAND, PackageArea.AIRPORT, stay_end),
         )
-    first_checkout = intent.start_date + timedelta(days=1)
-    last_checkin = intent.end_date - timedelta(days=1)
+    first_checkout = stay_start + timedelta(days=1)
+    last_checkin = stay_end - timedelta(days=1)
     return (
-        (PackageArea.AIRPORT, PackageArea.AIRPORT_ISLAND, intent.start_date),
+        (PackageArea.AIRPORT, PackageArea.AIRPORT_ISLAND, stay_start),
         (PackageArea.AIRPORT_ISLAND, PackageArea.AIRPORT, first_checkout),
         (PackageArea.AIRPORT, PackageArea.DESTINATION_ISLAND, first_checkout),
         (PackageArea.DESTINATION_ISLAND, PackageArea.AIRPORT, last_checkin),
         (PackageArea.AIRPORT, PackageArea.AIRPORT_ISLAND, last_checkin),
-        (PackageArea.AIRPORT_ISLAND, PackageArea.AIRPORT, intent.end_date),
+        (PackageArea.AIRPORT_ISLAND, PackageArea.AIRPORT, stay_end),
     )
 
 
 def _split_connection_pairs(
     intent: PackageIntent,
     transfers: tuple[TransferOption, ...],
+    *,
+    flight: NormalizedFlightQuote | None = None,
 ) -> tuple[tuple[TransferOption, TransferOption], ...]:
     required = _required_transfer_legs(
         intent,
         PackageCandidateKind.SPLIT_AIRPORT_ISLAND,
+        flight=flight,
     )
     by_leg = {
         (transfer.origin_area, transfer.destination_area, transfer.travel_date): transfer
@@ -1643,6 +1965,8 @@ class PackagePlanner:
             and flight.outbound_depart_at.date() == intent.start_date
             and flight.return_depart_at.date() == intent.end_date
             and flight.adults == intent.adults
+            and flight.children == intent.children
+            and flight.infants == intent.infants
             and flight.currency == intent.currency
         )
         if not flights:
@@ -1675,6 +1999,8 @@ class PackagePlanner:
                 and transfer.destination_area == destination
                 and transfer.service_date == service_date
                 and transfer.adults == intent.adults
+                and transfer.children == intent.children
+                and transfer.infants == intent.infants
                 and (
                     (
                         transfer.price_guarantee
@@ -1781,6 +2107,8 @@ class PackagePlanner:
             and flight.outbound_depart_at.date() == intent.start_date
             and flight.return_depart_at.date() == intent.end_date
             and flight.adults == intent.adults
+            and flight.children == intent.children
+            and flight.infants == intent.infants
             and flight.currency == intent.currency
         )
         for flight in flights:
@@ -1857,12 +2185,20 @@ class PackagePlanner:
         return tuple(sorted(selected.values(), key=lambda item: rank_by_id[item.id]))
 
     def _prescreen_live_inventory(self, inventory: PackageInventory) -> PackageInventory:
+        # A provider display amount with no same-product 1/2-adult proof is
+        # observation-only.  It must not reach ranking or package arithmetic,
+        # even when the rest of its route evidence looks complete.
+        party_total_flights = tuple(
+            flight
+            for flight in inventory.flights
+            if flight.party_total_known is True and flight.price_basis == "total_party"
+        )
         flights = self._take_diverse_flights(
-            inventory.flights,
+            party_total_flights,
             self.LIVE_FLIGHT_LIMIT,
         )
         lodging_groups: dict[
-            tuple[PackageArea, date, date, int, int, str],
+            tuple[PackageArea, date, date, int, int, int, int, str],
             list[NormalizedLodgingQuote],
         ] = {}
         for lodging in inventory.lodgings:
@@ -1871,6 +2207,8 @@ class PackagePlanner:
                 lodging.check_in,
                 lodging.check_out,
                 lodging.adults,
+                lodging.children,
+                lodging.infants,
                 lodging.rooms,
                 lodging.currency,
             )
@@ -1894,6 +2232,8 @@ class PackagePlanner:
                 str | None,
                 TransferPurchaseScope,
                 TransferPriceGuarantee,
+                int,
+                int,
                 int,
                 str,
                 str,
@@ -1923,6 +2263,8 @@ class PackagePlanner:
                 transfer.purchase_scope,
                 transfer.price_guarantee,
                 transfer.adults,
+                transfer.children,
+                transfer.infants,
                 transfer.currency,
                 transfer.provider,
                 transfer.price_scope,
@@ -1959,6 +2301,8 @@ class PackagePlanner:
                 TransferPriceGuarantee,
                 TransferPriceScope,
                 int,
+                int,
+                int,
                 str,
             ],
             list[TransferOption],
@@ -1973,6 +2317,8 @@ class PackagePlanner:
                 transfer.price_guarantee,
                 transfer.price_scope,
                 transfer.adults,
+                transfer.children,
+                transfer.infants,
                 transfer.currency,
             )
             transfer_contract_groups.setdefault(contract_key, []).append(transfer)
@@ -2127,6 +2473,8 @@ class PackagePlanner:
             and flight.outbound_depart_at.date() == intent.start_date
             and flight.return_depart_at.date() == intent.end_date
             and flight.adults == intent.adults
+            and flight.children == intent.children
+            and flight.infants == intent.infants
             and flight.currency == intent.currency
         )
         continuous_areas = (
@@ -2143,29 +2491,40 @@ class PackagePlanner:
                 for lodging in inventory.lodgings
             )
 
-        continuous = sum(
-            count(area, intent.start_date, intent.end_date) for area in continuous_areas
-        )
-        split = 0
-        if intent.night_count >= 3:
-            split = (
-                count(
-                    PackageArea.AIRPORT_ISLAND,
-                    intent.start_date,
-                    intent.start_date + timedelta(days=1),
-                )
-                * count(
-                    PackageArea.DESTINATION_ISLAND,
-                    intent.start_date + timedelta(days=1),
-                    intent.end_date - timedelta(days=1),
-                )
-                * count(
-                    PackageArea.AIRPORT_ISLAND,
-                    intent.end_date - timedelta(days=1),
-                    intent.end_date,
-                )
+        upper_bound = 0
+        for flight in flights:
+            stay_start = flight.outbound_arrive_at.date()
+            stay_end = flight.return_depart_at.date()
+            continuous = sum(
+                count(area, stay_start, stay_end) for area in continuous_areas
             )
-        return len(flights) * (continuous + split)
+            split = 0
+            if (stay_end - stay_start).days >= 3:
+                split = (
+                    count(
+                        PackageArea.AIRPORT_ISLAND,
+                        stay_start,
+                        stay_start + timedelta(days=1),
+                    )
+                    * count(
+                        PackageArea.DESTINATION_ISLAND,
+                        stay_start + timedelta(days=1),
+                        stay_end - timedelta(days=1),
+                    )
+                    * count(
+                        PackageArea.AIRPORT_ISLAND,
+                        stay_end - timedelta(days=1),
+                        stay_end,
+                    )
+                )
+            upper_bound += continuous + split
+        # The bounded generator retains one additional provider-constrained
+        # Maafushi/iCom transfer variant whenever the inventory contains the
+        # official public-transfer contract.  Include that finite alternative
+        # in the structural envelope so the audit cannot undercount the join.
+        if any(transfer.provider == "icom-public-transfer" for transfer in inventory.transfers):
+            upper_bound *= 2
+        return upper_bound
 
     def _inventory_counts(self, inventory: PackageInventory) -> dict[str, int]:
         return {
@@ -2194,30 +2553,35 @@ class PackagePlanner:
         intent: PackageIntent,
         candidates: tuple[TravelPackageCandidate, ...],
     ) -> tuple[TravelPackageCandidate, ...]:
-        baseline = tuple(
-            sorted(
-                candidates,
-                key=lambda item: (
-                    published_base_fare_contract_count(item.transfers),
-                    item.declared_total_cents,
-                    item.id,
-                ),
+        def rank_key(item: TravelPackageCandidate) -> tuple[int, int, int, str]:
+            budget = package_budget(item)
+            # A complete CNY party total is the only directly comparable primary
+            # price.  Unknown taxes, foreign subtotals, and partial party totals
+            # must never outrank it merely because they have more contracts.
+            complete_cny = int(budget.is_all_in_total and item.currency == "CNY")
+            return (
+                -complete_cny,
+                published_base_fare_contract_count(item.transfers),
+                item.declared_total_cents,
+                item.id,
             )
-        )
+
+        baseline = tuple(sorted(candidates, key=rank_key))
         mode, weight = _effective_breakfast_preference(intent)
         if mode != PreferenceMode.WEIGHTED or weight is None or weight <= 0 or len(baseline) < 2:
             return baseline
         ranked: list[TravelPackageCandidate] = []
-        tiers = sorted(
-            {published_base_fare_contract_count(candidate.transfers) for candidate in baseline}
-        )
+        # Keep the same ordering as the baseline: ``rank_key[0]`` is already
+        # negative for the preferred complete-CNY tier.  Inverting it here
+        # would make incomplete/foreign totals the first weighted tier.
+        tiers = sorted({(rank_key(candidate)[0], rank_key(candidate)[1]) for candidate in baseline})
         preference_weight = Decimal(str(weight))
         price_weight = Decimal(1) - preference_weight
         for tier in tiers:
             comparable = tuple(
                 candidate
                 for candidate in baseline
-                if published_base_fare_contract_count(candidate.transfers) == tier
+                if (rank_key(candidate)[0], rank_key(candidate)[1]) == tier
             )
             if len(comparable) < 2:
                 ranked.extend(comparable)
@@ -2287,6 +2651,8 @@ class PackagePlanner:
                     PackageCandidateKind.CONTINUOUS_AIRPORT_ISLAND,
                 ),
             )
+        stay_start = flight.outbound_arrive_at.date()
+        stay_end = flight.return_depart_at.date()
         for area, kind in branches:
             stays = (
                 lodging
@@ -2295,11 +2661,11 @@ class PackagePlanner:
                     lodging,
                     intent,
                     area,
-                    intent.start_date,
-                    intent.end_date,
+                    stay_start,
+                    stay_end,
                 )
             )
-            legs = _required_transfer_legs(intent, kind)
+            legs = _required_transfer_legs(intent, kind, flight=flight)
             for stay in stays:
                 if limit is not None and len(result) >= limit:
                     return result
@@ -2311,17 +2677,40 @@ class PackagePlanner:
                     flight=flight,
                     kind=kind,
                 )
-                if selected_transfers is None:
-                    continue
-                result.append(
-                    self._candidate(
+                selected_variants = [selected_transfers] if selected_transfers is not None else []
+                # A frozen Maafushi plan has an exact iCom public-transfer
+                # contract.  The ordinary score quite correctly prefers a
+                # cheaper hotel-bound transfer, but that single winner would
+                # disappear when live-v4 applies the frozen contract.  Keep
+                # one provider-constrained variant in the bounded candidate
+                # pool so the later frozen join can consume the real iCom
+                # evidence without treating another provider as equivalent.
+                if area == PackageArea.DESTINATION_ISLAND:
+                    public_variant = self._select_transfers(
                         intent,
-                        kind,
-                        flight,
-                        (stay,),
-                        selected_transfers,
+                        inventory,
+                        legs,
+                        lodgings=(stay,),
+                        flight=flight,
+                        kind=kind,
+                        required_provider_by_leg=(
+                            "icom-public-transfer",
+                            "icom-public-transfer",
+                        ),
                     )
-                )
+                    if public_variant is not None and public_variant != selected_transfers:
+                        selected_variants.append(public_variant)
+                for transfers in selected_variants:
+                    assert transfers is not None
+                    result.append(
+                        self._candidate(
+                            intent,
+                            kind,
+                            flight,
+                            (stay,),
+                            transfers,
+                        )
+                    )
         return result
 
     def _split_candidates(
@@ -2334,8 +2723,10 @@ class PackagePlanner:
     ) -> list[TravelPackageCandidate]:
         if intent.night_count < 3:
             return []
-        first_checkout = intent.start_date + timedelta(days=1)
-        last_checkin = intent.end_date - timedelta(days=1)
+        stay_start = flight.outbound_arrive_at.date()
+        stay_end = flight.return_depart_at.date()
+        first_checkout = stay_start + timedelta(days=1)
+        last_checkin = stay_end - timedelta(days=1)
         first_stays = tuple(
             lodging
             for lodging in inventory.lodgings
@@ -2343,7 +2734,7 @@ class PackagePlanner:
                 lodging,
                 intent,
                 PackageArea.AIRPORT_ISLAND,
-                intent.start_date,
+                stay_start,
                 first_checkout,
             )
         )
@@ -2366,12 +2757,13 @@ class PackagePlanner:
                 intent,
                 PackageArea.AIRPORT_ISLAND,
                 last_checkin,
-                intent.end_date,
+                stay_end,
             )
         )
         legs = _required_transfer_legs(
             intent,
             PackageCandidateKind.SPLIT_AIRPORT_ISLAND,
+            flight=flight,
         )
         result: list[TravelPackageCandidate] = []
         for first in first_stays:
@@ -2388,17 +2780,38 @@ class PackagePlanner:
                         flight=flight,
                         kind=PackageCandidateKind.SPLIT_AIRPORT_ISLAND,
                     )
-                    if selected_transfers is None:
-                        continue
-                    result.append(
-                        self._candidate(
-                            intent,
-                            PackageCandidateKind.SPLIT_AIRPORT_ISLAND,
-                            flight,
-                            lodgings,
-                            selected_transfers,
-                        )
+                    selected_variants = (
+                        [selected_transfers] if selected_transfers is not None else []
                     )
+                    public_variant = self._select_transfers(
+                        intent,
+                        inventory,
+                        legs,
+                        lodgings=lodgings,
+                        flight=flight,
+                        kind=PackageCandidateKind.SPLIT_AIRPORT_ISLAND,
+                        required_provider_by_leg=tuple(
+                            (
+                                "icom-public-transfer"
+                                if PackageArea.DESTINATION_ISLAND in {origin, destination}
+                                else None
+                            )
+                            for origin, destination, _ in legs
+                        ),
+                    )
+                    if public_variant is not None and public_variant != selected_transfers:
+                        selected_variants.append(public_variant)
+                    for transfers in selected_variants:
+                        assert transfers is not None
+                        result.append(
+                            self._candidate(
+                                intent,
+                                PackageCandidateKind.SPLIT_AIRPORT_ISLAND,
+                                flight,
+                                lodgings,
+                                transfers,
+                            )
+                        )
         return result
 
     def _matching_lodging(
@@ -2415,8 +2828,9 @@ class PackagePlanner:
             and lodging.check_in == check_in
             and lodging.check_out == check_out
             and lodging.adults == intent.adults
+            and lodging.children == intent.children
+            and lodging.infants == intent.infants
             and lodging.rooms == intent.rooms
-            and lodging.currency == intent.currency
             and (
                 intent.destination_place_key is None
                 or (
@@ -2440,9 +2854,17 @@ class PackagePlanner:
         lodgings: tuple[NormalizedLodgingQuote, ...],
         flight: NormalizedFlightQuote,
         kind: PackageCandidateKind,
+        required_provider_by_leg: tuple[str | None, ...] | None = None,
     ) -> tuple[TransferOption, ...] | None:
+        if required_provider_by_leg is not None and len(required_provider_by_leg) != len(legs):
+            raise ValueError("required transfer providers must match transfer legs")
         matches_by_leg: list[tuple[TransferOption, ...]] = []
-        for origin, destination, travel_date in legs:
+        for leg_index, (origin, destination, travel_date) in enumerate(legs):
+            required_provider = (
+                required_provider_by_leg[leg_index]
+                if required_provider_by_leg is not None
+                else None
+            )
             matches = tuple(
                 transfer
                 for transfer in inventory.transfers
@@ -2451,6 +2873,12 @@ class PackagePlanner:
                 and transfer.destination_area == destination
                 and transfer.travel_date == travel_date
                 and transfer.adults == intent.adults
+                and transfer.children == intent.children
+                and transfer.infants == intent.infants
+                and (
+                    required_provider is None
+                    or transfer.provider == required_provider
+                )
                 and (
                     (
                         transfer.price_guarantee == TransferPriceGuarantee.ALL_IN_CONFIRMED
@@ -2465,9 +2893,49 @@ class PackagePlanner:
                 return None
             matches_by_leg.append(matches)
 
-        def score(items: tuple[TransferOption, ...]) -> tuple[int, int, int, tuple[str, ...]]:
+        def schedule_preference_penalty(items: tuple[TransferOption, ...]) -> int:
+            """Prefer the requested safe-window ferry observations when available.
+
+            The current Maldives run should prefer the earliest safe 15:25
+            airport->Maafushi observation and the 09:30 Maafushi->airport
+            observation.  This tie-breaker only runs
+            for the continuous Maafushi branch; it never turns an unsafe
+            schedule into an acceptable one and falls back to the normal
+            connection/price ordering when those observations are absent.
+            """
+
+            if kind != PackageCandidateKind.CONTINUOUS_ISLAND:
+                return 0
+            penalty = 0
+            outbound_target = time(15, 25)
+            inbound_target = time(9, 30)
+            for item in items:
+                if item.depart_at is None:
+                    continue
+                if (
+                    item.origin_area == PackageArea.AIRPORT
+                    and item.destination_area == PackageArea.DESTINATION_ISLAND
+                    and item.travel_date == flight.outbound_arrive_at.date()
+                ):
+                    target = outbound_target
+                elif (
+                    item.origin_area == PackageArea.DESTINATION_ISLAND
+                    and item.destination_area == PackageArea.AIRPORT
+                    and item.travel_date == flight.return_depart_at.date()
+                ):
+                    target = inbound_target
+                else:
+                    continue
+                penalty += abs(
+                    (item.depart_at.hour * 60 + item.depart_at.minute)
+                    - (target.hour * 60 + target.minute)
+                )
+            return penalty
+
+        def score(items: tuple[TransferOption, ...]) -> tuple[int, int, int, int, tuple[str, ...]]:
             return (
                 self._connection_penalty(intent, flight, kind, items),
+                schedule_preference_penalty(items),
                 len(
                     {
                         item.price_contract_id
@@ -2512,7 +2980,7 @@ class PackagePlanner:
                     second,
                     minimum_connection_minutes=intent.minimum_transfer_connection_minutes,
                 )
-                for first, second in _split_connection_pairs(intent, transfers)
+                for first, second in _split_connection_pairs(intent, transfers, flight=flight)
             )
         return penalty
 
@@ -2530,13 +2998,18 @@ class PackagePlanner:
             *(item.id for item in transfers),
         )
         digest = hashlib.sha256("|".join(component_ids).encode()).hexdigest()[:12]
-        total = (
+        flight_total = (
             flight.total_for_party_cents
-            + sum(item.total_for_party_cents for item in lodgings)
-            + transfer_contract_total_cents(
-                transfers,
-                currency=intent.currency,
-            )
+            if flight.party_total_known and flight.total_for_party_cents is not None
+            else 0
+        )
+        total = flight_total + sum(
+            item.total_for_party_cents
+            for item in lodgings
+            if item.currency == intent.currency
+        ) + transfer_contract_total_cents(
+            transfers,
+            currency=intent.currency,
         )
         return TravelPackageCandidate(
             id=f"{intent.trip_id}:package:{kind.value}:{digest}:v1",
@@ -2601,8 +3074,26 @@ class PackageVerifier:
         if (
             candidate.flight.outbound_depart_at.date() == intent.start_date
             and candidate.flight.return_depart_at.date() == intent.end_date
+            and (
+                intent.latest_arrival_date is None
+                or candidate.flight.return_arrive_at.date() <= intent.latest_arrival_date
+            )
         ):
             return []
+        if (
+            candidate.flight.outbound_depart_at.date() == intent.start_date
+            and candidate.flight.return_depart_at.date() == intent.end_date
+            and intent.latest_arrival_date is not None
+            and candidate.flight.return_arrive_at.date() > intent.latest_arrival_date
+        ):
+            return [
+                PackageViolation(
+                    code=PackageViolationCode.DATE_MISMATCH,
+                    severity=PackageViolationSeverity.ERROR,
+                    message="返程实际到达日期晚于用户要求的回杭边界",
+                    component_ids=(candidate.flight.id,),
+                )
+            ]
         return [
             PackageViolation(
                 code=PackageViolationCode.DATE_MISMATCH,
@@ -2622,7 +3113,15 @@ class PackageVerifier:
             *candidate.lodgings,
             *candidate.transfers,
         )
-        mismatches = [quote.id for quote in quotes if quote.adults != intent.adults]
+        expected_party = (intent.adults, intent.children, intent.infants)
+        mismatches = [
+            quote.id
+            for quote in quotes
+            if (quote.adults, quote.children, quote.infants) != expected_party
+        ]
+        mismatches.extend(
+            quote.id for quote in quotes if quote.children_ages != intent.children_ages
+        )
         mismatches.extend(
             lodging.id for lodging in candidate.lodgings if lodging.rooms != intent.rooms
         )
@@ -2632,9 +3131,14 @@ class PackageVerifier:
             PackageViolation(
                 code=PackageViolationCode.PARTY_MISMATCH,
                 severity=PackageViolationSeverity.ERROR,
-                message="报价并非针对完整成人数和房间数",
+                message="报价并非针对完整出行人数和房间数",
                 component_ids=tuple(dict.fromkeys(mismatches)),
-                details={"expected_adults": intent.adults, "expected_rooms": intent.rooms},
+                details={
+                    "expected_adults": intent.adults,
+                    "expected_children": intent.children,
+                    "expected_infants": intent.infants,
+                    "expected_rooms": intent.rooms,
+                },
             )
         ]
 
@@ -2648,10 +3152,12 @@ class PackageVerifier:
             PackageViolation(
                 code=PackageViolationCode.PARTY_AVAILABILITY_UNCONFIRMED,
                 severity=PackageViolationSeverity.ERROR,
-                message="航班报价未确认请求的完整成人数仍有可用库存",
+                message="航班报价未确认请求的完整出行人数仍有可用库存",
                 component_ids=(candidate.flight.id,),
                 details={
                     "requested_adults": candidate.flight.adults,
+                    "requested_children": candidate.flight.children,
+                    "requested_infants": candidate.flight.infants,
                     "party_availability_confirmed": False,
                 },
             )
@@ -2662,12 +3168,12 @@ class PackageVerifier:
         intent: PackageIntent,
         candidate: TravelPackageCandidate,
     ) -> list[PackageViolation]:
-        mismatches = [
+        hard_mismatches = [
             quote.id
-            for quote in (candidate.flight, *candidate.lodgings)
+            for quote in (candidate.flight,)
             if quote.currency != intent.currency
         ]
-        mismatches.extend(
+        hard_mismatches.extend(
             transfer.id
             for transfer in candidate.transfers
             if (
@@ -2676,15 +3182,29 @@ class PackageVerifier:
             )
         )
         if candidate.currency != intent.currency:
-            mismatches.append(candidate.id)
-        if not mismatches:
+            hard_mismatches.append(candidate.id)
+        foreign_lodgings = tuple(
+            lodging.id
+            for lodging in candidate.lodgings
+            if lodging.currency != intent.currency
+        )
+        if hard_mismatches:
+            return [
+                PackageViolation(
+                    code=PackageViolationCode.CURRENCY_MISMATCH,
+                    severity=PackageViolationSeverity.ERROR,
+                    message="整包中存在未经确定性换汇的航班或全包接驳币种",
+                    component_ids=tuple(hard_mismatches),
+                )
+            ]
+        if not foreign_lodgings:
             return []
         return [
             PackageViolation(
                 code=PackageViolationCode.CURRENCY_MISMATCH,
                 severity=PackageViolationSeverity.ERROR,
-                message="整包中存在未经确定性换汇的不同币种",
-                component_ids=tuple(mismatches),
+                message="住宿存在未换算外币，不能参与完整人民币总价最优或接受",
+                component_ids=foreign_lodgings,
             )
         ]
 
@@ -2763,6 +3283,23 @@ class PackageVerifier:
                     severity=PackageViolationSeverity.ERROR,
                     message="整包组件缺少报价证据引用",
                     component_ids=missing,
+                )
+            )
+        if not candidate.flight.party_total_known:
+            violations.append(
+                PackageViolation(
+                    code=PackageViolationCode.BUDGET_NOT_FULLY_VERIFIED,
+                    severity=PackageViolationSeverity.WARNING,
+                    message=(
+                        "航班仅有每成人显示价；同一票价产品的 1/2 成人对照不足，"
+                        "机票两人总价未计入整包总价"
+                    ),
+                    component_ids=(candidate.flight.id,),
+                    details={
+                        "party_total_known": False,
+                        "price_basis": candidate.flight.price_basis,
+                        "display_amount_cents": candidate.flight.display_amount_cents,
+                    },
                 )
             )
         return violations
@@ -2861,8 +3398,11 @@ class PackageVerifier:
         intent: PackageIntent,
         candidate: TravelPackageCandidate,
     ) -> list[PackageViolation]:
+        stay_start = candidate.flight.outbound_arrive_at.date()
+        stay_end = candidate.flight.return_depart_at.date()
         expected = {
-            intent.start_date + timedelta(days=offset): 0 for offset in range(intent.night_count)
+            stay_start + timedelta(days=offset): 0
+            for offset in range((stay_end - stay_start).days)
         }
         outside = False
         for lodging in candidate.lodgings:
@@ -2891,26 +3431,28 @@ class PackageVerifier:
         intent: PackageIntent,
         candidate: TravelPackageCandidate,
     ) -> list[PackageViolation]:
+        stay_start = candidate.flight.outbound_arrive_at.date()
+        stay_end = candidate.flight.return_depart_at.date()
         if candidate.kind == PackageCandidateKind.CONTINUOUS_ISLAND:
             expected = Counter(
-                {(PackageArea.DESTINATION_ISLAND, intent.start_date, intent.end_date): 1}
+                {(PackageArea.DESTINATION_ISLAND, stay_start, stay_end): 1}
             )
         elif candidate.kind == PackageCandidateKind.CONTINUOUS_AIRPORT_ISLAND:
             expected = Counter(
-                {(PackageArea.AIRPORT_ISLAND, intent.start_date, intent.end_date): 1}
+                {(PackageArea.AIRPORT_ISLAND, stay_start, stay_end): 1}
             )
         else:
-            first_checkout = intent.start_date + timedelta(days=1)
-            last_checkin = intent.end_date - timedelta(days=1)
+            first_checkout = stay_start + timedelta(days=1)
+            last_checkin = stay_end - timedelta(days=1)
             expected = Counter(
                 {
-                    (PackageArea.AIRPORT_ISLAND, intent.start_date, first_checkout): 1,
+                    (PackageArea.AIRPORT_ISLAND, stay_start, first_checkout): 1,
                     (
                         PackageArea.DESTINATION_ISLAND,
                         first_checkout,
                         last_checkin,
                     ): 1,
-                    (PackageArea.AIRPORT_ISLAND, last_checkin, intent.end_date): 1,
+                    (PackageArea.AIRPORT_ISLAND, last_checkin, stay_end): 1,
                 }
             )
         actual = Counter(
@@ -3001,7 +3543,7 @@ class PackageVerifier:
         intent: PackageIntent,
         candidate: TravelPackageCandidate,
     ) -> list[PackageViolation]:
-        required = _required_transfer_legs(intent, candidate.kind)
+        required = _required_transfer_legs(intent, candidate.kind, flight=candidate.flight)
         available = Counter(
             (item.origin_area, item.destination_area, item.travel_date)
             for item in candidate.transfers
@@ -3041,7 +3583,11 @@ class PackageVerifier:
             return []
         invalid = tuple(
             (first, second)
-            for first, second in _split_connection_pairs(intent, candidate.transfers)
+            for first, second in _split_connection_pairs(
+                intent,
+                candidate.transfers,
+                flight=candidate.flight,
+            )
             if not _transfers_can_connect(
                 first,
                 second,
@@ -3301,6 +3847,8 @@ class PackageVerifier:
         minimum_known_total_cents = (
             candidate.computed_total_cents + known_same_currency_base_fare_cents
         )
+        if not candidate.flight.party_total_known:
+            return []
         if (
             intent.budget_cents is None
             or minimum_known_total_cents <= intent.budget_cents
@@ -3593,13 +4141,18 @@ class PackageRepairer:
                 ),
             )
 
-        total = (
+        flight_total = (
             flight.total_for_party_cents
-            + sum(item.total_for_party_cents for item in lodgings)
-            + transfer_contract_total_cents(
-                transfers,
-                currency=candidate.currency,
-            )
+            if flight.party_total_known and flight.total_for_party_cents is not None
+            else 0
+        )
+        total = flight_total + sum(
+            item.total_for_party_cents
+            for item in lodgings
+            if item.currency == candidate.currency
+        ) + transfer_contract_total_cents(
+            transfers,
+            currency=candidate.currency,
         )
         version = candidate.version + 1
         repaired = candidate.model_copy(

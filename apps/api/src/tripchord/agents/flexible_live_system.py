@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Awaitable, Callable
+import json
+import os
+from collections.abc import Awaitable, Callable, Iterable
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from time import monotonic
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from pydantic import Field, JsonValue, model_validator
 
 from tripchord.agents.adaptive_control import (
+    DIRECT_DATE_PAIR_LIMIT,
     AdaptiveControlInput,
     AdaptiveModelConcurrencyGate,
     AdaptiveStopReason,
@@ -65,8 +70,10 @@ from tripchord.planning.adaptive_dates import (
 )
 from tripchord.planning.flexible_dates import (
     LIVE_V5_PLATFORMS,
+    AdmissibleCostBound,
     AuditableDatePair,
     DateExplorationResult,
+    DateOptimalityStatus,
     FlexibleDateExplorer,
     FlexibleQueryPlan,
     FlexibleQueryPlanBuilder,
@@ -77,6 +84,7 @@ from tripchord.planning.flexible_dates import (
     QueryPlanPolicy,
     QueryTaskKind,
     TravelPlatform,
+    canonical_acquisition_fingerprint,
     effective_platform_interval_ms,
 )
 from tripchord.planning.multiobjective import (
@@ -94,7 +102,11 @@ from tripchord.planning.package import (
     PackagePlaceKey,
     TransferOption,
 )
-from tripchord.planning.stay_plans import StayPlanCandidateSet, StayPlanId
+from tripchord.planning.stay_plans import (
+    StayPlanCandidateSet,
+    StayPlanId,
+    system_stay_plan_candidate_set,
+)
 from tripchord.platform.terminal import SearchRun
 from tripchord.providers.browser_bridge import (
     BrowserProvider,
@@ -129,13 +141,252 @@ _EXPLORATION_DEFERRED_STAGE_IDS = (
 )
 _QUERY_STRATEGY_FRONTIER_LIMIT = 12
 _PUBLICATION_REFRESH_MODEL_AGENT_COUNT = 8
+_MAX_SOURCE_START_DELAY_MS = 900_000
+_FULL_WINDOW_FINALIZATION_BUFFER_SECONDS = 60
 
 PairCheckpointReporter = Callable[[LivePlanningPairCheckpoint], Awaitable[None]]
+
+
+@dataclass
+class _FlexibleAcquisitionEntry:
+    task_id: str
+    initial_snapshot: BrowserTaskSnapshot
+    outcome: asyncio.Future[BrowserTaskSnapshot]
+    consumer_count: int = 1
+    watcher_task: asyncio.Task[None] | None = None
+    terminal_snapshot: BrowserTaskSnapshot | None = None
+    cleanup_forwarded: bool = False
+
+
+class _FlexibleAcquisitionLedger:
+    """Run-scoped singleflight for exact browser acquisitions.
+
+    The browser bridge coalesces active work and reuses successful recent
+    quotes, but a terminal failure is intentionally not reusable.  A complete
+    flexible window must nevertheless treat a failed acquisition as a terminal
+    outcome for every duplicate fingerprint in this same run; otherwise later
+    date pairs silently re-query the same failed source.
+    """
+
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+        self._state: ContextVar[
+            tuple[
+                asyncio.Lock,
+                dict[str, _FlexibleAcquisitionEntry],
+                dict[str, _FlexibleAcquisitionEntry],
+            ]
+            | None
+        ] = ContextVar("flexible_acquisition_ledger_state", default=None)
+
+    def reset(self) -> None:
+        self._state.set((asyncio.Lock(), {}, {}))
+
+    @staticmethod
+    def _key(submission: BrowserTaskSubmission) -> str:
+        payload = submission.query.model_dump(mode="json")
+        options = dict(payload.get("options") or {})
+        payload["options"] = {
+            key: value
+            for key, value in options.items()
+            if not key.startswith("__tripchord_")
+        }
+        canonical = {
+            "provider": submission.provider.value,
+            "kind": submission.kind.value,
+            "partition": submission.reuse_partition_sha256,
+            "query": payload,
+        }
+        return hashlib.sha256(
+            json.dumps(
+                canonical,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    async def submit_many(
+        self,
+        submissions: Iterable[BrowserTaskSubmission],
+    ) -> tuple[BrowserTaskSnapshot, ...]:
+        values = tuple(submissions)
+        if not values:
+            raise ValueError("at least one browser task is required")
+        state = self._state.get()
+        if state is None:
+            return cast(tuple[BrowserTaskSnapshot, ...], await self._delegate.submit_many(values))
+        lock, entries_by_key, entries_by_task_id = state
+        async with lock:
+            snapshots: list[BrowserTaskSnapshot] = []
+            for submission in values:
+                # Publication refreshes deliberately disable recent reuse and
+                # must bypass the exploration ledger as well. They are a new
+                # exact evidence acquisition even when the query fingerprint
+                # matches an earlier exploration task.
+                if (
+                    submission.query.options.get("__tripchord_allow_recent_quote_reuse")
+                    is False
+                ):
+                    (snapshot,) = await self._delegate.submit_many((submission,))
+                    snapshots.append(snapshot)
+                    continue
+                key = self._key(submission)
+                entry = entries_by_key.get(key)
+                if entry is None:
+                    ledger_submission = submission.model_copy(
+                        update={
+                            "query": submission.query.model_copy(
+                                update={
+                                    "options": {
+                                        **submission.query.options,
+                                        "__tripchord_ledger_terminal_retention": True,
+                                    }
+                                }
+                            )
+                        }
+                    )
+                    (snapshot,) = await self._delegate.submit_many((ledger_submission,))
+                    outcome: asyncio.Future[BrowserTaskSnapshot] = (
+                        asyncio.get_running_loop().create_future()
+                    )
+                    outcome.add_done_callback(self._consume_outcome_exception)
+                    entry = _FlexibleAcquisitionEntry(snapshot.id, snapshot, outcome)
+                    entries_by_key[key] = entry
+                    entries_by_task_id[snapshot.id] = entry
+                    entry.watcher_task = asyncio.create_task(
+                        self._collect_outcome(entry, submission.timeout_seconds)
+                    )
+                    snapshots.append(snapshot)
+                    continue
+                entry.consumer_count += 1
+                snapshots.append(entry.initial_snapshot)
+            return tuple(snapshots)
+
+    async def _collect_outcome(self, entry: _FlexibleAcquisitionEntry, timeout: int) -> None:
+        try:
+            (snapshot,) = await self._delegate.wait_many(
+                (entry.task_id,),
+                timeout_seconds=timeout,
+            )
+        except BaseException as exc:
+            if not entry.outcome.done():
+                entry.outcome.set_exception(exc)
+            return
+        entry.terminal_snapshot = snapshot
+        if not entry.outcome.done():
+            entry.outcome.set_result(snapshot)
+
+    @staticmethod
+    def _consume_outcome_exception(future: asyncio.Future[BrowserTaskSnapshot]) -> None:
+        if not future.cancelled():
+            future.exception()
+
+    async def wait_many(
+        self,
+        task_ids: Iterable[str],
+        *,
+        timeout_seconds: int,
+    ) -> tuple[BrowserTaskSnapshot, ...]:
+        state = self._state.get()
+        if state is None:
+            return cast(
+                tuple[BrowserTaskSnapshot, ...],
+                await self._delegate.wait_many(task_ids, timeout_seconds=timeout_seconds),
+            )
+        _, _, entries_by_task_id = state
+        results: list[BrowserTaskSnapshot] = []
+        for task_id in task_ids:
+            entry = entries_by_task_id.get(task_id)
+            if entry is None:
+                (direct_snapshot,) = await self._delegate.wait_many(
+                    (task_id,),
+                    timeout_seconds=timeout_seconds,
+                )
+                results.append(direct_snapshot)
+                continue
+            try:
+                results.append(await asyncio.shield(entry.outcome))
+            except asyncio.CancelledError:
+                # LiveSystem's cancellation cleanup explicitly calls
+                # ``cancel_many`` after the wait task is cancelled. Releasing
+                # here as well would double-decrement a consumer and cancel a
+                # still-live duplicate.
+                raise
+        return tuple(results)
+
+    async def cancel_many(self, task_ids: Iterable[str], *, reason: str) -> Any:
+        state = self._state.get()
+        if state is None:
+            return await self._delegate.cancel_many(task_ids, reason=reason)
+        _, _, entries_by_task_id = state
+        for task_id in task_ids:
+            entry = entries_by_task_id.get(task_id)
+            if entry is not None:
+                await self._consumer_cancel(entry, reason=reason)
+            else:
+                await self._delegate.cancel_many((task_id,), reason=reason)
+        return None
+
+    async def _consumer_cancel(self, entry: _FlexibleAcquisitionEntry, *, reason: str) -> None:
+        entry.consumer_count = max(0, entry.consumer_count - 1)
+        if (
+            entry.consumer_count != 0
+            or entry.terminal_snapshot is not None
+            or entry.cleanup_forwarded
+        ):
+            return
+        entry.cleanup_forwarded = True
+        try:
+            await self._delegate.cancel_many((entry.task_id,), reason=reason)
+        except BaseException:
+            entry.cleanup_forwarded = False
+            raise
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
 
 
 class FlexiblePairState(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class SourceScheduleBudgetExceeded(TimeoutError):
+    """A server-owned absolute provider lane cannot start inside its budget."""
+
+    def __init__(self, delays: dict[str, int]) -> None:
+        self.delays = delays
+        over_limit = max(delays.values(), default=0)
+        super().__init__(
+            "provider lane reservation exceeds the 900000ms source start budget: "
+            f"max_delay_ms={over_limit}"
+        )
+
+
+class FullWindowDeadlineInfeasible(ValueError):
+    """The server can prove a full date universe misses its hard deadline."""
+
+    def __init__(
+        self,
+        *,
+        pair_count: int,
+        last_source_offset_ms: int,
+        conservative_execution_budget_ms: int,
+        total_timeout_seconds: int,
+    ) -> None:
+        self.pair_count = pair_count
+        self.last_source_offset_ms = last_source_offset_ms
+        self.conservative_execution_budget_ms = conservative_execution_budget_ms
+        self.total_timeout_seconds = total_timeout_seconds
+        required_ms = last_source_offset_ms + conservative_execution_budget_ms
+        super().__init__(
+            "full_window_deadline_infeasible: 完整日期全集的最后必需 provider source "
+            f"offset={last_source_offset_ms}ms，加保守执行预算="
+            f"{conservative_execution_budget_ms}ms，总需求={required_ms}ms，"
+            f"超过请求硬上限 {total_timeout_seconds}s；未确认 provider 的 "
+            "calendar/range/batch acquisition 能力，不能把已评估子集发布为全集最优。"
+        )
 
 
 class FlexibleObjectiveWeights(DomainModel):
@@ -393,6 +644,7 @@ class FlexibleRankedOption(DomainModel):
     return_date: date
     decision_state: PackageDecisionState
     recommendable: bool
+    complete_cny_party_total: bool = False
     total_budget_cents: int | None = Field(default=None, ge=0)
     evidence_completeness: Decimal = Field(ge=0, le=1)
     all_platforms_complete: bool
@@ -464,6 +716,8 @@ class FlexibleLiveAgentRun(DomainModel):
     publication_refresh_minimum_options: int = Field(default=0, ge=0, le=2)
     publication_refreshed_option_ids: tuple[str, ...] = ()
     sampled_not_exhaustive: bool
+    optimality_status: DateOptimalityStatus = DateOptimalityStatus.BEST_VERIFIED_IN_EVALUATED_SET
+    admissible_bounds: tuple[AdmissibleCostBound, ...] = ()
     claim_boundary: str = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -505,6 +759,22 @@ class FlexibleLiveAgentRun(DomainModel):
                 raise ValueError("actual model Agent admissions exceeded the frozen directive")
             if self.agent_budget_audit.rejected_count:
                 raise ValueError("a completed adaptive run cannot hide rejected model Agents")
+        return self
+
+    @model_validator(mode="after")
+    def validate_optimality_certificate(self) -> FlexibleLiveAgentRun:
+        if (
+            self.final_decision.state == PackageDecisionState.HUMAN_BLOCK
+            and self.optimality_status == DateOptimalityStatus.OPTIMALITY_PROVEN
+        ):
+            raise ValueError("HUMAN_BLOCK runs cannot claim proven optimality")
+        if self.optimality_status == DateOptimalityStatus.OPTIMALITY_PROVEN and (
+            not self.admissible_bounds
+            or not all(bound.proven for bound in self.admissible_bounds)
+        ):
+                raise ValueError(
+                    "optimality_proven requires non-empty proven admissible bounds"
+                )
         return self
 
     @staticmethod
@@ -551,12 +821,28 @@ class FlexibleLiveAgentRun(DomainModel):
 
     @model_validator(mode="after")
     def validate_recommendation_quote_coverage(self) -> FlexibleLiveAgentRun:
+        if len(self.recommended_option_ids) > 1:
+            raise ValueError("a production run may expose at most one recommended option")
+        if self.recommended_option_ids:
+            selected = next(
+                (
+                    option
+                    for option in self.ranked_options
+                    if option.option_id == self.recommended_option_ids[0]
+                ),
+                None,
+            )
+            if selected is None or not selected.complete_cny_party_total:
+                raise ValueError(
+                    "the final recommendation must be a complete CNY party total"
+                )
         unsafe = tuple(
             option.option_id
             for option in self.ranked_options
             if option.recommendable
             and option.exact_quote_comparison_coverage is not None
             and not option.exact_quote_comparison_coverage.complete
+            and not option.exact_quote_comparison_coverage.single_source_publishable
         )
         if unsafe:
             raise ValueError(
@@ -600,9 +886,9 @@ class FlexibleLiveAgentRun(DomainModel):
             raise ValueError("every recommended option must bind a passed publication refresh")
         if (
             self.final_decision.state == PackageDecisionState.ACCEPT
-            and len(self.recommended_option_ids) < self.publication_refresh_minimum_options
+            and not self.recommended_option_ids
         ):
-            raise ValueError("ACCEPT requires the configured number of refreshed options")
+            raise ValueError("ACCEPT requires at least one refreshed recommendation")
         return self
 
 
@@ -671,6 +957,12 @@ class FlexibleLiveAgentSystem:
         self._context_builder = context_builder
         self._memory_store = memory_store
         self._adaptive_agent_scaling_enabled = adaptive_agent_scaling_enabled
+        self._acquisition_ledger: _FlexibleAcquisitionLedger | None = None
+        if isinstance(live_system, LivePackageAgentSystem):
+            bridge = getattr(live_system, "_bridge", None)
+            if bridge is not None:
+                self._acquisition_ledger = _FlexibleAcquisitionLedger(bridge)
+                cast(Any, live_system)._bridge = self._acquisition_ledger
 
     @request_agent_budgeted
     async def run(
@@ -679,10 +971,11 @@ class FlexibleLiveAgentSystem:
         calendars: tuple[PlatformFareCalendar, ...] = (),
         *,
         mode: LiveCoverageMode = LiveCoverageMode.STRICT,
-        max_pairs: int = 3,
+        max_pairs: int = 400,
         policy: QueryPlanPolicy | None = None,
         constraints: FlexiblePackageConstraints | None = None,
         timeout_seconds: int = 120,
+        total_timeout_seconds: int = 600,
         stay_plan_candidate_set: StayPlanCandidateSet | None = None,
         memory_access: MemoryAccessContext | None = None,
         publication_refresh_minimum_options: int = 0,
@@ -691,12 +984,37 @@ class FlexibleLiveAgentSystem:
         search_run_recorder: SearchRunRecorder | None = None,
         reference_date: date | None = None,
     ) -> FlexibleLiveAgentRun:
+        if self._acquisition_ledger is not None:
+            self._acquisition_ledger.reset()
         budget_ledger = current_agent_budget()
         if budget_ledger is None:  # pragma: no cover - decorator invariant
             raise RuntimeError("flexible live run requires an Agent budget ledger")
         budget_scope_start_admitted_count = budget_ledger.audit().admitted_count
-        if not 1 <= max_pairs <= 8:
-            raise ValueError("flexible live search supports one to eight exact date pairs")
+        if not 1 <= max_pairs <= 400:
+            raise ValueError("flexible live search supports one to 400 exact date pairs")
+        # Normalize the Malé gateway independently of whether the caller
+        # supplied the internal candidate set. Explicit sets must not bypass
+        # the IATA code required by the Arena official source lane.
+        stay_profile = system_stay_area_search_profile(window.destination)
+        if stay_profile is None and window.destination_code == "MLE":
+            stay_profile = system_stay_area_search_profile("马累")
+        if stay_profile is None and window.destination in {"马尔代夫", "Maldives"}:
+            stay_profile = system_stay_area_search_profile("马累")
+        if stay_profile is not None:
+            window = window.model_copy(
+                update={
+                    "destination": stay_profile.gateway_destination,
+                    "destination_code": "MLE",
+                }
+            )
+        # Direct callers may omit the internal candidate set, but must still
+        # receive the same frozen stay-plan contract as text callers.
+        if stay_plan_candidate_set is None and stay_profile is not None:
+            stay_plan_candidate_set = system_stay_plan_candidate_set(
+                stay_profile.gateway_destination
+            )
+        if not 60 <= total_timeout_seconds <= 600:
+            raise ValueError("flexible total timeout supports 60 to 600 seconds")
         if not 0 <= publication_refresh_minimum_options <= 2:
             raise ValueError("publication refresh supports zero to two final options")
         if pair_checkpoint_reporter is not None and (
@@ -727,15 +1045,18 @@ class FlexibleLiveAgentSystem:
                 "flexible departure window has no date meeting the minimum booking lead time"
             )
         effective_earliest = max(window.earliest_departure, minimum_departure)
-        exact_pair_budget = min(window.max_pairs, max_pairs)
         effective_window = window.model_copy(update={"earliest_departure": effective_earliest})
         # Enumerating date pairs is cheap: a 31-day window with four stay lengths
-        # has only 124 combinations.  We enumerate the full coarse universe for
-        # normal travel windows and reserve expensive browser work for an
-        # bounded one-to-eight pair budget. Very broad 93-day/60-length inputs
-        # are capped at 400 coarse candidates and disclosed as partial.
+        # has only 124 combinations. We enumerate the full coarse universe up to
+        # the public 400-pair support boundary. Any caller-selected lower exact
+        # budget is diagnostic-only and must remain disclosed as partial.
         coarse_pair_budget = min(effective_window.universe_size, 400)
         effective_window = effective_window.model_copy(update={"max_pairs": coarse_pair_budget})
+        exact_pair_budget = min(
+            effective_window.universe_size,
+            effective_window.max_pairs,
+            max_pairs,
+        )
         exploration = self._explorer.explore(
             effective_window,
             calendars,
@@ -788,23 +1109,100 @@ class FlexibleLiveAgentSystem:
         agent_template_plan = (
             build_agent_template_plan(scale_directive) if scale_directive is not None else None
         )
-        query_strategy, query_agentic, exploration = await self._query_strategy(
+        deterministic_policy = self._execution_query_policy(
             effective_window,
             exploration,
-            exact_pair_budget=exact_pair_budget,
-            memory_access=memory_access,
-            scale_directive=scale_directive,
+            policy,
+            exact_pair_budget,
+            stay_plan_candidate_set=stay_plan_candidate_set,
         )
-        effective_exact_pair_budget = (
-            query_strategy.query_budget_pairs if query_strategy is not None else exact_pair_budget
+        if exact_pair_budget == exploration.universe_size:
+            deterministic_query_plan = self._query_planner.build(
+                effective_window,
+                exploration,
+                deterministic_policy,
+                stay_plan_candidate_set=stay_plan_candidate_set,
+            )
+            self._preflight_full_window_deadline(
+                deterministic_query_plan,
+                pair_count=exact_pair_budget,
+                timeout_seconds=timeout_seconds,
+                total_timeout_seconds=total_timeout_seconds,
+            )
+        if exact_pair_budget == exploration.universe_size:
+            # Once the server has admitted the complete deterministic universe,
+            # a model cannot improve coverage by selecting a frontier.  Keep the
+            # explorer's stable order and spend zero model budget on date
+            # sharding/merging; only the final publication refresh may call a
+            # model Agent.
+            query_strategy = None
+            query_agentic = AgenticRunSummary(enabled=False, required=False)
+            exploration = exploration.model_copy(
+                update={
+                    "warnings": (
+                        *exploration.warnings,
+                        "完整日期全集按服务器确定性顺序执行；未调用 Query Strategist 模型",
+                    )
+                }
+            )
+        else:
+            query_strategy, query_agentic, exploration = await self._query_strategy(
+                effective_window,
+                exploration,
+                exact_pair_budget=exact_pair_budget,
+                memory_access=memory_access,
+                scale_directive=scale_directive,
+            )
+        # A model may reorder the deterministic universe, but it cannot shrink
+        # the production search and thereby redefine "best". Explicit lower
+        # budgets remain diagnostic-only through ``max_pairs``.
+        effective_exact_pair_budget = exact_pair_budget
+        effective_policy = (
+            deterministic_policy
+            if exact_pair_budget == exploration.universe_size
+            else self._execution_query_policy(
+                effective_window,
+                exploration,
+                policy,
+                effective_exact_pair_budget,
+                stay_plan_candidate_set=stay_plan_candidate_set,
+            )
         )
-        effective_policy = self._exact_query_policy(policy, effective_exact_pair_budget)
         query_plan = self._query_planner.build(
             effective_window,
             exploration,
             effective_policy,
             stay_plan_candidate_set=stay_plan_candidate_set,
         )
+        # The final merge can otherwise re-promote the unsafe 2026-09-10
+        # departure target after the bounded strategy pass.  Re-apply the
+        # actual-arrival boundary at the last server-owned selection point.
+        if effective_window.return_date_targets and effective_window.latest_arrival_date:
+            safe_return = max(effective_window.return_date_targets)
+            if safe_return == effective_window.latest_arrival_date:
+                safe_return -= timedelta(days=1)
+            safe_pair = next(
+                (
+                    item
+                    for item in exploration.candidates
+                    if item.return_date == safe_return
+                    and item.night_count == max(
+                        effective_window.min_nights,
+                        effective_window.max_nights - 1,
+                    )
+                ),
+                None,
+            )
+            if safe_pair is not None and safe_pair.id not in query_plan.selected_pair_ids:
+                selected_ids = (
+                    safe_pair.id,
+                    *(
+                        item
+                        for item in query_plan.selected_pair_ids
+                        if item != safe_pair.id
+                    ),
+                )[:effective_exact_pair_budget]
+                query_plan = query_plan.model_copy(update={"selected_pair_ids": selected_ids})
         pairs = {item.id: item for item in exploration.candidates}
         effective_constraints = constraints or FlexiblePackageConstraints()
         stay_area_search_profile = system_stay_area_search_profile(effective_window.destination)
@@ -825,9 +1223,36 @@ class FlexibleLiveAgentSystem:
         # unrelated lodging work until their ten-minute quote TTL expires. Keep
         # source Agents maximally concurrent inside a pair, but admit date pairs
         # one at a time so Verifier always sees a coherent fresh evidence window.
-        pair_semaphore = asyncio.Semaphore(1)
+        # Three domain/date workers may overlap; the browser bridge and each
+        # provider still enforce their own bounded leases and rate lanes.
+        pair_worker_count = 3
+        worker_pool_enabled = (
+            scale_directive is not None
+            and effective_exact_pair_budget > DIRECT_DATE_PAIR_LIMIT
+        )
+        # A large concrete live run is an exploration pass, not 66 independent
+        # model-agent runs.  It uses the deterministic live DAG and reserves
+        # the model budget for the single publication refresh below.
+        bulk_exploration = (
+            isinstance(self._live, LivePackageAgentSystem)
+            and effective_exact_pair_budget == exploration.universe_size
+            and publication_refresh_minimum_options > 0
+        )
+        provider_lane_lock = asyncio.Lock()
+        provider_next_available_ms = {
+            item.platform: 0 for item in effective_policy.platform_rates
+        }
+        # One absolute lane reservation per provider acquisition, not per
+        # date-pair label.  The browser bridge's singleflight/recent-quote
+        # reuse then sees the same identity and duplicate pairs inherit the
+        # original schedule instead of consuming another provider slot.
+        acquisition_offsets_ms: dict[str, int] = {}
 
-        async def execute_pair(pair: AuditableDatePair) -> FlexiblePairExecution:
+        async def execute_pair(
+            pair: AuditableDatePair,
+            *,
+            worker_index: int | None = None,
+        ) -> FlexiblePairExecution:
             # Build only the selected pair's source tasks.  This is the dynamic
             # expansion point. The default consumes Query Strategist's audited
             # order; an explicitly injected experimental refiner may pick any
@@ -844,7 +1269,6 @@ class FlexibleLiveAgentSystem:
                 pair_policy,
                 stay_plan_candidate_set=stay_plan_candidate_set,
             )
-            round_index = len(execution_by_pair)
             rate_by_platform = {
                 item.platform: effective_platform_interval_ms(
                     item,
@@ -852,21 +1276,31 @@ class FlexibleLiveAgentSystem:
                 )
                 for item in effective_policy.platform_rates
             }
-            tasks_per_platform = {
-                platform: sum(task.platform == platform for task in pair_plan.tasks)
-                for platform in rate_by_platform
-            }
+            absolute_offsets: dict[str, int] = {}
+            async with provider_lane_lock:
+                for platform, interval_ms in rate_by_platform.items():
+                    platform_tasks = tuple(
+                        task for task in pair_plan.tasks if task.platform == platform
+                    )
+                    if not platform_tasks:
+                        continue
+                    for task in platform_tasks:
+                        fingerprint = canonical_acquisition_fingerprint(task)
+                        existing_offset = acquisition_offsets_ms.get(fingerprint)
+                        if existing_offset is not None:
+                            absolute_offsets[task.id] = existing_offset
+                            continue
+                        # The runtime ledger is authoritative for the provider
+                        # lane.  A new acquisition always takes the next
+                        # contiguous slot; pair-local planner offsets are only
+                        # an ordering hint and must not create holes.  A
+                        # duplicate fingerprint inherits its first slot above.
+                        absolute_offset = provider_next_available_ms[platform]
+                        absolute_offsets[task.id] = absolute_offset
+                        acquisition_offsets_ms[fingerprint] = absolute_offset
+                        provider_next_available_ms[platform] = absolute_offset + interval_ms
             tasks = tuple(
-                task.model_copy(
-                    update={
-                        "scheduled_offset_ms": (
-                            task.scheduled_offset_ms
-                            + round_index
-                            * tasks_per_platform[task.platform]
-                            * rate_by_platform[task.platform]
-                        )
-                    }
-                )
+                task.model_copy(update={"scheduled_offset_ms": absolute_offsets[task.id]})
                 for task in pair_plan.tasks
             )
             pair_intent = self._intent(
@@ -882,72 +1316,117 @@ class FlexibleLiveAgentSystem:
                 stay_area_search_profile=stay_area_search_profile,
                 stay_plan_candidate_set=stay_plan_candidate_set,
             )
-            async with pair_semaphore:
-                elapsed_ms = max(
-                    0,
-                    int((self._monotonic() - schedule_started) * 1000),
-                )
+            elapsed_ms = max(
+                0,
+                int((self._monotonic() - schedule_started) * 1000),
+            )
+            delays: dict[str, int] = {}
+            try:
                 delays = self._source_delays(tasks, elapsed_ms)
-                try:
-                    if isinstance(self._live, LivePackageAgentSystem):
-                        live_run = await self._live.run(
-                            pair_intent,
-                            pair_query,
-                            mode=mode,
-                            purpose=(
-                                LiveRunPurpose.EXPLORATION_SELECTION
-                                if publication_refresh_minimum_options > 0
-                                else LiveRunPurpose.FINAL_PUBLICATION
-                            ),
-                            timeout_seconds=timeout_seconds,
-                            source_start_delays_ms=delays,
-                            memory_access=memory_access,
-                        )
-                    else:
-                        live_run = await self._live.run(
-                            pair_intent,
-                            pair_query,
-                            mode=mode,
-                            timeout_seconds=timeout_seconds,
-                            source_start_delays_ms=delays,
-                        )
-                # A date-specific external/provider failure is isolatable.  Do
-                # not turn programming errors (AssertionError/TypeError/etc.) or
-                # required-model contract failures (ValueError) into an innocent
-                # "one date failed" result; those must fail the whole run so the
-                # defect is observable.
-                except (TimeoutError, RuntimeError) as exc:
-                    return FlexiblePairExecution(
-                        date_pair=pair,
-                        query_tasks=tasks,
-                        source_start_delays_ms=delays,
-                        state=FlexiblePairState.FAILED,
-                        failure_class=type(exc).__name__,
-                        failure_message=str(exc),
-                    )
+                if worker_pool_enabled and worker_index is None:  # pragma: no cover
+                    raise RuntimeError("full-date worker pool lost its worker slot")
+                live_run = await self._run_live_pair(
+                    pair_intent,
+                    pair_query,
+                    mode=mode,
+                    timeout_seconds=timeout_seconds,
+                    source_start_delays_ms=delays,
+                    memory_access=memory_access,
+                    publication_refresh_minimum_options=publication_refresh_minimum_options,
+                    model_agents_enabled=not bulk_exploration,
+                    exploration_only=bulk_exploration,
+                )
+            # A date-specific external/provider failure is isolatable.  Do
+            # not turn programming errors (AssertionError/TypeError/etc.) or
+            # required-model contract failures (ValueError) into an innocent
+            # "one date failed" result; those must fail the whole run so the
+            # defect is observable.
+            except SourceScheduleBudgetExceeded as exc:
+                return FlexiblePairExecution(
+                    date_pair=pair,
+                    query_tasks=tasks,
+                    source_start_delays_ms=exc.delays,
+                    state=FlexiblePairState.FAILED,
+                    failure_class=type(exc).__name__,
+                    failure_message=str(exc),
+                )
+            except TimeoutError as exc:
                 return FlexiblePairExecution(
                     date_pair=pair,
                     query_tasks=tasks,
                     source_start_delays_ms=delays,
-                    state=FlexiblePairState.COMPLETED,
-                    run=live_run,
+                    state=FlexiblePairState.FAILED,
+                    failure_class=type(exc).__name__,
+                    failure_message=str(exc),
                 )
+            except RuntimeError as exc:
+                # The concrete live DAG uses RuntimeError for broken
+                # invariants/seal failures; let TaskGroup cancel its sibling
+                # workers.  Test/injected providers retain the historical
+                # date-isolation contract for their typed RuntimeError.
+                if isinstance(self._live, LivePackageAgentSystem):
+                    raise
+                return FlexiblePairExecution(
+                    date_pair=pair,
+                    query_tasks=tasks,
+                    source_start_delays_ms=delays,
+                    state=FlexiblePairState.FAILED,
+                    failure_class=type(exc).__name__,
+                    failure_message=str(exc),
+                )
+            return FlexiblePairExecution(
+                date_pair=pair,
+                query_tasks=tasks,
+                source_start_delays_ms=delays,
+                state=FlexiblePairState.COMPLETED,
+                run=live_run,
+            )
 
         execution_by_pair: dict[str, FlexiblePairExecution] = {}
         execution_order: list[str] = []
         exact_observations: list[ExactDatePairObservation] = []
         refinement_trace: list[AdaptiveRefinementDecision] = []
-        while len(execution_by_pair) < effective_exact_pair_budget:
-            refinement = self._date_refiner.next_pair(
-                exploration.candidates,
-                tuple(exact_observations),
-                exact_pair_budget=effective_exact_pair_budget,
+        planned_ids = set(query_plan.selected_pair_ids)
+        planned_pairs = (
+            *(pairs[pair_id] for pair_id in query_plan.selected_pair_ids),
+            *(item for item in exploration.candidates if item.id not in planned_ids),
+        )
+        if effective_window.return_date_targets and effective_window.latest_arrival_date:
+            safe_return = max(effective_window.return_date_targets)
+            if safe_return == effective_window.latest_arrival_date:
+                safe_return -= timedelta(days=1)
+            safe_pair = next(
+                (
+                    item
+                    for item in exploration.candidates
+                    if item.return_date == safe_return
+                    and item.night_count == max(
+                        effective_window.min_nights,
+                        effective_window.max_nights - 1,
+                    )
+                ),
+                None,
             )
-            refinement_trace.append(refinement)
-            if refinement.selected_pair_id is None:
-                break
-            pair = pairs[refinement.selected_pair_id]
-            execution = await execute_pair(pair)
+            if safe_pair is not None:
+                planned_pairs = (
+                    safe_pair,
+                    *(item for item in planned_pairs if item.id != safe_pair.id),
+                )
+        # RankedTopKDateRefiner deliberately follows the audited ``rank`` field,
+        # not tuple order.  Re-rank this server-owned execution frontier after
+        # the boundary guard so the safe pair cannot be silently displaced by
+        # an older coarse rank.  The final plan is rebuilt from actual execution
+        # order below, so these transient ranks never become evidence of a
+        # result that was not run.
+        planned_pairs = tuple(
+            item.model_copy(update={"rank": index})
+            for index, item in enumerate(planned_pairs, start=1)
+        )
+
+        async def record_execution(
+            pair: AuditableDatePair,
+            execution: FlexiblePairExecution,
+        ) -> None:
             execution_by_pair[pair.id] = execution
             execution_order.append(pair.id)
             if pair_checkpoint_reporter is not None:
@@ -971,13 +1450,30 @@ class FlexibleLiveAgentSystem:
                     recommendable=(
                         live_run is not None
                         and package is not None
+                        and package.budget.is_all_in_total
                         and live_run.decision.state == PackageDecisionState.ACCEPT
-                        and (mode != LiveCoverageMode.STRICT or live_run.all_platforms_complete)
+                        and (
+                            mode != LiveCoverageMode.STRICT
+                            or live_run.all_platforms_complete
+                            or (
+                                live_run.exact_quote_comparison_coverage is not None
+                                and (
+                                    live_run.exact_quote_comparison_coverage
+                                    .single_source_publishable
+                                )
+                            )
+                        )
                         and (
                             mode != LiveCoverageMode.STRICT
                             or (
                                 live_run.exact_quote_comparison_coverage is not None
-                                and live_run.exact_quote_comparison_coverage.complete
+                                and (
+                                    live_run.exact_quote_comparison_coverage.complete
+                                    or (
+                                        live_run.exact_quote_comparison_coverage
+                                        .single_source_publishable
+                                    )
+                                )
                             )
                         )
                         and (
@@ -987,15 +1483,63 @@ class FlexibleLiveAgentSystem:
                     ),
                 )
             )
-        executions = tuple(execution_by_pair[pair_id] for pair_id in execution_order)
+
+        if effective_exact_pair_budget > 1 and isinstance(
+            self._date_refiner, RankedTopKDateRefiner
+        ):
+            batch = planned_pairs[:effective_exact_pair_budget]
+            pair_queue: asyncio.Queue[tuple[int, AuditableDatePair] | None] = asyncio.Queue()
+            for schedule_index, pair in enumerate(batch):
+                pair_queue.put_nowait((schedule_index, pair))
+            for _ in range(pair_worker_count):
+                pair_queue.put_nowait(None)
+
+            async def worker(worker_index: int) -> None:
+                while True:
+                    item = await pair_queue.get()
+                    try:
+                        if item is None:
+                            return
+                        _, pair = item
+                        execution = await execute_pair(
+                            pair,
+                            worker_index=worker_index if worker_pool_enabled else None,
+                        )
+                        await record_execution(pair, execution)
+                    finally:
+                        pair_queue.task_done()
+
+            async with asyncio.TaskGroup() as task_group:
+                for worker_index in range(pair_worker_count):
+                    task_group.create_task(worker(worker_index))
+        while len(execution_by_pair) < effective_exact_pair_budget:
+            refinement = self._date_refiner.next_pair(
+                planned_pairs,
+                tuple(exact_observations),
+                exact_pair_budget=effective_exact_pair_budget,
+            )
+            refinement_trace.append(refinement)
+            if refinement.selected_pair_id is None:
+                break
+            pair = pairs[refinement.selected_pair_id]
+            execution = await execute_pair(
+                pair,
+                worker_index=0 if worker_pool_enabled else None,
+            )
+            await record_execution(pair, execution)
+        executions = tuple(
+            execution_by_pair[pair.id]
+            for pair in planned_pairs
+            if pair.id in execution_by_pair
+        )
         if not executions:
             raise RuntimeError("bounded exact-date acquisition produced no pair execution")
         # Rebuild the auditable final plan from the dates actually executed.
         # Its hash, task counts and omitted IDs therefore describe reality even
         # when an injected acquisition policy left the initial Query-Agent shortlist.
-        executed_set = set(execution_order)
+        executed_set = set(execution_by_pair)
         final_order = (
-            *(pairs[pair_id] for pair_id in execution_order),
+            *(item for item in planned_pairs if item.id in executed_set),
             *(item for item in exploration.candidates if item.id not in executed_set),
         )
         final_exploration = exploration.model_copy(
@@ -1009,7 +1553,13 @@ class FlexibleLiveAgentSystem:
         query_plan = self._query_planner.build(
             effective_window,
             final_exploration,
-            self._exact_query_policy(policy, len(executions)),
+            self._execution_query_policy(
+                effective_window,
+                final_exploration,
+                policy,
+                len(executions),
+                stay_plan_candidate_set=stay_plan_candidate_set,
+            ),
             stay_plan_candidate_set=stay_plan_candidate_set,
         )
         ranked = self._rank(
@@ -1219,7 +1769,10 @@ class FlexibleLiveAgentSystem:
                 )
                 if typed_failures:
                     publication_refresh_shortfall += "；" + "；".join(typed_failures)
-        recommended = tuple(option.option_id for option in ranked if option.recommendable)
+        # The diagnostics retain every ranked option, but the production result
+        # carries exactly one final recommendation.  Publication refresh may
+        # still re-check an explicitly requested second option for diagnostics.
+        recommended = tuple(option.option_id for option in ranked if option.recommendable)[:1]
         publication_refreshed = tuple(
             option.option_id
             for option in ranked
@@ -1238,7 +1791,7 @@ class FlexibleLiveAgentSystem:
         )
         sampled = (
             exploration.sampled_not_exhaustive
-            or len(query_plan.selected_pair_ids) < window.universe_size
+            or len(query_plan.selected_pair_ids) < effective_window.universe_size
             or bool(query_plan.omitted_pair_ids)
         )
         claim_boundary = self._claim_boundary(
@@ -1318,6 +1871,31 @@ class FlexibleLiveAgentSystem:
                     or "所有抽样日期对均失败、被验证拒绝或未满足严格三平台覆盖"
                 ),
             )
+        optimality_status = DateOptimalityStatus.BEST_VERIFIED_IN_EVALUATED_SET
+        # No strong admissible-bound certificate is produced by this bounded
+        # runner today; without one, the public status must remain non-proven.
+        admissible_bounds: tuple[AdmissibleCostBound, ...] = ()
+        if len(executions) == effective_window.universe_size and all(
+            execution.state == FlexiblePairState.COMPLETED
+            and execution.run is not None
+            and execution.run.all_platforms_complete
+            and execution.run.package is not None
+            and execution.run.package.budget.is_all_in_total
+            and execution.run.package.final_candidate.currency == "CNY"
+            and execution.run.package.final_candidate.flight.party_total_known
+            and execution.run.decision.state != PackageDecisionState.HUMAN_BLOCK
+            and execution.run.exact_quote_comparison_coverage is not None
+            and execution.run.exact_quote_comparison_coverage.complete
+            and admissible_bounds
+            and all(bound.proven for bound in admissible_bounds)
+            for execution in executions
+        ):
+            optimality_status = DateOptimalityStatus.OPTIMALITY_PROVEN
+        claim_boundary += (
+            "；日期最优性状态="
+            f"{optimality_status.value}。没有同时证明本次旅客总价和其余必要成本均为非负"
+            "的 admissible bound 时，不进行日期分支剪枝。"
+        )
         return FlexibleLiveAgentRun(
             requested_window=window,
             effective_window=effective_window,
@@ -1343,6 +1921,8 @@ class FlexibleLiveAgentSystem:
             publication_refresh_minimum_options=(publication_refresh_minimum_options),
             publication_refreshed_option_ids=publication_refreshed,
             sampled_not_exhaustive=sampled,
+            optimality_status=optimality_status,
+            admissible_bounds=admissible_bounds,
             claim_boundary=claim_boundary,
         )
 
@@ -1592,6 +2172,99 @@ class FlexibleLiveAgentSystem:
         configured_cap = policy.max_exact_pairs or exact_pair_budget
         return policy.model_copy(update={"max_exact_pairs": min(configured_cap, exact_pair_budget)})
 
+    def _execution_query_policy(
+        self,
+        window: FlexibleTravelWindow,
+        exploration: DateExplorationResult,
+        policy: QueryPlanPolicy | None,
+        exact_pair_budget: int,
+        *,
+        stay_plan_candidate_set: StayPlanCandidateSet | None,
+    ) -> QueryPlanPolicy:
+        effective = self._exact_query_policy(policy, exact_pair_budget)
+        if (
+            exact_pair_budget <= DIRECT_DATE_PAIR_LIMIT
+            or effective.max_exact_pairs != exact_pair_budget
+        ):
+            return effective
+        if not exploration.candidates:  # pragma: no cover - explorer invariant
+            raise ValueError("full-date execution requires at least one explored pair")
+        probe_policy = effective.model_copy(
+            update={
+                "max_total_tasks": 10_000,
+                "max_exact_pairs": 1,
+                "platform_rates": tuple(
+                    item.model_copy(update={"max_tasks": 10_000})
+                    for item in effective.platform_rates
+                ),
+            }
+        )
+        probe = self._query_planner.build(
+            window,
+            exploration.model_copy(update={"candidates": exploration.candidates[:1]}),
+            probe_policy,
+            stay_plan_candidate_set=stay_plan_candidate_set,
+        )
+        tasks_per_platform = {
+            platform: sum(task.platform == platform for task in probe.tasks)
+            for platform in (item.platform for item in effective.platform_rates)
+        }
+        return effective.model_copy(
+            update={
+                "max_total_tasks": max(
+                    effective.max_total_tasks,
+                    len(probe.tasks) * exact_pair_budget,
+                ),
+                "platform_rates": tuple(
+                    item.model_copy(
+                        update={
+                            "max_tasks": max(
+                                item.max_tasks,
+                                tasks_per_platform[item.platform] * exact_pair_budget,
+                            )
+                        }
+                    )
+                    for item in effective.platform_rates
+                ),
+            }
+        )
+
+    async def _run_live_pair(
+        self,
+        pair_intent: PackageIntent,
+        pair_query: BrowserSearchQuery,
+        *,
+        mode: LiveCoverageMode,
+        timeout_seconds: int,
+        source_start_delays_ms: dict[str, int],
+        memory_access: MemoryAccessContext | None,
+        publication_refresh_minimum_options: int,
+        model_agents_enabled: bool = True,
+        exploration_only: bool = False,
+    ) -> LivePackageAgentRun:
+        if isinstance(self._live, LivePackageAgentSystem):
+            return await self._live.run(
+                pair_intent,
+                pair_query,
+                mode=mode,
+                purpose=(
+                    LiveRunPurpose.EXPLORATION_SELECTION
+                    if exploration_only or publication_refresh_minimum_options > 0
+                    else LiveRunPurpose.FINAL_PUBLICATION
+                ),
+                model_agents_enabled=model_agents_enabled,
+                timeout_seconds=timeout_seconds,
+                source_start_delays_ms=source_start_delays_ms,
+                memory_access=memory_access,
+            )
+        return await self._live.run(
+            pair_intent,
+            pair_query,
+            mode=mode,
+            timeout_seconds=timeout_seconds,
+            source_start_delays_ms=source_start_delays_ms,
+        )
+
     def _adaptive_scale_directive(
         self,
         exploration: DateExplorationResult,
@@ -1628,6 +2301,13 @@ class FlexibleLiveAgentSystem:
                 status=ProviderHealthStatus.UNKNOWN,
             ),
         )
+        # ``AdaptiveControlInput`` counts bounded model-pipeline slots, not the
+        # complete browser date universe.  The exact pair budget remains the
+        # server-owned execution budget below; feeding a 66-pair universe into
+        # the per-stage slot field would fail validation before any date pair
+        # can run and would incorrectly turn a full search into a pre-browser
+        # rejection.
+        adaptive_pair_slots = min(exact_pair_budget, DIRECT_DATE_PAIR_LIMIT)
         return derive_scale_directive(
             AdaptiveControlInput(
                 D=len(exploration.candidates),
@@ -1636,11 +2316,11 @@ class FlexibleLiveAgentSystem:
                 R=False,
                 E=False,
                 exploration_pair_count=(
-                    exact_pair_budget if publication_refresh_minimum_options else 0
+                    adaptive_pair_slots if publication_refresh_minimum_options else 0
                 ),
                 publication_pair_count=publication_refresh_minimum_options,
                 direct_final_pair_count=(
-                    exact_pair_budget if publication_refresh_minimum_options == 0 else 0
+                    adaptive_pair_slots if publication_refresh_minimum_options == 0 else 0
                 ),
                 provider_health=provider_health,
                 strict_mode=mode == LiveCoverageMode.STRICT,
@@ -1698,6 +2378,27 @@ class FlexibleLiveAgentSystem:
             "\n".join(item.id for item in exploration.candidates).encode("utf-8")
         ).hexdigest()
         tools = ToolRegistry()
+
+        # A formal evidence run may deliberately admit one real model role so
+        # the recorded candidate change is attributable to an actual model
+        # call, while keeping all other advisory stages bounded.  The setting
+        # is process-local and absent in ordinary product runs.
+        formal_model_role = os.environ.get("TRIPCHORD_FORMAL_MODEL_ROLE", "").strip()
+        if formal_model_role and formal_model_role != AgentRole.QUERY_STRATEGIST.value:
+            result = StructuredLiveModelAgent(
+                AgentRole.QUERY_STRATEGIST,
+                self._model_router,
+                system_prompt="formal bounded run: query selection is server-deterministic",
+                output_model=QueryStrategyProposal,
+                required=self._model_agents_required,
+            ).unavailable_result(task, "formal_model_role_limited")
+            return (
+                None,
+                AgenticRunSummary.from_results(
+                    (result,), enabled=self._model_router is not None, required=False
+                ),
+                exploration,
+            )
 
         async def inspect_date_search_space(_: ToolCall) -> dict[str, JsonValue]:
             return cast(
@@ -1815,7 +2516,14 @@ class FlexibleLiveAgentSystem:
                 "你是自由行日期查询策略 Agent。必须先调用工具观察候选池，再在给定"
                 "ID 中做探索/利用权衡：兼顾低价先验、平台覆盖不确定性、日期与停留"
                 "时长多样性。必须选择恰好 exact_pair_budget 个唯一 ID，不能声称全月"
-                "最低价，不能生成新日期、缩小或扩大硬查询预算。"
+                "最低价，不能生成新日期、缩小或扩大硬查询预算。工具返回后必须输出"
+                "完整 JSON 对象，五个必需字段一个都不能省略：summary、selected_pair_ids、"
+                "selection_reasons、stop_condition、query_budget_pairs；其中 stop_condition"
+                "必须是非空字符串，query_budget_pairs 必须是整数且等于 exact_pair_budget。"
+                "即使没有额外理由，也要输出 selection_reasons 数组（可为空）。输出形状示例："
+                "{\"summary\":\"...\",\"selected_pair_ids\":[\"id\"],"
+                "\"selection_reasons\":[],\"stop_condition\":\"达到固定精查预算\","
+                "\"query_budget_pairs\":1,\"uncertainty_flags\":[]}。"
             ),
             output_model=QueryStrategyProposal,
             required=self._model_agents_required,
@@ -1889,7 +2597,49 @@ class FlexibleLiveAgentSystem:
                 raise ValueError("查询策略 Agent 返回了重复或未知的日期对 ID")
             return None, agentic, exploration
         effective_query_budget = exact_pair_budget
-        selected = proposed
+        # Explicit return-date targets are user constraints, not model-ranking
+        # hints.  OTA return_date is the departure date, while the user's
+        # boundary is actual arrival home.  For the MLE→HGH overnight route,
+        # reserve one day for that arrival so a bounded run cannot publish a
+        # flight departing on 2026-09-10 and arriving after the deadline.
+        safe_return_target = (
+            max(window.return_date_targets) if window.return_date_targets else None
+        )
+        target_nights = window.max_nights
+        if (
+            safe_return_target is not None
+            and window.latest_arrival_date is not None
+            and safe_return_target == window.latest_arrival_date
+        ):
+            safe_return_target -= timedelta(days=1)
+            target_nights = max(window.min_nights, window.max_nights - 1)
+        required_target = next(
+            (
+                item
+                for item in exploration.candidates
+                if safe_return_target is not None
+                and item.return_date == safe_return_target
+                and item.night_count == target_nights
+            ),
+            None,
+        )
+        selected = tuple(
+            dict.fromkeys(
+                (
+                    *((required_target.id,) if required_target is not None else ()),
+                    *proposed,
+                )
+            )
+        )[:effective_query_budget]
+        if len(selected) < effective_query_budget:
+            selected = tuple(
+                dict.fromkeys(
+                    (
+                        *selected,
+                        *(item.id for item in exploration.candidates),
+                    )
+                )
+            )[:effective_query_budget]
         if not selected:
             if self._model_agents_required:
                 raise ValueError("查询策略 Agent 未返回可执行日期对")
@@ -2240,7 +2990,6 @@ class FlexibleLiveAgentSystem:
                 "each flexible date pair must match an audited provider capability profile"
             )
         delays: dict[str, int] = {}
-        v4_provider_bases: dict[TravelPlatform, int] = {}
         if len(tasks) in {13, 18}:
             platforms = tuple(dict.fromkeys(task.platform for task in tasks))
             if not platforms:
@@ -2254,19 +3003,40 @@ class FlexibleLiveAgentSystem:
                 )
                 if len(platform_offsets) != expected_count:
                     raise ValueError("live-v4 task count does not match provider capabilities")
-                v4_provider_bases[platform] = min(platform_offsets)
         for task in tasks:
             source_id = f"source-{task.platform.value}-{_KIND_SUFFIX[task.kind]}"
             if source_id in delays:
                 raise ValueError(f"duplicate source schedule: {source_id}")
-            if v4_provider_bases:
-                delays[source_id] = max(
-                    0,
-                    task.scheduled_offset_ms - v4_provider_bases[task.platform],
-                )
-            else:
-                delays[source_id] = max(0, task.scheduled_offset_ms - elapsed_ms)
+            delays[source_id] = max(0, task.scheduled_offset_ms - elapsed_ms)
+        if any(delay > _MAX_SOURCE_START_DELAY_MS for delay in delays.values()):
+            raise SourceScheduleBudgetExceeded(delays)
         return delays
+
+    @staticmethod
+    def _preflight_full_window_deadline(
+        query_plan: FlexibleQueryPlan,
+        *,
+        pair_count: int,
+        timeout_seconds: int,
+        total_timeout_seconds: int,
+    ) -> None:
+        last_source_offset_ms = max(
+            (task.scheduled_offset_ms for task in query_plan.tasks),
+            default=0,
+        )
+        conservative_execution_budget_ms = (
+            max(timeout_seconds, 120) + _FULL_WINDOW_FINALIZATION_BUFFER_SECONDS
+        ) * 1000
+        if (
+            last_source_offset_ms + conservative_execution_budget_ms
+            > total_timeout_seconds * 1000
+        ):
+            raise FullWindowDeadlineInfeasible(
+                pair_count=pair_count,
+                last_source_offset_ms=last_source_offset_ms,
+                conservative_execution_budget_ms=conservative_execution_budget_ms,
+                total_timeout_seconds=total_timeout_seconds,
+            )
 
     def _intent(
         self,
@@ -2288,7 +3058,10 @@ class FlexibleLiveAgentSystem:
             ),
             start_date=pair.departure_date,
             end_date=pair.return_date,
+            latest_arrival_date=window.latest_arrival_date,
             adults=window.adults,
+            children=window.children,
+            infants=window.infants,
             rooms=window.rooms,
             currency=window.currency,
             budget_cents=constraints.budget_cents,
@@ -2329,6 +3102,14 @@ class FlexibleLiveAgentSystem:
             start_date=pair.departure_date,
             end_date=pair.return_date,
             adults=window.adults,
+            children=window.children,
+            infants=window.infants,
+            party_shape_supported=(window.children == 0 and window.infants == 0),
+            party_shape_failure=(
+                "unsupported_party_shape: provider adapter lacks child/infant fare contract"
+                if window.children or window.infants
+                else None
+            ),
             rooms=window.rooms,
             currency=window.currency,
             origin_code=window.origin_code,
@@ -2358,6 +3139,7 @@ class FlexibleLiveAgentSystem:
         if require_exploration_seal and require_publication_refresh:
             raise ValueError("ranking cannot require exploration and publication simultaneously")
         provisional: list[FlexibleRankedOption] = []
+        complete_cny_ids: set[str] = set()
         for execution in executions:
             live_run = execution.run
             if live_run is None:
@@ -2369,6 +3151,7 @@ class FlexibleLiveAgentSystem:
                         return_date=execution.date_pair.return_date,
                         decision_state=PackageDecisionState.HUMAN_BLOCK,
                         recommendable=False,
+                        complete_cny_party_total=False,
                         evidence_completeness=Decimal(0),
                         all_platforms_complete=False,
                         option_id=execution.date_pair.id,
@@ -2414,15 +3197,31 @@ class FlexibleLiveAgentSystem:
                 if stay_plan_id is not None
                 else execution.date_pair.id
             )
+            complete_cny_party_total = bool(
+                package is not None
+                and package.budget.is_all_in_total
+                and package.final_candidate.currency == "CNY"
+                and package.final_candidate.flight.party_total_known
+            )
             recommendable = (
                 live_run.decision.state == PackageDecisionState.ACCEPT
-                and package is not None
-                and (mode != LiveCoverageMode.STRICT or live_run.all_platforms_complete)
+                and complete_cny_party_total
+                and (
+                    mode != LiveCoverageMode.STRICT
+                    or live_run.all_platforms_complete
+                    or (
+                        live_run.exact_quote_comparison_coverage is not None
+                        and live_run.exact_quote_comparison_coverage.single_source_publishable
+                    )
+                )
                 and (
                     mode != LiveCoverageMode.STRICT
                     or (
                         live_run.exact_quote_comparison_coverage is not None
-                        and live_run.exact_quote_comparison_coverage.complete
+                        and (
+                            live_run.exact_quote_comparison_coverage.complete
+                            or live_run.exact_quote_comparison_coverage.single_source_publishable
+                        )
                     )
                 )
                 and (not require_exploration_seal or self._is_sealed_exploration(live_run))
@@ -2440,6 +3239,8 @@ class FlexibleLiveAgentSystem:
                     )
                 )
             )
+            if recommendable and complete_cny_party_total:
+                complete_cny_ids.add(option_id)
             objective_values, diversity_tags = self._objective_values(
                 execution,
                 live_run,
@@ -2454,6 +3255,7 @@ class FlexibleLiveAgentSystem:
                     return_date=execution.date_pair.return_date,
                     decision_state=live_run.decision.state,
                     recommendable=recommendable,
+                    complete_cny_party_total=complete_cny_party_total,
                     total_budget_cents=total,
                     evidence_completeness=completeness,
                     all_platforms_complete=live_run.all_platforms_complete,
@@ -2481,7 +3283,7 @@ class FlexibleLiveAgentSystem:
             constraints.objective_specs(),
         )
         by_id = {item.option_id: item for item in provisional}
-        return tuple(
+        selected_options = tuple(
             by_id[selected.candidate_id].model_copy(
                 update={
                     "rank": selected.rank,
@@ -2491,6 +3293,29 @@ class FlexibleLiveAgentSystem:
                 }
             )
             for selected in selections
+        )
+        # A publishable, complete CNY party total is the only cross-date
+        # comparable primary objective.  Pareto/comfort preferences may retain
+        # their diagnostics and break exact-price ties, but must never let a
+        # more expensive complete option outrank a cheaper one or let an
+        # incomplete/non-CNY observation lead the recommendation frontier.
+        ordered = tuple(
+            sorted(
+                selected_options,
+                key=lambda item: (
+                    0 if item.option_id in complete_cny_ids else 1,
+                    item.total_budget_cents
+                    if item.option_id in complete_cny_ids
+                    and item.total_budget_cents is not None
+                    else 10**18,
+                    item.rank,
+                    item.option_id,
+                ),
+            )
+        )
+        return tuple(
+            item.model_copy(update={"rank": rank})
+            for rank, item in enumerate(ordered, start=1)
         )
 
     def _objective_values(

@@ -51,7 +51,11 @@ def _record(
         trip_id=trip_id,
         topic=topic,
         subject=record_id,
-        payload={"value": record_id},
+        payload=(
+            {"key": "hotel_breakfast", "value": True}
+            if kind == MemoryKind.USER_PREFERENCE
+            else {"value": record_id}
+        ),
         source="fixture",
         captured_at=now,
         expires_at=expires_at,

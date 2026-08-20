@@ -112,6 +112,7 @@ def browser_quote(
     }
     details = _browser_context(kind, provider, search_query or query())
     if kind == BrowserVertical.FLIGHT:
+        flight_query = search_query or query()
         details.update(
             {
                 "origin": "HGH",
@@ -193,6 +194,32 @@ def browser_quote(
                 },
             }
         )
+        if provider == BrowserProvider.QUNAR:
+            details["party_price_comparison"] = {
+                "schema": "tripchord.flight_party_comparison.v1",
+                "verification": "server_owned_same_product",
+                "provider": "qunar",
+                "currency": "CNY",
+                "start_date": flight_query.start_date.isoformat(),
+                "end_date": flight_query.end_date.isoformat(),
+                "origin_code": flight_query.origin_code,
+                "destination_code": flight_query.destination_code,
+                "same_product_id": "fixture-product",
+                "query_hash": "q" * 64,
+                "one_adult": {
+                    "adults": 1,
+                    "amount": 400000,
+                    "same_product_id": "fixture-product",
+                    "query_hash": "q" * 64,
+                },
+                "two_adults": {
+                    "adults": 2,
+                    "amount": 624400,
+                    "same_product_id": "fixture-product",
+                    "query_hash": "q" * 64,
+                },
+                "two_adult_amount": 624400,
+            }
     else:
         details.update(
             {
@@ -556,6 +583,36 @@ def test_tongcheng_visible_form_flight_requires_exact_readback_and_normalizes() 
     assert wrong_readback.issues[0].code == QuoteNormalizationCode.QUERY_CONTEXT_MISMATCH
 
 
+def test_tongcheng_total_label_without_party_comparison_is_display_only() -> None:
+    exact_query = _trusted_flight_query(BrowserProvider.TONGCHENG)
+    source = browser_quote(
+        BrowserVertical.FLIGHT,
+        provider=BrowserProvider.TONGCHENG,
+        amount="4103",
+        basis=QuotePriceBasis.TOTAL_PARTY,
+        search_query=exact_query,
+        details_update={
+            "driver": _trusted_flight_driver(BrowserProvider.TONGCHENG, exact_query),
+        },
+    )
+    total_labelled = _reseal_model_copy(
+        source,
+        details_update={
+            "price_text": "¥4103含税总价",
+            "price_basis_evidence": "¥4103含税总价",
+            "price_basis_source": "visible_total_label_unverified_party_v1",
+        },
+    )
+
+    normalized = BrowserQuoteNormalizer().normalize(total_labelled, exact_query)
+
+    assert normalized.status == QuoteNormalizationStatus.USABLE
+    assert normalized.quote is not None
+    assert normalized.quote.party_total_known is False
+    assert normalized.quote.total_for_party_cents is None
+    assert normalized.quote.price_basis == "comparison_only"
+
+
 def test_qunar_exact_party_result_card_is_usable_without_booking_control() -> None:
     exact_query = query().model_copy(
         update={"search_url": qunar_trusted_flight_search_url(query())}
@@ -591,14 +648,23 @@ def test_qunar_exact_party_result_card_is_usable_without_booking_control() -> No
         search_query=exact_query,
         details_update={
             "driver": _trusted_flight_driver(BrowserProvider.QUNAR, exact_query),
-            "availability_evidence": "visible_result_card；inventory_not_locked",
+            "party_price_comparison": None,
+            "availability_evidence": (
+                "exact_trusted_url_party_context: HGH→MLE, "
+                "2026-08-23→2026-08-30, 2名成人；"
+                "visible_result_card；inventory_not_locked"
+            ),
             "price_text": "2名成人 含税总价 ¥6244",
             "price_basis_evidence": "2名成人 含税总价 ¥6244",
         },
     )
-    rejected = BrowserQuoteNormalizer().normalize(weak, exact_query)
-    assert rejected.status == QuoteNormalizationStatus.REJECTED
-    assert rejected.issues[0].field == "availability_evidence"
+    observed = BrowserQuoteNormalizer().normalize(weak, exact_query)
+    assert observed.status == QuoteNormalizationStatus.USABLE
+    assert observed.quote is not None
+    assert observed.quote.party_total_known is False
+    assert observed.quote.price_basis == "comparison_only"
+    assert observed.quote.total_for_party_cents is None
+    assert observed.quote.display_amount_cents == 624_400
 
 
 def test_normalizer_rejects_outbound_preview_even_if_model_validation_was_bypassed() -> None:
@@ -764,7 +830,9 @@ def test_trusted_flight_urls_preserve_provider_specific_party_evidence() -> None
     assert qunar.status == QuoteNormalizationStatus.USABLE
     assert isinstance(qunar.quote, NormalizedFlightQuote)
     assert qunar.quote.party_availability_confirmed
-    assert qunar.quote.total_for_party_cents == 938_400
+    # The verified same-product comparison is authoritative for Qunar's
+    # requested-party total; it is not synthesized from the visible fare.
+    assert qunar.quote.total_for_party_cents == 624_400
 
 
 def test_trusted_flight_urls_reject_host_path_route_date_count_and_extra_query_tampering() -> None:
@@ -1052,6 +1120,7 @@ def test_query_snapshot_omits_only_audited_planner_metadata() -> None:
                 "expected_package_area": "destination_island",
                 "segment": "full",
                 "__tripchord_allow_recent_quote_reuse": True,
+                "__tripchord_reuse_exact_result_tab": True,
                 "gateway_destination": "MLE",
                 "stay_area_search_profile": profile.model_dump(mode="json"),
                 "stay_plan_candidate_set": {

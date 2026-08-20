@@ -39,3 +39,30 @@ coverage/
 /benchmarks/results/ui-e2e-*
 # Deterministic scenario contracts and compact LoRA summaries remain public;
 # only their raw provider executions and screenshots stay local.
+
+# Real browser/provider captures are local-only. They may contain session
+# headers, personal trip parameters, third-party page payloads, or screenshots.
+/evidence/live-runs/
+/docs/case-studies/
+
+# One-off local capture/replay utilities are coupled to the private live-run
+# bundle above. Product and reusable benchmark code stays tracked elsewhere.
+/scripts/build_change_recovery_candidate_v1.py
+/scripts/build_formal_run_manifest.mjs
+/scripts/capture_hulhumale_split_v1.py
+/scripts/capture_maafushi_candidate_v1.py
+/scripts/create_change_recovery_manifest_v1.py
+/scripts/create_change_recovery_manifest_v2.py
+/scripts/create_hulhumale_split_v2.py
+/scripts/create_hulhumale_split_v3.py
+/scripts/create_maafushi_candidate_v3_manifest.py
+/scripts/replay_case_bundle.py
+/scripts/run_change_recovery_event_v1.py
+/scripts/run_formal_current_trip.mjs
+/scripts/run_formal_current_trip_v16.py
+/scripts/run_formal_event_replan.mjs
+/scripts/run_hulhumale_price_comparison.mjs
+/scripts/run_party_price_comparison.mjs
+/scripts/run_recovery_baseline_probe.py
+/scripts/tests/test_case_replay_page.py
+/scripts/tests/test_replay_case_bundle.py

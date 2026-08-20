@@ -474,6 +474,7 @@ export type LivePlanResponse = {
   run_id: string;
   expires_at: string;
   run: LivePackageAgentRun;
+  final_plan?: FinalPlanProjection | null;
 };
 
 export type LiveMonitorState = "active" | "stopped" | "completed" | "failed";
@@ -656,6 +657,7 @@ export type FlexibleRankedOption = {
   return_date: string;
   decision_state: LiveDecisionState;
   recommendable: boolean;
+  complete_cny_party_total: boolean;
   total_budget_cents: number | null;
   evidence_completeness: number | string;
   all_platforms_complete: boolean;
@@ -693,9 +695,59 @@ export type LiveFlexiblePairRunHandle = {
   expires_at: string;
 };
 
+export type FinalPlanProjection = {
+  option_id: string;
+  date_pair_id: string;
+  departure_date: string;
+  return_date: string;
+  total_budget_cents: number | null;
+  optimality_status: string;
+  claim_boundary: string;
+  flight_component_id: string | null;
+  lodging_component_ids: string[];
+  transfer_component_ids: string[];
+  flight: {
+    provider: string;
+    origin: string;
+    destination: string;
+    outbound_flight_numbers: string[];
+    outbound_depart_at: string;
+    outbound_arrive_at: string;
+    return_flight_numbers: string[];
+    return_depart_at: string;
+    return_arrive_at: string;
+  } | null;
+  lodgings: Array<{
+    provider: string;
+    property_name: string;
+    area: string;
+    check_in: string;
+    check_out: string;
+    rooms: number;
+    room_name: string | null;
+    breakfast_included: boolean | null;
+    cancellation_policy: string | null;
+  }>;
+  transfers: Array<{
+    provider: string;
+    origin_area: string;
+    destination_area: string;
+    service_date: string;
+    schedule_mode: string;
+    depart_at: string | null;
+    arrive_at: string | null;
+  }>;
+  party: Record<string, number>;
+  covered_source_ids: string[];
+  failed_source_ids: string[];
+  price_comparability: string;
+  unresolved_items: string[];
+};
+
 export type LiveFlexibleFromTextResponse = {
   interpretation: PackageRequirementInterpretation;
   run: FlexibleLiveAgentRun | null;
+  final_plan?: FinalPlanProjection | null;
   cached_pair_runs: LiveFlexiblePairRunHandle[];
   model_enhancement_enabled: boolean;
   execution_boundary: string;
@@ -907,6 +959,7 @@ export type LiveEventReplanResponse = {
   run_id: string;
   expires_at: string;
   run: LiveEventReplanRun;
+  final_plan?: FinalPlanProjection | null;
 };
 
 export type LiveProviderCoveragePresentation = {
@@ -1337,6 +1390,7 @@ export function resolveFlexibleOption(
   if (!response.run) return null;
   const preferredId =
     requestedDatePairId ??
+    response.final_plan?.date_pair_id ??
     response.run.recommended_option_ids[0] ??
     response.run.ranked_options[0]?.date_pair_id;
   const option = response.run.ranked_options.find(

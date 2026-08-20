@@ -969,10 +969,10 @@ def _validate_required_model_runtime(
 
 def _validate_runtime_timeout_contract(runtime: dict[str, Any]) -> None:
     observed = runtime.get("effective_flexible_timeout_seconds")
-    if observed != 3_600:
+    if observed != 600:
         raise RuntimeError(
             "live-v4 runtime preflight failed before live search: "
-            "runtime.effective_flexible_timeout_seconds must equal 3600; "
+            "runtime.effective_flexible_timeout_seconds must equal 600; "
             f"observed {observed!r}"
         )
 
@@ -1056,8 +1056,8 @@ def _validate_request_contract(request: dict[str, Any]) -> None:
         errors.append("max_pairs 必须为 3")
     if request.get("timeout_seconds") != 120:
         errors.append("timeout_seconds 必须为 120")
-    if request.get("total_timeout_seconds") != 3_600:
-        errors.append("total_timeout_seconds 必须为 3600")
+    if request.get("total_timeout_seconds") != 600:
+        errors.append("total_timeout_seconds 必须为 600")
     if done_gate_profile.get("maximum_quote_age_minutes") != _FROZEN_MAXIMUM_QUOTE_AGE_MINUTES:
         errors.append("done_gate_profile.maximum_quote_age_minutes 必须为冻结值 15")
     if (

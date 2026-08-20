@@ -80,7 +80,29 @@ class QueryStrategyProposal(DomainModel):
 
 
 class CandidateCurationProposal(DomainModel):
-    summary: str = Field(min_length=1)
+    # The explanation is advisory metadata; candidate identity and eligibility
+    # remain independently required and server-validated.  A model that omits
+    # this non-authoritative field must not turn an otherwise valid proposal
+    # into an opaque run failure.
+    summary: str = Field(
+        default="模型未提供候选说明；选择仍由服务端证据规则复核",
+        min_length=1,
+    )
+    # Some local OpenAI-compatible models emit a bounded response-type label
+    # alongside the JSON proposal.  It is transport metadata only: it is not
+    # used for candidate identity, ranking, evidence, or approval.
+    response_type: str | None = Field(default=None, max_length=120)
+    recommendation_reason: str | None = Field(default=None, max_length=400)
+    evidence_refs: tuple[Annotated[str, Field(min_length=1, max_length=240)], ...] = Field(
+        default=(), max_length=16
+    )
+    # A few local OpenAI-compatible models use ``evidence`` instead of the
+    # canonical ``evidence_refs`` label.  It is bounded transport metadata and
+    # is never trusted for candidate eligibility or factual claims.
+    evidence: tuple[Annotated[str, Field(min_length=1, max_length=240)], ...] = Field(
+        default=(), max_length=16
+    )
+    proposal_text: str | None = Field(default=None, max_length=400)
     selected_candidate_id: str | None = None
     alternative_candidate_ids: tuple[str, ...] = ()
     tradeoffs: tuple[str, ...] = ()

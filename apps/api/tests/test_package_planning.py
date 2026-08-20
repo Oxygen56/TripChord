@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import cast
 
 import pytest
 from tripchord.agents.models import PreferenceMode
 from tripchord.planning.package import (
+    FlightGroundTransferContract,
     NormalizedFlightQuote,
+    NormalizedFlightSegment,
     NormalizedLodgingQuote,
     PackageArea,
     PackageCandidateKind,
@@ -46,6 +49,98 @@ MALDIVES = timezone(timedelta(hours=5))
 CAPTURED = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
 EXPIRES = datetime(2026, 7, 30, 10, 0, tzinfo=UTC)
 VERIFY_AT = datetime(2026, 7, 30, 9, 30, tzinfo=UTC)
+_UNSET_PLACE_KEY = object()
+
+
+def test_flight_publishability_requires_party_total_and_airport_segments() -> None:
+    outbound_depart = datetime(2026, 8, 23, 8, 30, tzinfo=timezone(timedelta(hours=8)))
+    outbound_arrive = datetime(2026, 8, 23, 18, 35, tzinfo=MALDIVES)
+    return_depart = datetime(2026, 8, 30, 10, 45, tzinfo=MALDIVES)
+    return_arrive = datetime(2026, 8, 31, 15, 40, tzinfo=timezone(timedelta(hours=8)))
+    complete = flight().model_copy(
+        update={
+            "origin_airport_code": "HGH",
+            "destination_airport_code": "MLE",
+            "outbound_flight_numbers": ("MU501",),
+            "return_flight_numbers": ("MU502",),
+            "outbound_segments": (
+                NormalizedFlightSegment(
+                    flight_number="MU501",
+                    departure_airport_code="HGH",
+                    arrival_airport_code="MLE",
+                    departure_at=outbound_depart,
+                    arrival_at=outbound_arrive,
+                ),
+            ),
+            "return_segments": (
+                NormalizedFlightSegment(
+                    flight_number="MU502",
+                    departure_airport_code="MLE",
+                    arrival_airport_code="HGH",
+                    departure_at=return_depart,
+                    arrival_at=return_arrive,
+                ),
+            ),
+        },
+    )
+    assert complete.has_publishable_execution_contract is True
+    assert complete.model_copy(
+        update={"party_total_known": False, "price_basis": "comparison_only"}
+    ).has_publishable_execution_contract is False
+    assert complete.model_copy(
+        update={"outbound_segments": (), "return_segments": ()}
+    ).has_publishable_execution_contract is False
+    cross_airport = complete.model_copy(
+        update={
+            "outbound_flight_numbers": ("MU501", "MU503"),
+            "outbound_segments": (
+                    complete.outbound_segments[0].model_copy(
+                        update={
+                            "arrival_airport_code": "PEK",
+                            "arrival_at": datetime(
+                                2026,
+                                8,
+                                23,
+                                10,
+                                30,
+                                tzinfo=timezone(timedelta(hours=8)),
+                            ),
+                        }
+                    ),
+                    NormalizedFlightSegment(
+                        flight_number="MU503",
+                        departure_airport_code="PKX",
+                        arrival_airport_code="MLE",
+                        departure_at=datetime(
+                            2026,
+                            8,
+                            23,
+                            11,
+                            0,
+                            tzinfo=timezone(timedelta(hours=8)),
+                        ),
+                        arrival_at=outbound_arrive,
+                    ),
+                ),
+        }
+    )
+    assert cross_airport.has_publishable_execution_contract is False
+    assert cross_airport.model_copy(
+        update={
+            "outbound_ground_transfers": (
+                FlightGroundTransferContract(
+                    from_airport_code="PEK",
+                    to_airport_code="PKX",
+                    mode="audited ground transfer",
+                    minimum_buffer_minutes=30,
+                    actual_buffer_minutes=30,
+                    baggage_recheck_required=True,
+                    through_ticket_protected=True,
+                    evidence_refs=("evidence:ground-transfer",),
+                ),
+            )
+        }
+    ).has_publishable_execution_contract is True
 
 
 def intent(
@@ -131,8 +226,13 @@ def lodging(
     adults: int = 2,
     expires_at: datetime = EXPIRES,
     availability: QuoteAvailability = QuoteAvailability.AVAILABLE,
-    place_key: PackagePlaceKey | None = None,
+    place_key: PackagePlaceKey | object | None = _UNSET_PLACE_KEY,
 ) -> NormalizedLodgingQuote:
+    default_place_key = {
+        PackageArea.AIRPORT: PackagePlaceKey.VELANA_AIRPORT,
+        PackageArea.AIRPORT_ISLAND: PackagePlaceKey.HULHUMALE,
+        PackageArea.DESTINATION_ISLAND: PackagePlaceKey.MAAFUSHI,
+    }[area]
     return NormalizedLodgingQuote(
         id=quote_id,
         provider="ctrip",
@@ -149,7 +249,11 @@ def lodging(
         adults=adults,
         rooms=1,
         breakfast_included=breakfast,
-        place_key=place_key,
+        place_key=(
+            default_place_key
+            if place_key is _UNSET_PLACE_KEY
+            else cast(PackagePlaceKey | None, place_key)
+        ),
     )
 
 
@@ -170,6 +274,11 @@ def transfer(
     destination_place_key: PackagePlaceKey | None = None,
 ) -> TransferOption:
     duration_minutes = int((arrive_at - depart_at).total_seconds() // 60)
+    place_by_area = {
+        PackageArea.AIRPORT: PackagePlaceKey.VELANA_AIRPORT,
+        PackageArea.AIRPORT_ISLAND: PackagePlaceKey.HULHUMALE,
+        PackageArea.DESTINATION_ISLAND: PackagePlaceKey.MAAFUSHI,
+    }
     return TransferOption(
         id=quote_id,
         provider="local-transfer",
@@ -181,8 +290,8 @@ def transfer(
         evidence_refs=(f"evidence:{quote_id}",),
         origin_area=origin,
         destination_area=destination,
-        origin_place_key=origin_place_key,
-        destination_place_key=destination_place_key,
+        origin_place_key=origin_place_key or place_by_area[origin],
+        destination_place_key=destination_place_key or place_by_area[destination],
         adults=2,
         service_date=depart_at.date(),
         schedule_mode=TransferScheduleMode.EXACT_DEPARTURE,
@@ -228,6 +337,11 @@ def window_transfer(
         f"单程{duration_minutes}分钟，需提前预约，含税总价 CNY "
         f"{total_cents / 100:.2f}"
     )
+    place_by_area = {
+        PackageArea.AIRPORT: PackagePlaceKey.VELANA_AIRPORT,
+        PackageArea.AIRPORT_ISLAND: PackagePlaceKey.HULHUMALE,
+        PackageArea.DESTINATION_ISLAND: PackagePlaceKey.MAAFUSHI,
+    }
     return TransferOption(
         id=quote_id,
         provider="ctrip",
@@ -238,6 +352,8 @@ def window_transfer(
         evidence_refs=(f"evidence:{quote_id}",),
         origin_area=origin,
         destination_area=destination,
+        origin_place_key=place_by_area[origin],
+        destination_place_key=place_by_area[destination],
         adults=2,
         service_date=service_date,
         schedule_mode=TransferScheduleMode.SERVICE_WINDOW,
@@ -487,6 +603,24 @@ def test_golden_case_verifier_rejects_then_repair_and_orchestrator_accepts() -> 
     )
     assert result.evidence_refs == result.final_candidate.evidence_refs
     assert len(result.evidence_refs) == 10
+
+
+def test_verifier_rejects_return_flight_that_arrives_after_home_deadline() -> None:
+    request = intent().model_copy(update={"latest_arrival_date": date(2026, 8, 30)})
+    inventory = golden_inventory()
+    candidate = next(
+        item
+        for item in PackagePlanner().generate(request, inventory)
+        if item.kind == PackageCandidateKind.CONTINUOUS_ISLAND
+    )
+
+    violations = PackageVerifier().verify(request, candidate, now=VERIFY_AT)
+
+    assert any(
+        item.code == PackageViolationCode.DATE_MISMATCH
+        and "回杭边界" in item.message
+        for item in violations
+    )
 
 
 def test_live_candidate_generation_is_bounded_audited_and_deterministic_under_pressure() -> None:
@@ -892,6 +1026,36 @@ def test_weighted_breakfast_preference_changes_only_soft_candidate_ranking() -> 
     assert application.comparable_candidate_count == 2
     assert application.selected_breakfast_coverage == Decimal(1)
     assert application.selected_breakfast_evidence_complete
+
+
+def test_weighted_breakfast_never_promotes_incomplete_foreign_total_over_complete_cny() -> None:
+    inventory = breakfast_ranking_inventory(
+        breakfast_stay("stay:subtotal", total_cents=250_000, breakfast=True),
+        breakfast_stay("stay:complete", total_cents=300_000, breakfast=False),
+    )
+    request = intent(
+        budget_cents=2_000_000,
+        require_breakfast=None,
+        breakfast_preference_mode=PreferenceMode.WEIGHTED,
+        breakfast_preference_weight=0.9,
+    )
+    candidates = PackagePlanner().generate(request, inventory)
+    incomplete = candidates[0].model_copy(
+        update={
+            "id": "candidate:foreign-subtotal",
+            "transfers": tuple(
+                transfer.model_copy(
+                    update={"currency": "USD", "taxes_and_fees_included": None}
+                )
+                for transfer in candidates[0].transfers
+            ),
+        }
+    )
+    complete = candidates[1].model_copy(update={"id": "candidate:complete-cny"})
+
+    ranked = PackagePlanner().rank_candidates(request, (incomplete, complete))
+
+    assert ranked[0].id == "candidate:complete-cny"
 
 
 def test_unknown_breakfast_gets_no_soft_preference_reward() -> None:

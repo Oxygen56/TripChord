@@ -34,7 +34,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 import httpx
@@ -242,7 +242,7 @@ async def _serve_loopback_http(target_app: Any, host: str, port: int) -> None:
     # The worker is a subprocess; uvicorn's default SIGINT/SIGTERM handlers must
     # not touch this process group's signal disposition. Stash the server on the
     # app so the worker entry can shut it down after the operation.
-    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+    server.install_signal_handlers = lambda: None  # type: ignore[attr-defined]
     target_app.state.live_worker_http_server = server
     await server.serve()
 
@@ -459,7 +459,7 @@ def install_runtime_bundle(
         remote_source = FormalParentSourceClient(
             parent_api_origin=str(formal_parent_origin),
             source_token=token,
-            execution_capability=formal_execution_capability,
+            execution_capability=cast(dict[str, object], formal_execution_capability),
         )
     bridge, live_system = api_main._install_browser_bridge(
         target_app,
@@ -482,6 +482,8 @@ def install_runtime_bundle(
     target_app.state.live_worker_icom_http_client = icom_http_client
     target_app.state.live_worker_parent_source_client = remote_source
     if not remote_formal_source:
+        assert isinstance(host, str)
+        assert isinstance(port, int)
         target_app.state.live_worker_http_host = host
         target_app.state.live_worker_http_port = port
         target_app.state.live_worker_http_server_task = asyncio.create_task(

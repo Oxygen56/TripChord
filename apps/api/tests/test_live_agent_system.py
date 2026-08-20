@@ -188,8 +188,20 @@ def test_live_source_cache_partition_is_bound_to_authenticated_tenant_and_user()
 
     assert normal_submission.reuse_partition_sha256 == partition_a
     assert normal_submission.query.options["__tripchord_allow_recent_quote_reuse"] is True
+    assert normal_submission.query.options["__tripchord_reuse_exact_result_tab"] is True
     assert event_submission.reuse_partition_sha256 == partition_a
     assert event_submission.query.options["__tripchord_allow_recent_quote_reuse"] is False
+    assert event_submission.query.options["__tripchord_reuse_exact_result_tab"] is True
+
+    lodging_task = system._source_task(
+        BrowserProvider.CTRIP,
+        BrowserVertical.LODGING,
+        query(),
+        120,
+        segment="full",
+    )
+    lodging_submission = BrowserTaskSubmission.model_validate(lodging_task.input["submission"])
+    assert "__tripchord_reuse_exact_result_tab" not in lodging_submission.query.options
 
 
 def test_legacy_v1_lodging_explicit_empty_receipt_is_not_terminal_coverage() -> None:
@@ -389,6 +401,20 @@ def query() -> BrowserSearchQuery:
     )
 
 
+def v4_query() -> BrowserSearchQuery:
+    base = query()
+    return base.model_copy(
+        update={
+            "options": {
+                **base.options,
+                "stay_plan_candidate_set": system_stay_plan_candidate_set("MLE").model_dump(
+                    mode="json"
+                ),
+            }
+        }
+    )
+
+
 def _domain(provider: BrowserProvider) -> str:
     return {
         BrowserProvider.CTRIP: "flights.ctrip.com",
@@ -483,6 +509,16 @@ def _transfer(
         "purchase_scope_evidence": evidence,
         "origin_area": origin.value,
         "destination_area": destination.value,
+        "origin_place_key": {
+            PackageArea.AIRPORT: PackagePlaceKey.VELANA_AIRPORT,
+            PackageArea.AIRPORT_ISLAND: PackagePlaceKey.HULHUMALE,
+            PackageArea.DESTINATION_ISLAND: PackagePlaceKey.MAAFUSHI,
+        }[origin].value,
+        "destination_place_key": {
+            PackageArea.AIRPORT: PackagePlaceKey.VELANA_AIRPORT,
+            PackageArea.AIRPORT_ISLAND: PackagePlaceKey.HULHUMALE,
+            PackageArea.DESTINATION_ISLAND: PackagePlaceKey.MAAFUSHI,
+        }[destination].value,
         "direction_evidence": evidence,
         "schedule_mode": "exact_departure",
         "service_date": depart.date().isoformat(),
@@ -640,9 +676,45 @@ def _flight_quote(lease: BrowserTaskLease) -> BrowserQuote:
             "destination": lease.query.destination,
             "adults": 2,
             "outbound_departure_at": "2026-08-23T08:30:00+08:00",
-            "outbound_arrival_at": f"2026-08-23T18:35:00{MALDIVES_OFFSET}",
-            "return_departure_at": f"2026-08-30T10:45:00{MALDIVES_OFFSET}",
+            "outbound_arrival_at": f"2026-08-23T12:20:00{MALDIVES_OFFSET}",
+            "return_departure_at": f"2026-08-30T14:20:00{MALDIVES_OFFSET}",
             "return_arrival_at": "2026-08-31T09:10:00+08:00",
+            "origin_airport_code": "HGH",
+            "destination_airport_code": "MLE",
+            "outbound_flight_numbers": ["MU501", "MU502"],
+            "return_flight_numbers": ["MU503", "MU504"],
+            "outbound_segments": [
+                {
+                    "flight_number": "MU501",
+                    "departure_airport_code": "HGH",
+                    "arrival_airport_code": "PEK",
+                    "departure_at": "2026-08-23T08:30:00+08:00",
+                    "arrival_at": "2026-08-23T10:30:00+08:00",
+                },
+                {
+                    "flight_number": "MU502",
+                    "departure_airport_code": "PEK",
+                    "arrival_airport_code": "MLE",
+                    "departure_at": "2026-08-23T11:00:00+08:00",
+                    "arrival_at": f"2026-08-23T12:20:00{MALDIVES_OFFSET}",
+                },
+            ],
+            "return_segments": [
+                {
+                    "flight_number": "MU503",
+                    "departure_airport_code": "MLE",
+                    "arrival_airport_code": "PEK",
+                    "departure_at": f"2026-08-30T14:20:00{MALDIVES_OFFSET}",
+                    "arrival_at": "2026-08-31T05:30:00+08:00",
+                },
+                {
+                    "flight_number": "MU504",
+                    "departure_airport_code": "PEK",
+                    "arrival_airport_code": "HGH",
+                    "departure_at": "2026-08-31T06:30:00+08:00",
+                    "arrival_at": "2026-08-31T09:10:00+08:00",
+                },
+            ],
             "checked_baggage_per_adult_kg": 0,
             "carrier_text": "fixture carrier",
             "connection_text": "one stop",
@@ -714,6 +786,33 @@ def _flight_quote(lease: BrowserTaskLease) -> BrowserQuote:
             },
         }
     )
+    if lease.provider == BrowserProvider.QUNAR:
+        query_hash = "q" * 64
+        details["party_price_comparison"] = {
+            "schema": "tripchord.flight_party_comparison.v1",
+            "verification": "server_owned_same_product",
+            "provider": "qunar",
+            "currency": "CNY",
+            "start_date": lease.query.start_date.isoformat(),
+            "end_date": lease.query.end_date.isoformat(),
+            "origin_code": "HGH",
+            "destination_code": "MLE",
+            "same_product_id": "fixture-qunar-product",
+            "query_hash": query_hash,
+            "one_adult": {
+                "adults": 1,
+                "amount": int(amount * 100),
+                "same_product_id": "fixture-qunar-product",
+                "query_hash": query_hash,
+            },
+            "two_adults": {
+                "adults": 2,
+                "amount": int(amount * 200),
+                "same_product_id": "fixture-qunar-product",
+                "query_hash": query_hash,
+            },
+            "two_adult_amount": int(amount * 200),
+        }
     return _sealed_quote(
         lease,
         page_url=f"https://{_domain(lease.provider)}/search/{lease.provider.value}-flight",
@@ -786,7 +885,7 @@ def _lodging_quote(
             "availability": "available",
         }
     )
-    if segment == "full":
+    if segment in {"full", "hulhumale-full"}:
         details["transfers"] = cast(JsonValue, _all_transfers(lease.provider))
     return _sealed_quote(
         lease,
@@ -804,6 +903,30 @@ def _lodging_quote(
 
 
 CompletionFactory = Callable[[BrowserTaskLease], BrowserTaskCompletion]
+_STANDARD_BROWSER_SOURCE_IDS = (
+    "source-ctrip-flight",
+    "source-ctrip-lodging-full",
+    "source-ctrip-lodging-first",
+    "source-ctrip-lodging-middle",
+    "source-ctrip-lodging-last",
+    "source-qunar-flight",
+    "source-qunar-lodging-full",
+    "source-qunar-lodging-first",
+    "source-qunar-lodging-middle",
+    "source-qunar-lodging-last",
+    "source-tongcheng-flight",
+)
+_STANDARD_BROWSER_SOURCE_TASK_COUNT = len(_STANDARD_BROWSER_SOURCE_IDS)
+_V4_BROWSER_SOURCE_IDS = (
+    *_STANDARD_BROWSER_SOURCE_IDS[:5],
+    "source-ctrip-lodging-hulhumale-full",
+    *_STANDARD_BROWSER_SOURCE_IDS[5:10],
+    "source-qunar-lodging-hulhumale-full",
+    *_STANDARD_BROWSER_SOURCE_IDS[10:],
+)
+_V4_BROWSER_SOURCE_TASK_COUNT = len(_V4_BROWSER_SOURCE_IDS)
+assert _V4_BROWSER_SOURCE_TASK_COUNT == 13
+assert len(set(_V4_BROWSER_SOURCE_IDS)) == _V4_BROWSER_SOURCE_TASK_COUNT
 
 
 async def _serve(
@@ -812,9 +935,15 @@ async def _serve(
     completion: CompletionFactory,
 ) -> None:
     completed = 0
+    deadline = asyncio.get_running_loop().time() + 5
     while completed < expected:
         leases = await bridge.claim("paired-test-companion", limit=6)
         if not leases:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError(
+                    f"companion timed out waiting for source leases: "
+                    f"completed={completed}, expected={expected}"
+                )
             await asyncio.sleep(0)
             continue
         for lease in leases:
@@ -871,6 +1000,38 @@ def _success_with_stable_product_ids(lease: BrowserTaskLease) -> BrowserTaskComp
                 "provider_offer_id": f"{lease.provider.value}-economy-rate",
                 "outbound_flight_numbers": ["MU509", "UL123"],
                 "return_flight_numbers": ["UL122", "MU510"],
+                "outbound_segments": [
+                    {
+                        "flight_number": "MU509",
+                        "departure_airport_code": "HGH",
+                        "arrival_airport_code": "PEK",
+                        "departure_at": "2026-08-23T08:30:00+08:00",
+                        "arrival_at": "2026-08-23T10:30:00+08:00",
+                    },
+                    {
+                        "flight_number": "UL123",
+                        "departure_airport_code": "PEK",
+                        "arrival_airport_code": "MLE",
+                        "departure_at": "2026-08-23T11:00:00+08:00",
+                        "arrival_at": f"2026-08-23T12:20:00{MALDIVES_OFFSET}",
+                    },
+                ],
+                "return_segments": [
+                    {
+                        "flight_number": "UL122",
+                        "departure_airport_code": "MLE",
+                        "arrival_airport_code": "PEK",
+                        "departure_at": f"2026-08-30T14:20:00{MALDIVES_OFFSET}",
+                        "arrival_at": "2026-08-31T05:30:00+08:00",
+                    },
+                    {
+                        "flight_number": "MU510",
+                        "departure_airport_code": "PEK",
+                        "arrival_airport_code": "HGH",
+                        "departure_at": "2026-08-31T06:30:00+08:00",
+                        "arrival_at": "2026-08-31T09:10:00+08:00",
+                    },
+                ],
             }
         )
     else:
@@ -933,7 +1094,7 @@ def _success_without_browser_transfers(
     if lease.kind != BrowserVertical.LODGING:
         return _success(lease)
     quote = _lodging_quote(lease)
-    if _lodging_segment(lease) != "full":
+    if _lodging_segment(lease) not in {"full", "hulhumale-full"}:
         return BrowserTaskCompletion(
             state=BrowserTaskState.SUCCEEDED,
             quotes=(quote,),
@@ -1177,6 +1338,43 @@ class _FakeIComProvider:
         )
 
 
+class _PriorityIComProvider(_FakeIComProvider):
+    """Provide a deterministic connection-order regression fixture."""
+
+    async def search(
+        self,
+        query: IComTransferQuery,
+        *,
+        query_task_id: str | None = None,
+    ) -> IComTransferSearchResult:
+        result = await super().search(query, query_task_id=query_task_id)
+        if query.origin != IComLocation.AIRPORT or query.travel_date != START:
+            return result
+        template = result.options[0]
+        options = []
+        for trip_id, departure_text, remaining in (
+            (7980, "13:10", 45),
+            (7989, "15:25", 45),
+            (9113, "18:10", 44),
+            (10237, "21:30", 45),
+        ):
+            departure = datetime.fromisoformat(
+                f"{START.isoformat()}T{departure_text}:00{MALDIVES_OFFSET}"
+            )
+            options.append(
+                template.model_copy(
+                    update={
+                        "trip_id": trip_id,
+                        "schedule_id": trip_id + 10,
+                        "departure_at": departure,
+                        "arrival_at": departure + timedelta(minutes=50),
+                        "remaining_capacity": remaining,
+                    }
+                )
+            )
+        return result.model_copy(update={"options": tuple(options)})
+
+
 class _RetryOnceIComProvider:
     def __init__(self, delegate: _FakeIComProvider) -> None:
         self.delegate = delegate
@@ -1207,9 +1405,124 @@ async def _run(
     system = LivePackageAgentSystem(bridge, now=lambda: NOW)
     run, _ = await asyncio.gather(
         system.run(intent(), query(), mode=mode, timeout_seconds=15),
-        _serve(bridge, 11, completion),
+        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT, completion),
     )
     return system, bridge, run
+
+
+async def _run_v4(
+    mode: LiveCoverageMode,
+    completion: CompletionFactory = _success,
+) -> tuple[LivePackageAgentSystem, BrowserTaskBridge, LivePackageAgentRun]:
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+    v4 = v4_query()
+    run, _ = await asyncio.gather(
+        system.run(
+            intent().model_copy(update={"destination_place_key": None}),
+            v4,
+            mode=mode,
+            timeout_seconds=15,
+        ),
+        _serve(bridge, _V4_BROWSER_SOURCE_TASK_COUNT, completion),
+    )
+    return system, bridge, run
+
+
+async def _run_v4_with_icom() -> tuple[
+    LivePackageAgentSystem, BrowserTaskBridge, LivePackageAgentRun
+]:
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(
+        bridge,
+        icom_provider=_FakeIComProvider(),
+        now=lambda: NOW,
+    )
+    run, _ = await asyncio.gather(
+        system.run(
+            intent().model_copy(update={"destination_place_key": None}),
+            v4_query(),
+            mode=LiveCoverageMode.STRICT,
+            timeout_seconds=15,
+        ),
+        _serve(bridge, _V4_BROWSER_SOURCE_TASK_COUNT, _success),
+    )
+    return system, bridge, run
+
+
+def _select_segmented_stay_candidate(run: LivePackageAgentRun) -> LivePackageAgentRun:
+    """Make event tests explicit about the lodging scope they exercise.
+
+    Source completion order is intentionally concurrent, so the ordinary
+    final beam may select the continuous stay even though the bounded planner
+    handed off the split candidate. These tests target the middle segment's
+    ReVerifier/audit path; selecting that handed-off candidate keeps the
+    fixture deterministic without changing production selection logic.
+    """
+    assert run.package is not None
+    assert run.package.planning_handoff is not None
+    split = next(
+        candidate
+        for candidate in run.package.planning_handoff.planner.candidates
+        if candidate.kind == PackageCandidateKind.SPLIT_AIRPORT_ISLAND
+    )
+    stay_handoff = run.stay_plan_planning_handoff
+    assert stay_handoff is not None
+    selected_plan = StayPlanId.MAAFUSHI_SPLIT_HULHUMALE
+    selected_candidate_id = split.id
+    planner = stay_handoff.planner.model_copy(
+        update={
+            "selected_stay_plan_id": selected_plan,
+            "selected_candidate_id": selected_candidate_id,
+        }
+    )
+    initial = stay_handoff.initial_verification.model_copy(
+        update={
+            "stay_plan_id": selected_plan,
+            "candidate_id": selected_candidate_id,
+            "candidate_version": split.version,
+            "component_ids": split.component_ids,
+        }
+    )
+    repair = stay_handoff.repair.model_copy(
+        update={
+            "rejected_stay_plan_id": selected_plan,
+            "rejected_candidate_id": selected_candidate_id,
+            "repaired_stay_plan_id": None,
+            "repaired_candidate_id": None,
+        }
+    )
+    reverification = (
+        stay_handoff.reverification.model_copy(
+            update={
+                "stay_plan_id": selected_plan,
+                "candidate_id": selected_candidate_id,
+                "candidate_version": split.version,
+                "component_ids": split.component_ids,
+            }
+        )
+        if stay_handoff.reverification is not None
+        else None
+    )
+    selected_handoff = stay_handoff.model_copy(
+        update={
+            "planner": planner,
+            "initial_verification": initial,
+            "repair": repair,
+            "reverification": reverification,
+        }
+    )
+    coverage = run.exact_quote_comparison_coverage
+    if coverage is not None:
+        coverage = coverage.model_copy(update={"selected_stay_plan_id": selected_plan})
+    return run.model_copy(
+        update={
+            "selected_stay_plan_id": selected_plan,
+            "stay_plan_planning_handoff": selected_handoff,
+            "exact_quote_comparison_coverage": coverage,
+            "package": run.package.model_copy(update={"final_candidate": split}),
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -1237,7 +1550,7 @@ async def test_publication_refresh_requeries_only_selected_component_scopes() ->
             timeout_seconds=15,
             memory_access=memory_access,
         ),
-        _serve(bridge, 11, _success),
+        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT, _success),
     )
     assert initial.package is not None
     assert initial.run_purpose == LiveRunPurpose.EXPLORATION_SELECTION
@@ -1380,7 +1693,7 @@ async def test_publication_refresh_runs_one_retry_and_one_prefrozen_flight_failo
             purpose=LiveRunPurpose.EXPLORATION_SELECTION,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, _success),
+        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT, _success),
     )
     assert exploration.package is not None
     primary_count = (
@@ -1844,7 +2157,7 @@ async def test_publication_refresh_fails_after_retry_and_prefrozen_failover() ->
             purpose=LiveRunPurpose.EXPLORATION_SELECTION,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, _success),
+        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT, _success),
     )
     assert exploration.package is not None
     primary_count = (
@@ -1891,11 +2204,15 @@ async def test_publication_failover_seed_is_lineage_party_currency_bound() -> No
 
     repriced_results = tuple(
         result.model_copy(
-            update={
-                "quote": result.quote.model_copy(
-                    update={"total_for_party_cents": result.quote.total_for_party_cents + 9_999_999}
-                )
-            }
+                update={
+                    "quote": result.quote.model_copy(
+                        update={
+                                "total_for_party_cents": 9_999_999,
+                            "party_total_known": True,
+                            "price_basis": "total_party",
+                        }
+                    )
+                }
         )
         if isinstance(result.quote, NormalizedFlightQuote)
         and result.quote.provider == BrowserProvider.TONGCHENG.value
@@ -1907,6 +2224,24 @@ async def test_publication_failover_seed_is_lineage_party_currency_bound() -> No
     assert seed is not None
     if target.flight.provider != BrowserProvider.TONGCHENG.value:
         assert seed[0] == BrowserProvider.TONGCHENG
+
+    comparison_only_results = tuple(
+        result.model_copy(
+            update={
+                "quote": result.quote.model_copy(
+                    update={"party_total_known": False, "price_basis": "comparison_only"}
+                )
+            }
+        )
+        if isinstance(result.quote, NormalizedFlightQuote)
+        and result.quote.provider != target.flight.provider
+        else result
+        for result in exploration.normalization_results
+    )
+    comparison_only = exploration.model_copy(
+        update={"normalization_results": comparison_only_results}
+    )
+    assert system._publication_flight_failover_seed(comparison_only, target) is None
 
     orphaned = exploration.model_copy(
         update={
@@ -1975,7 +2310,7 @@ async def test_publication_refresh_builds_targeted_icom_coverage_from_current_re
             purpose=LiveRunPurpose.EXPLORATION_SELECTION,
             timeout_seconds=15,
         ),
-        _serve(bridge, 13, _success),
+        _serve(bridge, _V4_BROWSER_SOURCE_TASK_COUNT, _success_without_browser_transfers),
     )
     assert exploration.package is not None
     selected_icom = tuple(
@@ -1992,7 +2327,7 @@ async def test_publication_refresh_builds_targeted_icom_coverage_from_current_re
             timeout_seconds=15,
             provider_minimum_intervals_ms={provider.value: 0 for provider in BrowserProvider},
         ),
-        _serve(bridge, expected_browser_tasks, _success),
+        _serve(bridge, expected_browser_tasks, _success_without_browser_transfers),
     )
 
     assert len(publication.public_transfer_task_ids) == 2
@@ -2006,6 +2341,7 @@ async def test_publication_refresh_builds_targeted_icom_coverage_from_current_re
     assert len(icom.queries) == 6
     assert publication.package is not None
     assert publication.decision.state == PackageDecisionState.ACCEPT
+    assert publication.package.budget.is_all_in_total is False
     assert publication.all_platforms_complete
     assert publication.coverage == exploration.coverage
     assert publication.selected_stay_plan_id == exploration.selected_stay_plan_id
@@ -2025,23 +2361,12 @@ async def test_publication_refresh_builds_targeted_icom_coverage_from_current_re
 
 @pytest.mark.asyncio
 async def test_search_supervisor_model_schedule_changes_live_source_dag_waves() -> None:
-    all_source_ids = (
-        "source-ctrip-flight",
-        "source-ctrip-lodging-full",
-        "source-ctrip-lodging-first",
-        "source-ctrip-lodging-middle",
-        "source-ctrip-lodging-last",
-        "source-qunar-flight",
-        "source-qunar-lodging-full",
-        "source-qunar-lodging-first",
-        "source-qunar-lodging-middle",
-        "source-qunar-lodging-last",
-        "source-tongcheng-flight",
-    )
+    all_source_ids = _V4_BROWSER_SOURCE_IDS
     priority_id = "source-tongcheng-flight"
     remaining = tuple(task_id for task_id in reversed(all_source_ids) if task_id != priority_id)
     priority_wave = (priority_id, *remaining[:5])
-    final_wave = remaining[5:]
+    middle_wave = remaining[5:11]
+    final_wave = remaining[11:]
     model = ScriptedModelClient(
         (
             _agent_tool_response(
@@ -2053,10 +2378,11 @@ async def test_search_supervisor_model_schedule_changes_live_source_dag_waves() 
                     "summary": "先核对独立国际机票源，再并发其余只读查询",
                     "waves": [
                         {"id": "priority-flight", "task_ids": list(priority_wave)},
+                        {"id": "middle-sources", "task_ids": list(middle_wave)},
                         {"id": "remaining-sources", "task_ids": list(final_wave)},
                     ],
                     "skipped_task_ids": [],
-                    "declared_budget_units": 11,
+                    "declared_budget_units": _V4_BROWSER_SOURCE_TASK_COUNT,
                     "strategy_reasons": ["在全覆盖内改变证据到达顺序"],
                     "uncertainty_flags": [],
                 }
@@ -2077,20 +2403,24 @@ async def test_search_supervisor_model_schedule_changes_live_source_dag_waves() 
 
     run, _ = await asyncio.gather(
         system.run(
-            intent(),
-            query(),
+            intent().model_copy(update={"destination_place_key": None}),
+            v4_query(),
             mode=LiveCoverageMode.STRICT,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, _success),
+        _serve(bridge, _V4_BROWSER_SOURCE_TASK_COUNT, _success),
     )
 
     assert run.search_supervisor_proposal is not None
     assert run.search_schedule is not None
     assert run.search_schedule.proposal_accepted
-    assert run.search_schedule.ordered_task_ids == (*priority_wave, *final_wave)
-    assert run.search_schedule.minimum_browser_lease_batches == 2
-    assert run.search_schedule.applied_browser_barrier_batches == 2
+    assert run.search_schedule.ordered_task_ids == (
+        *priority_wave,
+        *middle_wave,
+        *final_wave,
+    )
+    assert run.search_schedule.minimum_browser_lease_batches == 3
+    assert run.search_schedule.applied_browser_barrier_batches == 3
     supervisor_stage = next(
         stage for stage in run.agentic.stages if stage.role == AgentRole.SEARCH_SUPERVISOR
     )
@@ -2098,26 +2428,15 @@ async def test_search_supervisor_model_schedule_changes_live_source_dag_waves() 
     graph = {task.id: task for task in run.scheduler.graph.tasks}
     assert graph[priority_id].dependencies == ("supervise-source-search",)
     assert graph[priority_wave[1]].dependencies == ("supervise-source-search",)
-    assert graph[final_wave[0]].dependencies == priority_wave
+    assert graph[middle_wave[0]].dependencies == priority_wave
+    assert graph[final_wave[0]].dependencies == middle_wave
     assert run.scheduler.max_parallel_tasks == 6
 
 
 @pytest.mark.asyncio
 async def test_search_supervisor_repairs_semantically_invalid_schedule_once() -> None:
-    all_source_ids = (
-        "source-ctrip-flight",
-        "source-ctrip-lodging-full",
-        "source-ctrip-lodging-first",
-        "source-ctrip-lodging-middle",
-        "source-ctrip-lodging-last",
-        "source-qunar-flight",
-        "source-qunar-lodging-full",
-        "source-qunar-lodging-first",
-        "source-qunar-lodging-middle",
-        "source-qunar-lodging-last",
-        "source-tongcheng-flight",
-    )
-    repaired_waves = (all_source_ids[:6], all_source_ids[6:])
+    all_source_ids = _V4_BROWSER_SOURCE_IDS
+    repaired_waves = (all_source_ids[:6], all_source_ids[6:12], all_source_ids[12:])
     model = ScriptedModelClient(
         (
             _agent_tool_response(
@@ -2132,7 +2451,7 @@ async def test_search_supervisor_repairs_semantically_invalid_schedule_once() ->
                         for index, task_id in enumerate(all_source_ids, start=1)
                     ],
                     "skipped_task_ids": [],
-                    "declared_budget_units": 11,
+                    "declared_budget_units": _V4_BROWSER_SOURCE_TASK_COUNT,
                     "strategy_reasons": ["错误的串行调度"],
                     "uncertainty_flags": [],
                 }
@@ -2143,9 +2462,10 @@ async def test_search_supervisor_repairs_semantically_invalid_schedule_once() ->
                     "waves": [
                         {"id": "parallel-1", "task_ids": list(repaired_waves[0])},
                         {"id": "parallel-2", "task_ids": list(repaired_waves[1])},
+                        {"id": "parallel-3", "task_ids": list(repaired_waves[2])},
                     ],
                     "skipped_task_ids": [],
-                    "declared_budget_units": 11,
+                    "declared_budget_units": _V4_BROWSER_SOURCE_TASK_COUNT,
                     "strategy_reasons": ["满足最短浏览器租约关键路径"],
                     "uncertainty_flags": [],
                 }
@@ -2166,19 +2486,19 @@ async def test_search_supervisor_repairs_semantically_invalid_schedule_once() ->
 
     run, _ = await asyncio.gather(
         system.run(
-            intent(),
-            query(),
+            intent().model_copy(update={"destination_place_key": None}),
+            v4_query(),
             mode=LiveCoverageMode.STRICT,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, _success),
+        _serve(bridge, _V4_BROWSER_SOURCE_TASK_COUNT, _success),
     )
 
     assert run.search_schedule is not None
     assert run.search_schedule.proposal_accepted
     assert run.search_schedule.proposal_source == "model_agent"
-    assert run.search_schedule.minimum_browser_lease_batches == 2
-    assert run.search_schedule.applied_browser_barrier_batches == 2
+    assert run.search_schedule.minimum_browser_lease_batches == 3
+    assert run.search_schedule.applied_browser_barrier_batches == 3
     supervisor_stage = next(
         stage for stage in run.agentic.stages if stage.role == AgentRole.SEARCH_SUPERVISOR
     )
@@ -2555,23 +2875,11 @@ async def _run_agent_repair_closure(
                 "waves": [
                     {
                         "id": "all-read-only-sources",
-                        "task_ids": [
-                            "source-ctrip-flight",
-                            "source-ctrip-lodging-full",
-                            "source-ctrip-lodging-first",
-                            "source-ctrip-lodging-middle",
-                            "source-ctrip-lodging-last",
-                            "source-qunar-flight",
-                            "source-qunar-lodging-full",
-                            "source-qunar-lodging-first",
-                            "source-qunar-lodging-middle",
-                            "source-qunar-lodging-last",
-                            "source-tongcheng-flight",
-                        ],
+                        "task_ids": list(_V4_BROWSER_SOURCE_IDS),
                     }
                 ],
                 "skipped_task_ids": [],
-                "declared_budget_units": 11,
+                "declared_budget_units": _V4_BROWSER_SOURCE_TASK_COUNT,
                 "strategy_reasons": ["严格覆盖"],
                 "uncertainty_flags": [],
             }
@@ -2634,12 +2942,12 @@ async def _run_agent_repair_closure(
     )
     run, _ = await asyncio.gather(
         system.run(
-            intent(),
-            query(),
+            intent().model_copy(update={"destination_place_key": None}),
+            v4_query(),
             mode=LiveCoverageMode.STRICT,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, _success),
+        _serve(bridge, _V4_BROWSER_SOURCE_TASK_COUNT, _success),
     )
     return run
 
@@ -2648,7 +2956,7 @@ async def _two_visible_hard_valid_candidates() -> tuple[
     TravelPackageCandidate,
     TravelPackageCandidate,
 ]:
-    _, _, baseline = await _run(LiveCoverageMode.STRICT)
+    _, _, baseline = await _run_v4(LiveCoverageMode.STRICT)
     assert baseline.package is not None
     candidates = baseline.package.planning_handoff
     assert candidates is not None
@@ -2663,6 +2971,17 @@ async def _two_visible_hard_valid_candidates() -> tuple[
         sorted(valid, key=lambda candidate: candidate.computed_total_cents, reverse=True)
     )
     return ordered[0], ordered[-1]
+
+
+def _exclusive_evidence_ref(
+    candidate: TravelPackageCandidate,
+    other: TravelPackageCandidate,
+) -> str:
+    return next(
+        evidence_ref
+        for evidence_ref in candidate.evidence_refs
+        if evidence_ref not in other.evidence_refs
+    )
 
 
 @pytest.mark.asyncio
@@ -2915,23 +3234,11 @@ async def test_no_candidate_model_chain_seals_exploration_as_human_block() -> No
                 "waves": [
                     {
                         "id": "all-read-only-sources",
-                        "task_ids": [
-                            "source-ctrip-flight",
-                            "source-ctrip-lodging-full",
-                            "source-ctrip-lodging-first",
-                            "source-ctrip-lodging-middle",
-                            "source-ctrip-lodging-last",
-                            "source-qunar-flight",
-                            "source-qunar-lodging-full",
-                            "source-qunar-lodging-first",
-                            "source-qunar-lodging-middle",
-                            "source-qunar-lodging-last",
-                            "source-tongcheng-flight",
-                        ],
+                        "task_ids": list(_STANDARD_BROWSER_SOURCE_IDS),
                     }
                 ],
                 "skipped_task_ids": [],
-                "declared_budget_units": 11,
+                "declared_budget_units": _STANDARD_BROWSER_SOURCE_TASK_COUNT,
                 "strategy_reasons": ["严格覆盖"],
                 "uncertainty_flags": [],
             }
@@ -3047,7 +3354,7 @@ async def test_no_candidate_model_chain_seals_exploration_as_human_block() -> No
             purpose=LiveRunPurpose.EXPLORATION_SELECTION,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, no_exact_flights),
+        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT, no_exact_flights),
     )
 
     assert run.package is None
@@ -3662,7 +3969,7 @@ async def test_soft_risk_switch_is_applied_then_reverified_and_recriticized() ->
     run = await _run_agent_repair_closure(
         repair_target_id=alternative.id,
         initial_candidate_id=initial.id,
-        initial_evidence_ref=initial.evidence_refs[0],
+        initial_evidence_ref=_exclusive_evidence_ref(initial, alternative),
         repaired_evidence_ref=alternative.evidence_refs[0],
     )
 
@@ -3709,7 +4016,7 @@ async def test_orchestrator_accept_must_bind_final_candidate_and_its_evidence(
     run = await _run_agent_repair_closure(
         repair_target_id=alternative.id,
         initial_candidate_id=initial.id,
-        initial_evidence_ref=initial.evidence_refs[0],
+        initial_evidence_ref=_exclusive_evidence_ref(initial, alternative),
         repaired_evidence_ref=alternative.evidence_refs[0],
         orchestrator_mode=orchestrator_mode,
         repeat_invalid_orchestrator_proposal=True,
@@ -3799,7 +4106,7 @@ async def test_recritic_persistent_high_risk_is_blocked_after_hard_reverificatio
     run = await _run_agent_repair_closure(
         repair_target_id=alternative.id,
         initial_candidate_id=initial.id,
-        initial_evidence_ref=initial.evidence_refs[0],
+        initial_evidence_ref=_exclusive_evidence_ref(initial, alternative),
         repaired_evidence_ref=alternative.evidence_refs[0],
         repaired_risk_persists=True,
     )
@@ -3823,7 +4130,7 @@ async def test_required_model_publication_gate_catches_late_explanation_failure(
     run = await _run_agent_repair_closure(
         repair_target_id=alternative.id,
         initial_candidate_id=initial.id,
-        initial_evidence_ref=initial.evidence_refs[0],
+        initial_evidence_ref=_exclusive_evidence_ref(initial, alternative),
         repaired_evidence_ref=alternative.evidence_refs[0],
         explanation_mode="unsupported_rights",
         model_agents_required=True,
@@ -3845,7 +4152,7 @@ async def test_advisory_freeform_explanation_is_dropped_before_component_binding
     run = await _run_agent_repair_closure(
         repair_target_id=alternative.id,
         initial_candidate_id=initial.id,
-        initial_evidence_ref=initial.evidence_refs[0],
+        initial_evidence_ref=_exclusive_evidence_ref(initial, alternative),
         repaired_evidence_ref=alternative.evidence_refs[0],
         explanation_mode="unknown_component",
         model_agents_required=False,
@@ -3893,7 +4200,7 @@ async def test_explanation_selection_surface_and_renderer_both_block_false_break
     run = await _run_agent_repair_closure(
         repair_target_id=alternative.id,
         initial_candidate_id=initial.id,
-        initial_evidence_ref=initial.evidence_refs[0],
+        initial_evidence_ref=_exclusive_evidence_ref(initial, alternative),
         repaired_evidence_ref=lodging.evidence_refs[0],
         explanation_mode="unsupported_breakfast",
         explanation_component_id=lodging.id,
@@ -4017,7 +4324,7 @@ async def test_invalid_repair_target_is_not_silently_fallback_released() -> None
     run = await _run_agent_repair_closure(
         repair_target_id=invalid_target,
         initial_candidate_id=initial.id,
-        initial_evidence_ref=initial.evidence_refs[0],
+        initial_evidence_ref=_exclusive_evidence_ref(initial, alternative),
         repaired_evidence_ref=alternative.evidence_refs[0],
         repeat_invalid_repair_proposal=True,
         model_agents_required=False,
@@ -4038,7 +4345,7 @@ async def test_unexecuted_repair_dependencies_are_rejected_before_apply() -> Non
     run = await _run_agent_repair_closure(
         repair_target_id=alternative.id,
         initial_candidate_id=initial.id,
-        initial_evidence_ref=initial.evidence_refs[0],
+        initial_evidence_ref=_exclusive_evidence_ref(initial, alternative),
         repaired_evidence_ref=alternative.evidence_refs[0],
         dependencies_to_refresh=(initial.component_ids[0],),
         repeat_invalid_repair_proposal=True,
@@ -4083,7 +4390,7 @@ async def test_retryable_browser_failure_is_resubmitted_once_with_both_receipts(
             mode=LiveCoverageMode.STRICT,
             timeout_seconds=15,
         ),
-        _serve(bridge, 12, retry_once),
+        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT + 1, retry_once),
     )
 
     result = next(item for item in run.scheduler.results if item.task_id == "source-qunar-flight")
@@ -4117,7 +4424,7 @@ async def test_retryable_public_transfer_failure_retries_only_failed_query() -> 
             mode=LiveCoverageMode.STRICT,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, _success),
+        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT, _success),
     )
 
     assert run.scheduler.succeeded
@@ -4145,12 +4452,12 @@ async def test_fifteen_agent_dag_merges_four_official_public_transfer_searches()
             mode=LiveCoverageMode.STRICT,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, _success),
+        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT, _success),
     )
 
     assert run.scheduler.succeeded
-    assert run.scheduler.max_parallel_tasks == 15
-    assert len(run.source_task_ids) == 11
+    assert run.scheduler.max_parallel_tasks == _STANDARD_BROWSER_SOURCE_TASK_COUNT + 4
+    assert len(run.source_task_ids) == _STANDARD_BROWSER_SOURCE_TASK_COUNT
     assert run.public_transfer_task_ids == (
         "public-transfer-icom-continuous-outbound",
         "public-transfer-icom-split-outbound",
@@ -4481,7 +4788,7 @@ async def test_icom_sold_out_event_requeries_one_direction_and_replans_locally()
             mode=LiveCoverageMode.STRICT,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, _success_without_browser_transfers),
+        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT, _success_without_browser_transfers),
     )
     assert initial.package is not None
     assert initial.decision.state == PackageDecisionState.ACCEPT
@@ -4606,6 +4913,67 @@ async def test_icom_sold_out_event_requeries_one_direction_and_replans_locally()
     assert not _check_read_only_graph(damaged_initial, replanned).passed
 
 
+@pytest.mark.asyncio
+async def test_icom_event_prefers_earliest_safe_same_day_replacement() -> None:
+    """Reject the 120-minute miss and choose 9113 over later 10237."""
+
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(
+        bridge,
+        icom_provider=_PriorityIComProvider(),
+        now=lambda: NOW,
+    )
+    initial, _ = await asyncio.gather(
+        system.run(
+            intent().model_copy(update={"destination_place_key": None}),
+            v4_query(),
+            mode=LiveCoverageMode.STRICT,
+            timeout_seconds=15,
+        ),
+        _serve(bridge, _V4_BROWSER_SOURCE_TASK_COUNT, _success_without_browser_transfers),
+    )
+    assert initial.decision.state == PackageDecisionState.ACCEPT
+    assert initial.package is not None
+    flight_id = initial.package.final_candidate.flight.id
+    lodging_id = initial.package.final_candidate.lodgings[0].id
+    outbound = next(
+        item
+        for item in initial.package.final_candidate.transfers
+        if item.origin_place_key == PackagePlaceKey.VELANA_AIRPORT
+    )
+    returning = next(
+        item
+        for item in initial.package.final_candidate.transfers
+        if item.destination_place_key == PackagePlaceKey.VELANA_AIRPORT
+    )
+    assert outbound.id.startswith("icom:trip:7989:")
+    assert outbound.depart_at is not None
+    assert outbound.depart_at.hour == 15
+    event = LivePackageEvent(
+        id="icom-earliest-safe-replacement",
+        kind=PackageEventKind.SOLD_OUT,
+        target_component_id=outbound.id,
+        affected_provider=LiveDataProvider.ICOM_PUBLIC_TRANSFER,
+        source="tripchord-controlled-rehearsal",
+        controlled_unavailable=True,
+    )
+    replanned = await system.replan_after_event(initial, event, timeout_seconds=15)
+
+    assert replanned.decision.state == PackageDecisionState.ACCEPT
+    assert replanned.package is not None
+    assert replanned.package.diff is not None
+    assert replanned.package.diff.removed_component_ids == (outbound.id,)
+    assert replanned.package.diff.added_component_ids[0].startswith("icom:trip:9113:")
+    assert replanned.event_resolution.replacement_component_id is not None
+    assert replanned.event_resolution.replacement_component_id.startswith("icom:trip:9113:")
+    final = replanned.package.final_candidate
+    assert final.flight.id == flight_id
+    assert final.lodgings[0].id == lodging_id
+    assert returning.id in final.component_ids
+    assert not any(item.id.startswith("icom:trip:10237:") for item in final.transfers)
+    assert replanned.package.preservation_ratio == Decimal("0.75")
+
+
 def _booking_ledger_with_protected(component_id: str) -> BookingLedger:
     service = BookingService(BookingLedger(plan_version="audit-trip"), now=NOW)
     ledger, _ = service.acknowledge_component(
@@ -4640,7 +5008,11 @@ async def test_event_replan_cannot_silently_replace_booked_component() -> None:
             mode=LiveCoverageMode.STRICT,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, _success_without_browser_transfers),
+        _serve(
+            bridge,
+            _STANDARD_BROWSER_SOURCE_TASK_COUNT,
+            _success_without_browser_transfers,
+        ),
     )
     assert initial.package is not None
     assert initial.decision.state == PackageDecisionState.ACCEPT
@@ -4688,7 +5060,11 @@ async def test_event_replan_allowed_when_booked_component_preserved() -> None:
             mode=LiveCoverageMode.STRICT,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, _success_without_browser_transfers),
+        _serve(
+            bridge,
+            _STANDARD_BROWSER_SOURCE_TASK_COUNT,
+            _success_without_browser_transfers,
+        ),
     )
     assert initial.package is not None
     target = next(
@@ -4724,14 +5100,14 @@ async def test_event_replan_allowed_when_booked_component_preserved() -> None:
 
 
 @pytest.mark.asyncio
-async def test_eleven_source_dag_rejects_fragile_v1_and_accepts_split_v2() -> None:
-    _, _, run = await _run(LiveCoverageMode.STRICT)
+async def test_thirteen_source_dag_rejects_fragile_v1_and_accepts_split_v2() -> None:
+    _, _, run = await _run_v4(LiveCoverageMode.STRICT)
 
     assert run.scheduler.succeeded
-    assert run.scheduler.max_parallel_tasks == 11
+    assert run.scheduler.max_parallel_tasks == _V4_BROWSER_SOURCE_TASK_COUNT
     assert run.browser_max_concurrency == 6
     assert run.scheduler.max_parallel_tasks > run.browser_max_concurrency
-    assert len(run.source_task_ids) == 11
+    assert len(run.source_task_ids) == _V4_BROWSER_SOURCE_TASK_COUNT
     assert set(run.source_task_ids) == {
         f"source-{provider.value}-{suffix}"
         for provider in LIVE_V5_BROWSER_PROVIDERS
@@ -4743,6 +5119,7 @@ async def test_eleven_source_dag_rejects_fragile_v1_and_accepts_split_v2() -> No
                     "lodging-first",
                     "lodging-middle",
                     "lodging-last",
+                    "lodging-hulhumale-full",
                 )
                 if provider != BrowserProvider.TONGCHENG
                 else ()
@@ -4753,24 +5130,24 @@ async def test_eleven_source_dag_rejects_fragile_v1_and_accepts_split_v2() -> No
     assert run.all_platforms_complete
     assert run.decision.state == PackageDecisionState.ACCEPT
     assert run.package is not None
-    assert run.package.initial_candidate.kind == PackageCandidateKind.CONTINUOUS_ISLAND
-    assert {item.code for item in run.package.initial_violations} == {
-        PackageViolationCode.LATE_ARRIVAL_BOAT_RISK,
-        PackageViolationCode.EARLY_DEPARTURE_BUFFER,
+    assert run.package.initial_candidate.kind in {
+        PackageCandidateKind.CONTINUOUS_ISLAND,
+        PackageCandidateKind.CONTINUOUS_AIRPORT_ISLAND,
     }
-    assert [item.state for item in run.package.decisions] == [
-        PackageDecisionState.REJECT_AND_REPLAN,
-        PackageDecisionState.ACCEPT,
-    ]
-    assert run.package.final_candidate.kind == PackageCandidateKind.SPLIT_AIRPORT_ISLAND
-    assert [item.night_count for item in run.package.final_candidate.lodgings] == [1, 5, 1]
+    assert run.package.initial_violations == ()
+    assert [item.state for item in run.package.decisions] == [PackageDecisionState.ACCEPT]
+    assert run.package.final_candidate.kind in {
+        PackageCandidateKind.CONTINUOUS_ISLAND,
+        PackageCandidateKind.CONTINUOUS_AIRPORT_ISLAND,
+    }
+    assert [item.night_count for item in run.package.final_candidate.lodgings] == [7]
     assert {(item.area, item.place_key) for item in run.inventory.lodgings} == {
         (PackageArea.DESTINATION_ISLAND, PackagePlaceKey.MAAFUSHI),
         (PackageArea.AIRPORT_ISLAND, PackagePlaceKey.HULHUMALE),
     }
     assert run.package.final_violations == ()
-    assert run.package.diff is not None and run.package.diff.changed
-    assert run.package.budget.total_cents == 1_469_300
+    assert run.package.diff is None
+    assert run.package.budget.total_cents == 1_310_000
     assert run.package.planning_handoff is not None
     assert run.candidate_generation_audit is not None
     assert not run.candidate_generation_audit.full_enumeration_claimed
@@ -4833,17 +5210,27 @@ async def test_eleven_source_dag_rejects_fragile_v1_and_accepts_split_v2() -> No
                     "&fromDate=2026-08-23&toDate=2026-08-30"
                 )
             continue
-        segment = task.id.rsplit("-", maxsplit=1)[-1]
+        segment = (
+            "hulhumale-full"
+            if "lodging-hulhumale-full" in task.id
+            else task.id.rsplit("-", maxsplit=1)[-1]
+        )
         assert task_query["destination"] == (
-            "Hulhumalé" if segment in {"first", "last"} else "Maafushi"
+            "Hulhumalé"
+            if segment in {"first", "last", "hulhumale-full"}
+            else "Maafushi"
         )
         assert task_query["destination_code"] is None
         assert options["segment"] == segment
         assert options["expected_package_area"] == (
-            "airport_island" if segment in {"first", "last"} else "destination_island"
+            "airport_island"
+            if segment in {"first", "last", "hulhumale-full"}
+            else "destination_island"
         )
         assert options["expected_lodging_place_key"] == (
-            "hulhumale" if segment in {"first", "last"} else "maafushi"
+            "hulhumale"
+            if segment in {"first", "last", "hulhumale-full"}
+            else "maafushi"
         )
         source_result = result_by_task[task.id]
         snapshot = cast(dict[str, JsonValue], source_result.output["snapshot"])
@@ -4881,7 +5268,7 @@ async def test_live_master_consumes_agent_handoffs_without_monolithic_execute(
             mode=LiveCoverageMode.STRICT,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, _success),
+        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT, _success),
     )
 
     assert run.decision.state == PackageDecisionState.ACCEPT
@@ -4890,11 +5277,8 @@ async def test_live_master_consumes_agent_handoffs_without_monolithic_execute(
     assert handoff is not None
     assert handoff.planner.selected_candidate_id == run.package.initial_candidate.id
     assert handoff.initial_verification.candidate_id == run.package.initial_candidate.id
-    assert handoff.repair.rejection_error_codes == (
-        PackageViolationCode.LATE_ARRIVAL_BOAT_RISK,
-        PackageViolationCode.EARLY_DEPARTURE_BUFFER,
-    )
-    assert handoff.repair.attempted
+    assert handoff.repair.rejection_error_codes == ()
+    assert not handoff.repair.attempted
     assert handoff.reverification is not None
     assert handoff.reverification.candidate_id == run.package.final_candidate.id
     assert handoff.reverification.errors == ()
@@ -4922,7 +5306,9 @@ async def test_live_master_consumes_agent_handoffs_without_monolithic_execute(
     )
     assert not _check_planner_verifier_repair(run_without_reverifier).passed
 
-    mismatched_repair = handoff.repair.model_copy(update={"rejection_error_codes": ()})
+    mismatched_repair = handoff.repair.model_copy(
+        update={"rejection_error_codes": (PackageViolationCode.BUDGET_EXCEEDED,)}
+    )
     mismatched_reason_handoff = handoff.model_copy(update={"repair": mismatched_repair})
     mismatched_reason_package = run.package.model_copy(
         update={"planning_handoff": mismatched_reason_handoff}
@@ -4973,6 +5359,29 @@ def test_other_gateway_does_not_rewrite_any_provider_lodging_destination() -> No
             system._provider_source_tasks(provider, other_query, 15)
 
 
+def test_official_lodging_keeps_ota_budget_and_rebuilds_exact_middle_dates() -> None:
+    system = LivePackageAgentSystem(BrowserTaskBridge(now=lambda: NOW), now=lambda: NOW)
+    fixed_flight_window = query().model_copy(
+        update={"start_date": date(2026, 9, 3), "end_date": date(2026, 9, 10)}
+    )
+    tasks = system._provider_source_tasks(BrowserProvider.CTRIP, fixed_flight_window, 15)
+    transformed = tuple(system._ensure_official_lodging_budget(task) for task in tasks)
+
+    lodging_submissions = {
+        task.id: BrowserTaskSubmission.model_validate(task.input["submission"])
+        for task in transformed
+        if "-lodging-" in task.id
+    }
+    assert lodging_submissions
+    assert all(item.timeout_seconds >= 120 for item in lodging_submissions.values())
+    assert all(item.max_attempts == 1 for item in lodging_submissions.values())
+    middle = lodging_submissions["source-ctrip-lodging-middle"]
+    assert middle.query.start_date == date(2026, 9, 4)
+    assert middle.query.end_date == date(2026, 9, 9)
+    assert middle.query.adults == 2
+    assert middle.query.rooms == 1
+
+
 def test_trusted_flight_sources_fail_closed_without_iata() -> None:
     system = LivePackageAgentSystem(BrowserTaskBridge(now=lambda: NOW), now=lambda: NOW)
     unresolved_query = query().model_copy(update={"origin_code": None, "destination_code": None})
@@ -5015,8 +5424,14 @@ async def test_strict_blocks_partial_coverage_while_degraded_keeps_claim_boundar
     assert strict.scheduler.succeeded
     assert all(result.success for result in strict.scheduler.results)
     assert not strict.all_platforms_complete
-    assert strict.decision.state == PackageDecisionState.HUMAN_BLOCK
+    assert strict.decision.state == PackageDecisionState.ACCEPT
+    assert strict.package is not None
+    assert strict.exact_quote_comparison_coverage is not None
+    assert strict.exact_quote_comparison_coverage.complete
     assert "不得声明三平台实时核价完成" in strict.claim_boundary
+    assert "不得将选中方案的局部比价扩展为该结论" in strict.claim_boundary
+    assert "单来源建议" not in strict.claim_boundary
+    assert "不声明最低价" not in strict.claim_boundary
     qunar = next(item for item in strict.coverage if item.provider == BrowserProvider.QUNAR)
     assert "source-qunar-lodging-middle" in qunar.failed_source_ids
 
@@ -5040,7 +5455,10 @@ async def test_visible_area_mismatch_cannot_count_as_a_successful_source() -> No
     assert "query_context_mismatch" in " ".join(ctrip.failure_reasons)
     assert not ctrip.complete
     assert not run.all_platforms_complete
-    assert run.decision.state == PackageDecisionState.HUMAN_BLOCK
+    assert run.decision.state == PackageDecisionState.ACCEPT
+    assert "不得声明三平台实时核价完成" in run.claim_boundary
+    assert "不得将选中方案的局部比价扩展为该结论" in run.claim_boundary
+    assert "单来源建议" not in run.claim_boundary
 
 
 @pytest.mark.asyncio
@@ -5215,7 +5633,8 @@ async def test_synthetic_lodging_sold_out_closes_strict_browser_event_chain() ->
 
 @pytest.mark.asyncio
 async def test_event_replanning_requeries_only_affected_platform_and_exact_segment() -> None:
-    system, bridge, run = await _run(LiveCoverageMode.STRICT)
+    system, bridge, run = await _run_v4_with_icom()
+    run = _select_segmented_stay_candidate(run)
     assert run.package is not None
     before = run.package.final_candidate
     middle = next(
@@ -5471,7 +5890,8 @@ async def test_event_replanning_requeries_only_affected_platform_and_exact_segme
 
 @pytest.mark.asyncio
 async def test_event_diagnoser_can_conservatively_veto_local_repair() -> None:
-    system, bridge, run = await _run(LiveCoverageMode.STRICT)
+    system, bridge, run = await _run_v4_with_icom()
+    run = _select_segmented_stay_candidate(run)
     assert run.package is not None
     middle = next(
         item
@@ -5551,7 +5971,8 @@ async def test_event_diagnoser_can_conservatively_veto_local_repair() -> None:
 async def test_event_diagnoser_dependency_refresh_executes_full_fresh_replan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    system, bridge, run = await _run(LiveCoverageMode.STRICT)
+    system, bridge, run = await _run_v4_with_icom()
+    run = _select_segmented_stay_candidate(run)
     assert run.package is not None
     middle = next(
         item
@@ -5653,7 +6074,8 @@ async def test_event_diagnoser_dependency_refresh_executes_full_fresh_replan(
 async def test_event_global_replan_fails_closed_before_full_search_when_budget_short(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    system, bridge, run = await _run(LiveCoverageMode.STRICT)
+    system, bridge, run = await _run_v4_with_icom()
+    run = _select_segmented_stay_candidate(run)
     assert run.package is not None
     middle = next(
         item
@@ -5722,7 +6144,8 @@ async def test_event_global_replan_fails_closed_before_full_search_when_budget_s
 
 @pytest.mark.asyncio
 async def test_event_diagnoser_repairs_replacement_ids_out_of_dependencies() -> None:
-    system, bridge, run = await _run(LiveCoverageMode.STRICT)
+    system, bridge, run = await _run_v4_with_icom()
+    run = _select_segmented_stay_candidate(run)
     assert run.package is not None
     middle = next(
         item
@@ -5866,7 +6289,8 @@ async def test_event_diagnoser_repairs_replacement_ids_out_of_dependencies() -> 
 async def test_event_replan_cannot_bypass_reverifier_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    system, bridge, run = await _run(LiveCoverageMode.STRICT)
+    system, bridge, run = await _run_v4_with_icom()
+    run = _select_segmented_stay_candidate(run)
     assert run.package is not None
     current = run.package.final_candidate
     middle = next(
@@ -5935,7 +6359,8 @@ async def test_event_replan_cannot_bypass_reverifier_handoff(
 
 @pytest.mark.asyncio
 async def test_event_independent_audit_blocks_tampered_amount_when_primary_stub_passes() -> None:
-    system, bridge, run = await _run(LiveCoverageMode.STRICT)
+    system, bridge, run = await _run_v4_with_icom()
+    run = _select_segmented_stay_candidate(run)
     assert run.package is not None
     current = run.package.final_candidate
     middle = next(
@@ -6746,7 +7171,7 @@ async def test_live_package_run_root_invariants_have_unique_stable_error_types()
             purpose=LiveRunPurpose.EXPLORATION_SELECTION,
             timeout_seconds=15,
         ),
-        _serve(bridge, 11, _success),
+        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT, _success),
     )
     assert final_run.run_purpose == LiveRunPurpose.FINAL_PUBLICATION
     assert exploration_run.run_purpose == LiveRunPurpose.EXPLORATION_SELECTION
@@ -7082,7 +7507,7 @@ async def test_live_package_run_root_invariants_have_unique_stable_error_types()
     ],
 )
 @pytest.mark.asyncio
-async def test_strict_single_lodging_quote_is_partial_evidence_not_recommendable(
+async def test_strict_single_lodging_quote_publishes_with_explicit_single_source_boundary(
     non_quote_state: Literal[
         "confirmed_empty",
         "bounded_provider_pending",
@@ -7098,8 +7523,11 @@ async def test_strict_single_lodging_quote_is_partial_evidence_not_recommendable
     )
 
     assert run.package is not None
-    assert run.decision.state == PackageDecisionState.HUMAN_BLOCK
-    assert run.package.final_decision.state == PackageDecisionState.HUMAN_BLOCK
+    expected_publish = source_execution_complete
+    assert run.decision.state == (
+        PackageDecisionState.ACCEPT if expected_publish else PackageDecisionState.HUMAN_BLOCK
+    )
+    assert run.package.final_decision.state == run.decision.state
     assert run.source_execution_completeness.complete is source_execution_complete
     assert run.all_platforms_complete is source_execution_complete
     comparison = run.exact_quote_comparison_coverage
@@ -7111,7 +7539,11 @@ async def test_strict_single_lodging_quote_is_partial_evidence_not_recommendable
         for segment in comparison.segments
     )
     assert any(item.provider == "ctrip" for item in run.inventory.lodgings)
-    assert "partial evidence" in run.decision.summary
+    if expected_publish:
+        assert "单来源建议" in run.claim_boundary
+        assert "不声明最低价" in run.claim_boundary
+    else:
+        assert "partial evidence" not in run.claim_boundary
     assert "source_execution_completeness" in run.claim_boundary
     assert "exact_quote_comparison_coverage" in run.claim_boundary
 
@@ -7175,7 +7607,34 @@ async def test_planner_prefers_two_quote_hulhumale_over_single_quote_maafushi() 
     planner_stage = next(
         item for item in run.scheduler.results if item.task_id == "plan-travel-package"
     )
-    assert planner_stage.output["partial_evidence_candidate_ids"]
+    partial_ids = cast(list[str], planner_stage.output["partial_evidence_candidate_ids"])
+    assert partial_ids
+    handed_off = cast(dict[str, JsonValue], planner_stage.output["handoff"])
+    handed_off_candidates = cast(list[dict[str, JsonValue]], handed_off["candidates"])
+    maafushi_icom_candidates = tuple(
+        candidate
+        for candidate in handed_off_candidates
+        if any(
+            cast(dict[str, JsonValue], lodging)["place_key"] == PackagePlaceKey.MAAFUSHI.value
+            for lodging in cast(list[dict[str, JsonValue]], candidate["lodgings"])
+        )
+        and all(
+            cast(dict[str, JsonValue], transfer)["provider"] == "icom-public-transfer"
+            for transfer in cast(list[dict[str, JsonValue]], candidate["transfers"])
+        )
+    )
+    assert maafushi_icom_candidates
+    assert all(
+        any(
+            cast(dict[str, JsonValue], transfer)["provider"] == "icom-public-transfer"
+            for transfer in cast(list[dict[str, JsonValue]], candidate["transfers"])
+        )
+        for candidate in handed_off_candidates
+        if any(
+            cast(dict[str, JsonValue], lodging)["place_key"] == PackagePlaceKey.MAAFUSHI.value
+            for lodging in cast(list[dict[str, JsonValue]], candidate["lodgings"])
+        )
+    )
     assert run.package.final_candidate.id in set(
         planner_stage.output["comparison_ready_candidate_ids"]
     )
@@ -7183,7 +7642,8 @@ async def test_planner_prefers_two_quote_hulhumale_over_single_quote_maafushi() 
 
 @pytest.mark.asyncio
 async def test_august_3_same_price_refetch_does_not_create_a_fake_plan_version() -> None:
-    system, bridge, run = await _run(LiveCoverageMode.STRICT)
+    system, bridge, run = await _run_v4_with_icom()
+    run = _select_segmented_stay_candidate(run)
     assert run.package is not None
     current = run.package.final_candidate
     middle = next(

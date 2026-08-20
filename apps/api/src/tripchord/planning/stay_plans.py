@@ -589,10 +589,20 @@ def stay_plan_candidate_errors(
     intent: PackageIntent,
     candidate: TravelPackageCandidate,
 ) -> tuple[str, ...]:
+    # A date-pair return date is the searched departure date.  The stay plan
+    # must follow the flight's actual airport arrival and return-departure
+    # dates, otherwise a safe 2026-09-03 -> 2026-09-10 itinerary is compared
+    # against the wrong 2026-09-03 hotel check-in boundary.
+    bound_intent = intent.model_copy(
+        update={
+            "start_date": candidate.flight.outbound_arrive_at.date(),
+            "end_date": candidate.flight.return_depart_at.date(),
+        }
+    )
     errors: list[str] = []
     for segment in plan.segments:
-        check_in = segment.check_in.resolve(intent)
-        check_out = segment.check_out.resolve(intent)
+        check_in = segment.check_in.resolve(bound_intent)
+        check_out = segment.check_out.resolve(bound_intent)
         lodging_matches = tuple(
             lodging
             for lodging in candidate.lodgings
@@ -612,7 +622,7 @@ def stay_plan_candidate_errors(
             f"lodging_segment_count:expected_{len(plan.segments)}:found_{len(candidate.lodgings)}"
         )
     for contract in plan.required_transfer_contracts:
-        service_date = contract.service_date.resolve(intent)
+        service_date = contract.service_date.resolve(bound_intent)
         transfer_matches = tuple(
             transfer
             for transfer in candidate.transfers
@@ -804,7 +814,6 @@ def _stay_plan_inventory_rejection_reasons(
             and lodging.check_out == check_out
             and lodging.adults == intent.adults
             and lodging.rooms == intent.rooms
-            and lodging.currency == intent.currency
         )
         if exact_lodgings:
             continue

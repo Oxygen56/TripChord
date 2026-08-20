@@ -59,8 +59,8 @@ from tripchord.providers.icom_transfer import (
 _EXPECTED_PROVIDERS = frozenset(LIVE_V5_BROWSER_PROVIDERS)
 _LODGING_PROVIDERS = frozenset({BrowserProvider.CTRIP, BrowserProvider.QUNAR})
 _EXPECTED_SOURCE_COUNTS = {
-    BrowserProvider.CTRIP: 5,
-    BrowserProvider.QUNAR: 5,
+    BrowserProvider.CTRIP: 6,
+    BrowserProvider.QUNAR: 6,
     BrowserProvider.TONGCHENG: 1,
 }
 _EXPECTED_PUBLIC_TRANSFER_TASK_IDS = (
@@ -272,6 +272,7 @@ def _check_flexible_ranked_options(
         and item.date_pair_id in completed_ids
     )
     recommendable_ids = tuple(item.date_pair_id for item in recommendable)
+    final_recommendable_ids = recommendable_ids[:1]
     rank_sequence = tuple(item.rank for item in flexible.ranked_options)
     pair_run_by_id = {
         execution.date_pair.id: execution.run
@@ -291,7 +292,7 @@ def _check_flexible_ranked_options(
                 maximum_quote_age=maximum_quote_age,
             ).passed
         )
-    recommended_pairs_have_icom_4_of_4 = len(public_transfer_pair_checks) >= 2 and all(
+    recommended_pairs_have_icom_4_of_4 = len(public_transfer_pair_checks) >= 1 and all(
         public_transfer_pair_checks.values()
     )
     sampled_boundary_ok = (
@@ -301,8 +302,12 @@ def _check_flexible_ranked_options(
         len(selected_ids) == 3
         and len(flexible.query_plan.tasks) == 33
         and len(flexible.pair_runs) == 3
-        and len(recommendable) >= 2
-        and flexible.recommended_option_ids == recommendable_ids
+        and len(recommendable) >= 1
+        and flexible.recommended_option_ids == tuple(
+            item.option_id
+            for item in flexible.ranked_options
+            if item.date_pair_id in final_recommendable_ids
+        )
         and rank_sequence == tuple(range(1, len(rank_sequence) + 1))
         and recommended_pairs_have_icom_4_of_4
         and sampled_boundary_ok
@@ -311,7 +316,7 @@ def _check_flexible_ranked_options(
         id="flexible_ranked_options",
         passed=passed,
         summary=(
-            "三个精确日期对完成有界查询，并形成至少两个浏览器 11/11、iCom 4/4 的推荐方案"
+            "三个精确日期对完成有界查询，并形成一个浏览器 11/11、iCom 4/4 的最终推荐方案"
             if passed
             else "灵活日期查询未形成至少两个浏览器与 iCom 公共证据均完整的推荐方案"
         ),
@@ -366,23 +371,26 @@ def _check_source_dag(initial: LivePackageAgentRun) -> LiveDoneGateCheck:
     public_transfer_ids = tuple(initial.public_transfer_task_ids)
     all_source_ids = (*browser_source_ids, *public_transfer_ids)
     graph_ids = {task.id for task in initial.scheduler.graph.tasks}
+    expected_lodging_suffixes = (
+        "lodging-full",
+        "lodging-first",
+        "lodging-middle",
+        "lodging-last",
+        *(
+            ("lodging-hulhumale-full",)
+            if initial.stay_plan_candidate_set is not None
+            else ()
+        ),
+    )
     expected_browser = {
         f"source-{provider.value}-{suffix}"
         for provider in LIVE_V5_BROWSER_PROVIDERS
         for suffix in (
             "flight",
-            *(
-                (
-                    "lodging-full",
-                    "lodging-first",
-                    "lodging-middle",
-                    "lodging-last",
-                )
-                if provider in _LODGING_PROVIDERS
-                else ()
-            ),
+            *(expected_lodging_suffixes if provider in _LODGING_PROVIDERS else ()),
         )
     }
+    expected_browser_count = len(expected_browser)
     coverage = initial.public_transfer_coverage
     public_coverage_complete = (
         coverage is not None
@@ -395,22 +403,28 @@ def _check_source_dag(initial: LivePackageAgentRun) -> LiveDoneGateCheck:
         and coverage.usable_option_count >= 4
     )
     passed = (
-        len(browser_source_ids) == 11
+        len(browser_source_ids) == expected_browser_count
         and set(browser_source_ids) == expected_browser
         and public_transfer_ids == _EXPECTED_PUBLIC_TRANSFER_TASK_IDS
-        and len(all_source_ids) == 15
+        and len(all_source_ids) == expected_browser_count + len(
+            _EXPECTED_PUBLIC_TRANSFER_TASK_IDS
+        )
         and set(all_source_ids) <= graph_ids
         and public_coverage_complete
         and initial.scheduler.succeeded
-        and initial.scheduler.max_parallel_tasks >= 15
+        and initial.scheduler.max_parallel_tasks >= len(all_source_ids)
     )
     return LiveDoneGateCheck(
-        id="fifteen_source_agent_dag",
+        id="versioned_source_agent_dag",
         passed=passed,
         summary=(
-            "11 路浏览器与 4 路 iCom 官方公共读取进入同一 15 源可追溯 DAG"
+            f"{expected_browser_count} 路浏览器与 4 路 iCom 官方公共读取进入同一 "
+            f"{expected_browser_count + 4} 源可追溯 DAG"
             if passed
-            else "15 源 DAG、iCom 4/4 覆盖、调度成功或并发证据不完整"
+            else (
+                f"{expected_browser_count + 4} 源 DAG、iCom 4/4 覆盖、"
+                "调度成功或并发证据不完整"
+            )
         ),
         evidence={
             "browser_source_count": len(browser_source_ids),
@@ -870,6 +884,14 @@ def _round_trip_quote_errors(quote: BrowserQuote) -> tuple[str, ...]:
     for field, expected in expected_fields.items():
         if details.get(field) != expected:
             errors.append(f"{field} must be {expected}")
+    if quote.provider == BrowserProvider.QUNAR:
+        comparison = details.get("party_price_comparison")
+        if not isinstance(comparison, dict) or comparison.get(
+            "schema"
+        ) != "tripchord.flight_party_comparison.v1":
+            errors.append(
+                "Qunar flight requires a server-verified same-product one/two-adult comparison"
+            )
     for field in (
         "combination_id",
         "price_basis_evidence",

@@ -49,7 +49,7 @@ from tripchord.planning.flexible_dates import (
     QueryPlanPolicy,
     QueryTaskKind,
 )
-from tripchord.planning.stay_plans import system_stay_plan_candidate_set
+from tripchord.planning.stay_plans import StayPlanCandidateSet, system_stay_plan_candidate_set
 
 # C-122 HG-G: the frozen live-v4 scenario seals EXACTLY three date pairs, each
 # executing the same fixed per-pair browser-source / query-task / iCom-source
@@ -58,7 +58,7 @@ FROZEN_V4_PAIR_COUNT = 3
 
 
 @lru_cache(maxsize=1)
-def _frozen_candidate_set() -> object:
+def _frozen_candidate_set() -> StayPlanCandidateSet:
     """The immutable system-frozen candidate set the canonical graph is built from."""
     return system_stay_plan_candidate_set()
 
@@ -404,7 +404,7 @@ def frozen_v4_canonical_pair_ids(
             "frozen canonical pair-set derivation produced "
             f"{len(trio)}/{FROZEN_V4_PAIR_COUNT} pairs"
         )
-    return tuple(trio)
+    return (trio[0], trio[1], trio[2])
 
 
 # A real ``FlexibleQueryTask.id``: ``query:<platform>:<kind>:<16-hex>`` — the

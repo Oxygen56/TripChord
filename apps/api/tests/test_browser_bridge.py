@@ -42,6 +42,7 @@ from tripchord.providers.browser_bridge import (
     fliggy_trusted_flight_search_url,
     qunar_trusted_flight_search_url,
     tongcheng_trusted_flight_search_url,
+    tongcheng_trusted_lodging_search_url,
 )
 
 OLD_BUILD_SHA256 = "1" * 64
@@ -1513,6 +1514,14 @@ def test_qunar_trusted_flight_url_uses_audited_names_and_exact_percent_encoding(
         "&fromCity=%E6%9D%AD%E5%B7%9E&toCity=%E9%A9%AC%E7%B4%AF"
         "&adultNum=2&childNum=0&fromDate=2026-08-01&toDate=2026-08-05"
     )
+    assert qunar_trusted_flight_search_url(
+        canonical.model_copy(update={"destination": "马尔代夫"})
+    ) == (
+        "https://flight.qunar.com/twell/flight/Search.jsp"
+        "?from=flight_int_search&showTotalPr=0&searchType=RoundTripFlight"
+        "&fromCity=%E6%9D%AD%E5%B7%9E&toCity=%E9%A9%AC%E7%B4%AF"
+        "&adultNum=2&childNum=0&fromDate=2026-08-01&toDate=2026-08-05"
+    )
     for update in (
         {"origin": "上海"},
         {"destination": "东京"},
@@ -1548,6 +1557,41 @@ def test_tongcheng_trusted_flight_url_encodes_official_book1_search_contract() -
     ):
         with pytest.raises(ValueError, match="audited"):
             tongcheng_trusted_flight_search_url(canonical.model_copy(update=update))
+
+
+def test_tongcheng_trusted_lodging_url_is_exact_and_submission_allows_it() -> None:
+    canonical = BrowserSearchQuery(
+        destination="胡鲁马累",
+        start_date=date(2026, 9, 4),
+        end_date=date(2026, 9, 6),
+        adults=2,
+        rooms=1,
+        options={
+            "expected_package_area": "airport_island",
+            "expected_lodging_place_key": "hulhumale",
+            "segment": "first",
+        },
+    )
+    expected = (
+        "https://www.ly.com/hotel/hotellist"
+        "?city=110018578&inDate=2026-09-04&outDate=2026-09-06"
+        "&adultsNumber=2&roomNum=1&intl=1"
+    )
+    assert tongcheng_trusted_lodging_search_url(canonical) == expected
+    accepted = BrowserTaskSubmission(
+        provider=BrowserProvider.TONGCHENG,
+        kind=BrowserVertical.LODGING,
+        query=canonical.model_copy(update={"search_url": expected}),
+    )
+    assert accepted.query.search_url == expected
+    with pytest.raises(ValidationError, match="audited provider search contract"):
+        BrowserTaskSubmission(
+            provider=BrowserProvider.TONGCHENG,
+            kind=BrowserVertical.LODGING,
+            query=canonical.model_copy(
+                update={"search_url": f"{expected}&tracking=unexpected"}
+            ),
+        )
 
 
 def test_success_requires_quote_and_blocked_requires_gate_failure() -> None:
@@ -1635,6 +1679,15 @@ def test_flight_quote_enforces_provider_workflow_contract(
     assert result.details["workflow_kind"] == workflow
     assert result.details["party_availability_status"] == party_status
     assert result.details["action_trace"] == actions
+
+
+def test_observed_party_context_is_valid_availability_without_price_proof() -> None:
+    raw = quote(BrowserProvider.QUNAR, BrowserVertical.FLIGHT).model_dump(mode="python")
+    raw["details"]["party_availability_status"] = "observed_party_context"
+
+    accepted = BrowserQuote.model_validate(raw)
+
+    assert accepted.details["party_availability_status"] == "observed_party_context"
 
 
 @pytest.mark.parametrize(

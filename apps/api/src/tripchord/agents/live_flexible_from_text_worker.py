@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, cast
 
 _MODEL_EXECUTION_RECEIPT_SCHEMA = "tripchord-model-execution-receipt-v1"
 
@@ -436,4 +436,4 @@ async def run_live_flexible_from_text(
     result["_worker_observability"] = observability.as_payload()
     if runtime_receipt is not None:
         result["worker_runtime_receipt"] = runtime_receipt
-    return result
+    return cast(dict[str, Any], result)

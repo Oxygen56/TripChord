@@ -334,7 +334,7 @@ def test_v5_query_plan_uses_flight_only_tongcheng_capability() -> None:
     )
 
 
-def test_v4_default_query_plan_freezes_each_provider_lane_at_40_seconds() -> None:
+def test_v4_default_query_plan_freezes_each_provider_lane_at_one_second() -> None:
     window = FlexibleTravelWindow(
         origin="杭州",
         destination="马累",
@@ -362,7 +362,7 @@ def test_v4_default_query_plan_freezes_each_provider_lane_at_40_seconds() -> Non
         offsets = tuple(
             task.scheduled_offset_ms for task in plan.tasks if task.platform == platform
         )
-        assert offsets == tuple(index * 40_000 for index in range(len(offsets)))
+        assert offsets == tuple(index * 1_000 for index in range(len(offsets)))
 
 
 def _v4_source_graph_fixture() -> tuple[SimpleNamespace, StayPlanCandidateSet]:
@@ -1041,7 +1041,7 @@ def _stage_aware_done_gate_fixture() -> SimpleNamespace:
     return SimpleNamespace(
         pair_runs=tuple(pair_runs),
         publication_refresh_minimum_options=2,
-        recommended_option_ids=tuple(recommended_ids),
+        recommended_option_ids=(recommended_ids[0],),
     )
 
 
@@ -1140,7 +1140,7 @@ def _recommendable_fixture() -> SimpleNamespace:
         **{
             **vars(run),
             "ranked_options": options,
-            "recommended_option_ids": tuple(option.option_id for option in options),
+            "recommended_option_ids": (options[0].option_id,),
         }
     )
 
@@ -1157,11 +1157,7 @@ def test_recommendable_gate_counts_distinct_real_date_pairs_only() -> None:
                 run.ranked_options[0],
                 run.ranked_options[2],
             ),
-            "recommended_option_ids": (
-                run.ranked_options[0].option_id,
-                run.ranked_options[0].option_id,
-                run.ranked_options[2].option_id,
-            ),
+            "recommended_option_ids": (run.ranked_options[0].option_id,),
         }
     )
     assert not _check_recommendable_options(
@@ -1271,7 +1267,7 @@ def test_two_publication_options_are_rechecked_against_600_second_ttl_after_even
             **vars(base),
             "pair_runs": tuple(refreshed_executions),
             "ranked_options": options,
-            "recommended_option_ids": tuple(item.option_id for item in options),
+            "recommended_option_ids": (options[0].option_id,),
             "publication_refresh_minimum_options": 2,
         }
     )

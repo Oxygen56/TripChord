@@ -6,10 +6,10 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 from pydantic import Field, JsonValue, TypeAdapter, ValidationError, model_validator
 
@@ -71,6 +71,8 @@ _FIELD_LABELS = (
     "从哪里出发",
     "出发日期",
     "出发时间",
+    "出发窗口",
+    "开始日期",
     "目的地",
     "出发地",
     "到达地",
@@ -111,6 +113,7 @@ _MODEL_FACT_FIELDS = (
     "min_nights",
     "max_nights",
     "adults",
+    "children_ages",
     "rooms",
     "currency",
     "budget_cents",
@@ -125,7 +128,9 @@ _LOCATION_IATA_BY_ALIAS = {
     "male": "MLE",
     "malé": "MLE",
     "mle": "MLE",
+    "马尔代夫": "MLE",
 }
+_CHINESE_SMALL_NUMBERS = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4}
 
 
 class PackageRequestState(StrEnum):
@@ -168,6 +173,9 @@ class PackageRequirementRequest(DomainModel):
     reference_date: date = Field(default_factory=date.today)
     breakfast_mode: PreferenceMode | None = None
     breakfast_weight: float | None = Field(default=None, ge=0, le=1)
+    # Optional structured override; the same canonical tuple is also extracted
+    # from Chinese text below.
+    children_ages: tuple[int, ...] = ()
 
     @model_validator(mode="after")
     def validate_breakfast_override(self) -> PackageRequirementRequest:
@@ -185,6 +193,12 @@ class PackageRequirementRequest(DomainModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_children_ages(self) -> PackageRequirementRequest:
+        if any(age < 0 or age > 17 for age in self.children_ages):
+            raise ValueError("children ages must be between 0 and 17")
+        return self
+
 
 class PackageIntentTemplate(DomainModel):
     """Package intent fields that are stable before a flexible date pair is selected."""
@@ -193,6 +207,9 @@ class PackageIntentTemplate(DomainModel):
     origin: str = Field(min_length=1)
     destination: str = Field(min_length=1)
     adults: int = Field(ge=1, le=20)
+    children: int = Field(default=0, ge=0, le=20)
+    children_ages: tuple[int, ...] = ()
+    infants: int = Field(default=0, ge=0, le=10)
     rooms: int = Field(ge=1, le=8)
     currency: str = Field(default="CNY", min_length=3, max_length=3)
     budget_cents: int | None = Field(default=None, ge=0)
@@ -203,6 +220,7 @@ class PackageIntentTemplate(DomainModel):
     breakfast_preference_weight: float | None = Field(default=None, ge=0, le=1)
     minimum_arrival_to_boat_minutes: int = Field(default=120, ge=0, le=1440)
     minimum_airport_buffer_minutes: int = Field(default=180, ge=0, le=1440)
+    latest_arrival_date: date | None = None
 
     def materialize(self, departure_date: date, return_date: date) -> PackageIntent:
         return PackageIntent(
@@ -212,6 +230,9 @@ class PackageIntentTemplate(DomainModel):
             start_date=departure_date,
             end_date=return_date,
             adults=self.adults,
+            children=self.children,
+            children_ages=self.children_ages,
+            infants=self.infants,
             rooms=self.rooms,
             currency=self.currency,
             budget_cents=self.budget_cents,
@@ -222,7 +243,81 @@ class PackageIntentTemplate(DomainModel):
             breakfast_preference_weight=self.breakfast_preference_weight,
             minimum_arrival_to_boat_minutes=self.minimum_arrival_to_boat_minutes,
             minimum_airport_buffer_minutes=self.minimum_airport_buffer_minutes,
+            latest_arrival_date=self.latest_arrival_date,
         )
+
+
+# These are the preference keys whose semantics are represented directly by
+# PackageIntentTemplate.  Keep this list deliberately narrow: a preference
+# that is not represented here must remain visible as an unapplied diagnostic
+# rather than being presented as if it affected live ranking.
+_INTENT_TEMPLATE_PREFERENCE_KEYS = frozenset(
+    {"checked_baggage", "flight_connections", "hotel_breakfast"}
+)
+
+
+def project_preferences_to_intent_template(
+    template: PackageIntentTemplate,
+    preferences: PreferenceConstitution,
+) -> tuple[PackageIntentTemplate, tuple[str, ...]]:
+    """Project effective typed preferences into executable package intent.
+
+    The constitution has already resolved current-trip rules over durable
+    rules by source priority.  This function therefore only translates the
+    resulting effective rule; it never lets a durable rule overwrite an
+    explicit current request.  Unsupported keys are returned for a diagnostic
+    and are intentionally not used to alter the intent.
+    """
+
+    updates: dict[str, object] = {}
+
+    baggage = preferences.effective("checked_baggage")
+    if baggage is not None and baggage.mode in {
+        PreferenceMode.REQUIRED,
+        PreferenceMode.FORBIDDEN,
+    }:
+        updates["require_checked_baggage"] = (
+            baggage.expected
+            if isinstance(baggage.expected, bool)
+            else baggage.mode == PreferenceMode.REQUIRED
+        )
+
+    connections = preferences.effective("flight_connections")
+    if connections is not None and connections.mode in {
+        PreferenceMode.REQUIRED,
+        PreferenceMode.FORBIDDEN,
+    }:
+        updates["allow_connections"] = (
+            connections.expected
+            if isinstance(connections.expected, bool)
+            else connections.mode == PreferenceMode.REQUIRED
+        )
+
+    breakfast = preferences.effective("hotel_breakfast")
+    if breakfast is not None:
+        if breakfast.mode in {PreferenceMode.REQUIRED, PreferenceMode.FORBIDDEN}:
+            updates["require_breakfast"] = (
+                breakfast.expected
+                if isinstance(breakfast.expected, bool)
+                else breakfast.mode == PreferenceMode.REQUIRED
+            )
+        elif breakfast.mode == PreferenceMode.WEIGHTED:
+            updates["require_breakfast"] = None
+            updates["breakfast_preference_mode"] = breakfast.mode
+            updates["breakfast_preference_weight"] = breakfast.weight
+        elif breakfast.mode == PreferenceMode.INDIFFERENT:
+            updates["require_breakfast"] = None
+            updates["breakfast_preference_mode"] = breakfast.mode
+            updates["breakfast_preference_weight"] = 0.0
+
+    unsupported = tuple(
+        sorted(
+            rule.key
+            for rule in preferences.effective_rules()
+            if rule.key not in _INTENT_TEMPLATE_PREFERENCE_KEYS
+        )
+    )
+    return template.model_copy(update=updates), unsupported
 
 
 class ModelPreferenceProposal(DomainModel):
@@ -261,6 +356,9 @@ class ModelPackageRequirementProposal(DomainModel):
     min_nights: int | None = Field(default=None, ge=1, le=60)
     max_nights: int | None = Field(default=None, ge=1, le=60)
     adults: int | None = Field(default=None, ge=1, le=20)
+    children: int | None = Field(default=None, ge=0, le=20)
+    children_ages: tuple[int, ...] | None = None
+    infants: int | None = Field(default=None, ge=0, le=10)
     rooms: int | None = Field(default=None, ge=1, le=8)
     currency: str | None = Field(default=None, min_length=3, max_length=3)
     budget_cents: int | None = Field(default=None, ge=0)
@@ -271,6 +369,14 @@ class ModelPackageRequirementProposal(DomainModel):
 
     @model_validator(mode="after")
     def validate_ranges_and_preferences(self) -> ModelPackageRequirementProposal:
+        if self.children_ages is not None and any(
+            age < 0 or age > 17 for age in self.children_ages
+        ):
+            raise ValueError("children ages must be between 0 and 17")
+        if self.children is not None and self.children > 0 and (
+            self.children_ages is None or len(self.children_ages) != self.children
+        ):
+            raise ValueError("children_ages must contain exactly one age for every child")
         if (
             self.earliest_departure is not None
             and self.latest_departure is not None
@@ -322,6 +428,9 @@ class _Draft:
     conflicts: list[RequirementConflict] = field(default_factory=list)
     unresolved: list[UnresolvedRequirement] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    latest_return_date: date | None = None
+    latest_arrival_date: date | None = None
+    return_date_targets: tuple[date, ...] = ()
 
 
 class HybridPackageRequirementAgent:
@@ -390,6 +499,20 @@ class HybridPackageRequirementAgent:
                     )
                 )
 
+        children = self._int_value(draft.values.get("children", 0))
+        ages = draft.values.get("children_ages")
+        if children > 0 and (
+            not isinstance(ages, (list, tuple)) or len(ages) != children
+        ):
+            self._add_unresolved(
+                draft,
+                UnresolvedRequirement(
+                    field="children_ages",
+                    reason="儿童年龄必须逐一提供且与儿童人数一致，未知时不得发布完整 party 总价",
+                    critical=True,
+                ),
+            )
+
         self._add_missing_critical_fields(draft, proposal)
         window = self._build_window(draft)
         intent_template = self._build_intent_template(normalized_request, draft)
@@ -435,11 +558,19 @@ class HybridPackageRequirementAgent:
         draft = _Draft()
         text = request.text.strip()
         self._extract_locations(text, draft)
+        self._normalize_destination_scope(draft)
         self._resolve_location_codes(draft)
         self._extract_dates(text, request.reference_date, draft)
         self._validate_departure_recency(draft, request.reference_date)
         self._extract_duration(text, draft)
+        self._apply_return_boundary(draft)
         self._extract_party(text, draft)
+        if request.children_ages:
+            self._set_fact(
+                draft, "children_ages", list(request.children_ages),
+                RequirementFactSource.STRUCTURED_USER_OVERRIDE,
+                "用户通过结构化控件提供儿童年龄", overwrite=True,
+            )
         self._extract_budget_and_currency(text, draft)
         self._extract_baggage(text, draft, captured_at)
         self._extract_breakfast(text, draft, captured_at)
@@ -489,6 +620,77 @@ class HybridPackageRequirementAgent:
                         RequirementFactSource.EXPLICIT_TEXT,
                         natural.group(0),
                     )
+        if "origin" not in draft.values:
+            origin = re.search(
+                r"从\s*([\u4e00-\u9fffA-Za-z]{2,20})\s*出发",
+                text,
+            )
+            if origin is not None:
+                self._set_fact(
+                    draft,
+                    "origin",
+                    origin.group(1),
+                    RequirementFactSource.EXPLICIT_TEXT,
+                    origin.group(0),
+                )
+        if "origin" not in draft.values:
+            known_aliases = sorted(
+                (alias for alias in _LOCATION_IATA_BY_ALIAS if len(alias) >= 2),
+                key=len,
+                reverse=True,
+            )
+            origin = re.search(
+                rf"(?:从\s*)?(?P<origin>{'|'.join(map(re.escape, known_aliases))})\s*出发",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if origin is not None:
+                self._set_fact(
+                    draft,
+                    "origin",
+                    origin.group("origin"),
+                    RequirementFactSource.EXPLICIT_TEXT,
+                    origin.group(0),
+                )
+        if "destination" not in draft.values:
+            aliases = sorted(_LOCATION_IATA_BY_ALIAS, key=len, reverse=True)
+            destination = re.search(
+                rf"(?:规划|前往|去往|去|到|飞往)\s*"
+                rf"(?P<destination>{'|'.join(map(re.escape, aliases))})"
+                rf"|[，,、]\s*(?P<after_comma>{'|'.join(map(re.escape, aliases))})",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if destination is not None:
+                value = destination.group("destination") or destination.group("after_comma")
+                self._set_fact(
+                    draft,
+                    "destination",
+                    value,
+                    RequirementFactSource.EXPLICIT_TEXT,
+                    destination.group(0),
+                )
+
+    def _normalize_destination_scope(self, draft: _Draft) -> None:
+        """Keep a travel scope qualifier out of the gateway identity.
+
+        ``马尔代夫周边游`` describes a trip scope, not a different airport or
+        destination identity.  The gateway remains the trusted MALÉ mapping;
+        island choices are represented by lodging evidence later in planning.
+        """
+        destination = draft.values.get("destination")
+        if not isinstance(destination, str):
+            return
+        normalized = re.sub(r"(?:周边)?游$", "", destination.strip())
+        if normalized and normalized != destination:
+            self._set_fact(
+                draft,
+                "destination",
+                normalized,
+                RequirementFactSource.EXPLICIT_TEXT,
+                "目的地中的“周边游”是行程范围修饰，不改变马尔代夫 gateway 身份",
+                overwrite=True,
+            )
 
     def _resolve_location_codes(self, draft: _Draft) -> None:
         for location_field, code_field in (
@@ -594,9 +796,88 @@ class HybridPackageRequirementAgent:
                     same_month_range.group(0),
                 )
                 return
+        relative_departure = re.search(r"(?:从\s*)?明天(?:开始|起)?", text)
+        deadline = re.search(
+            r"(?:到|截至|不晚于)\s*(?P<month>\d{1,2})\s*月\s*"
+            r"(?P<day>\d{1,2})\s*日?\s*(?:前)?",
+            text,
+        )
+        if (
+            (relative_departure is not None or deadline is not None)
+            and _FULL_DATE_PATTERN.search(text) is None
+        ):
+            relative_departure_date: date | None = None
+            if relative_departure is not None:
+                relative_departure_date = reference_date + timedelta(days=1)
+                self._set_fact(
+                    draft,
+                    "earliest_departure",
+                    relative_departure_date,
+                    RequirementFactSource.EXPLICIT_TEXT,
+                    relative_departure.group(0),
+                )
+                self._set_fact(
+                    draft,
+                    "latest_departure",
+                    relative_departure_date,
+                    RequirementFactSource.EXPLICIT_TEXT,
+                    relative_departure.group(0),
+                )
+            if deadline is not None:
+                month = int(deadline.group("month"))
+                day = int(deadline.group("day"))
+                year = (
+                    reference_date.year
+                    if month >= reference_date.month
+                    else reference_date.year + 1
+                )
+                try:
+                    return_deadline = date(year, month, day)
+                except ValueError:
+                    self._add_unresolved(
+                        draft,
+                        UnresolvedRequirement(
+                            field="date_window",
+                            reason=f"用户提供的返程边界无效：{deadline.group(0)}",
+                            critical=True,
+                        ),
+                    )
+                    return
+                draft.latest_return_date = return_deadline
+                draft.latest_arrival_date = return_deadline
+                # A natural-language arrival deadline is an explicit search
+                # boundary, not a single guessed return leg.  Preserve the
+                # boundary and probe the last two legal return dates so the
+                # formal planner can compare the user's "before Sep 10"
+                # wording without silently dropping Sep 10 itself.  The
+                # actual arrival verifier remains authoritative for the
+                # inclusive home-arrival deadline.
+                if (
+                    relative_departure_date is None
+                    or return_deadline > relative_departure_date
+                ):
+                    draft.return_date_targets = tuple(
+                        dict.fromkeys(
+                            (
+                                return_deadline - timedelta(days=1),
+                                return_deadline,
+                            )
+                        )
+                    )
+                self._set_fact(
+                    draft,
+                    "latest_arrival_date",
+                    return_deadline,
+                    RequirementFactSource.EXPLICIT_TEXT,
+                    deadline.group(0),
+                )
+            return
         parsed_dates: list[tuple[date, str]] = []
         invalid_dates: list[str] = []
         for match in _FULL_DATE_PATTERN.finditer(text):
+            prefix = text[max(0, match.start() - 18) : match.start()]
+            if re.search(r"(?:当前日期|今天|今日|现在|基准日期)\s*(?:是|为|：|:)\s*$", prefix):
+                continue
             try:
                 value = date(
                     int(match.group("year")),
@@ -625,10 +906,27 @@ class HybridPackageRequirementAgent:
             departure_dates = self._dates_from_labels(
                 text,
                 ("去程", "出发日期", "出发时间"),
+                reference_date,
             )
             return_dates = self._dates_from_labels(
                 text,
                 ("返程", "回程", "返回日期", "返程日期"),
+                reference_date,
+            )
+            for suffix_match in re.finditer(
+                r"(?P<value>(?:\d{1,2}\s*月\s*\d{1,2}\s*日"
+                r"(?:\s*(?:与|和|或|/|、)\s*\d{1,2}\s*月\s*\d{1,2}\s*日)*)\s*返程)",
+                text,
+            ):
+                return_dates += self._dates_from_labels(
+                    f"返程：{suffix_match.group('value')}",
+                    ("返程",),
+                    reference_date,
+                )
+            departure_dates += self._dates_from_labels(
+                text,
+                ("出发窗口", "开始日期"),
+                reference_date,
             )
             if departure_dates or return_dates:
                 departure: date | None = None
@@ -661,23 +959,34 @@ class HybridPackageRequirementAgent:
                 return_date: date | None = None
                 if return_dates:
                     return_date, return_text = return_dates[0]
-                    self._set_fact(
-                        draft,
-                        "exact_return_date",
-                        return_date,
-                        RequirementFactSource.EXPLICIT_TEXT,
-                        return_text,
-                    )
                     unique_returns = tuple(dict.fromkeys(item[0] for item in return_dates))
-                    if len(unique_returns) > 1:
-                        draft.conflicts.append(
-                            RequirementConflict(
-                                field="return_date",
-                                deterministic_value=unique_returns[0].isoformat(),
-                                model_value=unique_returns[1].isoformat(),
-                                reason="用户输入了多个不同的明确返程日期",
-                            )
+                    if len(unique_returns) == 1:
+                        draft.latest_arrival_date = unique_returns[0]
+                        self._set_fact(
+                            draft,
+                            "exact_return_date",
+                            return_date,
+                            RequirementFactSource.EXPLICIT_TEXT,
+                            return_text,
                         )
+                    else:
+                        draft.return_date_targets = unique_returns
+                        draft.latest_return_date = max(unique_returns)
+                        draft.latest_arrival_date = max(unique_returns)
+                        draft.notes.append("多个明确返程日期作为候选目标共同纳入日期遍历")
+                        minimum = draft.values.get("min_nights")
+                        if departure is not None and isinstance(minimum, int):
+                            derived_latest = max(unique_returns) - timedelta(days=minimum)
+                            if derived_latest >= departure:
+                                self._set_fact(
+                                    draft,
+                                    "latest_departure",
+                                    derived_latest,
+                                    RequirementFactSource.DETERMINISTIC_DERIVATION,
+                                    "按最晚返程边界和最短行程时长推导最晚可出发日",
+                                    explicit=False,
+                                    overwrite=True,
+                                )
                 if departure is not None and return_date is not None and return_date <= departure:
                     draft.conflicts.append(
                         RequirementConflict(
@@ -934,18 +1243,65 @@ class HybridPackageRequirementAgent:
     def _extract_party(self, text: str, draft: _Draft) -> None:
         adults = re.search(r"(\d{1,2})\s*(?:名|位|个)?\s*成人", text)
         if adults is None:
+            adults = re.search(
+                rf"({'|'.join(_CHINESE_SMALL_NUMBERS)})\s*(?:名|位|个)?\s*成人",
+                text,
+            )
+        if adults is None:
             adults = re.search(r"(?:人数|出行人数)\s*[:：]?\s*(\d{1,2})\s*人", text)
+        if adults is None and re.search(
+            r"(?:我和(?:女朋友|女友)|本人和(?:女朋友|女友)|两个人|两位伴侣)",
+            text,
+        ):
+            self._set_fact(
+                draft,
+                "adults",
+                2,
+                RequirementFactSource.EXPLICIT_TEXT,
+                "我和女朋友两个人",
+            )
         if adults is not None:
             self._set_fact(
                 draft,
                 "adults",
-                int(adults.group(1)),
+                (
+                    int(adults.group(1))
+                    if adults.group(1).isdigit()
+                    else _CHINESE_SMALL_NUMBERS[adults.group(1)]
+                ),
                 RequirementFactSource.EXPLICIT_TEXT,
                 adults.group(0),
+            )
+        children = re.search(r"(\d{1,2})\s*(?:名|位|个)?\s*儿童", text)
+        if children is not None:
+            self._set_fact(
+                draft, "children", int(children.group(1)),
+                RequirementFactSource.EXPLICIT_TEXT, children.group(0)
+            )
+        ages = re.findall(r"(\d{1,2})\s*岁", text)
+        if ages:
+            self._set_fact(
+                draft, "children_ages", [int(age) for age in ages],
+                RequirementFactSource.EXPLICIT_TEXT, "、".join(ages) + "岁",
+            )
+        infants = re.search(r"(\d{1,2})\s*(?:名|位|个)?\s*婴儿", text)
+        if infants is not None:
+            self._set_fact(
+                draft, "infants", int(infants.group(1)),
+                RequirementFactSource.EXPLICIT_TEXT, infants.group(0)
             )
         rooms = re.search(r"(\d{1,2})\s*间\s*(?:房|客房|房间)", text)
         if rooms is None:
             rooms = re.search(r"(?:酒店|房间数)\s*[:：]?\s*(\d{1,2})\s*间", text)
+        if rooms is None and re.search(r"(?:本人和女友|本人和女朋友|女友|女朋友|情侣|夫妻)", text):
+            self._set_fact(
+                draft,
+                "rooms",
+                1,
+                RequirementFactSource.DETERMINISTIC_DERIVATION,
+                "两位伴侣按一间房比较；如需分房应在确认前调整",
+                explicit=False,
+            )
         if rooms is not None:
             self._set_fact(
                 draft,
@@ -954,6 +1310,35 @@ class HybridPackageRequirementAgent:
                 RequirementFactSource.EXPLICIT_TEXT,
                 rooms.group(0),
             )
+
+    def _apply_return_boundary(self, draft: _Draft) -> None:
+        latest_return = draft.latest_return_date
+        earliest = draft.values.get("earliest_departure")
+        minimum = draft.values.get("min_nights")
+        if not isinstance(latest_return, date) or not isinstance(earliest, date):
+            return
+        if not isinstance(minimum, int):
+            return
+        latest_departure = latest_return - timedelta(days=minimum)
+        if latest_departure < earliest:
+            self._add_unresolved(
+                draft,
+                UnresolvedRequirement(
+                    field="date_window",
+                    reason="最晚返程边界早于最短行程可覆盖的出发日",
+                    critical=True,
+                ),
+            )
+            return
+        self._set_fact(
+            draft,
+            "latest_departure",
+            latest_departure,
+            RequirementFactSource.DETERMINISTIC_DERIVATION,
+            "按最晚返程边界和最短行程时长推导最晚可出发日",
+            explicit=False,
+            overwrite=True,
+        )
 
     def _extract_budget_and_currency(self, text: str, draft: _Draft) -> None:
         scoped_budget = _SCOPED_BUDGET_PATTERN.search(text)
@@ -1235,7 +1620,7 @@ class HybridPackageRequirementAgent:
                 key="flight_connections",
                 mode=PreferenceMode.FORBIDDEN,
                 weight=1,
-                expected=True,
+                expected=False,
                 reason=match.group(0),
                 captured_at=captured_at,
             )
@@ -1255,6 +1640,53 @@ class HybridPackageRequirementAgent:
                 weight=1,
                 expected=True,
                 reason=match.group(0),
+                captured_at=captured_at,
+            )
+        if match := re.search(r"酒店(?:不能(?:太)?|不可(?:太)?)简陋|可稍有品质|酒店品质", text):
+            draft.preferences["lodging_quality"] = self._preference_rule(
+                key="lodging_quality",
+                mode=PreferenceMode.REQUIRED,
+                weight=1,
+                expected="not_basic",
+                reason=match.group(0),
+                captured_at=captured_at,
+            )
+        if match := re.search(r"(?:酒店)?不能太偏|位置不能太偏|交通便利|位置方便", text):
+            draft.preferences["lodging_location"] = self._preference_rule(
+                key="lodging_location",
+                mode=PreferenceMode.REQUIRED,
+                weight=1,
+                expected="convenient_not_remote",
+                reason=match.group(0),
+                captured_at=captured_at,
+            )
+        if match := re.search(r"价格不能过高|价格不宜过高|价格合理|价格适中|不能太贵", text):
+            draft.preferences["lodging_price"] = self._preference_rule(
+                key="lodging_price",
+                mode=PreferenceMode.WEIGHTED,
+                weight=0.75,
+                expected="reasonable_not_high",
+                reason=(
+                    f"{match.group(0)}；用户未提供数字预算，按相对偏好比较，不推导硬性价格上限"
+                ),
+                captured_at=captured_at,
+            )
+        if match := re.search(r"(?:机场附近(?:可以|可|能)?住|住机场附近|机场附近住宿)", text):
+            draft.preferences["airport_lodging_fallback"] = self._preference_rule(
+                key="airport_lodging_fallback",
+                mode=PreferenceMode.INDIFFERENT,
+                weight=0,
+                expected=None,
+                reason=f"{match.group(0)}；机场住宿仅作为可选过渡，不替代岛屿方案比较",
+                captured_at=captured_at,
+            )
+        if match := re.search(r"关注有没有更好的选择|更好的选择|岛屿方案", text):
+            draft.preferences["lodging_zone_comparison"] = self._preference_rule(
+                key="lodging_zone_comparison",
+                mode=PreferenceMode.REQUIRED,
+                weight=1,
+                expected=True,
+                reason=f"{match.group(0)}；必须比较机场过渡与交通便利岛屿住宿",
                 captured_at=captured_at,
             )
 
@@ -1552,8 +1984,13 @@ class HybridPackageRequirementAgent:
                 min_nights=self._int_value(draft.values["min_nights"]),
                 max_nights=self._int_value(draft.values["max_nights"]),
                 adults=self._int_value(draft.values["adults"]),
+                children=self._int_value(draft.values.get("children", 0)),
+                infants=self._int_value(draft.values.get("infants", 0)),
                 rooms=self._int_value(draft.values["rooms"]),
                 currency=str(draft.values["currency"]),
+                latest_return_date=draft.latest_return_date,
+                latest_arrival_date=draft.latest_arrival_date,
+                return_date_targets=draft.return_date_targets,
             )
         except (TypeError, ValueError, ValidationError) as exc:
             self._add_unresolved(
@@ -1585,6 +2022,15 @@ class HybridPackageRequirementAgent:
                 origin=str(draft.values["origin"]),
                 destination=str(draft.values["destination"]),
                 adults=self._int_value(draft.values["adults"]),
+                children=self._int_value(draft.values.get("children", 0)),
+                children_ages=tuple(
+                    int(age)
+                    for age in cast(
+                        list[int] | tuple[int, ...],
+                        draft.values.get("children_ages", ()),
+                    )
+                ),
+                infants=self._int_value(draft.values.get("infants", 0)),
                 rooms=self._int_value(draft.values["rooms"]),
                 currency=str(draft.values["currency"]),
                 budget_cents=self._optional_int(draft.values.get("budget_cents")),
@@ -1604,6 +2050,7 @@ class HybridPackageRequirementAgent:
                 breakfast_preference_weight=(
                     breakfast_rule.weight if breakfast_rule is not None else None
                 ),
+                latest_arrival_date=draft.latest_arrival_date,
             )
         except (TypeError, ValueError, ValidationError) as exc:
             self._add_unresolved(
@@ -1731,6 +2178,7 @@ class HybridPackageRequirementAgent:
         self,
         text: str,
         labels: tuple[str, ...],
+        reference_date: date,
     ) -> tuple[tuple[date, str], ...]:
         values: list[tuple[date, str]] = []
         for labelled_value in self._label_values(text, labels):
@@ -1745,6 +2193,21 @@ class HybridPackageRequirementAgent:
                         match.group(0),
                     )
                 )
+            for match in re.finditer(
+                r"(?<!\d)(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日",
+                labelled_value,
+            ):
+                try:
+                    value = date(
+                        reference_date.year
+                        if int(match.group("month")) >= reference_date.month
+                        else reference_date.year + 1,
+                        int(match.group("month")),
+                        int(match.group("day")),
+                    )
+                except ValueError:
+                    continue
+                values.append((value, match.group(0)))
         return tuple(values)
 
     def _set_unique_text_match(

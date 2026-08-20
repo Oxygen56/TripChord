@@ -8,7 +8,13 @@ from threading import RLock
 
 from pydantic import Field, JsonValue, field_validator, model_validator
 
-from tripchord.agents.models import AgentRole
+from tripchord.agents.models import (
+    AgentRole,
+    PreferenceConstitution,
+    PreferenceMode,
+    PreferenceRule,
+    PreferenceSource,
+)
 from tripchord.domain.common import DomainModel
 
 _MAX_MEMORY_PAYLOAD_BYTES = 8_192
@@ -30,6 +36,203 @@ _PROMPT_INJECTION_MARKERS = (
     "系统提示词",
     "开发者消息",
 )
+
+# Durable preferences describe stable user intent, never a particular live
+# offer.  Semantic price preferences remain allowed (for example
+# ``lodging_price`` or ``price_sensitivity``); factual quote/inventory fields
+# are rejected recursively before they can enter stable memory.
+_DYNAMIC_PREFERENCE_KEYS = frozenset(
+    {
+        "price",
+        "price_cents",
+        "amount",
+        "amount_cents",
+        "total",
+        "total_cents",
+        "total_for_party_cents",
+        "quote",
+        "quote_id",
+        "fare",
+        "fare_id",
+        "inventory",
+        "availability",
+        "available",
+        "seat_count",
+        "seats",
+        "remaining_seats",
+        "flight_number",
+        "flight_no",
+        "schedule_id",
+        "departure_time",
+        "arrival_time",
+        "specific_flight",
+    }
+)
+_SEMANTIC_PRICE_KEYS = frozenset({"lodging_price", "price_sensitivity", "budget_sensitivity"})
+_SUPPORTED_PREFERENCE_KEYS = frozenset(
+    {
+        "airport_lodging_fallback",
+        "checked_baggage",
+        "compare_budget_options",
+        "flight_connections",
+        "hotel_breakfast",
+        "hotel_star_rating",
+        "lodging_location",
+        "lodging_price",
+        "lodging_quality",
+        "lodging_zone_comparison",
+        "price_sensitivity",
+        "budget_sensitivity",
+    }
+)
+_PREFERENCE_EXPECTED_VALUES: dict[str, frozenset[JsonValue]] = {
+    "airport_lodging_fallback": frozenset({True, False}),
+    "checked_baggage": frozenset({True, False}),
+    "compare_budget_options": frozenset({True, False}),
+    "flight_connections": frozenset({True, False}),
+    "hotel_breakfast": frozenset({True, False}),
+    "hotel_star_rating": frozenset({"3_plus", "4_plus", "5_plus"}),
+    "lodging_location": frozenset({"convenient_not_remote", "airport_nearby", "central"}),
+    "lodging_price": frozenset({"low", "reasonable_not_high", "price_first", "balanced"}),
+    "lodging_quality": frozenset({"not_basic", "standard", "premium"}),
+    "lodging_zone_comparison": frozenset({True, False}),
+    "price_sensitivity": frozenset({"low", "balanced", "high", "price_first"}),
+    "budget_sensitivity": frozenset({"low", "balanced", "high", "price_first"}),
+}
+
+
+def _is_dynamic_preference_key(key: str) -> bool:
+    normalized = key.strip().casefold()
+    if normalized in _SEMANTIC_PRICE_KEYS:
+        return False
+    if normalized in _DYNAMIC_PREFERENCE_KEYS:
+        return True
+    # Keep semantic preference names such as lodging_price, but reject fields
+    # that embed an exact live-fact marker (flight_price, quoted_amount, etc.).
+    return any(
+        marker in normalized
+        for marker in (
+            "total_cents",
+            "quote_",
+            "inventory",
+            "availability",
+            "seat_count",
+            "flight_number",
+            "schedule_id",
+        )
+    )
+
+
+def _reject_dynamic_preference_payload(value: JsonValue, *, path: str = "value") -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if _is_dynamic_preference_key(str(key)):
+                raise ValueError(
+                    f"长期偏好不能包含实时价格、余位、库存或具体班次字段: {path}.{key}"
+                )
+            _reject_dynamic_preference_payload(item, path=f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _reject_dynamic_preference_payload(item, path=f"{path}[{index}]")
+
+
+def normalize_confirmed_preference_value(key: str, value: JsonValue) -> dict[str, JsonValue]:
+    """Normalize the public memory envelope and reject live facts.
+
+    The legacy API accepted a scalar or a partial ``{mode, weight}`` object;
+    those forms remain readable while all newly stored records get the same
+    explicit mode/expected/weight shape.
+    """
+
+    normalized_key = key.strip()
+    if not normalized_key:
+        raise ValueError("preference key cannot be empty")
+    if normalized_key not in _SUPPORTED_PREFERENCE_KEYS:
+        raise ValueError(f"不支持的长期偏好 key: {normalized_key}")
+    if _is_dynamic_preference_key(normalized_key):
+        raise ValueError("长期偏好不能把实时价格、余位、库存或具体班次作为 key")
+    _reject_dynamic_preference_payload(value)
+    if isinstance(value, dict) and "mode" in value:
+        mode = PreferenceMode(str(value["mode"]))
+        expected = value.get("expected")
+        weight_value = value.get("weight")
+        if weight_value is not None and not isinstance(weight_value, (int, float, str)):
+            raise ValueError("preference weight must be numeric")
+        weight = float(weight_value) if weight_value is not None else {
+            PreferenceMode.REQUIRED: 1.0,
+            PreferenceMode.FORBIDDEN: 1.0,
+            PreferenceMode.INDIFFERENT: 0.0,
+        }.get(mode, 0.5)
+    elif isinstance(value, bool):
+        mode, expected, weight = PreferenceMode.REQUIRED, value, 1.0
+    elif isinstance(value, str) and value in {item.value for item in PreferenceMode}:
+        mode = PreferenceMode(value)
+        expected = {PreferenceMode.REQUIRED: True, PreferenceMode.FORBIDDEN: False}.get(mode)
+        weight = {PreferenceMode.REQUIRED: 1.0, PreferenceMode.FORBIDDEN: 1.0,
+                  PreferenceMode.INDIFFERENT: 0.0}.get(mode, 0.5)
+    else:
+        mode, expected, weight = PreferenceMode.WEIGHTED, value, 0.5
+    if not 0 <= weight <= 1:
+        raise ValueError("preference weight must be between 0 and 1")
+    if mode == PreferenceMode.REQUIRED and expected is None:
+        expected = True
+    if mode == PreferenceMode.FORBIDDEN and expected is None:
+        expected = False
+    if mode == PreferenceMode.INDIFFERENT:
+        expected = None
+        weight = 0.0
+    allowed_expected = _PREFERENCE_EXPECTED_VALUES[normalized_key]
+    if expected is not None and isinstance(expected, (dict, list)):
+        raise ValueError("长期偏好 expected 只能是受控布尔值或枚举值")
+    if expected is not None and expected not in allowed_expected:
+        raise ValueError(f"长期偏好 {normalized_key} 的 expected 不在允许枚举内")
+    return {"mode": mode.value, "expected": expected, "weight": weight}
+
+
+def confirmed_preference_constitution(
+    store: MemoryStore,
+    access: MemoryAccessContext,
+    *,
+    now: datetime | None = None,
+) -> PreferenceConstitution:
+    """Load only fresh, user-scoped confirmed preferences into domain rules."""
+
+    rules: list[PreferenceRule] = []
+    records = store.query(
+        MemoryQuery(kinds=(MemoryKind.USER_PREFERENCE,), fresh_only=True, rag_only=True, limit=200),
+        access,
+        now=now,
+    )
+    for record in records:
+        if record.scope != MemoryScope.USER or record.user_id != access.user_id:
+            continue
+        key = record.payload.get("key")
+        raw_value = record.payload.get("value")
+        if not isinstance(key, str):
+            continue
+        try:
+            normalized = normalize_confirmed_preference_value(key, raw_value)
+            normalized_weight = normalized["weight"]
+            if not isinstance(normalized_weight, (int, float)):
+                continue
+            rules.append(
+                PreferenceRule(
+                    key=key,
+                    mode=PreferenceMode(str(normalized["mode"])),
+                    expected=normalized["expected"],
+                    weight=float(normalized_weight),
+                    source=PreferenceSource.EXPLICIT_LONG_TERM,
+                    scope="user",
+                    reason="用户已显式确认的长期偏好",
+                    created_at=record.captured_at,
+                )
+            )
+        except (TypeError, ValueError):
+            # Corrupt/legacy records are not allowed to influence planning.
+            continue
+    return PreferenceConstitution(rules=tuple(rules)).model_copy(
+        update={"rules": PreferenceConstitution(rules=tuple(rules)).effective_rules()}
+    )
 
 
 def _validate_memory_json(value: JsonValue, *, depth: int = 0) -> None:

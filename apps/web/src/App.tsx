@@ -21,6 +21,7 @@ import {
   type JsonValue,
   type LiveBridgeHealth,
   type LiveEventReplanRun,
+  type FinalPlanProjection,
   type LiveFlexibleFromTextResponse,
   type LiveMonitorStatus,
   type LivePackageAgentRun,
@@ -639,18 +640,13 @@ function factValueLabel(field: string, value: JsonValue): string {
 
 function FlexiblePlanningSummary({
   response,
-  selectedDatePairId,
-  onSelect,
 }: {
   response: LiveFlexibleFromTextResponse;
-  selectedDatePairId: string;
-  onSelect: (datePairId: string) => void;
 }) {
   const interpretation = response.interpretation;
   const window = interpretation.window;
   const run = response.run;
-  const recommendableCount =
-    run?.ranked_options.filter((option) => option.recommendable).length ?? 0;
+  const finalPlan = response.final_plan;
   const breakfastApplication = getBreakfastPreferenceApplication(response);
   const pairById = new Map(
     run?.pair_runs.map((pair) => [pair.date_pair.id, pair]) ?? [],
@@ -764,8 +760,122 @@ function FlexiblePlanningSummary({
         <p className="execution-boundary">{response.execution_boundary}</p>
       </section>
 
+      {finalPlan ? (
+        <section className="final-plan-card" aria-label="最终最佳方案">
+          <div className="final-plan-heading">
+            <div>
+              <p className="eyebrow">最终方案</p>
+              <h2>这趟行程的最佳可执行方案</h2>
+            </div>
+            <strong>
+              {finalPlan.optimality_status === "optimality_proven"
+                ? "覆盖范围内总价最优"
+                : "当前已验证最优"}
+            </strong>
+          </div>
+          {finalPlan.flight && (
+            <div className="final-plan-itinerary">
+              <h3>往返航班</h3>
+              <article>
+                <strong>去程 {finalPlan.flight.outbound_flight_numbers.join(" + ")}</strong>
+                <span>
+                  {finalPlan.flight.origin} {formatDateTime(finalPlan.flight.outbound_depart_at)}
+                  {" → "}
+                  {finalPlan.flight.destination} {formatDateTime(finalPlan.flight.outbound_arrive_at)}
+                </span>
+              </article>
+              <article>
+                <strong>返程 {finalPlan.flight.return_flight_numbers.join(" + ")}</strong>
+                <span>
+                  {finalPlan.flight.destination} {formatDateTime(finalPlan.flight.return_depart_at)}
+                  {" → "}
+                  {finalPlan.flight.origin} {formatDateTime(finalPlan.flight.return_arrive_at)}
+                </span>
+              </article>
+            </div>
+          )}
+          {finalPlan.lodgings.length > 0 && (
+            <div className="final-plan-itinerary">
+              <h3>住宿</h3>
+              {finalPlan.lodgings.map((lodging) => (
+                <article key={`${lodging.provider}:${lodging.property_name}:${lodging.check_in}`}>
+                  <strong>{lodging.property_name}</strong>
+                  <span>{lodging.check_in} 至 {lodging.check_out} · {lodging.rooms} 间</span>
+                  <small>
+                    {lodging.room_name ?? "房型待确认"} ·
+                    {lodging.breakfast_included === true ? " 含早餐" : " 早餐待确认"}
+                  </small>
+                </article>
+              ))}
+            </div>
+          )}
+          {finalPlan.transfers.length > 0 && (
+            <div className="final-plan-itinerary">
+              <h3>接驳</h3>
+              {finalPlan.transfers.map((transfer, index) => (
+                <article key={`${transfer.provider}:${transfer.service_date}:${index}`}>
+                  <strong>{transfer.origin_area} → {transfer.destination_area}</strong>
+                  <span>
+                    {transfer.service_date}
+                    {transfer.depart_at ? ` · ${formatDateTime(transfer.depart_at)}` : " · 时刻待确认"}
+                    {transfer.arrive_at ? ` → ${formatDateTime(transfer.arrive_at)}` : ""}
+                  </span>
+                </article>
+              ))}
+            </div>
+          )}
+          <div className="final-plan-route">
+            <div><span>去程</span><strong>{finalPlan.departure_date}</strong></div>
+            <div className="route-arrow" aria-hidden="true">→</div>
+            <div><span>返程</span><strong>{finalPlan.return_date}</strong></div>
+          </div>
+          <div className="final-plan-facts">
+            <article>
+              <span>人民币总价</span>
+              <strong>
+                {finalPlan.price_comparability === "complete_cny" &&
+                finalPlan.total_budget_cents !== null
+                  ? formatCents(finalPlan.total_budget_cents, "CNY")
+                  : "总价待确认"}
+              </strong>
+              {finalPlan.price_comparability !== "complete_cny" && (
+                <small>报价条件尚不能完整比较</small>
+              )}
+            </article>
+            <article>
+              <span>出行人数</span>
+              <strong>{finalPlan.party.adults ?? 0} 位成人</strong>
+              <small>
+                {finalPlan.party.children ?? 0} 位儿童 · {finalPlan.party.infants ?? 0} 位婴儿
+              </small>
+            </article>
+            <article>
+              <span>房间</span>
+              <strong>{finalPlan.party.rooms ?? 0} 间</strong>
+              <small>按本次需求确认</small>
+            </article>
+          </div>
+          {finalPlan.unresolved_items.length > 0 && (
+            <div className="final-plan-unresolved">
+              <strong>仍待确认</strong>
+              <ul>
+                {finalPlan.unresolved_items.map((item) => <li key={item}>{item}</li>)}
+              </ul>
+            </div>
+          )}
+          <p className="claim-boundary">{finalPlan.claim_boundary}</p>
+        </section>
+      ) : (
+        <section className="issue-box final-plan-missing" aria-label="最终方案不可用">
+          <strong>暂未形成唯一最终方案</strong>
+          <p>后端没有发布可验证的最终方案，页面不会把诊断候选冒充成推荐结果。</p>
+        </section>
+      )}
+
       {run && (
-        <section className="query-observability" aria-label="查询策略 Agent 与自适应核价轨迹">
+        <details className="diagnostics-disclosure">
+          <summary>查看内部诊断：查询覆盖、候选排序与核价轨迹</summary>
+          <div className="query-observability" aria-label="查询策略 Agent 与自适应核价轨迹">
           <div className="stage-title">
             <div><span>Q</span><h3>Query Strategist → 自适应精确核价</h3></div>
             <strong>
@@ -863,33 +973,37 @@ function FlexiblePlanningSummary({
               {[...run.exploration.warnings, ...run.query_plan.warnings].join("；")}
             </p>
           )}
-        </section>
+          </div>
+        </details>
       )}
 
       {run && (
-        <section className="option-comparison" aria-label="灵活日期预算方案对比">
+        <details className="diagnostics-disclosure option-diagnostics">
+          <summary>查看内部诊断：日期核价与预算记录</summary>
+          <section className="option-comparison" aria-label="灵活日期核价记录">
           <div className="stage-title">
-            <div><span>00</span><h3>已核价日期方案与预算对比</h3></div>
+            <div><span>00</span><h3>已核价日期与预算记录</h3></div>
             <strong>
-              {recommendableCount >= 2
-                ? `${recommendableCount} 个可推荐方案`
-                : `${recommendableCount} 个可推荐方案 · 证据不足时不凑数`}
+              {run.ranked_options.length} 个日期组合已核价
             </strong>
           </div>
           <div className="option-grid">
-            {run.ranked_options.slice(0, 3).map((option) => {
+            {run.ranked_options.map((option) => {
               const pair = pairById.get(option.date_pair_id);
-              const selected = selectedDatePairId === option.date_pair_id;
               return (
                 <button
                   type="button"
-                  className={`${selected ? "selected" : ""} ${option.recommendable ? "recommendable" : "blocked"}`}
-                  onClick={() => onSelect(option.date_pair_id)}
+                  className={`${option.recommendable ? "recommendable" : "blocked"}`}
+                  disabled
                   key={option.date_pair_id}
                 >
-                  <span>本轮核价第 {option.rank} 名</span>
+                  <span>
+                    {option.complete_cny_party_total ? `本轮核价第 ${option.rank} 名` : "金额不完整"}
+                  </span>
                   <strong>
-                    {option.total_budget_cents === null
+                    {!option.complete_cny_party_total
+                      ? "仅已确认小计"
+                      : option.total_budget_cents === null
                       ? "未形成安全预算"
                       : formatCents(option.total_budget_cents)}
                   </strong>
@@ -897,9 +1011,13 @@ function FlexiblePlanningSummary({
                   <small>
                     {pair?.date_pair.night_count ?? "?"} 晚 ·{" "}
                     {option.all_platforms_complete ? "全部已选平台完整" : "平台覆盖不完整"} ·
-                    证据 {(Number(option.evidence_completeness) * 100).toFixed(0)}%
+                    证据 {(Number(option.evidence_completeness) * 100).toFixed(0)}% ·
+                    {option.complete_cny_party_total ? "完整人数总价" : "仅已确认小计，未参与最终价格排序"}
                   </small>
-                  <em>{option.recommendable ? "可推荐，查看完整闭环" : "主控未接受"}</em>
+                  {!option.complete_cny_party_total && (
+                    <em>金额不完整/仅已确认小计，未参与最终价格排序</em>
+                  )}
+                  <em>{option.recommendable ? "已通过内部完整性检查" : "未通过内部完整性检查"}</em>
                 </button>
               );
             })}
@@ -910,7 +1028,8 @@ function FlexiblePlanningSummary({
               : "排序只在有完整日历支持并执行精确查询的候选日期对内有效。"}
           </p>
           <p className="claim-boundary">{run.claim_boundary}</p>
-        </section>
+          </section>
+        </details>
       )}
     </div>
   );
@@ -1554,10 +1673,12 @@ function LiveEventLab({
   run,
   runId,
   onRunAdvanced,
+  onFinalPlanChanged,
 }: {
   run: LivePackageAgentRun;
   runId: string;
   onRunAdvanced: (run: LivePackageAgentRun) => void;
+  onFinalPlanChanged: (finalPlan: FinalPlanProjection | null) => void;
 }) {
   const candidate = run.package?.final_candidate;
   const components = candidate
@@ -1595,6 +1716,7 @@ function LiveEventLab({
         timeout_seconds: 120,
       });
       setEventRun(response.run);
+      onFinalPlanChanged(response.final_plan ?? null);
       onRunAdvanced(advanceLiveRunAfterEvent(run, response.run));
     } catch (caught) {
       setError(
@@ -1763,10 +1885,12 @@ function LiveMonitorPanel({
   run,
   runId,
   onRunAdvanced,
+  onFinalPlanChanged,
 }: {
   run: LivePackageAgentRun;
   runId: string;
   onRunAdvanced: (run: LivePackageAgentRun) => void;
+  onFinalPlanChanged: (finalPlan: FinalPlanProjection | null) => void;
 }) {
   const [monitor, setMonitor] = useState<LiveMonitorStatus | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1776,6 +1900,7 @@ function LiveMonitorPanel({
   async function refreshCurrentRun() {
     const current = await getLivePackage(runId);
     onRunAdvanced(current.run);
+    onFinalPlanChanged(current.final_plan ?? null);
   }
 
   useEffect(() => {
@@ -1913,7 +2038,7 @@ function App() {
   );
   const [planningMode, setPlanningMode] = useState<"replay" | "live">("replay");
   const [liveRequirementText, setLiveRequirementText] = useState(defaultLiveRequirement);
-  const [liveMaxPairs, setLiveMaxPairs] = useState(3);
+  const liveMaxPairs = 400;
   const [bridgeToken, setBridgeToken] = useState("");
   const [liveBridgeHealth, setLiveBridgeHealth] = useState<LiveBridgeHealth | null>(null);
   const [liveHealthChecking, setLiveHealthChecking] = useState(false);
@@ -1943,7 +2068,7 @@ function App() {
   const [breakfastWeight, setBreakfastWeight] = useState(0.7);
   const selectedFlexibleOption = useMemo(
     () =>
-      liveFlexibleResponse
+      liveFlexibleResponse?.final_plan
         ? resolveFlexibleOption(
             liveFlexibleResponse,
             selectedLiveDatePairId || undefined,
@@ -2014,7 +2139,8 @@ function App() {
           }
           setLiveFlexibleResponse(nextJob.result);
           setSelectedLiveDatePairId(
-            nextJob.result.run?.recommended_option_ids[0] ??
+            nextJob.result.final_plan?.date_pair_id ??
+              nextJob.result.run?.recommended_option_ids[0] ??
               nextJob.result.run?.ranked_options[0]?.date_pair_id ??
               "",
           );
@@ -2094,7 +2220,7 @@ function App() {
             },
             coverage_mode: "strict",
             timeout_seconds: 120,
-            total_timeout_seconds: 900,
+            total_timeout_seconds: 600,
             max_pairs: liveMaxPairs,
           },
           `ui-live-job-${crypto.randomUUID()}`,
@@ -2234,22 +2360,10 @@ function App() {
                   onWeightChange={setBreakfastWeight}
                 />
                 <div className="form-row compact-row">
-                  <label>
-                    本轮精确核价日期对
-                    <select
-                      value={liveMaxPairs}
-                      onChange={(event) => setLiveMaxPairs(Number(event.target.value))}
-                    >
-                      <option value={2}>2 组，用于预算对比</option>
-                      <option value={3}>3 组，推荐</option>
-                      <option value={5}>最多 5 组，自适应提前停止</option>
-                      <option value={8}>最多 8 组，深度核价</option>
-                    </select>
-                  </label>
                   <div className="live-policy-card">
-                    <span>覆盖策略</span>
-                    <strong>严格覆盖全部已选平台 · 来源数按能力矩阵生成</strong>
-                    <small>同程当前只查国际机票；单个平台的必需来源未终态时主控不会伪造完整结果。</small>
+                    <span>日期与平台覆盖</span>
+                    <strong>穷举支持范围内的合法日期组合 · 三路并行核价</strong>
+                    <small>只有完成硬约束校验且总价可完整比较的方案，才能进入最终排序。</small>
                   </div>
                 </div>
                 <label>
@@ -2360,8 +2474,6 @@ function App() {
               <>
                 <FlexiblePlanningSummary
                   response={liveFlexibleResponse}
-                  selectedDatePairId={selectedLiveDatePairId}
-                  onSelect={setSelectedLiveDatePairId}
                 />
                 {liveRun ? (
                   <>
@@ -2383,6 +2495,11 @@ function App() {
                               [liveRunId]: advancedRun,
                             }))
                           }
+                          onFinalPlanChanged={(finalPlan) =>
+                            setLiveFlexibleResponse((current) =>
+                              current ? { ...current, final_plan: finalPlan } : current,
+                            )
+                          }
                         />
                         <LiveMonitorPanel
                           key={`monitor-${selectedLiveDatePairId}-${liveRunId}`}
@@ -2393,6 +2510,11 @@ function App() {
                               ...current,
                               [liveRunId]: advancedRun,
                             }))
+                          }
+                          onFinalPlanChanged={(finalPlan) =>
+                            setLiveFlexibleResponse((current) =>
+                              current ? { ...current, final_plan: finalPlan } : current,
+                            )
                           }
                         />
                       </>

@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import cast
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from tripchord.agents.adaptive_control import AdaptiveControlInput, derive_scale_directive
 from tripchord.agents.agent_budget import AgentBudgetLedger, bind_agent_budget
 from tripchord.agents.context import ContextEngine, EvidenceBlackboard
@@ -29,6 +29,7 @@ from tripchord.agents.model_gateway import (
     ModelToolCall,
 )
 from tripchord.agents.models import AgentRole, AgentTask
+from tripchord.agents.tools import ToolCall, ToolReceipt
 from tripchord.planning.package import (
     PackageIntent,
     PackageInventory,
@@ -374,6 +375,46 @@ async def test_at_most_thirty_two_candidates_keep_the_single_curator_path(
     assert state.candidate_decision_frontier == state.candidate_shortlist
     assert ledger.audit().admitted_count == 0
     assert model.requests == []
+
+
+@pytest.mark.asyncio
+async def test_risk_critic_candidate_receipt_hides_selection_anchors_and_keeps_rows_aligned(
+    valid_candidates: tuple[TravelPackageCandidate, TravelPackageCandidate],
+) -> None:
+    system, state, _ = _system_and_state(valid_candidates[0], count=2)
+    registry = system._tool_registry(state, source_task_count=1)
+
+    async def inspect(role: AgentRole, call_id: str) -> ToolReceipt:
+        return await registry.invoke(
+            ToolCall(
+                id=call_id,
+                tool_name="inspect_package_candidates",
+                task_id=f"{call_id}-task",
+                agent_role=role,
+            )
+        )
+
+    risk_receipt = await inspect(AgentRole.RISK_CRITIC, "risk-candidate-inspect")
+    risk_table = cast(dict[str, JsonValue], risk_receipt.output["candidate_table"])
+    risk_columns = cast(list[JsonValue], risk_table["columns"])
+    risk_rows = cast(list[JsonValue], risk_table["rows"])
+    assert "shortlist_reasons" not in risk_columns
+    assert "deterministic_selected_candidate_id" not in risk_receipt.output
+    assert all(
+        len(cast(list[JsonValue], row)) == len(risk_columns)
+        for row in risk_rows
+    )
+
+    curator_receipt = await inspect(AgentRole.CANDIDATE_CURATOR, "curator-candidate-inspect")
+    curator_table = cast(dict[str, JsonValue], curator_receipt.output["candidate_table"])
+    curator_columns = cast(list[JsonValue], curator_table["columns"])
+    curator_rows = cast(list[JsonValue], curator_table["rows"])
+    assert "shortlist_reasons" in curator_columns
+    assert "deterministic_selected_candidate_id" in curator_receipt.output
+    assert all(
+        len(cast(list[JsonValue], row)) == len(curator_columns)
+        for row in curator_rows
+    )
 
 
 def test_evidence_arbiter_reads_the_collected_frontier_not_the_old_shortlist(

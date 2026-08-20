@@ -15,7 +15,10 @@ def test_browser_bridge_requires_long_pairing_token_when_enabled() -> None:
         )
 
 
-def test_live_model_and_bridge_settings_accept_explicit_local_configuration() -> None:
+def test_live_model_and_bridge_settings_accept_explicit_local_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ADAPTIVE_AGENT_SCALING_ENABLED", raising=False)
     settings = Settings(
         _env_file=None,
         browser_bridge_enabled=True,

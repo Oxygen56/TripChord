@@ -13,6 +13,21 @@ assert.equal(
 assert.equal(parser.flightPriceContract("¥4962起含税总价").valid, false);
 
 {
+  const loadingRoot = {
+    body: { textContent: "正在加载航班结果，请稍等" },
+    querySelectorAll() {
+      return [];
+    },
+  };
+  assert.deepEqual(parserHooks.qunarFlightLoadingDiagnostic(loadingRoot), {
+    outcome: "flight_results_loading",
+    stage: "result_loading",
+    scope: "visible_qunar_search_shell",
+    counts: { visible_combination_card_count: 0 },
+  });
+}
+
+{
   const crossDayCard =
     "阿联酋航空 EK311 EK656 00:10 HGH 杭州萧山 T4 " +
     "34时30分 转 迪拜 22时 07:40 8月20日 周四 MLE " +
@@ -1142,6 +1157,383 @@ assert.equal(
 }
 
 {
+  const visibleConnection =
+    "东方航空MU6550空客320(中)MU235空客330(大) 09:15 HGH 杭州" +
+    " 19:35 MLE 马累 中转昆明";
+  assert.deepEqual(
+    parserHooks.qunarVisibleFlightNumbers(visibleConnection),
+    ["MU6550", "MU235"],
+  );
+  assert.deepEqual(
+    parserHooks.qunarDirectFlightSegment(
+      { textContent: visibleConnection },
+      {
+        departure_at: "2026-09-03T09:15:00+08:00",
+        arrival_at: "2026-09-03T19:35:00+05:00",
+      },
+      ["MU6550", "MU235"],
+      "HGH",
+      "MLE",
+      { matches_expected: true },
+    ),
+    [],
+  );
+
+  const directText = "海南航空 HU7278 09:15 HGH 杭州 19:35 MLE 马累";
+  assert.deepEqual(
+    parserHooks.qunarVisibleFlightNumbers(directText),
+    ["HU7278"],
+  );
+  assert.deepEqual(
+    parserHooks.qunarDirectFlightSegment(
+      { textContent: directText },
+      {
+        departure_at: "2026-09-03T09:15:00+08:00",
+        arrival_at: "2026-09-03T19:35:00+05:00",
+      },
+      ["HU7278"],
+      "HGH",
+      "MLE",
+      { matches_expected: true },
+    ),
+    [{
+      flight_number: "HU7278",
+      departure_airport_code: "HGH",
+      arrival_airport_code: "MLE",
+      departure_at: "2026-09-03T09:15:00+08:00",
+      arrival_at: "2026-09-03T19:35:00+05:00",
+    }],
+  );
+
+  const singaporeConnectionText =
+    "新加坡航空 SQ839 00:10 HGH 杭州 06:00 SIN 新加坡 " +
+    "SQ432 08:15 SIN 新加坡 11:50 MLE 马累";
+  assert.deepEqual(
+    parserHooks.qunarVisibleAirportCodes(singaporeConnectionText),
+    ["HGH", "SIN", "MLE"],
+  );
+  assert.deepEqual(
+    parserHooks.qunarVisibleAirportCodes(
+      "新加坡航空 SQ839 00:10 杭州萧山 06:00 新加坡樟宜 " +
+      "SQ432 08:15 新加坡樟宜 11:50 韦拉纳",
+    ),
+    ["HGH", "SIN", "MLE"],
+  );
+  assert.deepEqual(
+    parserHooks.qunarAirportCodesAnchoredToFlights(
+      singaporeConnectionText,
+      ["SQ839", "SQ432"],
+    ),
+    ["HGH", "SIN", "MLE"],
+  );
+  assert.deepEqual(
+    parserHooks.qunarAirportCodesAnchoredToFlights(
+      "SQ001 09:00 HGH 11:00 PEK SQ002 12:00 PKX 15:00 MLE",
+      ["SQ001", "SQ002"],
+    ),
+    ["HGH", "PEK", "PKX", "MLE"],
+  );
+  assert.deepEqual(
+    parserHooks.qunarAirportCodesAnchoredToFlights(
+      singaporeConnectionText,
+      ["SQ839", "SQ432"],
+      true,
+    ),
+    {
+      pairs: [["HGH", "SIN"], ["SIN", "MLE"]],
+      chain: ["HGH", "SIN", "MLE"],
+    },
+  );
+  const structuredComponents = [
+    {
+      textContent: "21:45萧山机场T3杭州09-0400:05北京大兴机场北京",
+    },
+    {
+      textContent: "09-0406:55北京大兴机场北京09-0412:20马累机场T1马累",
+    },
+  ];
+  const structuredFlightNodes = [
+    { textContent: "JD5907 空客321" },
+    { textContent: "JD455 空客330" },
+  ];
+  const structuredSegments = parserHooks.qunarStructuredFlightSegments(
+    {
+      querySelectorAll(selector) {
+        if (selector.includes("segment-comp")) return structuredComponents;
+        if (selector === ".col-airline .d-air") return structuredFlightNodes;
+        return [];
+      },
+    },
+    ["JD5907", "JD455"],
+    "HGH",
+    "MLE",
+    "2026-09-03",
+    {
+      departure_at: "2026-09-03T21:45:00+08:00",
+      arrival_at: "2026-09-04T12:20:00+05:00",
+    },
+  );
+  assert.deepEqual(
+    structuredSegments && structuredSegments.pairs,
+    [["HGH", "PKX"], ["PKX", "MLE"]],
+  );
+  assert.deepEqual(
+    structuredSegments && structuredSegments.segments.map((segment) => [
+      segment.flight_number,
+      segment.departure_airport_code,
+      segment.arrival_airport_code,
+    ]),
+    [["JD5907", "HGH", "PKX"], ["JD455", "PKX", "MLE"]],
+  );
+  const goodReturnStructure = {
+    source: "embedded_dom_detail",
+    pairs: [["MLE", "PKX"], ["PKX", "HGH"]],
+    segments: [
+      { flight_number: "JD456", departure_airport_code: "MLE", arrival_airport_code: "PKX" },
+      { flight_number: "JD5908", departure_airport_code: "PKX", arrival_airport_code: "HGH" },
+    ],
+  };
+  const projectedReceiptSegments = parserHooks.qunarReceiptSegmentsFromStructured(
+    structuredSegments,
+    goodReturnStructure,
+    ["JD5907", "JD455"],
+    ["JD456", "JD5908"],
+    "HGH",
+    "MLE",
+  );
+  assert.equal(projectedReceiptSegments.valid, true);
+  assert.equal(projectedReceiptSegments.outbound_segments.length, 2);
+  assert.equal(projectedReceiptSegments.return_segments.length, 2);
+  const crossReturnStructure = {
+    ...goodReturnStructure,
+    pairs: [["MLE", "PKX"], ["PEK", "HGH"]],
+  };
+  const rejectedReceiptSegments = parserHooks.qunarReceiptSegmentsFromStructured(
+    structuredSegments,
+    crossReturnStructure,
+    ["JD5907", "JD455"],
+    ["JD456", "HU7577"],
+    "HGH",
+    "MLE",
+  );
+  assert.equal(rejectedReceiptSegments.valid, false);
+  assert.deepEqual(rejectedReceiptSegments.outbound_segments, []);
+  assert.deepEqual(rejectedReceiptSegments.return_segments, []);
+  const airportNode = {
+    nodeType: 1,
+    tagName: "SPAN",
+    textContent: "SQ839 00:10 HGH 06:00 SIN",
+    innerText: "SQ839 00:10 HGH 06:00 SIN",
+    hidden: false,
+    getAttribute(name) {
+      return name === "class" ? "airport-segment" : null;
+    },
+  };
+  const nodeEvidence = parserHooks.qunarFlightNodeEvidence(
+    {
+      textContent: singaporeConnectionText,
+      innerText: singaporeConnectionText.replace("HGH", "杭州"),
+      querySelectorAll(selector) {
+        return selector === "*" ? [airportNode] : [];
+      },
+    },
+    ["SQ839", "SQ432"],
+  );
+  assert.equal(nodeEvidence.differs, true);
+  assert.equal(nodeEvidence.nodes[0].class, "airport-segment");
+  assert.deepEqual(nodeEvidence.nodes[0].match_flights, ["SQ839"]);
+  assert.deepEqual(
+    parserHooks.qunarVisibleMultiFlightSegments(
+      { textContent: singaporeConnectionText },
+      {
+        departure_at: "2026-09-03T00:10:00+08:00",
+        arrival_at: "2026-09-03T11:50:00+05:00",
+      },
+      ["SQ839", "SQ432"],
+      "HGH",
+      "MLE",
+      "2026-09-03",
+    ),
+    [
+      {
+        flight_number: "SQ839",
+        departure_airport_code: "HGH",
+        arrival_airport_code: "SIN",
+        departure_at: "2026-09-03T00:10:00+08:00",
+        arrival_at: "2026-09-03T06:00:00+08:00",
+      },
+      {
+        flight_number: "SQ432",
+        departure_airport_code: "SIN",
+        arrival_airport_code: "MLE",
+        departure_at: "2026-09-03T08:15:00+08:00",
+        arrival_at: "2026-09-03T11:50:00+05:00",
+      },
+    ],
+  );
+  assert.deepEqual(
+    parserHooks.qunarVisibleMultiFlightSegments(
+      { textContent: singaporeConnectionText.replaceAll("SIN", "KUL") },
+      {
+        departure_at: "2026-09-03T00:10:00+08:00",
+        arrival_at: "2026-09-03T11:50:00+05:00",
+      },
+      ["SQ839", "SQ432"],
+      "HGH",
+      "MLE",
+      "2026-09-03",
+    ),
+    [],
+  );
+
+  let detailClicks = 0;
+  const detailControl = {
+    nodeType: 1,
+    tagName: "BUTTON",
+    textContent: "航班详情",
+    disabled: false,
+    parentElement: null,
+    ownerDocument: {
+      defaultView: null,
+      location: { href: "https://flight.qunar.com/site/interroundtrip_compare.htm" },
+    },
+    getAttribute() {
+      return null;
+    },
+    click() {
+      detailClicks += 1;
+    },
+  };
+  const bookingControl = {
+    ...detailControl,
+    textContent: "预订",
+  };
+  const outboundTrip = {
+    nodeType: 1,
+    textContent: singaporeConnectionText,
+    ownerDocument: detailControl.ownerDocument,
+    getAttribute() {
+      return null;
+    },
+    querySelectorAll(selector) {
+      return selector === "button" ? [detailControl, bookingControl] : [];
+    },
+  };
+  const returnTrip = {
+    ...outboundTrip,
+    textContent: singaporeConnectionText,
+  };
+  const qunarCard = {
+    nodeType: 1,
+    textContent: `${outboundTrip.textContent} ${returnTrip.textContent}`,
+    ownerDocument: detailControl.ownerDocument,
+    getAttribute() {
+      return null;
+    },
+    querySelectorAll(selector) {
+      return selector === ".s-trip" ? [outboundTrip, returnTrip] : [];
+    },
+  };
+  const qunarRoot = {
+    querySelectorAll(selector) {
+      return selector === ".b-airfly" ? [qunarCard] : [];
+    },
+  };
+  assert.deepEqual(
+    parser.qunarSafeExpandFlightDetail(
+      qunarRoot,
+      "outbound",
+      ["SQ839", "SQ432"],
+    ),
+    {
+      expanded: true,
+      direction: "outbound",
+      flight_numbers: ["SQ839", "SQ432"],
+      candidate_fingerprint: {
+        key: '{"outbound_arrive_at":null,"outbound_depart_at":null,"outbound_flight_numbers":["SQ839","SQ432"],"return_arrive_at":null,"return_depart_at":null,"return_flight_numbers":["SQ839","SQ432"]}',
+        detail_eligibility: "unknown",
+        outbound_flight_numbers: ["SQ839", "SQ432"],
+        return_flight_numbers: ["SQ839", "SQ432"],
+        outbound_depart_at: null,
+        outbound_arrive_at: null,
+        return_depart_at: null,
+        return_arrive_at: null,
+        price_text: null,
+        outbound_airport_chain: null,
+        return_airport_chain: null,
+      },
+      control_label: "航班详情",
+      action: {
+        action: "expand_flight_detail",
+        direction: "outbound",
+        provider: "qunar",
+        flight_numbers: ["SQ839", "SQ432"],
+        candidate_fingerprint: {
+          key: '{"outbound_arrive_at":null,"outbound_depart_at":null,"outbound_flight_numbers":["SQ839","SQ432"],"return_arrive_at":null,"return_depart_at":null,"return_flight_numbers":["SQ839","SQ432"]}',
+          detail_eligibility: "unknown",
+          outbound_flight_numbers: ["SQ839", "SQ432"],
+          return_flight_numbers: ["SQ839", "SQ432"],
+          outbound_depart_at: null,
+          outbound_arrive_at: null,
+          return_depart_at: null,
+          return_arrive_at: null,
+          price_text: null,
+          outbound_airport_chain: null,
+          return_airport_chain: null,
+        },
+        evidence: "航班详情",
+        read_only: true,
+      },
+    },
+  );
+  assert.equal(detailClicks, 1);
+
+  const outboundCandidate = parser.qunarSafeExpandFlightDetail(
+    qunarRoot,
+    "outbound",
+    {},
+  );
+  const boundReturn = parser.qunarSafeExpandFlightDetail(
+    qunarRoot,
+    "return",
+    { candidate_fingerprint: outboundCandidate.candidate_fingerprint },
+  );
+  assert.equal(boundReturn.expanded, true);
+  assert.deepEqual(
+    boundReturn.candidate_fingerprint,
+    outboundCandidate.candidate_fingerprint,
+  );
+  const mismatchedReturn = parser.qunarSafeExpandFlightDetail(
+    qunarRoot,
+    "return",
+    {
+      candidate_fingerprint: {
+        ...outboundCandidate.candidate_fingerprint,
+        key: "different-current-card",
+      },
+    },
+  );
+  assert.equal(mismatchedReturn.code, "target_card_not_found");
+
+  assert.deepEqual(
+    parser.qunarSafeExpandFlightDetail(
+      { querySelectorAll() { return []; } },
+      "return",
+      ["SQ437", "SQ838"],
+    ),
+    {
+      expanded: false,
+      direction: "return",
+      code: "target_card_not_found",
+      inspected_card_count: 0,
+      matching_target_card_count: 0,
+      candidate_fingerprint: null,
+      observed_candidates: [],
+    },
+  );
+}
+
+{
   const query = {
     origin: "杭州",
     destination: "马累",
@@ -1163,6 +1555,9 @@ assert.equal(
     candidate_summaries: [
       {
         candidate_index: 0,
+        destination_airport_code: "MLE",
+        outbound_flight_numbers: [],
+        outbound_segments: [],
         title: "泰国亚航 + 马来西亚亚航",
         route_evidence: "去程 杭州→马累(匹配)；返程 马累→杭州(匹配)",
         schedule_evidence:
@@ -1172,6 +1567,9 @@ assert.equal(
         amount: 5159,
         price_basis: "per_person",
         price_classification: "starting_or_estimated",
+        return_flight_numbers: [],
+        return_segments: [],
+        origin_airport_code: "HGH",
       },
     ],
     explicit_empty_evidence: null,
@@ -1216,9 +1614,15 @@ assert.equal(
       "amount",
       "candidate_index",
       "currency",
+      "destination_airport_code",
+      "origin_airport_code",
+      "outbound_flight_numbers",
+      "outbound_segments",
       "price_basis",
       "price_classification",
       "price_evidence",
+      "return_flight_numbers",
+      "return_segments",
       "route_evidence",
       "schedule_evidence",
       "title",

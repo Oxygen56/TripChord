@@ -265,7 +265,7 @@ def _payload(*, ready: bool) -> dict[str, object]:
         },
         "coverage_mode": "strict",
         "timeout_seconds": 300,
-        "total_timeout_seconds": 1800,
+        "total_timeout_seconds": 600,
         "max_pairs": 1,
     }
 

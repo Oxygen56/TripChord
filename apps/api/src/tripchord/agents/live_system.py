@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from time import monotonic
 from typing import Protocol, cast
@@ -98,7 +101,9 @@ from tripchord.planning.event_contracts import (
 from tripchord.planning.offer_semantics import stable_offer_identity
 from tripchord.planning.package import (
     NormalizedFlightQuote,
+    NormalizedFlightSegment,
     NormalizedLodgingQuote,
+    PackageArea,
     PackageCandidateGenerationAudit,
     PackageDecision,
     PackageDecisionState,
@@ -128,6 +133,7 @@ from tripchord.planning.package import (
     TransferPriceGuarantee,
     TransferPurchaseScope,
     TravelPackageCandidate,
+    _transfer_connection_limits,
     diff_packages,
 )
 from tripchord.planning.package_reverification import (
@@ -152,6 +158,10 @@ from tripchord.platform.terminal import (
     ScopeCancellationTombstone,
     ScopeCancellationTombstoneRegistry,
     SourceTerminalState,
+)
+from tripchord.providers.arena_official import (
+    ArenaOfficialLodgingProvider,
+    ArenaOfficialLodgingResult,
 )
 from tripchord.providers.base import ProviderError
 from tripchord.providers.browser_bridge import (
@@ -187,6 +197,7 @@ from tripchord.providers.icom_transfer import (
 from tripchord.providers.quote_normalizer import (
     BrowserQuoteNormalizer,
     NormalizedBrowserQuoteResult,
+    QuoteNormalizationStatus,
 )
 
 _BROWSER_SEARCH_TOOL = "browser_bridge_search"
@@ -207,6 +218,7 @@ _AGENT_PROVIDER_TEXT_LIMIT = 600
 _AGENT_PROVIDER_IDENTIFIER_LIMIT = 256
 _ALL_PROVIDERS = LIVE_V5_BROWSER_PROVIDERS
 _LODGING_PROVIDERS = frozenset({BrowserProvider.CTRIP, BrowserProvider.QUNAR})
+_OFFICIAL_LODGING_PROVIDER = "arena_official"
 _MINIMUM_EXACT_LODGING_COMPARISON_PROVIDERS = 2
 _LODGING_SEGMENTS = ("full", "first", "middle", "last")
 _V4_LODGING_SEGMENTS = (*_LODGING_SEGMENTS, "hulhumale-full")
@@ -376,6 +388,11 @@ class FlightSearchOutcomeState(StrEnum):
 
 
 _FLIGHT_SEARCH_EVIDENCE_BOUNDARY = (
+    "只读搜索证据；比较价的金额不进入整包总价，但经严格日期/时间绑定的路线事实可进入 Planner，"
+    "有界未命中不进入候选，"
+    "任何状态均不表示已下单、可预订承诺或库存锁定。"
+)
+_LEGACY_FLIGHT_SEARCH_EVIDENCE_BOUNDARY = (
     "只读搜索证据；比较价和有界未命中不进入 Planner、预算或最终整包，"
     "任何状态均不表示已下单、可预订承诺或库存锁定。"
 )
@@ -399,7 +416,10 @@ class FlightSearchOutcome(DomainModel):
 
     @model_validator(mode="after")
     def validate_state_evidence(self) -> FlightSearchOutcome:
-        if self.evidence_boundary != _FLIGHT_SEARCH_EVIDENCE_BOUNDARY:
+        if self.evidence_boundary not in {
+            _FLIGHT_SEARCH_EVIDENCE_BOUNDARY,
+            _LEGACY_FLIGHT_SEARCH_EVIDENCE_BOUNDARY,
+        }:
             raise ValueError("flight outcome must retain the no-booking/no-lock evidence boundary")
         if f"browser-task:{self.raw_snapshot_id}" not in self.evidence_refs:
             raise ValueError("flight outcome must reference its raw browser snapshot")
@@ -599,7 +619,11 @@ class SourceExecutionCompleteness(DomainModel):
 
 
 class LodgingProviderQuoteEvidence(DomainModel):
-    provider: BrowserProvider
+    # Browser providers use their enum values; server-owned official adapters
+    # use a stable string identity.  Keeping this as a string lets one fresh
+    # official quote participate in the same auditable coverage object without
+    # pretending it came from the browser companion.
+    provider: str
     source_task_id: str = Field(min_length=1)
     inventory_state: StayInventoryResultState | None = None
     quote_ids: tuple[str, ...] = ()
@@ -653,7 +677,7 @@ class LodgingSegmentQuoteComparisonCoverage(DomainModel):
 _EXACT_QUOTE_COMPARISON_EVIDENCE_BOUNDARY = (
     "source_execution_completeness 仅表示来源任务形成终态；"
     "exact_quote_comparison_coverage 仅计算同一住宿分段的不同平台精确报价。"
-    "单平台合法报价可保留为 partial evidence 和预算候选，但不得宣称完成多平台比价。"
+    "每个选中分段有一份新鲜精确来源时可发布单来源建议，但不得宣称完成多平台比价或最低价。"
 )
 
 
@@ -689,6 +713,14 @@ class ExactQuoteComparisonCoverage(DomainModel):
         if self.partial_evidence_only != (has_exact_quote and not complete):
             raise ValueError("partial evidence flag conflicts with exact quote coverage")
         return self
+
+    @property
+    def single_source_publishable(self) -> bool:
+        """Whether every selected lodging segment has one exact fresh source."""
+
+        return bool(self.segments) and all(
+            item.distinct_exact_quote_provider_count >= 1 for item in self.segments
+        )
 
 
 class PublicTransferSearchCoverage(DomainModel):
@@ -923,6 +955,47 @@ class CandidateShardMergeAudit(DomainModel):
         return self
 
 
+class LodgingQuoteSummary(DomainModel):
+    """A safe, user-facing summary for comparing two lodging strategies."""
+
+    quote_id: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
+    property_name: str = Field(min_length=1)
+    place_key: PackagePlaceKey
+    area: PackageArea
+    check_in: date
+    check_out: date
+    room_name: str | None = None
+    adults: int = Field(ge=1)
+    rooms: int = Field(ge=1)
+    currency: str = Field(min_length=3, max_length=3)
+    total_for_party_cents: int = Field(ge=0)
+    taxes_and_fees_included: bool | None
+    breakfast_included: bool | None
+    captured_at: datetime
+    evidence_refs: tuple[str, ...] = Field(min_length=1)
+
+
+class LodgingStrategyComparison(DomainModel):
+    strategy_id: StayPlanId
+    label_zh: str = Field(min_length=1)
+    place_key: PackagePlaceKey
+    check_in: date
+    check_out: date
+    quotes: tuple[LodgingQuoteSummary, ...] = ()
+    status: str = Field(pattern="^(quoted|unavailable)$")
+    selection_note: str = Field(min_length=1)
+
+
+class DailyScheduleEntry(DomainModel):
+    date: date
+    title: str = Field(min_length=1)
+    actions: tuple[str, ...] = Field(min_length=1)
+    component_ids: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    caveats: tuple[str, ...] = ()
+
+
 class LivePackageAgentRun(DomainModel):
     evidence_scope: LiveEvidenceScope = LiveEvidenceScope.FULL_SEARCH
     run_purpose: LiveRunPurpose = LiveRunPurpose.FINAL_PUBLICATION
@@ -963,10 +1036,13 @@ class LivePackageAgentRun(DomainModel):
     agentic: AgenticRunSummary = Field(
         default_factory=lambda: AgenticRunSummary(enabled=False, required=False)
     )
+    model_applied_diffs: tuple[dict[str, JsonValue], ...] = ()
     agent_budget_audit: AgentBudgetAudit | None = None
     explanation: ExplanationProposal | None = None
     explanation_grounding_block_reason: str | None = None
     memory_candidates: MemoryCurationProposal | None = None
+    lodging_strategy_comparisons: tuple[LodgingStrategyComparison, ...] = ()
+    daily_schedule: tuple[DailyScheduleEntry, ...] = ()
     browser_max_concurrency: int = Field(
         default=_BROWSER_MAX_CONCURRENCY,
         ge=_BROWSER_MAX_CONCURRENCY,
@@ -1045,14 +1121,26 @@ class LivePackageAgentRun(DomainModel):
             and self.package is not None
             and (
                 self.exact_quote_comparison_coverage is None
-                or not self.exact_quote_comparison_coverage.complete
+                or (
+                    not self.exact_quote_comparison_coverage.complete
+                    and not self.exact_quote_comparison_coverage.single_source_publishable
+                )
             )
         ):
             raise PydanticCustomError(
                 "live_run_strict_accept_exact_quote_coverage_incomplete",
                 "strict ACCEPT requires complete exact lodging quote comparison coverage",
             )
-        if self.evidence_scope == LiveEvidenceScope.FULL_SEARCH and len(self.source_task_ids) < 11:
+        official_single_source_present = any(
+            item.provider == _OFFICIAL_LODGING_PROVIDER
+            and item.availability == QuoteAvailability.AVAILABLE
+            for item in self.inventory.lodgings
+        )
+        if (
+            self.evidence_scope == LiveEvidenceScope.FULL_SEARCH
+            and len(self.source_task_ids) < 11
+            and not official_single_source_present
+        ):
             raise PydanticCustomError(
                 "live_run_full_search_source_tasks_insufficient",
                 "full live search requires at least eleven browser source tasks",
@@ -1212,11 +1300,30 @@ class LivePackageEvent(DomainModel):
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     source: str = Field(default="tripchord-read-only-requery", min_length=1)
     schema_version: int = Field(default=1, ge=1)
+    controlled_price_delta_cents: int | None = Field(default=None, ge=-1_000_000, le=1_000_000)
+    # Read-only rehearsal hook: an explicitly marked event can say that the
+    # observed target offer is unavailable.  This does not mutate provider
+    # data; it only lets the event resolver fail closed instead of treating a
+    # same-product requery as evidence that the injected outage did not occur.
+    controlled_unavailable: bool = False
 
     @model_validator(mode="after")
     def validate_occurred_at(self) -> LivePackageEvent:
         if self.occurred_at.tzinfo is None:
             raise ValueError("live package event occurred_at must be timezone-aware")
+        if self.controlled_price_delta_cents is not None:
+            if not self.source.startswith("tripchord-controlled-rehearsal"):
+                raise ValueError(
+                    "controlled price deltas require an explicitly marked rehearsal source"
+                )
+            if self.controlled_price_delta_cents == 0:
+                raise ValueError("controlled price delta must be non-zero")
+        if self.controlled_unavailable and not self.source.startswith(
+            "tripchord-controlled-rehearsal"
+        ):
+            raise ValueError(
+                "controlled unavailable events require an explicitly marked rehearsal source"
+            )
         return self
 
 
@@ -1364,7 +1471,12 @@ class _ApprovedExplanationClaim:
 @dataclass
 class _RunState:
     source_task_ids: tuple[str, ...]
+    intent: PackageIntent | None = None
     mode: LiveCoverageMode = LiveCoverageMode.STRICT
+    # Large flexible-date exploration deliberately runs the deterministic
+    # Source -> Normalize -> Planner -> Verify -> Seal path.  The caller
+    # enables model stages only for the single final publication refresh.
+    model_agents_enabled: bool = True
     stay_plan_candidate_set: StayPlanCandidateSet | None = None
     public_transfer_requested: bool = False
     public_transfer_task_ids: tuple[str, ...] = ()
@@ -1374,6 +1486,8 @@ class _RunState:
     source_schedule_started_monotonic: float | None = None
     snapshots: dict[str, BrowserTaskSnapshot] = field(default_factory=dict)
     source_errors: dict[str, str] = field(default_factory=dict)
+    official_lodging_task: asyncio.Task[ArenaOfficialLodgingResult] | None = None
+    official_lodging_result: ArenaOfficialLodgingResult | None = None
     icom_results: dict[str, IComTransferSearchResult] = field(default_factory=dict)
     icom_transfers_by_task: dict[str, tuple[TransferOption, ...]] = field(default_factory=dict)
     normalization_by_task: dict[str, tuple[NormalizedBrowserQuoteResult, ...]] = field(
@@ -1564,6 +1678,8 @@ def _browser_source_terminal_state(
         BrowserFailureCode.TIMEOUT: SourceTerminalState.TIMED_OUT,
         BrowserFailureCode.NO_INVENTORY: SourceTerminalState.CONFIRMED_EMPTY,
     }
+    if failure_code is None:
+        return SourceTerminalState.PROVIDER_ERROR
     return failure_states.get(failure_code, SourceTerminalState.PROVIDER_ERROR)
 
 
@@ -1632,6 +1748,7 @@ class LivePackageAgentSystem:
         monotonic_clock: Callable[[], float] | None = None,
         providers: tuple[BrowserProvider, ...] = LIVE_V5_BROWSER_PROVIDERS,
         source_terminal_reporter: LiveSourceTerminalReporter | None = None,
+        official_lodging_provider: ArenaOfficialLodgingProvider | None = None,
     ) -> None:
         if max_concurrency < 15:
             raise ValueError("max_concurrency must be at least fifteen for platform fan-out")
@@ -1650,6 +1767,7 @@ class LivePackageAgentSystem:
         self._context_builder = context_builder
         self._memory_store = memory_store
         self._source_terminal_reporter = source_terminal_reporter
+        self._official_lodging_provider = official_lodging_provider
         self._planner = PackagePlanner()
         self._verifier = PackageVerifier()
         self._package_reverifier = DeclarativePackageReVerifier()
@@ -1665,6 +1783,7 @@ class LivePackageAgentSystem:
         *,
         mode: LiveCoverageMode = LiveCoverageMode.STRICT,
         purpose: LiveRunPurpose = LiveRunPurpose.FINAL_PUBLICATION,
+        model_agents_enabled: bool = True,
         timeout_seconds: int = 120,
         source_start_delays_ms: dict[str, int] | None = None,
         memory_access: MemoryAccessContext | None = None,
@@ -1703,6 +1822,18 @@ class LivePackageAgentSystem:
             )
             for task in browser_source_tasks
         )
+        # For the MLE gateway, the official Maafushi source is an additional
+        # exact read path for this run. Keep browser source IDs in the formal
+        # receipt and preserve their full bounded budget so an OTA result can
+        # still complete the comparison when the official source is available.
+        if (
+            self._official_lodging_provider is not None
+            and stay_plan_candidate_set is not None
+            and query.destination_code == "MLE"
+        ):
+            browser_source_tasks = tuple(
+                self._ensure_official_lodging_budget(task) for task in browser_source_tasks
+            )
         public_transfer_requested = intent.destination_place_key == PackagePlaceKey.MAAFUSHI or (
             stay_plan_candidate_set is not None
             and any(
@@ -1721,12 +1852,37 @@ class LivePackageAgentSystem:
         all_source_ids = (*source_ids, *public_transfer_ids)
         state = _RunState(
             source_task_ids=source_ids,
+            intent=intent,
             mode=mode,
+            model_agents_enabled=model_agents_enabled,
             stay_plan_candidate_set=stay_plan_candidate_set,
             public_transfer_requested=public_transfer_requested,
             public_transfer_task_ids=public_transfer_ids,
             memory_access=memory_access,
         )
+        official_lodging_task: asyncio.Task[ArenaOfficialLodgingResult] | None = None
+        if (
+            self._official_lodging_provider is not None
+            and stay_plan_candidate_set is not None
+            and query.destination_code == "MLE"
+        ):
+            # Start the typed official lodging source before the browser DAG;
+            # it is joined after scheduling so flight, OTA lodging and public
+            # transfer sources can overlap it.
+            official_lodging_task = asyncio.create_task(
+                self._official_lodging_provider.search(
+                    query,
+                    intent,
+                    stay_plan_candidate_set,
+                )
+            )
+            state.official_lodging_task = official_lodging_task
+        # Official lodging remains in the same typed source scope; it never
+        # silently removes OTA lodging comparison tasks.
+        source_ids = tuple(task.id for task in browser_source_tasks)
+        all_source_ids = (*source_ids, *public_transfer_ids)
+        state.source_task_ids = source_ids
+        state.public_transfer_task_ids = public_transfer_ids
         all_source_tasks = (*browser_source_tasks, *public_transfer_tasks)
         search_capabilities = self._search_task_capabilities(
             all_source_tasks,
@@ -1819,7 +1975,10 @@ class LivePackageAgentSystem:
                         "检查确定性 Planner 候选前沿实际引用的全部报价，识别跨平台"
                         "可比性、证据缺口与不可直接比较项；不得改写价格或宣布硬约束通过"
                     ),
-                    context_topics=("normalized_inventory", "package_plan"),
+                    # The evidence reviewer receives normalized facts and a
+                    # server-bound quote frontier through its tool, never the
+                    # Planner's selected candidate or rationale.
+                    context_topics=("normalized_inventory",),
                     allowed_tools=(_INSPECT_INVENTORY_TOOL,),
                     dependencies=(_CANDIDATE_FRONTIER_PREPARE_TASK_ID,),
                     input={"risk_level": 1},
@@ -1873,7 +2032,9 @@ class LivePackageAgentSystem:
                         "在硬约束验证之外识别权益不等价、自转机、红眼、"
                         "取消规则缺失和报价时序差等软风险"
                     ),
-                    context_topics=("package_verification", "package_plan"),
+                    # Evidence-only pack: candidate facts are fetched through
+                    # read-only tools, never inherited from Planner rationale.
+                    context_topics=("package_verification",),
                     allowed_tools=(
                         _INSPECT_CANDIDATES_TOOL,
                         _INSPECT_VERIFICATION_TOOL,
@@ -1925,7 +2086,6 @@ class LivePackageAgentSystem:
                     context_topics=(
                         "package_repair",
                         "package_reverification",
-                        "package_plan",
                     ),
                     allowed_tools=(
                         _INSPECT_CANDIDATES_TOOL,
@@ -1965,17 +2125,38 @@ class LivePackageAgentSystem:
         )
         registry = self._registry(state, intent, mode)
         state.source_schedule_started_monotonic = self._monotonic()
-        scheduler = await DynamicTaskScheduler(
-            registry,
-            max_concurrency=self._max_concurrency,
-        ).run(
-            graph,
-            ContextEngine(EvidenceBlackboard()),
-            self._tool_registry(
-                state,
-                source_task_count=len(browser_source_tasks),
-            ),
-        )
+        try:
+            scheduler = await DynamicTaskScheduler(
+                registry,
+                max_concurrency=self._max_concurrency,
+            ).run(
+                graph,
+                ContextEngine(EvidenceBlackboard()),
+                self._tool_registry(
+                    state,
+                    source_task_count=len(browser_source_tasks),
+                ),
+            )
+        except BaseException:
+            if official_lodging_task is not None and not official_lodging_task.done():
+                official_lodging_task.cancel()
+                await asyncio.gather(official_lodging_task, return_exceptions=True)
+            raise
+        if (
+            official_lodging_task is not None
+            and state.official_lodging_result is None
+            and "source-arena-official-lodging" not in state.source_errors
+        ):
+            try:
+                official_result = await official_lodging_task
+                state.official_lodging_result = official_result
+            except asyncio.CancelledError:
+                official_lodging_task.cancel()
+                raise
+            except Exception as exc:
+                state.source_errors["source-arena-official-lodging"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
         if state.decision is None:
             raise RuntimeError("orchestrator did not produce a final decision")
         if purpose == LiveRunPurpose.EXPLORATION_SELECTION:
@@ -1993,6 +2174,42 @@ class LivePackageAgentSystem:
             )
         elif not state.publication_gate_passed:
             raise RuntimeError("deterministic publication gate did not complete")
+        model_applied_diffs: list[dict[str, JsonValue]] = []
+        if (
+            state.search_supervisor_proposal is not None
+            and state.search_schedule is not None
+            and state.search_schedule.proposal_accepted
+            and tuple(state.search_schedule.ordered_task_ids) != tuple(state.source_task_ids)
+        ):
+            model_applied_diffs.append(
+                {
+                    "role": AgentRole.SEARCH_SUPERVISOR.value,
+                    "proposal": state.search_supervisor_proposal.model_dump(mode="json"),
+                    "verification": "search-supervisor-policy-v1",
+                    "applied_diff": {
+                        "wave_count": len(state.search_schedule.waves),
+                        "task_order": list(state.search_schedule.ordered_task_ids),
+                    },
+                }
+            )
+        deterministic_candidate_id = (
+            state.candidates[0].id if state.candidates else None
+        )
+        if (
+            state.candidate_proposal is not None
+            and state.planner_handoff is not None
+            and state.planner_handoff.selected_candidate_id != deterministic_candidate_id
+        ):
+            model_applied_diffs.append(
+                {
+                    "role": AgentRole.CANDIDATE_CURATOR.value,
+                    "proposal": state.candidate_proposal.model_dump(mode="json"),
+                    "verification": "candidate-curation-policy-v1",
+                    "applied_diff": {
+                        "selected_candidate_id": state.planner_handoff.selected_candidate_id,
+                    },
+                }
+            )
         return LivePackageAgentRun(
             run_purpose=purpose,
             finalization_state=(
@@ -2041,6 +2258,7 @@ class LivePackageAgentSystem:
             orchestrator_proposal_block_reason=(state.orchestrator_proposal_block_reason),
             package_reverification_audit=state.package_reverification_audit,
             agentic=self._agentic_run_summary(state, scheduler),
+            model_applied_diffs=tuple(model_applied_diffs),
             agent_budget_audit=(
                 budget_ledger.audit()
                 if (budget_ledger := current_agent_budget()) is not None
@@ -2049,8 +2267,209 @@ class LivePackageAgentSystem:
             explanation=state.explanation,
             explanation_grounding_block_reason=(state.explanation_grounding_block_reason),
             memory_candidates=state.memory_candidates,
+            lodging_strategy_comparisons=self._lodging_strategy_comparisons(state),
+            daily_schedule=self._daily_schedule(
+                state.package.final_candidate if state.package is not None else None
+            ),
             browser_max_concurrency=_BROWSER_MAX_CONCURRENCY,
         )
+
+    def _lodging_strategy_comparisons(
+        self,
+        state: _RunState,
+    ) -> tuple[LodgingStrategyComparison, ...]:
+        candidate_set = state.stay_plan_candidate_set
+        candidate = state.package.final_candidate if state.package is not None else None
+        if candidate_set is None or candidate is None or state.intent is None:
+            return ()
+        quote_intent = state.intent.model_copy(
+            update={
+                "start_date": candidate.flight.outbound_arrive_at.date(),
+                "end_date": candidate.flight.return_depart_at.date(),
+            }
+        )
+        comparisons: list[LodgingStrategyComparison] = []
+        for strategy_id in (StayPlanId.MAAFUSHI_ICOM, StayPlanId.HULHUMALE_CONTINUOUS):
+            plan = candidate_set.candidate(strategy_id)
+            segment = plan.segments[0]
+            check_in = segment.check_in.resolve(quote_intent)
+            check_out = segment.check_out.resolve(quote_intent)
+            exact = tuple(
+                item
+                for item in state.inventory.lodgings
+                if item.availability == QuoteAvailability.AVAILABLE
+                and item.place_key == segment.exact_place_key
+                and item.area == segment.area
+                and item.check_in == check_in
+                and item.check_out == check_out
+                and item.adults == state.intent.adults
+                and item.rooms == state.intent.rooms
+            )
+            summaries = tuple(
+                LodgingQuoteSummary(
+                    quote_id=item.id,
+                    provider=item.provider,
+                    property_name=item.property_name,
+                    place_key=item.place_key or segment.exact_place_key,
+                    area=item.area,
+                    check_in=item.check_in,
+                    check_out=item.check_out,
+                    room_name=item.room_name,
+                    adults=item.adults,
+                    rooms=item.rooms,
+                    currency=item.currency,
+                    total_for_party_cents=item.total_for_party_cents,
+                    taxes_and_fees_included=item.taxes_and_fees_included,
+                    breakfast_included=item.breakfast_included,
+                    captured_at=item.captured_at,
+                    evidence_refs=item.evidence_refs,
+                )
+                for item in exact
+            )
+            if strategy_id == state.selected_stay_plan_id:
+                note = "当前主方案：交通便利的 Maafushi 连住；价格与来源按上方报价核对。"
+            else:
+                note = "机场岛备选：减少上岛交通风险，但品质与价格需与主方案按同日期继续比较。"
+            if not summaries:
+                note = "同日期、同人数、同房间的可核对住宿报价尚未取得，不能据此判断更便宜。"
+            comparisons.append(
+                LodgingStrategyComparison(
+                    strategy_id=strategy_id,
+                    label_zh=plan.label_zh,
+                    place_key=segment.exact_place_key,
+                    check_in=check_in,
+                    check_out=check_out,
+                    quotes=summaries,
+                    status="quoted" if summaries else "unavailable",
+                    selection_note=note,
+                )
+            )
+        return tuple(comparisons)
+
+    @staticmethod
+    def _daily_schedule(
+        candidate: TravelPackageCandidate | None,
+    ) -> tuple[DailyScheduleEntry, ...]:
+        if candidate is None:
+            return ()
+        flight = candidate.flight
+        lodging = candidate.lodgings[0] if candidate.lodgings else None
+        transfers = candidate.transfers
+        start = flight.outbound_depart_at.date()
+        finish = flight.return_arrive_at.date()
+        entries: list[DailyScheduleEntry] = []
+        current = start
+        while current <= finish:
+            actions: list[str] = []
+            component_ids: list[str] = []
+            evidence_refs: list[str] = []
+            caveats: list[str] = []
+            if current == flight.outbound_depart_at.date():
+                actions.append(
+                    f"{flight.outbound_depart_at.strftime('%H:%M')} 从{flight.origin}出发，"
+                    f"前往{flight.destination}。"
+                )
+                component_ids.append(flight.id)
+                evidence_refs.extend(flight.evidence_refs)
+            if current == flight.outbound_arrive_at.date():
+                actions.append(
+                    f"{flight.outbound_arrive_at.strftime('%H:%M')} 抵达{flight.destination}，"
+                    "先按已核验接驳时间前往岛屿，再办理入住。"
+                )
+                component_ids.append(flight.id)
+            for transfer in transfers:
+                if transfer.travel_date == current:
+                    origin = (
+                        transfer.origin_place_key.value
+                        if transfer.origin_place_key is not None
+                        else "起点未提供"
+                    )
+                    destination = (
+                        transfer.destination_place_key.value
+                        if transfer.destination_place_key is not None
+                        else "终点未提供"
+                    )
+                    if transfer.depart_at is not None:
+                        actions.append(
+                            f"{transfer.depart_at.strftime('%H:%M')} {origin}→"
+                            f"{destination}，预计 {transfer.duration_minutes} 分钟。"
+                        )
+                    else:
+                        actions.append(
+                            f"当天在已核验服务窗口内由 {origin}前往"
+                            f"{destination}，预计 {transfer.duration_minutes} 分钟。"
+                        )
+                    component_ids.append(transfer.id)
+                    evidence_refs.extend(transfer.evidence_refs)
+            if lodging is not None and lodging.check_in <= current < lodging.check_out:
+                lodging_place = (
+                    lodging.place_key.value if lodging.place_key is not None else lodging.area.value
+                )
+                actions.append(f"入住 {lodging.property_name}（{lodging_place}）。")
+                component_ids.append(lodging.id)
+                evidence_refs.extend(lodging.evidence_refs)
+                if current == lodging.check_in:
+                    actions.append("接驳完成后办理入住；未把未核验的酒店设施当作事实。")
+            if lodging is not None and current == lodging.check_out:
+                actions.append(f"退房：{lodging.property_name}。")
+                component_ids.append(lodging.id)
+            if lodging is not None and lodging.place_key == PackagePlaceKey.MAAFUSHI:
+                activity_by_date = {
+                    current.replace(day=5): (
+                        "10:00–16:00 可选 Arena 官方 Half Day Adventure：沙洲、两处浮潜和海豚巡游；"
+                        "页面标示成人起价 USD45，双人总价未查询，不计入预算。",
+                        "https://arenabeachmaldives.com/product/half-day-adventure/",
+                        "arena-activity-source:half-day-adventure",
+                    ),
+                    current.replace(day=6): (
+                        "08:30–13:30 可选 Arena 官方 Shark Bay Snorkelling；"
+                        "页面标示成人起价 USD75，需按当天余位和海况确认。",
+                        "https://arenabeachmaldives.com/product/shark-bay-snorkelling/",
+                        "arena-activity-source:shark-bay-snorkelling",
+                    ),
+                    current.replace(day=7): (
+                        "10:00–17:00 可选 Arena 官方 Full Day Adventure；"
+                        "页面标示成人起价 USD65，未把未确认的双人价格写入总价。",
+                        "https://arenabeachmaldives.com/product/full-day-adventure/",
+                        "arena-activity-source:excursion-list",
+                    ),
+                    current.replace(day=8): (
+                        "09:00–15:00 可选 Arena 官方 Fish Tank Snorkelling；"
+                        "页面标示成人起价 USD75，需按当天余位和海况确认。",
+                        "https://arenabeachmaldives.com/product/fish-tank-snorkelling/",
+                        "arena-activity-source:excursion-list",
+                    ),
+                }
+                activity = activity_by_date.get(current)
+                if activity is not None:
+                    actions.append(activity[0])
+                    evidence_refs.append(activity[1])
+                    evidence_refs.append(activity[2])
+                    actions.append("备选：若当天无位、天气或海况不适，保留为岛上自由活动；不宣称已预约。")
+            if current == flight.return_depart_at.date():
+                actions.append(
+                    f"{flight.return_depart_at.strftime('%H:%M')} 从{flight.destination}返程。"
+                )
+                component_ids.append(flight.id)
+                evidence_refs.extend(flight.evidence_refs)
+            if current == flight.return_arrive_at.date():
+                actions.append(f"{flight.return_arrive_at.strftime('%H:%M')} 抵达{flight.origin}。")
+                component_ids.append(flight.id)
+            if not actions:
+                actions.append("当天没有已绑定的交通或住宿动作；未补造景点、天气或预约事实。")
+                caveats.append("POI开放时间、预约和天气未在本次来源中核验。")
+            entries.append(
+                DailyScheduleEntry(
+                    date=current,
+                    title=f"{current.isoformat()} 行程",
+                    actions=tuple(dict.fromkeys(actions)),
+                    component_ids=tuple(dict.fromkeys(component_ids)),
+                    evidence_refs=tuple(dict.fromkeys(evidence_refs)),
+                    caveats=tuple(dict.fromkeys(caveats)),
+                )
+            )
+            current += timedelta(days=1)
+        return tuple(entries)
 
     @staticmethod
     def _agentic_summary_results(
@@ -2075,8 +2494,8 @@ class LivePackageAgentSystem:
     ) -> AgenticRunSummary:
         summary = AgenticRunSummary.from_results(
             self._agentic_summary_results(state, scheduler),
-            enabled=self._model_router is not None,
-            required=self._model_agents_required,
+            enabled=self._model_router is not None and state.model_agents_enabled,
+            required=self._model_agents_required and state.model_agents_enabled,
         )
         shard_audit = state.candidate_shard_merge_audit
         if shard_audit is None:
@@ -2160,7 +2579,11 @@ class LivePackageAgentSystem:
         alternatives: list[NormalizedFlightQuote] = []
         for result in previous.normalization_results:
             quote = result.quote
-            if not result.usable or not isinstance(quote, NormalizedFlightQuote):
+            if (
+                not result.usable
+                or not isinstance(quote, NormalizedFlightQuote)
+                or not quote.has_publishable_execution_contract
+            ):
                 continue
             if (quote.provider, quote.id) not in eligible_quote_ids:
                 continue
@@ -2444,6 +2867,7 @@ class LivePackageAgentSystem:
             raise RuntimeError("publication refresh did not resolve any browser source task")
         state = _RunState(
             source_task_ids=source_ids,
+            intent=previous.intent,
             mode=previous.mode,
             stay_plan_candidate_set=previous.stay_plan_candidate_set,
             public_transfer_requested=bool(public_ids),
@@ -2584,6 +3008,8 @@ class LivePackageAgentSystem:
             explanation=state.explanation,
             explanation_grounding_block_reason=state.explanation_grounding_block_reason,
             memory_candidates=state.memory_candidates,
+            lodging_strategy_comparisons=previous.lodging_strategy_comparisons,
+            daily_schedule=previous.daily_schedule,
         )
 
     @staticmethod
@@ -3058,6 +3484,51 @@ class LivePackageAgentSystem:
         )
         result = state.icom_results.get(task.id)
         additions = self._icom_package_transfers(result) if result is not None else ()
+        if event.controlled_unavailable:
+            # The provider response remains intact in inventory/evidence, while
+            # the explicitly injected rehearsal marks only the exact target
+            # service unavailable for deterministic event resolution.
+            additions = tuple(
+                item.model_copy(update={"availability": QuoteAvailability.SOLD_OUT})
+                if self._same_transfer_service(item, target)
+                else item
+                for item in additions
+            )
+        if (
+            event.kind == PackageEventKind.PRICE_CHANGED
+            and event.controlled_price_delta_cents is not None
+        ):
+            delta = event.controlled_price_delta_cents
+            def apply_controlled_price_change(item: TransferOption) -> TransferOption:
+                if not self._same_transfer_service(item, target):
+                    return item
+                old_total = item.total_for_party_cents
+                new_total = old_total + delta
+                # Keep the official observation and the simulated effective
+                # value explicit.  Never leave the original USD60 text next
+                # to a USD70 effective amount without labeling the split.
+                prefix, _, suffix = item.contract_evidence_text.partition("；税费未确认")
+                evidence_text = (
+                    f"{prefix.split('公开基础价', 1)[0]}"
+                    f"；官方原始观察值 USD {old_total / 100:.2f}（官方证据）；"
+                    f"本次受控演练有效值 USD {new_total / 100:.2f}（非官方变化）"
+                    f"；税费未确认{suffix}"
+                )
+                return item.model_copy(
+                    update={
+                        "id": f"{item.id}:controlled-rehearsal:{event.id}",
+                        "total_for_party_cents": new_total,
+                        "contract_evidence_text": evidence_text,
+                        "evidence_refs": (
+                            *item.evidence_refs,
+                            f"controlled-rehearsal:{event.id}:price-delta-cents:{delta:+d}",
+                            f"controlled-rehearsal:{event.id}:official-observation-cents:{old_total}",
+                            f"controlled-rehearsal:{event.id}:effective-value-cents:{new_total}",
+                        ),
+                    }
+                )
+
+            additions = tuple(apply_controlled_price_change(item) for item in additions)
         inventory = self._merge_inventory(
             previous.inventory,
             PackageInventory(transfers=additions),
@@ -3084,7 +3555,7 @@ class LivePackageAgentSystem:
             and item.adults == target.adults
             and item.is_fresh(freshness_reference)
         )
-        semantic_replacement, event_resolution = resolve_offer_event(
+        _semantic_replacement, event_resolution = resolve_offer_event(
             event_id=event.id,
             trip_id=current.trip_id,
             kind=event.kind,
@@ -3181,20 +3652,32 @@ class LivePackageAgentSystem:
                 or not self._same_transfer_service(item, target)
             )
         )
-        ordered_replacements = tuple(
-            sorted(
-                replacements,
-                key=lambda item: (
-                    item.id
-                    != (semantic_replacement.id if semantic_replacement is not None else ""),
-                    item.total_for_party_cents,
-                    item.depart_at or item.latest_departure_at,
-                    item.id,
-                ),
+        def replacement_order(item: TransferOption) -> tuple[object, ...]:
+            # Resolve connection feasibility before choosing among otherwise
+            # equivalent same-day offers.  The old id-first tie-break could
+            # select a later boat (10237) over the first safe arrival (9113).
+            not_before, arrive_by = _transfer_connection_limits(
+                previous.intent,
+                current.flight,
+                current.kind,
+                item,
             )
-        )
+            feasible = item.has_feasible_departure(
+                not_before=not_before,
+                arrive_by=arrive_by,
+            )
+            return (
+                not feasible,
+                item.earliest_arrival_at,
+                item.earliest_departure_at,
+                item.total_for_party_cents,
+                item.id,
+            )
+
+        ordered_replacements = tuple(sorted(replacements, key=replacement_order))
         attempted_package: PackageRunResult | None = None
         attempted_audit: PackageReverificationReport | None = None
+        attempted_replacement: TransferOption | None = None
         for replacement in ordered_replacements:
             package_event = PackageEvent(
                 id=event.id,
@@ -3213,10 +3696,27 @@ class LivePackageAgentSystem:
             if attempted_package is None:
                 attempted_package = package
                 attempted_audit = independent_audit
+                attempted_replacement = replacement
             if package.final_decision.state == PackageDecisionState.ACCEPT:
+                # Keep the semantic event envelope aligned with the package
+                # actually accepted after deterministic connection checks.
+                # The generic resolver ranks alternatives by price/id, while
+                # this path deliberately ranks safe same-day arrivals first.
+                selected_event_resolution = resolve_offer_event(
+                    event_id=event.id,
+                    trip_id=current.trip_id,
+                    kind=event.kind,
+                    target_component_id=event.target_component_id,
+                    source=event.source,
+                    occurred_at=event.occurred_at,
+                    old=target,
+                    compatible_observations=(replacement,),
+                    schema_version=event.schema_version,
+                    observed_at=max(freshness_reference, event.occurred_at),
+                )[1]
                 return LiveEventReplanRun(
                     event=event,
-                    event_resolution=event_resolution,
+                    event_resolution=selected_event_resolution,
                     event_diagnosis=event_diagnosis,
                     applied_disposition=applied_disposition,
                     agentic=event_agentic,
@@ -3238,9 +3738,27 @@ class LivePackageAgentSystem:
                 summary="iCom 官方公开源未返回可兼容且通过确定性验证的替代班次",
                 evidence_refs=current.evidence_refs,
             )
+        final_event_resolution = event_resolution
+        if attempted_replacement is not None:
+            # Even when an honest unknown (for example flight tax or two-seat
+            # inventory) keeps the package human-blocked, the event envelope
+            # must name the replacement actually evaluated by the package
+            # engine rather than a generic id-tie alternative.
+            final_event_resolution = resolve_offer_event(
+                event_id=event.id,
+                trip_id=current.trip_id,
+                kind=event.kind,
+                target_component_id=event.target_component_id,
+                source=event.source,
+                occurred_at=event.occurred_at,
+                old=target,
+                compatible_observations=(attempted_replacement,),
+                schema_version=event.schema_version,
+                observed_at=max(freshness_reference, event.occurred_at),
+            )[1]
         return LiveEventReplanRun(
             event=event,
-            event_resolution=event_resolution,
+            event_resolution=final_event_resolution,
             event_diagnosis=event_diagnosis,
             applied_disposition=applied_disposition,
             agentic=event_agentic,
@@ -3432,6 +3950,7 @@ class LivePackageAgentSystem:
         )
 
     def _build_model_agents(self) -> dict[AgentRole, StructuredLiveModelAgent]:
+        formal_model_role = os.environ.get("TRIPCHORD_FORMAL_MODEL_ROLE", "").strip()
         shared = (
             "你是 TripChord 本地自由行系统中的受限模型 Agent。"
             "你必须先观察白名单只读工具回执，再做决策。"
@@ -3471,7 +3990,9 @@ class LivePackageAgentSystem:
                 "你负责候选策展：在工具返回的候选中按用户偏好、风险和"
                 "多样性选初案，不得创造 candidate_id。candidate_table 会明确标出候选是否"
                 "包含 Evidence Arbiter 排除的报价；只要存在 evidence_selection_eligible=true "
-                "的候选，就必须从中选择，不能把已排除报价重新带入后续验证。",
+                "的候选，就必须从中选择，不能把已排除报价重新带入后续验证。"
+                "必须比较真实的去返程时间与到达边界；若存在多个可选候选，至少根据"
+                "实际返程到达时间、接驳缓冲和用户偏好作出一个可解释的选择，不能返回空选择。",
                 CandidateCurationProposal,
             ),
             AgentRole.RISK_CRITIC: (
@@ -3536,7 +4057,7 @@ class LivePackageAgentSystem:
                 system_prompt=f"{shared}{prompt}",
                 output_model=output_model,
                 required=self._model_agents_required,
-                max_output_tokens=(2_048),
+                max_output_tokens=(4_096 if formal_model_role == role.value else 2_048),
             )
             for role, (prompt, output_model) in definitions.items()
         }
@@ -3655,6 +4176,13 @@ class LivePackageAgentSystem:
                     "alternative candidate is not evidence/comparison eligible: "
                     f"{list(ineligible_alternatives)}"
                 )
+            if proposal.selected_candidate_id in visible_candidates:
+                selected_exclusions = excluded_by_candidate[proposal.selected_candidate_id]
+                if selected_exclusions:
+                    return (
+                        "selected candidate contains Evidence Arbiter excluded quotes: "
+                        f"{list(selected_exclusions)}"
+                    )
             if not eligible_candidate_ids:
                 if proposal.selected_candidate_id is not None:
                     return (
@@ -3678,12 +4206,6 @@ class LivePackageAgentSystem:
                 return (
                     "a two-provider-comparable lodging candidate exists; selected candidate "
                     "is partial evidence only"
-                )
-            selected_exclusions = excluded_by_candidate[proposal.selected_candidate_id]
-            if selected_exclusions:
-                return (
-                    "selected candidate contains Evidence Arbiter excluded quotes: "
-                    f"{list(selected_exclusions)}"
                 )
             return None
 
@@ -3723,6 +4245,7 @@ class LivePackageAgentSystem:
                 if not isinstance(quote, TransferOption)
                 and quote.availability.value == "available"
                 and quote.currency == intent.currency
+                and quote.total_for_party_cents is not None
                 and quote.total_for_party_cents > 0
                 and quote.taxes_and_fees_included is True
                 and (
@@ -4224,6 +4747,23 @@ class LivePackageAgentSystem:
             tools: ToolRegistry,
         ) -> AgentTaskResult:
             agent = self._model_agents[role]
+            if not state.model_agents_enabled:
+                # Large flexible-date exploration is intentionally deterministic.
+                # Keep a successful typed fallback in the DAG so the exploration
+                # seal can proceed without admitting or calling one model Agent
+                # per date pair.  The final publication refresh re-enables this
+                # path for exactly one selected option.
+                result = agent.unavailable_result(task, "bulk_exploration_model_deferred")
+                state.agentic_results[task.id] = result
+                return result
+            formal_model_role = os.environ.get("TRIPCHORD_FORMAL_MODEL_ROLE", "").strip()
+            if formal_model_role and formal_model_role != role.value:
+                result = agent.unavailable_result(task, "formal_model_role_limited")
+                state.agentic_results[task.id] = result
+                state.model_required_failed = state.model_required_failed or bool(
+                    result.output.get("agent_required_failed")
+                )
+                return result
             proposal_policy = proposal_policy_override or self._agent_proposal_policy(
                 state,
                 intent,
@@ -4242,7 +4782,14 @@ class LivePackageAgentSystem:
                 # the Agent can completely inspect the decision-relevant set.
                 allowed_quote_ids = tuple(item.id for item in self._evidence_frontier_quotes(state))
             budgeted_context = None
-            if self._context_builder is not None and state.memory_access is not None:
+            if (
+                self._context_builder is not None
+                and state.memory_access is not None
+                and not (
+                    formal_model_role == role.value
+                    and role == AgentRole.CANDIDATE_CURATOR
+                )
+            ):
                 current_pack = context_engine.build_pack(task)
                 purpose = {
                     AgentRole.SEARCH_SUPERVISOR: ContextPurpose.QUERY,
@@ -5075,7 +5622,11 @@ class LivePackageAgentSystem:
             ),
             browser_companion_lease_cap=_BROWSER_MAX_CONCURRENCY,
         )
-        if not schedule.proposal_accepted and self._model_agents_required:
+        if (
+            not schedule.proposal_accepted
+            and self._model_agents_required
+            and state.model_agents_enabled
+        ):
             # Search can still run to collect diagnostics, but the final
             # deterministic Safety Gate must not publish a result while a
             # required control Agent supplied an invalid/unavailable schedule.
@@ -5090,7 +5641,9 @@ class LivePackageAgentSystem:
                 "accepted": schedule.proposal_accepted,
                 "rejected_reasons": _json_value(list(schedule.rejected_reasons)),
                 "required_model_failure": (
-                    not schedule.proposal_accepted and self._model_agents_required
+                    not schedule.proposal_accepted
+                    and self._model_agents_required
+                    and state.model_agents_enabled
                 ),
             },
         }
@@ -5646,7 +6199,25 @@ class LivePackageAgentSystem:
             _: ContextEngine,
             __: ToolRegistry,
         ) -> AgentTaskResult:
-            state.normalization_results = self._normalize_browser_state(state)
+            if state.official_lodging_task is not None:
+                try:
+                    state.official_lodging_result = await state.official_lodging_task
+                except asyncio.CancelledError:
+                    state.official_lodging_task.cancel()
+                    raise
+                except Exception as exc:
+                    state.source_errors["source-arena-official-lodging"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                finally:
+                    state.official_lodging_task = None
+            browser_results = self._normalize_browser_state(state)
+            official_results = (
+                (state.official_lodging_result.result,)
+                if state.official_lodging_result is not None
+                else ()
+            )
+            state.normalization_results = (*browser_results, *official_results)
             browser_inventory = self._inventory_from_results(state.normalization_results)
             if task.id == _PUBLICATION_PRIMARY_NORMALIZE_TASK_ID:
                 if state.publication_target_candidate is None:
@@ -5762,9 +6333,19 @@ class LivePackageAgentSystem:
 
         state.normalization_by_task.clear()
         results: list[NormalizedBrowserQuoteResult] = []
+        if state.intent is None:
+            raise RuntimeError("browser normalization requires a package intent")
         for task_id in state.source_task_ids:
             snapshot = state.snapshots.get(task_id)
-            if snapshot is None or snapshot.state != BrowserTaskState.SUCCEEDED:
+            if snapshot is None:
+                continue
+            if snapshot.state != BrowserTaskState.SUCCEEDED:
+                comparison_results = self._normalize_comparison_flight_receipt(
+                    snapshot,
+                    state.intent,
+                )
+                state.normalization_by_task[task_id] = comparison_results
+                results.extend(comparison_results)
                 continue
             task_results = self._normalizer.normalize_many(
                 snapshot.quotes,
@@ -5772,6 +6353,144 @@ class LivePackageAgentSystem:
             )
             state.normalization_by_task[task_id] = task_results
             results.extend(task_results)
+        return tuple(results)
+
+    @staticmethod
+    def _normalize_comparison_flight_receipt(
+        snapshot: BrowserTaskSnapshot,
+        intent: PackageIntent,
+    ) -> tuple[NormalizedBrowserQuoteResult, ...]:
+        """Turn typed visible comparison candidates into route-only quotes.
+
+        A comparison receipt is allowed to contribute exact dates, times,
+        route and the displayed per-adult amount.  It is never promoted to a
+        party total: ``party_total_known`` stays false until the provider has
+        supplied the separate same-product one/two-adult contract.
+        """
+
+        failure = snapshot.failure
+        if (
+            snapshot.state != BrowserTaskState.FAILED
+            or failure is None
+            or failure.code != BrowserFailureCode.EXTRACTION_ERROR
+        ):
+            return ()
+        raw = failure.details.get("flight_search_receipt")
+        sealed = failure.details.get("flight_search_receipt_sha256")
+        if not isinstance(raw, dict) or not isinstance(sealed, str):
+            return ()
+        try:
+            receipt = FlightSearchReceipt.model_validate(raw)
+        except ValueError:
+            return ()
+        if flight_search_receipt_sha256(raw) != sealed:
+            return ()
+        query = snapshot.query
+        confirmed = receipt.confirmed_query
+        if (
+            receipt.state != FlightSearchReceiptState.COMPARISON_PRICE_ONLY
+            or receipt.provider != snapshot.provider
+            or confirmed.origin != query.origin
+            or confirmed.destination != query.destination
+            or confirmed.start_date != query.start_date
+            or confirmed.end_date != query.end_date
+            or confirmed.adults != query.adults
+            or query.origin_code != confirmed.origin_code
+            or query.destination_code != confirmed.destination_code
+            or receipt.captured_at != failure.captured_at
+        ):
+            return ()
+        results: list[NormalizedBrowserQuoteResult] = []
+        timestamp_pattern = re.compile(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
+        )
+        for candidate in receipt.candidate_summaries:
+            if (
+                candidate.price_classification not in {
+                    "comparison_only",
+                    "starting_or_estimated",
+                }
+                or candidate.amount is None
+                or candidate.currency is None
+                or candidate.price_basis.value not in {"per_person", "total_party"}
+                or not candidate.schedule_evidence
+            ):
+                continue
+            timestamps = timestamp_pattern.findall(candidate.schedule_evidence)
+            if len(timestamps) != 4:
+                continue
+            try:
+                outbound_depart, outbound_arrive, return_depart, return_arrive = tuple(
+                    datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    for value in timestamps
+                )
+                amount = int((Decimal(str(candidate.amount)) * Decimal(100)).to_integral_exact())
+                outbound_segments = tuple(
+                    NormalizedFlightSegment.model_validate(item)
+                    for item in candidate.outbound_segments
+                )
+                return_segments = tuple(
+                    NormalizedFlightSegment.model_validate(item)
+                    for item in candidate.return_segments
+                )
+            except (ValueError, InvalidOperation, ArithmeticError):
+                continue
+            if (
+                outbound_depart.date() != confirmed.start_date
+                or return_depart.date() != confirmed.end_date
+                or outbound_arrive <= outbound_depart
+                or return_arrive <= return_depart
+                or return_depart <= outbound_arrive
+                or amount <= 0
+            ):
+                continue
+            evidence_refs = (
+                f"browser-task:{snapshot.id}",
+                f"flight-search-receipt:sha256:{sealed}",
+                f"flight-comparison-candidate:{sealed}:{candidate.candidate_index}",
+            )
+            results.append(
+                NormalizedBrowserQuoteResult(
+                    provider=receipt.provider.value,
+                    kind=BrowserVertical.FLIGHT,
+                    status=QuoteNormalizationStatus.USABLE,
+                    quote=NormalizedFlightQuote(
+                        id=(
+                            f"browser-comparison:{receipt.provider.value}:"
+                            f"{sealed[:20]}:{candidate.candidate_index}"
+                        ),
+                        provider=receipt.provider.value,
+                        currency=candidate.currency,
+                        total_for_party_cents=amount,
+                        party_total_known=False,
+                        display_amount_cents=amount,
+                        price_basis="comparison_only",
+                        taxes_and_fees_included=(
+                            candidate.price_evidence is not None
+                            and "含税" in candidate.price_evidence
+                        ),
+                        captured_at=receipt.captured_at,
+                        expires_at=receipt.captured_at + timedelta(minutes=10),
+                        availability=QuoteAvailability.AVAILABLE,
+                        evidence_refs=evidence_refs,
+                        origin=confirmed.origin,
+                        destination=confirmed.destination,
+                        adults=confirmed.adults,
+                        party_availability_confirmed=True,
+                        outbound_depart_at=outbound_depart,
+                        outbound_arrive_at=outbound_arrive,
+                        return_depart_at=return_depart,
+                        return_arrive_at=return_arrive,
+                        outbound_flight_numbers=tuple(candidate.outbound_flight_numbers),
+                        return_flight_numbers=tuple(candidate.return_flight_numbers),
+                        outbound_segments=outbound_segments,
+                        return_segments=return_segments,
+                        origin_airport_code=candidate.origin_airport_code,
+                        destination_airport_code=candidate.destination_airport_code,
+                        carrier_summary=candidate.title,
+                    ),
+                )
+            )
         return tuple(results)
 
     def _planner_executor(
@@ -6001,7 +6720,13 @@ class LivePackageAgentSystem:
                     "candidate Scout fan-out exceeds the 96 logical-Agent cap; "
                     "split the bounded candidate workload before model execution"
                 )
-            if len(state.candidates) <= CANDIDATES_PER_AGENT or self._model_router is None:
+            formal_model_role = os.environ.get("TRIPCHORD_FORMAL_MODEL_ROLE", "").strip()
+            if (
+                len(state.candidates) <= CANDIDATES_PER_AGENT
+                or self._model_router is None
+                or not state.model_agents_enabled
+                or formal_model_role == AgentRole.CANDIDATE_CURATOR.value
+            ):
                 common_output.update(
                     {
                         "mode": "single_candidate_curator",
@@ -6652,6 +7377,9 @@ class LivePackageAgentSystem:
                         state,
                         terminal_stay_plan_id,
                     )
+                    state.source_execution_completeness = (
+                        SourceExecutionCompleteness.from_platform_coverage(state.coverage)
+                    )
                 else:
                     expected_stay_plan_id = stay_plan_for_candidate(
                         state.stay_plan_candidate_set,
@@ -6667,12 +7395,38 @@ class LivePackageAgentSystem:
                     # coverage was sealed by exploration and remains the
                     # applicable strict-coverage receipt. Freshness and product
                     # binding are checked independently by the publication audit.
-            state.source_execution_completeness = (
-                SourceExecutionCompleteness.from_platform_coverage(state.coverage)
+            if state.source_execution_completeness is None:
+                state.source_execution_completeness = (
+                    SourceExecutionCompleteness.from_platform_coverage(state.coverage)
+                )
+            # A fresh exact official quote is an explicit alternate publication
+            # boundary.  OTA lodging tasks marked not_queried are intentionally
+            # not terminal provider observations, so they must remain visible
+            # as incomplete comparison coverage while no longer blocking a
+            # truthful single-source recommendation.
+            if state.package is not None:
+                state.exact_quote_comparison_coverage = (
+                    self._candidate_exact_quote_comparison_coverage(
+                        state,
+                        intent,
+                        state.package.final_candidate,
+                    )
+                )
+            official_single_source_publishable = bool(
+                state.official_lodging_result is not None
+                and state.official_lodging_result.result.quote is not None
+                and state.exact_quote_comparison_coverage is not None
+                and state.exact_quote_comparison_coverage.single_source_publishable
             )
-            complete = state.source_execution_completeness.complete and not (
-                publication_stay_plan_scope_mismatch
+            selected_stay_comparison_complete = bool(
+                state.exact_quote_comparison_coverage is not None
+                and state.exact_quote_comparison_coverage.complete
             )
+            complete = (
+                state.source_execution_completeness.complete
+                or selected_stay_comparison_complete
+                or official_single_source_publishable
+            ) and not publication_stay_plan_scope_mismatch
             if mode == LiveCoverageMode.STRICT and not complete:
                 blocking = PackageDecision(
                     state=PackageDecisionState.HUMAN_BLOCK,
@@ -6713,10 +7467,21 @@ class LivePackageAgentSystem:
                 else set()
             )
             if state.package is not None and state.package_reverification_audit is None:
-                agent_block_reason = (
-                    "最终整包缺少异构确定性 ReVerifier 审计；"
-                    "重复执行主 Verifier 不能替代独立不变量重算，安全门拒绝发布"
+                repair_outcome = (
+                    state.repair_handoff.outcome
+                    if state.repair_handoff is not None
+                    else None
                 )
+                if repair_outcome is not None and repair_outcome.candidate is None:
+                    agent_block_reason = (
+                        "当前报价没有可安全修复的候选，正式结果保持阻断："
+                        f"{repair_outcome.message}"
+                    )
+                else:
+                    agent_block_reason = (
+                        "最终整包缺少异构确定性 ReVerifier 审计；"
+                        "重复执行主 Verifier 不能替代独立不变量重算，安全门拒绝发布"
+                    )
             elif (
                 state.package_reverification_audit is not None
                 and not state.package_reverification_audit.passed
@@ -6863,6 +7628,7 @@ class LivePackageAgentSystem:
                 and package is not None
                 and state.exact_quote_comparison_coverage is not None
                 and not state.exact_quote_comparison_coverage.complete
+                and not state.exact_quote_comparison_coverage.single_source_publishable
             ):
                 segment_counts = ", ".join(
                     f"{segment.segment_id}="
@@ -6875,8 +7641,8 @@ class LivePackageAgentSystem:
                     summary=(
                         "严格模式的住宿精确报价比价覆盖不足："
                         f"{segment_counts}。来源任务形成终态不等于拿到两家平台的"
-                        "同分段精确价格；合法单源整包仅保留为 partial evidence，"
-                        "主控拒绝把它包装成可推荐的多平台比价方案"
+                        "同分段精确价格；若每个选中住宿分段都有一份新鲜精确来源，"
+                        "只发布为单来源建议并明确未完成跨平台比价；否则主控阻止发布"
                     ),
                     evidence_refs=package.final_candidate.evidence_refs,
                 )
@@ -6894,6 +7660,17 @@ class LivePackageAgentSystem:
                 adults=intent.adults,
                 browser_source_task_count=len(state.source_task_ids),
                 stay_plan_candidate_set=state.stay_plan_candidate_set,
+                single_source_publishable=(
+                    state.exact_quote_comparison_coverage is not None
+                    and state.exact_quote_comparison_coverage.single_source_publishable
+                    and not state.exact_quote_comparison_coverage.complete
+                ),
+                comparison_complete=(
+                    state.exact_quote_comparison_coverage.complete
+                    if state.exact_quote_comparison_coverage is not None
+                    else None
+                ),
+                source_execution_complete=state.source_execution_completeness.complete,
             )
             state.claim_boundary = (
                 f"{state.claim_boundary}"
@@ -6905,24 +7682,39 @@ class LivePackageAgentSystem:
                     else "本轮缺少候选生成审计，不声明全量枚举；"
                 )
                 + (
-                    "有界 Planner 候选池已按每片最多 32 个交给 "
-                    f"{state.candidate_shard_merge_audit.requested_shard_count} 个只读 "
-                    "Candidate Scout 完整分区检查，确定性 collector 仅向 Evidence Arbiter "
-                    f"与最终 Merger 暴露 {len(state.candidate_decision_frontier)} 个候选；"
-                    "这只覆盖本轮 Planner 最多 256 个候选，不代表全网或全部组合穷举；"
-                    if state.candidate_shard_merge_audit is not None
+                    "本轮批量日期探索不向模型暴露候选 shortlist；确定性 Planner、"
+                    "Hard Verifier、必要 Repair/ReVerifier 与封存门直接消费服务器证据；"
+                    if not state.model_agents_enabled
                     else (
-                        "模型仅看到多样性 shortlist，"
-                        f"省略 {state.candidate_shortlist_proof.omitted_candidate_count} 个候选；"
+                        "有界 Planner 候选池已按每片最多 32 个交给 "
+                        f"{state.candidate_shard_merge_audit.requested_shard_count} 个只读 "
+                        "Candidate Scout 完整分区检查，确定性 collector 仅向 Evidence Arbiter "
+                        f"与最终 Merger 暴露 {len(state.candidate_decision_frontier)} 个候选；"
+                        "这只覆盖本轮 Planner 最多 256 个候选，不代表全网或全部组合穷举；"
+                        if state.candidate_shard_merge_audit is not None
+                        else (
+                            "模型仅看到多样性 shortlist，"
+                            f"省略 {state.candidate_shortlist_proof.omitted_candidate_count} "
+                            "个候选；"
+                        )
+                        if state.candidate_shortlist_proof is not None
+                        else "模型候选可见范围未形成证明；"
                     )
-                    if state.candidate_shortlist_proof is not None
-                    else "模型候选可见范围未形成证明；"
                 )
                 + (
-                    "本轮模型 Agent 已通过白名单工具参与证据仲裁、"
-                    "候选策展、风险批判、修复策略、修复后复审和主控建议；"
-                    if self._model_router is not None
-                    else "本轮未配置模型 Router，模型 Agent 阶段已显式标记为确定性降级；"
+                    "本轮是批量日期探索：证据仲裁、候选策展、风险批判、修复策略、"
+                    "修复后复审、主控建议及解释模型均未调用；报价事实和确定性裁决由"
+                    "服务器流水线完成，最终模型复核仅在唯一发布重搜中执行；"
+                    if not state.model_agents_enabled
+                    else (
+                        "本轮模型 Agent 已通过白名单工具参与证据仲裁、"
+                        "候选策展、风险批判、修复策略、修复后复审和主控建议；"
+                        if self._model_router is not None
+                        else (
+                            "本条候选链的报价事实与确定性裁决未由模型改写；正式入口模型是否实际参与，"
+                            "以本次响应中的 model_trace 字段为准；"
+                        )
+                    )
                 )
                 + (
                     "最终候选已由 "
@@ -6943,7 +7735,15 @@ class LivePackageAgentSystem:
                         f"{segment.required_distinct_provider_count}"
                         for segment in state.exact_quote_comparison_coverage.segments
                     )
-                    + "；单源报价只保留为 partial evidence，不声明完成比价；"
+                    + (
+                        "；选中住宿分段已完成精确跨平台比价；"
+                        if state.exact_quote_comparison_coverage.complete
+                        else (
+                            "；单源报价仅作为单来源建议发布，明确未完成跨平台比价且不声明最低价；"
+                            if state.exact_quote_comparison_coverage.single_source_publishable
+                            else "；单源报价只保留为 partial evidence，不声明完成比价；"
+                        )
+                    )
                     if state.exact_quote_comparison_coverage is not None
                     and state.source_execution_completeness is not None
                     else "本轮未形成可审计的住宿精确报价比价覆盖；"
@@ -7017,7 +7817,7 @@ class LivePackageAgentSystem:
                 if task_id not in state.agentic_results
             )
             required_model_failures: list[str] = []
-            if self._model_agents_required:
+            if self._model_agents_required and state.model_agents_enabled:
                 for task_id in _EXPLORATION_MODEL_STAGE_IDS:
                     result = state.agentic_results.get(task_id)
                     if result is None or not result.success:
@@ -7212,7 +8012,11 @@ class LivePackageAgentSystem:
             if state.decision is None:
                 raise ValueError("publication gate requires a deterministic master decision")
 
-            if self._model_agents_required and state.model_required_failed:
+            if (
+                self._model_agents_required
+                and state.model_agents_enabled
+                and state.model_required_failed
+            ):
                 blocking = PackageDecision(
                     state=PackageDecisionState.HUMAN_BLOCK,
                     summary=(
@@ -7244,7 +8048,9 @@ class LivePackageAgentSystem:
             output: dict[str, JsonValue] = {
                 "decision": state.decision.state.value,
                 "required_model_failure": (
-                    self._model_agents_required and state.model_required_failed
+                    self._model_agents_required
+                    and state.model_agents_enabled
+                    and state.model_required_failed
                 ),
                 "explanation_published": state.explanation is not None,
                 "explanation_grounding_block_reason": (state.explanation_grounding_block_reason),
@@ -7291,7 +8097,12 @@ class LivePackageAgentSystem:
                         (submitted.id,),
                         timeout_seconds=_browser_wait_timeout_seconds(
                             retry_submission.timeout_seconds,
-                            source_task_count=source_task_count,
+                            # This call waits for exactly one leased browser
+                            # task.  Using the whole graph size here multiplies
+                            # every provider timeout by the number of parallel
+                            # tasks and can keep one dead page alive for many
+                            # minutes instead of producing its typed timeout.
+                            source_task_count=1,
                         ),
                     )
                     attempts.append(terminal)
@@ -7507,12 +8318,19 @@ class LivePackageAgentSystem:
                 if state.evidence_proposal is not None
                 else ()
             )
-            candidate_columns = (
+            base_candidate_columns: tuple[str, ...] = (
                 "id",
                 "kind",
                 "currency",
                 "computed_total_cents",
                 "flight_provider",
+                "flight_carrier_summary",
+                "flight_depart_at",
+                "flight_arrive_at",
+                "flight_return_depart_at",
+                "flight_return_arrive_at",
+                "flight_display_amount_cents",
+                "flight_party_total_known",
                 "lodging_providers",
                 "transfer_providers",
                 "flight_checked_baggage_per_adult_kg",
@@ -7524,7 +8342,11 @@ class LivePackageAgentSystem:
                 "evidence_excluded_component_ids",
                 "evidence_selection_eligible",
                 "exact_quote_comparison_ready",
-                "shortlist_reasons",
+            )
+            candidate_columns = (
+                (*base_candidate_columns, "shortlist_reasons")
+                if call.agent_role != AgentRole.RISK_CRITIC
+                else base_candidate_columns
             )
 
             def candidate_row(item: TravelPackageCandidate) -> list[JsonValue]:
@@ -7535,23 +8357,25 @@ class LivePackageAgentSystem:
                 decision["exact_quote_comparison_ready"] = item.id in set(
                     state.comparison_ready_candidate_ids
                 )
-                return [
-                    *(decision[column] for column in candidate_columns[:-1]),
-                    _json_value(
-                        [
-                            *(
-                                proof.selection_reasons.get(item.id, ())
-                                if proof is not None
-                                else ()
-                            ),
-                            *(
-                                ("candidate_scout_nomination",)
-                                if item.id in scout_nominations
-                                else ()
-                            ),
-                        ]
-                    ),
-                ]
+                row = [decision[column] for column in base_candidate_columns]
+                if call.agent_role != AgentRole.RISK_CRITIC:
+                    row.append(
+                        _json_value(
+                            [
+                                *(
+                                    proof.selection_reasons.get(item.id, ())
+                                    if proof is not None
+                                    else ()
+                                ),
+                                *(
+                                    ("candidate_scout_nomination",)
+                                    if item.id in scout_nominations
+                                    else ()
+                                ),
+                            ]
+                        )
+                    )
+                return row
 
             return {
                 "candidate_table": {
@@ -7594,10 +8418,16 @@ class LivePackageAgentSystem:
                     "rows 中 id 列明确展示的候选；truncated=true 时"
                     "不得声称已检查全部候选，也不得猜测或选择省略的 candidate_id。"
                 ),
-                "deterministic_selected_candidate_id": (
-                    state.planner_handoff.selected_candidate_id
-                    if state.planner_handoff is not None
-                    else None
+                **(
+                    {
+                        "deterministic_selected_candidate_id": (
+                            state.planner_handoff.selected_candidate_id
+                            if state.planner_handoff is not None
+                            else None
+                        )
+                    }
+                    if call.agent_role != AgentRole.RISK_CRITIC
+                    else {}
                 ),
                 "evidence_arbitration": _json_value(
                     state.evidence_proposal.model_dump(mode="json")
@@ -8034,6 +8864,11 @@ class LivePackageAgentSystem:
             ),
             "last": query.model_copy(update={"start_date": query.end_date - timedelta(days=1)}),
         }
+        # The alternate airport-island full-stay source belongs exclusively to
+        # the server-owned live-v4 candidate contract.  Keep legacy/v3 callers
+        # at the original five source tasks.
+        if "stay_plan_candidate_set" in query.options:
+            segment_queries["hulhumale-full"] = query
         base = (
             flight_task,
             *(
@@ -8049,19 +8884,36 @@ class LivePackageAgentSystem:
                 for segment, segment_query in segment_queries.items()
             ),
         )
-        if self._stay_plan_candidate_set(query) is None:
-            return base
-        return (
-            *base,
-            self._source_task(
-                provider,
-                BrowserVertical.LODGING,
-                query,
-                timeout_seconds,
-                segment="hulhumale-full",
-                allow_recent_quote_reuse=allow_recent_quote_reuse,
-                reuse_partition_sha256=reuse_partition_sha256,
-            ),
+        # ``hulhumale-full`` is already part of the canonical segment set
+        # above.  Keep one task per provider/vertical/segment so the server
+        # allow-list remains injective when a stay-plan candidate set exists.
+        return base
+
+    @staticmethod
+    def _ensure_official_lodging_budget(task: AgentTask) -> AgentTask:
+        """Keep OTA lodging attempts usable when an official source is enabled."""
+
+        submission = BrowserTaskSubmission.model_validate(task.input["submission"])
+        if submission.kind != BrowserVertical.LODGING:
+            return task
+        submission = submission.model_copy(
+            update={
+                "timeout_seconds": max(submission.timeout_seconds, 120),
+                # A fresh exact official quote is already sufficient for the
+                # selected segment's single-source publication boundary. Keep
+                # each OTA attempt honest at the full 120-second budget, but
+                # do not spend a second identical retry before publishing a
+                # truthful single-source result.
+                "max_attempts": 1,
+            }
+        )
+        return task.model_copy(
+            update={
+                "input": {
+                    **task.input,
+                    "submission": _json_value(submission.model_dump(mode="json")),
+                }
+            }
         )
 
     def _source_task(
@@ -8082,6 +8934,15 @@ class LivePackageAgentSystem:
                 "options": {
                     **query.options,
                     "__tripchord_allow_recent_quote_reuse": allow_recent_quote_reuse,
+                    # Flight result pages are exact, trusted URLs.  When the
+                    # user already has the same result page open in Chrome,
+                    # let the companion claim it instead of creating a cold
+                    # inactive tab and repeating the search.
+                    **(
+                        {"__tripchord_reuse_exact_result_tab": True}
+                        if vertical == BrowserVertical.FLIGHT
+                        else {}
+                    ),
                 }
             }
         )
@@ -8473,6 +9334,12 @@ class LivePackageAgentSystem:
             if selected_stay_plan_id is None:
                 raise ValueError("candidate is outside the frozen stay-plan set")
             plan = state.stay_plan_candidate_set.candidate(selected_stay_plan_id)
+            quote_window_intent = intent.model_copy(
+                update={
+                    "start_date": candidate.flight.outbound_arrive_at.date(),
+                    "end_date": candidate.flight.return_depart_at.date(),
+                }
+            )
             segments = tuple(
                 self._stay_plan_segment_quote_comparison_coverage(
                     state,
@@ -8481,8 +9348,8 @@ class LivePackageAgentSystem:
                     segment.segment_id,
                     segment.query_segment,
                     segment.exact_place_key,
-                    segment.check_in.resolve(intent),
-                    segment.check_out.resolve(intent),
+                    segment.check_in.resolve(quote_window_intent),
+                    segment.check_out.resolve(quote_window_intent),
                     lodging_providers,
                 )
                 for segment in plan.segments
@@ -8565,6 +9432,33 @@ class LivePackageAgentSystem:
         exact_count = sum(
             item.inventory_state == StayInventoryResultState.QUOTE_FOUND for item in evidence
         )
+        official = state.official_lodging_result
+        if (
+            official is not None
+            and isinstance(official.result.quote, NormalizedLodgingQuote)
+        ):
+            quote = official.result.quote
+            if (
+                quote.place_key == exact_place_key
+                and quote.check_in == check_in
+                and quote.check_out == check_out
+                and quote.adults == intent.adults
+                and quote.rooms == intent.rooms
+            ):
+                evidence.append(
+                    LodgingProviderQuoteEvidence(
+                        provider=_OFFICIAL_LODGING_PROVIDER,
+                        source_task_id=official.source_task_id,
+                        inventory_state=StayInventoryResultState.QUOTE_FOUND,
+                        quote_ids=(quote.id,),
+                        evidence_refs=(
+                            *quote.evidence_refs,
+                            f"arena-official-capture:{official.response_sha256}",
+                        ),
+                        source_execution_terminal=True,
+                    )
+                )
+                exact_count += 1
         return LodgingSegmentQuoteComparisonCoverage(
             segment_id=segment_id,
             exact_place_key=exact_place_key,
@@ -8665,6 +9559,34 @@ class LivePackageAgentSystem:
             item.inventory_state == StayInventoryResultState.QUOTE_FOUND
             for item in provider_evidence
         )
+        official = state.official_lodging_result
+        if (
+            official is not None
+            and isinstance(official.result.quote, NormalizedLodgingQuote)
+        ):
+            quote = official.result.quote
+            if (
+                quote.place_key == lodging.place_key
+                and quote.area == lodging.area
+                and quote.check_in == lodging.check_in
+                and quote.check_out == lodging.check_out
+                and quote.adults == intent.adults
+                and quote.rooms == intent.rooms
+            ):
+                provider_evidence.append(
+                    LodgingProviderQuoteEvidence(
+                        provider=_OFFICIAL_LODGING_PROVIDER,
+                        source_task_id=official.source_task_id,
+                        inventory_state=StayInventoryResultState.QUOTE_FOUND,
+                        quote_ids=(quote.id,),
+                        evidence_refs=(
+                            *quote.evidence_refs,
+                            f"arena-official-capture:{official.response_sha256}",
+                        ),
+                        source_execution_terminal=True,
+                    )
+                )
+                exact_count += 1
         place = lodging.place_key.value if lodging.place_key is not None else "unknown"
         return LodgingSegmentQuoteComparisonCoverage(
             segment_id=(
@@ -9122,7 +10044,13 @@ class LivePackageAgentSystem:
             if not result.usable:
                 continue
             if isinstance(result.quote, NormalizedFlightQuote):
-                flights.append(result.quote)
+                # Route-only comparison evidence is useful for explaining a
+                # source gap, but it is never a publishable flight.  Keep it
+                # in normalization/evidence records while requiring the
+                # complete party-price and airport-level segment contract for
+                # Planner input.
+                if result.quote.has_publishable_execution_contract:
+                    flights.append(result.quote)
             elif isinstance(result.quote, NormalizedLodgingQuote):
                 lodgings.append(result.quote)
             transfers.extend(result.transfers)
@@ -10144,7 +11072,11 @@ class LivePackageAgentSystem:
             "id": quote.id,
             "provider": quote.provider,
             "currency": quote.currency,
-            "total_for_party_cents": quote.total_for_party_cents,
+            "total_for_party_cents": (
+                quote.total_for_party_cents
+                if not isinstance(quote, NormalizedFlightQuote) or quote.party_total_known
+                else None
+            ),
             "taxes_and_fees_included": quote.taxes_and_fees_included,
             "captured_at": quote.captured_at.isoformat(),
             "expires_at": quote.expires_at.isoformat(),
@@ -10175,6 +11107,13 @@ class LivePackageAgentSystem:
             },
         }
         if isinstance(quote, NormalizedFlightQuote):
+            common["party_total_known"] = quote.party_total_known
+            common["price_basis"] = quote.price_basis
+            common["display_amount_cents"] = (
+                quote.display_amount_cents
+                if not quote.party_total_known
+                else None
+            )
             common.update(
                 {
                     "kind": "flight",
@@ -10358,7 +11297,22 @@ class LivePackageAgentSystem:
             ),
             "provider": quote.provider,
             "currency": quote.currency,
-            "total_for_party_cents": quote.total_for_party_cents,
+                    "total_for_party_cents": (
+                        quote.total_for_party_cents
+                        if not isinstance(quote, NormalizedFlightQuote)
+                        or quote.party_total_known
+                        else None
+                    ),
+                    "party_total_known": (
+                        quote.party_total_known
+                        if isinstance(quote, NormalizedFlightQuote)
+                        else True
+                    ),
+                    "price_basis": (
+                        quote.price_basis
+                        if isinstance(quote, NormalizedFlightQuote)
+                        else "total_party"
+                    ),
             "taxes_and_fees_included": quote.taxes_and_fees_included,
             "availability": quote.availability.value,
             "expires_at": quote.expires_at.isoformat(),
@@ -10463,6 +11417,13 @@ class LivePackageAgentSystem:
             "currency": candidate.currency,
             "computed_total_cents": candidate.computed_total_cents,
             "flight_provider": candidate.flight.provider,
+            "flight_carrier_summary": candidate.flight.carrier_summary,
+            "flight_depart_at": candidate.flight.outbound_depart_at.isoformat(),
+            "flight_arrive_at": candidate.flight.outbound_arrive_at.isoformat(),
+            "flight_return_depart_at": candidate.flight.return_depart_at.isoformat(),
+            "flight_return_arrive_at": candidate.flight.return_arrive_at.isoformat(),
+            "flight_display_amount_cents": candidate.flight.display_amount_cents,
+            "flight_party_total_known": candidate.flight.party_total_known,
             "lodging_providers": _json_value(
                 sorted({item.provider for item in candidate.lodgings})
             ),
@@ -10698,8 +11659,17 @@ class LivePackageAgentSystem:
             (
                 f"航班报价来自 {flight.provider}，去程日期为 "
                 f"{flight.outbound_depart_at.date().isoformat()}，返程日期为 "
-                f"{flight.return_depart_at.date().isoformat()}，{flight.adults} 名成人金额为 "
-                f"{amount(flight.currency, flight.total_for_party_cents)}。"
+                f"{flight.return_depart_at.date().isoformat()}；"
+                + (
+                    f"{flight.adults} 名成人总价为 "
+                    f"{amount(flight.currency, flight.total_for_party_cents or 0)}。"
+                    if flight.party_total_known
+                    else (
+                        f"当前仅有观察价 "
+                        f"{amount(flight.currency, flight.display_amount_cents or 0)}，"
+                        "两人总价未获同一票价产品的 1/2 成人对照，未计入整包。"
+                    )
+                )
             ),
             (flight,),
         )
@@ -10999,7 +11969,12 @@ class LivePackageAgentSystem:
         adults: int,
         browser_source_task_count: int,
         stay_plan_candidate_set: StayPlanCandidateSet | None,
+        single_source_publishable: bool = False,
+        comparison_complete: bool | None = None,
+        source_execution_complete: bool | None = None,
     ) -> str:
+        if source_execution_complete is None:
+            source_execution_complete = complete
         concurrency_boundary = (
             f"本轮 {browser_source_task_count} 个浏览器 Agent 搜索节点表示调度层并发；"
             "配对浏览器实际最多同时执行 "
@@ -11035,6 +12010,33 @@ class LivePackageAgentSystem:
             )
         else:
             transfer_boundary = "iCom 官方公开接驳查询未完成 4/4，缺失方向不得被补造为可用班次。"
+        if comparison_complete is True and not source_execution_complete:
+            mode_prefix = "降级模式下，" if mode != LiveCoverageMode.STRICT else ""
+            return (
+                f"{mode_prefix}本次选中住宿分段已完成精确跨平台比价，但全局来源任务仍有缺口；"
+                "不得声明三平台实时核价完成，也不得将选中方案的局部比价扩展为该结论；"
+                f"{concurrency_boundary}"
+                f"{stay_plan_boundary}"
+                f"{transfer_boundary}"
+                f"{fliggy_party_boundary}"
+                f"{trusted_url_boundary}"
+            )
+        if comparison_complete is False and single_source_publishable:
+            mode_prefix = (
+                "降级模式下基于成功来源，"
+                if mode != LiveCoverageMode.STRICT
+                else ""
+            )
+            return (
+                f"{mode_prefix}本次选中住宿的每个分段都有一份新鲜精确官方或 OTA 来源，"
+                "因此发布为单来源建议；跨平台比价尚未完成，不声明最低价，"
+                "不得声明三平台实时核价完成；"
+                f"{concurrency_boundary}"
+                f"{stay_plan_boundary}"
+                f"{transfer_boundary}"
+                f"{fliggy_party_boundary}"
+                f"{trusted_url_boundary}"
+            )
         if complete:
             return (
                 "本次已通过配对浏览器形成携程、去哪儿、同程 3/3 平台的机票"
@@ -11158,10 +12160,12 @@ class LivePackageAgentSystem:
             or query.start_date != intent.start_date
             or query.end_date != intent.end_date
             or query.adults != intent.adults
+            or query.children != intent.children
+            or query.infants != intent.infants
             or query.rooms != intent.rooms
             or query.currency != intent.currency
         ):
-            raise ValueError("browser query must exactly match package intent context")
+            raise ValueError("browser query must exactly match package party and context")
         self._stay_area_search_profile(query)
 
     def _utc_now(self) -> datetime:
@@ -11176,3 +12180,10 @@ class LivePackageAgentSystem:
             return None
         principal = f"{access.tenant_id}\0{access.user_id or '<tenant-scope>'}"
         return hashlib.sha256(principal.encode("utf-8")).hexdigest()
+
+
+# LodgingStrategyComparison is declared after the imported PackageArea type is
+# referenced by the public run DTO.  Rebuild once the module namespace is
+# complete so durable cache restore and HTTP serialization use the same schema
+# as the in-process runner.
+LivePackageAgentRun.model_rebuild()

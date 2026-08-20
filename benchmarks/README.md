@@ -65,9 +65,9 @@ read-only same-provider page requery, and checks the
 Planner–Verifier–Repair–ReVerifier–master stay-plan handoff before reporting a
 recommendation. The three date pairs use batch admission over the Companion's
 six global read-only leases so all 39 browser tasks receive a viable execution
-window. The frozen server execution budget is 3600 seconds. The runner submits
+window. The frozen server execution budget is 600 seconds. The runner submits
 only after runtime preflight reports an effective flexible timeout of exactly
-3600 seconds. It submits
+600 seconds. It submits
 that work through `POST /api/v1/agents/live-flexible-plan-from-text/jobs`, derives
 its idempotency key from the canonical API-payload SHA plus one fresh per-run
 attempt ID, and polls the returned job with the same tenant-scoped authenticated
@@ -80,7 +80,7 @@ stage/progress changes, whitelisted terminal metadata plus the result digest, an
 the job-bound model trace receipt. The complete terminal result is not duplicated
 under `terminal_job`; only separately validated result projections enter the bundle.
 The process-global model counter is diagnostic only. A failed or cancelled
-job, a tenant-scoped 404, or expiry of the 3900-second default client wait budget
+job, a tenant-scoped 404, or expiry of the 900-second default client wait budget
 fails closed before the Done-Gate and triggers a best-effort same-tenant `DELETE`
 whose whitelisted receipt is persisted. API and Browser Bridge credentials are
 neither inputs to the idempotency key nor persisted in the evidence bundle; nested

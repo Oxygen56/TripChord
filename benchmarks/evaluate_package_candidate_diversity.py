@@ -13,6 +13,7 @@ from tripchord.planning.package import (
     PackageArea,
     PackageIntent,
     PackageInventory,
+    PackagePlaceKey,
     PackagePlanner,
     TransferOption,
     TransferPriceGuarantee,
@@ -136,6 +137,11 @@ def _lodging(
         adults=2,
         rooms=1,
         breakfast_included=True,
+        place_key=(
+            PackagePlaceKey.MAAFUSHI
+            if area == PackageArea.DESTINATION_ISLAND
+            else PackagePlaceKey.HULHUMALE
+        ),
     )
 
 
@@ -158,6 +164,16 @@ def _transfer(
         evidence_refs=(f"synthetic-evidence:{quote_id}",),
         origin_area=origin,
         destination_area=destination,
+        origin_place_key={
+            PackageArea.AIRPORT: PackagePlaceKey.VELANA_AIRPORT,
+            PackageArea.AIRPORT_ISLAND: PackagePlaceKey.HULHUMALE,
+            PackageArea.DESTINATION_ISLAND: PackagePlaceKey.MAAFUSHI,
+        }[origin],
+        destination_place_key={
+            PackageArea.AIRPORT: PackagePlaceKey.VELANA_AIRPORT,
+            PackageArea.AIRPORT_ISLAND: PackagePlaceKey.HULHUMALE,
+            PackageArea.DESTINATION_ISLAND: PackagePlaceKey.MAAFUSHI,
+        }[destination],
         adults=2,
         service_date=depart_at.date(),
         schedule_mode=TransferScheduleMode.EXACT_DEPARTURE,

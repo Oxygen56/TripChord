@@ -45,6 +45,7 @@ def _source_ids() -> tuple[str, ...]:
                 "lodging-first",
                 "lodging-middle",
                 "lodging-last",
+                "lodging-hulhumale-full",
             ) if provider != BrowserProvider.TONGCHENG else ()),
         )
     )
@@ -148,7 +149,7 @@ class _FakePairRunner:
         self.calls += 1
         assert timeout_seconds == 20
         assert source_start_delays_ms is not None
-        assert len(source_start_delays_ms) == 11
+        assert len(source_start_delays_ms) == 13
         return _blocked_run(request, query, mode)
 
 
@@ -168,7 +169,7 @@ def _payload(*, coverage_mode: str = "strict") -> dict[str, object]:
         },
         "coverage_mode": coverage_mode,
         "timeout_seconds": 20,
-        "total_timeout_seconds": 120,
+        "total_timeout_seconds": 600,
         "max_pairs": 1,
     }
 
@@ -263,9 +264,9 @@ async def test_flexible_live_success_caches_each_pair_for_event_replanning(
             json=_payload(),
         )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     body = response.json()
-    assert body["run"]["query_plan"]["total_task_count"] == 11
+    assert body["run"]["query_plan"]["total_task_count"] == 13
     assert len(body["run"]["pair_runs"]) == 1
     assert body["run"]["sampled_not_exhaustive"] is False
     assert "不得声称全月最低价" in body["run"]["claim_boundary"]

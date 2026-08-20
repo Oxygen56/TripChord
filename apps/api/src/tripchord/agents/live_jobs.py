@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Protocol, Self
+from typing import Annotated, Any, Protocol, Self, cast
 from uuid import uuid4
 
 from pydantic import Field, ValidationError, field_validator, model_validator
@@ -1073,7 +1073,7 @@ class _RuntimeJob:
         tenant_partition: str,
         snapshot: LivePlanningJobSnapshot,
         deadline_monotonic: float,
-        operation: LiveJobOperation,
+        operation: LiveJobOperation | LiveJobWorkerCommand,
         prepared: bool = False,
     ) -> None:
         self.tenant_partition = tenant_partition
@@ -1732,8 +1732,8 @@ class LivePlanningJobRegistry:
                         raise RuntimeError(
                             "live planning idempotency updated_at is invalid"
                         ) from None
-            runtime = self._records.get(job_id)
-            if runtime is None:
+            loaded_runtime = self._records.get(job_id)
+            if loaded_runtime is None:
                 # C-146 P0 supplement (P0-4)/b119: a minimal durable tombstone
                 # keeps the idempotency binding after its quarantined record is
                 # reclaimed, so a same-key request always fails closed and the
@@ -1747,16 +1747,16 @@ class LivePlanningJobRegistry:
                     or schema_version != "tripchord-live-job-registry-v3"
                 ):
                     raise RuntimeError("live planning idempotency binding is invalid")
-            elif runtime.snapshot.request_sha256 != request_digest:
+            elif loaded_runtime.snapshot.request_sha256 != request_digest:
                 raise RuntimeError("live planning idempotency binding is invalid")
             if defer_start is None:
                 # P0-2: legacy v1/v2 records carry no execution mode. Derive the
                 # provable mode from the surviving durable facts; when the facts
                 # are insufficient, fail closed into an isolated binding that is
                 # never replayed (the derived bool is persisted, never null).
-                assert runtime is not None
+                assert loaded_runtime is not None
                 derived = self._derive_legacy_execution_mode(
-                    runtime,
+                    loaded_runtime,
                     schema_version=schema_version,
                 )
                 if derived is None:
@@ -2730,9 +2730,9 @@ class LivePlanningJobRegistry:
             )
             if type(dispatch_count) is not int or dispatch_count not in expected_counts:
                 raise RuntimeError("live planning activation dispatch count is invalid")
-        return json.loads(
+        return cast(dict[str, Any], json.loads(
             json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        )
+        ))
 
     async def prepare_activation_intent(
         self,
@@ -2762,7 +2762,7 @@ class LivePlanningJobRegistry:
                     raise LivePlanningJobInactiveError(
                         "live planning activation intent differs from the durable intent"
                     )
-                return json.loads(json.dumps(existing, sort_keys=True))
+                return cast(dict[str, Any], json.loads(json.dumps(existing, sort_keys=True)))
             if (
                 not runtime.prepared
                 or runtime.task is not None
@@ -2785,7 +2785,10 @@ class LivePlanningJobRegistry:
                 runtime.activation_operation = None
                 raise
             self._changed.notify_all()
-            return json.loads(json.dumps(runtime.activation_operation, sort_keys=True))
+            return cast(
+                dict[str, Any],
+                json.loads(json.dumps(runtime.activation_operation, sort_keys=True)),
+            )
 
     async def activation_operation(
         self,
@@ -2802,7 +2805,7 @@ class LivePlanningJobRegistry:
                 raise LivePlanningJobInactiveError(
                     "live planning job uses a foreign activation operation"
                 )
-            return json.loads(json.dumps(operation, sort_keys=True))
+            return cast(dict[str, Any], json.loads(json.dumps(operation, sort_keys=True)))
 
     async def commit_activation(
         self,
@@ -2819,7 +2822,11 @@ class LivePlanningJobRegistry:
                 raise LivePlanningJobInactiveError(
                     "live planning job uses a foreign activation operation"
                 )
-            if runtime is not None and runtime.quarantined:
+            if runtime is None:
+                raise LivePlanningJobInactiveError(
+                    "live planning job uses a foreign activation operation"
+                )
+            if runtime.quarantined:
                 # C-146 P0 supplement (P0-4 / b119): a quarantined record's
                 # activation is never committed — fail closed, keep the durable
                 # facts untouched.
@@ -2830,7 +2837,7 @@ class LivePlanningJobRegistry:
                 raise LivePlanningJobInactiveError(
                     "live planning activation operation was cancelled"
                 )
-            if runtime is not None and runtime.snapshot.state == LivePlanningJobState.CANCELLED:
+            if runtime.snapshot.state == LivePlanningJobState.CANCELLED:
                 raise LivePlanningJobInactiveError("live planning job was cancelled")
             if operation["phase"] == "intent":
                 raise LivePlanningJobInactiveError(
@@ -2851,8 +2858,11 @@ class LivePlanningJobRegistry:
                     runtime.activation_operation = operation
                     raise
                 self._changed.notify_all()
-                return json.loads(json.dumps(committed_operation, sort_keys=True))
-            return json.loads(json.dumps(operation, sort_keys=True))
+                return cast(
+                    dict[str, Any],
+                    json.loads(json.dumps(committed_operation, sort_keys=True)),
+                )
+            return cast(dict[str, Any], json.loads(json.dumps(operation, sort_keys=True)))
 
     async def is_prepared(
         self,
@@ -3026,7 +3036,7 @@ class LivePlanningJobRegistry:
             else:
                 operation_task.cancel()
         task_done = task is None or task is asyncio.current_task() or task.done()
-        if not task_done:
+        if task is not None and not task_done:
             task.cancel()
             done_tasks, _ = await asyncio.wait(
                 (task,),
@@ -3349,7 +3359,11 @@ class LivePlanningJobRegistry:
             else:
                 await self._mark_cancel_stuck(current)
 
-    async def _run(self, runtime: _RuntimeJob, operation: LiveJobOperation) -> None:
+    async def _run(
+        self,
+        runtime: _RuntimeJob,
+        operation: LiveJobOperation | LiveJobWorkerCommand,
+    ) -> None:
         operation_task: asyncio.Task[dict[str, Any]] | None = None
         generation = runtime.generation
         try:
@@ -3746,17 +3760,29 @@ class LivePlanningJobRegistry:
         # to quarantine), but keep the marker file path for cleanup.
         seen: dict[tuple[int, str], int] = {}
         unique: list[tuple[int, str, Path | None, _RuntimeJob | None]] = []
-        for pgid, marker, marker_path, runtime in candidates:
-            key = (pgid, marker)
+        for (
+            candidate_pgid,
+            candidate_marker,
+            candidate_marker_path,
+            candidate_runtime,
+        ) in candidates:
+            key = (candidate_pgid, candidate_marker)
             index = seen.get(key)
             if index is None:
                 seen[key] = len(unique)
-                unique.append((pgid, marker, marker_path, runtime))
-            elif unique[index][3] is None and runtime is not None:
-                unique[index] = (pgid, marker, unique[index][2], runtime)
-        for pgid, marker, marker_path, runtime in unique:
-            commands = self._group_commands(pgid)
-            authenticated = any(marker in line for line in commands)
+                unique.append(
+                    (candidate_pgid, candidate_marker, candidate_marker_path, candidate_runtime)
+                )
+            elif unique[index][3] is None and candidate_runtime is not None:
+                unique[index] = (
+                    candidate_pgid,
+                    candidate_marker,
+                    unique[index][2],
+                    candidate_runtime,
+                )
+        for unique_pgid, unique_marker, unique_marker_path, unique_runtime in unique:
+            commands = self._group_commands(unique_pgid)
+            authenticated = any(unique_marker in line for line in commands)
             # Kill the whole authenticated group; confirm every member died.
             # An unauthenticated group (marker not found in its command lines,
             # or the ps query itself failed) is NEVER killed — a reused PGID
@@ -3765,7 +3791,7 @@ class LivePlanningJobRegistry:
             group_absent = False
             if authenticated:
                 with suppress(ProcessLookupError, PermissionError, OSError):
-                    os.killpg(pgid, signal.SIGKILL)
+                    os.killpg(unique_pgid, signal.SIGKILL)
                     deadline = asyncio.get_running_loop().time() + self._hard_stop_confirm_seconds
                     while asyncio.get_running_loop().time() < deadline:
                         try:
@@ -3784,7 +3810,7 @@ class LivePlanningJobRegistry:
                             # the next startup.
                             pass
                         await asyncio.sleep(0.01)
-            elif runtime is not None:
+            elif unique_runtime is not None:
                 # A marker-free command scan can mean either a failed ``ps`` /
                 # reused live PGID OR that the old worker exited and removed its
                 # marker before this boot. Probe existence without signalling.
@@ -3795,15 +3821,15 @@ class LivePlanningJobRegistry:
                 # absence lets this boot discard the stale worker identity and
                 # resolve only from the record's independent durable facts.
                 try:
-                    os.killpg(pgid, 0)
+                    os.killpg(unique_pgid, 0)
                 except ProcessLookupError:
-                    if runtime.orphan_authenticated is True:
+                    if unique_runtime.orphan_authenticated is True:
                         confirmed = True
                     else:
                         group_absent = True
                 except (PermissionError, OSError):
                     pass
-            if runtime is not None:
+            if unique_runtime is not None:
                 # C-146 P0-3: quarantine EVERY cold-booted record with a durable
                 # worker identity — authenticated OR not. An unauthenticated
                 # group that still exists (marker not found in its command lines,
@@ -3811,7 +3837,7 @@ class LivePlanningJobRegistry:
                 # stays ISOLATED with the durable per-identity auth fact persisted.
                 # A separately-proven ESRCH group takes the branch below instead.
                 async with self._lock:
-                    current = self._records.get(runtime.snapshot.id)
+                    current = self._records.get(unique_runtime.snapshot.id)
                     if (
                         current is not None
                         and current.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
@@ -3838,9 +3864,9 @@ class LivePlanningJobRegistry:
                             self._resolve_cold_booted_record_locked(current)
                             self._persist_locked()
                             self._changed.notify_all()
-                            if marker_path is not None:
+                            if unique_marker_path is not None:
                                 with suppress(OSError):
-                                    marker_path.unlink(missing_ok=True)
+                                    unique_marker_path.unlink(missing_ok=True)
                             continue
                         # C-146 P0-3: the durable auth/death-confirm facts are
                         # MONOTONIC per identity — a cold start only ever STRENGTHENS
@@ -3878,8 +3904,8 @@ class LivePlanningJobRegistry:
                             current.quarantined = True
                             current.quarantine_stage = _QUARANTINE_ORPHAN_STAGE
                             current.hard_stopped = confirmed_so_far
-                            current.worker_pgid = pgid
-                            current.worker_marker = marker
+                            current.worker_pgid = unique_pgid
+                            current.worker_marker = unique_marker
                             current.orphan_authenticated = authenticated_so_far
                             current.orphan_death_confirmed = confirmed_so_far
                             current.generation += 1
@@ -3895,9 +3921,9 @@ class LivePlanningJobRegistry:
                             with suppress(Exception):
                                 self._persist_locked()
                             self._changed.notify_all()
-            if marker_path is not None and (authenticated or confirmed):
+            if unique_marker_path is not None and (authenticated or confirmed):
                 with suppress(OSError):
-                    marker_path.unlink(missing_ok=True)
+                    unique_marker_path.unlink(missing_ok=True)
 
     async def _kill_orphan_group(self, pgid: int, marker: str) -> bool:
         """SIGKILL a cold-booted orphan group and confirm it died in budget.
@@ -3985,7 +4011,7 @@ class LivePlanningJobRegistry:
                 try:
                     from starlette.exceptions import HTTPException
                 except ImportError:  # pragma: no cover - starlette is a dependency
-                    from fastapi import HTTPException  # type: ignore[no-redef]
+                    from fastapi import HTTPException
                 status_code = 500
                 try:
                     status_code = int(payload.get("status_code") or 500)
@@ -4545,7 +4571,7 @@ class LivePlanningJobRegistry:
             if isinstance(checkpoint, dict):
                 await self._update_pair_checkpoint(
                     runtime,
-                    checkpoint,
+                    LivePlanningPairCheckpoint.model_validate(checkpoint),
                     generation=generation,
                 )
         source_events = observability.get("source_terminal_events")

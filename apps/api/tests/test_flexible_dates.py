@@ -17,7 +17,9 @@ from tripchord.planning.flexible_dates import (
     QueryPlanPolicy,
     QueryTaskKind,
     TravelPlatform,
+    canonical_acquisition_fingerprint,
 )
+from tripchord.planning.stay_plans import system_stay_plan_candidate_set
 
 CAPTURED = datetime(2026, 7, 30, 8, 0, tzinfo=UTC)
 EXPIRES = datetime(2026, 7, 30, 10, 0, tzinfo=UTC)
@@ -142,7 +144,7 @@ def test_august_five_to_eight_nights_uses_bounded_stratified_query_plan() -> Non
         assert len(pair_tasks) == 15
         for platform in EXPECTED_PLATFORMS:
             platform_tasks = [item for item in pair_tasks if item.platform == platform]
-            assert {item.kind for item in platform_tasks} == {
+        assert {item.kind for item in platform_tasks} == {
                 QueryTaskKind.FLIGHT,
                 QueryTaskKind.LODGING_FULL_STAY,
                 QueryTaskKind.LODGING_FIRST_NIGHT,
@@ -402,3 +404,55 @@ def test_zero_provider_query_plan_refuses_cleanly() -> None:
         FlexibleDateExplorer(())
     with pytest.raises(ValueError):
         FlexibleQueryPlanBuilder(())
+
+
+def test_deadline_targets_prioritize_latest_safe_return_in_bounded_sampling() -> None:
+    window = FlexibleTravelWindow(
+        origin="HGH",
+        destination="MLE",
+        earliest_departure=date(2026, 8, 20),
+        latest_departure=date(2026, 9, 7),
+        min_nights=3,
+        max_nights=7,
+        latest_return_date=date(2026, 9, 10),
+        latest_arrival_date=date(2026, 9, 10),
+        return_date_targets=(date(2026, 9, 9), date(2026, 9, 10)),
+    )
+
+    exploration = FlexibleDateExplorer().explore(window, now=NOW)
+
+    assert exploration.candidates[0].departure_date == date(2026, 9, 3)
+    assert exploration.candidates[0].return_date == date(2026, 9, 10)
+
+
+def test_v4_plan_deduplicates_acquisitions_without_reducing_date_coverage() -> None:
+    window = FlexibleTravelWindow(
+        origin="HGH",
+        destination="MLE",
+        earliest_departure=date(2026, 8, 1),
+        latest_departure=date(2026, 8, 11),
+        min_nights=3,
+        max_nights=8,
+        max_pairs=66,
+        adults=2,
+        rooms=1,
+    )
+    platforms = (TravelPlatform.CTRIP, TravelPlatform.QUNAR, TravelPlatform.TONGCHENG)
+    exploration = FlexibleDateExplorer(platforms).explore(window, now=NOW)
+    plan = FlexibleQueryPlanBuilder(platforms).build(
+        window,
+        exploration,
+        QueryPlanPolicy(
+            max_exact_pairs=66,
+            platform_rates=tuple(
+                PlatformRatePolicy(platform=item) for item in platforms
+            ),
+        ),
+        stay_plan_candidate_set=system_stay_plan_candidate_set(),
+    )
+    assert plan.selected_pair_ids and plan.omitted_pair_ids == ()
+    assert plan.logical_task_count == 858
+    assert plan.unique_acquisition_count == 648
+    assert plan.deduplicated_task_count == 210
+    assert max(item.scheduled_offset_ms for item in plan.tasks) == 290_000
+    assert len({canonical_acquisition_fingerprint(item) for item in plan.tasks}) == 648

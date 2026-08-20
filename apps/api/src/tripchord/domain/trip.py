@@ -23,9 +23,28 @@ class TransportMode(StrEnum):
 
 class TravelParty(DomainModel):
     adults: int = Field(default=1, ge=1, le=20)
+    children: int = Field(default=0, ge=0, le=20)
     children_ages: tuple[int, ...] = ()
+    infants: int = Field(default=0, ge=0, le=10)
+    rooms: int = Field(default=1, ge=1, le=8)
     includes_elderly: bool = False
     accessibility_needs: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_children_ages(self) -> "TravelParty":
+        """Never infer a booking party from a partial child-age list."""
+
+        if self.children > 0 and len(self.children_ages) != self.children:
+            raise ValueError(
+                "children_ages must contain exactly one age for every child"
+            )
+        if any(age < 0 or age > 17 for age in self.children_ages):
+            raise ValueError("children ages must be between 0 and 17")
+        return self
+
+    @property
+    def traveller_count(self) -> int:
+        return self.adults + self.children + self.infants
 
 
 class DailyWindow(DomainModel):

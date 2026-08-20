@@ -273,6 +273,17 @@ def _render(value: dict[str, Any]) -> str:
     return json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
 
 
+def _display_path(path: Path) -> str:
+    """Render repository paths compactly without rejecting external outputs."""
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(ROOT))
+    except ValueError:
+        # CI intentionally writes build-time artifacts to /tmp.  Keep the
+        # absolute path in that case so the message remains unambiguous.
+        return str(resolved)
+
+
 def generate(output_dir: Path) -> None:
     commit_sha, committed_at = _git_head()
     generated_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -304,9 +315,9 @@ def generate(output_dir: Path) -> None:
     sbom_path.write_text(sbom_text, encoding="utf-8")
     provenance_path.write_text(provenance_text, encoding="utf-8")
     print(
-        f"wrote {sbom_path.relative_to(ROOT)} "
+        f"wrote {_display_path(sbom_path)} "
         f"({python_count} pypi + {npm_count} npm components) and "
-        f"{provenance_path.relative_to(ROOT)}"
+        f"{_display_path(provenance_path)}"
     )
 
 

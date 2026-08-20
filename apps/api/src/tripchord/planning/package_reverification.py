@@ -332,7 +332,6 @@ class DeclarativePackageReVerifier:
             for lodging in candidate.lodgings
             if lodging.adults != intent.adults
             or lodging.rooms != intent.rooms
-            or lodging.currency != intent.currency
         )
         invalid.extend(
             transfer.id
@@ -357,9 +356,12 @@ class DeclarativePackageReVerifier:
         intent: PackageIntent,
         candidate: TravelPackageCandidate,
     ) -> PackageInvariantCheck:
+        stay_start = candidate.flight.outbound_arrive_at.date()
+        stay_end = candidate.flight.return_depart_at.date()
+        night_count = (stay_end - stay_start).days
         counts = {
-            intent.start_date + timedelta(days=offset): 0
-            for offset in range(intent.night_count)
+            stay_start + timedelta(days=offset): 0
+            for offset in range(max(night_count, 0))
         }
         outside: list[str] = []
         for lodging in candidate.lodgings:
@@ -419,26 +421,28 @@ class DeclarativePackageReVerifier:
         intent: PackageIntent,
         candidate: TravelPackageCandidate,
     ) -> PackageInvariantCheck:
+        stay_start = candidate.flight.outbound_arrive_at.date()
+        stay_end = candidate.flight.return_depart_at.date()
         if candidate.kind == PackageCandidateKind.CONTINUOUS_ISLAND:
             expected = Counter(
-                {(PackageArea.DESTINATION_ISLAND, intent.start_date, intent.end_date): 1}
+                {(PackageArea.DESTINATION_ISLAND, stay_start, stay_end): 1}
             )
         elif candidate.kind == PackageCandidateKind.CONTINUOUS_AIRPORT_ISLAND:
             expected = Counter(
-                {(PackageArea.AIRPORT_ISLAND, intent.start_date, intent.end_date): 1}
+                {(PackageArea.AIRPORT_ISLAND, stay_start, stay_end): 1}
             )
         else:
-            first_checkout = intent.start_date + timedelta(days=1)
-            last_checkin = intent.end_date - timedelta(days=1)
+            first_checkout = stay_start + timedelta(days=1)
+            last_checkin = stay_end - timedelta(days=1)
             expected = Counter(
                 {
-                    (PackageArea.AIRPORT_ISLAND, intent.start_date, first_checkout): 1,
+                    (PackageArea.AIRPORT_ISLAND, stay_start, first_checkout): 1,
                     (
                         PackageArea.DESTINATION_ISLAND,
                         first_checkout,
                         last_checkin,
                     ): 1,
-                    (PackageArea.AIRPORT_ISLAND, last_checkin, intent.end_date): 1,
+                    (PackageArea.AIRPORT_ISLAND, last_checkin, stay_end): 1,
                 }
             )
         actual = Counter(
@@ -558,9 +562,19 @@ class DeclarativePackageReVerifier:
                     transfer_total += transfer.total_for_party_cents
             elif previous != terms or transfer.price_scope != TransferPriceScope.ROUND_TRIP:
                 invalid_contracts.add(transfer.price_contract_id)
-        independently_computed = (
+        flight_total = (
             candidate.flight.total_for_party_cents
-            + sum(item.total_for_party_cents for item in candidate.lodgings)
+            if candidate.flight.party_total_known
+            and candidate.flight.total_for_party_cents is not None
+            else 0
+        )
+        independently_computed = (
+            flight_total
+            + sum(
+                item.total_for_party_cents
+                for item in candidate.lodgings
+                if item.currency == candidate.currency
+            )
             + transfer_total
         )
         minimum_known_total = (
@@ -664,7 +678,7 @@ class DeclarativePackageReVerifier:
         intent: PackageIntent,
         candidate: TravelPackageCandidate,
     ) -> PackageInvariantCheck:
-        required = self._required_transfer_legs(intent, candidate.kind)
+        required = self._required_transfer_legs(candidate)
         available = Counter(
             (item.origin_area, item.destination_area, item.service_date)
             for item in candidate.transfers
@@ -747,28 +761,30 @@ class DeclarativePackageReVerifier:
 
     @staticmethod
     def _required_transfer_legs(
-        intent: PackageIntent,
-        kind: PackageCandidateKind,
+        candidate: TravelPackageCandidate,
     ) -> tuple[tuple[PackageArea, PackageArea, date], ...]:
+        start_date = candidate.flight.outbound_arrive_at.date()
+        end_date = candidate.flight.return_depart_at.date()
+        kind = candidate.kind
         if kind == PackageCandidateKind.CONTINUOUS_ISLAND:
             return (
-                (PackageArea.AIRPORT, PackageArea.DESTINATION_ISLAND, intent.start_date),
-                (PackageArea.DESTINATION_ISLAND, PackageArea.AIRPORT, intent.end_date),
+                (PackageArea.AIRPORT, PackageArea.DESTINATION_ISLAND, start_date),
+                (PackageArea.DESTINATION_ISLAND, PackageArea.AIRPORT, end_date),
             )
         if kind == PackageCandidateKind.CONTINUOUS_AIRPORT_ISLAND:
             return (
-                (PackageArea.AIRPORT, PackageArea.AIRPORT_ISLAND, intent.start_date),
-                (PackageArea.AIRPORT_ISLAND, PackageArea.AIRPORT, intent.end_date),
+                (PackageArea.AIRPORT, PackageArea.AIRPORT_ISLAND, start_date),
+                (PackageArea.AIRPORT_ISLAND, PackageArea.AIRPORT, end_date),
             )
-        first_checkout = intent.start_date + timedelta(days=1)
-        last_checkin = intent.end_date - timedelta(days=1)
+        first_checkout = start_date + timedelta(days=1)
+        last_checkin = end_date - timedelta(days=1)
         return (
-            (PackageArea.AIRPORT, PackageArea.AIRPORT_ISLAND, intent.start_date),
+            (PackageArea.AIRPORT, PackageArea.AIRPORT_ISLAND, start_date),
             (PackageArea.AIRPORT_ISLAND, PackageArea.AIRPORT, first_checkout),
             (PackageArea.AIRPORT, PackageArea.DESTINATION_ISLAND, first_checkout),
             (PackageArea.DESTINATION_ISLAND, PackageArea.AIRPORT, last_checkin),
             (PackageArea.AIRPORT, PackageArea.AIRPORT_ISLAND, last_checkin),
-            (PackageArea.AIRPORT_ISLAND, PackageArea.AIRPORT, intent.end_date),
+            (PackageArea.AIRPORT_ISLAND, PackageArea.AIRPORT, end_date),
         )
 
     @staticmethod

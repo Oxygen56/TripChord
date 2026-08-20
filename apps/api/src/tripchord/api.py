@@ -1,7 +1,9 @@
 import json
-from datetime import datetime
+from collections.abc import Callable
+from datetime import date, datetime
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_serializer, model_validator
 
 from tripchord.agents.companion_control_tools import (
     BrowserCompanionBuildReconcileResponse,
@@ -18,7 +20,7 @@ from tripchord.agents.live_system import (
     LivePackageAgentRun,
     LivePackageEvent,
 )
-from tripchord.agents.memory import MemoryRecord
+from tripchord.agents.memory import MemoryRecord, normalize_confirmed_preference_value
 from tripchord.agents.models import PreferenceConstitution
 from tripchord.agents.package_request import (
     HybridPackageRequirementResult,
@@ -37,7 +39,7 @@ from tripchord.planning import ChineseRequirementParser, ItineraryOptimizer, Pla
 from tripchord.planning.adaptive import AdaptiveReplanResult
 from tripchord.planning.flexible_dates import FlexibleTravelWindow, PlatformFareCalendar
 from tripchord.planning.impact import PlanDependency
-from tripchord.planning.package import PackageIntent
+from tripchord.planning.package import PackageDecisionState, PackageIntent
 from tripchord.planning.policy import ReplanPreference
 from tripchord.planning.problem import OptimizationResult, PlanningProblem
 from tripchord.planning.replanner import LocalReplanner, LocalReplanResult
@@ -52,6 +54,19 @@ from tripchord.providers.user_snapshot import UserQuoteInput, import_user_quote
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+def _sanitize_public_flight_totals(value: Any) -> Any:
+    if isinstance(value, dict):
+        result = {key: _sanitize_public_flight_totals(item) for key, item in value.items()}
+        if result.get("party_total_known") is False and "total_for_party_cents" in result:
+            result["display_amount_cents"] = result.get("total_for_party_cents")
+            result["total_for_party_cents"] = None
+            result["price_basis"] = "comparison_only"
+        return result
+    if isinstance(value, list):
+        return [_sanitize_public_flight_totals(item) for item in value]
+    return value
 
 
 class VerifyRequest(ApiModel):
@@ -255,6 +270,7 @@ class ConfirmPreferenceMemoryRequest(ApiModel):
 
     @model_validator(mode="after")
     def validate_bounded_preference(self) -> "ConfirmPreferenceMemoryRequest":
+        self.value = normalize_confirmed_preference_value(self.key, self.value)
         serialized = json.dumps(
             self.value,
             ensure_ascii=False,
@@ -296,6 +312,9 @@ class LiveAgentPlanningResponse(ApiModel):
     run_id: str = Field(min_length=1)
     expires_at: datetime
     run: LivePackageAgentRun
+    # FinalPlanProjection is declared below; rebuild this model after that
+    # declaration so the public schema remains strongly typed.
+    final_plan: "FinalPlanProjection | None" = None
 
 
 class LiveFlexibleAgentPlanningRequest(ApiModel):
@@ -303,9 +322,9 @@ class LiveFlexibleAgentPlanningRequest(ApiModel):
     calendars: tuple[PlatformFareCalendar, ...] = ()
     coverage_mode: LiveCoverageMode = LiveCoverageMode.STRICT
     timeout_seconds: int | None = Field(default=None, ge=15, le=300)
-    total_timeout_seconds: int | None = Field(default=None, ge=60, le=3600)
-    max_pairs: int = Field(default=3, ge=1, le=8)
-    publication_refresh_minimum_options: int = Field(default=2, ge=0, le=2)
+    total_timeout_seconds: int | None = Field(default=None, ge=60, le=600)
+    max_pairs: int = Field(default=400, ge=1, le=400)
+    publication_refresh_minimum_options: int = Field(default=1, ge=0, le=2)
     constraints: FlexiblePackageConstraints = FlexiblePackageConstraints()
     stay_plan_candidate_set: StayPlanCandidateSet | None = None
 
@@ -316,8 +335,73 @@ class LiveFlexiblePairRunHandle(ApiModel):
     expires_at: datetime
 
 
+class FinalFlightProjection(ApiModel):
+    provider: str
+    origin: str
+    destination: str
+    outbound_flight_numbers: tuple[str, ...] = ()
+    outbound_depart_at: datetime
+    outbound_arrive_at: datetime
+    return_flight_numbers: tuple[str, ...] = ()
+    return_depart_at: datetime
+    return_arrive_at: datetime
+
+
+class FinalLodgingProjection(ApiModel):
+    provider: str
+    property_name: str
+    area: str
+    check_in: date
+    check_out: date
+    rooms: int
+    room_name: str | None = None
+    breakfast_included: bool | None = None
+    cancellation_policy: str | None = None
+
+
+class FinalTransferProjection(ApiModel):
+    provider: str
+    origin_area: str
+    destination_area: str
+    service_date: date
+    schedule_mode: str
+    depart_at: datetime | None = None
+    arrive_at: datetime | None = None
+
+
+class FinalPlanProjection(ApiModel):
+    """The sole user-facing flexible result; ranked options remain diagnostics."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    option_id: str
+    date_pair_id: str
+    departure_date: date
+    return_date: date
+    total_budget_cents: int | None = None
+    optimality_status: str
+    claim_boundary: str
+    flight_component_id: str | None = None
+    lodging_component_ids: tuple[str, ...] = ()
+    transfer_component_ids: tuple[str, ...] = ()
+    flight: FinalFlightProjection | None = None
+    lodgings: tuple[FinalLodgingProjection, ...] = ()
+    transfers: tuple[FinalTransferProjection, ...] = ()
+    party: dict[str, int] = Field(default_factory=dict)
+    covered_source_ids: tuple[str, ...] = ()
+    failed_source_ids: tuple[str, ...] = ()
+    price_comparability: str = "total_not_comparable"
+    unresolved_items: tuple[str, ...] = ()
+
+
+LiveAgentPlanningResponse.model_rebuild(
+    _types_namespace={"FinalPlanProjection": FinalPlanProjection}
+)
+
+
 class LiveFlexibleAgentPlanningResponse(ApiModel):
     run: FlexibleLiveAgentRun
+    final_plan: FinalPlanProjection | None = None
     cached_pair_runs: tuple[LiveFlexiblePairRunHandle, ...] = ()
 
 
@@ -326,9 +410,9 @@ class LiveFlexibleFromTextPlanningRequest(ApiModel):
     calendars: tuple[PlatformFareCalendar, ...] = ()
     coverage_mode: LiveCoverageMode = LiveCoverageMode.STRICT
     timeout_seconds: int | None = Field(default=None, ge=15, le=300)
-    total_timeout_seconds: int | None = Field(default=None, ge=60, le=3600)
-    max_pairs: int = Field(default=3, ge=1, le=8)
-    publication_refresh_minimum_options: int = Field(default=2, ge=0, le=2)
+    total_timeout_seconds: int | None = Field(default=None, ge=60, le=600)
+    max_pairs: int = Field(default=400, ge=1, le=400)
+    publication_refresh_minimum_options: int = Field(default=1, ge=0, le=2)
     stay_plan_candidate_set: StayPlanCandidateSet | None = None
 
 
@@ -341,6 +425,7 @@ LIVE_FLEXIBLE_FROM_TEXT_EXECUTION_BOUNDARY = (
 class LiveFlexibleFromTextPlanningResponse(ApiModel):
     interpretation: HybridPackageRequirementResult
     run: FlexibleLiveAgentRun | None = None
+    final_plan: FinalPlanProjection | None = None
     cached_pair_runs: tuple[LiveFlexiblePairRunHandle, ...] = ()
     model_enhancement_enabled: bool = False
     model_trace_scope_sha256: str = Field(pattern="^[0-9a-f]{64}$")
@@ -353,6 +438,12 @@ class LiveFlexibleFromTextPlanningResponse(ApiModel):
     )
     execution_boundary: str = LIVE_FLEXIBLE_FROM_TEXT_EXECUTION_BOUNDARY
 
+    @model_serializer(mode="wrap")
+    def serialize_public(self, handler: Callable[[Any], Any]) -> Any:
+        """Hide unproven flight party totals at the public API boundary."""
+
+        return _sanitize_public_flight_totals(handler(self))
+
     @model_validator(mode="after")
     def validate_model_trace_counts(self) -> "LiveFlexibleFromTextPlanningResponse":
         if self.model_trace_count != (
@@ -361,6 +452,194 @@ class LiveFlexibleFromTextPlanningResponse(ApiModel):
             raise ValueError("model trace success and failure counts must add up")
         return self
 
+
+def build_live_final_plan_projection(run: LivePackageAgentRun) -> FinalPlanProjection | None:
+    if run.decision.state != PackageDecisionState.ACCEPT or run.package is None:
+        return None
+    package = run.package
+    candidate = package.final_candidate
+    comparable = (
+        package.budget.is_all_in_total
+        and package.budget.currency == "CNY"
+        and candidate.currency == "CNY"
+    )
+    if not comparable:
+        return None
+    covered = tuple(source_id for item in run.coverage for source_id in item.successful_source_ids)
+    failed = tuple(source_id for item in run.coverage for source_id in item.failed_source_ids)
+    unresolved = ["尚未获得全部人数、税费和币种一致的可比总价"] if not comparable else []
+    if failed:
+        unresolved.append("部分已连接来源未返回可用结果：" + "、".join(failed))
+    for lodging in candidate.lodgings:
+        if lodging.cancellation_policy is None:
+            unresolved.append(f"{lodging.property_name}的取消规则待确认")
+    return FinalPlanProjection(
+        option_id=candidate.id,
+        date_pair_id=f"{run.intent.start_date}:{run.intent.end_date}",
+        departure_date=run.intent.start_date,
+        return_date=run.intent.end_date,
+        total_budget_cents=package.budget.total_cents if comparable else None,
+        optimality_status="best_verified",
+        claim_boundary=run.claim_boundary,
+        flight_component_id=candidate.flight.id if candidate.flight else None,
+        lodging_component_ids=tuple(item.id for item in candidate.lodgings),
+        transfer_component_ids=tuple(item.id for item in candidate.transfers),
+        flight=(FinalFlightProjection(
+            provider=candidate.flight.provider, origin=candidate.flight.origin,
+            destination=candidate.flight.destination,
+            outbound_flight_numbers=candidate.flight.outbound_flight_numbers,
+            outbound_depart_at=candidate.flight.outbound_depart_at,
+            outbound_arrive_at=candidate.flight.outbound_arrive_at,
+            return_flight_numbers=candidate.flight.return_flight_numbers,
+            return_depart_at=candidate.flight.return_depart_at,
+            return_arrive_at=candidate.flight.return_arrive_at,
+        ) if candidate.flight else None),
+        lodgings=tuple(FinalLodgingProjection(
+            provider=item.provider, property_name=item.property_name, area=item.area.value,
+            check_in=item.check_in, check_out=item.check_out, rooms=item.rooms,
+            room_name=item.room_name, breakfast_included=item.breakfast_included,
+            cancellation_policy=item.cancellation_policy,
+        ) for item in candidate.lodgings),
+        transfers=tuple(FinalTransferProjection(
+            provider=item.provider, origin_area=item.origin_area.value,
+            destination_area=item.destination_area.value, service_date=item.service_date,
+            schedule_mode=item.schedule_mode.value,
+            depart_at=item.depart_at,
+            arrive_at=item.arrive_at,
+        ) for item in candidate.transfers),
+        party={"adults": run.intent.adults, "children": run.intent.children,
+               "infants": run.intent.infants, "rooms": run.intent.rooms},
+        covered_source_ids=covered, failed_source_ids=failed,
+        price_comparability="complete_cny" if comparable else "total_not_comparable",
+        unresolved_items=tuple(dict.fromkeys(unresolved)),
+    )
+
+
+def build_final_plan_projection(
+    run: FlexibleLiveAgentRun | LivePackageAgentRun,
+) -> FinalPlanProjection | None:
+    if isinstance(run, LivePackageAgentRun):
+        return build_live_final_plan_projection(run)
+    option_id = next(iter(run.recommended_option_ids), None)
+    if option_id is None:
+        return None
+    option = next((item for item in run.ranked_options if item.option_id == option_id), None)
+    if option is None:
+        raise ValueError("recommended option is missing from ranked diagnostics")
+    execution = next(
+        (item for item in run.pair_runs if item.date_pair.id == option.date_pair_id),
+        None,
+    )
+    package_run = execution.run.package if execution and execution.run else None
+    candidate = package_run.final_candidate if package_run else None
+    covered_source_ids = tuple(
+        source_id
+        for coverage in (execution.run.coverage if execution and execution.run else ())
+        for source_id in coverage.successful_source_ids
+    )
+    failed_source_ids = tuple(
+        source_id
+        for coverage in (execution.run.coverage if execution and execution.run else ())
+        for source_id in coverage.failed_source_ids
+    )
+    price_comparability = (
+        "complete_cny"
+        if package_run is not None
+        and package_run.budget.is_all_in_total
+        and candidate is not None
+        and candidate.currency == "CNY"
+        else "total_not_comparable"
+    )
+    unresolved_items: list[str] = []
+    if price_comparability != "complete_cny":
+        unresolved_items.append("尚未获得全部人数、税费和币种一致的可比总价")
+    if failed_source_ids:
+        unresolved_items.append(
+            "部分已连接来源未返回可用结果：" + "、".join(failed_source_ids)
+        )
+    if run.optimality_status.value != "optimality_proven":
+        unresolved_items.append("当前是已成功覆盖范围内的最优结果，尚未证明全局最低总价")
+    if candidate is not None:
+        for lodging in candidate.lodgings:
+            if lodging.cancellation_policy is None:
+                unresolved_items.append(f"{lodging.property_name}的取消规则待确认")
+    return FinalPlanProjection(
+        option_id=option.option_id,
+        date_pair_id=option.date_pair_id,
+        departure_date=option.departure_date,
+        return_date=option.return_date,
+        total_budget_cents=(
+            option.total_budget_cents if price_comparability == "complete_cny" else None
+        ),
+        optimality_status=run.optimality_status.value,
+        claim_boundary=run.claim_boundary,
+        flight_component_id=candidate.flight.id if candidate else None,
+        lodging_component_ids=tuple(item.id for item in candidate.lodgings) if candidate else (),
+        transfer_component_ids=tuple(item.id for item in candidate.transfers) if candidate else (),
+        flight=(
+            FinalFlightProjection(
+                provider=candidate.flight.provider,
+                origin=candidate.flight.origin,
+                destination=candidate.flight.destination,
+                outbound_flight_numbers=candidate.flight.outbound_flight_numbers,
+                outbound_depart_at=candidate.flight.outbound_depart_at,
+                outbound_arrive_at=candidate.flight.outbound_arrive_at,
+                return_flight_numbers=candidate.flight.return_flight_numbers,
+                return_depart_at=candidate.flight.return_depart_at,
+                return_arrive_at=candidate.flight.return_arrive_at,
+            )
+            if candidate
+            else None
+        ),
+        lodgings=(
+            tuple(
+                FinalLodgingProjection(
+                    provider=item.provider,
+                    property_name=item.property_name,
+                    area=item.area.value,
+                    check_in=item.check_in,
+                    check_out=item.check_out,
+                    rooms=item.rooms,
+                    room_name=item.room_name,
+                    breakfast_included=item.breakfast_included,
+                    cancellation_policy=item.cancellation_policy,
+                )
+                for item in candidate.lodgings
+            )
+            if candidate
+            else ()
+        ),
+        transfers=(
+            tuple(
+                FinalTransferProjection(
+                    provider=item.provider,
+                    origin_area=item.origin_area.value,
+                    destination_area=item.destination_area.value,
+                    service_date=item.service_date,
+                    schedule_mode=item.schedule_mode.value,
+                    depart_at=item.depart_at,
+                    arrive_at=item.arrive_at,
+                )
+                for item in candidate.transfers
+            )
+            if candidate
+            else ()
+        ),
+        party=(
+            {
+                "adults": execution.run.intent.adults,
+                "children": execution.run.intent.children,
+                "infants": execution.run.intent.infants,
+                "rooms": execution.run.intent.rooms,
+            }
+            if execution and execution.run
+            else {}
+        ),
+        covered_source_ids=covered_source_ids,
+        failed_source_ids=failed_source_ids,
+        price_comparability=price_comparability,
+        unresolved_items=tuple(dict.fromkeys(unresolved_items)),
+    )
 
 class StartLiveFlexibleFromTextJobResponse(ApiModel):
     job: LivePlanningJobSnapshot
@@ -382,6 +661,11 @@ class LiveAgentEventReplanResponse(ApiModel):
     run_id: str = Field(min_length=1)
     expires_at: datetime
     run: LiveEventReplanRun
+    final_plan: FinalPlanProjection | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_public(self, handler: Callable[[Any], Any]) -> Any:
+        return _sanitize_public_flight_totals(handler(self))
 
 
 class StartLiveMonitorRequest(ApiModel):

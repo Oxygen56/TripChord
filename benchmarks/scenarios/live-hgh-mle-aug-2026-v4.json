@@ -8,7 +8,7 @@
   "coverage_mode": "strict",
   "max_pairs": 3,
   "timeout_seconds": 120,
-  "total_timeout_seconds": 3600,
+  "total_timeout_seconds": 600,
   "done_gate_profile": {
     "maximum_quote_age_minutes": 15,
     "minimum_recommendable_options": 2

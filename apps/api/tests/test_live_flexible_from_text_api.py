@@ -192,7 +192,7 @@ def _payload(
         },
         "coverage_mode": coverage_mode,
         "timeout_seconds": 300,
-        "total_timeout_seconds": 1800,
+        "total_timeout_seconds": 600,
         "max_pairs": max_pairs,
     }
 
@@ -224,7 +224,7 @@ async def test_ready_text_maps_constraints_runs_flexible_search_and_caches_pairs
             json=_payload(),
         )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     body = response.json()
     interpretation = body["interpretation"]
     assert interpretation["state"] == "ready"
@@ -292,6 +292,51 @@ async def test_ready_text_maps_constraints_runs_flexible_search_and_caches_pairs
     for handle in body["cached_pair_runs"]:
         assert await cache.get(handle["run_id"], "anonymous") is not None
         assert await cache.get(handle["run_id"], "another-tenant") is None
+
+
+@pytest.mark.asyncio
+async def test_verbatim_maldives_text_binds_male_gateway_profile_before_live_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pair_runner = _RecordingPairRunner()
+    flexible = FlexibleLiveAgentSystem(
+        pair_runner,
+        now=lambda: NOW,
+        monotonic_clock=lambda: 100.0,
+    )
+    cache = LiveRunCache(capacity=8, ttl=timedelta(minutes=5), now=lambda: NOW)
+    text = (
+        "我要从杭州出发去马尔代夫周边游，时间：从明天开始到9月10日前的4-8天游，"
+        "人数：我和女朋友两个人，偏好：酒店不能太简陋，地址不能太偏，可以稍微有点品质但价格不能太高，"
+        "到达和返程可以住机场附近，但也要关注有没有更好的选择。"
+    )
+    monkeypatch.setattr(app.state, "package_requirement_agent", package_requirement_agent)
+    monkeypatch.setattr(app.state, "flexible_live_agent_system", flexible)
+    monkeypatch.setattr(app.state, "live_run_cache", cache)
+    monkeypatch.setattr(settings, "browser_bridge_require_all_providers", True)
+    monkeypatch.setattr(settings, "browser_bridge_task_timeout_seconds", 60)
+    monkeypatch.setattr(settings, "browser_bridge_flexible_timeout_seconds", 120)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51343)),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=text, coverage_mode="strict", max_pairs=1),
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["interpretation"]["window"]["destination"] == "马尔代夫"
+    assert body["interpretation"]["window"]["return_date_targets"] == [
+        "2026-09-09",
+        "2026-09-10",
+    ]
+    assert pair_runner.calls[0][0].destination == "马累"
+    assert pair_runner.calls[0][1].destination == "马累"
+    assert pair_runner.calls[0][1].options["gateway_destination"] == "马累"
+    assert "stay_plan_candidate_set" in pair_runner.calls[0][1].options
 
 
 @pytest.mark.asyncio

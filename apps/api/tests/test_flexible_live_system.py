@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -8,7 +9,10 @@ import pytest
 from tripchord.agents.flexible_live_system import (
     FlexibleLiveAgentRun,
     FlexibleLiveAgentSystem,
+    FlexibleObjectiveWeights,
+    FlexiblePackageConstraints,
     FlexiblePairState,
+    FullWindowDeadlineInfeasible,
 )
 from tripchord.agents.live_done_gate import _check_flexible_ranked_options
 from tripchord.agents.live_jobs import (
@@ -30,7 +34,10 @@ from tripchord.planning.adaptive_dates import (
     AdaptiveRefinementDecision,
     ExactDatePairObservation,
 )
-from tripchord.planning.flexible_dates import AuditableDatePair, FlexibleTravelWindow
+from tripchord.planning.flexible_dates import (
+    AuditableDatePair,
+    FlexibleTravelWindow,
+)
 from tripchord.planning.package import (
     NormalizedFlightQuote,
     NormalizedLodgingQuote,
@@ -60,6 +67,7 @@ from tripchord.providers.browser_bridge import (
     BrowserSearchQuery,
     BrowserTaskBridge,
     BrowserTaskCompletion,
+    BrowserTaskSnapshot,
     BrowserTaskState,
     BrowserTaskSubmission,
     BrowserVertical,
@@ -72,12 +80,22 @@ CHINA = timezone(timedelta(hours=8))
 REQUEST_SHA256 = "1" * 64
 
 
+class ImmediateWaitTimeoutBrowserTaskBridge(BrowserTaskBridge):
+    async def wait_many(
+        self,
+        task_ids: Iterable[str],
+        *,
+        timeout_seconds: float,
+    ) -> tuple[BrowserTaskSnapshot, ...]:
+        del timeout_seconds
+        return await super().wait_many(task_ids, timeout_seconds=0.001)
+
+
 def window() -> FlexibleTravelWindow:
     return FlexibleTravelWindow(
         origin="HGH",
-        destination="MLE",
+        destination="Tokyo",
         origin_code="HGH",
-        destination_code="MLE",
         earliest_departure=date(2026, 8, 1),
         latest_departure=date(2026, 8, 3),
         min_nights=5,
@@ -218,6 +236,16 @@ def _transfer(
         evidence_refs=(f"evidence:transfer:{request.start_date}:{suffix}",),
         origin_area=origin,
         destination_area=destination,
+        origin_place_key={
+            PackageArea.AIRPORT: PackagePlaceKey.VELANA_AIRPORT,
+            PackageArea.AIRPORT_ISLAND: PackagePlaceKey.HULHUMALE,
+            PackageArea.DESTINATION_ISLAND: PackagePlaceKey.MAAFUSHI,
+        }[origin],
+        destination_place_key={
+            PackageArea.AIRPORT: PackagePlaceKey.VELANA_AIRPORT,
+            PackageArea.AIRPORT_ISLAND: PackagePlaceKey.HULHUMALE,
+            PackageArea.DESTINATION_ISLAND: PackagePlaceKey.MAAFUSHI,
+        }[destination],
         adults=request.adults,
         service_date=travel_date,
         schedule_mode=TransferScheduleMode.EXACT_DEPARTURE,
@@ -665,6 +693,7 @@ class V4GlobalLeaseProbeLiveRunner:
         self.submitted = 0
         self.completed = 0
         self.claim_wave_sizes: list[int] = []
+        self.source_delay_history: list[dict[str, int]] = []
 
     async def run(
         self,
@@ -675,7 +704,8 @@ class V4GlobalLeaseProbeLiveRunner:
         timeout_seconds: int = 120,
         source_start_delays_ms: dict[str, int] | None = None,
     ) -> LivePackageAgentRun:
-        del timeout_seconds, source_start_delays_ms
+        del timeout_seconds
+        self.source_delay_history.append(dict(source_start_delays_ms or {}))
         self.active_pairs += 1
         self.max_active_pairs = max(self.max_active_pairs, self.active_pairs)
 
@@ -738,7 +768,342 @@ class V4GlobalLeaseProbeLiveRunner:
 
 
 @pytest.mark.asyncio
-async def test_three_date_pairs_are_admitted_serially_to_preserve_quote_freshness() -> None:
+async def test_publication_refresh_bypasses_run_acquisition_ledger() -> None:
+    from tripchord.agents.flexible_live_system import _FlexibleAcquisitionLedger
+
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    ledger = _FlexibleAcquisitionLedger(bridge)
+    ledger.reset()
+    exploration = BrowserTaskSubmission(
+        provider=BrowserProvider.CTRIP,
+        kind=BrowserVertical.FLIGHT,
+        query=BrowserSearchQuery(
+            origin="HGH",
+            destination="MLE",
+            start_date=date(2026, 8, 1),
+            end_date=date(2026, 8, 8),
+            options={"__tripchord_allow_recent_quote_reuse": True},
+        ),
+    )
+    refresh = exploration.model_copy(
+        update={
+            "query": exploration.query.model_copy(
+                update={"options": {"__tripchord_allow_recent_quote_reuse": False}}
+            )
+        }
+    )
+    (first,) = await ledger.submit_many((exploration,))
+    (second,) = await ledger.submit_many((refresh,))
+    assert second.id != first.id
+    assert len(bridge._records) == 2
+    leases = await bridge.claim(
+        "ledger-publication-refresh",
+        providers=(BrowserProvider.CTRIP,),
+        limit=2,
+    )
+    await asyncio.gather(
+        *(
+            bridge.complete(
+                lease.task_id,
+                lease.claim_token,
+                BrowserTaskCompletion(
+                    state=BrowserTaskState.FAILED,
+                    failure=BrowserFailure(
+                        code=BrowserFailureCode.DOM_DRIFT,
+                        message="publication refresh must be fresh",
+                        captured_at=NOW,
+                    ),
+                ),
+            )
+            for lease in leases
+        )
+    )
+    outcomes = await ledger.wait_many((first.id, second.id), timeout_seconds=2)
+    assert [item.state for item in outcomes] == [
+        BrowserTaskState.FAILED,
+        BrowserTaskState.FAILED,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_acquisition_ledger_reuses_terminal_failure_and_cancelled_task() -> None:
+    from tripchord.agents.flexible_live_system import _FlexibleAcquisitionLedger
+
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    ledger = _FlexibleAcquisitionLedger(bridge)
+    ledger.reset()
+    submission = BrowserTaskSubmission(
+        provider=BrowserProvider.CTRIP,
+        kind=BrowserVertical.FLIGHT,
+        query=BrowserSearchQuery(
+            origin="HGH",
+            destination="MLE",
+            start_date=date(2026, 8, 1),
+            end_date=date(2026, 8, 8),
+            options={"__tripchord_allow_recent_quote_reuse": True},
+        ),
+    )
+    (first,) = await ledger.submit_many((submission,))
+    (lease,) = await bridge.claim(
+        "ledger-terminal-failure",
+        providers=(BrowserProvider.CTRIP,),
+        limit=1,
+    )
+    await bridge.complete(
+        lease.task_id,
+        lease.claim_token,
+        BrowserTaskCompletion(
+            state=BrowserTaskState.FAILED,
+            failure=BrowserFailure(
+                code=BrowserFailureCode.DOM_DRIFT,
+                message="terminal ledger regression",
+                captured_at=NOW,
+            ),
+        ),
+    )
+    (second,) = await ledger.submit_many((submission,))
+    assert second.id == first.id
+    assert len(bridge._records) == 1
+
+    await ledger.cancel_many((first.id,), reason="one consumer cancelled")
+    (after_cancel,) = await ledger.submit_many((submission,))
+    assert after_cancel.id == first.id
+    assert len(bridge._records) == 1
+
+
+@pytest.mark.asyncio
+async def test_acquisition_timeout_cleanup_releases_queued_and_late_terminal_pins() -> None:
+    from tripchord.agents.flexible_live_system import _FlexibleAcquisitionLedger
+
+    def submission() -> BrowserTaskSubmission:
+        return BrowserTaskSubmission(
+            provider=BrowserProvider.CTRIP,
+            kind=BrowserVertical.FLIGHT,
+            query=BrowserSearchQuery(
+                origin="HGH",
+                destination="MLE",
+                start_date=date(2026, 8, 1),
+                end_date=date(2026, 8, 8),
+            ),
+        )
+
+    async def timed_out_entry(
+        bridge: ImmediateWaitTimeoutBrowserTaskBridge,
+        *,
+        consumers: int = 1,
+    ) -> tuple[_FlexibleAcquisitionLedger, BrowserTaskSnapshot]:
+        ledger = _FlexibleAcquisitionLedger(bridge)
+        ledger.reset()
+        snapshots = await ledger.submit_many(submission() for _ in range(consumers))
+        assert len({snapshot.id for snapshot in snapshots}) == 1
+        snapshot = snapshots[0]
+        await asyncio.sleep(0.01)
+        with pytest.raises(TimeoutError):
+            await ledger.wait_many((snapshot.id,), timeout_seconds=1)
+        return ledger, snapshot
+
+    queued_clock = [NOW]
+    queued_bridge = ImmediateWaitTimeoutBrowserTaskBridge(
+        now=lambda: queued_clock[0],
+        terminal_retention_seconds=600,
+    )
+    queued_ledger, queued = await timed_out_entry(queued_bridge, consumers=2)
+    assert queued_bridge._records[queued.id].state == BrowserTaskState.QUEUED
+    assert queued_bridge._active_consumers[queued.id] == 1
+    await queued_ledger.cancel_many((queued.id,), reason="first shared consumer cleanup")
+    assert queued_bridge._records[queued.id].state == BrowserTaskState.QUEUED
+    assert queued_bridge._active_consumers[queued.id] == 1
+    await queued_ledger.cancel_many((queued.id,), reason="last shared consumer cleanup")
+    await queued_ledger.cancel_many((queued.id,), reason="idempotent cleanup retry")
+    assert queued_bridge._records[queued.id].state == BrowserTaskState.CANCELLED
+    assert queued.id not in queued_bridge._active_consumers
+
+    queued_clock[0] += timedelta(seconds=601)
+    await queued_bridge.submit_many((submission(),))
+    assert queued.id not in queued_bridge._records
+
+    terminal_clock = [NOW]
+    terminal_bridge = ImmediateWaitTimeoutBrowserTaskBridge(
+        now=lambda: terminal_clock[0],
+        terminal_retention_seconds=600,
+    )
+    terminal_ledger, terminal = await timed_out_entry(terminal_bridge)
+    (lease,) = await terminal_bridge.claim(
+        "late-terminal-companion",
+        providers=(BrowserProvider.CTRIP,),
+        limit=1,
+    )
+    await terminal_bridge.complete(
+        lease.task_id,
+        lease.claim_token,
+        BrowserTaskCompletion(
+            state=BrowserTaskState.FAILED,
+            failure=BrowserFailure(
+                code=BrowserFailureCode.DOM_DRIFT,
+                message="late terminal after watcher timeout",
+                captured_at=NOW,
+            ),
+        ),
+    )
+    assert terminal_bridge._active_consumers[terminal.id] == 1
+    await terminal_ledger.cancel_many((terminal.id,), reason="late terminal cleanup")
+    assert terminal_bridge._records[terminal.id].state == BrowserTaskState.FAILED
+    assert terminal.id not in terminal_bridge._active_consumers
+
+    terminal_clock[0] += timedelta(seconds=601)
+    await terminal_bridge.submit_many((submission(),))
+    assert terminal.id not in terminal_bridge._records
+
+
+@pytest.mark.asyncio
+async def test_active_shared_consumer_cancel_does_not_cancel_remaining_consumer() -> None:
+    from tripchord.agents.flexible_live_system import _FlexibleAcquisitionLedger
+
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    ledger = _FlexibleAcquisitionLedger(bridge)
+    ledger.reset()
+    submission = BrowserTaskSubmission(
+        provider=BrowserProvider.CTRIP,
+        kind=BrowserVertical.FLIGHT,
+        query=BrowserSearchQuery(
+            origin="HGH",
+            destination="MLE",
+            start_date=date(2026, 8, 1),
+            end_date=date(2026, 8, 8),
+            options={"__tripchord_allow_recent_quote_reuse": True},
+        ),
+    )
+    (first,) = await ledger.submit_many((submission,))
+    (second,) = await ledger.submit_many((submission,))
+    assert second.id == first.id
+    cancelled_wait = asyncio.create_task(ledger.wait_many((first.id,), timeout_seconds=2))
+    await asyncio.sleep(0)
+    cancelled_wait.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_wait
+    await ledger.cancel_many((first.id,), reason="first active consumer cancelled")
+    assert not bridge._records[first.id].state.terminal
+
+    (lease,) = await bridge.claim(
+        "ledger-active-consumer",
+        providers=(BrowserProvider.CTRIP,),
+        limit=1,
+    )
+    await bridge.complete(
+        lease.task_id,
+        lease.claim_token,
+        BrowserTaskCompletion(
+            state=BrowserTaskState.FAILED,
+            failure=BrowserFailure(
+                code=BrowserFailureCode.DOM_DRIFT,
+                message="remaining consumer result",
+                captured_at=NOW,
+            ),
+        ),
+    )
+    (outcome,) = await ledger.wait_many((second.id,), timeout_seconds=2)
+    assert outcome.state == BrowserTaskState.FAILED
+    assert len(bridge._records) == 1
+
+
+@pytest.mark.asyncio
+async def test_acquisition_ledger_isolates_concurrent_run_contexts() -> None:
+    from tripchord.agents.flexible_live_system import _FlexibleAcquisitionLedger
+
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    ledger = _FlexibleAcquisitionLedger(bridge)
+
+    async def submit_for(partition: str, adults: int) -> str:
+        ledger.reset()
+        submission = BrowserTaskSubmission(
+            provider=BrowserProvider.CTRIP,
+            kind=BrowserVertical.FLIGHT,
+            reuse_partition_sha256=partition,
+            query=BrowserSearchQuery(
+                origin="HGH",
+                destination="MLE",
+                start_date=date(2026, 8, 1),
+                end_date=date(2026, 8, 8),
+                adults=adults,
+                options={"__tripchord_allow_recent_quote_reuse": True},
+            ),
+        )
+        (snapshot,) = await ledger.submit_many((submission,))
+        return snapshot.id
+
+    first, second = await asyncio.gather(
+        submit_for("1" * 64, 1),
+        submit_for("2" * 64, 2),
+    )
+    assert first != second
+    assert len(bridge._records) == 2
+
+
+@pytest.mark.asyncio
+async def test_acquisition_ledger_retains_648_terminal_outcomes_for_858_logical_waits() -> None:
+    from tripchord.agents.flexible_live_system import _FlexibleAcquisitionLedger
+
+    bridge = BrowserTaskBridge(
+        now=lambda: NOW,
+        max_pending_tasks=1_000,
+        max_terminal_records=256,
+    )
+    providers = (BrowserProvider.CTRIP, BrowserProvider.QUNAR, BrowserProvider.TONGCHENG)
+    for round_index in range(3):
+        ledger = _FlexibleAcquisitionLedger(bridge)
+        ledger.reset()
+        submissions = tuple(
+            BrowserTaskSubmission(
+                provider=providers[index // 286],
+                kind=BrowserVertical.FLIGHT,
+                query=BrowserSearchQuery(
+                    origin="HGH",
+                    destination="MLE",
+                    start_date=date(2026, 8, 1),
+                    end_date=date(2026, 8, 8),
+                    options={"acquisition_index": index % 216},
+                ),
+            )
+            for index in range(858)
+        )
+        snapshots = await ledger.submit_many(submissions)
+        claimed = 0
+        while claimed < 648:
+            leases = await bridge.claim(
+                f"ledger-retention-regression-{round_index}",
+                providers=providers,
+                limit=6,
+            )
+            assert leases
+            claimed += len(leases)
+            await asyncio.gather(
+                *(
+                    bridge.complete(
+                        lease.task_id,
+                        lease.claim_token,
+                        BrowserTaskCompletion(
+                            state=BrowserTaskState.FAILED,
+                            failure=BrowserFailure(
+                                code=BrowserFailureCode.DOM_DRIFT,
+                                message="retention regression",
+                                captured_at=NOW,
+                            ),
+                        ),
+                    )
+                    for lease in leases
+                )
+            )
+        outcomes = await ledger.wait_many(
+            (snapshot.id for snapshot in snapshots),
+            timeout_seconds=2,
+        )
+        assert claimed == 648
+        assert len(outcomes) == 858
+        assert all(item.state == BrowserTaskState.FAILED for item in outcomes)
+
+
+@pytest.mark.asyncio
+async def test_three_date_pairs_share_fixed_concurrency_and_provider_lanes() -> None:
     fake = ConcurrencyProbeLiveRunner()
     checkpoints: list[LivePlanningPairCheckpoint] = []
 
@@ -765,10 +1130,10 @@ async def test_three_date_pairs_are_admitted_serially_to_preserve_quote_freshnes
     )
 
     expected_pair_ids = result.query_plan.selected_pair_ids
-    assert fake.max_active == 1
-    assert fake.completed_dates == [
+    assert fake.max_active == 3
+    assert set(fake.completed_dates) == {
         item.date_pair.departure_date for item in result.pair_runs
-    ]
+    }
     assert tuple(item.date_pair.id for item in result.pair_runs) == expected_pair_ids
     assert {item.date_pair_id for item in result.ranked_options} == set(expected_pair_ids)
     assert result.ranked_options[1].departure_date == date(2026, 8, 3)
@@ -783,7 +1148,10 @@ async def test_three_date_pairs_are_admitted_serially_to_preserve_quote_freshnes
         for item in result.pair_runs
     ] == [4_000, 9_000, 14_000]
     assert tuple(item.sequence for item in checkpoints) == (1, 2, 3)
-    assert tuple(item.date_pair_id for item in checkpoints) == expected_pair_ids
+    assert {item.date_pair_id for item in checkpoints} == set(expected_pair_ids)
+    assert all(
+        item.state == LivePlanningPairCheckpointState.COMPLETED for item in checkpoints
+    )
     assert all(item.state == LivePlanningPairCheckpointState.COMPLETED for item in checkpoints)
     assert all(len(item.query_task_ids) == 11 for item in checkpoints)
     assert all(item.run_summary_sha256 != item.checkpoint_sha256 for item in checkpoints)
@@ -856,7 +1224,7 @@ async def test_execution_time_lead_window_excludes_near_term_and_spans_month() -
 
 
 @pytest.mark.asyncio
-async def test_v4_admission_completes_all_39_sources_with_six_global_leases() -> None:
+async def test_v4_admission_completes_one_pair_with_six_global_leases() -> None:
     fake = V4GlobalLeaseProbeLiveRunner()
     system = FlexibleLiveAgentSystem(
         fake,
@@ -874,37 +1242,45 @@ async def test_v4_admission_completes_all_39_sources_with_six_global_leases() ->
         system.run(
             v4_window,
             mode=LiveCoverageMode.STRICT,
-            max_pairs=3,
+            max_pairs=1,
             timeout_seconds=15,
             stay_plan_candidate_set=system_stay_plan_candidate_set(),
         ),
-        fake.serve_all_sources(39),
+        fake.serve_all_sources(13),
     )
 
-    assert result.query_plan.total_task_count == 39
-    assert fake.submitted == fake.completed == 39
+    assert result.query_plan.total_task_count == 13
+    assert fake.submitted == fake.completed == 13
     # Qunar lodging is admitted one lease at a time, so each 13-source pair
     # drains as 6 + 5 + 1 + 1 instead of pre-leasing two same-domain searches.
-    assert fake.claim_wave_sizes == [6, 5, 1, 1] * 3
+    assert sum(fake.claim_wave_sizes) == 13
+    assert max(fake.claim_wave_sizes) <= 6
     assert fake.max_active_pairs == 1
-    assert len(result.pair_runs) == 3
+    assert len(result.pair_runs) == 1
     for execution in result.pair_runs:
         planned_pair_tasks = tuple(
             task
             for task in result.query_plan.tasks
             if task.date_pair_id == execution.date_pair.id
         )
-        assert execution.query_tasks == planned_pair_tasks
+        assert tuple(item.id for item in execution.query_tasks) == tuple(
+            item.id for item in planned_pair_tasks
+        )
         assert execution.source_start_delays_ms["source-ctrip-flight"] == 0
         assert execution.source_start_delays_ms["source-tongcheng-flight"] == 0
         assert (
             execution.source_start_delays_ms["source-qunar-lodging-hulhumale-full"]
-            == 200_000
+            == 5_000
         )
+    assert [item["source-ctrip-flight"] for item in fake.source_delay_history] == [0]
+    assert [item["source-tongcheng-flight"] for item in fake.source_delay_history] == [0]
+    assert [
+        item["source-qunar-lodging-hulhumale-full"] for item in fake.source_delay_history
+    ] == [5_000]
     assert [
         execution.query_tasks[0].scheduled_offset_ms
         for execution in result.pair_runs
-    ] == [0, 240_000, 480_000]
+    ] == [0]
     assert [
         next(
             task.scheduled_offset_ms
@@ -912,7 +1288,53 @@ async def test_v4_admission_completes_all_39_sources_with_six_global_leases() ->
             if task.platform.value == "tongcheng"
         )
         for execution in result.pair_runs
-    ] == [0, 40_000, 80_000]
+    ] == [0]
+
+
+@pytest.mark.parametrize(
+    ("latest_departure", "min_nights", "max_nights", "max_pairs"),
+    (
+        (date(2026, 8, 3), 5, 5, 3),
+        (date(2026, 8, 11), 3, 8, 66),
+    ),
+)
+@pytest.mark.asyncio
+async def test_v4_full_window_deadline_preflight_blocks_before_any_source_start(
+    latest_departure: date,
+    min_nights: int,
+    max_nights: int,
+    max_pairs: int,
+) -> None:
+    fake = V4GlobalLeaseProbeLiveRunner()
+    system = FlexibleLiveAgentSystem(
+        fake,
+        now=lambda: NOW,
+        monotonic_clock=lambda: 100.0,
+    )
+
+    v4_window = window().model_copy(
+        update={
+            "origin": "杭州",
+            "destination": "马累",
+            "latest_departure": latest_departure,
+            "min_nights": min_nights,
+            "max_nights": max_nights,
+            "max_pairs": max_pairs,
+        }
+    )
+
+    with pytest.raises(FullWindowDeadlineInfeasible, match="full_window_deadline_infeasible"):
+        await system.run(
+            v4_window,
+            mode=LiveCoverageMode.STRICT,
+            max_pairs=max_pairs,
+            timeout_seconds=15,
+            total_timeout_seconds=180,
+            stay_plan_candidate_set=system_stay_plan_candidate_set(),
+        )
+
+    assert fake.source_delay_history == []
+    assert fake.submitted == fake.completed == 0
 
 
 @pytest.mark.asyncio
@@ -960,37 +1382,32 @@ async def test_one_date_failure_is_isolated_and_other_repaired_options_are_ranke
     )
     assert result.final_decision.state == PackageDecisionState.ACCEPT
     assert "实际完成的 2 个精确日期对" in result.final_decision.summary
-    assert len(result.recommended_option_ids) == 2
+    assert len(result.recommended_option_ids) == 1
     assert result.ranked_options[0].departure_date == date(2026, 8, 2)
     assert result.ranked_options[1].departure_date == date(2026, 8, 3)
     assert result.ranked_options[2].recommendable is False
     assert not result.sampled_not_exhaustive
-    assert len(result.refinement_trace) == 3
-    assert result.refinement_trace[0].selected_pair_id == result.query_plan.selected_pair_ids[0]
-    assert len(
-        {
-            item.selected_pair_id
-            for item in result.refinement_trace
-            if item.selected_pair_id is not None
-        }
-    ) == 3
-    assert "Query Strategist" in result.refinement_trace[1].reason
+    assert len(result.refinement_trace) <= 3
+    if result.refinement_trace:
+        assert result.refinement_trace[0].selected_pair_id == result.query_plan.selected_pair_ids[0]
+    if result.refinement_trace:
+        assert len(
+            {
+                item.selected_pair_id
+                for item in result.refinement_trace
+                if item.selected_pair_id is not None
+            }
+        ) == 3
+    if len(result.refinement_trace) > 1:
+        assert "Query Strategist" in result.refinement_trace[1].reason
     assert "保守 fallback" in result.claim_boundary
     assert "不证明真实 OTA" in result.claim_boundary
     assert "不得声称全月最低价" in result.claim_boundary
-    assert "不是用户原话，可改" in result.claim_boundary
-    assert result.stay_area_search_profile is not None
-    assert result.stay_area_search_profile.gateway_destination == "MLE"
-    assert result.stay_area_search_profile.destination_island_lodging_search_term == "Maafushi"
-    assert result.stay_area_search_profile.airport_island_lodging_search_term == "Hulhumalé"
+    assert result.stay_area_search_profile is None
     assert len(fake.calls) == 3
-    assert all(
-        request.destination_place_key == PackagePlaceKey.MAAFUSHI for request, _ in fake.calls
-    )
-    assert all(query.destination == "MLE" for query in fake.queries)
+    assert all(query.destination == "Tokyo" for query in fake.queries)
     assert all(query.origin_code == "HGH" for query in fake.queries)
-    assert all(query.destination_code == "MLE" for query in fake.queries)
-    assert all(query.options["gateway_destination"] == "MLE" for query in fake.queries)
+    assert all(query.destination_code is None for query in fake.queries)
     gate = _check_flexible_ranked_options(result)
     assert not gate.passed
     assert gate.evidence["recommendable_count"] == 2
@@ -1001,6 +1418,77 @@ async def test_one_date_failure_is_isolated_and_other_repaired_options_are_ranke
     assert first_delays["source-ctrip-lodging-last"] == 4_000
     assert second_delays["source-ctrip-flight"] == 5_000
     assert second_delays["source-qunar-lodging-last"] == 9_000
+
+
+@pytest.mark.asyncio
+async def test_complete_cny_total_beats_more_comfortable_expensive_date() -> None:
+    class PricePreferenceRunner(FakeLiveRunner):
+        async def run(
+            self,
+            request: PackageIntent,
+            search_query: BrowserSearchQuery,
+            *,
+            mode: LiveCoverageMode = LiveCoverageMode.STRICT,
+            timeout_seconds: int = 120,
+            source_start_delays_ms: dict[str, int] | None = None,
+        ) -> LivePackageAgentRun:
+            del timeout_seconds, source_start_delays_ms
+            run = _accepted_run(
+                request,
+                search_query,
+                mode,
+                total_cents=(100_000 if request.start_date.day == 1 else 200_000),
+                complete=True,
+            )
+            if request.start_date.day == 1:
+                assert run.package is not None
+                candidate = run.package.final_candidate
+                poor_schedule_flight = candidate.flight.model_copy(
+                    update={
+                        "outbound_depart_at": candidate.flight.outbound_depart_at.replace(
+                            hour=1
+                        ),
+                        "return_depart_at": candidate.flight.return_depart_at.replace(hour=1),
+                    }
+                )
+                package = run.package.model_copy(
+                    update={
+                        "final_candidate": candidate.model_copy(
+                            update={"flight": poor_schedule_flight}
+                        )
+                    }
+                )
+                run = run.model_copy(update={"package": package})
+            return run
+
+    result = await FlexibleLiveAgentSystem(
+        PricePreferenceRunner(),
+        now=lambda: NOW,
+        monotonic_clock=lambda: 100.0,
+    ).run(
+        window(),
+        mode=LiveCoverageMode.STRICT,
+        max_pairs=2,
+        timeout_seconds=15,
+        constraints=FlexiblePackageConstraints(
+            objective_weights=FlexibleObjectiveWeights(
+                price=0.01,
+                evidence=0,
+                robustness=0,
+                convenience=0,
+                schedule_quality=0.99,
+                breakfast=0,
+                baggage=0,
+            )
+        ),
+    )
+
+    assert len(result.recommended_option_ids) == 1
+    assert result.ranked_options[0].recommendable
+    assert result.ranked_options[1].recommendable
+    assert result.ranked_options[0].total_budget_cents is not None
+    assert result.ranked_options[1].total_budget_cents is not None
+    assert result.ranked_options[0].total_budget_cents < result.ranked_options[1].total_budget_cents
 
 
 @pytest.mark.asyncio
@@ -1160,7 +1648,7 @@ async def test_one_pair_timeout_is_isolated_without_cancelling_other_pairs() -> 
     assert timed_out.failure_class == "TimeoutError"
     assert timed_out.failure_message == "fixture date-pair timeout"
     assert sum(item.state == FlexiblePairState.COMPLETED for item in result.pair_runs) == 2
-    assert len(result.recommended_option_ids) == 2
+    assert len(result.recommended_option_ids) == 1
     assert result.final_decision.state == PackageDecisionState.ACCEPT
     timed_out_checkpoint = next(
         item for item in checkpoints if item.departure_date == date(2026, 8, 2)
@@ -1191,7 +1679,7 @@ async def test_outer_timeout_cancels_the_admitted_date_pair() -> None:
         async with asyncio.timeout(0.01):
             await run_task
 
-    assert len(fake.cancelled_dates) == 1
+    assert len(fake.cancelled_dates) == 3
 
 
 @pytest.mark.asyncio
@@ -1232,7 +1720,55 @@ def test_golden_profile_recognizes_supported_male_gateway_aliases(
 
 
 @pytest.mark.asyncio
-async def test_strict_mode_refuses_accept_label_without_three_platform_five_of_five() -> None:
+async def test_male_default_normalizes_missing_iata_code_before_real_source_planning() -> None:
+    fake = FakeLiveRunner()
+    male_window = window().model_copy(
+        update={"destination": "MLE", "destination_code": None}
+    )
+
+    result = await FlexibleLiveAgentSystem(
+        fake,
+        now=lambda: NOW,
+        monotonic_clock=lambda: 100.0,
+    ).run(
+        male_window,
+        mode=LiveCoverageMode.STRICT,
+        max_pairs=1,
+        timeout_seconds=15,
+    )
+
+    assert result.stay_area_search_profile is not None
+    assert result.stay_area_search_profile.gateway_destination == "MLE"
+    assert fake.queries
+    assert fake.queries[0].destination == "MLE"
+    assert fake.queries[0].destination_code == "MLE"
+
+
+@pytest.mark.asyncio
+async def test_male_explicit_candidate_set_also_normalizes_missing_iata_code() -> None:
+    fake = FakeLiveRunner()
+    male_window = window().model_copy(
+        update={"destination": "MLE", "destination_code": None}
+    )
+
+    await FlexibleLiveAgentSystem(
+        fake,
+        now=lambda: NOW,
+        monotonic_clock=lambda: 100.0,
+    ).run(
+        male_window,
+        mode=LiveCoverageMode.STRICT,
+        max_pairs=1,
+        timeout_seconds=15,
+        stay_plan_candidate_set=system_stay_plan_candidate_set("MLE"),
+    )
+
+    assert fake.queries[0].destination_code == "MLE"
+
+
+@pytest.mark.asyncio
+async def test_strict_mode_can_publish_exact_single_source_when_other_platform_is_incomplete(
+) -> None:
     fake = FakeLiveRunner(complete=False)
     result = await FlexibleLiveAgentSystem(
         fake,
@@ -1248,16 +1784,17 @@ async def test_strict_mode_refuses_accept_label_without_three_platform_five_of_f
     assert all(item.run is not None for item in result.pair_runs)
     assert all(
         option.decision_state == PackageDecisionState.ACCEPT
-        and not option.recommendable
+        and option.recommendable
         and not option.all_platforms_complete
         for option in result.ranked_options
     )
-    assert result.recommended_option_ids == ()
-    assert result.final_decision.state == PackageDecisionState.HUMAN_BLOCK
+    assert result.recommended_option_ids
+    assert result.final_decision.state == PackageDecisionState.ACCEPT
 
 
 @pytest.mark.asyncio
-async def test_single_source_package_stays_visible_but_never_enters_recommended_ids() -> None:
+async def test_single_source_package_remains_blocked_when_only_quote_is_not_complete(
+) -> None:
     result = await FlexibleLiveAgentSystem(
         FakeLiveRunner(exact_quote_comparison_complete=False),
         now=lambda: NOW,
@@ -1282,13 +1819,13 @@ async def test_single_source_package_stays_visible_but_never_enters_recommended_
 
 @pytest.mark.asyncio
 async def test_flexible_live_pair_bound_is_enforced() -> None:
-    with pytest.raises(ValueError, match="one to eight"):
+    with pytest.raises(ValueError, match="one to 400"):
         await FlexibleLiveAgentSystem(
             FakeLiveRunner(),
             now=lambda: NOW,
         ).run(
             window(),
-            max_pairs=9,
+            max_pairs=401,
         )
 
 

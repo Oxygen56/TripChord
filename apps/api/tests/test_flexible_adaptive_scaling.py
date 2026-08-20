@@ -67,6 +67,38 @@ class _NeverRunLiveSystem:
         raise AssertionError((intent, query, mode, timeout_seconds, source_start_delays_ms))
 
 
+class _FullUniverseLiveRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.active = 0
+        self.peak_active = 0
+
+    async def run(
+        self,
+        intent: PackageIntent,
+        query: BrowserSearchQuery,
+        *,
+        mode: LiveCoverageMode = LiveCoverageMode.STRICT,
+        timeout_seconds: int = 120,
+        source_start_delays_ms: dict[str, int] | None = None,
+    ) -> LivePackageAgentRun:
+        del timeout_seconds, source_start_delays_ms
+        self.calls += 1
+        self.active += 1
+        self.peak_active = max(self.peak_active, self.active)
+        try:
+            await asyncio.sleep(0.001)
+            return _accepted_run(
+                intent,
+                query,
+                mode,
+                total_cents=900_000,
+                complete=True,
+            )
+        finally:
+            self.active -= 1
+
+
 class _AdaptiveQueryModel:
     provider = "adaptive-test"
     model = "adaptive-query-test"
@@ -238,6 +270,7 @@ class _PublicationBudgetLiveSystem(LivePackageAgentSystem):
         *,
         mode: LiveCoverageMode = LiveCoverageMode.STRICT,
         purpose: LiveRunPurpose = LiveRunPurpose.FINAL_PUBLICATION,
+        model_agents_enabled: bool = True,
         timeout_seconds: int = 120,
         source_start_delays_ms: dict[str, int] | None = None,
         memory_access: MemoryAccessContext | None = None,
@@ -245,6 +278,7 @@ class _PublicationBudgetLiveSystem(LivePackageAgentSystem):
     ) -> LivePackageAgentRun:
         del (
             purpose,
+            model_agents_enabled,
             timeout_seconds,
             source_start_delays_ms,
             memory_access,
@@ -275,7 +309,7 @@ _PUBLICATION_AGENT_ROLES = (
 def _window() -> FlexibleTravelWindow:
     return FlexibleTravelWindow(
         origin="HGH",
-        destination="MLE",
+        destination="Tokyo",
         earliest_departure=date(2026, 8, 1),
         latest_departure=date(2026, 8, 6),
         min_nights=5,
@@ -289,7 +323,7 @@ def _window() -> FlexibleTravelWindow:
 def _broad_window() -> FlexibleTravelWindow:
     return FlexibleTravelWindow(
         origin="HGH",
-        destination="MLE",
+        destination="Tokyo",
         earliest_departure=date(2026, 8, 1),
         latest_departure=date(2026, 10, 1),
         min_nights=3,
@@ -303,7 +337,7 @@ def _broad_window() -> FlexibleTravelWindow:
 def _two_hundred_fifty_two_date_window() -> FlexibleTravelWindow:
     return FlexibleTravelWindow(
         origin="HGH",
-        destination="MLE",
+        destination="Tokyo",
         earliest_departure=date(2026, 8, 1),
         latest_departure=date(2026, 10, 2),
         min_nights=5,
@@ -312,6 +346,121 @@ def _two_hundred_fifty_two_date_window() -> FlexibleTravelWindow:
         adults=2,
         rooms=1,
     )
+
+
+@pytest.mark.asyncio
+async def test_adaptive_full_66_pair_run_keeps_full_execution_and_fixed_pair_concurrency() -> None:
+    window = FlexibleTravelWindow(
+        origin="HGH",
+        destination="Tokyo",
+        earliest_departure=date(2026, 8, 1),
+        latest_departure=date(2026, 8, 11),
+        min_nights=3,
+        max_nights=8,
+        max_pairs=66,
+        adults=2,
+        rooms=1,
+    )
+    assert window.universe_size == 66
+    runner = _FullUniverseLiveRunner()
+    model = _AdaptiveQueryModel()
+    system = FlexibleLiveAgentSystem(
+        runner,
+        now=lambda: datetime(2026, 7, 1, tzinfo=UTC),
+        model_router=ModelRouter(
+            {AgentRole.QUERY_STRATEGIST: model},
+            high_risk_client=model,
+        ),
+        adaptive_agent_scaling_enabled=True,
+    )
+
+    result = await system.run(window, max_pairs=400)
+
+    assert result.scale_directive is not None
+    assert result.scale_directive.control_input.direct_final_pair_count == 8
+    assert result.scale_directive.background_batches == 9
+    assert len(result.pair_runs) == 66
+    assert runner.calls == 66
+    assert runner.peak_active == 3
+    assert len(result.query_plan.selected_pair_ids) == 66
+    assert result.query_plan.omitted_pair_ids == ()
+    assert result.query_plan.sampled_not_exhaustive is False
+    assert result.sampled_not_exhaustive is False
+    assert result.query_agentic.model_call_count == 0
+    assert result.agent_budget_audit is not None
+    assert result.agent_budget_audit.admitted_count == 0
+    assert result.agent_budget_audit.rejected_count == 0
+
+
+@pytest.mark.asyncio
+async def test_full_v4_window_runs_with_contiguous_acquisition_budget() -> None:
+    window = FlexibleTravelWindow(
+        origin="HGH",
+        destination="MLE",
+        earliest_departure=date(2026, 8, 1),
+        latest_departure=date(2026, 8, 11),
+        min_nights=3,
+        max_nights=8,
+        max_pairs=66,
+        adults=2,
+        rooms=1,
+    )
+    runner = _FullUniverseLiveRunner()
+    model = _AdaptiveQueryModel()
+    system = FlexibleLiveAgentSystem(
+        runner,
+        now=lambda: datetime(2026, 7, 1, tzinfo=UTC),
+        model_router=ModelRouter(
+            {AgentRole.QUERY_STRATEGIST: model},
+            high_risk_client=model,
+        ),
+        adaptive_agent_scaling_enabled=True,
+    )
+
+    result = await system.run(window, max_pairs=400)
+
+    assert len(result.pair_runs) == 66
+    assert runner.calls == 66
+    assert model.requests == []
+    assert result.query_plan.unique_acquisition_count == 648
+    assert max(item.scheduled_offset_ms for item in result.query_plan.tasks) == 290_000
+    assert max(
+        item.scheduled_offset_ms
+        for execution in result.pair_runs
+        for item in execution.query_tasks
+    ) == 290_000
+
+
+@pytest.mark.asyncio
+async def test_lead_time_filtered_full_effective_universe_is_not_marked_sampled() -> None:
+    window = FlexibleTravelWindow(
+        origin="HGH",
+        destination="Tokyo",
+        earliest_departure=date(2026, 8, 1),
+        latest_departure=date(2026, 8, 10),
+        min_nights=3,
+        max_nights=8,
+        max_pairs=400,
+        adults=2,
+        rooms=1,
+    )
+    runner = _FullUniverseLiveRunner()
+    system = FlexibleLiveAgentSystem(
+        runner,
+        now=lambda: datetime(2026, 8, 1, tzinfo=UTC),
+        minimum_departure_lead_days=7,
+        adaptive_agent_scaling_enabled=True,
+    )
+
+    result = await system.run(window, max_pairs=400)
+
+    assert result.effective_window.earliest_departure == date(2026, 8, 8)
+    assert len(result.exploration.candidates) == result.effective_window.universe_size
+    assert len(result.pair_runs) == result.effective_window.universe_size
+    assert len(result.query_plan.selected_pair_ids) == result.effective_window.universe_size
+    assert result.query_plan.omitted_pair_ids == ()
+    assert result.query_plan.sampled_not_exhaustive is False
+    assert result.sampled_not_exhaustive is False
 
 
 @pytest.mark.asyncio

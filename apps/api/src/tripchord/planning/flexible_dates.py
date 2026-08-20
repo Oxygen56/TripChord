@@ -58,6 +58,29 @@ class DateSearchMetricStatus(StrEnum):
     PARTIAL_PRIOR_ONLY = "partial_prior_only"
 
 
+class DateOptimalityStatus(StrEnum):
+    OPTIMALITY_PROVEN = "optimality_proven"
+    BEST_VERIFIED_IN_EVALUATED_SET = "best_verified_in_evaluated_set"
+
+
+class AdmissibleCostBound(DomainModel):
+    """A safe lower bound for branch-and-bound date pruning."""
+
+    date_pair_id: str = Field(min_length=1)
+    lower_bound_cents: int = Field(ge=0)
+    currency: str = Field(default="CNY", min_length=3, max_length=3)
+    party_total_known: bool
+    necessary_costs_non_negative: bool
+    proven: bool = False
+    basis: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_proof(self) -> Self:
+        if self.proven and (not self.party_total_known or not self.necessary_costs_non_negative):
+            raise ValueError("a pruning bound requires known party total and non-negative costs")
+        return self
+
+
 class QueryTaskKind(StrEnum):
     FLIGHT = "flight"
     LODGING_FULL_STAY = "lodging_full_stay"
@@ -88,10 +111,25 @@ class FlexibleTravelWindow(DomainModel):
     latest_departure: date
     min_nights: int = Field(ge=1, le=60)
     max_nights: int = Field(ge=1, le=60)
-    max_pairs: int = Field(default=12, ge=1, le=400)
+    # Production defaults to the complete supported date universe. Lower
+    # values are retained only for explicit diagnostics and tests; they must
+    # never be described as a global optimum.
+    max_pairs: int = Field(default=400, ge=1, le=400)
     adults: int = Field(default=2, ge=1, le=20)
+    children: int = Field(default=0, ge=0, le=20)
+    infants: int = Field(default=0, ge=0, le=10)
+    # Kept on the canonical acquisition contract even when an adapter cannot
+    # yet quote mixed parties.  Ages must never be silently dropped when a
+    # future provider adapter becomes capable of using them.
+    children_ages: tuple[int, ...] = ()
     rooms: int = Field(default=1, ge=1, le=8)
     currency: str = Field(default="CNY", min_length=3, max_length=3)
+    latest_return_date: date | None = None
+    # This is the user's actual return-home deadline.  It is deliberately
+    # separate from the searched return-leg date: an overnight flight may
+    # depart on the target date and arrive home the next calendar day.
+    latest_arrival_date: date | None = None
+    return_date_targets: tuple[date, ...] = ()
 
     @field_validator("currency")
     @classmethod
@@ -114,8 +152,29 @@ class FlexibleTravelWindow(DomainModel):
             raise ValueError("latest_departure must not be before earliest_departure")
         if self.max_nights < self.min_nights:
             raise ValueError("max_nights must not be less than min_nights")
+        if len(self.children_ages) != self.children:
+            raise ValueError("children_ages must contain one age per child")
+        if any(age < 0 or age > 17 for age in self.children_ages):
+            raise ValueError("children ages must be between 0 and 17")
         if (self.latest_departure - self.earliest_departure).days > 92:
             raise ValueError("flexible departure window cannot exceed 93 calendar days")
+        if (
+            self.latest_return_date is not None
+            and self.latest_return_date <= self.earliest_departure
+        ):
+            raise ValueError("latest_return_date must be after earliest_departure")
+        if any(item <= self.earliest_departure for item in self.return_date_targets):
+            raise ValueError("return_date_targets must be after earliest_departure")
+        if self.latest_return_date is not None and any(
+            item > self.latest_return_date for item in self.return_date_targets
+        ):
+            raise ValueError("return_date_targets must not exceed latest_return_date")
+        if (
+            self.latest_arrival_date is not None
+            and self.latest_return_date is not None
+            and self.latest_arrival_date < self.latest_return_date
+        ):
+            raise ValueError("latest_arrival_date must not precede searched return date")
         return self
 
     @property
@@ -124,9 +183,13 @@ class FlexibleTravelWindow(DomainModel):
 
     @property
     def universe_size(self) -> int:
-        return self.departure_day_count * (self.max_nights - self.min_nights + 1)
+        boundary = self.latest_return_date or self.latest_arrival_date
+        if boundary is None:
+            return self.departure_day_count * (self.max_nights - self.min_nights + 1)
+        return len(self.all_date_pairs())
 
     def all_date_pairs(self) -> tuple[tuple[date, date], ...]:
+        boundary = self.latest_return_date or self.latest_arrival_date
         return tuple(
             (
                 self.earliest_departure + timedelta(days=departure_offset),
@@ -134,13 +197,36 @@ class FlexibleTravelWindow(DomainModel):
             )
             for departure_offset in range(self.departure_day_count)
             for night_count in range(self.min_nights, self.max_nights + 1)
+            if boundary is None
+            or self.earliest_departure
+            + timedelta(days=departure_offset + night_count)
+            <= boundary
+        )
+
+    def full_exploration(self, *, now: datetime | None = None) -> DateExplorationResult:
+        """Return every legal date pair for the controller's exhaustive phase.
+
+        Provider work may still be capped by ``QueryPlanPolicy``.  Enumeration
+        is deliberately separate so a provider budget cannot silently turn a
+        date window into a model-chosen sample.
+        """
+        universe = self.all_date_pairs()
+        if not universe:
+            raise ValueError("date window has no legal date pairs")
+        return FlexibleDateExplorer().explore(
+            self.model_copy(update={"max_pairs": min(len(universe), 400)}), now=now
         )
 
     def contains(self, departure_date: date, return_date: date) -> bool:
         nights = (return_date - departure_date).days
+        boundary = self.latest_return_date or self.latest_arrival_date
         return (
             self.earliest_departure <= departure_date <= self.latest_departure
             and self.min_nights <= nights <= self.max_nights
+            and (
+                boundary is None
+                or return_date <= boundary
+            )
         )
 
 
@@ -240,44 +326,37 @@ class DateExplorationResult(DomainModel):
 class PlatformRatePolicy(DomainModel):
     platform: TravelPlatform
     minimum_interval_ms: int = Field(default=1_000, ge=0, le=60_000)
-    max_tasks: int = Field(default=100, ge=1, le=10_000)
-
-
-_LIVE_STAY_PLAN_PROVIDER_INTERVAL_FLOOR_MS = 40_000
+    max_tasks: int = Field(default=10_000, ge=1, le=10_000)
 
 
 def effective_platform_interval_ms(
     rate: PlatformRatePolicy,
     *,
-    stay_plan_candidate_set: StayPlanCandidateSet | None,
+    stay_plan_candidate_set: StayPlanCandidateSet | None = None,
 ) -> int:
-    """Return the one audited provider interval used by planning and execution.
+    """Return the sole audited provider pacing policy.
 
-    A live stay-plan query opens several authenticated result surfaces on the
-    same provider.  Both the global plan and each serially admitted date pair
-    must therefore use the same anti-bot floor; otherwise the execution record
-    no longer binds exactly to the frozen query plan even though task IDs match.
+    Stay-plan semantics affect *what* is acquired, not an undocumented second
+    40-second scheduler.  BrowserBridge/provider bounded concurrency and task
+    deadlines remain the safety boundary; this function is shared by planning
+    and runtime so the policy is still auditable.
     """
 
-    if stay_plan_candidate_set is None:
-        return rate.minimum_interval_ms
-    return max(
-        rate.minimum_interval_ms,
-        _LIVE_STAY_PLAN_PROVIDER_INTERVAL_FLOOR_MS,
-    )
+    del stay_plan_candidate_set
+    return rate.minimum_interval_ms
 
 
 def _default_rate_policies() -> tuple[PlatformRatePolicy, ...]:
     return tuple(
-        PlatformRatePolicy(platform=platform, minimum_interval_ms=1_000, max_tasks=100)
+        PlatformRatePolicy(platform=platform, minimum_interval_ms=1_000, max_tasks=10_000)
         for platform in EXPECTED_PLATFORMS
     )
 
 
 class QueryPlanPolicy(DomainModel):
     include_split_stays: bool = True
-    max_total_tasks: int = Field(default=150, ge=1, le=10_000)
-    max_exact_pairs: int | None = Field(default=None, ge=1, le=100)
+    max_total_tasks: int = Field(default=10_000, ge=1, le=10_000)
+    max_exact_pairs: int | None = Field(default=None, ge=1, le=400)
     platform_rates: tuple[PlatformRatePolicy, ...] = Field(default_factory=_default_rate_policies)
 
     @model_validator(mode="after")
@@ -300,11 +379,22 @@ class FlexibleQueryTask(DomainModel):
     start_date: date
     end_date: date
     adults: int = Field(ge=1, le=20)
+    children: int = Field(default=0, ge=0, le=20)
+    infants: int = Field(default=0, ge=0, le=10)
+    children_ages: tuple[int, ...] = ()
+    party_shape_supported: bool = True
+    party_shape_failure: str | None = None
     rooms: int = Field(ge=1, le=8)
     currency: str = Field(min_length=3, max_length=3)
     lodging_zone: LodgingZone | None = None
     stay_plan_id: StayPlanId | None = None
     scheduled_offset_ms: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_party_shape(self) -> Self:
+        if not self.party_shape_supported and not self.party_shape_failure:
+            raise ValueError("unsupported party shape requires an explicit failure")
+        return self
 
 
 class FlexibleQueryPlan(DomainModel):
@@ -312,6 +402,9 @@ class FlexibleQueryPlan(DomainModel):
     selected_pair_ids: tuple[str, ...] = Field(min_length=1)
     omitted_pair_ids: tuple[str, ...] = ()
     total_task_count: int = Field(ge=1)
+    logical_task_count: int = Field(default=1, ge=1)
+    unique_acquisition_count: int = Field(default=1, ge=1)
+    deduplicated_task_count: int = Field(default=0, ge=0)
     task_count_by_platform: dict[str, int]
     sampled_not_exhaustive: bool
     search_metrics: DateSearchMetrics
@@ -323,6 +416,37 @@ class FlexibleQueryPlan(DomainModel):
     )
     frozen_stay_plan_ids: tuple[StayPlanId, ...] = ()
     warnings: tuple[str, ...] = ()
+
+
+def canonical_acquisition_fingerprint(task: FlexibleQueryTask) -> str:
+    """Stable identity of one provider acquisition, independent of pair ID.
+
+    Date-pair IDs are orchestration labels, not provider input.  Keeping them
+    out of this fingerprint lets the planner and runtime share one acquisition
+    (for example, the same first-night or return-date search) while preserving
+    provider, route, party shape/ages, rooms, currency, zone and stay-plan
+    meaning as hard binding fields.
+    """
+
+    canonical = {
+        "provider": task.platform.value,
+        "kind": task.kind.value,
+        "origin": task.origin,
+        "destination": task.destination,
+        "start_date": task.start_date.isoformat(),
+        "end_date": task.end_date.isoformat(),
+        "adults": task.adults,
+        "children": task.children,
+        "children_ages": list(task.children_ages),
+        "infants": task.infants,
+        "rooms": task.rooms,
+        "currency": task.currency.upper(),
+        "lodging_zone": task.lodging_zone.value if task.lodging_zone else None,
+        "stay_plan_id": task.stay_plan_id.value if task.stay_plan_id else None,
+    }
+    return hashlib.sha256(
+        json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
 
 
 class FlexibleDateExplorer:
@@ -642,6 +766,17 @@ class FlexibleDateExplorer:
             ),
         )
         ordered: list[tuple[date, date]] = []
+        # A hard home-arrival deadline is the safety-critical target.  Probe
+        # its latest legal return first, then the preceding explicitly
+        # requested target, so a bounded Top-K run cannot spend its only exact
+        # slot on the less useful boundary and miss the user's requested
+        # 9/3→9/10 skeleton.
+        for return_date in reversed(window.return_date_targets):
+            for night_count in (window.max_nights, window.min_nights):
+                departure = return_date - timedelta(days=night_count)
+                pair = (departure, return_date)
+                if pair in universe and pair not in ordered:
+                    ordered.append(pair)
         for pair in anchor_pairs:
             if pair in universe and pair not in ordered:
                 ordered.append(pair)
@@ -717,7 +852,7 @@ class FlexibleDateExplorer:
         raw = (
             f"{window.origin}|{window.destination}|"
             f"{departure.isoformat()}|{return_date.isoformat()}|"
-            f"{window.adults}|{window.rooms}|{window.currency}"
+            f"{window.adults}|{window.children}|{window.infants}|{window.rooms}|{window.currency}"
         )
         digest = hashlib.sha256(raw.encode()).hexdigest()[:12]
         return f"date-pair:{departure.isoformat()}:{return_date.isoformat()}:{digest}"
@@ -784,6 +919,13 @@ class FlexibleQueryPlanBuilder:
         omitted = exploration.candidates[pair_capacity:]
         counters = {platform: 0 for platform in self._platforms}
         tasks: list[FlexibleQueryTask] = []
+        logical_task_count = 0
+        seen_acquisitions: set[str] = set()
+        deduplicated_task_count = 0
+        # V4 stay-plan searches are the production case where different date
+        # pairs intentionally ask for the same provider input.  Legacy plans
+        # retain their historical per-pair task shape for compatibility.
+        deduplicate_acquisitions = stay_plan_candidate_set is not None
         for pair in selected:
             for platform in self._platforms:
                 for kind, start_date, end_date, zone in self._task_windows(
@@ -817,6 +959,17 @@ class FlexibleQueryPlanBuilder:
                         stay_plan_id,
                         offset,
                     )
+                    logical_task_count += 1
+                    fingerprint = canonical_acquisition_fingerprint(task)
+                    if deduplicate_acquisitions and fingerprint in seen_acquisitions:
+                        deduplicated_task_count += 1
+                        continue
+                    seen_acquisitions.add(fingerprint)
+                    # Offset counts only actual acquisitions.  Duplicate
+                    # logical requests inherit the first acquisition's lane.
+                    task = task.model_copy(
+                        update={"scheduled_offset_ms": counters[platform] * interval_ms}
+                    )
                     tasks.append(task)
                     counters[platform] += 1
         query_hash = self._query_hash(
@@ -833,6 +986,9 @@ class FlexibleQueryPlanBuilder:
             selected_pair_ids=tuple(item.id for item in selected),
             omitted_pair_ids=tuple(item.id for item in omitted),
             total_task_count=len(tasks),
+            logical_task_count=logical_task_count,
+            unique_acquisition_count=len(tasks),
+            deduplicated_task_count=deduplicated_task_count,
             task_count_by_platform={
                 platform.value: counters[platform] for platform in self._platforms
             },
@@ -960,6 +1116,15 @@ class FlexibleQueryPlanBuilder:
             start_date=start_date,
             end_date=end_date,
             adults=window.adults,
+            children=window.children,
+            infants=window.infants,
+            children_ages=window.children_ages,
+            party_shape_supported=(window.children == 0 and window.infants == 0),
+            party_shape_failure=(
+                "unsupported_party_shape: provider adapter lacks child/infant fare contract"
+                if window.children or window.infants
+                else None
+            ),
             rooms=window.rooms,
             currency=window.currency,
             lodging_zone=zone,

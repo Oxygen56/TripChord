@@ -14,7 +14,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Protocol
+from typing import Annotated, Any, Protocol, cast
 from urllib.parse import ParseResult, parse_qsl, urlencode, urlparse
 from urllib.parse import quote as url_quote
 from uuid import uuid4
@@ -31,6 +31,7 @@ CONTROL_TOKEN_HEADER = "X-TripChord-Control-Token"
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 COMPANION_HEARTBEAT_STALE_AFTER_SECONDS = 45
 RECENT_EXACT_QUOTE_REUSE_SECONDS = 600
+RANGE_RECEIPT_MAX_CLOCK_SKEW_SECONDS = 30
 PRODUCTION_VISIBLE_DOM_PARSER_VERSION = "tripchord-visible-dom-v3"
 SOURCE_EXECUTION_ATTESTATION_SCHEMA = (
     "tripchord-browser-source-execution-attestation-v1"
@@ -44,6 +45,10 @@ _FORMAL_WORKER_SOURCE_TOKEN_CONTEXT = (
 _FORMAL_ACTIVATION_FAILPOINT_ACK_FLUSH_SECONDS = 0.05
 DEFAULT_TERMINAL_RECORD_RETENTION_SECONDS = 3600
 DEFAULT_MAX_TERMINAL_RECORDS = 256
+# Flexible-window acquisition watchers are started immediately after submit.
+# Keep their source record until that watcher consumes the terminal snapshot so
+# a large burst cannot prune a result between ``complete`` and ``wait_many``.
+_LEDGER_TERMINAL_RETENTION_OPTION = "__tripchord_ledger_terminal_retention"
 DEFAULT_MAX_COMPANION_CONTROL_RECORDS = 64
 COMPANION_CONTROL_PROTOCOL_VERSION = "tripchord-companion-control-v1"
 BROWSER_BRIDGE_STATE_PATH_ENV = "TRIPCHORD_BROWSER_BRIDGE_STATE_PATH"
@@ -95,11 +100,11 @@ _FLIGHT_WORKFLOW_BY_PROVIDER = {
     "qunar": "combined_roundtrip_card",
     "tongcheng": "staged_outbound_return",
 }
-_FLIGHT_PARTY_STATUS_BY_PROVIDER = {
-    "ctrip": "confirmed_for_party",
-    "fliggy": "comparison_only",
-    "qunar": "confirmed_for_party",
-    "tongcheng": "confirmed_for_party",
+_FLIGHT_PARTY_STATUSES_BY_PROVIDER = {
+    "ctrip": frozenset({"confirmed_for_party", "observed_party_context"}),
+    "fliggy": frozenset({"comparison_only"}),
+    "qunar": frozenset({"confirmed_for_party", "observed_party_context"}),
+    "tongcheng": frozenset({"confirmed_for_party", "observed_party_context"}),
 }
 _ALLOWED_READ_ONLY_FLIGHT_ACTIONS = frozenset(
     {
@@ -390,15 +395,36 @@ def _is_lodging_search_checkout_date(
 class BrowserSearchQuery(DomainModel):
     origin: str | None = None
     destination: str
+    origin_code: str | None = None
+    destination_code: str | None = None
     start_date: date
     end_date: date | None = None
     adults: int = Field(default=1, ge=1, le=9)
+    children: int = Field(default=0, ge=0, le=9)
+    children_ages: tuple[int, ...] = ()
+    infants: int = Field(default=0, ge=0, le=9)
+    party_shape_supported: bool = True
+    party_shape_failure: str | None = None
     rooms: int = Field(default=1, ge=1, le=8)
     currency: str = Field(default="CNY", min_length=3, max_length=3)
-    origin_code: str | None = None
-    destination_code: str | None = None
     search_url: str | None = None
     options: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_party_shape_contract(self) -> BrowserSearchQuery:
+        if any(age < 0 or age > 17 for age in self.children_ages):
+            raise ValueError("children ages must be between 0 and 17")
+        if self.children > 0 and len(self.children_ages) != self.children:
+            raise ValueError("children_ages must contain exactly one age for every child")
+        if self.children == 0 and self.children_ages:
+            raise ValueError("children_ages require children")
+        if (self.children or self.infants) and self.party_shape_supported:
+            raise ValueError(
+                "mixed child/infant parties require an explicit provider party-shape contract"
+            )
+        if not self.party_shape_supported and not self.party_shape_failure:
+            raise ValueError("unsupported party shape requires an explicit failure")
+        return self
 
     @field_validator("currency")
     @classmethod
@@ -440,6 +466,340 @@ class BrowserSearchQuery(DomainModel):
                 "query options cannot contain account, transaction, or browser secrets"
             )
         return self
+
+
+class BrowserRangeCapabilityStatus(StrEnum):
+    """What the browser actually proved about a provider's date-range UI."""
+
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+    INCONCLUSIVE = "inconclusive"
+
+
+class BrowserRangePriceFinality(StrEnum):
+    EXACT = "exact"
+    STARTING = "starting"
+    UNKNOWN = "unknown"
+
+
+class BrowserRangePriceBasis(StrEnum):
+    TOTAL_FOR_PARTY = "total_for_party"
+    PER_PERSON = "per_person"
+    UNKNOWN = "unknown"
+
+
+class BrowserRangeEvidenceType(StrEnum):
+    VISIBLE_DOM = "visible_dom"
+    PROVIDER_NETWORK = "provider_network"
+    NONE = "none"
+
+
+class BrowserRangeParty(DomainModel):
+    adults: int = Field(ge=1, le=9)
+    children: int = Field(default=0, ge=0, le=9)
+    children_ages: tuple[int, ...] = ()
+    infants: int = Field(default=0, ge=0, le=9)
+    rooms: int = Field(default=1, ge=1, le=8)
+
+    @model_validator(mode="after")
+    def validate_children(self) -> BrowserRangeParty:
+        if len(self.children_ages) != self.children:
+            raise ValueError("range party children_ages must match children")
+        if any(age < 0 or age > 17 for age in self.children_ages):
+            raise ValueError("range party children ages must be between 0 and 17")
+        return self
+
+
+class BrowserDateRangeQuery(DomainModel):
+    """Immutable input to a provider's batch-date capability probe.
+
+    ``requested_pairs`` is deliberately explicit: a range response is never
+    allowed to silently widen or reinterpret the dates the caller requested.
+    """
+
+    provider: BrowserProvider
+    kind: BrowserVertical
+    origin: str | None = None
+    destination: str
+    origin_code: str | None = None
+    destination_code: str | None = None
+    requested_pairs: tuple[tuple[date, date], ...]
+    party: BrowserRangeParty
+    currency: str = Field(min_length=3, max_length=3)
+    tenant_partition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    contract_version: str = Field(min_length=1, max_length=64)
+    parser_version: str = Field(min_length=1, max_length=64)
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str) -> str:
+        return value.upper()
+
+    @model_validator(mode="after")
+    def validate_pairs(self) -> BrowserDateRangeQuery:
+        if not self.requested_pairs:
+            raise ValueError("range probe requires at least one requested date pair")
+        if len(set(self.requested_pairs)) != len(self.requested_pairs):
+            raise ValueError("range probe requested_pairs must be unique")
+        if any(checkout <= checkin for checkin, checkout in self.requested_pairs):
+            raise ValueError("range probe checkout must be after checkin")
+        if self.kind == BrowserVertical.FLIGHT and not self.origin:
+            raise ValueError("range flight probes require an origin")
+        if self.kind == BrowserVertical.FLIGHT:
+            for code in (self.origin_code, self.destination_code):
+                if (
+                    code is None
+                    or len(code) != 3
+                    or not code.isascii()
+                    or not code.isalpha()
+                ):
+                    raise ValueError(
+                        "range flight probes require audited IATA origin and destination"
+                    )
+        return self
+
+    @property
+    def fingerprint_sha256(self) -> str:
+        return browser_range_query_fingerprint_sha256(self)
+
+
+class BrowserRangeCell(DomainModel):
+    """One visible calendar cell; starting prices are never exact quotes."""
+
+    start_date: date
+    end_date: date
+    party: BrowserRangeParty
+    currency: str = Field(min_length=3, max_length=3)
+    amount: Decimal | None = Field(default=None, ge=0)
+    price_basis: BrowserRangePriceBasis = BrowserRangePriceBasis.UNKNOWN
+    party_total_known: bool = False
+    taxes_and_fees_included: bool | None = None
+    product_identity: str | None = Field(default=None, min_length=1, max_length=240)
+    quote: BrowserQuote | None = None
+    price_finality: BrowserRangePriceFinality = BrowserRangePriceFinality.UNKNOWN
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    captured_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_lodging_dates(cls, value: object) -> object:
+        if isinstance(value, dict):
+            value = dict(value)
+            if "start_date" not in value and "checkin" in value:
+                value["start_date"] = value.pop("checkin")
+            if "end_date" not in value and "checkout" in value:
+                value["end_date"] = value.pop("checkout")
+        return value
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str) -> str:
+        return value.upper()
+
+    @field_validator("captured_at")
+    @classmethod
+    def validate_captured_at(cls, value: datetime) -> datetime:
+        return _require_timezone(value)
+
+    @model_validator(mode="after")
+    def validate_cell(self) -> BrowserRangeCell:
+        if self.end_date <= self.start_date:
+            raise ValueError("range cell checkout must be after checkin")
+        if self.price_finality == BrowserRangePriceFinality.EXACT and self.amount is None:
+            raise ValueError("exact range cell requires an amount")
+        if self.price_finality == BrowserRangePriceFinality.STARTING and self.amount is None:
+            raise ValueError("starting range cell requires an amount")
+        if self.price_finality == BrowserRangePriceFinality.EXACT and (
+            self.price_basis != BrowserRangePriceBasis.TOTAL_FOR_PARTY
+            or not self.party_total_known
+            or self.taxes_and_fees_included is not True
+            or not self.product_identity
+        ):
+            raise ValueError(
+                "exact range cell requires comparable party total, included taxes, "
+                "and product identity"
+            )
+        return self
+
+
+class RangeCapabilityEvidence(DomainModel):
+    status: BrowserRangeCapabilityStatus
+    provider: BrowserProvider
+    contract_version: str = Field(min_length=1, max_length=64)
+    parser_version: str = Field(min_length=1, max_length=64)
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    captured_at: datetime
+    query_fingerprint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    task_id: str | None = None
+    lease_id: str | None = None
+    evidence_type: BrowserRangeEvidenceType = BrowserRangeEvidenceType.NONE
+    source_url: str | None = None
+    response_shape_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    reason: str | None = Field(default=None, max_length=500)
+
+    @field_validator("captured_at")
+    @classmethod
+    def validate_captured_at(cls, value: datetime) -> datetime:
+        return _require_timezone(value)
+
+    @model_validator(mode="after")
+    def validate_evidence_boundary(self) -> RangeCapabilityEvidence:
+        if self.evidence_type == BrowserRangeEvidenceType.NONE:
+            if self.source_url is not None or self.response_shape_sha256 is not None:
+                raise ValueError("none range evidence cannot claim a source or response shape")
+        elif self.response_shape_sha256 is None:
+            raise ValueError("range evidence requires response_shape_sha256")
+        if (self.task_id is None) != (self.lease_id is None):
+            raise ValueError("range evidence task_id and lease_id must be paired")
+        if self.task_id is not None and (
+            not self.task_id.strip() or not self.lease_id or not self.lease_id.strip()
+        ):
+            raise ValueError("range evidence task_id and lease_id must be non-blank")
+        return self
+
+
+class BrowserRangeCompletion(DomainModel):
+    """Receipt for a range probe, including its exact coverage boundary."""
+
+    schema_version: str = Field(pattern=r"^tripchord-browser-range-receipt-v1$")
+    query: BrowserDateRangeQuery
+    capability: RangeCapabilityEvidence
+    cells: tuple[BrowserRangeCell, ...] = ()
+    receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_receipt(self) -> BrowserRangeCompletion:
+        if self.capability.provider != self.query.provider:
+            raise ValueError("range capability provider does not match query")
+        if self.capability.contract_version != self.query.contract_version:
+            raise ValueError("range capability contract version does not match query")
+        if self.capability.parser_version != self.query.parser_version:
+            raise ValueError("range capability parser version does not match query")
+        if self.capability.query_fingerprint_sha256 != self.query.fingerprint_sha256:
+            raise ValueError("range capability query fingerprint does not match query")
+        expected_pairs = set(self.query.requested_pairs)
+        cell_pairs = {(cell.start_date, cell.end_date) for cell in self.cells}
+        if len(cell_pairs) != len(self.cells):
+            raise ValueError("range receipt cells must contain unique date pairs")
+        if not cell_pairs <= expected_pairs:
+            raise ValueError("range receipt contains a date pair not requested")
+        for cell in self.cells:
+            if cell.party != self.query.party:
+                raise ValueError("range cell party does not match requested party")
+            if cell.currency != self.query.currency:
+                raise ValueError("range cell currency does not match requested currency")
+            if cell.price_finality == BrowserRangePriceFinality.EXACT:
+                error = exact_cell_binding_error(
+                    self.query,
+                    self.capability,
+                    cell,
+                    self.expires_at,
+                    datetime.now(UTC),
+                )
+                if error is not None:
+                    raise ValueError(error)
+        if self.capability.status == BrowserRangeCapabilityStatus.CONFIRMED and any(
+            cell.price_finality == BrowserRangePriceFinality.EXACT
+            and (
+                cell.quote is not None
+                and (
+                    cell.quote.provider != self.query.provider
+                    or cell.quote.kind != self.query.kind
+                )
+            )
+            for cell in self.cells
+        ):
+            raise ValueError("range cell quote provider or kind does not match query")
+        if self.receipt_sha256 != browser_range_receipt_sha256(self):
+            raise ValueError("range receipt_sha256 does not match canonical receipt payload")
+        if self.expires_at is not None and self.expires_at <= self.capability.captured_at:
+            raise ValueError("range receipt expires_at must be after captured_at")
+        if self.expires_at is not None and (
+            self.expires_at - self.capability.captured_at
+        ).total_seconds() > RECENT_EXACT_QUOTE_REUSE_SECONDS:
+            raise ValueError("range receipt TTL cannot exceed exact quote freshness window")
+        return self
+
+    @property
+    def complete_coverage(self) -> bool:
+        return (
+            self.capability.status == BrowserRangeCapabilityStatus.CONFIRMED
+            and self.usable_exact_pairs == set(self.query.requested_pairs)
+            and self.expires_at is not None
+        )
+
+    @property
+    def usable_exact_pairs(self) -> set[tuple[date, date]]:
+        if self.expires_at is None or self.expired:
+            return set()
+        return {
+            (cell.start_date, cell.end_date)
+            for cell in self.cells
+            if cell.price_finality == BrowserRangePriceFinality.EXACT
+            and exact_cell_binding_error(
+                self.query, self.capability, cell, self.expires_at, datetime.now(UTC)
+            )
+            is None
+        }
+
+    @property
+    def requires_single_date_fallback(self) -> bool:
+        return not self.complete_coverage
+
+    @property
+    def expired(self) -> bool:
+        return self.expires_at is not None and datetime.now(UTC) >= self.expires_at
+
+
+def _range_json_default(value: object) -> str:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    raise TypeError(f"unsupported range receipt value: {type(value).__name__}")
+
+
+def browser_range_receipt_sha256(receipt: BrowserRangeCompletion | object) -> str:
+    payload = (
+        receipt.model_dump(mode="json")
+        if isinstance(receipt, BrowserRangeCompletion)
+        else receipt
+    )
+    if isinstance(payload, dict):
+        payload = {
+            key: value for key, value in payload.items() if key != "receipt_sha256"
+        }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            default=_range_json_default,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def browser_range_query_fingerprint_sha256(query: BrowserDateRangeQuery | object) -> str:
+    payload = query.model_dump(mode="json") if isinstance(query, BrowserDateRangeQuery) else query
+    return _canonical_json_sha256(payload)
+
+
+def range_completion_fallback_pairs(
+    receipt: BrowserRangeCompletion,
+) -> tuple[tuple[date, date], ...]:
+    """Return all requested pairs for conservative single-date fallback."""
+
+    if receipt.capability.status in {
+        BrowserRangeCapabilityStatus.REJECTED,
+        BrowserRangeCapabilityStatus.INCONCLUSIVE,
+    }:
+        return receipt.query.requested_pairs
+    if receipt.expired:
+        return receipt.query.requested_pairs
+    covered = receipt.usable_exact_pairs
+    return tuple(pair for pair in receipt.query.requested_pairs if pair not in covered)
 
 
 class LodgingInventoryConfirmedQuery(DomainModel):
@@ -747,6 +1107,15 @@ class FlightSearchCandidateSummary(DomainModel):
     amount: Decimal | None = Field(default=None, gt=0)
     price_basis: QuotePriceBasis
     price_classification: FlightCandidatePriceClassification
+    # Route identifiers may be preserved even when the visible price remains
+    # comparison-only.  They never turn a comparison observation into a
+    # publishable quote without the separate party-total and segment contract.
+    outbound_flight_numbers: tuple[str, ...] = ()
+    return_flight_numbers: tuple[str, ...] = ()
+    outbound_segments: tuple[dict[str, JsonValue], ...] = ()
+    return_segments: tuple[dict[str, JsonValue], ...] = ()
+    origin_airport_code: str | None = None
+    destination_airport_code: str | None = None
 
     @field_validator("currency")
     @classmethod
@@ -1131,7 +1500,7 @@ class TrustedSearchUrlContract:
 
 _QUNAR_AUDITED_CITY_IDENTITIES = {
     "HGH": ("杭州", frozenset({"杭州", "hangzhou", "hgh"})),
-    "MLE": ("马累", frozenset({"马累", "male", "mle"})),
+    "MLE": ("马累", frozenset({"马累", "马尔代夫", "male", "mle"})),
 }
 
 
@@ -1220,7 +1589,7 @@ def tongcheng_trusted_flight_city_names(query: BrowserSearchQuery) -> tuple[str,
     origin_code, destination_code, _ = _require_round_trip_iata(query, "Tongcheng")
     audited = {
         "HGH": ("杭州", {"杭州", "hangzhou", "hgh"}),
-        "MLE": ("马累", {"马累", "male", "mle"}),
+        "MLE": ("马累", {"马累", "马尔代夫", "male", "mle"}),
     }
     names: list[str] = []
     for field, value, code in (
@@ -1266,6 +1635,36 @@ def tongcheng_trusted_flight_search_url(query: BrowserSearchQuery) -> str:
     )
 
 
+def tongcheng_trusted_lodging_search_url(query: BrowserSearchQuery) -> str:
+    """Build the extension's exact, read-only Tongcheng lodging result URL."""
+
+    expected_place_key = str(
+        query.options.get("expected_lodging_place_key", "")
+    ).strip().lower()
+    city_ids = {
+        "hulhumale": "110018578",
+        "maafushi": "110018575",
+    }
+    city_id = city_ids.get(expected_place_key)
+    if (
+        city_id is None
+        or query.rooms != 1
+        or query.end_date is None
+        or query.end_date <= query.start_date
+    ):
+        raise ValueError(
+            "Tongcheng trusted lodging URL requires an audited city and one room"
+        )
+    return (
+        "https://www.ly.com/hotel/hotellist"
+        f"?city={city_id}"
+        f"&inDate={query.start_date.isoformat()}"
+        f"&outDate={query.end_date.isoformat()}"
+        f"&adultsNumber={query.adults}"
+        "&roomNum=1&intl=1"
+    )
+
+
 def trusted_search_url_contract(
     provider: BrowserProvider,
     kind: BrowserVertical,
@@ -1279,8 +1678,30 @@ def trusted_search_url_contract(
 
     if query.search_url is None:
         return None
+    if kind == BrowserVertical.LODGING and provider == BrowserProvider.TONGCHENG:
+        expected = tongcheng_trusted_lodging_search_url(query)
+        contract = TrustedSearchUrlContract(
+            provider=provider,
+            kind=kind,
+            canonical_url=expected,
+            party_availability_confirmed=True,
+            pricing_context="requested_adults_and_single_room_in_search_url",
+            url_readback=(
+                ("destination", query.destination),
+                ("start_date", query.start_date.isoformat()),
+                ("end_date", query.end_date.isoformat() if query.end_date else None),
+                ("adults", query.adults),
+                ("rooms", query.rooms),
+                ("expected_lodging_place_key", query.options.get("expected_lodging_place_key")),
+            ),
+        )
+        if not hmac.compare_digest(query.search_url, expected):
+            raise ValueError(
+                "Tongcheng search_url does not exactly match the audited lodging contract"
+            )
+        return contract
     if kind != BrowserVertical.FLIGHT:
-        raise ValueError("trusted search URLs are only enabled for round-trip flights")
+        raise ValueError("trusted search URLs are only enabled for audited read-only routes")
     if provider == BrowserProvider.CTRIP:
         expected = ctrip_trusted_flight_search_url(query)
         contract = TrustedSearchUrlContract(
@@ -1373,6 +1794,11 @@ class BrowserTaskSubmission(DomainModel):
 
     @model_validator(mode="after")
     def validate_vertical_and_url(self) -> BrowserTaskSubmission:
+        if not self.query.party_shape_supported:
+            raise ValueError(
+                self.query.party_shape_failure
+                or "provider does not support the requested mixed party shape"
+            )
         if self.kind == BrowserVertical.FLIGHT and not self.query.origin:
             raise ValueError("flight searches require an origin")
         if self.kind == BrowserVertical.LODGING and self.query.end_date is None:
@@ -1529,11 +1955,17 @@ class BrowserQuote(DomainModel):
             "combination_status": "round_trip_complete",
             "journey_price_scope": "round_trip",
             "price_finality": "final_for_combination",
-            "party_availability_status": _FLIGHT_PARTY_STATUS_BY_PROVIDER[self.provider.value],
         }
         for field, expected in fixed_fields.items():
             if self.details[field] != expected:
                 raise ValueError(f"flight {field} must be {expected}")
+        party_status = self.details["party_availability_status"]
+        if party_status not in _FLIGHT_PARTY_STATUSES_BY_PROVIDER[self.provider.value]:
+            raise ValueError(
+                "flight party_availability_status must describe the exact adult search "
+                "context or an independently proven party price; allowed values: "
+                + ", ".join(sorted(_FLIGHT_PARTY_STATUSES_BY_PROVIDER[self.provider.value]))
+            )
 
         for field in (
             "combination_id",
@@ -1606,6 +2038,96 @@ class BrowserQuote(DomainModel):
             for action in actions
         ):
             raise ValueError("combined round-trip cards must not select an outbound flight")
+
+
+def exact_cell_binding_error(
+    query: BrowserDateRangeQuery,
+    capability: RangeCapabilityEvidence,
+    cell: BrowserRangeCell,
+    expires_at: datetime | None,
+    now: datetime,
+) -> str | None:
+    """Single fail-closed predicate shared by receipt and fallback decisions."""
+
+    if expires_at is None or now >= expires_at:
+        return "range receipt is missing or past expiry"
+    quote = cell.quote
+    if quote is None:
+        return "exact range cell requires a bound BrowserQuote"
+    maximum_future_time = now + timedelta(seconds=RANGE_RECEIPT_MAX_CLOCK_SKEW_SECONDS)
+    timestamps = (capability.captured_at, cell.captured_at, quote.captured_at)
+    if any(timestamp > maximum_future_time for timestamp in timestamps):
+        return "range evidence is future-dated beyond allowed clock skew"
+    if expires_at > now + timedelta(
+        seconds=(
+            RECENT_EXACT_QUOTE_REUSE_SECONDS + RANGE_RECEIPT_MAX_CLOCK_SKEW_SECONDS
+        )
+    ):
+        return "range receipt expiry is future-dated beyond its freshness window"
+    if now - quote.captured_at > timedelta(seconds=RECENT_EXACT_QUOTE_REUSE_SECONDS):
+        return "bound BrowserQuote is stale"
+    if max(timestamps) - min(timestamps) > timedelta(seconds=RECENT_EXACT_QUOTE_REUSE_SECONDS):
+        return "range evidence is outside one freshness window"
+    if capability.status != BrowserRangeCapabilityStatus.CONFIRMED:
+        return "capability is not confirmed"
+    if capability.evidence_type == BrowserRangeEvidenceType.NONE:
+        return "confirmed range evidence cannot be none"
+    if not capability.source_url or not capability.response_shape_sha256:
+        return "confirmed range evidence requires source and response shape"
+    if capability.task_id is None or capability.lease_id is None:
+        return "confirmed range evidence requires task and lease lineage"
+    if not capability.task_id.strip() or not capability.lease_id.strip():
+        return "confirmed range evidence requires non-blank task and lease lineage"
+    if (
+        not capability.source_url.startswith("https://")
+        or not _is_allowed_provider_url(query.provider, capability.source_url)
+    ):
+        return "confirmed range evidence source_url is not an allowed provider URL"
+    visible_evidence_sha256 = hashlib.sha256(
+        quote.visible_evidence.encode("utf-8")
+    ).hexdigest()
+    if (
+        quote.provider != query.provider
+        or quote.kind != query.kind
+        or quote.currency != query.currency
+        or quote.amount != cell.amount
+        or quote.price_basis != QuotePriceBasis.TOTAL_PARTY
+        or quote.taxes_included is not True
+        or quote.evidence_sha256 != cell.evidence_sha256
+        or quote.evidence_sha256 != visible_evidence_sha256
+        or cell.price_basis != BrowserRangePriceBasis.TOTAL_FOR_PARTY
+        or not cell.party_total_known
+        or cell.taxes_and_fees_included is not True
+    ):
+        return "bound BrowserQuote does not match exact range cell"
+    quote_query = quote.details.get("query")
+    if not isinstance(quote_query, dict):
+        return "bound BrowserQuote query is missing"
+    if (
+        quote_query.get("start_date") != cell.start_date.isoformat()
+        or quote_query.get("end_date") != cell.end_date.isoformat()
+        or quote_query.get("origin") != query.origin
+        or quote_query.get("destination") != query.destination
+        or quote_query.get("origin_code") != query.origin_code
+        or quote_query.get("destination_code") != query.destination_code
+        or quote_query.get("currency") != query.currency
+        or quote_query.get("adults") != cell.party.adults
+        or quote_query.get("rooms") != cell.party.rooms
+    ):
+        return "bound BrowserQuote route, dates, or party do not match"
+    if query.party.children or query.party.infants:
+        return "mixed party range requires complete quote party fields"
+    identity = (
+        quote.details.get("combination_id")
+        if query.kind == BrowserVertical.FLIGHT
+        else f"{quote.title}|{quote.details.get('room_text', '')}"
+    )
+    if not isinstance(identity, str) or identity != cell.product_identity:
+        return "range product_identity does not match bound BrowserQuote"
+    return None
+
+
+BrowserRangeCell.model_rebuild(_types_namespace={"BrowserQuote": BrowserQuote})
 
 
 class BrowserFailure(DomainModel):
@@ -2766,7 +3288,8 @@ class BrowserTaskBridge:
                 raise
             record.claim_token = None
             record.lease_expires_at = None
-            self._active_consumers.pop(record.id, None)
+            if not self._terminal_record_has_pending_ledger_waiter(record):
+                self._active_consumers.pop(record.id, None)
             self._prune_terminal_records()
             self._persist_state()
             self._changed.notify_all()
@@ -2958,8 +3481,13 @@ class BrowserTaskBridge:
             self._housekeep_and_notify_locked()
             records = tuple(self._record(task_id) for task_id in ids)
             changed = False
+            retention_released = False
             for record in records:
                 if record.state.terminal:
+                    retention_released = (
+                        self._release_terminal_waiter_locked(record)
+                        or retention_released
+                    )
                     continue
                 consumers = self._active_consumers.get(record.id, 1)
                 if consumers > 1:
@@ -2981,7 +3509,7 @@ class BrowserTaskBridge:
                 )
                 self._active_consumers.pop(record.id, None)
                 changed = True
-            if changed:
+            if changed or retention_released:
                 self._prune_terminal_records()
                 self._persist_state()
                 self._changed.notify_all()
@@ -3003,7 +3531,11 @@ class BrowserTaskBridge:
                     self._housekeep_and_notify_locked()
                     records = tuple(self._record(task_id) for task_id in ids)
                     if all(record.state.terminal for record in records):
-                        return tuple(self._snapshot(record) for record in records)
+                        snapshots = tuple(self._snapshot(record) for record in records)
+                        for record in records:
+                            self._release_terminal_waiter_locked(record)
+                        self._prune_terminal_records()
+                        return snapshots
                     lease_expiries = tuple(
                         record.lease_expires_at
                         for record in records
@@ -3030,6 +3562,21 @@ class BrowserTaskBridge:
 
         async with asyncio.timeout(timeout_seconds):
             return await wait_for_terminal()
+
+    def _release_terminal_waiter_locked(self, record: _TaskRecord) -> bool:
+        if (
+            record.submission.query.options.get(_LEDGER_TERMINAL_RETENTION_OPTION)
+            is not True
+        ):
+            return False
+        consumers = self._active_consumers.get(record.id, 0)
+        if consumers == 0:
+            return False
+        if consumers <= 1:
+            self._active_consumers.pop(record.id, None)
+        else:
+            self._active_consumers[record.id] = consumers - 1
+        return True
 
     def _record(self, task_id: str) -> _TaskRecord:
         record = self._records.get(task_id)
@@ -3621,15 +4168,33 @@ class BrowserTaskBridge:
         remove_ids = {
             record.id
             for record in terminal
-            if now - record.updated_at.astimezone(UTC) > self._terminal_retention
+            if (
+                now - record.updated_at.astimezone(UTC) > self._terminal_retention
+                and not self._terminal_record_has_pending_ledger_waiter(record)
+            )
         }
         retained = [record for record in terminal if record.id not in remove_ids]
-        overflow = max(0, len(retained) - self._max_terminal_records)
-        remove_ids.update(record.id for record in retained[:overflow])
+        # The bounded cap applies to ordinary terminal history. Ledger-backed
+        # records are removed as soon as their registered waiter consumes the
+        # result, so they must not be allowed to evict each other first.
+        ordinary_retained = [
+            record
+            for record in retained
+            if not self._terminal_record_has_pending_ledger_waiter(record)
+        ]
+        overflow = max(0, len(ordinary_retained) - self._max_terminal_records)
+        remove_ids.update(record.id for record in ordinary_retained[:overflow])
         for task_id in remove_ids:
             self._records.pop(task_id, None)
             self._active_consumers.pop(task_id, None)
         return bool(remove_ids)
+
+    def _terminal_record_has_pending_ledger_waiter(self, record: _TaskRecord) -> bool:
+        return bool(
+            record.submission.query.options.get(_LEDGER_TERMINAL_RETENTION_OPTION)
+            is True
+            and self._active_consumers.get(record.id, 0) > 0
+        )
 
     def _prune_terminal_reload_requests(self) -> bool:
         now = self._utc_now()
@@ -4118,7 +4683,7 @@ def create_browser_bridge_app(
                 )
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return result.model_dump(mode="json")
+        return cast(dict[str, Any], result.model_dump(mode="json"))
 
     @app.post(
         "/v1/tasks/claim",

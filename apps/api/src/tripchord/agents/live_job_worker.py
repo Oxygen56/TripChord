@@ -39,9 +39,11 @@ import inspect
 import json
 import os
 import sys
+from collections.abc import Coroutine
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 
 def _atomic_write(path: Path, payload: dict[str, object]) -> None:
@@ -54,7 +56,7 @@ def _atomic_write(path: Path, payload: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
-def _load_entry(module_path: str, entry: str):
+def _load_entry(module_path: str, entry: str) -> Any:
     spec = importlib.util.spec_from_file_location("live_job_worker_entry", module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load worker module: {module_path}")
@@ -110,7 +112,11 @@ def main(argv: list[str] | None = None) -> int:
             kwargs["probe_path"] = args.probe_path
         fn = _load_entry(args.module_path, args.entry)
         maybe = fn(**kwargs)
-        result = asyncio.run(maybe) if inspect.isawaitable(maybe) else maybe
+        result = (
+            asyncio.run(cast(Coroutine[Any, Any, Any], maybe))
+            if inspect.isawaitable(maybe)
+            else maybe
+        )
         json.dump(result, sys.stdout, ensure_ascii=False)
         sys.stdout.flush()
     except BaseException as exc:

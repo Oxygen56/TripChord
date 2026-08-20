@@ -36,7 +36,7 @@ import unicodedata
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Flag, auto
-from typing import Any
+from typing import Any, Protocol, cast
 
 # Hard budgets for the recursive JSON walk.  ``_MAX_JSON_SCAN_DEPTH`` covers
 # the mandated level 0-3 double/triple-encoding counter-examples plus structural
@@ -133,6 +133,10 @@ class PatternScope(Flag):
     FINAL_VALUE = auto()
 
 
+class _SearchPattern(Protocol):
+    def search(self, text: str) -> re.Match[str] | None: ...
+
+
 @dataclass(frozen=True)
 class SensitiveShapePattern:
     """One credential shape in the single registry.
@@ -145,7 +149,7 @@ class SensitiveShapePattern:
     """
 
     name: str
-    pattern: re.Pattern[str]
+    pattern: _SearchPattern
     kind: str
     scopes: PatternScope
 
@@ -697,7 +701,7 @@ class _WholeHeaderScan:
     def sub(self, repl: str, text: str, count: int = 0) -> str:
         return _SHAPE_PATTERN_WHOLE_HEADER_RE.sub(repl, text, count=count)
 
-    def finditer(self, text: str) -> re.Iterator[re.Match[str]]:
+    def finditer(self, text: str) -> Iterator[re.Match[str]]:
         return _SHAPE_PATTERN_WHOLE_HEADER_RE.finditer(text)
 
 
@@ -1490,8 +1494,8 @@ def _rightward_arrow_family_ranges() -> str:
     # Collapse the ascending codepoints into contiguous ranges.
     parts: list[str] = []
     start = prev = family[0]
-    for cp in [*family[1:], None]:
-        if cp is None or cp != prev + 1:
+    for cp in [*family[1:], -1]:
+        if cp == -1 or cp != prev + 1:
             if start == prev:
                 parts.append(
                     rf"\u{start:04X}" if start < 0x10000
@@ -1503,7 +1507,7 @@ def _rightward_arrow_family_ranges() -> str:
                     if prev < 0x10000
                     else rf"\U{start:08X}-\U{prev:08X}"
                 )
-            if cp is None:
+            if cp == -1:
                 break
             start = cp
         prev = cp
@@ -2125,6 +2129,8 @@ def _registered_base_value_exempt_at_path(
         return True
     if info is _WRAPPED_BASE_ILLEGAL:
         return False
+    if not isinstance(info, tuple):
+        return False
     base, _is_version = info
     # R42 Block 86 (打回七): a decoded ARRAY / nested-ARRAY element sits at a
     # ``(carried_path, <array>, ...)`` path — strip the trailing typed ARRAY
@@ -2143,7 +2149,7 @@ def _registered_base_value_exempt_at_path(
     base_path = path
     while base_path and base_path[-1] is _ARRAY_PATH_ELEMENT:
         base_path = base_path[:-1]
-    allowed = _DOCUMENTED_BUSINESS_VALUE_PATHS.get(base_path)
+    allowed = _DOCUMENTED_BUSINESS_VALUE_PATHS.get(cast(tuple[str, ...], base_path))
     if allowed is None:
         return False
     return base in allowed
@@ -2691,7 +2697,7 @@ def _decode_json_string_escapes(text: str) -> str:
     An invalid or incomplete escape leaves ``text`` untouched and the caller
     fails closed on the raw form — decoding never makes a rejection weaker."""
     try:
-        return json.loads('"' + text + '"')
+        return cast(str, json.loads('"' + text + '"'))
     except (ValueError, TypeError):
         return text
 
@@ -2805,6 +2811,8 @@ def _is_documented_json_array_element_assign(
         return False
     info = _registered_base_value_info(stripped[elem_start:j])
     if info is None or info is _WRAPPED_BASE_ILLEGAL:
+        return False
+    if not isinstance(info, tuple):
         return False
     base, _is_version = info
     allowed = _DOCUMENTED_BUSINESS_VALUE_PATHS.get(base_path)
@@ -3094,7 +3102,7 @@ SHAPE_PATTERN_REGISTRY: tuple[SensitiveShapePattern, ...] = (
 )
 
 
-def registry_patterns(*scopes: PatternScope) -> tuple[re.Pattern[str], ...]:
+def registry_patterns(*scopes: PatternScope) -> tuple[_SearchPattern, ...]:
     """Patterns from the registry whose scope includes ANY of ``scopes``."""
     wanted = PatternScope(0)
     for scope in scopes:
@@ -3104,7 +3112,7 @@ def registry_patterns(*scopes: PatternScope) -> tuple[re.Pattern[str], ...]:
     )
 
 
-def registry_pattern(name: str) -> re.Pattern[str]:
+def registry_pattern(name: str) -> _SearchPattern:
     """The single registry pattern for ``name`` — what a caller keeps as a
     named module-level variable so a mask layer can apply per-pattern
     replacements while still deriving from the ONE registry (补充 C)."""
@@ -3116,7 +3124,7 @@ def registry_pattern(name: str) -> re.Pattern[str]:
 
 def registry_shape_pairs(
     *scopes: PatternScope,
-) -> tuple[tuple[re.Pattern[str], str], ...]:
+) -> tuple[tuple[_SearchPattern, str], ...]:
     """``(pattern, kind)`` pairs from the registry whose scope includes ANY of
     ``scopes`` — what the final secret scan iterates to reject a shape."""
     wanted = PatternScope(0)

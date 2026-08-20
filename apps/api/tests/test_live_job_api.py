@@ -60,7 +60,7 @@ def _payload(*, ready: bool) -> dict[str, object]:
         },
         "coverage_mode": "strict",
         "timeout_seconds": 300,
-        "total_timeout_seconds": 1800,
+        "total_timeout_seconds": 600,
         "max_pairs": 1,
     }
 
@@ -158,7 +158,7 @@ async def test_async_live_job_returns_202_then_exposes_result_and_status_only_ss
         job_id = created_job["id"]
         admitted_at = datetime.fromisoformat(created_job["created_at"])
         deadline_at = datetime.fromisoformat(created_job["deadline_at"])
-        assert (deadline_at - admitted_at).total_seconds() == 1800
+        assert (deadline_at - admitted_at).total_seconds() == 600
         assert created.json()["status_url"].endswith(job_id)
         terminal = await _terminal_job(client, job_id)
         assert terminal["state"] == "succeeded"
@@ -238,7 +238,7 @@ async def test_runtime_status_returns_effective_flexible_timeout_setting(
     ) as client:
         response = await client.get("/api/v1/agents/runtime")
     assert response.status_code == 200
-    assert response.json()["effective_flexible_timeout_seconds"] == 3600
+    assert response.json()["effective_flexible_timeout_seconds"] == 600
 
 
 @pytest.mark.asyncio

@@ -2509,6 +2509,17 @@ assert.equal(
   tongchengUrlEvidence.url_confirmed_fields.join(","),
   "origin,destination,origin_code,destination_code,start_date,end_date,adults",
 );
+for (const provider of ["qunar", "tongcheng"]) {
+  const aliasUrl = provider === "qunar" ? qunarTrustedUrl : tongchengTrustedUrl;
+  const aliasEvidence = hooks.trustedSearchUrlDriverEvidence(
+    provider,
+    "flight",
+    aliasUrl,
+    { ...trustedFlightQuery, destination: "马尔代夫" },
+  );
+  assert.equal(aliasEvidence.confirmation_scope, "trusted_exact_search_url");
+  assert.equal(aliasEvidence.readback_query.destination, "马尔代夫");
+}
 assert.equal(
   hooks.trustedSearchUrlDriverEvidence(
     "tongcheng",
@@ -3136,6 +3147,68 @@ const portClosed = () =>
   assert.equal(reusable.tab_id, 24);
   assert.equal(reusable.url, exactUrl);
   tabs.delete(24);
+}
+
+{
+  // Qunar redirects the trusted search entry to this result route.  Reuse is
+  // allowed only when its complete visible URL contract still binds the same
+  // cities, dates, and party size.
+  const redirectedResultUrl =
+    "https://flight.qunar.com/site/interroundtrip_compare.htm" +
+    "?fromCity=%E6%9D%AD%E5%B7%9E&toCity=%E9%A9%AC%E7%B4%AF" +
+    "&fromDate=2026-08-01&toDate=2026-08-05" +
+    "&from=flight_int_search&lowestPrice=null&isInter=true" +
+    "&favoriteKey=&showTotalPr=0&adultNum=2&childNum=0&cabinClass=";
+  tabs.set(27, {
+    id: 27,
+    windowId: 1,
+    active: false,
+    status: "complete",
+    url: redirectedResultUrl,
+  });
+  const resultDecision = await hooks.auditedFlightResultUrlDecision(
+    "qunar",
+    redirectedResultUrl,
+    {
+      origin: "杭州",
+      destination: "马尔代夫",
+      origin_code: "HGH",
+      destination_code: "MLE",
+      start_date: "2026-08-01",
+      end_date: "2026-08-05",
+      adults: 2,
+    },
+  );
+  assert.equal(resultDecision.allowed, true);
+  assert.equal(resultDecision.confirmation_scope, "audited_visible_result_url");
+  const reusable = await hooks.claimReusableExactFlightResultTab({
+    provider: "qunar",
+    kind: "flight",
+    query: {
+      origin: "杭州",
+      destination: "马尔代夫",
+      origin_code: "HGH",
+      destination_code: "MLE",
+      start_date: "2026-08-01",
+      end_date: "2026-08-05",
+      adults: 2,
+      search_url:
+        "https://flight.qunar.com/twell/flight/Search.jsp?from=flight_int_search&showTotalPr=0&searchType=RoundTripFlight&fromCity=%E6%9D%AD%E5%B7%9E&toCity=%E9%A9%AC%E7%B4%AF&adultNum=2&childNum=0&fromDate=2026-08-01&toDate=2026-08-05",
+      options: { __tripchord_reuse_exact_result_tab: true },
+    },
+  });
+  assert.equal(reusable.tab_id, 27);
+  assert.equal(reusable.confirmation_scope, "audited_visible_result_url");
+  assert.deepEqual(JSON.parse(JSON.stringify(reusable.result_url_readback)), {
+    origin: "杭州",
+    destination: "马累",
+    origin_code: "HGH",
+    destination_code: "MLE",
+    start_date: "2026-08-01",
+    end_date: "2026-08-05",
+    adults: 2,
+  });
+  tabs.delete(27);
 }
 
 {
@@ -4182,6 +4255,15 @@ const portClosed = () =>
   });
   sendMessageImpl = async (_tabId, message) => {
     messages.push(message);
+    if (message.type === "tripchord:safe-expand-qunar-flight-detail") {
+      return {
+        ok: true,
+        result: {
+          expanded: false,
+          code: "safe_detail_control_not_found",
+        },
+      };
+    }
     extractionCalls += 1;
     return {
       ok: true,
@@ -4242,6 +4324,15 @@ const portClosed = () =>
   });
   sendMessageImpl = async (_tabId, message) => {
     messages.push(message);
+    if (message.type === "tripchord:safe-expand-qunar-flight-detail") {
+      return {
+        ok: true,
+        result: {
+          expanded: false,
+          code: "safe_detail_control_not_found",
+        },
+      };
+    }
     extractionCalls += 1;
     if (message.driver.qunar_geometry_price_disabled === true) {
       return {

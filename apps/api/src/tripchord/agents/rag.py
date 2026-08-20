@@ -15,6 +15,7 @@ from tripchord.agents.memory import (
     MemoryRecord,
     MemoryStore,
     MemoryVolatility,
+    normalize_confirmed_preference_value,
 )
 from tripchord.domain.common import DomainModel
 
@@ -173,6 +174,14 @@ class EvidenceRagRetriever:
         if any(marker in searchable for marker in _PRICE_MARKERS):
             return False
         if record.kind == MemoryKind.USER_PREFERENCE:
+            key = record.payload.get("key")
+            value = record.payload.get("value")
+            if not isinstance(key, str):
+                return False
+            try:
+                normalize_confirmed_preference_value(key, value)
+            except (TypeError, ValueError):
+                return False
             return True
         serialized_payload = json.dumps(
             record.payload,

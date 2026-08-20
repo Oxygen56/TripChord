@@ -669,23 +669,26 @@ def _check_stage_aware_run_contracts(
         errors.append(f"必须恰好封存 3 个探索运行，实际 {exploration_count} 个")
     if len(set(exploration_trip_ids)) != 3:
         errors.append("3 个探索运行必须绑定 3 个唯一 trip_id")
-    if publication_count != 2:
-        errors.append(f"必须恰好完成 2 个发布刷新运行，实际 {publication_count} 个")
-    if run.publication_refresh_minimum_options != 2:
-        errors.append("发布刷新冻结下限必须为 2")
+    configured_refresh = run.publication_refresh_minimum_options
+    if publication_count != configured_refresh:
+        errors.append(
+            f"必须恰好完成 {configured_refresh} 个发布刷新运行，实际 {publication_count} 个"
+        )
+    if configured_refresh < 1:
+        errors.append("发布刷新冻结下限必须至少为 1")
     if (
         len(publication_option_ids) != len(set(publication_option_ids))
-        or len(run.recommended_option_ids) != 2
-        or set(publication_option_ids) != set(run.recommended_option_ids)
+        or len(run.recommended_option_ids) != 1
+        or not set(run.recommended_option_ids).issubset(set(publication_option_ids))
     ):
-        errors.append("最终推荐必须精确等于两个完整发布运行的 option_id 集合")
+        errors.append("最终推荐必须只包含一个已完成发布运行的 option_id")
 
     return LiveV4DoneGateCheck(
         name="stage_aware_exploration_publication_contract",
         passed=not errors,
         summary=(
             "3 个探索运行均已封存且仅延后 Explanation/Memory/Publish，"
-            "2 个最终方案均完成全量发布尾链"
+            "发布刷新运行均完成全量发布尾链，最终只暴露一个首选方案"
             if not errors
             else "；".join(errors)
         ),
@@ -1335,8 +1338,8 @@ def _check_recommendable_options(
         errors.append("可推荐选项重复使用同一 date_pair_id")
     if len(option_dates) != len(set(option_dates)):
         errors.append("可推荐选项重复使用同一出发/返程日期")
-    if tuple(run.recommended_option_ids) != option_ids:
-        errors.append("recommended_option_ids 未精确等于唯一可推荐 option_id 序列")
+    if tuple(run.recommended_option_ids) != option_ids[:1]:
+        errors.append("recommended_option_ids 必须是按最终排序选出的唯一首选 option_id")
     for item in recommendable:
         matching_executions = tuple(
             execution for execution in run.pair_runs if execution.date_pair.id == item.date_pair_id

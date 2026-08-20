@@ -3530,7 +3530,7 @@
     };
   }
 
-  globalThis.TripChordContentRuntimeVersion = "2026-08-05.16";
+  globalThis.TripChordContentRuntimeVersion = "2026-08-05.18";
   globalThis.TripChordVisibleSearchDriver = {
     ctripCalendarMonthOrdinal,
     ctripCalendarNavigationDirection,
@@ -3611,6 +3611,19 @@
           message.query || {},
           message.driver || {},
           message.selection_id,
+        );
+      }
+      if (message.type === "tripchord:safe-expand-qunar-flight-detail") {
+        if (message.provider !== "qunar") {
+          throw new Error("flight detail expansion is only supported for Qunar");
+        }
+        return globalThis.TripChordQuoteParser.qunarSafeExpandFlightDetail(
+          document,
+          message.direction,
+          {
+            query: message.query || null,
+            candidate_fingerprint: message.candidate_fingerprint || null,
+          },
         );
       }
       if (message.type === "tripchord:extract-transfer-detail") {

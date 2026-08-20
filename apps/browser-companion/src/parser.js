@@ -194,10 +194,18 @@
     "reselect_outbound",
     "provider_auto_selected_outbound",
     "select_return",
+    "expand_flight_detail",
   ]);
   const FLIGHT_TIMEZONE_OFFSETS = Object.freeze({
     HGH: "+08:00",
     MLE: "+05:00",
+    SIN: "+08:00",
+    DXB: "+04:00",
+    PEK: "+08:00",
+    PKX: "+08:00",
+    PVG: "+08:00",
+    KMG: "+08:00",
+    CAN: "+08:00",
   });
   const AUDITED_FLIGHT_CITY_ALIASES = Object.freeze({
     HGH: Object.freeze([
@@ -249,10 +257,16 @@
   const FLIGHT_SEARCH_CANDIDATE_KEYS = Object.freeze([
     "amount",
     "candidate_index",
+    "destination_airport_code",
     "currency",
+    "outbound_flight_numbers",
+    "outbound_segments",
     "price_basis",
     "price_classification",
     "price_evidence",
+    "return_flight_numbers",
+    "return_segments",
+    "origin_airport_code",
     "route_evidence",
     "schedule_evidence",
     "title",
@@ -525,6 +539,20 @@
 
   function cleanText(value) {
     return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function shortTextHash(value) {
+    let hash = 2166136261;
+    for (const character of String(value || "")) {
+      hash ^= character.codePointAt(0);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0");
+  }
+
+  function boundedText(value, maxLength = 240) {
+    const text = cleanText(value);
+    return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
   }
 
   function comparableLodgingAlias(value) {
@@ -4749,6 +4777,1038 @@
         );
   }
 
+  // Qunar renders identifiers in the visible carrier summary (for example
+  // `MU6550 ... MU235`) rather than in the airport time nodes.  An identifier
+  // is evidence only; it becomes a segment below only when the card proves a
+  // direct, single-flight journey.
+  function qunarVisibleFlightNumbers(value) {
+    const text = cleanText(value);
+    const matches = [];
+    const pattern = /(?:^|[^A-Za-z0-9])([A-Z]{2})\s*([0-9]{2,4})(?![A-Za-z0-9])/g;
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      const flightNumber = `${match[1]}${match[2]}`;
+      if (!matches.includes(flightNumber)) {
+        matches.push(flightNumber);
+      }
+      if (matches.length >= 8) {
+        break;
+      }
+    }
+    return matches;
+  }
+
+  function qunarDirectFlightSegment(
+    trip,
+    leg,
+    flightNumbers,
+    originCode,
+    destinationCode,
+    routeEvidence,
+  ) {
+    const text = cleanText(trip && trip.textContent);
+    if (
+      !leg ||
+      !Array.isArray(flightNumbers) ||
+      flightNumbers.length !== 1 ||
+      !routeEvidence ||
+      routeEvidence.matches_expected !== true ||
+      /中转|经停|转|经由|transfer|stopover|connection/i.test(text) ||
+      !/^[A-Z]{3}$/.test(cleanText(originCode).toUpperCase()) ||
+      !/^[A-Z]{3}$/.test(cleanText(destinationCode).toUpperCase())
+    ) {
+      return [];
+    }
+    return [{
+      flight_number: flightNumbers[0],
+      departure_airport_code: cleanText(originCode).toUpperCase(),
+      arrival_airport_code: cleanText(destinationCode).toUpperCase(),
+      departure_at: leg.departure_at,
+      arrival_at: leg.arrival_at,
+    }];
+  }
+
+  function qunarRawVisibleAirportCodes(value) {
+    const text = cleanText(value);
+    const observations = [];
+    const knownCodes = new Set(Object.keys(FLIGHT_TIMEZONE_OFFSETS));
+    let unknownCodeObserved = false;
+    const pattern = /(?:^|[^A-Za-z])([A-Z]{3})(?![A-Za-z])/g;
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      const code = match[1];
+      if (!knownCodes.has(code)) {
+        unknownCodeObserved = true;
+        continue;
+      }
+      observations.push({ index: match.index, code });
+    }
+    // Some live cards expose the airport as an unambiguous visible name but
+    // omit the IATA code.  This remains source evidence: only audited names
+    // with one airport mapping are accepted, and carrier names such as
+    // “新加坡航空” are explicitly excluded.  Never map a bare ambiguous city
+    // (for example “北京”) to an airport.
+    const visibleNames = [
+      ["北京大兴国际机场", "PKX"],
+      ["北京大兴机场", "PKX"],
+      ["大兴机场", "PKX"],
+      ["北京首都国际机场", "PEK"],
+      ["首都机场", "PEK"],
+      ["萧山国际机场", "HGH"],
+      ["萧山机场", "HGH"],
+      ["杭州萧山国际机场", "HGH"],
+      ["杭州萧山", "HGH"],
+      ["杭州", "HGH"],
+      ["新加坡樟宜国际机场", "SIN"],
+      ["新加坡樟宜", "SIN"],
+      ["樟宜机场", "SIN"],
+      ["樟宜", "SIN"],
+      ["新加坡(?!航空)", "SIN"],
+      ["韦拉纳国际机场", "MLE"],
+      ["韦拉纳", "MLE"],
+      ["马累", "MLE"],
+    ];
+    const namePattern = new RegExp(
+      visibleNames.map(([name]) => name).join("|"),
+      "g",
+    );
+    while ((match = namePattern.exec(text)) !== null) {
+      const matched = match[0];
+      const entry = visibleNames.find(([name]) =>
+        new RegExp(`^${name}$`).test(matched),
+      );
+      if (entry) {
+        observations.push({ index: match.index, code: entry[1] });
+      }
+    }
+    if (unknownCodeObserved) {
+      return [];
+    }
+    observations.sort((left, right) => left.index - right.index);
+    return observations.map((observation) => observation.code);
+  }
+
+  function qunarVisibleAirportCodes(value) {
+    const codes = [];
+    for (const code of qunarRawVisibleAirportCodes(value)) {
+      if (codes[codes.length - 1] !== code) {
+        codes.push(code);
+      }
+      if (codes.length >= 8) {
+        return codes;
+      }
+    }
+    return codes;
+  }
+
+  // The card text often repeats its summary route around the expandable
+  // detail.  Bind airport codes to the visible flight-number spans instead
+  // of treating every IATA token in the whole card as one route.  A complete
+  // pair for each flight is required; otherwise the caller must keep the
+  // route state unknown rather than infer a transfer from noisy text.
+  function qunarAirportCodesAnchoredToFlights(
+    value,
+    flightNumbers,
+    returnEvidence = false,
+  ) {
+    const text = cleanText(value);
+    const numbers = Array.isArray(flightNumbers) ? flightNumbers : [];
+    if (!text || !numbers.length) {
+      return returnEvidence ? { pairs: [], chain: [] } : [];
+    }
+    const observations = [];
+    const rawCodes = qunarRawVisibleAirportCodes(text);
+    if (!rawCodes.length) {
+      return returnEvidence ? { pairs: [], chain: [] } : [];
+    }
+    const codePattern = /(?:^|[^A-Za-z])([A-Z]{3})(?![A-Za-z])/g;
+    let codeMatch;
+    while ((codeMatch = codePattern.exec(text)) !== null) {
+      if (Object.prototype.hasOwnProperty.call(FLIGHT_TIMEZONE_OFFSETS, codeMatch[1])) {
+        observations.push({ index: codeMatch.index, code: codeMatch[1] });
+      }
+    }
+    const positions = [];
+    let cursor = 0;
+    for (const number of numbers) {
+      const escaped = cleanText(number).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const match = new RegExp(`(?:^|[^A-Za-z0-9])${escaped}(?![A-Za-z0-9])`).exec(
+        text.slice(cursor),
+      );
+      if (!match) {
+        return returnEvidence ? { pairs: [], chain: [] } : [];
+      }
+      const start = cursor + match.index;
+      positions.push(start);
+      cursor = start + match[0].length;
+    }
+    const anchored = [];
+    for (let index = 0; index < positions.length; index += 1) {
+      const start = positions[index];
+      const end = index + 1 < positions.length ? positions[index + 1] : text.length;
+      const pair = observations
+        .filter((observation) => observation.index >= start && observation.index < end)
+        .map((observation) => observation.code);
+      if (pair.length < 2) {
+        return returnEvidence ? { pairs: [], chain: [] } : [];
+      }
+      anchored.push(pair[0], pair[1]);
+    }
+    const normalized = [];
+    for (const code of anchored) {
+      if (normalized[normalized.length - 1] !== code) {
+        normalized.push(code);
+      }
+    }
+    if (normalized.length < numbers.length + 1) {
+      return returnEvidence ? { pairs: [], chain: [] } : [];
+    }
+    const evidence = {
+      pairs: anchored.reduce((pairs, code, index) => {
+        if (index % 2 === 0) {
+          pairs.push([code, anchored[index + 1]]);
+        }
+        return pairs;
+      }, []),
+      chain: normalized,
+    };
+    return returnEvidence ? evidence : evidence.chain;
+  }
+
+  function qunarVisibleMultiFlightSegments(
+    trip,
+    leg,
+    flightNumbers,
+    originCode,
+    destinationCode,
+    serviceDate,
+  ) {
+    const normalizedNumbers = Array.isArray(flightNumbers)
+      ? flightNumbers
+      : [];
+    if (
+      !leg ||
+      normalizedNumbers.length < 2 ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(cleanText(serviceDate))
+    ) {
+      return [];
+    }
+    const anchoredCodes = qunarAirportCodesAnchoredToFlights(
+      trip && trip.textContent,
+      normalizedNumbers,
+    );
+    const codes = anchoredCodes.length
+      ? anchoredCodes
+      : qunarVisibleAirportCodes(trip && trip.textContent);
+    const expectedOrigin = cleanText(originCode).toUpperCase();
+    const expectedDestination = cleanText(destinationCode).toUpperCase();
+    if (
+      codes.length !== normalizedNumbers.length + 1 ||
+      codes[0] !== expectedOrigin ||
+      codes[codes.length - 1] !== expectedDestination
+    ) {
+      return [];
+    }
+    const times = visibleTimeTokens(trip && trip.textContent);
+    if (times.length !== normalizedNumbers.length * 2) {
+      return [];
+    }
+    const segments = [];
+    let currentDate = serviceDate;
+    let previousArrival = null;
+    for (let index = 0; index < normalizedNumbers.length; index += 1) {
+      const departureOffset = FLIGHT_TIMEZONE_OFFSETS[codes[index]];
+      const arrivalOffset = FLIGHT_TIMEZONE_OFFSETS[codes[index + 1]];
+      if (!departureOffset || !arrivalOffset) {
+        return [];
+      }
+      let departureAt = localIso(
+        currentDate,
+        times[index * 2],
+        departureOffset,
+      );
+      if (!departureAt) {
+        return [];
+      }
+      if (previousArrival && new Date(departureAt) <= new Date(previousArrival)) {
+        currentDate = addLocalDays(currentDate, 1);
+        departureAt = localIso(
+          currentDate,
+          times[index * 2],
+          departureOffset,
+        );
+      }
+      let arrivalAt = localIso(
+        currentDate,
+        times[index * 2 + 1],
+        arrivalOffset,
+      );
+      if (!arrivalAt) {
+        return [];
+      }
+      if (new Date(arrivalAt) <= new Date(departureAt)) {
+        const nextDate = addLocalDays(currentDate, 1);
+        arrivalAt = localIso(nextDate, times[index * 2 + 1], arrivalOffset);
+        currentDate = nextDate;
+      }
+      if (!arrivalAt || new Date(arrivalAt) <= new Date(departureAt)) {
+        return [];
+      }
+      segments.push({
+        flight_number: normalizedNumbers[index],
+        departure_airport_code: codes[index],
+        arrival_airport_code: codes[index + 1],
+        departure_at: departureAt,
+        arrival_at: arrivalAt,
+      });
+      previousArrival = arrivalAt;
+    }
+    if (
+      segments[0].departure_at !== leg.departure_at ||
+      segments[segments.length - 1].arrival_at !== leg.arrival_at
+    ) {
+      return [];
+    }
+    return segments;
+  }
+
+  function qunarSafeFlightDetailControl(trip) {
+    const controls = visibleNodes(
+      trip,
+      ["button", "[role='button']", "a"],
+      24,
+    );
+    const safe = controls.filter((control) => {
+      const label = cleanText(
+        [
+          control.textContent,
+          control.getAttribute("aria-label"),
+          control.getAttribute("title"),
+        ].filter(Boolean).join(" "),
+      );
+      if (
+        !label ||
+        !/(?:航班详情|航段详情|查看详情|展开|中转|经停)/i.test(label) ||
+        /预订|选择|支付|下单|出票|购买|立即订|book|buy|pay|checkout/i.test(label) ||
+        control.disabled === true ||
+        control.getAttribute("disabled") !== null ||
+        control.getAttribute("aria-disabled") === "true"
+      ) {
+        return false;
+      }
+      if (cleanText(control.tagName).toLowerCase() !== "a") {
+        return true;
+      }
+      const href = cleanText(control.getAttribute("href"));
+      if (!href || href.startsWith("#")) {
+        return true;
+      }
+      try {
+        const current = new URL(
+          cleanText(trip && trip.ownerDocument && trip.ownerDocument.location &&
+            trip.ownerDocument.location.href) || "https://flight.qunar.com/",
+        );
+        const target = new URL(href, current.href);
+        return (
+          target.origin === current.origin &&
+          target.pathname === current.pathname &&
+          !/[?&](?:book|order|pay|checkout)=/i.test(target.search)
+        );
+      } catch {
+        return false;
+      }
+    });
+    return safe.length === 1 ? safe[0] : null;
+  }
+
+  function qunarFlightNodeEvidence(trip, flightNumbers) {
+    const textContent = cleanText(trip && trip.textContent);
+    const innerText = cleanText(
+      trip && typeof trip.innerText === "string"
+        ? trip.innerText
+        : textContent,
+    );
+    const numbers = Array.isArray(flightNumbers)
+      ? flightNumbers.map((number) => cleanText(number).toUpperCase()).filter(Boolean)
+      : [];
+    const evidence = {
+      inner_text: boundedText(innerText),
+      text_content: boundedText(textContent),
+      inner_text_hash: shortTextHash(innerText),
+      text_content_hash: shortTextHash(textContent),
+      differs: innerText !== textContent,
+      nodes: [],
+    };
+    if (!trip || typeof trip.querySelectorAll !== "function") {
+      return evidence;
+    }
+    let descendants = [];
+    try {
+      descendants = Array.from(trip.querySelectorAll("*"));
+    } catch {
+      descendants = [];
+    }
+    const candidates = [];
+    for (const node of descendants.slice(0, 600)) {
+      const nodeTextContent = cleanText(node && node.textContent);
+      const nodeInnerText = cleanText(
+        node && typeof node.innerText === "string"
+          ? node.innerText
+          : nodeTextContent,
+      );
+      const combined = `${nodeTextContent} ${nodeInnerText}`.trim();
+      if (!combined) {
+        continue;
+      }
+      const flightHits = numbers.filter((number) => combined.includes(number));
+      const airportHits = qunarRawVisibleAirportCodes(combined);
+      const timeHits = visibleTimeTokens(combined);
+      if (!flightHits.length && !airportHits.length && !timeHits.length) {
+        continue;
+      }
+      let hidden = false;
+      let style = "";
+      try {
+        hidden =
+          node.hidden === true ||
+          node.getAttribute("hidden") !== null ||
+          node.getAttribute("aria-hidden") === "true";
+        style = cleanText(node.getAttribute("style"));
+      } catch {
+        // Some test and extension DOM shims expose no attributes.
+      }
+      const invisibleByStyle = /(?:display\s*:\s*none|visibility\s*:\s*hidden)/i.test(
+        style,
+      );
+      const attributes = (name) => {
+        try {
+          return cleanText(node.getAttribute(name)) || null;
+        } catch {
+          return null;
+        }
+      };
+      candidates.push({
+        tag: cleanText(node && node.tagName).toLowerCase() || null,
+        class: attributes("class"),
+        role: attributes("role"),
+        aria_expanded: attributes("aria-expanded"),
+        hidden: hidden || invisibleByStyle,
+        visible: !(hidden || invisibleByStyle),
+        text: boundedText(nodeInnerText || nodeTextContent, 180),
+        text_hash: shortTextHash(nodeTextContent),
+        match_flights: flightHits,
+        match_airports: airportHits.slice(0, 8),
+        match_times: timeHits.slice(0, 8),
+      });
+    }
+    candidates.sort((left, right) => {
+      const textLength = left.text.length - right.text.length;
+      if (textLength !== 0) {
+        return textLength;
+      }
+      return (left.tag || "").localeCompare(right.tag || "");
+    });
+    evidence.nodes = candidates.slice(0, 48);
+    return evidence;
+  }
+
+  function qunarSegmentComponents(trip) {
+    if (!trip || typeof trip.querySelectorAll !== "function") {
+      return [];
+    }
+    for (const selector of [
+      ".m-tips.m-trans-tips .mgbt.segment-comp",
+      ".m-tips .mgbt.segment-comp",
+      ".mgbt.segment-comp",
+    ]) {
+      try {
+        const nodes = Array.from(trip.querySelectorAll(selector));
+        if (nodes.length) {
+          return nodes.slice(0, 8);
+        }
+      } catch {
+        // Continue with the next bounded selector.
+      }
+    }
+    return [];
+  }
+
+  function qunarSegmentFlightNumbers(trip) {
+    if (!trip || typeof trip.querySelectorAll !== "function") {
+      return null;
+    }
+    const selectors = [".col-airline .d-air", ".col-airline .num"];
+    for (const selector of selectors) {
+      let nodes = [];
+      try {
+        nodes = Array.from(trip.querySelectorAll(selector));
+      } catch {
+        nodes = [];
+      }
+      if (!nodes.length) {
+        continue;
+      }
+      const numbers = [];
+      let valid = true;
+      for (const node of nodes.slice(0, 8)) {
+        const nodeNumbers = qunarVisibleFlightNumbers(node && node.textContent);
+        if (nodeNumbers.length !== 1) {
+          valid = false;
+          break;
+        }
+        numbers.push(nodeNumbers[0]);
+      }
+      if (valid && numbers.length) {
+        return numbers;
+      }
+    }
+    return null;
+  }
+
+  function qunarSegmentVisibleTimes(value) {
+    const times = visibleTimeTokens(value);
+    for (const match of cleanText(value).matchAll(
+      /\d{1,2}-\d{1,2}((?:[01]?\d|2[0-3]):[0-5]\d)/g,
+    )) {
+      const normalized = match[1].padStart(5, "0");
+      if (!times.includes(normalized)) {
+        times.push(normalized);
+      }
+    }
+    return times;
+  }
+
+  function qunarDistinctAirportCodes(value) {
+    const distinct = [];
+    for (const code of qunarRawVisibleAirportCodes(value)) {
+      if (distinct[distinct.length - 1] !== code) {
+        distinct.push(code);
+      }
+    }
+    return distinct;
+  }
+
+  function qunarStructuredFlightSegments(
+    trip,
+    flightNumbers,
+    originCode,
+    destinationCode,
+    serviceDate,
+    leg,
+  ) {
+    const numbers = Array.isArray(flightNumbers) ? flightNumbers : [];
+    const components = qunarSegmentComponents(trip);
+    if (
+      !numbers.length ||
+      components.length !== numbers.length ||
+      !leg ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(cleanText(serviceDate))
+    ) {
+      return null;
+    }
+    const nodeNumbers = qunarSegmentFlightNumbers(trip);
+    if (
+      !nodeNumbers ||
+      nodeNumbers.length !== numbers.length ||
+      nodeNumbers.some((number, index) => number !== numbers[index])
+    ) {
+      return {
+        source: "embedded_dom_detail_unbound",
+        pairs: [],
+        chain: [],
+        segments: [],
+      };
+    }
+    const pairs = [];
+    const componentTimes = [];
+    for (const component of components) {
+      const codes = qunarDistinctAirportCodes(component && component.textContent);
+      const times = qunarSegmentVisibleTimes(component && component.textContent);
+      if (codes.length !== 2 || times.length !== 2) {
+        return null;
+      }
+      pairs.push([codes[0], codes[1]]);
+      componentTimes.push(times);
+    }
+    const expectedOrigin = cleanText(originCode).toUpperCase();
+    const expectedDestination = cleanText(destinationCode).toUpperCase();
+    if (
+      pairs[0][0] !== expectedOrigin ||
+      pairs[pairs.length - 1][1] !== expectedDestination
+    ) {
+      return null;
+    }
+    const segments = [];
+    let currentDate = serviceDate;
+    let previousArrival = null;
+    for (let index = 0; index < pairs.length; index += 1) {
+      const [departureCode, arrivalCode] = pairs[index];
+      const departureOffset = FLIGHT_TIMEZONE_OFFSETS[departureCode];
+      const arrivalOffset = FLIGHT_TIMEZONE_OFFSETS[arrivalCode];
+      if (!departureOffset || !arrivalOffset) {
+        return null;
+      }
+      let departureAt = localIso(
+        currentDate,
+        componentTimes[index][0],
+        departureOffset,
+      );
+      if (!departureAt) {
+        return null;
+      }
+      if (previousArrival && new Date(departureAt) <= new Date(previousArrival)) {
+        currentDate = addLocalDays(currentDate, 1);
+        departureAt = localIso(
+          currentDate,
+          componentTimes[index][0],
+          departureOffset,
+        );
+      }
+      let arrivalAt = localIso(
+        currentDate,
+        componentTimes[index][1],
+        arrivalOffset,
+      );
+      if (!arrivalAt) {
+        return null;
+      }
+      if (new Date(arrivalAt) <= new Date(departureAt)) {
+        const nextDate = addLocalDays(currentDate, 1);
+        arrivalAt = localIso(nextDate, componentTimes[index][1], arrivalOffset);
+        currentDate = nextDate;
+      }
+      if (!arrivalAt || new Date(arrivalAt) <= new Date(departureAt)) {
+        return null;
+      }
+      segments.push({
+        flight_number: numbers[index],
+        departure_airport_code: departureCode,
+        arrival_airport_code: arrivalCode,
+        departure_at: departureAt,
+        arrival_at: arrivalAt,
+      });
+      previousArrival = arrivalAt;
+    }
+    if (
+      segments[0].departure_at !== leg.departure_at ||
+      segments[segments.length - 1].arrival_at !== leg.arrival_at
+    ) {
+      return null;
+    }
+    return {
+      source: "embedded_dom_detail",
+      pairs,
+      chain: pairs.reduce((chain, pair, index) => {
+        if (index === 0) {
+          return [pair[0], pair[1]];
+        }
+        return pair[0] === chain[chain.length - 1]
+          ? [...chain, pair[1]]
+          : [...chain, pair[0], pair[1]];
+      }, []),
+      segments,
+    };
+  }
+
+  function qunarReceiptSegmentsFromStructured(
+    outboundStructured,
+    returnStructured,
+    outboundFlightNumbers,
+    returnFlightNumbers,
+    originCode,
+    destinationCode,
+  ) {
+    const structuredSegmentsContinuous = (structured, numbers, origin, destination) =>
+      Boolean(
+        structured &&
+        structured.source === "embedded_dom_detail" &&
+        structured.segments.length === numbers.length &&
+        structured.pairs.length === numbers.length &&
+        structured.pairs[0][0] === origin &&
+        structured.pairs[structured.pairs.length - 1][1] === destination &&
+        structured.pairs.every(
+          (pair, index) =>
+            index === 0 ||
+            structured.pairs[index - 1][1] === pair[0],
+        ),
+      );
+    const valid =
+      structuredSegmentsContinuous(
+        outboundStructured,
+        outboundFlightNumbers,
+        originCode,
+        destinationCode,
+      ) &&
+      structuredSegmentsContinuous(
+        returnStructured,
+        returnFlightNumbers,
+        destinationCode,
+        originCode,
+      );
+    return {
+      valid,
+      outbound_segments: valid ? outboundStructured.segments : [],
+      return_segments: valid ? returnStructured.segments : [],
+    };
+  }
+
+  function qunarDetailCandidateFingerprint(card, query) {
+    const trips = visibleNodes(card, [".s-trip"], 3);
+    if (trips.length !== 2) {
+      return null;
+    }
+    const outboundFlightNumbers = qunarVisibleFlightNumbers(
+      trips[0].textContent,
+    );
+    const returnFlightNumbers = qunarVisibleFlightNumbers(
+      trips[1].textContent,
+    );
+    if (!outboundFlightNumbers.length || !returnFlightNumbers.length) {
+      return null;
+    }
+    const priceEvidence = qunarPriceEvidence(card, { allowGeometry: false });
+    const priceText = cleanText(priceEvidence.priceText);
+    if (query && !priceText) {
+      return null;
+    }
+    let outboundLeg = null;
+    let returnLeg = null;
+    let outboundRoute = null;
+    let returnRoute = null;
+    let outboundSegments = [];
+    let returnSegments = [];
+    let detailEligibility = "unknown";
+    let outboundAirportCodesRaw = [];
+    let outboundAirportCodesNormalized = [];
+    let returnAirportCodesRaw = [];
+    let returnAirportCodesNormalized = [];
+    let outboundNodeEvidence = null;
+    let returnNodeEvidence = null;
+    let outboundAirportStructure = null;
+    let returnAirportStructure = null;
+    if (query) {
+      const timezones = routeTimezones(query);
+      if (!timezones) {
+        return null;
+      }
+      outboundLeg = legFromQunarTrip(
+        trips[0],
+        query.start_date,
+        timezones.origin_offset,
+        timezones.destination_offset,
+      );
+      returnLeg = legFromQunarTrip(
+        trips[1],
+        query.end_date,
+        timezones.destination_offset,
+        timezones.origin_offset,
+      );
+      outboundRoute = flightLegRouteEvidence(
+        trips[0].textContent,
+        query,
+        "outbound",
+        "same_dom_detail_candidate",
+        outboundLeg && outboundLeg.departure_place,
+        outboundLeg && outboundLeg.arrival_place,
+      );
+      returnRoute = flightLegRouteEvidence(
+        trips[1].textContent,
+        query,
+        "return",
+        "same_dom_detail_candidate",
+        returnLeg && returnLeg.departure_place,
+        returnLeg && returnLeg.arrival_place,
+      );
+      if (
+        !outboundLeg ||
+        !returnLeg ||
+        !outboundRoute ||
+        outboundRoute.matches_expected !== true ||
+        !returnRoute ||
+        returnRoute.matches_expected !== true
+      ) {
+        return null;
+      }
+      outboundNodeEvidence = qunarFlightNodeEvidence(
+        trips[0],
+        outboundFlightNumbers,
+      );
+      returnNodeEvidence = qunarFlightNodeEvidence(
+        trips[1],
+        returnFlightNumbers,
+      );
+      outboundAirportStructure = qunarStructuredFlightSegments(
+        trips[0],
+        outboundFlightNumbers,
+        query.origin_code,
+        query.destination_code,
+        query.start_date,
+        outboundLeg,
+      );
+      returnAirportStructure = qunarStructuredFlightSegments(
+        trips[1],
+        returnFlightNumbers,
+        query.destination_code,
+        query.origin_code,
+        query.end_date,
+        returnLeg,
+      );
+      outboundSegments = outboundAirportStructure
+        ? outboundAirportStructure.segments
+        : qunarVisibleMultiFlightSegments(
+            trips[0],
+            outboundLeg,
+            outboundFlightNumbers,
+            query.origin_code,
+            query.destination_code,
+            query.start_date,
+          );
+      returnSegments = returnAirportStructure
+        ? returnAirportStructure.segments
+        : qunarVisibleMultiFlightSegments(
+            trips[1],
+            returnLeg,
+            returnFlightNumbers,
+            query.destination_code,
+            query.origin_code,
+            query.end_date,
+          );
+      const airportChainIsContinuous = (segments) =>
+        Array.isArray(segments) &&
+        segments.length > 0 &&
+        segments.every((segment, index) =>
+          index === 0 ||
+          segments[index - 1].arrival_airport_code ===
+            segment.departure_airport_code,
+        );
+      const segmentState = (
+        trip,
+        numbers,
+        segments,
+        origin,
+        destination,
+        structuredEvidence,
+      ) => {
+        const rawCodes = qunarRawVisibleAirportCodes(trip && trip.textContent);
+        const airportEvidence = structuredEvidence ||
+          qunarAirportCodesAnchoredToFlights(
+            trip && trip.textContent,
+            numbers,
+            true,
+          );
+        const codes = airportEvidence.chain;
+        const pairsComplete = airportEvidence.pairs.length === numbers.length;
+        const endpointsMatch =
+          pairsComplete &&
+          airportEvidence.pairs[0][0] === origin &&
+          airportEvidence.pairs[airportEvidence.pairs.length - 1][1] === destination;
+        let state = "unknown";
+        if (pairsComplete) {
+          if (!endpointsMatch) {
+            state = "invalid_route";
+          } else {
+            const explicitCrossAirport = airportEvidence.pairs.some(
+              (pair, index) =>
+                index > 0 &&
+                airportEvidence.pairs[index - 1][1] !== pair[0],
+            );
+            if (explicitCrossAirport) {
+              state = "known_cross_airport";
+            } else if (
+              codes.length === numbers.length + 1 &&
+              segments.length === numbers.length &&
+              airportChainIsContinuous(segments)
+            ) {
+              state = "known_good";
+            }
+          }
+        }
+        return {
+          state,
+          raw_codes: rawCodes,
+          normalized_codes: codes,
+        };
+      };
+      const outboundState = segmentState(
+        trips[0],
+        outboundFlightNumbers,
+        outboundSegments,
+        query.origin_code,
+        query.destination_code,
+        outboundAirportStructure,
+      );
+      const returnState = segmentState(
+        trips[1],
+        returnFlightNumbers,
+        returnSegments,
+        query.destination_code,
+        query.origin_code,
+        returnAirportStructure,
+      );
+      outboundAirportCodesRaw = outboundState.raw_codes;
+      outboundAirportCodesNormalized = outboundState.normalized_codes;
+      returnAirportCodesRaw = returnState.raw_codes;
+      returnAirportCodesNormalized = returnState.normalized_codes;
+      detailEligibility =
+        outboundState.state === "invalid_route" ||
+        returnState.state === "invalid_route"
+          ? "invalid_route"
+          : outboundState.state === "known_cross_airport" ||
+              returnState.state === "known_cross_airport"
+            ? "known_cross_airport"
+          : outboundState.state === "known_good" && returnState.state === "known_good"
+            ? "known_good"
+            : "unknown";
+    }
+    const fields = {
+      outbound_flight_numbers: outboundFlightNumbers,
+      return_flight_numbers: returnFlightNumbers,
+      outbound_depart_at: outboundLeg && outboundLeg.departure_at,
+      outbound_arrive_at: outboundLeg && outboundLeg.arrival_at,
+      return_depart_at: returnLeg && returnLeg.departure_at,
+      return_arrive_at: returnLeg && returnLeg.arrival_at,
+      price_text: priceText || null,
+      ...(query
+        ? {
+            outbound_airport_codes_raw: outboundAirportCodesRaw,
+            outbound_airport_codes_normalized: outboundAirportCodesNormalized,
+            return_airport_codes_raw: returnAirportCodesRaw,
+            return_airport_codes_normalized: returnAirportCodesNormalized,
+            outbound_airport_evidence_source: outboundAirportStructure
+              ? outboundAirportStructure.source
+              : null,
+            return_airport_evidence_source: returnAirportStructure
+              ? returnAirportStructure.source
+              : null,
+            outbound_node_evidence: outboundNodeEvidence,
+            return_node_evidence: returnNodeEvidence,
+          }
+        : {}),
+      outbound_airport_chain: outboundSegments.length
+        ? outboundSegments.flatMap((segment, index) =>
+            index === 0
+              ? [segment.departure_airport_code, segment.arrival_airport_code]
+              : [segment.arrival_airport_code],
+          )
+        : null,
+      return_airport_chain: returnSegments.length
+        ? returnSegments.flatMap((segment, index) =>
+            index === 0
+              ? [segment.departure_airport_code, segment.arrival_airport_code]
+              : [segment.arrival_airport_code],
+          )
+        : null,
+    };
+    const stableIdentity = {
+      outbound_flight_numbers: outboundFlightNumbers,
+      return_flight_numbers: returnFlightNumbers,
+      outbound_depart_at: outboundLeg && outboundLeg.departure_at,
+      outbound_arrive_at: outboundLeg && outboundLeg.arrival_at,
+      return_depart_at: returnLeg && returnLeg.departure_at,
+      return_arrive_at: returnLeg && returnLeg.arrival_at,
+    };
+    return {
+      key: canonicalJson(stableIdentity),
+      detail_eligibility: detailEligibility,
+      ...fields,
+    };
+  }
+
+  function qunarSafeExpandFlightDetail(
+    root,
+    direction,
+    options = {},
+  ) {
+    if (!root || !["outbound", "return"].includes(direction)) {
+      return { expanded: false, code: "invalid_detail_direction" };
+    }
+    const cards = visibleNodes(
+      root,
+      [".m-airfly-lst .b-airfly", ".b-airfly"],
+      20,
+    );
+    const config = options && !Array.isArray(options) ? options : {};
+    const query = config.query || null;
+    const expectedFingerprint = config.candidate_fingerprint || null;
+    let matchingTargetCardCount = 0;
+    const observedCandidates = [];
+    for (const card of cards) {
+      const trips = visibleNodes(card, [".s-trip"], 3);
+      const candidate = qunarDetailCandidateFingerprint(card, query);
+      if (!candidate) {
+        continue;
+      }
+      const trip = trips[direction === "outbound" ? 0 : 1];
+      if (!trip) {
+        continue;
+      }
+      const control = qunarSafeFlightDetailControl(trip) ||
+        qunarSafeFlightDetailControl(card);
+      observedCandidates.push({
+        candidate_fingerprint: candidate,
+        detail_eligibility: candidate.detail_eligibility,
+        control_observed: Boolean(control),
+      });
+      if (
+        candidate.detail_eligibility === "known_cross_airport" ||
+        candidate.detail_eligibility === "invalid_route" ||
+        expectedFingerprint &&
+        (
+          candidate.key !== expectedFingerprint.key ||
+          (
+            expectedFingerprint.price_text &&
+            candidate.price_text !== expectedFingerprint.price_text
+          )
+        )
+      ) {
+        continue;
+      }
+      matchingTargetCardCount += 1;
+      if (!control) {
+        continue;
+      }
+      const label = cleanText(
+        [
+          control.textContent,
+          control.getAttribute("aria-label"),
+          control.getAttribute("title"),
+        ].filter(Boolean).join(" "),
+      );
+      control.click();
+      return {
+        expanded: true,
+        direction,
+        flight_numbers: direction === "outbound"
+          ? candidate.outbound_flight_numbers
+          : candidate.return_flight_numbers,
+        candidate_fingerprint: candidate,
+        control_label: sanitizeDiagnosticText(label),
+        action: {
+          action: "expand_flight_detail",
+          direction,
+          provider: "qunar",
+          flight_numbers: direction === "outbound"
+            ? candidate.outbound_flight_numbers
+            : candidate.return_flight_numbers,
+          candidate_fingerprint: candidate,
+          evidence: sanitizeDiagnosticText(label),
+          read_only: true,
+        },
+      };
+    }
+    return {
+      expanded: false,
+      direction,
+      code: matchingTargetCardCount > 0
+        ? "safe_detail_control_not_found"
+        : "target_card_not_found",
+      inspected_card_count: cards.length,
+      matching_target_card_count: matchingTargetCardCount,
+      candidate_fingerprint: expectedFingerprint || null,
+      observed_candidates: observedCandidates.slice(0, 20),
+    };
+  }
+
   function legFromQunarTrip(
     trip,
     serviceDate,
@@ -4877,19 +5937,23 @@
     const confirmedAdults = Number(
       driver && driver.confirmed_query && driver.confirmed_query.adults,
     );
+    const comparison = driver && driver.party_price_comparison;
+    const comparisonVerified =
+      comparison &&
+      comparison.schema === "tripchord.flight_party_comparison.v1" &&
+      comparison.verification === "server_owned_same_product" &&
+      comparison.provider === provider &&
+      comparison.one_adult && comparison.one_adult.adults === 1 &&
+      comparison.two_adults && comparison.two_adults.adults === 2 &&
+      Number.isInteger(adults) && adults === 2 &&
+      comparison.two_adult_amount === comparison.two_adults.amount;
     return (
       driver &&
-      (
-        driver.party_availability_confirmed === true ||
-        (
-          Number.isInteger(adults) &&
-          adults > 0 &&
-          confirmedAdults === adults &&
-          driver.mode === "visible_form"
-        )
-      )
+      Number.isInteger(confirmedAdults) && confirmedAdults === adults
     )
-      ? "confirmed_for_party"
+      ? comparisonVerified
+        ? "confirmed_for_party"
+        : "observed_party_context"
       : null;
   }
 
@@ -7539,6 +8603,31 @@
     };
   }
 
+  function qunarFlightLoadingDiagnostic(root) {
+    const text = cleanText(
+      root && root.body && root.body.textContent,
+    );
+    if (
+      !text ||
+      !/(正在加载|加载中|正在搜索|查询中|请稍等|loading)/i.test(text) ||
+      /(?:暂无航班|没有符合条件|未找到航班|无航班)/.test(text)
+    ) {
+      return null;
+    }
+    return {
+      outcome: "flight_results_loading",
+      stage: "result_loading",
+      scope: "visible_qunar_search_shell",
+      counts: {
+        visible_combination_card_count: visibleNodes(
+          root,
+          [".m-airfly-lst .b-airfly", ".b-airfly"],
+          30,
+        ).length,
+      },
+    };
+  }
+
   function flightFailureDiagnostic(provider, root, query, driver) {
     if (provider === "fliggy") {
       return fliggyAlternateOriginDiagnostic(root, query);
@@ -7547,6 +8636,10 @@
       return ctripFlightContractDiagnostic(root, query);
     }
     if (provider === "qunar") {
+      const loading = qunarFlightLoadingDiagnostic(root);
+      if (loading) {
+        return loading;
+      }
       return qunarFlightStructureDiagnostic(root, query, driver);
     }
     if (provider === "tongcheng") {
@@ -8043,6 +9136,9 @@
   }) {
     return {
       candidate_index: candidateIndex,
+      destination_airport_code: null,
+      outbound_flight_numbers: [],
+      outbound_segments: [],
       title: flightReceiptText(title, 180),
       route_evidence: flightReceiptText(routeEvidence, 240),
       schedule_evidence: flightReceiptText(scheduleEvidence, 240),
@@ -8051,6 +9147,9 @@
       amount: null,
       price_basis: "unknown",
       price_classification: "no_visible_price",
+      return_flight_numbers: [],
+      return_segments: [],
+      origin_airport_code: null,
     };
   }
 
@@ -8060,6 +9159,12 @@
     routeEvidence,
     scheduleEvidence,
     price,
+    outboundFlightNumbers = [],
+    returnFlightNumbers = [],
+    outboundSegments = [],
+    returnSegments = [],
+    originAirportCode = null,
+    destinationAirportCode = null,
   }) {
     if (!price) {
       return noVisiblePriceFlightCandidate({
@@ -8071,6 +9176,9 @@
     }
     return {
       candidate_index: candidateIndex,
+      destination_airport_code: destinationAirportCode,
+      outbound_flight_numbers: outboundFlightNumbers,
+      outbound_segments: outboundSegments,
       title: flightReceiptText(title, 180),
       route_evidence: flightReceiptText(routeEvidence, 240),
       schedule_evidence: flightReceiptText(scheduleEvidence, 240),
@@ -8079,6 +9187,9 @@
       amount: price.amount,
       price_basis: price.price_basis,
       price_classification: price.price_classification,
+      return_flight_numbers: returnFlightNumbers,
+      return_segments: returnSegments,
+      origin_airport_code: originAirportCode,
     };
   }
 
@@ -8383,6 +9494,12 @@
         timezones.destination_offset,
         timezones.origin_offset,
       );
+      const outboundFlightNumbers = qunarVisibleFlightNumbers(
+        trips[0].textContent,
+      );
+      const returnFlightNumbers = qunarVisibleFlightNumbers(
+        trips[1].textContent,
+      );
       const outboundRoute = flightLegRouteEvidence(
         trips[0].textContent,
         query,
@@ -8413,6 +9530,71 @@
         allowGeometry:
           !(driver && driver.qunar_geometry_price_disabled === true),
       }).priceText;
+      const outboundStructured = qunarStructuredFlightSegments(
+        trips[0],
+        outboundFlightNumbers,
+        query.origin_code,
+        query.destination_code,
+        query.start_date,
+        outboundLeg,
+      );
+      const returnStructured = qunarStructuredFlightSegments(
+        trips[1],
+        returnFlightNumbers,
+        query.destination_code,
+        query.origin_code,
+        query.end_date,
+        returnLeg,
+      );
+      const directOutbound = qunarDirectFlightSegment(
+        trips[0],
+        outboundLeg,
+        outboundFlightNumbers,
+        query.origin_code,
+        query.destination_code,
+        outboundRoute,
+      );
+      const directReturn = qunarDirectFlightSegment(
+        trips[1],
+        returnLeg,
+        returnFlightNumbers,
+        query.destination_code,
+        query.origin_code,
+        returnRoute,
+      );
+      const structuredReceiptSegments = qunarReceiptSegmentsFromStructured(
+        outboundStructured,
+        returnStructured,
+        outboundFlightNumbers,
+        returnFlightNumbers,
+        query.origin_code,
+        query.destination_code,
+      );
+      const anyStructuredEvidence = Boolean(outboundStructured || returnStructured);
+      const outboundSegments = anyStructuredEvidence
+        ? structuredReceiptSegments.outbound_segments
+        : directOutbound.length
+          ? directOutbound
+          : qunarVisibleMultiFlightSegments(
+              trips[0],
+              outboundLeg,
+              outboundFlightNumbers,
+              query.origin_code,
+              query.destination_code,
+              query.start_date,
+            );
+      const returnSegments = anyStructuredEvidence
+        ? structuredReceiptSegments.return_segments
+        : directReturn.length
+          ? directReturn
+          : qunarVisibleMultiFlightSegments(
+              trips[1],
+              returnLeg,
+              returnFlightNumbers,
+              query.destination_code,
+              query.origin_code,
+              query.end_date,
+            );
       candidates.push(
         pricedFlightCandidate({
           candidateIndex: candidates.length,
@@ -8428,6 +9610,12 @@
             returnLeg,
           ),
           price: flightComparisonPrice("qunar", priceText),
+          outboundFlightNumbers,
+          returnFlightNumbers,
+          outboundSegments,
+          returnSegments,
+          originAirportCode: query.origin_code,
+          destinationAirportCode: query.destination_code,
         }),
       );
     }
@@ -8642,6 +9830,16 @@
           price_basis: summary && summary.price_basis,
           price_classification:
             summary && summary.price_classification,
+          outbound_flight_numbers:
+            summary && summary.outbound_flight_numbers || [],
+          return_flight_numbers:
+            summary && summary.return_flight_numbers || [],
+          outbound_segments: summary && summary.outbound_segments || [],
+          return_segments: summary && summary.return_segments || [],
+          origin_airport_code:
+            summary && summary.origin_airport_code || null,
+          destination_airport_code:
+            summary && summary.destination_airport_code || null,
         }),
       );
       const priceBearing = candidateSummaries.some((candidate) =>
@@ -8731,6 +9929,10 @@
     availabilityEvidence,
     outboundLeg,
     returnLeg,
+    outboundFlightNumbers = [],
+    returnFlightNumbers = [],
+    outboundSegments = [],
+    returnSegments = [],
     outboundRouteEvidence,
     returnRouteEvidence,
     selectionEvidence,
@@ -8849,6 +10051,10 @@
       action_trace: actionTrace,
       outbound_leg: outboundLeg,
       return_leg: returnLeg,
+      outbound_flight_numbers: outboundFlightNumbers,
+      return_flight_numbers: returnFlightNumbers,
+      outbound_segments: outboundSegments,
+      return_segments: returnSegments,
       outbound_route_evidence: outboundRouteEvidence,
       return_route_evidence: returnRouteEvidence,
     };
@@ -8920,25 +10126,27 @@
         timezones.destination_offset,
         timezones.origin_offset,
       );
+      const outboundFlightNumbers = qunarVisibleFlightNumbers(
+        trips[0].textContent,
+      );
+      const returnFlightNumbers = qunarVisibleFlightNumbers(
+        trips[1].textContent,
+      );
       const priceEvidence = qunarPriceEvidence(card, {
         allowGeometry:
           !(driver && driver.qunar_geometry_price_disabled === true),
       });
       const visiblePriceText = priceEvidence.priceText;
-      const totalPartyPriceText =
-        visiblePriceText &&
-        /含税总价/.test(cleanText(visiblePriceText)) &&
-        exactPartySearchContext
-          ? `${query.adults}名成人 ${visiblePriceText}`
-          : null;
-      const priceText = totalPartyPriceText || visiblePriceText;
+      // The adult count in a URL/form is not proof that the visible amount is
+      // a party total.  A separately captured same-product comparison is the
+      // only accepted proof; never rewrite the visible text to manufacture it.
+      const totalPartyPriceText = null;
+      const priceText = visiblePriceText;
       const taxEvidence = explicitTaxEvidence(card, visiblePriceText);
       const priceContract = flightPriceContract(priceText);
       const visibleAvailability = flightAvailabilityEvidence(card);
       const availabilityEvidence =
-        totalPartyPriceText
-          ? exactPartySearchContext
-          : visibleAvailability;
+        visibleAvailability;
       const outboundRouteEvidence = flightLegRouteEvidence(
         trips[0].textContent,
         query,
@@ -8955,10 +10163,46 @@
         returnLeg && returnLeg.departure_place,
         returnLeg && returnLeg.arrival_place,
       );
+      const outboundSegments = qunarDirectFlightSegment(
+        trips[0],
+        outboundLeg,
+        outboundFlightNumbers,
+        query.origin_code,
+        query.destination_code,
+        outboundRouteEvidence,
+      );
+      const outboundSegmentsWithConnection = outboundSegments.length
+        ? outboundSegments
+        : qunarVisibleMultiFlightSegments(
+            trips[0],
+            outboundLeg,
+            outboundFlightNumbers,
+            query.origin_code,
+            query.destination_code,
+            query.start_date,
+          );
+      const returnSegments = qunarDirectFlightSegment(
+        trips[1],
+        returnLeg,
+        returnFlightNumbers,
+        query.destination_code,
+        query.origin_code,
+        returnRouteEvidence,
+      );
+      const returnSegmentsWithConnection = returnSegments.length
+        ? returnSegments
+        : qunarVisibleMultiFlightSegments(
+            trips[1],
+            returnLeg,
+            returnFlightNumbers,
+            query.destination_code,
+            query.origin_code,
+            query.end_date,
+          );
       const geometryStabilityKey =
         priceEvidence.evidenceSource ===
           "geometry_clipped_visible_digit_sequence" &&
-        totalPartyPriceText &&
+        false &&
         taxEvidence &&
         outboundLeg &&
         returnLeg &&
@@ -9000,10 +10244,7 @@
         priceContract.valid === true &&
         priceContract.price_basis === "per_person" &&
         Boolean(visibleAvailability);
-      const exactPartyTotal =
-        Boolean(totalPartyPriceText) &&
-        priceContract.valid === true &&
-        priceContract.price_basis === "total_party";
+      const exactPartyTotal = false;
       if (
         (!exactPerPerson && !exactPartyTotal) ||
         !taxEvidence ||
@@ -9033,6 +10274,10 @@
         availabilityEvidence,
         outboundLeg,
         returnLeg,
+        outboundFlightNumbers,
+        returnFlightNumbers,
+        outboundSegments: outboundSegmentsWithConnection,
+        returnSegments: returnSegmentsWithConnection,
         outboundRouteEvidence,
         returnRouteEvidence,
         selectionEvidence:
@@ -9582,17 +10827,21 @@
           title: `${outboundCarrier} + ${returnCarrier} 精确往返产品`,
           carrier: outboundCarrier,
           priceText,
-          priceBasisValue: "per_person",
+          // The visible row says "含税总价", but this run did not perform a
+          // server-owned 1-adult/2-adult same-product comparison. Keep it as
+          // an observed total label; the API normalizer will downgrade it to
+          // comparison_only and leave total_for_party_cents unset.
+          priceBasisValue: "total_party",
           priceContractOverride: {
             valid: true,
             amount: amount.amount,
             currency: amount.currency,
-            price_basis: "per_person",
+            price_basis: "total_party",
             finality: "exact_candidate",
             evidence: priceText,
           },
           priceBasisSource:
-            "tongcheng_product_row_adult_count_invariance_canary_v1",
+            "visible_total_label_unverified_party_v1",
           taxEvidence: priceText,
           availabilityEvidence:
             "visible_enabled_预订_control_observed_not_clicked",
@@ -10915,6 +12164,7 @@
     inspectFlightPage,
     safeSelectOutbound,
     safeSelectReturn,
+    qunarSafeExpandFlightDetail,
     extractTransferDetail,
     pageGate,
     parseAmount,
@@ -10986,7 +12236,17 @@
       flightTerminalFailureCode,
       exactOutboundControls,
       flightCarrierText,
+      qunarVisibleFlightNumbers,
+      qunarDirectFlightSegment,
+      qunarRawVisibleAirportCodes,
+      qunarVisibleAirportCodes,
+      qunarAirportCodesAnchoredToFlights,
+      qunarVisibleMultiFlightSegments,
+      qunarFlightNodeEvidence,
+      qunarStructuredFlightSegments,
+      qunarReceiptSegmentsFromStructured,
       flightLegRouteEvidence,
+      qunarFlightLoadingDiagnostic,
       tongchengFlightAvailabilityEvidence,
       selectedOutboundSummary,
       tongchengAutoSelectedOutboundDriver,

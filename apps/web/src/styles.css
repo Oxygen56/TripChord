@@ -275,6 +275,40 @@ h1 { font-family: "Noto Sans SC", sans-serif; margin: 0; font-size: clamp(40px, 
 .query-strategy-proposal ul { margin: 0; padding-left: 17px; font-size: 12px; line-height: 1.55; }
 .query-strategy-proposal small { display: block; color: #777691; font-size: 12px; line-height: 1.5; }
 .query-strategy-proposal em { color: #71633c; font-size: 12px; font-style: normal; }
+.final-plan-card { padding: 24px; border: 1px solid #b9d6c2; border-radius: 22px; background: linear-gradient(145deg, #eff9f1, #fffdf8); box-shadow: 0 16px 34px rgba(39, 92, 66, .09); }
+.final-plan-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.final-plan-heading h2 { margin: 0; font-size: 26px; color: #1f4d3c; }
+.final-plan-heading > strong { padding: 7px 10px; border-radius: 99px; background: #dcefe1; color: #28704d; font-size: 12px; white-space: nowrap; }
+.final-plan-route { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: end; margin: 20px 0; padding: 18px; border-radius: 16px; background: #1c4b3c; color: white; }
+.final-plan-route div:not(.route-arrow) { display: grid; gap: 5px; }
+.final-plan-route span { color: #b9d6c6; font-size: 12px; }
+.final-plan-route strong { color: #f4d58f; font-size: 21px; }
+.route-arrow { color: #e9bf68; font-size: 23px; }
+.final-plan-facts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; }
+.final-plan-facts article { padding: 13px; border-radius: 13px; background: rgba(255,255,255,.82); }
+.final-plan-facts span, .final-plan-facts strong, .final-plan-facts small { display: block; }
+.final-plan-facts span { color: #73877b; font-size: 12px; }
+.final-plan-facts strong { margin-top: 5px; color: #244b3c; font-size: 18px; }
+.final-plan-facts small { margin-top: 5px; color: #7f8e84; font-size: 12px; line-height: 1.45; }
+.final-plan-itinerary { display: grid; gap: 8px; margin-top: 14px; }
+.final-plan-itinerary h3 { margin: 0 0 2px; color: #315c4b; font-size: 15px; }
+.final-plan-itinerary article { display: grid; gap: 4px; padding: 12px 14px; border-radius: 13px; background: rgba(255,255,255,.82); }
+.final-plan-itinerary article strong { color: #244b3c; font-size: 14px; }
+.final-plan-itinerary article span, .final-plan-itinerary article small { color: #718178; font-size: 12px; line-height: 1.5; }
+.final-plan-unresolved { margin-top: 12px; padding: 12px 14px; border: 1px solid #e8cdbf; border-radius: 13px; background: #fff6f1; color: #8d5548; font-size: 12px; }
+.final-plan-unresolved ul { margin: 6px 0 0; padding-left: 18px; line-height: 1.6; }
+.final-plan-card .claim-boundary { margin-bottom: 0; }
+.final-plan-missing { margin: 0; }
+.diagnostics-disclosure { border: 1px solid #dce5de; border-radius: 16px; background: #fbfdfb; }
+.diagnostics-disclosure > summary { cursor: pointer; padding: 14px 16px; color: #4b6d5c; font-size: 12px; font-weight: 700; }
+.diagnostics-disclosure[open] > summary { border-bottom: 1px solid #e1e8e2; }
+.diagnostics-disclosure .query-observability, .diagnostics-disclosure .option-comparison { margin: 0; border: 0; border-radius: 0; }
+.option-diagnostics .option-comparison { background: #fbfdfb; }
+.option-diagnostics .option-grid button:disabled { cursor: default; opacity: .9; }
+@media (max-width: 700px) {
+  .final-plan-facts { grid-template-columns: 1fr; }
+  .final-plan-route strong { font-size: 17px; }
+}
 .query-strategy-proposal.deterministic { border-color: #dfe4df; background: #f7f9f6; color: #64736c; }
 .refinement-trace { margin-top: 11px; padding: 12px; border: 1px solid #e0e2e0; border-radius: 12px; background: rgba(255,255,255,.76); }
 .refinement-trace > strong { color: #415b50; font-size: 12px; }

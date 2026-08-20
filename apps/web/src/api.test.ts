@@ -307,7 +307,7 @@ describe("real multi-platform API boundary", () => {
       },
       coverage_mode: "strict" as const,
       timeout_seconds: 120,
-      total_timeout_seconds: 900,
+      total_timeout_seconds: 600,
       max_pairs: 3,
     };
     const response = await runLiveFlexiblePlanningFromText(request);
@@ -378,7 +378,7 @@ describe("real multi-platform API boundary", () => {
       requirement: { text: "杭州到马累，2026年8月，2成人" },
       coverage_mode: "strict" as const,
       timeout_seconds: 120,
-      total_timeout_seconds: 900,
+      total_timeout_seconds: 600,
       max_pairs: 3,
     };
     const started = await startLiveFlexiblePlanningFromTextJob(input, "ui-retry-key-1");
@@ -532,6 +532,88 @@ describe("real multi-platform API boundary", () => {
     expect(selected?.handle?.run_id).toBe("live-run-b");
   });
 
+  it("uses the API final_plan as the sole default selection", () => {
+    const option = (id: string) => ({
+      rank: id === "pair-final" ? 2 : 1,
+      date_pair_id: id,
+      departure_date: "2026-08-20",
+      return_date: "2026-08-26",
+      decision_state: "accept",
+      recommendable: true,
+      total_budget_cents: 1200000,
+      evidence_completeness: "1",
+      all_platforms_complete: true,
+      final_candidate_id: id,
+    });
+    const response = {
+      interpretation: { state: "ready" },
+      final_plan: {
+        option_id: "pair-final",
+        date_pair_id: "pair-final",
+        departure_date: "2026-08-20",
+        return_date: "2026-08-26",
+        total_budget_cents: 1200000,
+        optimality_status: "best_verified",
+        claim_boundary: "test",
+        price_comparability: "complete_cny",
+        party: { adults: 2, rooms: 1 },
+      },
+      run: {
+        recommended_option_ids: ["pair-ranked"],
+        ranked_options: [option("pair-ranked"), option("pair-final")],
+        pair_runs: [
+          { date_pair: { id: "pair-ranked" }, state: "completed", run: {} },
+          { date_pair: { id: "pair-final" }, state: "completed", run: {} },
+        ],
+      },
+      cached_pair_runs: [],
+    } as unknown as LiveFlexibleFromTextResponse;
+
+    expect(resolveFlexibleOption(response)?.option.date_pair_id).toBe("pair-final");
+  });
+
+  it("resolves a composite final option id through the explicit date-pair id", () => {
+    const response = {
+      interpretation: { state: "ready" },
+      final_plan: {
+        option_id: "pair-final:maafushi_icom",
+        date_pair_id: "pair-final",
+      },
+      run: {
+        recommended_option_ids: ["pair-final:maafushi_icom"],
+        ranked_options: [
+          {
+            rank: 1,
+            date_pair_id: "pair-final",
+            departure_date: "2026-08-20",
+            return_date: "2026-08-26",
+            decision_state: "accept",
+            recommendable: true,
+            total_budget_cents: 1200000,
+            evidence_completeness: "1",
+            all_platforms_complete: true,
+            final_candidate_id: "pair-final:maafushi_icom",
+          },
+        ],
+        pair_runs: [
+          { date_pair: { id: "pair-final" }, state: "completed", run: {} },
+        ],
+      },
+      cached_pair_runs: [
+        {
+          date_pair_id: "pair-final",
+          run_id: "live-run-final",
+          expires_at: "2026-08-01T00:10:00Z",
+        },
+      ],
+    } as unknown as LiveFlexibleFromTextResponse;
+
+    const selected = resolveFlexibleOption(response);
+
+    expect(selected?.option.date_pair_id).toBe("pair-final");
+    expect(selected?.handle?.run_id).toBe("live-run-final");
+  });
+
   it("sends a live event only to the live replan endpoint", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
@@ -640,6 +722,17 @@ describe("real multi-platform API boundary", () => {
     expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe("POST");
     expect((fetchMock.mock.calls[2][1] as RequestInit).method).toBe("POST");
     expect((fetchMock.mock.calls[4][1] as RequestInit).method).toBe("DELETE");
+  });
+
+  it("propagates cached final_plan replacement and invalidation for monitor refresh", async () => {
+    const run = { decision: { state: "human_block" } };
+    const finalPlan = { option_id: "new", date_pair_id: "dates" };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ run_id: "r", expires_at: "x", run, final_plan: null }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ run_id: "r", expires_at: "x", run, final_plan: finalPlan }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await getLivePackage("r")).final_plan).toBeNull();
+    expect((await getLivePackage("r")).final_plan).toEqual(finalPlan);
   });
 
   it("derives provider capability and denominator from actually scheduled sources", () => {

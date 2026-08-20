@@ -17,6 +17,7 @@ from tripchord.agents.package_request import (
     PackageRequirementRequest,
     RequirementFactSource,
 )
+from tripchord.planning.flexible_dates import FlexibleTravelWindow
 
 NOW = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
 ORIGINAL_REQUEST = """出发地：杭州
@@ -438,6 +439,147 @@ async def test_date_labels_are_respected_even_when_return_appears_first() -> Non
     assert result.window.earliest_departure == date(2026, 8, 12)
     assert result.window.latest_departure == date(2026, 8, 12)
     assert result.window.min_nights == result.window.max_nights == 6
+
+
+@pytest.mark.asyncio
+async def test_real_natural_trip_request_ignores_current_date_and_keeps_return_targets() -> None:
+    result = await HybridPackageRequirementAgent(now=fixed_now).parse(
+        PackageRequirementRequest(
+            text=(
+                "当前日期 2026-08-19；杭州出发，马尔代夫及合理周边组合。"
+                "出发窗口从 2026-08-20 开始，4到8天，2位成人（本人和女朋友）。"
+                "酒店不能简陋、不能太偏，可以有一定品质但价格不能过高；"
+                "搜索时同时覆盖9月9日与9月10日返程。"
+            ),
+            reference_date=date(2026, 8, 19),
+        )
+    )
+
+    assert result.state == PackageRequestState.READY
+    assert result.window is not None
+    assert result.window.origin == "杭州"
+    assert result.window.destination == "马尔代夫"
+    assert result.window.earliest_departure == date(2026, 8, 20)
+    assert result.window.latest_departure == date(2026, 9, 7)
+    assert result.window.latest_return_date == date(2026, 9, 10)
+    assert result.window.latest_arrival_date == date(2026, 9, 10)
+    assert result.window.return_date_targets == (date(2026, 9, 9), date(2026, 9, 10))
+    assert (result.window.min_nights, result.window.max_nights) == (3, 7)
+    assert result.window.adults == 2
+    assert result.window.rooms == 1
+    preferences = {rule.key: rule for rule in result.preferences.rules}
+    assert preferences["lodging_quality"].mode == PreferenceMode.REQUIRED
+    assert preferences["lodging_quality"].expected == "not_basic"
+    assert preferences["lodging_location"].mode == PreferenceMode.REQUIRED
+    assert preferences["lodging_location"].expected == "convenient_not_remote"
+    assert preferences["lodging_price"].mode == PreferenceMode.WEIGHTED
+    assert preferences["lodging_price"].expected == "reasonable_not_high"
+
+
+@pytest.mark.asyncio
+async def test_verbatim_maldives_request_parses_gateway_and_island_comparison() -> None:
+    text = (
+        "我要从杭州出发去马尔代夫周边游，时间：从明天开始到9月10日前的4-8天游，"
+        "人数：我和女朋友两个人，偏好：酒店不能太简陋，地址不能太偏，可以稍微有点品质但价格不能过高，"
+        "到达和返程可以住机场附近，但也要关注有没有更好的选择。"
+    )
+    result = await HybridPackageRequirementAgent(
+        now=lambda: datetime(2026, 8, 19, 12, tzinfo=UTC)
+    ).parse(
+        PackageRequirementRequest(text=text, reference_date=date(2026, 8, 19))
+    )
+
+    assert result.state == PackageRequestState.READY
+    assert result.window is not None
+    assert result.window.origin == "杭州"
+    assert result.window.origin_code == "HGH"
+    assert result.window.destination == "马尔代夫"
+    assert result.window.destination_code == "MLE"
+    assert result.window.earliest_departure == date(2026, 8, 20)
+    assert result.window.latest_departure == date(2026, 9, 7)
+    assert result.window.latest_arrival_date == date(2026, 9, 10)
+    assert result.window.latest_return_date == date(2026, 9, 10)
+    assert result.window.return_date_targets == (date(2026, 9, 9), date(2026, 9, 10))
+    assert (result.window.min_nights, result.window.max_nights) == (3, 7)
+    assert (result.window.adults, result.window.rooms) == (2, 1)
+    preferences = {rule.key: rule for rule in result.preferences.rules}
+    assert preferences["lodging_quality"].expected == "not_basic"
+    assert preferences["lodging_location"].expected == "convenient_not_remote"
+    assert preferences["lodging_price"].expected == "reasonable_not_high"
+    assert preferences["airport_lodging_fallback"].mode == PreferenceMode.INDIFFERENT
+    assert preferences["lodging_zone_comparison"].mode == PreferenceMode.REQUIRED
+
+
+@pytest.mark.asyncio
+async def test_real_request_binds_return_home_deadline_into_intent_template() -> None:
+    result = await HybridPackageRequirementAgent(now=fixed_now).parse(
+        PackageRequirementRequest(
+            text=(
+                "杭州出发去马尔代夫，出发窗口从2026-08-20开始，4到8天，2位成人，1间房，"
+                "搜索9月9日和9月10日返程，实际回杭州不晚于9月10日"
+            ),
+            reference_date=date(2026, 8, 19),
+        )
+    )
+
+    assert result.state == PackageRequestState.READY
+    assert result.window is not None
+    assert result.window.latest_arrival_date == date(2026, 9, 10)
+    assert result.intent_template is not None
+    assert result.intent_template.latest_arrival_date == date(2026, 9, 10)
+
+
+@pytest.mark.asyncio
+async def test_real_request_couple_alias_and_known_origin_phrase() -> None:
+    result = await HybridPackageRequirementAgent(now=fixed_now).parse(
+        PackageRequirementRequest(
+            text=(
+                "当前日期 2026-08-19；杭州出发，马尔代夫。出发窗口从 2026-08-20 开始，"
+                "4到8天，2位成人（本人和女友）；搜索时覆盖9月9日与9月10日返程。"
+            ),
+            reference_date=date(2026, 8, 19),
+        )
+    )
+
+    assert result.state == PackageRequestState.READY
+    assert result.window is not None
+    assert result.window.origin == "杭州"
+    assert result.window.rooms == 1
+
+
+def test_return_boundary_filters_pairs_and_preserves_requested_return_targets() -> None:
+    window = FlexibleTravelWindow(
+        origin="杭州",
+        destination="马尔代夫",
+        earliest_departure=date(2026, 8, 20),
+        latest_departure=date(2026, 9, 7),
+        min_nights=3,
+        max_nights=7,
+        latest_return_date=date(2026, 9, 10),
+        return_date_targets=(date(2026, 9, 9), date(2026, 9, 10)),
+    )
+
+    pairs = window.all_date_pairs()
+    assert (date(2026, 9, 2), date(2026, 9, 9)) in pairs
+    assert (date(2026, 9, 3), date(2026, 9, 10)) in pairs
+    assert all(return_date <= date(2026, 9, 10) for _, return_date in pairs)
+
+
+def test_actual_return_home_boundary_also_limits_date_pairs_without_search_targets() -> None:
+    window = FlexibleTravelWindow(
+        origin="杭州",
+        destination="马尔代夫",
+        earliest_departure=date(2026, 8, 20),
+        latest_departure=date(2026, 9, 7),
+        min_nights=3,
+        max_nights=7,
+        latest_arrival_date=date(2026, 9, 10),
+    )
+
+    pairs = window.all_date_pairs()
+
+    assert pairs
+    assert all(return_date <= date(2026, 9, 10) for _, return_date in pairs)
 
 
 @pytest.mark.asyncio

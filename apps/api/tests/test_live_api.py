@@ -6,10 +6,12 @@ import json
 import stat
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 from tripchord.agents.live_monitor import (
     LiveMonitorCheck,
     LiveMonitorStatus,
@@ -28,6 +30,7 @@ from tripchord.agents.live_system import (
 from tripchord.agents.models import AgentRole, AgentTask, AgentTaskResult, TaskGraph
 from tripchord.agents.persistent_memory import CorruptionPolicy
 from tripchord.agents.runtime import SchedulerOutcome
+from tripchord.api import LiveAgentPlanningResponse, build_live_final_plan_projection
 from tripchord.config import Settings
 from tripchord.main import (
     LiveRunCache,
@@ -263,6 +266,69 @@ def _live_request_payload() -> dict[str, object]:
         "coverage_mode": "strict",
         "timeout_seconds": 20,
     }
+
+
+def test_live_final_projection_rejects_non_all_in_accept_package() -> None:
+    run = _blocked_live_run().model_copy(
+        update={
+            "decision": PackageDecision(state=PackageDecisionState.ACCEPT, summary="accepted"),
+            "package": SimpleNamespace(
+                final_candidate=SimpleNamespace(currency="CNY"),
+                budget=SimpleNamespace(currency="CNY", is_all_in_total=False),
+            ),
+        }
+    )
+    assert build_live_final_plan_projection(run) is None
+
+
+def test_live_agent_response_schema_strongly_types_final_plan() -> None:
+    schema = LiveAgentPlanningResponse.model_json_schema()
+    assert schema["properties"]["final_plan"]["anyOf"][0]["$ref"].endswith(
+        "/FinalPlanProjection"
+    )
+    with pytest.raises(ValidationError):
+        LiveAgentPlanningResponse.model_validate(
+            {
+                "run_id": "run",
+                "expires_at": "2026-08-01T00:00:00Z",
+                "run": {},
+                "final_plan": {"bad": True},
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_legacy_live_plan_rejects_non_all_in_accept_without_caching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_system = _FakeLiveSystem()
+    partial = _blocked_live_run().model_copy(
+        update={
+            "decision": PackageDecision(state=PackageDecisionState.ACCEPT, summary="accepted"),
+            "package": SimpleNamespace(
+                final_candidate=SimpleNamespace(currency="CNY"),
+                budget=SimpleNamespace(currency="CNY", is_all_in_total=False),
+            ),
+        }
+    )
+
+    async def run(*args: object, **kwargs: object) -> LivePackageAgentRun:
+        del args, kwargs
+        fake_system.run_calls += 1
+        return partial
+
+    fake_system.run = run  # type: ignore[method-assign]
+    cache = LiveRunCache(capacity=4, ttl=timedelta(minutes=5))
+    monkeypatch.setattr(app.state, "live_package_agent_system", fake_system)
+    monkeypatch.setattr(app.state, "live_run_cache", cache)
+    monkeypatch.setattr(settings, "browser_bridge_require_all_providers", False)
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/api/v1/agents/live-plan", json=_live_request_payload())
+    assert response.status_code == 422
+    assert not cache._entries
 
 
 def test_browser_bridge_mount_requires_explicit_enablement() -> None:

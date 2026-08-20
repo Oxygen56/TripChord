@@ -63,7 +63,7 @@ def _runtime_payload(*, model_trace_count: int = 7) -> dict[str, Any]:
         "primary_model": "deepseek-v4-flash",
         "fast_model": "deepseek-v4-flash",
         "model_trace_count": model_trace_count,
-        "effective_flexible_timeout_seconds": 3600,
+        "effective_flexible_timeout_seconds": 600,
         "rag_enabled": True,
         "runtime_provenance": _runtime_provenance_payload(),
         "formal_live_source": {
@@ -480,7 +480,7 @@ def _poll_control(*, job_id: str = "live-job-fixture") -> dict[str, Any]:
     control = run_live_done_gate_v4._new_live_job_control(
         request,
         run_live_done_gate_v4._api_payload(request),
-        client_wait_timeout_seconds=3900.0,
+        client_wait_timeout_seconds=900.0,
         attempt_id="1" * 32,
     )
     started = run_live_done_gate_v4.StartLiveFlexibleFromTextJobResponse.model_validate(
@@ -511,7 +511,7 @@ def test_v4_scenario_binds_the_canonical_candidate_set_before_search() -> None:
     assert payload["coverage_mode"] == "strict"
     assert payload["max_pairs"] == 3
     assert payload["timeout_seconds"] == 120
-    assert payload["total_timeout_seconds"] == 3600
+    assert payload["total_timeout_seconds"] == 600
     assert payload["publication_refresh_minimum_options"] == 2
     assert request["done_gate_profile"] == {
         "maximum_quote_age_minutes": 15,
@@ -603,7 +603,7 @@ def test_v4_client_timeout_defaults_to_server_budget_plus_margin() -> None:
             _request(),
             None,
         )
-        == 3900.0
+        == 900.0
     )
 
 
@@ -790,19 +790,19 @@ def test_v4_synthetic_sold_out_rejects_same_product_refresh() -> None:
         )
 
 
-def test_v4_client_timeout_accepts_explicit_3900_seconds() -> None:
+def test_v4_client_timeout_accepts_explicit_900_seconds() -> None:
     assert (
         run_live_done_gate_v4._client_request_timeout_seconds(
             _request(),
-            3900.0,
+            900.0,
         )
-        == 3900.0
+        == 900.0
     )
 
 
 @pytest.mark.parametrize(
     "configured_timeout_seconds",
-    [0.0, 3600.0, 3899.999, float("inf"), float("nan")],
+    [0.0, 600.0, 899.999, float("inf"), float("nan")],
 )
 def test_v4_client_timeout_cannot_race_the_frozen_server_budget(
     configured_timeout_seconds: float,
@@ -825,7 +825,7 @@ def test_v4_job_idempotency_key_binds_payload_sha_and_fresh_attempt() -> None:
     control = run_live_done_gate_v4._new_live_job_control(
         request,
         payload,
-        client_wait_timeout_seconds=3900.0,
+        client_wait_timeout_seconds=900.0,
         attempt_id=attempt_id,
     )
 
@@ -850,13 +850,13 @@ def test_v4_fresh_attempt_ids_prevent_terminal_replay_across_deliberate_runs() -
     first = run_live_done_gate_v4._new_live_job_control(
         request,
         payload,
-        client_wait_timeout_seconds=3900.0,
+        client_wait_timeout_seconds=900.0,
         attempt_id="c" * 32,
     )
     second = run_live_done_gate_v4._new_live_job_control(
         request,
         payload,
-        client_wait_timeout_seconds=3900.0,
+        client_wait_timeout_seconds=900.0,
         attempt_id="d" * 32,
     )
 
@@ -922,7 +922,7 @@ async def test_v4_async_job_records_replay_revision_progress_and_full_terminal_r
     control = run_live_done_gate_v4._new_live_job_control(
         request,
         payload,
-        client_wait_timeout_seconds=3900.0,
+        client_wait_timeout_seconds=900.0,
         attempt_id="b" * 32,
     )
     async with httpx.AsyncClient(
@@ -939,7 +939,7 @@ async def test_v4_async_job_records_replay_revision_progress_and_full_terminal_r
             client,
             "http://tripchord.test",
             control,
-            client_wait_timeout_seconds=3900.0,
+            client_wait_timeout_seconds=900.0,
             poll_interval_seconds=0.001,
             sleep=no_wait,
         )
@@ -1684,8 +1684,8 @@ def test_v4_completed_bundle_rejects_context_without_formal_receipt() -> None:
     context = {
         "formal_live_source_binding": {"fixture": "already-authority-validated"},
         "timeout_contract": {
-            "server_execution_timeout_seconds": 3600,
-            "client_wait_timeout_seconds": 3900.0,
+            "server_execution_timeout_seconds": 600,
+            "client_wait_timeout_seconds": 900.0,
             "minimum_client_margin_seconds": 300.0,
         },
         "runner_contract": {
@@ -1821,7 +1821,7 @@ async def test_v4_runtime_evidence_is_whitelisted_and_excludes_secrets() -> None
 def test_v4_runtime_preflight_rejects_stale_server_timeout_override() -> None:
     runtime = {**_runtime_payload(), "effective_flexible_timeout_seconds": 1200}
 
-    with pytest.raises(RuntimeError, match="must equal 3600"):
+    with pytest.raises(RuntimeError, match="must equal 600"):
         run_live_done_gate_v4._validate_runtime_timeout_contract(runtime)
 
 
@@ -1937,7 +1937,7 @@ async def test_v4_required_model_gate_fails_before_live_network_when_runtime_is_
         api_base="http://tripchord.test",
         api_token=api_secret,
         bridge_token=bridge_secret,
-        request_timeout_seconds=3900.0,
+        request_timeout_seconds=900.0,
         maximum_quote_age_minutes=15,
         minimum_recommendable_options=2,
         require_model_enhancement=True,
@@ -2168,11 +2168,11 @@ async def test_v4_run_without_recommendation_emits_gate_failure_and_skips_event(
         posts[0]["headers"]["Idempotency-Key"]
         == (evidence["live_job_control"]["idempotency"]["key"])
     )
-    assert client_timeouts[0].read == 3900.0
+    assert client_timeouts[0].read == 900.0
     assert evidence["run_status"] == "done_gate_failed"
     assert evidence["timeout_contract"] == {
-        "server_execution_timeout_seconds": 3600,
-        "client_wait_timeout_seconds": 3900.0,
+        "server_execution_timeout_seconds": 600,
+        "client_wait_timeout_seconds": 900.0,
         "minimum_client_margin_seconds": 300.0,
     }
     assert evidence["runner_contract"] == {
@@ -2305,7 +2305,7 @@ async def test_v4_required_model_gate_rejects_silent_deterministic_fallback(
         api_base="http://tripchord.test",
         api_token="",
         bridge_token="fixture-bridge-token-that-is-long-enough",
-        request_timeout_seconds=3900.0,
+        request_timeout_seconds=900.0,
         maximum_quote_age_minutes=15,
         minimum_recommendable_options=2,
         require_model_enhancement=True,
@@ -2445,7 +2445,7 @@ async def test_v4_job_bound_trace_receipt_ignores_non_positive_global_delta(
         api_base="http://tripchord.test",
         api_token="",
         bridge_token="fixture-bridge-token-that-is-long-enough",
-        request_timeout_seconds=3900.0,
+        request_timeout_seconds=900.0,
         maximum_quote_age_minutes=15,
         minimum_recommendable_options=2,
         require_model_enhancement=True,

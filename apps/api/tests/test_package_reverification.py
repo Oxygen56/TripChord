@@ -310,6 +310,73 @@ def test_heterogeneous_package_reverifier_accepts_consistent_repair() -> None:
     assert "形式化证明" in report.semantics_boundary
 
 
+def test_reverifier_uses_actual_arrival_dates_and_keeps_foreign_lodging_separate() -> None:
+    intent = _intent()
+    actual_arrival = datetime(2026, 8, 24, 18, 35, tzinfo=MALDIVES)
+    flight = _flight().model_copy(update={"outbound_arrive_at": actual_arrival})
+    transfers = (
+        _transfer(
+            "transfer:actual-arrival",
+            PackageArea.AIRPORT,
+            PackageArea.AIRPORT_ISLAND,
+            actual_arrival.date(),
+        ),
+        _transfer(
+            "transfer:actual-return",
+            PackageArea.AIRPORT_ISLAND,
+            PackageArea.AIRPORT,
+            END,
+        ),
+    )
+    before_lodging = _lodging("lodging:usd-before", 105_826).model_copy(
+        update={
+            "check_in": actual_arrival.date(),
+            "currency": "USD",
+        }
+    )
+    after_lodging = before_lodging.model_copy(
+        update={
+            "id": "lodging:usd-after",
+            "property_name": "Airport Island Hotel (updated capture)",
+        }
+    )
+    before = TravelPackageCandidate(
+        id="audit-trip:package:actual-dates:v1",
+        trip_id=intent.trip_id,
+        kind=PackageCandidateKind.CONTINUOUS_AIRPORT_ISLAND,
+        flight=flight,
+        lodgings=(before_lodging,),
+        transfers=transfers,
+        declared_total_cents=920_000,
+    )
+    after = before.model_copy(
+        update={
+            "id": "audit-trip:package:actual-dates:v2",
+            "version": 2,
+            "parent_candidate_id": before.id,
+            "lodgings": (after_lodging,),
+        }
+    )
+
+    report = DeclarativePackageReVerifier().audit(
+        intent,
+        before,
+        after,
+        diff_packages(before, after),
+        now=NOW,
+    )
+
+    assert report.passed
+    assert next(
+        check for check in report.checks
+        if check.code is PackageInvariantCode.LODGING_NIGHT_COVERAGE
+    ).passed
+    assert next(
+        check for check in report.checks
+        if check.code is PackageInvariantCode.TOTAL_ARITHMETIC_AND_BUDGET
+    ).passed
+
+
 @pytest.mark.parametrize(
     "intent_update",
     (

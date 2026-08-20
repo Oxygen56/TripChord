@@ -112,6 +112,24 @@ class PreferenceConstitution(DomainModel):
         keys = sorted({rule.key for rule in self.rules})
         return tuple(rule for key in keys if (rule := self.effective(key)) is not None)
 
+    def merged_for_trip(
+        self,
+        *,
+        current: PreferenceConstitution | None = None,
+    ) -> PreferenceConstitution:
+        """Merge durable preferences without allowing them to override this trip.
+
+        Explicit current-trip rules win by source priority.  Inferred rules
+        are retained only when no explicit current or durable rule exists, so
+        a user can revise or revoke a durable preference deterministically.
+        """
+        durable = list(self.rules)
+        if current is not None:
+            durable.extend(current.rules)
+        return PreferenceConstitution(rules=tuple(durable)).model_copy(
+            update={"rules": tuple(PreferenceConstitution(rules=tuple(durable)).effective_rules())}
+        )
+
 
 class EvidenceRecord(DomainModel):
     id: str = Field(min_length=1)

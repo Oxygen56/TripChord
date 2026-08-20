@@ -56,10 +56,11 @@ class _WaveBudgetProbeBridge(BrowserTaskBridge):
         await asyncio.wait_for(self.all_submitted.wait(), timeout=2)
         task_id = ids[0]
         self.wait_budgets[task_id] = timeout_seconds
-        wave = self.positions[task_id] // 6 + 1
-        minimum_budget = float(wave * (self.lease_by_id[task_id] + 1))
+        # Production waits for one leased task at a time.  Later scheduler
+        # waves do not extend the per-task wait budget.
+        minimum_budget = float(self.lease_by_id[task_id] + 1)
         if timeout_seconds < minimum_budget:
-            raise TimeoutError(f"wave {wave} requires {minimum_budget:g} seconds")
+            raise TimeoutError(f"task requires {minimum_budget:g} seconds")
         return await self.cancel_many(
             ids,
             reason="wave-budget probe reached a bounded terminal result",
@@ -144,11 +145,12 @@ async def test_eleven_browser_sources_do_not_time_out_while_waiting_for_later_wa
     )
 
     assert len(bridge.wait_budgets) == 11
-    # All browser source tasks keep the frozen request-level lease (15s); 11
-    # tasks across 6 slots = 2 waves -> 32s API-side wait.  The C-98 lodging
-    # lease bump (482s) is removed: the retry-with-tab-reuse closure handles the
-    # lodging budget split inside the frozen per-task lease.
-    assert set(bridge.wait_budgets.values()) == {32.0}
+    # Each browser task is waited independently after it receives a lease.
+    # The bridge timeout therefore covers one frozen 15s task lease plus the
+    # 1s handoff, rather than multiplying that timeout by later scheduler
+    # waves.  The C-98 lodging lease bump is removed: retry-with-tab-reuse
+    # handles the lodging budget split inside the frozen per-task lease.
+    assert set(bridge.wait_budgets.values()) == {16.0}
     assert all(
         all("TimeoutError" not in reason for reason in coverage.failure_reasons)
         for coverage in run.coverage

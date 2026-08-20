@@ -6,14 +6,16 @@ import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 from urllib.parse import parse_qs, parse_qsl, urlparse
 
 from pydantic import Field, JsonValue, model_validator
 
 from tripchord.domain.common import DomainModel
 from tripchord.planning.package import (
+    FlightGroundTransferContract,
     NormalizedFlightQuote,
+    NormalizedFlightSegment,
     NormalizedLodgingQuote,
     PackageArea,
     PackagePlaceKey,
@@ -119,6 +121,7 @@ class BrowserQuoteNormalizer:
     _BROWSER_OMITTED_ORCHESTRATION_OPTION_KEYS = frozenset(
         {
             "__tripchord_allow_recent_quote_reuse",
+            "__tripchord_reuse_exact_result_tab",
             "gateway_destination",
             "stay_area_search_profile",
             "stay_plan_candidate_set",
@@ -225,18 +228,17 @@ class BrowserQuoteNormalizer:
             BrowserProvider.QUNAR: "combined_roundtrip_card",
             BrowserProvider.TONGCHENG: "staged_outbound_return",
         }[quote.provider]
-        expected_party_status = {
-            BrowserProvider.CTRIP: "confirmed_for_party",
-            BrowserProvider.FLIGGY: "comparison_only",
-            BrowserProvider.QUNAR: "confirmed_for_party",
-            BrowserProvider.TONGCHENG: "confirmed_for_party",
+        expected_party_statuses = {
+            BrowserProvider.CTRIP: {"confirmed_for_party", "observed_party_context"},
+            BrowserProvider.FLIGGY: {"comparison_only"},
+            BrowserProvider.QUNAR: {"confirmed_for_party", "observed_party_context"},
+            BrowserProvider.TONGCHENG: {"confirmed_for_party", "observed_party_context"},
         }[quote.provider]
         fixed_fields = {
             "workflow_kind": expected_workflow,
             "combination_status": "round_trip_complete",
             "journey_price_scope": "round_trip",
             "price_finality": "final_for_combination",
-            "party_availability_status": expected_party_status,
         }
         for field, expected in fixed_fields.items():
             if details.get(field) != expected:
@@ -245,6 +247,12 @@ class BrowserQuoteNormalizer:
                     f"flight {field} must be {expected}",
                     field=field,
                 )
+        if details.get("party_availability_status") not in expected_party_statuses:
+            raise _RejectNormalization(
+                QuoteNormalizationCode.INCOMPLETE_ROUND_TRIP,
+                "flight party context is not an audited observed or confirmed state",
+                field="party_availability_status",
+            )
         for field in (
             "combination_id",
             "price_basis_evidence",
@@ -287,7 +295,10 @@ class BrowserQuoteNormalizer:
             quote.provider == BrowserProvider.QUNAR
             and details.get("workflow_kind") == "combined_roundtrip_card"
             and details.get("combination_status") == "round_trip_complete"
-            and details.get("party_availability_status") == "confirmed_for_party"
+            and details.get("party_availability_status") in {
+                "confirmed_for_party",
+                "observed_party_context",
+            }
             and "exact_trusted_url_party_context:" in availability_evidence
             and "visible_result_card" in availability_evidence
             and "inventory_not_locked" in availability_evidence
@@ -460,22 +471,8 @@ class BrowserQuoteNormalizer:
             if quote.price_basis == QuotePriceBasis.PER_PERSON
             else r"总价|合计|total(?:\s+(?:price|trip|party))?"
         )
-        tongcheng_invariance_basis = (
-            quote.provider == BrowserProvider.TONGCHENG
-            and quote.price_basis == QuotePriceBasis.PER_PERSON
-            and quote.details.get("price_basis_source")
-            == "tongcheng_product_row_adult_count_invariance_canary_v1"
-            and bool(
-                re.fullmatch(
-                    r"(?:¥|￥|CNY|RMB)\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?含税总价",
-                    price_text,
-                    re.IGNORECASE,
-                )
-            )
-        )
         if (
             not re.search(basis_pattern, price_text, re.IGNORECASE)
-            and not tongcheng_invariance_basis
         ):
             raise _RejectNormalization(
                 QuoteNormalizationCode.UNSUPPORTED_PRICE_BASIS,
@@ -1404,11 +1401,30 @@ class BrowserQuoteNormalizer:
                 field="flight_dates",
             )
         adults = self._context_int(quote.details, "adults", query.adults)
-        if adults != query.adults:
+        children = self._context_int(quote.details, "children", query.children)
+        infants = self._context_int(quote.details, "infants", query.infants)
+        children_ages = self._context_ages(quote.details, query.children_ages)
+        if (adults, children, infants) != (
+            query.adults,
+            query.children,
+            query.infants,
+        ):
             raise _RejectNormalization(
                 QuoteNormalizationCode.QUERY_CONTEXT_MISMATCH,
-                "flight quote adult count differs from the submitted search",
-                field="adults",
+                "flight quote traveller shape differs from the submitted search",
+                field="party",
+            )
+        if children_ages != query.children_ages:
+            raise _RejectNormalization(
+                QuoteNormalizationCode.QUERY_CONTEXT_MISMATCH,
+                "flight child ages differ from the submitted search",
+                field="children_ages",
+            )
+        if (children or infants) and quote.price_basis != QuotePriceBasis.TOTAL_PARTY:
+            raise _RejectNormalization(
+                QuoteNormalizationCode.UNSUPPORTED_PRICE_BASIS,
+                "mixed-party flight pricing requires an explicit total-party amount",
+                field="price_basis",
             )
         self._flight_route_evidence(
             quote.details,
@@ -1428,12 +1444,41 @@ class BrowserQuoteNormalizer:
             expected_arrival_name=query.origin,
             expected_arrival_code=query.origin_code,
         )
-        if quote.price_basis == QuotePriceBasis.TOTAL_PARTY:
+        price_text = self._str(quote.details, "price_text")
+        qunar_party_comparison_payload = quote.details.get("party_price_comparison")
+        qunar_party_comparison = (
+            quote.provider == BrowserProvider.QUNAR
+            and self._valid_qunar_party_comparison(
+                qunar_party_comparison_payload,
+                query=query,
+                quote=quote,
+            )
+        )
+        provider_has_explicit_basis = quote.provider not in {
+            BrowserProvider.QUNAR,
+            BrowserProvider.TONGCHENG,
+        } and quote.price_basis in {
+            QuotePriceBasis.PER_PERSON,
+            QuotePriceBasis.TOTAL_PARTY,
+        }
+        party_total_known = bool(
+            provider_has_explicit_basis
+            or qunar_party_comparison
+        )
+        requires_party_total_label = quote.price_basis == QuotePriceBasis.TOTAL_PARTY
+        # A visible "含税总价" on a Qunar/Tongcheng round-trip card is useful
+        # route evidence, but it does not identify whether the amount is for
+        # one traveller or the requested party.  Preserve that observation
+        # and downgrade it instead of dropping the complete itinerary.  Other
+        # providers keep the strict explicit-party contract.
+        if requires_party_total_label and quote.provider not in {
+            BrowserProvider.QUNAR,
+            BrowserProvider.TONGCHENG,
+        }:
             party_pattern = (
                 rf"(?:全部|全体|所有|订单|旅客|乘客|{adults}\s*(?:名|位)?成人|"
                 rf"{adults}\s*人)"
             )
-            price_text = self._str(quote.details, "price_text")
             if not (
                 re.search(
                     rf"{party_pattern}[^¥￥$]{{0,18}}(?:总价|合计)",
@@ -1451,6 +1496,30 @@ class BrowserQuoteNormalizer:
                     "flight total price does not explicitly identify the requested party",
                     field="price_basis",
                 )
+        if provider_has_explicit_basis:
+            calculation_price_basis = quote.price_basis
+            effective_price_basis = quote.price_basis.value
+        elif party_total_known:
+            calculation_price_basis = QuotePriceBasis.TOTAL_PARTY
+            effective_price_basis = QuotePriceBasis.TOTAL_PARTY.value
+        else:
+            calculation_price_basis = QuotePriceBasis.PER_PERSON
+            effective_price_basis = "comparison_only"
+        total: int | None
+        if qunar_party_comparison:
+            assert isinstance(qunar_party_comparison_payload, dict)
+            total = cast(int, qunar_party_comparison_payload["two_adult_amount"])
+        else:
+            total = (
+                self._total_cents(
+                    quote.amount,
+                    calculation_price_basis,
+                    per_person_multiplier=adults,
+                    per_night_multiplier=None,
+                )
+                if party_total_known
+                else None
+            )
         baggage = self._optional_int(quote.details, "checked_baggage_per_adult_kg")
         if baggage is not None:
             self._str(quote.details, "baggage_text")
@@ -1460,18 +1529,13 @@ class BrowserQuoteNormalizer:
                     "checked baggage kilograms must be between 0 and 100",
                     field="checked_baggage_per_adult_kg",
                 )
-        total = self._total_cents(
-            quote.amount,
-            quote.price_basis,
-            per_person_multiplier=adults,
-            per_night_multiplier=None,
-        )
         party_availability_confirmed = (
             self._str(quote.details, "party_availability_status") == "confirmed_for_party"
         )
         if (
             search_url_contract is not None
-            and party_availability_confirmed is not search_url_contract.party_availability_confirmed
+            and not search_url_contract.party_availability_confirmed
+            and party_availability_confirmed
         ):
             raise _RejectNormalization(
                 QuoteNormalizationCode.QUERY_CONTEXT_MISMATCH,
@@ -1492,7 +1556,18 @@ class BrowserQuoteNormalizer:
             origin=query.origin,
             destination=query.destination,
             adults=adults,
+            children=children,
+            children_ages=children_ages,
+            infants=infants,
             party_availability_confirmed=party_availability_confirmed,
+            party_total_known=party_total_known,
+            price_basis=effective_price_basis,
+            display_amount_cents=self._total_cents(
+                quote.amount,
+                QuotePriceBasis.PER_PERSON,
+                per_person_multiplier=1,
+                per_night_multiplier=None,
+            ),
             outbound_depart_at=outbound_depart,
             outbound_arrive_at=outbound_arrive,
             return_depart_at=return_depart,
@@ -1502,6 +1577,14 @@ class BrowserQuoteNormalizer:
                 quote.details,
                 "provider_itinerary_id",
             ),
+            origin_airport_code=self._optional_iata_code(
+                quote.details,
+                "origin_airport_code",
+            ),
+            destination_airport_code=self._optional_iata_code(
+                quote.details,
+                "destination_airport_code",
+            ),
             outbound_flight_numbers=self._optional_string_tuple(
                 quote.details,
                 "outbound_flight_numbers",
@@ -1509,6 +1592,22 @@ class BrowserQuoteNormalizer:
             return_flight_numbers=self._optional_string_tuple(
                 quote.details,
                 "return_flight_numbers",
+            ),
+            outbound_segments=self._optional_flight_segments(
+                quote.details,
+                "outbound_segments",
+            ),
+            return_segments=self._optional_flight_segments(
+                quote.details,
+                "return_segments",
+            ),
+            outbound_ground_transfers=self._optional_ground_transfer_contracts(
+                quote.details,
+                "outbound_ground_transfers",
+            ),
+            return_ground_transfers=self._optional_ground_transfer_contracts(
+                quote.details,
+                "return_ground_transfers",
             ),
             carrier_summary=self._optional_str(quote.details, "carrier_text"),
             cabin_class=self._optional_str(quote.details, "cabin_class"),
@@ -1521,6 +1620,56 @@ class BrowserQuoteNormalizer:
                 "fare_rule_summary",
             ),
         )
+
+    def _valid_qunar_party_comparison(
+        self,
+        comparison: object,
+        *,
+        query: BrowserSearchQuery,
+        quote: BrowserQuote,
+    ) -> bool:
+        """Require an independent, same-product 1/2-adult price receipt.
+
+        A search URL's adult query parameter and a visible ``含税总价`` label
+        are not enough to establish whether the amount is per traveller or
+        for the party.  This contract is deliberately strict so an adapter
+        cannot manufacture a party total from its own URL.
+        """
+        if not isinstance(comparison, dict):
+            return False
+        if comparison.get("schema") != "tripchord.flight_party_comparison.v1":
+            return False
+        if comparison.get("verification") != "server_owned_same_product":
+            return False
+        if comparison.get("provider") != quote.provider.value:
+            return False
+        if comparison.get("currency") != quote.currency:
+            return False
+        if comparison.get("start_date") != query.start_date.isoformat():
+            return False
+        if query.end_date is None or comparison.get("end_date") != query.end_date.isoformat():
+            return False
+        if comparison.get("origin_code") != query.origin_code:
+            return False
+        if comparison.get("destination_code") != query.destination_code:
+            return False
+        product_id = comparison.get("same_product_id")
+        if not isinstance(product_id, str) or not product_id.strip():
+            return False
+        one = comparison.get("one_adult")
+        two = comparison.get("two_adults")
+        if not isinstance(one, dict) or not isinstance(two, dict):
+            return False
+        if one.get("adults") != 1 or two.get("adults") != 2:
+            return False
+        for row in (one, two):
+            if not isinstance(row.get("amount"), int) or row["amount"] <= 0:
+                return False
+            if row.get("same_product_id") != product_id:
+                return False
+            if row.get("query_hash") != comparison.get("query_hash"):
+                return False
+        return comparison.get("two_adult_amount") == two.get("amount")
 
     def _flight_route_evidence(
         self,
@@ -1670,12 +1819,26 @@ class BrowserQuoteNormalizer:
                 field="stay_dates",
             )
         adults = self._context_int(quote.details, "adults", query.adults)
+        children = self._context_int(quote.details, "children", query.children)
+        infants = self._context_int(quote.details, "infants", query.infants)
+        children_ages = self._context_ages(quote.details, query.children_ages)
         rooms = self._context_int(quote.details, "rooms", query.rooms)
-        if adults != query.adults or rooms != query.rooms:
+        if (adults, children, infants, rooms) != (
+            query.adults,
+            query.children,
+            query.infants,
+            query.rooms,
+        ):
             raise _RejectNormalization(
                 QuoteNormalizationCode.QUERY_CONTEXT_MISMATCH,
                 "lodging occupancy differs from the submitted search",
                 field="occupancy",
+            )
+        if children_ages != query.children_ages:
+            raise _RejectNormalization(
+                QuoteNormalizationCode.QUERY_CONTEXT_MISMATCH,
+                "lodging child ages differ from the submitted search",
+                field="children_ages",
             )
         nights = (check_out - check_in).days
         total = self._total_cents(
@@ -1739,6 +1902,9 @@ class BrowserQuoteNormalizer:
             check_in=check_in,
             check_out=check_out,
             adults=adults,
+            children=children,
+            children_ages=children_ages,
+            infants=infants,
             rooms=rooms,
             breakfast_included=breakfast,
             place_key=place_key,
@@ -2075,6 +2241,8 @@ class BrowserQuoteNormalizer:
                 origin_place_key=origin_place_key,
                 destination_place_key=destination_place_key,
                 adults=query.adults,
+                children=query.children,
+                infants=query.infants,
                 service_date=service_date,
                 schedule_mode=schedule_mode,
                 duration_minutes=duration_minutes,
@@ -2548,6 +2716,89 @@ class BrowserQuoteNormalizer:
                 normalized.append(text)
         return tuple(normalized)
 
+    def _optional_iata_code(
+        self,
+        details: dict[str, JsonValue],
+        key: str,
+    ) -> str | None:
+        value = self._optional_str(details, key)
+        if value is None:
+            return None
+        normalized = value.strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", normalized):
+            raise _RejectNormalization(
+                QuoteNormalizationCode.INVALID_FIELD,
+                f"{key} must be a three-letter IATA code",
+                field=key,
+            )
+        return normalized
+
+    def _optional_flight_segments(
+        self,
+        details: dict[str, JsonValue],
+        key: str,
+    ) -> tuple[NormalizedFlightSegment, ...]:
+        value = details.get(key)
+        if value is None:
+            return ()
+        if not isinstance(value, list) or not value:
+            raise _RejectNormalization(
+                QuoteNormalizationCode.INVALID_FIELD,
+                f"{key} must be a non-empty list of airport-level segments",
+                field=key,
+            )
+        segments: list[NormalizedFlightSegment] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise _RejectNormalization(
+                    QuoteNormalizationCode.INVALID_FIELD,
+                    f"{key}[{index}] must be an object",
+                    field=key,
+                )
+            try:
+                segment = NormalizedFlightSegment.model_validate(item)
+            except ValueError as exc:
+                raise _RejectNormalization(
+                    QuoteNormalizationCode.INVALID_FIELD,
+                    f"{key}[{index}] is not a complete airport-level segment",
+                    field=key,
+                ) from exc
+            segments.append(segment)
+        return tuple(segments)
+
+    def _optional_ground_transfer_contracts(
+        self,
+        details: dict[str, JsonValue],
+        key: str,
+    ) -> tuple[FlightGroundTransferContract, ...]:
+        value = details.get(key)
+        if value is None:
+            return ()
+        if not isinstance(value, list) or not value:
+            raise _RejectNormalization(
+                QuoteNormalizationCode.INVALID_FIELD,
+                f"{key} must be a non-empty list of airport-change contracts",
+                field=key,
+            )
+        contracts: list[FlightGroundTransferContract] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise _RejectNormalization(
+                    QuoteNormalizationCode.INVALID_FIELD,
+                    f"{key}[{index}] must be an object",
+                    field=key,
+                )
+            try:
+                contract = FlightGroundTransferContract.model_validate(item)
+            except ValueError as exc:
+                raise _RejectNormalization(
+                    QuoteNormalizationCode.INVALID_FIELD,
+                    f"{key}[{index}] is not a complete airport-change contract",
+                    field=key,
+                ) from exc
+            contracts.append(contract)
+        return tuple(contracts)
+
     def _visible_payment_policy(self, details: dict[str, JsonValue]) -> str | None:
         explicit = self._optional_str(details, "payment_text")
         if explicit is not None:
@@ -2606,6 +2857,31 @@ class BrowserQuoteNormalizer:
                 field=key,
             )
         return value
+
+    def _context_ages(
+        self,
+        details: dict[str, JsonValue],
+        default: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        value = details.get("children_ages")
+        if value is None:
+            return default
+        if not isinstance(value, list) or any(
+            not isinstance(age, int) or isinstance(age, bool) for age in value
+        ):
+            raise _RejectNormalization(
+                QuoteNormalizationCode.INVALID_FIELD,
+                "children_ages must be a list of integers",
+                field="children_ages",
+            )
+        ages = tuple(cast(list[int], value))
+        if any(age < 0 or age > 17 for age in ages):
+            raise _RejectNormalization(
+                QuoteNormalizationCode.INVALID_FIELD,
+                "children ages must be between 0 and 17",
+                field="children_ages",
+            )
+        return ages
 
     def _optional_bool(
         self,

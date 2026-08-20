@@ -2,7 +2,7 @@ importScripts("build-meta.js");
 
 const DEFAULT_BRIDGE_URL = "http://127.0.0.1:8000/browser-bridge";
 const POLL_ALARM = "tripchord-read-only-poll";
-const CONTENT_RUNTIME_VERSION = "2026-08-05.16";
+const CONTENT_RUNTIME_VERSION = "2026-08-05.18";
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const COMPANION_ID = `chrome-mv3-${chrome.runtime.id}`;
 const SOURCE_EXECUTION_ATTESTATION_SCHEMA =
@@ -139,7 +139,10 @@ const SEARCH_TRANSITION_GRACE_MS = 3000;
 const NAVIGATION_OBSERVER_SLACK_MS = 1000;
 const MAX_NAVIGATION_TRACE_ENTRIES = 12;
 const VISIBLE_CONTENT_SETTLE_MS = 400;
-const FLIGHT_LOADING_DOM_DRIFT_MAX_POLLS = 3;
+// Provider search shells can remain in a visible loading state well after the
+// tab is interactive.  A diagnostic from that state is not a terminal
+// observation; keep polling within the existing bounded extraction lease.
+const FLIGHT_LOADING_DOM_DRIFT_MAX_POLLS = 60;
 const FLIGHT_STAGED_DOM_DRIFT_MAX_POLLS = 4;
 // Ctrip's return-flight list is hydrated after the exact outbound transition;
 // live pages have taken more than two seconds even after the tab reports ready.
@@ -200,6 +203,7 @@ const VISIBLE_CONTENT_MESSAGE_TYPES = new Set([
   "tripchord:extract",
   "tripchord:safe-select-outbound",
   "tripchord:safe-select-return",
+  "tripchord:safe-expand-qunar-flight-detail",
   "tripchord:extract-transfer-detail",
   "tripchord:tongcheng-detail-candidates",
 ]);
@@ -1755,13 +1759,32 @@ async function claimReusableExactFlightResultTab(lease) {
     if (
       !tab ||
       !Number.isInteger(tab.id) ||
-      leasedExistingTabIds.has(tab.id) ||
-      (tab.url || tab.pendingUrl || "") !== lease.query.search_url
+      leasedExistingTabIds.has(tab.id)
     ) {
       continue;
     }
+    const tabUrl = String(tab.url || tab.pendingUrl || "");
+    const exactSearchUrl = tabUrl === lease.query.search_url;
+    const resultDecision = exactSearchUrl
+      ? {
+          allowed: true,
+          href: tabUrl,
+          confirmation_scope: "trusted_exact_search_url",
+          readback_query: expected.readback_query,
+          url_confirmed_fields: expected.url_confirmed_fields,
+        }
+      : auditedFlightResultUrlDecision(lease.provider, tabUrl, lease.query);
+    if (!resultDecision.allowed) {
+      continue;
+    }
     leasedExistingTabIds.add(tab.id);
-    return { tab_id: tab.id, url: lease.query.search_url };
+    return {
+      tab_id: tab.id,
+      url: resultDecision.href,
+      result_url_readback: resultDecision.readback_query,
+      result_url_confirmed_fields: resultDecision.url_confirmed_fields,
+      confirmation_scope: resultDecision.confirmation_scope,
+    };
   }
   return null;
 }
@@ -2000,7 +2023,7 @@ function trustedSearchUrlDriverEvidence(provider, kind, rawUrl, query = {}) {
       },
       MLE: {
         canonicalName: "马累",
-        aliases: new Set(["马累", "male", "mle"]),
+        aliases: new Set(["马累", "马尔代夫", "male", "mle"]),
       },
     };
     const originIdentity = auditedIdentities[originCode];
@@ -2033,7 +2056,7 @@ function trustedSearchUrlDriverEvidence(provider, kind, rawUrl, query = {}) {
     pricingContext = "requested_adults_in_search_url";
     readbackQuery = {
       origin: originIdentity.canonicalName,
-      destination: destinationIdentity.canonicalName,
+      destination: query.destination,
       start_date: query.start_date,
       end_date: query.end_date,
       adults: query.adults,
@@ -2059,7 +2082,7 @@ function trustedSearchUrlDriverEvidence(provider, kind, rawUrl, query = {}) {
       },
       MLE: {
         canonicalName: "马累",
-        aliases: new Set(["马累", "male", "mle"]),
+        aliases: new Set(["马累", "马尔代夫", "male", "mle"]),
       },
     };
     const originIdentity = auditedIdentities[originCode];
@@ -2090,7 +2113,7 @@ function trustedSearchUrlDriverEvidence(provider, kind, rawUrl, query = {}) {
     pricingContext = "requested_adults_in_search_url";
     readbackQuery = {
       origin: originIdentity.canonicalName,
-      destination: destinationIdentity.canonicalName,
+      destination: query.destination,
       origin_code: originCode,
       destination_code: destinationCode,
       start_date: query.start_date,
@@ -2129,6 +2152,148 @@ function trustedSearchUrlDriverEvidence(provider, kind, rawUrl, query = {}) {
     url_confirmed_fields: urlConfirmedFields,
     party_availability_confirmed: partyAvailabilityConfirmed,
     pricing_context: pricingContext,
+  };
+}
+
+function auditedFlightResultUrlDecision(provider, rawUrl, query = {}) {
+  const rejected = (reason, parsed = null) => ({
+    allowed: false,
+    reason,
+    url: navigationUrlEvidence(parsed ? parsed.href : rawUrl),
+  });
+  if (provider !== "qunar") {
+    return rejected("unsupported_provider");
+  }
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return rejected("invalid_url");
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.hostname.toLowerCase() !== "flight.qunar.com" ||
+    parsed.port ||
+    parsed.username ||
+    parsed.password ||
+    parsed.hash ||
+    !new Set([
+      "/twell/flight/Search.jsp",
+      "/site/interroundtrip_compare.htm",
+    ]).has(parsed.pathname)
+  ) {
+    return rejected("wrong_surface", parsed);
+  }
+  const originCode = String(query.origin_code || "").toUpperCase();
+  const destinationCode = String(query.destination_code || "").toUpperCase();
+  const originIdentity = {
+    HGH: { canonicalName: "杭州", aliases: new Set(["杭州", "hangzhou", "hgh"]) },
+  }[originCode];
+  const destinationIdentity = {
+    MLE: { canonicalName: "马累", aliases: new Set(["马累", "马尔代夫", "male", "mle"]) },
+  }[destinationCode];
+  const normalizedAlias = (value) =>
+    String(value)
+      .trim()
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase();
+  const adults = Number(query.adults);
+  if (
+    !originIdentity ||
+    !destinationIdentity ||
+    !originIdentity.aliases.has(normalizedAlias(query.origin)) ||
+    !destinationIdentity.aliases.has(normalizedAlias(query.destination)) ||
+    calendarDateQueryValue(query.start_date) === null ||
+    calendarDateQueryValue(query.end_date) === null ||
+    String(query.end_date) <= String(query.start_date) ||
+    !Number.isInteger(adults) ||
+    adults < 1 ||
+    adults > 9
+  ) {
+    return rejected("invalid_requested_query", parsed);
+  }
+
+  const isCompareRoute = parsed.pathname === "/site/interroundtrip_compare.htm";
+  const requiredKeys = isCompareRoute
+    ? [
+        "fromCity",
+        "toCity",
+        "fromDate",
+        "toDate",
+        "from",
+        "lowestPrice",
+        "isInter",
+        "favoriteKey",
+        "showTotalPr",
+        "adultNum",
+        "childNum",
+        "cabinClass",
+      ]
+    : [
+        "from",
+        "showTotalPr",
+        "searchType",
+        "fromCity",
+        "toCity",
+        "adultNum",
+        "childNum",
+        "fromDate",
+        "toDate",
+      ];
+  const entries = [...parsed.searchParams.entries()];
+  if (
+    entries.length !== requiredKeys.length ||
+    entries.some(([key]) => !requiredKeys.includes(key)) ||
+    requiredKeys.some(
+      (key) => entries.filter(([candidate]) => candidate === key).length !== 1,
+    )
+  ) {
+    return rejected("query_shape_mismatch", parsed);
+  }
+  const expected = new Map([
+    ["fromCity", originIdentity.canonicalName],
+    ["toCity", destinationIdentity.canonicalName],
+    ["fromDate", String(query.start_date)],
+    ["toDate", String(query.end_date)],
+    ["from", "flight_int_search"],
+    ["showTotalPr", "0"],
+    ["adultNum", String(adults)],
+    ["childNum", "0"],
+  ]);
+  if (isCompareRoute) {
+    expected.set("lowestPrice", "null");
+    expected.set("isInter", "true");
+    expected.set("favoriteKey", "");
+    expected.set("cabinClass", "");
+  } else {
+    expected.set("searchType", "RoundTripFlight");
+  }
+  if ([...expected].some(([key, value]) => parsed.searchParams.get(key) !== value)) {
+    return rejected("query_value_mismatch", parsed);
+  }
+  return {
+    allowed: true,
+    reason: "allowed",
+    href: parsed.href,
+    url: navigationUrlEvidence(parsed.href),
+    confirmation_scope: "audited_visible_result_url",
+    readback_query: {
+      origin: originIdentity.canonicalName,
+      destination: destinationIdentity.canonicalName,
+      origin_code: originCode,
+      destination_code: destinationCode,
+      start_date: String(query.start_date),
+      end_date: String(query.end_date),
+      adults,
+    },
+    url_confirmed_fields: [
+      "origin_code",
+      "destination_code",
+      "start_date",
+      "end_date",
+      "adults",
+    ],
   };
 }
 
@@ -6319,6 +6484,7 @@ async function extractWithRetry(
   let outboundSelectionRevalidationMisses = 0;
   let returnSelections = 0;
   let retainedFlightSearchReceipt = null;
+  let qunarDetailCandidateFingerprint = null;
   const outboundSelectionQueue = [];
   const attemptedOutboundSelectionIds = new Set();
   let readyForNextOutboundSelection = false;
@@ -6329,6 +6495,11 @@ async function extractWithRetry(
   let ctripOutboundStageWarmupPolls = 0;
   let tongchengFlightResultWarmupPolls = 0;
   let qunarGeometryStabilityPolls = 0;
+  const qunarFlightDetailExpandAttempts = {
+    outbound: false,
+    return: false,
+  };
+  const qunarFlightDetailExpansionEvidence = [];
   const retainFlightSearchReceipt = (result) => {
     const failureDetails =
       result &&
@@ -6378,7 +6549,6 @@ async function extractWithRetry(
   const withRetainedFlightSearchReceipt = (result) => {
     if (
       lease.kind !== "flight" ||
-      !retainedFlightSearchReceipt ||
       !result ||
       result.state !== "failed" ||
       !result.failure
@@ -6390,13 +6560,32 @@ async function extractWithRetry(
       typeof result.failure.details === "object"
         ? result.failure.details
         : {};
-    if (
+    const hasRetainedReceipt = Boolean(
       details.flight_search_receipt &&
-      details.flight_search_receipt_sha256
-    ) {
+      details.flight_search_receipt_sha256,
+    );
+    if (!retainedFlightSearchReceipt && !qunarFlightDetailExpansionEvidence.length) {
       return result;
     }
-    const receipt = retainedFlightSearchReceipt.receipt;
+    const receipt = retainedFlightSearchReceipt && retainedFlightSearchReceipt.receipt;
+    const nextDetails = {
+      ...details,
+      ...(qunarFlightDetailExpansionEvidence.length
+        ? {
+            qunar_safe_detail_expansion:
+              qunarFlightDetailExpansionEvidence.slice(),
+          }
+        : {}),
+    };
+    if (hasRetainedReceipt || !receipt) {
+      return {
+        ...result,
+        failure: {
+          ...result.failure,
+          details: nextDetails,
+        },
+      };
+    }
     return {
       ...result,
       failure: {
@@ -6405,13 +6594,187 @@ async function extractWithRetry(
         page_url: receipt.page_url,
         captured_at: receipt.captured_at,
         details: {
-          ...details,
+          ...nextDetails,
           flight_search_receipt: receipt,
           flight_search_receipt_sha256:
             retainedFlightSearchReceipt.receipt_sha256,
         },
       },
     };
+  };
+  const expandOneQunarFlightDetail = async () => {
+    if (lease.provider !== "qunar" || lease.kind !== "flight") {
+      return false;
+    }
+    const direction = qunarFlightDetailExpandAttempts.outbound
+      ? "return"
+      : "outbound";
+    if (qunarFlightDetailExpandAttempts[direction]) {
+      return false;
+    }
+    qunarFlightDetailExpandAttempts[direction] = true;
+    const probe = () => visibleContentCall(
+      tabId,
+      {
+        type: "tripchord:safe-expand-qunar-flight-detail",
+        provider: "qunar",
+        direction,
+        query: lease.query,
+        candidate_fingerprint: qunarDetailCandidateFingerprint,
+        observed_candidates: Array.isArray(expanded && expanded.observed_candidates)
+          ? expanded.observed_candidates
+          : [],
+      },
+      {
+        lease,
+        deadline: extractionDeadline,
+        ownedTabIds,
+        timeoutCapMs: 15000,
+        postSettleMs: 700,
+      },
+    );
+    let expanded;
+    try {
+      expanded = await probe();
+    } catch (error) {
+      if (error && error.status === 409) {
+        throw error;
+      }
+      qunarFlightDetailExpansionEvidence.push({
+        direction,
+        candidate_fingerprint: qunarDetailCandidateFingerprint,
+        observed_candidates: Array.isArray(expanded && expanded.observed_candidates)
+          ? expanded.observed_candidates
+          : [],
+        result_code: "safe_detail_probe_error",
+        probe_attempt: 1,
+        clicked: false,
+        read_only: true,
+        transaction_controls_excluded: true,
+      });
+      return false;
+    }
+    const receipt = retainedFlightSearchReceipt && retainedFlightSearchReceipt.receipt;
+    const receiptHasCards = Boolean(
+      receipt && Number.isInteger(receipt.scanned_count) && receipt.scanned_count > 0,
+    );
+    const receiptExplicitlyEmpty = Boolean(
+      receipt && (
+        receipt.state === "confirmed_empty" ||
+        receipt.explicit_empty_evidence
+      ),
+    );
+    let retriedEmptyScope = false;
+    if (
+      expanded &&
+      expanded.expanded !== true &&
+      expanded.inspected_card_count === 0 &&
+      receiptHasCards &&
+      !receiptExplicitlyEmpty &&
+      Date.now() + 350 < extractionDeadline
+    ) {
+      retriedEmptyScope = true;
+      qunarFlightDetailExpansionEvidence.push({
+        direction,
+        candidate_fingerprint: qunarDetailCandidateFingerprint,
+        result_code: "transient_empty_card_scope",
+        initial_result_code:
+          typeof expanded.code === "string"
+            ? expanded.code
+            : "safe_detail_control_unavailable",
+        inspected_card_count: 0,
+        matching_target_card_count: 0,
+        probe_attempt: 1,
+        clicked: false,
+        read_only: true,
+        transaction_controls_excluded: true,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      try {
+        expanded = await probe();
+      } catch (error) {
+        if (error && error.status === 409) {
+          throw error;
+        }
+        qunarFlightDetailExpansionEvidence.push({
+          direction,
+          candidate_fingerprint: qunarDetailCandidateFingerprint,
+          observed_candidates: Array.isArray(expanded && expanded.observed_candidates)
+            ? expanded.observed_candidates
+            : [],
+          result_code: "safe_detail_probe_error",
+          probe_attempt: 2,
+          retry_of: "transient_empty_card_scope",
+          clicked: false,
+          read_only: true,
+          transaction_controls_excluded: true,
+        });
+        return false;
+      }
+    }
+    if (!expanded || expanded.expanded !== true) {
+      qunarFlightDetailExpansionEvidence.push({
+        direction,
+        candidate_fingerprint: qunarDetailCandidateFingerprint,
+        observed_candidates: Array.isArray(expanded && expanded.observed_candidates)
+          ? expanded.observed_candidates
+          : [],
+        result_code:
+          expanded && typeof expanded.code === "string"
+            ? expanded.code
+            : "safe_detail_control_unavailable",
+        inspected_card_count:
+          expanded && Number.isInteger(expanded.inspected_card_count)
+            ? expanded.inspected_card_count
+            : null,
+        matching_target_card_count:
+          expanded && Number.isInteger(expanded.matching_target_card_count)
+            ? expanded.matching_target_card_count
+            : null,
+        probe_attempt: retriedEmptyScope ? 2 : 1,
+        ...(retriedEmptyScope ? { retry_of: "transient_empty_card_scope" } : {}),
+        clicked: false,
+        read_only: true,
+        transaction_controls_excluded: true,
+      });
+      return false;
+    }
+    if (retriedEmptyScope) {
+      qunarFlightDetailExpansionEvidence.push({
+        direction,
+        candidate_fingerprint: qunarDetailCandidateFingerprint,
+        observed_candidates: Array.isArray(expanded && expanded.observed_candidates)
+          ? expanded.observed_candidates
+          : [],
+        result_code: "retry_succeeded",
+        inspected_card_count:
+          Number.isInteger(expanded.inspected_card_count)
+            ? expanded.inspected_card_count
+            : null,
+        matching_target_card_count:
+          Number.isInteger(expanded.matching_target_card_count)
+            ? expanded.matching_target_card_count
+            : null,
+        probe_attempt: 2,
+        retry_of: "transient_empty_card_scope",
+        clicked: true,
+        read_only: true,
+        transaction_controls_excluded: true,
+      });
+    }
+    workflowDriver = {
+      ...workflowDriver,
+      action_trace: [
+        ...(Array.isArray(workflowDriver && workflowDriver.action_trace)
+          ? workflowDriver.action_trace
+          : []),
+        expanded.action,
+      ],
+    };
+    if (!qunarDetailCandidateFingerprint && expanded.candidate_fingerprint) {
+      qunarDetailCandidateFingerprint = expanded.candidate_fingerprint;
+    }
+    return true;
   };
   const restartForNextOutbound = async () => {
     const hasUntriedCandidate = outboundSelectionQueue.some(
@@ -6804,6 +7167,26 @@ async function extractWithRetry(
       continue;
     }
     if (
+      lease.provider === "qunar" &&
+      lease.kind === "flight" &&
+      extraction &&
+      extraction.state === "failed" &&
+      extraction.failure &&
+      ["dom_drift", "extraction_error"].includes(extraction.failure.code)
+    ) {
+      // Probe both directions in one bounded failure pass.  A missing
+      // outbound control must not short-circuit the independent return probe;
+      // otherwise the old branch reported DOM drift without inspecting the
+      // return-side details at all.
+      let expanded = await expandOneQunarFlightDetail();
+      if (!expanded && !qunarFlightDetailExpandAttempts.return) {
+        expanded = await expandOneQunarFlightDetail();
+      }
+      if (expanded) {
+        continue;
+      }
+    }
+    if (
       lease.provider === "ctrip" &&
       lease.kind === "flight" &&
       ctripOutboundStageNeedsWarmup(extraction) &&
@@ -6892,9 +7275,11 @@ async function extractWithRetry(
       const flightDiagnostic =
         extraction.failure.details &&
         extraction.failure.details.flight_diagnostic;
+      const providerResultsStillLoading =
+        flightDiagnostic &&
+        flightDiagnostic.outcome === "flight_results_loading";
       if (
-        !flightDiagnostic &&
-        pageStillLoading &&
+        (providerResultsStillLoading || pageStillLoading) &&
         flightLoadingDriftPolls < FLIGHT_LOADING_DOM_DRIFT_MAX_POLLS &&
         Date.now() + FLIGHT_DOM_DRIFT_POLL_INTERVAL_MS <
           extractionDeadline
@@ -10563,7 +10948,10 @@ async function recordCompletionDiagnostic(
 async function executeLease(lease) {
   let tabId = null;
   let reusedTabId = null;
-  let reusedExactLodgingResult = false;
+  let reusedExactResult = false;
+  let reusedResultUrlReadback = null;
+  let reusedResultUrlConfirmedFields = [];
+  let reusedResultConfirmationScope = null;
   let reusedPreservedIsolationWindow = false;
   let reusedPreservedWindowId = null;
   let preservedResultTabId = null;
@@ -10748,7 +11136,15 @@ async function executeLease(lease) {
           if (reusable) {
             tabId = reusable.tab_id;
             reusedTabId = reusable.tab_id;
-            reusedExactLodgingResult = true;
+            reusedExactResult = true;
+            reusedResultUrlReadback = reusable.result_url_readback || null;
+            reusedResultUrlConfirmedFields = Array.isArray(
+              reusable.result_url_confirmed_fields,
+            )
+              ? reusable.result_url_confirmed_fields
+              : [];
+            reusedResultConfirmationScope =
+              reusable.confirmation_scope || null;
             if (
               reusable.preserved_exact_result === true &&
               Number.isInteger(reusable.window_id)
@@ -10757,16 +11153,29 @@ async function executeLease(lease) {
               reusedPreservedIsolationWindow =
                 reusable.isolation_window === true;
             }
-            const readiness = await waitForTabInteractive(
-              tabId,
-              remainingTimeout(
-                stageDeadlineValue - INITIAL_LANDING_INNER_GUARD_MS,
-                INITIAL_LANDING_STAGE_CAP_MS -
-                  INITIAL_LANDING_INNER_GUARD_MS,
-              ),
-            );
-            const current = await chrome.tabs.get(tabId);
-            return { current, readiness, reused_exact_result: true };
+            try {
+              const readiness = await waitForTabInteractive(
+                tabId,
+                remainingTimeout(
+                  stageDeadlineValue - INITIAL_LANDING_INNER_GUARD_MS,
+                  INITIAL_LANDING_STAGE_CAP_MS -
+                    INITIAL_LANDING_INNER_GUARD_MS,
+                ),
+              );
+              const current = await chrome.tabs.get(tabId);
+              return { current, readiness, reused_exact_result: true };
+            } catch {
+              // A stale or crashed user tab must not poison the lease. Release
+              // the reservation and fall back to the normal read-only landing
+              // path, preserving the exact URL/readback gate above.
+              leasedExistingTabIds.delete(tabId);
+              tabId = null;
+              reusedTabId = null;
+              reusedExactResult = false;
+              reusedResultUrlReadback = null;
+              reusedResultUrlConfirmedFields = [];
+              reusedResultConfirmationScope = null;
+            }
           }
           let tab;
           if (qunarLodgingIsolationRequired) {
@@ -10827,11 +11236,14 @@ async function executeLease(lease) {
         ),
       };
     }
-    if (reusedExactLodgingResult) {
+    if (reusedExactResult) {
       browserIsolationEvidence = null;
       driver = {
         ...driver,
-        mode: "reused_exact_lodging_result",
+        mode:
+          lease.kind === "flight"
+            ? "reused_exact_flight_result"
+            : "reused_exact_lodging_result",
         triggered: true,
         confirmed_query: {
           destination: lease.query.destination,
@@ -10849,6 +11261,9 @@ async function executeLease(lease) {
         },
         confirmation_scope: "confirmed_visible_search",
         reused_exact_result_url: true,
+        reused_result_url_readback: reusedResultUrlReadback,
+        reused_result_url_confirmed_fields: reusedResultUrlConfirmedFields,
+        reused_result_url_confirmation_scope: reusedResultConfirmationScope,
         action_trace: [
           {
             action: "search",
@@ -10873,7 +11288,7 @@ async function executeLease(lease) {
       },
     );
 
-    if (!lease.query.search_url && !reusedExactLodgingResult) {
+    if (!lease.query.search_url && !reusedExactResult) {
       let preparedRun;
       try {
         preparedRun = await withStageBudget(
@@ -11826,6 +12241,7 @@ if (globalThis.__TRIPCHORD_BACKGROUND_TEST_HOOKS__) {
     tongchengLyFallbackResultUrl,
     auditedLodgingResultUrlDecision,
     auditedLodgingResultUrl,
+    auditedFlightResultUrlDecision,
     claimReusableExactLodgingResultTab,
     claimReusableExactFlightResultTab,
     preserveExactLodgingResultTab,

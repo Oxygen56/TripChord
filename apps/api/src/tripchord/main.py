@@ -83,6 +83,7 @@ from tripchord.agents.memory import (
     MemoryVolatility,
     PrivacyBoundary,
     ProviderCapabilitySeed,
+    confirmed_preference_constitution,
     seed_provider_capability_records,
 )
 from tripchord.agents.model_gateway import (
@@ -96,6 +97,8 @@ from tripchord.agents.models import AgentRole
 from tripchord.agents.package_request import (
     HybridPackageRequirementAgent,
     PackageRequestState,
+    UnresolvedRequirement,
+    project_preferences_to_intent_template,
 )
 from tripchord.agents.persistent_memory import (
     CorruptionPolicy,
@@ -143,6 +146,7 @@ from tripchord.api import (
     WeatherRequest,
     WorkspaceReplanRequest,
     WorkspaceReplanResponse,
+    build_final_plan_projection,
     create_user_quote,
     optimize_plan,
     parse_trip_request,
@@ -209,6 +213,7 @@ from tripchord.platform.search_run_builder import build_search_run, derive_scope
 from tripchord.platform.terminal import SearchRun
 from tripchord.platform.wiring_api import router as wiring_api_router
 from tripchord.providers.amap import AmapTravelDataProvider
+from tripchord.providers.arena_official import ArenaOfficialLodgingProvider
 from tripchord.providers.base import OfferSearchQuery, OfferSearchResult
 from tripchord.providers.browser_bridge import (
     BRIDGE_TOKEN_HEADER,
@@ -828,10 +833,20 @@ def _install_browser_bridge(
     selected_context_builder = context_builder or BudgetedAgentContextBuilder(
         EvidenceRagRetriever(selected_memory_store)
     )
+    # Optional model collaborators must not hold the formal live source path
+    # open for many minutes when the configured contract does not require them.
+    # Deterministic parsing, normalization, candidate generation, Planner and
+    # Verifier remain the authority for this endpoint; required-model deployments
+    # still receive the injected router unchanged.
+    # A configured local model is part of the real planning route even when
+    # advisory mode is allowed.  The deterministic verifier remains the gate;
+    # disabling the route merely because the model is not mandatory made the
+    # formal run claim model collaboration without actually calling it.
+    live_model_router = model_router
     live_system = LivePackageAgentSystem(
         bridge,
         icom_provider=icom_provider,
-        model_router=model_router,
+        model_router=live_model_router,
         model_agents_required=configured_settings.model_agents_required,
         context_builder=selected_context_builder,
         memory_store=selected_memory_store,
@@ -839,13 +854,19 @@ def _install_browser_bridge(
         sleep=sleep,
         providers=default_browser_providers_from_registry(),
         source_terminal_reporter=source_terminal_reporter,
+        official_lodging_provider=ArenaOfficialLodgingProvider(
+            captured_evidence_path=os.environ.get(
+                "TRIPCHORD_CAPTURED_ARENA_EVIDENCE_PATH"
+            ),
+            observation_dir=os.environ.get("TRIPCHORD_ARENA_OBSERVATION_DIR"),
+        ),
     )
     flexible_system = FlexibleLiveAgentSystem(
         cast(LiveDatePairRunner, live_system),
         explorer=FlexibleDateExplorer(default_platforms_from_registry()),
         query_planner=FlexibleQueryPlanBuilder(default_platforms_from_registry()),
         minimum_departure_lead_days=7,
-        model_router=model_router,
+        model_router=live_model_router,
         model_agents_required=configured_settings.model_agents_required,
         context_builder=selected_context_builder,
         memory_store=selected_memory_store,
@@ -1020,6 +1041,7 @@ if configured_job_registry_path is None and os.environ.get(
 # file — a concurrent second writer. The registry's worker spawner sets
 # ``TRIPCHORD_LIVE_WORKER_SUBPROCESS=1`` so this import-time singleton is skipped.
 _LIVE_WORKER_SUBPROCESS = os.environ.get("TRIPCHORD_LIVE_WORKER_SUBPROCESS") == "1"
+live_planning_job_registry: LivePlanningJobRegistry | None
 if not _LIVE_WORKER_SUBPROCESS:
     live_planning_job_registry = LivePlanningJobRegistry(
         state_path=(
@@ -1480,6 +1502,7 @@ async def agent_runtime_status_endpoint(
             }
             if isinstance(worker_model_identity, dict)
             and isinstance(worker_spec, dict)
+            and isinstance(worker_bundle, dict)
             and worker_spec.get("model_agents_required") is True
             else None
         ),
@@ -2132,7 +2155,12 @@ def _flexible_total_timeout_seconds(requested: int | None) -> int:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="flexible browser planning timeout must be between 60 and 3600 seconds",
         )
-    return configured if requested is None else min(requested, configured)
+    product_cap_seconds = 600
+    return min(configured, product_cap_seconds) if requested is None else min(
+        requested,
+        configured,
+        product_cap_seconds,
+    )
 
 
 def _authenticated_memory_user_id(principal: Principal) -> str:
@@ -2164,6 +2192,7 @@ def _memory_access(principal: Principal, trip_id: str) -> MemoryAccessContext:
         user_id=(None if principal.auth_mode == "development-anonymous" else principal.tenant_id),
         session_id=trip_id,
         trip_id=trip_id,
+        agent_role=AgentRole.CONTEXT,
     )
 
 
@@ -2536,6 +2565,7 @@ async def live_flexible_agent_plan_endpoint(
                     max_pairs=request.max_pairs,
                     constraints=request.constraints,
                     timeout_seconds=pair_timeout_seconds,
+                    total_timeout_seconds=total_timeout_seconds,
                     stay_plan_candidate_set=request.stay_plan_candidate_set,
                     publication_refresh_minimum_options=(
                         request.publication_refresh_minimum_options
@@ -2570,6 +2600,7 @@ async def live_flexible_agent_plan_endpoint(
     handles = await _cache_flexible_pair_runs(run, cache, principal.tenant_id)
     return LiveFlexibleAgentPlanningResponse(
         run=run,
+        final_plan=build_final_plan_projection(run),
         cached_pair_runs=handles,
     )
 
@@ -2634,11 +2665,28 @@ async def _execute_live_flexible_from_text_body(
         target_app.state.package_requirement_agent,
     )
     interpretation = await requirement_agent.parse(payload.requirement)
+    # Durable preferences are loaded only for the authenticated user and are
+    # merged after current-trip parsing.  The domain constitution gives
+    # explicit current text precedence over long-term memory; model-inferred
+    # preferences never become durable and cannot silently override either.
+    durable_preferences = confirmed_preference_constitution(
+        memory_store,
+        _memory_access(principal, "preference-context"),
+    )
+    if durable_preferences.rules:
+        interpretation = interpretation.model_copy(
+            update={
+                "preferences": durable_preferences.merged_for_trip(
+                    current=interpretation.preferences
+                )
+            }
+        )
     model_enabled = getattr(target_app.state, "model_router", None) is not None
     if interpretation.state == PackageRequestState.HUMAN_BLOCK:
         await report("blocked_before_live_search", 95)
         return LiveFlexibleFromTextPlanningResponse(
             interpretation=interpretation,
+            final_plan=None,
             model_enhancement_enabled=model_enabled,
             model_trace_scope_sha256=model_trace_scope_sha256,
             model_trace_count=0,
@@ -2659,6 +2707,36 @@ async def _execute_live_flexible_from_text_body(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="ready requirement interpretation did not provide executable constraints",
         )
+    # The parser builds the template before durable memory is loaded.  Project
+    # the already-resolved effective constitution now, so long-term rules are
+    # executable while current-trip explicit rules retain their precedence.
+    projected_template, unapplied_keys = project_preferences_to_intent_template(
+        intent_template,
+        interpretation.preferences,
+    )
+    if projected_template != intent_template or unapplied_keys:
+        diagnostics = list(interpretation.unresolved)
+        existing_fields = {item.field for item in diagnostics}
+        for key in unapplied_keys:
+            field = f"preference_application:{key}"
+            if field not in existing_fields:
+                diagnostics.append(
+                    UnresolvedRequirement(
+                        field=field,
+                        reason=(
+                            "该 typed 偏好已保留，但当前执行链没有对应的意图字段；"
+                            "不会影响候选排序或硬约束。"
+                        ),
+                        critical=False,
+                    )
+                )
+        interpretation = interpretation.model_copy(
+            update={
+                "intent_template": projected_template,
+                "unresolved": tuple(diagnostics),
+            }
+        )
+        intent_template = projected_template
     # C-122 R44 (canonical pair-set authority): the frozen gateway scenario must
     # explore the FROZEN window — the interpreter reads "玩5-8天" as a 4-7-night
     # window, which would seal non-canonical (generic) pair ids and break the
@@ -2683,9 +2761,19 @@ async def _execute_live_flexible_from_text_body(
     pair_timeout_seconds = _live_timeout_seconds(payload.timeout_seconds)
     total_timeout_seconds = _flexible_total_timeout_seconds(payload.total_timeout_seconds)
     stay_plan_candidate_set = payload.stay_plan_candidate_set
-    if stay_plan_candidate_set is None:
-        stay_area_profile = system_stay_area_search_profile(window.destination)
-        if stay_area_profile is not None:
+    stay_area_profile = system_stay_area_search_profile(window.destination)
+    if stay_area_profile is None and window.destination_code == "MLE":
+        # The user-facing parser correctly preserves "马尔代夫" as the
+        # destination phrase.  Execution still needs the audited MALÉ gateway
+        # profile so lodging tasks are bound to Maafushi/Hulhumalé rather than
+        # a meaningless country-wide hotel search.
+        stay_area_profile = system_stay_area_search_profile("马累")
+    if stay_area_profile is not None:
+        if window.destination != stay_area_profile.gateway_destination:
+            window = window.model_copy(
+                update={"destination": stay_area_profile.gateway_destination}
+            )
+        if stay_plan_candidate_set is None:
             # Natural-language users should not need to know or submit an
             # internal frozen-candidate schema.  For an audited gateway profile,
             # choose the system set before any provider result is observed.
@@ -2712,6 +2800,7 @@ async def _execute_live_flexible_from_text_body(
                     max_pairs=payload.max_pairs,
                     constraints=constraints,
                     timeout_seconds=pair_timeout_seconds,
+                    total_timeout_seconds=total_timeout_seconds,
                     stay_plan_candidate_set=stay_plan_candidate_set,
                     publication_refresh_minimum_options=(
                         payload.publication_refresh_minimum_options
@@ -2760,13 +2849,38 @@ async def _execute_live_flexible_from_text_body(
         ensure_active=(report_progress.ensure_active if report_progress is not None else None),
         search_run_recorder=(lambda live_run: _persist_search_run(principal.tenant_id, live_run)),
     )
+    model_summaries = [run.query_agentic]
+    model_summaries.extend(
+        pair.run.agentic
+        for pair in run.pair_runs
+        if pair.run is not None
+    )
+    model_trace_count = sum(item.logical_request_count for item in model_summaries)
+    model_trace_failure_count = sum(
+        stage.logical_request_count
+        for summary in model_summaries
+        for stage in summary.stages
+        if stage.failure is not None
+    )
+    model_trace_success_count = model_trace_count - model_trace_failure_count
+    applied_roles = sorted(
+        {
+            str(item["role"])
+            for pair in run.pair_runs
+            for live_run in (pair.exploration_run, pair.run)
+            if live_run is not None
+            for item in live_run.model_applied_diffs
+            if isinstance(item, dict) and isinstance(item.get("role"), str)
+        }
+    )
     execution_boundary = LIVE_FLEXIBLE_FROM_TEXT_EXECUTION_BOUNDARY
     if model_enabled:
         execution_boundary = (
-            "需求理解已由真实模型 Agent 提案并经确定性事实锁对账；"
-            "实时整包中的证据仲裁、候选策展、风险批判、Repair 策略"
-            "和主控建议同样使用受限模型 Agent；报价、金额、权限和"
-            "硬约束始终由确定性代码控制。"
+            f"本次实际发起 {model_trace_count} 次模型逻辑调用，"
+            f"成功 {model_trace_success_count} 次，"
+            f"失败 {model_trace_failure_count} 次；实际改变结果的角色："
+            f"{','.join(applied_roles) or '无（模型提案未改变确定性选择）'}。"
+            "模型只提交受限提案，候选、金额、权限和硬约束仍由确定性代码核验。"
         )
     if run.stay_area_search_profile is not None:
         assumption = run.stay_area_search_profile.assumption_zh
@@ -2778,12 +2892,13 @@ async def _execute_live_flexible_from_text_body(
     return LiveFlexibleFromTextPlanningResponse(
         interpretation=interpretation,
         run=run,
+        final_plan=build_final_plan_projection(run),
         cached_pair_runs=handles,
         model_enhancement_enabled=model_enabled,
         model_trace_scope_sha256=model_trace_scope_sha256,
-        model_trace_count=0,
-        model_trace_success_count=0,
-        model_trace_failure_count=0,
+        model_trace_count=model_trace_count,
+        model_trace_success_count=model_trace_success_count,
+        model_trace_failure_count=model_trace_failure_count,
         execution_boundary=execution_boundary,
     )
 
@@ -3318,11 +3433,27 @@ async def live_agent_plan_endpoint(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
+    # The legacy loopback route must never publish an ACCEPT-shaped partial
+    # CNY package.  The flexible route owns incomplete diagnostics; this
+    # public contract is fail-closed until every party amount is all-in.
+    if (
+        run.decision.state == PackageDecisionState.ACCEPT
+        and (
+            run.package is None
+            or run.package.budget.currency != "CNY"
+            or not run.package.budget.is_all_in_total
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="legacy live-plan cannot publish an incomplete non-all-in CNY package",
+        )
     run_id, expires_at = await cache.put(principal.tenant_id, run)
     return LiveAgentPlanningResponse(
         run_id=run_id,
         expires_at=expires_at,
         run=run,
+        final_plan=build_final_plan_projection(run),
     )
 
 
@@ -3355,6 +3486,7 @@ async def get_live_agent_plan_endpoint(
             run_id=run_id,
             expires_at=entry.expires_at,
             run=entry.run,
+            final_plan=build_final_plan_projection(entry.run),
         )
 
 
@@ -3427,6 +3559,7 @@ async def live_agent_event_replan_endpoint(
         run_id=run_id,
         expires_at=expires_at,
         run=run,
+        final_plan=build_final_plan_projection(updated),
     )
 
 

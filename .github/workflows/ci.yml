@@ -22,8 +22,9 @@ jobs:
       - run: uv run python -m training.policy_reranker
       - run: git diff --exit-code -- training/artifacts/replan-policy.json benchmarks/results/phase-7-post-training.json
       - run: |
-          uv export --frozen --no-dev --no-hashes --output-file /tmp/tripchord-requirements.txt
-          uvx pip-audit -r /tmp/tripchord-requirements.txt
+          uv export --frozen --no-dev --no-hashes --no-emit-project \
+            --output-file /tmp/tripchord-requirements.txt
+          uvx pip-audit --strict -r /tmp/tripchord-requirements.txt
       - run: |
           migration_db=$(mktemp /tmp/tripchord-migration-XXXXXX.db)
           TRIPCHORD_DATABASE_URL="sqlite+aiosqlite:///$migration_db" uv run alembic upgrade head
@@ -86,8 +87,9 @@ jobs:
       - run: uv run ruff check .
       - name: dependency audit
         run: |
-          uv export --frozen --no-dev --no-hashes --output-file /tmp/tripchord-requirements.txt
-          uvx pip-audit -r /tmp/tripchord-requirements.txt
+          uv export --frozen --no-dev --no-hashes --no-emit-project \
+            --output-file /tmp/tripchord-requirements.txt
+          uvx pip-audit --strict -r /tmp/tripchord-requirements.txt
 
   web:
     runs-on: ubuntu-latest
