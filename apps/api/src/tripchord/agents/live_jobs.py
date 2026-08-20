@@ -4468,8 +4468,8 @@ class LivePlanningJobRegistry:
                     if not entry.name.isdigit():
                         continue
                     try:
-                        command = (entry / "cmdline").read_bytes()
-                        if marker not in command.decode("utf-8", "replace"):
+                        command_bytes = (entry / "cmdline").read_bytes()
+                        if marker not in command_bytes.decode("utf-8", "replace"):
                             continue
                         stat_text = (entry / "stat").read_text(encoding="ascii")
                         _, remainder = stat_text.split(") ", 1)
@@ -4500,8 +4500,8 @@ class LivePlanningJobRegistry:
             parts = line.split(None, 2)
             if len(parts) != 3:
                 return ("unknown", None)
-            _pid_str, pgid_str, command = parts
-            if marker in command:
+            _pid_str, pgid_str, command_text = parts
+            if marker in command_text:
                 try:
                     return ("found", int(pgid_str))
                 except ValueError:
