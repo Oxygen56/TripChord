@@ -89,7 +89,10 @@ from tripchord.agents.search_supervisor import (
     apply_search_supervisor_proposal,
     materialize_search_schedule,
 )
-from tripchord.agents.stay_area import StayAreaSearchProfile
+from tripchord.agents.stay_area import (
+    StayAreaSearchProfile,
+    system_stay_area_search_profile,
+)
 from tripchord.agents.tools import ToolCall, ToolRegistry, ToolSpec
 from tripchord.domain.common import DomainModel
 from tripchord.planning.event_contracts import (
@@ -150,6 +153,7 @@ from tripchord.planning.stay_plans import (
     StayPlanRepairHandoff,
     StayPlanVerificationHandoff,
     stay_plan_for_candidate,
+    system_stay_plan_candidate_set,
 )
 from tripchord.platform.booking import BookingLedger
 from tripchord.platform.booking_gate import BookingProtectionGate, ComponentChangeSet
@@ -1473,6 +1477,7 @@ class _ApprovedExplanationClaim:
 @dataclass
 class _RunState:
     source_task_ids: tuple[str, ...]
+    source_timeout_seconds: int = 120
     intent: PackageIntent | None = None
     mode: LiveCoverageMode = LiveCoverageMode.STRICT
     # Large flexible-date exploration deliberately runs the deterministic
@@ -1494,6 +1499,7 @@ class _RunState:
         str, tuple[FlightPartyComparisonReceipt, ...]
     ] = field(default_factory=dict)
     party_price_validation_errors: dict[str, str] = field(default_factory=dict)
+    lodging_window_alignment: dict[str, JsonValue] | None = None
     source_errors: dict[str, str] = field(default_factory=dict)
     official_lodging_task: asyncio.Task[ArenaOfficialLodgingResult] | None = None
     official_lodging_result: ArenaOfficialLodgingResult | None = None
@@ -1798,9 +1804,14 @@ class LivePackageAgentSystem:
         memory_access: MemoryAccessContext | None = None,
         allow_recent_quote_reuse: bool = True,
     ) -> LivePackageAgentRun:
+        query, system_stay_contract_installed = self._with_system_stay_contract(query)
         self._validate_request(intent, query, timeout_seconds)
         stay_plan_candidate_set = self._stay_plan_candidate_set(query)
-        if stay_plan_candidate_set is not None and intent.destination_place_key is not None:
+        if (
+            stay_plan_candidate_set is not None
+            and intent.destination_place_key is not None
+            and not system_stay_contract_installed
+        ):
             raise ValueError("live-v4 cannot preselect a destination place before candidate search")
         reuse_partition_sha256 = self._quote_reuse_partition(memory_access)
         browser_source_tasks = tuple(
@@ -1861,6 +1872,7 @@ class LivePackageAgentSystem:
         all_source_ids = (*source_ids, *public_transfer_ids)
         state = _RunState(
             source_task_ids=source_ids,
+            source_timeout_seconds=timeout_seconds,
             intent=intent,
             mode=mode,
             model_agents_enabled=model_agents_enabled,
@@ -2281,6 +2293,44 @@ class LivePackageAgentSystem:
                 state.package.final_candidate if state.package is not None else None
             ),
             browser_max_concurrency=_BROWSER_MAX_CONCURRENCY,
+        )
+
+    @staticmethod
+    def _with_system_stay_contract(
+        query: BrowserSearchQuery,
+    ) -> tuple[BrowserSearchQuery, bool]:
+        """Install the audited gateway stay contract for fixed-date callers.
+
+        Flexible planning already projects this contract before invoking the
+        date-pair runner.  The fixed-date endpoint accepts the lower-level
+        ``BrowserSearchQuery`` directly, so a normal caller otherwise searches
+        every lodging segment against the gateway label (for example Malé)
+        and never binds Maafushi/Hulhumalé place evidence.  Only a completely
+        absent stay contract is filled; explicit caller configuration keeps
+        its existing validation and cannot be silently rewritten.
+        """
+
+        if {
+            "stay_area_search_profile",
+            "stay_plan_candidate_set",
+        } & query.options.keys():
+            return query, False
+        profile = system_stay_area_search_profile(query.destination)
+        if profile is None or profile.gateway_destination != query.destination:
+            return query, False
+        candidate_set = system_stay_plan_candidate_set(profile.gateway_destination)
+        return (
+            query.model_copy(
+                update={
+                    "options": {
+                        **query.options,
+                        "gateway_destination": profile.gateway_destination,
+                        "stay_area_search_profile": profile.model_dump(mode="json"),
+                        "stay_plan_candidate_set": candidate_set.model_dump(mode="json"),
+                    }
+                }
+            ),
+            True,
         )
 
     def _lodging_strategy_comparisons(
@@ -6343,9 +6393,20 @@ class LivePackageAgentSystem:
     ) -> AgentFunction:
         async def execute(
             task: AgentTask,
-            _: ContextEngine,
-            __: ToolRegistry,
+            context: ContextEngine,
+            tools: ToolRegistry,
         ) -> AgentTaskResult:
+            if (
+                task.id == "normalize-browser-quotes"
+                and state.publication_target_candidate is None
+            ):
+                state.lodging_window_alignment = (
+                    await self._align_lodging_windows_to_flight(
+                        state,
+                        context,
+                        tools,
+                    )
+                )
             if state.official_lodging_task is not None:
                 try:
                     state.official_lodging_result = await state.official_lodging_task
@@ -6477,6 +6538,9 @@ class LivePackageAgentSystem:
                 "party_price_validation_errors": _json_value(
                     dict(sorted(state.party_price_validation_errors.items()))
                 ),
+                "lodging_window_alignment": _json_value(
+                    state.lodging_window_alignment
+                ),
             }
             return self._stage_result(
                 task,
@@ -6486,6 +6550,202 @@ class LivePackageAgentSystem:
             )
 
         return execute
+
+    async def _align_lodging_windows_to_flight(
+        self,
+        state: _RunState,
+        context: ContextEngine,
+        tools: ToolRegistry,
+    ) -> dict[str, JsonValue]:
+        """Re-query exact stay dates when the usable flight arrives later.
+
+        Flight search dates are departure dates, while lodging begins on the
+        selected flight's local arrival date.  The first source wave remains
+        parallel, then this bounded correction replaces only mismatched
+        lodging scopes for providers that already returned an exact-place
+        lodging quote.  No quote is shifted or prorated in memory.
+        """
+
+        if state.stay_plan_candidate_set is None or state.intent is None:
+            return {"state": "not_applicable", "reason": "no_stay_plan_candidate_set"}
+        initial_results = self._normalize_browser_state(state)
+        initial_inventory = self._inventory_from_results(initial_results)
+        intent = state.intent
+        now = self._utc_now()
+        usable_flights = tuple(
+            flight
+            for flight in initial_inventory.flights
+            if flight.is_fresh(now)
+            and flight.has_publishable_execution_contract
+            and flight.party_total_known
+            and flight.total_for_party_cents is not None
+            and flight.origin == intent.origin
+            and flight.destination == intent.destination
+            and flight.outbound_depart_at.date() == intent.start_date
+            and flight.return_depart_at.date() == intent.end_date
+            and flight.adults == intent.adults
+            and flight.children == intent.children
+            and flight.infants == intent.infants
+            and flight.currency == intent.currency
+        )
+        stay_windows = {
+            (flight.outbound_arrive_at.date(), flight.return_depart_at.date())
+            for flight in usable_flights
+        }
+        if not usable_flights:
+            return {"state": "not_applied", "reason": "no_publishable_flight"}
+        if len(stay_windows) != 1:
+            return {
+                "state": "not_applied",
+                "reason": "multiple_flight_stay_windows",
+                "window_count": len(stay_windows),
+            }
+        stay_start, stay_end = next(iter(stay_windows))
+        selected_flight = min(
+            usable_flights,
+            key=lambda flight: (
+                flight.total_for_party_cents or 0,
+                flight.outbound_arrive_at,
+                flight.return_arrive_at,
+                flight.id,
+            ),
+        )
+        if stay_start == intent.start_date and stay_end == intent.end_date:
+            return {
+                "state": "already_aligned",
+                "flight_id": selected_flight.id,
+                "stay_start": stay_start.isoformat(),
+                "stay_end": stay_end.isoformat(),
+            }
+        flight_task_id = f"source-{selected_flight.provider}-flight"
+        flight_snapshot = state.snapshots.get(flight_task_id)
+        if flight_snapshot is None:
+            return {"state": "not_applied", "reason": "flight_snapshot_missing"}
+        lodging_providers = {
+            BrowserProvider(result.provider)
+            for result in initial_results
+            if result.usable
+            and isinstance(result.quote, NormalizedLodgingQuote)
+            and result.provider in {provider.value for provider in _LODGING_PROVIDERS}
+        }
+        if not lodging_providers:
+            return {"state": "not_applied", "reason": "no_exact_place_lodging_provider"}
+        if intent.destination_place_key == PackagePlaceKey.MAAFUSHI:
+            relevant_segments = {"full"}
+        elif intent.destination_place_key == PackagePlaceKey.HULHUMALE:
+            relevant_segments = {"hulhumale-full"}
+        else:
+            relevant_segments = set(_V4_LODGING_SEGMENTS)
+        base_query = flight_snapshot.query.model_copy(
+            update={
+                "start_date": stay_start,
+                "end_date": stay_end,
+                "search_url": None,
+            }
+        )
+        replacement_tasks: list[AgentTask] = []
+        original_snapshots: dict[str, BrowserTaskSnapshot] = {}
+        for provider in sorted(lodging_providers, key=lambda value: value.value):
+            provider_tasks = self._provider_source_tasks(
+                provider,
+                base_query,
+                state.source_timeout_seconds,
+                allow_recent_quote_reuse=False,
+                reuse_partition_sha256=None,
+            )
+            for source_task in provider_tasks:
+                submission = BrowserTaskSubmission.model_validate(
+                    source_task.input["submission"]
+                )
+                if submission.kind != BrowserVertical.LODGING:
+                    continue
+                segment = submission.query.options.get("segment")
+                if not isinstance(segment, str) or segment not in relevant_segments:
+                    continue
+                previous = state.snapshots.get(source_task.id)
+                if previous is None:
+                    continue
+                if (
+                    previous.query.start_date == submission.query.start_date
+                    and previous.query.end_date == submission.query.end_date
+                    and previous.query.destination == submission.query.destination
+                    and previous.query.options.get("expected_lodging_place_key")
+                    == submission.query.options.get("expected_lodging_place_key")
+                ):
+                    continue
+                original_snapshots[source_task.id] = previous
+                replacement_tasks.append(
+                    source_task.model_copy(
+                        update={
+                            "input": {
+                                **source_task.input,
+                                "lodging_window_alignment": {
+                                    "flight_id": selected_flight.id,
+                                    "stay_start": stay_start.isoformat(),
+                                    "stay_end": stay_end.isoformat(),
+                                },
+                            }
+                        }
+                    )
+                )
+        if not replacement_tasks:
+            return {
+                "state": "already_aligned",
+                "flight_id": selected_flight.id,
+                "stay_start": stay_start.isoformat(),
+                "stay_end": stay_end.isoformat(),
+            }
+        source_executor = self._source_executor(state)
+        task_results = await asyncio.gather(
+            *(
+                source_executor(source_task, context, tools)
+                for source_task in replacement_tasks
+            )
+        )
+        replacements: list[dict[str, JsonValue]] = []
+        for source_task, source_result in zip(
+            replacement_tasks,
+            task_results,
+            strict=True,
+        ):
+            previous = original_snapshots[source_task.id]
+            current = state.snapshots.get(source_task.id)
+            replacements.append(
+                {
+                    "source_task_id": source_task.id,
+                    "previous_browser_task_id": previous.id,
+                    "previous_start_date": previous.query.start_date.isoformat(),
+                    "previous_end_date": (
+                        previous.query.end_date.isoformat()
+                        if previous.query.end_date is not None
+                        else None
+                    ),
+                    "replacement_browser_task_id": current.id if current is not None else None,
+                    "replacement_state": (
+                        current.state.value if current is not None else "missing"
+                    ),
+                    "replacement_start_date": (
+                        current.query.start_date.isoformat() if current is not None else None
+                    ),
+                    "replacement_end_date": (
+                        current.query.end_date.isoformat()
+                        if current is not None and current.query.end_date is not None
+                        else None
+                    ),
+                    "source_result_success": source_result.success,
+                }
+            )
+        return {
+            "state": "applied",
+            "flight_id": selected_flight.id,
+            "stay_start": stay_start.isoformat(),
+            "stay_end": stay_end.isoformat(),
+            "replacement_count": len(replacements),
+            "replacements": _json_value(replacements),
+            "boundary": (
+                "仅重查日期不匹配的住宿范围；未平移、按天折算或改写旧报价。"
+            ),
+        }
 
     def _normalize_browser_state(
         self,

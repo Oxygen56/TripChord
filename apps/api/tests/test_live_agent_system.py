@@ -1454,6 +1454,186 @@ async def _run(
     return system, bridge, run
 
 
+@pytest.mark.asyncio
+async def test_fixed_date_run_installs_audited_mle_stay_contract() -> None:
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+    observed_lodging_queries: list[BrowserSearchQuery] = []
+
+    def complete(lease: BrowserTaskLease) -> BrowserTaskCompletion:
+        if lease.kind == BrowserVertical.LODGING:
+            observed_lodging_queries.append(lease.query)
+        return _success(lease)
+
+    bare_query = query().model_copy(update={"options": {}})
+    run, _ = await asyncio.gather(
+        system.run(
+            intent(),
+            bare_query,
+            mode=LiveCoverageMode.STRICT,
+            timeout_seconds=15,
+        ),
+        _serve(bridge, _V4_BROWSER_SOURCE_TASK_COUNT, complete),
+    )
+
+    assert run.stay_plan_candidate_set is not None
+    assert run.search_query.options["gateway_destination"] == "MLE"
+    assert set(run.source_task_ids) == set(_V4_BROWSER_SOURCE_IDS)
+    destination_by_segment = {
+        item.options["segment"]: (
+            item.destination,
+            item.options["expected_lodging_place_key"],
+        )
+        for item in observed_lodging_queries
+    }
+    assert destination_by_segment == {
+        "full": ("Maafushi", "maafushi"),
+        "first": ("Hulhumalé", "hulhumale"),
+        "middle": ("Maafushi", "maafushi"),
+        "last": ("Hulhumalé", "hulhumale"),
+        "hulhumale-full": ("Hulhumalé", "hulhumale"),
+    }
+    assert any(
+        result.usable and isinstance(result.quote, NormalizedLodgingQuote)
+        for result in run.normalization_results
+    )
+
+
+@pytest.mark.asyncio
+async def test_fixed_date_run_requeries_only_lodging_scopes_misaligned_with_arrival() -> None:
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+    observed_lodging_queries: list[tuple[BrowserProvider, BrowserSearchQuery]] = []
+    trip_start = date(2026, 9, 3)
+    trip_end = date(2026, 9, 9)
+
+    def complete(lease: BrowserTaskLease) -> BrowserTaskCompletion:
+        if lease.kind == BrowserVertical.LODGING:
+            observed_lodging_queries.append((lease.provider, lease.query))
+            if lease.provider == BrowserProvider.QUNAR:
+                return BrowserTaskCompletion(
+                    state=BrowserTaskState.FAILED,
+                    failure=BrowserFailure(
+                        code=BrowserFailureCode.DOM_DRIFT,
+                        message="fixture provider returned no usable exact-place quote",
+                        captured_at=NOW,
+                    ),
+                )
+            return _success(lease)
+        quote = _flight_quote(lease)
+        details = dict(quote.details)
+        outbound_segments: list[dict[str, JsonValue]] = [
+            {
+                "flight_number": "MU501",
+                "departure_airport_code": "HGH",
+                "arrival_airport_code": "PEK",
+                "departure_at": "2026-09-03T20:30:00+08:00",
+                "arrival_at": "2026-09-03T22:30:00+08:00",
+            },
+            {
+                "flight_number": "MU502",
+                "departure_airport_code": "PEK",
+                "arrival_airport_code": "MLE",
+                "departure_at": "2026-09-04T01:00:00+08:00",
+                "arrival_at": f"2026-09-04T12:20:00{MALDIVES_OFFSET}",
+            },
+        ]
+        return_segments: list[dict[str, JsonValue]] = [
+            {
+                "flight_number": "MU503",
+                "departure_airport_code": "MLE",
+                "arrival_airport_code": "PEK",
+                "departure_at": f"2026-09-09T14:20:00{MALDIVES_OFFSET}",
+                "arrival_at": "2026-09-10T05:30:00+08:00",
+            },
+            {
+                "flight_number": "MU504",
+                "departure_airport_code": "PEK",
+                "arrival_airport_code": "HGH",
+                "departure_at": "2026-09-10T06:30:00+08:00",
+                "arrival_at": "2026-09-10T09:10:00+08:00",
+            },
+        ]
+        details.update(
+            {
+                "outbound_departure_at": "2026-09-03T20:30:00+08:00",
+                "outbound_arrival_at": f"2026-09-04T12:20:00{MALDIVES_OFFSET}",
+                "return_departure_at": f"2026-09-09T14:20:00{MALDIVES_OFFSET}",
+                "return_arrival_at": "2026-09-10T09:10:00+08:00",
+                "outbound_segments": outbound_segments,
+                "return_segments": return_segments,
+            }
+        )
+        return BrowserTaskCompletion(
+            state=BrowserTaskState.SUCCEEDED,
+            quotes=(
+                _sealed_quote(
+                    lease,
+                    page_url=quote.page_url,
+                    amount=quote.amount,
+                    basis=quote.price_basis,
+                    title=quote.title,
+                    details=cast(dict[str, JsonValue], details),
+                ),
+            ),
+        )
+
+    bare_query = query().model_copy(
+        update={
+            "start_date": trip_start,
+            "end_date": trip_end,
+            "options": {},
+        }
+    )
+    trip_intent = intent().model_copy(
+        update={
+            "trip_id": "live-hgh-mle-20260903",
+            "start_date": trip_start,
+            "end_date": trip_end,
+        }
+    )
+    # The first source wave has 13 tasks. Only Ctrip returned usable exact-place
+    # lodging evidence, so the arrival-date correction adds one fresh full-stay
+    # query and does not retry flights, transfers, or the failed Qunar scopes.
+    run, _ = await asyncio.gather(
+        system.run(
+            trip_intent,
+            bare_query,
+            mode=LiveCoverageMode.STRICT,
+            timeout_seconds=15,
+        ),
+        _serve(bridge, _V4_BROWSER_SOURCE_TASK_COUNT + 1, complete),
+    )
+
+    normalizer = next(
+        result
+        for result in run.scheduler.results
+        if result.task_id == "normalize-browser-quotes"
+    )
+    alignment = cast(dict[str, JsonValue], normalizer.output["lodging_window_alignment"])
+    assert alignment["state"] == "applied"
+    assert alignment["stay_start"] == "2026-09-04"
+    assert alignment["stay_end"] == "2026-09-09"
+    assert alignment["replacement_count"] == 1
+    ctrip_full_queries = [
+        item_query
+        for provider, item_query in observed_lodging_queries
+        if provider == BrowserProvider.CTRIP
+        and item_query.options["segment"] == "full"
+    ]
+    assert [(item.start_date, item.end_date) for item in ctrip_full_queries] == [
+        (trip_start, trip_end),
+        (date(2026, 9, 4), trip_end),
+    ]
+    assert sum(
+        provider == BrowserProvider.QUNAR
+        and item_query.start_date == date(2026, 9, 4)
+        and item_query.end_date == trip_end
+        and item_query.options["segment"] == "full"
+        for provider, item_query in observed_lodging_queries
+    ) == 0
+
+
 async def _run_v4(
     mode: LiveCoverageMode,
     completion: CompletionFactory = _success,
