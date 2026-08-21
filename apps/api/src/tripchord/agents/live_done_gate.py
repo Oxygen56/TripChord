@@ -868,22 +868,26 @@ def _round_trip_quote_errors(quote: BrowserQuote) -> tuple[str, ...]:
         BrowserProvider.QUNAR: "combined_roundtrip_card",
         BrowserProvider.TONGCHENG: "staged_outbound_return",
     }[quote.provider]
-    expected_party_status = {
-        BrowserProvider.CTRIP: "confirmed_for_party",
-        BrowserProvider.FLIGGY: "comparison_only",
-        BrowserProvider.QUNAR: "confirmed_for_party",
-        BrowserProvider.TONGCHENG: "confirmed_for_party",
+    expected_party_statuses = {
+        BrowserProvider.CTRIP: {"confirmed_for_party", "observed_party_context"},
+        BrowserProvider.FLIGGY: {"comparison_only"},
+        BrowserProvider.QUNAR: {"confirmed_for_party", "observed_party_context"},
+        BrowserProvider.TONGCHENG: {"confirmed_for_party", "observed_party_context"},
     }[quote.provider]
     expected_fields = {
         "workflow_kind": expected_workflow,
         "combination_status": "round_trip_complete",
         "journey_price_scope": "round_trip",
         "price_finality": "final_for_combination",
-        "party_availability_status": expected_party_status,
     }
     for field, expected in expected_fields.items():
         if details.get(field) != expected:
             errors.append(f"{field} must be {expected}")
+    if details.get("party_availability_status") not in expected_party_statuses:
+        errors.append(
+            "party_availability_status must be one of "
+            f"{sorted(expected_party_statuses)}"
+        )
     if quote.provider == BrowserProvider.QUNAR:
         comparison = details.get("party_price_comparison")
         if not isinstance(comparison, dict) or comparison.get(
@@ -975,10 +979,30 @@ def _selected_flight_consistency_errors(
             errors.append(f"selected {field} differs from raw quote")
 
     raw_party_confirmed = quote.details.get("party_availability_status") == "confirmed_for_party"
-    if selected.party_availability_confirmed is not raw_party_confirmed:
+    derived_party_comparison = any(
+        reference.startswith("flight-party-comparison:sha256:")
+        for reference in selected.evidence_refs
+    )
+    if (
+        selected.party_availability_confirmed is not raw_party_confirmed
+        and not (
+            selected.party_availability_confirmed is True
+            and derived_party_comparison
+            and quote.details.get("party_availability_status")
+            == "observed_party_context"
+        )
+    ):
         errors.append("selected party availability differs from raw quote")
 
-    multiplier = selected.adults if quote.price_basis.value == "per_person" else 1
+    derived_per_person_comparison = (
+        selected.price_basis == "per_person"
+        and derived_party_comparison
+    )
+    multiplier = (
+        selected.adults
+        if quote.price_basis.value == "per_person" or derived_per_person_comparison
+        else 1
+    )
     raw_total = quote.amount * Decimal(multiplier) * Decimal(100)
     if raw_total != raw_total.to_integral_value():
         errors.append("raw quote total is not an integral number of cents")

@@ -311,6 +311,27 @@ class NormalizedFlightQuote(NormalizedQuote):
             return False
         if not self.origin_airport_code or not self.destination_airport_code:
             return False
+        summary_only_same_product = (
+            not self.outbound_segments
+            and not self.return_segments
+            and not self.outbound_ground_transfers
+            and not self.return_ground_transfers
+            and bool(self.outbound_flight_numbers)
+            and bool(self.return_flight_numbers)
+            and any(
+                reference.startswith("flight-party-comparison:sha256:")
+                for reference in self.evidence_refs
+            )
+            and "flight-segments:summary-only-not-expanded" in self.evidence_refs
+        )
+        if summary_only_same_product:
+            # Some provider cards expose a stable complete round-trip product,
+            # all flight numbers, exact endpoints and four whole-journey times
+            # without expanding each connection.  A server-owned 1/N receipt
+            # may rank that product, but its evidence marker keeps the missing
+            # segment detail visible; no intermediate airport or time is
+            # invented here.
+            return True
         for (
             numbers,
             segments,
@@ -2185,13 +2206,23 @@ class PackagePlanner:
         return tuple(sorted(selected.values(), key=lambda item: rank_by_id[item.id]))
 
     def _prescreen_live_inventory(self, inventory: PackageInventory) -> PackageInventory:
-        # A provider display amount with no same-product 1/2-adult proof is
+        # A provider display amount with no same-product 1/N-adult proof is
         # observation-only.  It must not reach ranking or package arithmetic,
         # even when the rest of its route evidence looks complete.
         party_total_flights = tuple(
             flight
             for flight in inventory.flights
-            if flight.party_total_known is True and flight.price_basis == "total_party"
+            if flight.party_total_known is True
+            and (
+                flight.price_basis == "total_party"
+                or (
+                    flight.price_basis == "per_person"
+                    and any(
+                        reference.startswith("flight-party-comparison:sha256:")
+                        for reference in flight.evidence_refs
+                    )
+                )
+            )
         )
         flights = self._take_diverse_flights(
             party_total_flights,

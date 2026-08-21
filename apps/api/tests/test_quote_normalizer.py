@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -17,6 +17,8 @@ from tripchord.providers.browser_bridge import (
     BrowserProvider,
     BrowserQuote,
     BrowserSearchQuery,
+    BrowserTaskSnapshot,
+    BrowserTaskState,
     BrowserVertical,
     LodgingInventoryConfirmedQuery,
     QuotePriceBasis,
@@ -677,6 +679,103 @@ def test_tongcheng_total_label_without_party_comparison_is_display_only() -> Non
     assert normalized.quote.party_total_known is False
     assert normalized.quote.total_for_party_cents is None
     assert normalized.quote.price_basis == "comparison_only"
+
+
+def _tongcheng_party_comparison_snapshot(
+    *,
+    adults: int,
+    captured_at: datetime,
+    ground_route: bool = False,
+) -> BrowserTaskSnapshot:
+    base = query().model_copy(update={"adults": adults, "search_url": None})
+    exact_query = base.model_copy(
+        update={"search_url": tongcheng_trusted_flight_search_url(base)}
+    )
+    selection = (
+        "JD5907+JD455 杭州萧山至韦拉纳；"
+        "JD456+JD5908 韦拉纳至杭州萧山；余5张"
+    )
+    if ground_route:
+        selection += "；HZD至HGH巴士地面联运"
+    raw = browser_quote(
+        BrowserVertical.FLIGHT,
+        provider=BrowserProvider.TONGCHENG,
+        amount="4101",
+        basis=QuotePriceBasis.TOTAL_PARTY,
+        search_query=exact_query,
+        details_update={
+            "adults": adults,
+            "driver": _trusted_flight_driver(BrowserProvider.TONGCHENG, exact_query),
+            "party_availability_status": "observed_party_context",
+            "selection_evidence": selection,
+            "price_text": "¥4101含税总价",
+            "price_basis_evidence": "¥4101含税总价",
+            "price_basis_source": "visible_total_label_unverified_party_v1",
+            "combination_id": "stable-jd5907-jd455-jd456-jd5908",
+            "origin_airport_code": "HGH",
+            "destination_airport_code": "MLE",
+            "outbound_flight_numbers": ["JD5907", "JD455"],
+            "return_flight_numbers": ["JD456", "JD5908"],
+        },
+    ).model_copy(update={"captured_at": captured_at})
+    return BrowserTaskSnapshot(
+        id=f"browser-task-tongcheng-{adults}",
+        provider=BrowserProvider.TONGCHENG,
+        kind=BrowserVertical.FLIGHT,
+        query=exact_query,
+        state=BrowserTaskState.SUCCEEDED,
+        created_at=captured_at,
+        updated_at=captured_at,
+        attempt_count=1,
+        quotes=(raw,),
+    )
+
+
+def test_server_owned_same_product_one_n_receipt_enters_party_total() -> None:
+    normalizer = BrowserQuoteNormalizer()
+    requested = _tongcheng_party_comparison_snapshot(
+        adults=2,
+        captured_at=CAPTURED,
+    )
+    one = _tongcheng_party_comparison_snapshot(
+        adults=1,
+        captured_at=CAPTURED + timedelta(seconds=30),
+    )
+
+    receipts = normalizer.derive_flight_party_comparison_receipts(requested, one)
+    assert len(receipts) == 1
+    assert receipts[0].price_basis == "per_person"
+    assert receipts[0].total_for_party_cents == 820_200
+    normalized = normalizer.normalize_many(
+        requested.quotes,
+        requested.query,
+        party_price_comparisons=receipts,
+    )[0]
+
+    assert isinstance(normalized.quote, NormalizedFlightQuote)
+    assert normalized.quote.party_total_known is True
+    assert normalized.quote.party_availability_confirmed is True
+    assert normalized.quote.price_basis == "per_person"
+    assert normalized.quote.total_for_party_cents == 820_200
+    assert "price-scope:derived-comparison-not-settlement-lock" in (
+        normalized.quote.evidence_refs
+    )
+
+
+def test_one_n_receipt_rejects_ground_transport_product() -> None:
+    normalizer = BrowserQuoteNormalizer()
+    requested = _tongcheng_party_comparison_snapshot(
+        adults=2,
+        captured_at=CAPTURED,
+        ground_route=True,
+    )
+    one = _tongcheng_party_comparison_snapshot(
+        adults=1,
+        captured_at=CAPTURED + timedelta(seconds=30),
+        ground_route=True,
+    )
+
+    assert normalizer.derive_flight_party_comparison_receipts(requested, one) == ()
 
 
 def test_qunar_exact_party_result_card_is_usable_without_booking_control() -> None:

@@ -32,6 +32,8 @@ from tripchord.providers.browser_bridge import (
     BrowserProvider,
     BrowserQuote,
     BrowserSearchQuery,
+    BrowserTaskSnapshot,
+    BrowserTaskState,
     BrowserVertical,
     LodgingInventoryReceipt,
     LodgingInventoryReceiptState,
@@ -95,6 +97,129 @@ class NormalizedBrowserQuoteResult(DomainModel):
     @property
     def usable(self) -> bool:
         return self.status == QuoteNormalizationStatus.USABLE and self.quote is not None
+
+
+class FlightPartyPriceObservation(DomainModel):
+    """One immutable browser observation used by the server-owned 1/N proof."""
+
+    task_id: str = Field(min_length=1)
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    adults: int = Field(ge=1, le=9)
+    amount_cents: int = Field(gt=0)
+    captured_at: datetime
+    expires_at: datetime
+    same_product_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    query_and_readback_confirmed: bool = True
+    taxes_included: bool = True
+    available_for_requested_adults: bool = True
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> FlightPartyPriceObservation:
+        if self.expires_at <= self.captured_at:
+            raise ValueError("party-price observation expiry must follow capture")
+        if not self.query_and_readback_confirmed:
+            raise ValueError("party-price observation requires query/readback confirmation")
+        if not self.taxes_included:
+            raise ValueError("party-price observation requires tax-inclusive evidence")
+        if not self.available_for_requested_adults:
+            raise ValueError("party-price observation requires requested-party availability")
+        return self
+
+
+class FlightPartyComparisonReceipt(DomainModel):
+    """Provider-agnostic, server-owned proof derived from exact 1/N searches.
+
+    The receipt never mutates either browser quote.  It is a separate,
+    hash-addressed comparison artifact and deliberately describes a comparison
+    amount rather than a settlement lock or held inventory.
+    """
+
+    schema_version: str = Field(
+        default="tripchord.flight_party_comparison.v2",
+        pattern=r"^tripchord\.flight_party_comparison\.v2$",
+        validation_alias="schema",
+        serialization_alias="schema",
+    )
+    verification: str = Field(
+        default="server_owned_same_product",
+        pattern=r"^server_owned_same_product$",
+    )
+    provider: BrowserProvider
+    currency: str = Field(min_length=3, max_length=3)
+    origin_code: str = Field(pattern=r"^[A-Z]{3}$")
+    destination_code: str = Field(pattern=r"^[A-Z]{3}$")
+    start_date: date
+    end_date: date
+    requested_adults: int = Field(ge=2, le=9)
+    same_product_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    outbound_flight_numbers: tuple[str, ...] = Field(min_length=1)
+    return_flight_numbers: tuple[str, ...] = Field(min_length=1)
+    outbound_times: tuple[datetime, datetime]
+    return_times: tuple[datetime, datetime]
+    price_basis: str = Field(pattern=r"^(?:per_person|total_party)$")
+    derivation_method: str = Field(
+        pattern=r"^(?:equal_display_amounts_imply_per_adult|explicit_n_party_total)$"
+    )
+    display_amount_cents: int = Field(gt=0)
+    total_for_party_cents: int = Field(gt=0)
+    capture_skew_seconds: float = Field(ge=0)
+    validity_overlap_start: datetime
+    validity_overlap_end: datetime
+    one_adult: FlightPartyPriceObservation
+    requested_party: FlightPartyPriceObservation
+    settlement_locked: bool = False
+    inventory_locked: bool = False
+
+    @model_validator(mode="after")
+    def validate_receipt(self) -> FlightPartyComparisonReceipt:
+        if self.end_date < self.start_date:
+            raise ValueError("party-price comparison dates are inverted")
+        if self.validity_overlap_end <= self.validity_overlap_start:
+            raise ValueError("party-price comparison freshness windows do not overlap")
+        if self.one_adult.adults != 1:
+            raise ValueError("party-price comparison baseline must contain one adult")
+        if self.requested_party.adults != self.requested_adults:
+            raise ValueError("party-price comparison requested-party count differs")
+        if any(
+            item.same_product_fingerprint != self.same_product_fingerprint
+            for item in (self.one_adult, self.requested_party)
+        ):
+            raise ValueError("party-price comparison observations are not the same product")
+        if self.display_amount_cents != self.requested_party.amount_cents:
+            raise ValueError("display amount must bind the requested-party observation")
+        if self.price_basis == "per_person":
+            if self.derivation_method != "equal_display_amounts_imply_per_adult":
+                raise ValueError("per-person proof requires equal-display derivation")
+            if self.one_adult.amount_cents != self.requested_party.amount_cents:
+                raise ValueError("per-person proof requires equal 1/N display amounts")
+            if self.total_for_party_cents != (
+                self.one_adult.amount_cents * self.requested_adults
+            ):
+                raise ValueError("per-person proof total does not equal amount times adults")
+        else:
+            if self.derivation_method != "explicit_n_party_total":
+                raise ValueError("party-total proof requires explicit-total derivation")
+            if self.requested_party.amount_cents != (
+                self.one_adult.amount_cents * self.requested_adults
+            ):
+                raise ValueError("party-total proof does not equal the 1-adult multiple")
+            if self.total_for_party_cents != self.requested_party.amount_cents:
+                raise ValueError("party-total proof must use the requested-party amount")
+        if self.settlement_locked or self.inventory_locked:
+            raise ValueError("comparison receipt cannot claim settlement or inventory lock")
+        return self
+
+
+def flight_party_comparison_receipt_sha256(
+    receipt: FlightPartyComparisonReceipt,
+) -> str:
+    canonical = json.dumps(
+        receipt.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 class _RejectNormalization(ValueError):
@@ -169,12 +294,19 @@ class BrowserQuoteNormalizer:
         self,
         quote: BrowserQuote,
         query: BrowserSearchQuery,
+        *,
+        party_price_comparisons: tuple[FlightPartyComparisonReceipt, ...] = (),
     ) -> NormalizedBrowserQuoteResult:
         primary: NormalizedPrimaryQuote
         try:
             search_url_contract = self._validate_common(quote, query)
             if quote.kind == BrowserVertical.FLIGHT:
-                primary = self._flight(quote, query, search_url_contract)
+                primary = self._flight(
+                    quote,
+                    query,
+                    search_url_contract,
+                    party_price_comparisons=party_price_comparisons,
+                )
                 transfers: tuple[TransferOption, ...] = ()
                 transfer_issues: tuple[QuoteNormalizationIssue, ...] = ()
             elif quote.kind == BrowserVertical.LODGING:
@@ -211,8 +343,17 @@ class BrowserQuoteNormalizer:
         self,
         quotes: tuple[BrowserQuote, ...],
         query: BrowserSearchQuery,
+        *,
+        party_price_comparisons: tuple[FlightPartyComparisonReceipt, ...] = (),
     ) -> tuple[NormalizedBrowserQuoteResult, ...]:
-        return tuple(self.normalize(quote, query) for quote in quotes)
+        return tuple(
+            self.normalize(
+                quote,
+                query,
+                party_price_comparisons=party_price_comparisons,
+            )
+            for quote in quotes
+        )
 
     def _validate_common(
         self,
@@ -1419,6 +1560,8 @@ class BrowserQuoteNormalizer:
         quote: BrowserQuote,
         query: BrowserSearchQuery,
         search_url_contract: TrustedSearchUrlContract | None,
+        *,
+        party_price_comparisons: tuple[FlightPartyComparisonReceipt, ...],
     ) -> NormalizedFlightQuote:
         if query.origin is None or query.end_date is None:
             raise _RejectNormalization(
@@ -1499,6 +1642,18 @@ class BrowserQuoteNormalizer:
                 quote=quote,
             )
         )
+        party_comparison = next(
+            (
+                receipt
+                for receipt in party_price_comparisons
+                if self._valid_party_comparison_receipt(
+                    receipt,
+                    query=query,
+                    quote=quote,
+                )
+            ),
+            None,
+        )
         provider_has_explicit_basis = quote.provider not in {
             BrowserProvider.QUNAR,
             BrowserProvider.TONGCHENG,
@@ -1506,9 +1661,12 @@ class BrowserQuoteNormalizer:
             QuotePriceBasis.PER_PERSON,
             QuotePriceBasis.TOTAL_PARTY,
         }
+        single_adult_total = adults == 1 and children == 0 and infants == 0
         party_total_known = bool(
             provider_has_explicit_basis
             or qunar_party_comparison
+            or party_comparison is not None
+            or single_adult_total
         )
         requires_party_total_label = quote.price_basis == QuotePriceBasis.TOTAL_PARTY
         # A visible "含税总价" on a Qunar/Tongcheng round-trip card is useful
@@ -1544,6 +1702,16 @@ class BrowserQuoteNormalizer:
         if provider_has_explicit_basis:
             calculation_price_basis = quote.price_basis
             effective_price_basis = quote.price_basis.value
+        elif party_comparison is not None:
+            calculation_price_basis = (
+                QuotePriceBasis.PER_PERSON
+                if party_comparison.price_basis == "per_person"
+                else QuotePriceBasis.TOTAL_PARTY
+            )
+            effective_price_basis = party_comparison.price_basis
+        elif single_adult_total:
+            calculation_price_basis = QuotePriceBasis.PER_PERSON
+            effective_price_basis = QuotePriceBasis.PER_PERSON.value
         elif party_total_known:
             calculation_price_basis = QuotePriceBasis.TOTAL_PARTY
             effective_price_basis = QuotePriceBasis.TOTAL_PARTY.value
@@ -1551,7 +1719,9 @@ class BrowserQuoteNormalizer:
             calculation_price_basis = QuotePriceBasis.PER_PERSON
             effective_price_basis = "comparison_only"
         total: int | None
-        if qunar_party_comparison:
+        if party_comparison is not None:
+            total = party_comparison.total_for_party_cents
+        elif qunar_party_comparison:
             assert isinstance(qunar_party_comparison_payload, dict)
             total = cast(int, qunar_party_comparison_payload["two_adult_amount"])
         else:
@@ -1576,6 +1746,7 @@ class BrowserQuoteNormalizer:
                 )
         party_availability_confirmed = (
             self._str(quote.details, "party_availability_status") == "confirmed_for_party"
+            or party_comparison is not None
         )
         if (
             search_url_contract is not None
@@ -1587,6 +1758,20 @@ class BrowserQuoteNormalizer:
                 "flight party availability status disagrees with the trusted URL contract",
                 field="party_availability_status",
             )
+        evidence_refs = list(self._evidence_refs(quote))
+        if party_comparison is not None:
+            comparison_sha256 = flight_party_comparison_receipt_sha256(party_comparison)
+            evidence_refs.extend(
+                (
+                    f"flight-party-comparison:sha256:{comparison_sha256}",
+                    f"browser-task:{party_comparison.one_adult.task_id}",
+                    f"browser:{quote.provider.value}:sha256:"
+                    f"{party_comparison.one_adult.evidence_sha256}",
+                    f"browser-task:{party_comparison.requested_party.task_id}",
+                    "price-scope:derived-comparison-not-settlement-lock",
+                    "flight-segments:summary-only-not-expanded",
+                )
+            )
         return NormalizedFlightQuote(
             id=self._quote_id(quote),
             provider=quote.provider.value,
@@ -1597,7 +1782,7 @@ class BrowserQuoteNormalizer:
             captured_at=quote.captured_at,
             expires_at=quote.captured_at + self._quote_ttl,
             availability=self._availability(quote.details),
-            evidence_refs=self._evidence_refs(quote),
+            evidence_refs=tuple(dict.fromkeys(evidence_refs)),
             origin=query.origin,
             destination=query.destination,
             adults=adults,
@@ -1625,10 +1810,16 @@ class BrowserQuoteNormalizer:
             origin_airport_code=self._optional_iata_code(
                 quote.details,
                 "origin_airport_code",
-            ),
+            )
+            or (party_comparison.origin_code if party_comparison is not None else None),
             destination_airport_code=self._optional_iata_code(
                 quote.details,
                 "destination_airport_code",
+            )
+            or (
+                party_comparison.destination_code
+                if party_comparison is not None
+                else None
             ),
             outbound_flight_numbers=self._optional_string_tuple(
                 quote.details,
@@ -1664,6 +1855,415 @@ class BrowserQuoteNormalizer:
                 quote.details,
                 "fare_rule_summary",
             ),
+        )
+
+    def derive_flight_party_comparison_receipts(
+        self,
+        requested_party_snapshot: BrowserTaskSnapshot,
+        one_adult_snapshot: BrowserTaskSnapshot,
+    ) -> tuple[FlightPartyComparisonReceipt, ...]:
+        """Derive strict same-product 1/N receipts without editing raw evidence."""
+
+        requested_query = requested_party_snapshot.query
+        one_query = one_adult_snapshot.query
+        if (
+            requested_party_snapshot.state != BrowserTaskState.SUCCEEDED
+            or one_adult_snapshot.state != BrowserTaskState.SUCCEEDED
+            or requested_party_snapshot.kind != BrowserVertical.FLIGHT
+            or one_adult_snapshot.kind != BrowserVertical.FLIGHT
+            or requested_party_snapshot.provider != one_adult_snapshot.provider
+            or requested_query.adults <= 1
+            or requested_query.children != 0
+            or requested_query.infants != 0
+            or one_query.adults != 1
+            or one_query.children != 0
+            or one_query.infants != 0
+            or requested_query.origin != one_query.origin
+            or requested_query.destination != one_query.destination
+            or requested_query.origin_code is None
+            or requested_query.destination_code is None
+            or requested_query.origin_code != one_query.origin_code
+            or requested_query.destination_code != one_query.destination_code
+            or requested_query.start_date != one_query.start_date
+            or requested_query.end_date is None
+            or requested_query.end_date != one_query.end_date
+            or requested_query.currency != one_query.currency
+        ):
+            return ()
+
+        requested_rows = self._comparison_observation_rows(
+            requested_party_snapshot,
+        )
+        one_rows = self._comparison_observation_rows(one_adult_snapshot)
+        receipts: list[FlightPartyComparisonReceipt] = []
+        for requested_quote, requested_normalized, requested_fingerprint in requested_rows:
+            for one_quote, one_normalized, one_fingerprint in one_rows:
+                if requested_fingerprint != one_fingerprint:
+                    continue
+                overlap_start = max(
+                    requested_normalized.captured_at,
+                    one_normalized.captured_at,
+                )
+                overlap_end = min(
+                    requested_normalized.expires_at,
+                    one_normalized.expires_at,
+                )
+                if overlap_end <= overlap_start:
+                    continue
+                requested_amount = self._literal_amount_cents(requested_quote)
+                one_amount = self._literal_amount_cents(one_quote)
+                if requested_amount is None or one_amount is None:
+                    continue
+                adults = requested_query.adults
+                if requested_amount == one_amount:
+                    price_basis = QuotePriceBasis.PER_PERSON.value
+                    derivation_method = "equal_display_amounts_imply_per_adult"
+                    total = one_amount * adults
+                elif (
+                    requested_amount == one_amount * adults
+                    and self._explicit_requested_party_total_label(
+                        requested_quote,
+                        adults=adults,
+                    )
+                ):
+                    price_basis = QuotePriceBasis.TOTAL_PARTY.value
+                    derivation_method = "explicit_n_party_total"
+                    total = requested_amount
+                else:
+                    continue
+                capture_skew = abs(
+                    (
+                        requested_normalized.captured_at
+                        - one_normalized.captured_at
+                    ).total_seconds()
+                )
+                receipt = FlightPartyComparisonReceipt(
+                    provider=requested_party_snapshot.provider,
+                    currency=requested_query.currency,
+                    origin_code=requested_query.origin_code,
+                    destination_code=requested_query.destination_code,
+                    start_date=requested_query.start_date,
+                    end_date=requested_query.end_date,
+                    requested_adults=adults,
+                    same_product_fingerprint=requested_fingerprint,
+                    outbound_flight_numbers=requested_normalized.outbound_flight_numbers,
+                    return_flight_numbers=requested_normalized.return_flight_numbers,
+                    outbound_times=(
+                        requested_normalized.outbound_depart_at,
+                        requested_normalized.outbound_arrive_at,
+                    ),
+                    return_times=(
+                        requested_normalized.return_depart_at,
+                        requested_normalized.return_arrive_at,
+                    ),
+                    price_basis=price_basis,
+                    derivation_method=derivation_method,
+                    display_amount_cents=requested_amount,
+                    total_for_party_cents=total,
+                    capture_skew_seconds=capture_skew,
+                    validity_overlap_start=overlap_start,
+                    validity_overlap_end=overlap_end,
+                    one_adult=FlightPartyPriceObservation(
+                        task_id=one_adult_snapshot.id,
+                        evidence_sha256=one_quote.evidence_sha256,
+                        adults=1,
+                        amount_cents=one_amount,
+                        captured_at=one_normalized.captured_at,
+                        expires_at=one_normalized.expires_at,
+                        same_product_fingerprint=one_fingerprint,
+                        available_for_requested_adults=True,
+                    ),
+                    requested_party=FlightPartyPriceObservation(
+                        task_id=requested_party_snapshot.id,
+                        evidence_sha256=requested_quote.evidence_sha256,
+                        adults=adults,
+                        amount_cents=requested_amount,
+                        captured_at=requested_normalized.captured_at,
+                        expires_at=requested_normalized.expires_at,
+                        same_product_fingerprint=requested_fingerprint,
+                        available_for_requested_adults=True,
+                    ),
+                )
+                receipts.append(receipt)
+        return tuple(
+            sorted(
+                receipts,
+                key=lambda item: (
+                    item.total_for_party_cents,
+                    item.same_product_fingerprint,
+                ),
+            )
+        )
+
+    def _comparison_observation_rows(
+        self,
+        snapshot: BrowserTaskSnapshot,
+    ) -> tuple[tuple[BrowserQuote, NormalizedFlightQuote, str], ...]:
+        rows: list[tuple[BrowserQuote, NormalizedFlightQuote, str]] = []
+        for quote in snapshot.quotes:
+            normalized_result = self.normalize(quote, snapshot.query)
+            normalized = normalized_result.quote
+            if (
+                not normalized_result.usable
+                or not isinstance(normalized, NormalizedFlightQuote)
+                or normalized.availability != QuoteAvailability.AVAILABLE
+                or quote.taxes_included is not True
+                or not self._visible_party_availability_proves_count(
+                    quote,
+                    adults=snapshot.query.adults,
+                )
+            ):
+                continue
+            product_payload = self._same_flight_product_payload(
+                quote,
+                normalized,
+                snapshot.query,
+            )
+            if product_payload is None:
+                continue
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    product_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            rows.append((quote, normalized, fingerprint))
+        return tuple(rows)
+
+    def _same_flight_product_payload(
+        self,
+        quote: BrowserQuote,
+        normalized: NormalizedFlightQuote,
+        query: BrowserSearchQuery,
+    ) -> dict[str, JsonValue] | None:
+        combination_id = quote.details.get("combination_id")
+        if (
+            not isinstance(combination_id, str)
+            or not combination_id.strip()
+            or not normalized.outbound_flight_numbers
+            or not normalized.return_flight_numbers
+            or normalized.outbound_ground_transfers
+            or normalized.return_ground_transfers
+            or query.origin_code is None
+            or query.destination_code is None
+            or not self._observed_route_endpoints_match(
+                quote,
+                query=query,
+            )
+            or self._observed_ground_transport_or_wrong_station(quote)
+        ):
+            return None
+        optional_identity_fields = (
+            "provider_itinerary_id",
+            "cabin_class",
+            "checked_baggage_per_adult_kg",
+            "fare_basis_codes",
+            "fare_rule_summary",
+            "carrier_text",
+            "baggage_text",
+        )
+        optional_identity: dict[str, JsonValue] = {}
+        for field_name in optional_identity_fields:
+            value = quote.details.get(field_name)
+            if value is not None:
+                optional_identity[field_name] = value
+        return {
+            "provider": quote.provider.value,
+            "transport_mode": "flight",
+            "origin_airport_code": query.origin_code,
+            "destination_airport_code": query.destination_code,
+            "combination_id": combination_id,
+            "outbound_flight_numbers": list(normalized.outbound_flight_numbers),
+            "return_flight_numbers": list(normalized.return_flight_numbers),
+            "outbound_depart_at": normalized.outbound_depart_at.isoformat(),
+            "outbound_arrive_at": normalized.outbound_arrive_at.isoformat(),
+            "return_depart_at": normalized.return_depart_at.isoformat(),
+            "return_arrive_at": normalized.return_arrive_at.isoformat(),
+            "optional_identity": optional_identity,
+        }
+
+    def _visible_party_availability_proves_count(
+        self,
+        quote: BrowserQuote,
+        *,
+        adults: int,
+    ) -> bool:
+        driver = quote.details.get("driver")
+        if not isinstance(driver, dict):
+            return False
+        confirmed = driver.get("confirmed_query")
+        readback = driver.get("readback_query")
+        if (
+            driver.get("party_availability_confirmed") is not True
+            or not isinstance(confirmed, dict)
+            or not isinstance(readback, dict)
+            or confirmed.get("adults") != adults
+            or readback.get("adults") != adults
+        ):
+            return False
+        if quote.details.get("party_availability_status") == "confirmed_for_party":
+            return True
+        availability_text = " ".join(
+            self._comparison_visible_text(value)
+            for value in (
+                quote.details.get("availability_evidence"),
+                quote.details.get("selection_evidence"),
+                quote.details.get("return_route_evidence"),
+            )
+        )
+        visible_counts = tuple(
+            int(match.group(1))
+            for match in re.finditer(r"余\s*(\d+)\s*张", availability_text)
+        )
+        return bool(visible_counts and max(visible_counts) >= adults)
+
+    def _observed_route_endpoints_match(
+        self,
+        quote: BrowserQuote,
+        *,
+        query: BrowserSearchQuery,
+    ) -> bool:
+        if query.origin_code is None or query.destination_code is None:
+            return False
+        aliases = {
+            "HGH": ("HGH", "杭州萧山", "萧山国际机场", "萧山机场"),
+            "MLE": ("MLE", "韦拉纳", "维拉纳", "马累"),
+        }
+
+        def endpoint_matches(route: object, *, departure: str, arrival: str) -> bool:
+            if not isinstance(route, dict):
+                return False
+            if (
+                route.get("departure_matches_requested") is not True
+                or route.get("arrival_matches_requested") is not True
+                or route.get("direction_order_confirmed") is not True
+                or route.get("matches_expected") is not True
+            ):
+                return False
+            for key, expected in (
+                ("observed_departure_code", departure),
+                ("observed_arrival_code", arrival),
+            ):
+                observed = route.get(key)
+                if observed is not None and observed != expected:
+                    return False
+            departure_text = " ".join(
+                str(route.get(key, ""))
+                for key in (
+                    "observed_departure_code",
+                    "observed_departure_label",
+                    "visible_evidence",
+                )
+            )
+            arrival_text = " ".join(
+                str(route.get(key, ""))
+                for key in (
+                    "observed_arrival_code",
+                    "observed_arrival_label",
+                    "visible_evidence",
+                )
+            )
+            return any(
+                alias in departure_text
+                for alias in aliases.get(departure, (departure,))
+            ) and any(
+                alias in arrival_text
+                for alias in aliases.get(arrival, (arrival,))
+            )
+
+        return endpoint_matches(
+            quote.details.get("outbound_route_evidence"),
+            departure=query.origin_code,
+            arrival=query.destination_code,
+        ) and endpoint_matches(
+            quote.details.get("return_route_evidence"),
+            departure=query.destination_code,
+            arrival=query.origin_code,
+        )
+
+    def _observed_ground_transport_or_wrong_station(self, quote: BrowserQuote) -> bool:
+        scoped_text = " ".join(
+            self._comparison_visible_text(value)
+            for value in (
+                quote.details.get("outbound_route_evidence"),
+                quote.details.get("return_route_evidence"),
+                quote.details.get("selection_evidence"),
+                quote.details.get("connection_text"),
+                quote.details.get("outbound_leg"),
+                quote.details.get("return_leg"),
+                quote.details.get("outbound_segments"),
+                quote.details.get("return_segments"),
+            )
+        )
+        return bool(
+            re.search(
+                r"(?:\bHZD\b|\bHHL\b|巴士|汽车|地面联运|火车|高铁|\bbus\b|\bcoach\b|\brail\b)",
+                scoped_text,
+                re.IGNORECASE,
+            )
+        )
+
+    def _comparison_visible_text(self, value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        return ""
+
+    def _literal_amount_cents(self, quote: BrowserQuote) -> int | None:
+        scaled = quote.amount * Decimal(100)
+        integral = scaled.to_integral_value()
+        if scaled != integral or integral <= 0:
+            return None
+        return int(integral)
+
+    def _explicit_requested_party_total_label(
+        self,
+        quote: BrowserQuote,
+        *,
+        adults: int,
+    ) -> bool:
+        price_text = quote.details.get("price_text")
+        if not isinstance(price_text, str):
+            return False
+        party_pattern = rf"(?:{adults}\s*(?:名|位)?成人|{adults}\s*人|全部|全体|所有旅客)"
+        return bool(
+            re.search(
+                rf"{party_pattern}[^\u00a5￥$]{{0,18}}(?:含税)?(?:总价|合计)",
+                price_text,
+                re.IGNORECASE,
+            )
+            or re.search(
+                rf"(?:含税)?(?:总价|合计)[^\u00a5￥$]{{0,18}}{party_pattern}",
+                price_text,
+                re.IGNORECASE,
+            )
+        )
+
+    def _valid_party_comparison_receipt(
+        self,
+        receipt: FlightPartyComparisonReceipt,
+        *,
+        query: BrowserSearchQuery,
+        quote: BrowserQuote,
+    ) -> bool:
+        return not (
+            query.end_date is None
+            or query.children != 0
+            or query.infants != 0
+            or receipt.provider != quote.provider
+            or receipt.currency != quote.currency
+            or receipt.origin_code != query.origin_code
+            or receipt.destination_code != query.destination_code
+            or receipt.start_date != query.start_date
+            or receipt.end_date != query.end_date
+            or receipt.requested_adults != query.adults
+            or receipt.requested_party.evidence_sha256 != quote.evidence_sha256
+            or receipt.requested_party.amount_cents != self._literal_amount_cents(quote)
+            or receipt.settlement_locked
+            or receipt.inventory_locked
         )
 
     def _valid_qunar_party_comparison(

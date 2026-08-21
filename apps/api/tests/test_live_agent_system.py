@@ -963,6 +963,50 @@ def _success(lease: BrowserTaskLease) -> BrowserTaskCompletion:
     )
 
 
+def _success_with_tongcheng_one_n_comparison(
+    lease: BrowserTaskLease,
+) -> BrowserTaskCompletion:
+    if lease.provider != BrowserProvider.TONGCHENG or lease.kind != BrowserVertical.FLIGHT:
+        return _success(lease)
+    quote = _flight_quote(lease)
+    amount = Decimal(4101)
+    details = dict(quote.details)
+    details.update(
+        {
+            "adults": lease.query.adults,
+            "price_text": "¥4101含税总价",
+            "price_basis_evidence": "¥4101含税总价",
+            "price_basis_source": "visible_total_label_unverified_party_v1",
+            "party_availability_status": "observed_party_context",
+            "availability_evidence": "visible_enabled_预订_control_observed_not_clicked",
+            "selection_evidence": (
+                "JD5907+JD455 HGH→MLE；JD456+JD5908 MLE→HGH；"
+                "当前查询可见余5张"
+            ),
+            "combination_id": "stable-jd5907-jd455-jd456-jd5908",
+            "outbound_flight_numbers": ["JD5907", "JD455"],
+            "return_flight_numbers": ["JD456", "JD5908"],
+        }
+    )
+    details.pop("outbound_segments", None)
+    details.pop("return_segments", None)
+    details.pop("origin_airport_code", None)
+    details.pop("destination_airport_code", None)
+    return BrowserTaskCompletion(
+        state=BrowserTaskState.SUCCEEDED,
+        quotes=(
+            _sealed_quote(
+                lease,
+                page_url=quote.page_url,
+                amount=amount,
+                basis=QuotePriceBasis.TOTAL_PARTY,
+                title=quote.title,
+                details=cast(dict[str, JsonValue], details),
+            ),
+        ),
+    )
+
+
 def _success_with_unusable_flight_price(
     lease: BrowserTaskLease,
 ) -> BrowserTaskCompletion:
@@ -6814,6 +6858,60 @@ async def test_flight_search_outcomes_cover_three_platforms_without_budget_conta
     ).passed
     assert "搜索完成不等于拿到最终报价" in run.claim_boundary
     assert "库存锁定" in run.claim_boundary
+
+
+@pytest.mark.asyncio
+async def test_tongcheng_source_adds_one_adult_proof_and_ranks_derived_party_total() -> None:
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+    run, _ = await asyncio.gather(
+        system.run(
+            intent().model_copy(update={"destination_place_key": None}),
+            v4_query(),
+            mode=LiveCoverageMode.STRICT,
+            timeout_seconds=15,
+        ),
+        _serve(
+            bridge,
+            _V4_BROWSER_SOURCE_TASK_COUNT + 1,
+            _success_with_tongcheng_one_n_comparison,
+        ),
+    )
+
+    tongcheng = next(
+        result.quote
+        for result in run.normalization_results
+        if result.usable
+        and isinstance(result.quote, NormalizedFlightQuote)
+        and result.quote.provider == BrowserProvider.TONGCHENG.value
+    )
+    assert tongcheng.party_total_known is True
+    assert tongcheng.party_availability_confirmed is True
+    assert tongcheng.price_basis == "per_person"
+    assert tongcheng.display_amount_cents == 410_100
+    assert tongcheng.total_for_party_cents == 820_200
+    assert tongcheng.has_publishable_execution_contract
+    assert any(
+        reference.startswith("flight-party-comparison:sha256:")
+        for reference in tongcheng.evidence_refs
+    )
+    assert tongcheng in run.inventory.flights
+    tongcheng_outcome = next(
+        outcome
+        for outcome in run.flight_search_outcomes
+        if outcome.provider == BrowserProvider.TONGCHENG
+    )
+    assert tongcheng_outcome.state == FlightSearchOutcomeState.QUOTE_FOUND
+    assert tongcheng_outcome.quote_ids == (tongcheng.id,)
+    source_result = next(
+        result
+        for result in run.scheduler.results
+        if result.task_id == "source-tongcheng-flight"
+    )
+    validation = source_result.output["party_price_validation_snapshot"]
+    assert isinstance(validation, dict)
+    assert validation["query"]["adults"] == 1
+    assert validation["state"] == BrowserTaskState.SUCCEEDED.value
 
 
 @pytest.mark.asyncio

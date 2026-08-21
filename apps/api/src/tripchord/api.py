@@ -519,6 +519,10 @@ def build_live_final_plan_projection(run: LivePackageAgentRun) -> FinalPlanProje
             return_flight_numbers=candidate.flight.return_flight_numbers,
             return_depart_at=candidate.flight.return_depart_at,
             return_arrive_at=candidate.flight.return_arrive_at,
+            display_amount_cents=candidate.flight.display_amount_cents,
+            party_total_known=candidate.flight.party_total_known,
+            price_basis=candidate.flight.price_basis,
+            official_view_url=_trusted_quote_view_url(candidate.flight),
         ) if candidate.flight else None),
         lodgings=tuple(FinalLodgingProjection(
             provider=item.provider, property_name=item.property_name, area=item.area.value,
@@ -613,6 +617,10 @@ def build_final_plan_projection(
                 return_flight_numbers=candidate.flight.return_flight_numbers,
                 return_depart_at=candidate.flight.return_depart_at,
                 return_arrive_at=candidate.flight.return_arrive_at,
+                display_amount_cents=candidate.flight.display_amount_cents,
+                party_total_known=candidate.flight.party_total_known,
+                price_basis=candidate.flight.price_basis,
+                official_view_url=_trusted_quote_view_url(candidate.flight),
             )
             if candidate
             else None

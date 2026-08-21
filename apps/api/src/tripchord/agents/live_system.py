@@ -196,8 +196,10 @@ from tripchord.providers.icom_transfer import (
 )
 from tripchord.providers.quote_normalizer import (
     BrowserQuoteNormalizer,
+    FlightPartyComparisonReceipt,
     NormalizedBrowserQuoteResult,
     QuoteNormalizationStatus,
+    flight_party_comparison_receipt_sha256,
 )
 
 _BROWSER_SEARCH_TOOL = "browser_bridge_search"
@@ -1485,6 +1487,13 @@ class _RunState:
     search_schedule: AppliedSearchSchedule | None = None
     source_schedule_started_monotonic: float | None = None
     snapshots: dict[str, BrowserTaskSnapshot] = field(default_factory=dict)
+    party_price_validation_snapshots: dict[str, BrowserTaskSnapshot] = field(
+        default_factory=dict
+    )
+    party_price_comparison_receipts: dict[
+        str, tuple[FlightPartyComparisonReceipt, ...]
+    ] = field(default_factory=dict)
+    party_price_validation_errors: dict[str, str] = field(default_factory=dict)
     source_errors: dict[str, str] = field(default_factory=dict)
     official_lodging_task: asyncio.Task[ArenaOfficialLodgingResult] | None = None
     official_lodging_result: ArenaOfficialLodgingResult | None = None
@@ -5844,6 +5853,77 @@ class LivePackageAgentSystem:
             ),
         )
 
+    def _needs_one_adult_price_validation(
+        self,
+        snapshot: BrowserTaskSnapshot,
+    ) -> bool:
+        """Whether this adult-only result exposes an unverified party amount."""
+
+        query = snapshot.query
+        if (
+            snapshot.state != BrowserTaskState.SUCCEEDED
+            or snapshot.kind != BrowserVertical.FLIGHT
+            or query.adults <= 1
+            or query.children != 0
+            or query.infants != 0
+        ):
+            return False
+        for raw_quote in snapshot.quotes:
+            price_basis_source = raw_quote.details.get("price_basis_source")
+            if not (
+                isinstance(price_basis_source, str)
+                and "unverified_party" in price_basis_source
+            ):
+                continue
+            normalized = self._normalizer.normalize(raw_quote, query)
+            if (
+                normalized.usable
+                and isinstance(normalized.quote, NormalizedFlightQuote)
+                and normalized.quote.party_total_known is False
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _one_adult_price_validation_submission(
+        source: BrowserTaskSubmission,
+    ) -> BrowserTaskSubmission:
+        query = source.query
+        if (
+            source.kind != BrowserVertical.FLIGHT
+            or query.adults <= 1
+            or query.children != 0
+            or query.infants != 0
+        ):
+            raise ValueError("1/N price validation requires an adult-only N-adult flight")
+        one_adult_query = query.model_copy(
+            update={
+                "adults": 1,
+                "search_url": None,
+                "options": {
+                    **query.options,
+                    "__tripchord_allow_recent_quote_reuse": False,
+                },
+            }
+        )
+        trusted_url_builder = {
+            BrowserProvider.CTRIP: ctrip_trusted_flight_search_url,
+            BrowserProvider.FLIGGY: fliggy_trusted_flight_search_url,
+            BrowserProvider.QUNAR: qunar_trusted_flight_search_url,
+            BrowserProvider.TONGCHENG: tongcheng_trusted_flight_search_url,
+        }[source.provider]
+        one_adult_query = one_adult_query.model_copy(
+            update={"search_url": trusted_url_builder(one_adult_query)}
+        )
+        return BrowserTaskSubmission(
+            provider=source.provider,
+            kind=BrowserVertical.FLIGHT,
+            query=one_adult_query,
+            timeout_seconds=source.timeout_seconds,
+            max_attempts=1,
+            reuse_partition_sha256=source.reuse_partition_sha256,
+        )
+
     def _source_executor(
         self,
         state: _RunState,
@@ -6023,16 +6103,72 @@ class LivePackageAgentSystem:
                         BrowserTaskSnapshot.model_validate(value) for value in raw_attempt_snapshots
                     )
                     state.snapshots[task.id] = snapshot
+                    validation_snapshot: BrowserTaskSnapshot | None = None
+                    validation_error: str | None = None
+                    if self._needs_one_adult_price_validation(snapshot):
+                        if (
+                            scope is not None
+                            and state.cancellation_tombstones.rejects(
+                                scope,
+                                attempt_generation,
+                            )
+                        ):
+                            validation_error = (
+                                "one-adult validation suppressed by scope cancellation tombstone"
+                            )
+                        else:
+                            try:
+                                source_submission = BrowserTaskSubmission.model_validate(
+                                    task.input["submission"]
+                                )
+                                validation_submission = (
+                                    self._one_adult_price_validation_submission(
+                                        source_submission
+                                    )
+                                )
+                                validation_call = ToolCall(
+                                    id=f"call:{task.id}:adult-1-price-validation",
+                                    tool_name=_BROWSER_SEARCH_TOOL,
+                                    task_id=task.id,
+                                    agent_role=task.role,
+                                    arguments={
+                                        "submission": _json_value(
+                                            validation_submission.model_dump(mode="json")
+                                        ),
+                                        "__tripchord_attempt_generation": attempt_generation,
+                                        "__tripchord_disable_retry": True,
+                                    },
+                                )
+                                validation_receipt = await tools.invoke(validation_call)
+                                validation_snapshot = BrowserTaskSnapshot.model_validate(
+                                    validation_receipt.output.get("snapshot")
+                                )
+                                state.party_price_validation_snapshots[task.id] = (
+                                    validation_snapshot
+                                )
+                            except Exception as validation_exc:
+                                validation_error = (
+                                    f"{type(validation_exc).__name__}: {validation_exc}"
+                                )
+                                state.party_price_validation_errors[task.id] = validation_error
                     summary = (
                         f"{snapshot.provider.value}/{snapshot.kind.value}:"
                         f"{snapshot.state.value}, quotes={len(snapshot.quotes)}, "
-                        f"attempts={len(attempt_snapshots) or 1}"
+                        f"attempts={len(attempt_snapshots) or 1}, "
+                        f"adult-1-validation="
+                        f"{validation_snapshot.state.value if validation_snapshot else 'none'}"
                     )
                     output = {
                         "snapshot": _json_value(snapshot.model_dump(mode="json")),
                         "attempt_snapshots": _json_value(
                             [value.model_dump(mode="json") for value in attempt_snapshots]
                         ),
+                        "party_price_validation_snapshot": _json_value(
+                            validation_snapshot.model_dump(mode="json")
+                            if validation_snapshot is not None
+                            else None
+                        ),
+                        "party_price_validation_error": validation_error,
                         "source_delay_audit": delay_audit,
                     }
                     topic = "browser_result"
@@ -6326,6 +6462,21 @@ class LivePackageAgentSystem:
                 "flight_search_outcomes": _json_value(
                     [item.model_dump(mode="json") for item in state.flight_search_outcomes]
                 ),
+                "party_price_comparison_receipts": _json_value(
+                    [
+                        {
+                            **receipt.model_dump(mode="json", by_alias=True),
+                            "receipt_sha256": (
+                                flight_party_comparison_receipt_sha256(receipt)
+                            ),
+                        }
+                        for task_id in sorted(state.party_price_comparison_receipts)
+                        for receipt in state.party_price_comparison_receipts[task_id]
+                    ]
+                ),
+                "party_price_validation_errors": _json_value(
+                    dict(sorted(state.party_price_validation_errors.items()))
+                ),
             }
             return self._stage_result(
                 task,
@@ -6358,9 +6509,22 @@ class LivePackageAgentSystem:
                 state.normalization_by_task[task_id] = comparison_results
                 results.extend(comparison_results)
                 continue
+            party_price_comparisons: tuple[FlightPartyComparisonReceipt, ...] = ()
+            validation_snapshot = state.party_price_validation_snapshots.get(task_id)
+            if validation_snapshot is not None:
+                party_price_comparisons = (
+                    self._normalizer.derive_flight_party_comparison_receipts(
+                        snapshot,
+                        validation_snapshot,
+                    )
+                )
+                state.party_price_comparison_receipts[task_id] = (
+                    party_price_comparisons
+                )
             task_results = self._normalizer.normalize_many(
                 snapshot.quotes,
                 snapshot.query,
+                party_price_comparisons=party_price_comparisons,
             )
             state.normalization_by_task[task_id] = task_results
             results.extend(task_results)
@@ -7761,6 +7925,14 @@ class LivePackageAgentSystem:
                 )
                 + "无论模型建议如何，报价事实、金额、权限、硬约束和发布门均不由 LLM 改写。"
             )
+            if any(state.party_price_comparison_receipts.values()):
+                state.claim_boundary += (
+                    "航班全部同行人总价来自服务器对同一完整往返产品"
+                    "执行的 1 成人/N 成人含税展示价对照；该金额仅用于本轮"
+                    "比较与预算，不是结算锁价、库存锁定或下单成功证明；"
+                    "平台本轮未展开中转分段机场与时刻，系统只保留已观察的"
+                    "完整去返航班号、端点和整程时间，不补造中转细节。"
+                )
             assert state.decision is not None
             output: dict[str, JsonValue] = {
                 "decision": state.decision.state.value,
@@ -8101,7 +8273,9 @@ class LivePackageAgentSystem:
                 # non-retryable DOM, login, captcha and inventory outcomes are
                 # never hidden or retried.
                 retry_submission = submission
-                for attempt_index in range(2):
+                disable_retry = call.arguments.get("__tripchord_disable_retry") is True
+                tool_attempt_limit = 1 if disable_retry else 2
+                for attempt_index in range(tool_attempt_limit):
                     (submitted,) = await self._bridge.submit_many((retry_submission,))
                     submitted_ids.append(submitted.id)
                     (terminal,) = await self._bridge.wait_many(
@@ -8122,7 +8296,7 @@ class LivePackageAgentSystem:
                         and terminal.failure is not None
                         and terminal.failure.retryable
                     )
-                    if not retryable_failure or attempt_index == 1:
+                    if not retryable_failure or attempt_index == tool_attempt_limit - 1:
                         return {
                             "snapshot": _json_value(terminal.model_dump(mode="json")),
                             "attempt_snapshots": _json_value(
@@ -8180,7 +8354,10 @@ class LivePackageAgentSystem:
                 input_schema={
                     "type": "object",
                     "required": ["submission"],
-                    "properties": {"submission": {"type": "object"}},
+                    "properties": {
+                        "submission": {"type": "object"},
+                        "__tripchord_disable_retry": {"type": "boolean"},
+                    },
                 },
             ),
             search,
@@ -9109,32 +9286,39 @@ class LivePackageAgentSystem:
                 and isinstance(result.quote, NormalizedFlightQuote)
             )
             if snapshot.state == BrowserTaskState.SUCCEEDED and exact_results:
+                primary_raw_by_sha = {
+                    raw.evidence_sha256: raw
+                    for raw in snapshot.quotes
+                    if raw.provider == provider and raw.kind == BrowserVertical.FLIGHT
+                }
+                party_price_comparisons = state.party_price_comparison_receipts.get(
+                    task_id,
+                    (),
+                )
                 crosslinks: list[tuple[NormalizedBrowserQuoteResult, str]] = []
                 for result in exact_results:
                     quote = result.quote
                     assert isinstance(quote, NormalizedFlightQuote)
-                    raw_refs = tuple(
+                    primary_raw_refs = tuple(
                         evidence_ref
                         for evidence_ref in quote.evidence_refs
                         if evidence_ref.startswith(f"browser:{provider.value}:sha256:")
+                        and evidence_ref.rsplit(":", maxsplit=1)[-1]
+                        in primary_raw_by_sha
                     )
-                    if len(raw_refs) != 1:
+                    if len(primary_raw_refs) != 1:
                         continue
-                    raw_sha = raw_refs[0].rsplit(":", maxsplit=1)[-1]
-                    raw_matches = tuple(
-                        raw
-                        for raw in snapshot.quotes
-                        if raw.provider == provider
-                        and raw.kind == BrowserVertical.FLIGHT
-                        and raw.evidence_sha256 == raw_sha
-                    )
-                    if len(raw_matches) != 1:
-                        continue
-                    raw = raw_matches[0]
+                    raw_sha = primary_raw_refs[0].rsplit(":", maxsplit=1)[-1]
+                    raw = primary_raw_by_sha[raw_sha]
                     if (
                         hashlib.sha256(raw.visible_evidence.encode()).hexdigest()
                         != raw.evidence_sha256
-                        or self._normalizer.normalize(raw, snapshot.query) != result
+                        or self._normalizer.normalize(
+                            raw,
+                            snapshot.query,
+                            party_price_comparisons=party_price_comparisons,
+                        )
+                        != result
                         or quote.provider != provider.value
                         or quote.origin != snapshot.query.origin
                         or quote.destination != snapshot.query.destination
@@ -11674,6 +11858,15 @@ class LivePackageAgentSystem:
                 + (
                     f"{flight.adults} 名成人总价为 "
                     f"{amount(flight.currency, flight.total_for_party_cents or 0)}。"
+                    + (
+                        "该金额由同一产品的 1 成人/N 成人展示价对照派生，"
+                        "只用于比较，不是结算锁价。"
+                        if any(
+                            reference.startswith("flight-party-comparison:sha256:")
+                            for reference in flight.evidence_refs
+                        )
+                        else ""
+                    )
                     if flight.party_total_known
                     else (
                         f"当前仅有观察价 "
