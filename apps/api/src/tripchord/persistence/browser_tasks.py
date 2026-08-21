@@ -130,11 +130,17 @@ class DurableBrowserTaskStore:
         consumer: BrowserTaskConsumerRow | None = None,
     ) -> BrowserTaskSnapshot:
         sub = BrowserTaskSubmission.model_validate(row.submission)
+        retained_completion = (
+            BrowserTaskCompletion.model_validate(row.completion_payload)
+            if row.completion_payload is not None
+            else None
+        )
         return BrowserTaskSnapshot(
             id=consumer_id,
             provider=BrowserProvider(row.provider),
             kind=BrowserVertical(row.kind),
             query=sub.query,
+            range_query=sub.range_query,
             state=BrowserTaskState("claimed" if row.state == "completing" else row.state),
             created_at=_aware(row.created_at),
             updated_at=_aware(row.updated_at),
@@ -142,6 +148,11 @@ class DurableBrowserTaskStore:
             claimed_by=row.lease_owner,
             claimed_at=_aware(row.claimed_at) if row.claimed_at else None,
             quotes=tuple(BrowserQuote.model_validate(x) for x in (row.quotes or [])),
+            range_completion=(
+                retained_completion.range_completion
+                if retained_completion is not None
+                else None
+            ),
             failure=BrowserFailure.model_validate(row.failure) if row.failure else None,
             reused_from_task_id=(
                 consumer.reused_from_task_id

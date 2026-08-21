@@ -6,6 +6,9 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 from test_browser_bridge import quote as legacy_quote
+from tripchord.persistence import browser_tasks as browser_task_persistence
+from tripchord.persistence.browser_tasks import DurableBrowserTaskStore
+from tripchord.persistence.database import Database
 from tripchord.providers.browser_bridge import (
     BrowserDateRangeQuery,
     BrowserProvider,
@@ -14,11 +17,17 @@ from tripchord.providers.browser_bridge import (
     BrowserRangeCompletion,
     BrowserRangeParty,
     BrowserRangePriceFinality,
+    BrowserSearchQuery,
+    BrowserTaskBridge,
+    BrowserTaskCompletion,
+    BrowserTaskState,
+    BrowserTaskSubmission,
     BrowserVertical,
     CompleteBrowserTaskRequest,
     QuotePriceBasis,
     RangeCapabilityEvidence,
     browser_range_receipt_sha256,
+    ctrip_trusted_flight_search_url,
     exact_cell_binding_error,
     range_completion_fallback_pairs,
 )
@@ -283,6 +292,84 @@ def test_complete_request_accepts_js_millisecond_range_receipt(
         browser_range_receipt_sha256(request.completion.range_completion)
         == range_completion["receipt_sha256"]
     )
+
+
+@pytest.mark.asyncio
+async def test_durable_complete_refreshes_renewed_lease_and_projects_range_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [datetime(2026, 8, 22, tzinfo=UTC)]
+    monkeypatch.setattr(browser_task_persistence, "utc_now", lambda: clock[0])
+    database = Database("sqlite+aiosqlite://")
+    await database.create_schema()
+    try:
+        store = DurableBrowserTaskStore(database, authority_partition_sha256="f" * 64)
+        bridge = BrowserTaskBridge(
+            durable_store=store,
+            durable_tenant_id="range-tenant",
+            now=lambda: clock[0],
+        )
+        search_query = BrowserSearchQuery(
+            origin="杭州",
+            destination="马累",
+            origin_code="HGH",
+            destination_code="MLE",
+            start_date=PAIR_A[0],
+            end_date=PAIR_A[1],
+            adults=2,
+            currency="CNY",
+        )
+        search_query = search_query.model_copy(
+            update={"search_url": ctrip_trusted_flight_search_url(search_query)}
+        )
+        submission = BrowserTaskSubmission(
+            provider=BrowserProvider.CTRIP,
+            kind=BrowserVertical.FLIGHT,
+            query=search_query,
+            range_query=query(),
+            timeout_seconds=60,
+            max_attempts=1,
+            reuse_partition_sha256="a" * 64,
+        )
+        (submitted,) = await bridge.submit_many((submission,))
+        (lease,) = await bridge.claim(
+            "range-companion",
+            providers=(BrowserProvider.CTRIP,),
+        )
+        initial_expiry = lease.lease_expires_at
+
+        clock[0] += timedelta(seconds=20)
+        session_id = hashlib.sha256(
+            f"{'f' * 64}:companion:range-companion".encode()
+        ).hexdigest()
+        assert await store.renew_session_leases(
+            session_id=session_id,
+            session_generation=1,
+            lease_seconds=30,
+        ) == 1
+        clock[0] += timedelta(seconds=11)
+        assert clock[0] > initial_expiry
+
+        range_receipt = completion(
+            BrowserRangeCapabilityStatus.CONFIRMED,
+            (cell(PAIR_A), cell(PAIR_B)),
+        )
+        completed = await bridge.complete(
+            lease.task_id,
+            lease.claim_token,
+            BrowserTaskCompletion(
+                state=BrowserTaskState.SUCCEEDED,
+                range_completion=range_receipt,
+            ),
+        )
+        reread = await bridge.get(submitted.id)
+
+        for snapshot in (completed, reread):
+            assert snapshot.range_query is not None
+            assert snapshot.range_query.requested_pairs == (PAIR_A, PAIR_B)
+            assert snapshot.range_completion == range_receipt
+    finally:
+        await database.dispose()
 
 
 @pytest.mark.parametrize(

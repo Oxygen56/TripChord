@@ -3666,15 +3666,19 @@ class BrowserTaskBridge:
         source_execution_attestation: BrowserSourceExecutionAttestation | None = None,
     ) -> BrowserTaskSnapshot:
         if self._durable_store is not None:
-            lease = self._durable_claims.get(task_id)
+            # Heartbeats renew the authoritative durable lease without
+            # mutating the process-local claim object created at acquisition
+            # time.  Always rehydrate by task id + token here so a valid long
+            # task is not rejected against that stale initial expiry.
+            lease = await self._durable_store.get_claim_lease(
+                task_id,
+                tenant_id=self._durable_tenant_id,
+                claim_token=claim_token,
+            )
             if lease is None:
-                lease = await self._durable_store.get_claim_lease(
-                    task_id,
-                    tenant_id=self._durable_tenant_id,
-                    claim_token=claim_token,
-                )
-            if lease is None:
+                self._durable_claims.pop(task_id, None)
                 raise BrowserClaimError("task does not have an active claim")
+            self._durable_claims[task_id] = lease
             record = await self._durable_record_for(task_id, lease)
             if record.claim_token is None or not hmac.compare_digest(
                 record.claim_token, claim_token
