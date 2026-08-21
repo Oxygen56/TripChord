@@ -10960,11 +10960,11 @@ async function recordCompletionDiagnostic(
   });
 }
 
-async function executeSingleLease(lease, executionOptions = {}) {
+async function runSinglePageQuery(lease, executionOptions = {}) {
   const sharedTabId = Number.isInteger(executionOptions.sharedTabId)
     ? executionOptions.sharedTabId
     : null;
-  const submitCompletion = executionOptions.submitCompletion !== false;
+  const submitCompletion = executionOptions.submitCompletion === true;
   let tabId = sharedTabId;
   let reusedTabId = null;
   let reusedExactResult = false;
@@ -10984,7 +10984,9 @@ async function executeSingleLease(lease, executionOptions = {}) {
     : null;
   const stageTrace = [];
   const timing = leaseTiming(lease);
-  const deadline = timing.work_deadline_ms;
+  const deadline = Number.isFinite(executionOptions.deadlineMs)
+    ? Math.min(timing.work_deadline_ms, Number(executionOptions.deadlineMs))
+    : timing.work_deadline_ms;
   const timingDiagnostic = leaseTimingDiagnostic(timing);
   const finish = async (completion) => {
     let preparedCompletion = completion;
@@ -11830,74 +11832,199 @@ function ctripRangeQueryUrl(query, startDate, endDate) {
     `&infant=${query.infants || 0}`;
 }
 
-async function executeLease(lease) {
-  const range = lease && lease.range_query;
-  if (!range || lease.provider !== "ctrip" || lease.kind !== "flight") {
-    return executeSingleLease(lease);
+function rangePairKey(pair) {
+  return `${String(pair[0])}/${String(pair[1])}`;
+}
+
+async function rangeCellFromCompletion(range, pair, completion) {
+  const quote = completion && Array.isArray(completion.quotes)
+    ? completion.quotes.find((candidate) => {
+      const query = candidate && candidate.details && candidate.details.query;
+      return query && query.start_date === String(pair[0]) &&
+        query.end_date === String(pair[1]);
+    })
+    : null;
+  const now = new Date().toISOString();
+  const evidence = quote && quote.evidence_sha256
+    ? quote.evidence_sha256
+    : await inventoryReceiptSha256(canonicalInventoryJson({
+      task_id: range.task_id,
+      pair,
+      state: completion && completion.state || "unknown",
+      failure: completion && completion.failure || null,
+    }));
+  if (!quote || !quote.amount) {
+    return {
+      start_date: String(pair[0]),
+      end_date: String(pair[1]),
+      party: range.party,
+      currency: range.currency,
+      amount: null,
+      price_basis: "unknown",
+      party_total_known: false,
+      taxes_and_fees_included: null,
+      product_identity: null,
+      quote: null,
+      price_finality: "unknown",
+      evidence_sha256: evidence,
+      captured_at: now,
+    };
   }
-  const pairs = Array.isArray(range.requested_pairs) ? range.requested_pairs : [];
-  if (!pairs.length) return executeSingleLease(lease);
-  const firstStart = String(pairs[0][0]);
-  const firstEnd = String(pairs[0][1]);
-  const firstQuery = {
-    ...lease.query,
-    start_date: firstStart,
-    end_date: firstEnd,
-    search_url: ctripRangeQueryUrl(lease.query, firstStart, firstEnd),
+  const exact = quote.price_basis === "total_party" &&
+    quote.taxes_included === true && quote.details &&
+    quote.details.combination_id;
+  return {
+    start_date: String(pair[0]),
+    end_date: String(pair[1]),
+    party: range.party,
+    currency: String(quote.currency || range.currency).toUpperCase(),
+    amount: String(quote.amount),
+    price_basis: exact ? "total_for_party" :
+      quote.price_basis === "per_person" ? "per_person" : "unknown",
+    party_total_known: Boolean(exact),
+    taxes_and_fees_included: quote.taxes_included === true ? true : null,
+    product_identity: exact
+      ? String(quote.details.combination_id)
+      : null,
+    quote,
+    price_finality: exact ? "exact" : "starting",
+    evidence_sha256: evidence,
+    captured_at: quote.captured_at || now,
   };
-  const tab = await chrome.tabs.create({ url: firstQuery.search_url, active: false });
+}
+
+async function executeRangeLease(lease) {
+  const range = lease && lease.range_query;
+  const pairs = range && Array.isArray(range.requested_pairs)
+    ? range.requested_pairs : [];
+  const timing = leaseTiming(lease);
+  const totalDeadline = Math.min(
+    timing.work_deadline_ms,
+    Date.now() + Math.max(10000, (Number(range && range.timeout_seconds) || 300) * 1000),
+  );
+  const reserveMs = Math.max(LEASE_COMPLETION_MAX_RESERVE_MS, 8000);
+  const cellBudgetMs = Math.max(
+    15000,
+    Math.min(90000, Math.floor((totalDeadline - Date.now() - reserveMs) / Math.max(1, pairs.length))),
+  );
+  const cells = [];
   const quotes = [];
-  let firstFailure = null;
-  try {
-    for (const pair of pairs) {
-      const startDate = String(pair[0]);
-      const endDate = String(pair[1]);
-      const query = {
-        ...lease.query,
-        start_date: startDate,
-        end_date: endDate,
-        search_url: ctripRangeQueryUrl(lease.query, startDate, endDate),
-      };
-      const completion = await executeSingleLease(
-        { ...lease, query, range_query: null },
-        { sharedTabId: tab.id, submitCompletion: false },
+  const failures = [];
+  const stageTrace = [];
+  for (const pair of pairs) {
+    if (Date.now() + reserveMs >= totalDeadline) {
+      failures.push({ pair, code: "range_deadline", message: "批量任务为提交回执保留时间" });
+      cells.push(await rangeCellFromCompletion(range, pair, {
+        state: "failed",
+        failure: { code: "range_deadline" },
+      }));
+      continue;
+    }
+    const startDate = String(pair[0]);
+    const endDate = String(pair[1]);
+    const query = {
+      ...lease.query,
+      start_date: startDate,
+      end_date: endDate,
+      search_url: lease.provider === "ctrip"
+        ? ctripRangeQueryUrl(lease.query, startDate, endDate)
+        : lease.query.search_url,
+    };
+    const cellLease = { ...lease, query, range_query: null };
+    const cellDeadline = Math.min(totalDeadline - reserveMs, Date.now() + cellBudgetMs);
+    let completion;
+    try {
+      completion = await runSinglePageQuery(
+        cellLease,
+        { deadlineMs: cellDeadline, submitCompletion: false },
       );
-      if (completion && Array.isArray(completion.quotes)) quotes.push(...completion.quotes);
-      if (!completion || completion.state !== "succeeded") {
-        firstFailure = completion && completion.failure || {
-          code: "extraction_error",
-          message: "批量日期中的一组查询未完成",
+    } catch (error) {
+      completion = {
+        state: "failed",
+        quotes: [],
+        failure: {
+          code: "range_cell_error",
+          message: String(error && error.message || error),
           retryable: true,
           page_url: null,
-          details: { range_pair: [startDate, endDate] },
-        };
-        break;
-      }
+        },
+      };
     }
-  } catch (error) {
-    firstFailure = {
-      code: "extraction_error",
-      message: `批量日期执行异常：${String(error && error.message || error)}`,
+    if (completion && Array.isArray(completion.quotes)) quotes.push(...completion.quotes);
+    if (!completion || completion.state !== "succeeded") {
+      failures.push({
+        pair,
+        code: completion && completion.failure && completion.failure.code || "range_cell_failed",
+        message: completion && completion.failure && completion.failure.message || "日期单元未完成",
+      });
+    }
+    cells.push(await rangeCellFromCompletion(range, pair, completion));
+  }
+  const capturedAt = new Date().toISOString();
+  const exactCount = cells.filter((cell) => cell.price_finality === "exact").length;
+  const capabilityStatus = exactCount === pairs.length && pairs.length > 0
+    ? "confirmed" : "inconclusive";
+  const evidence = await inventoryReceiptSha256(canonicalInventoryJson({
+    task_id: lease.task_id,
+    lease_id: lease.lease_id,
+    provider: lease.provider,
+    pairs: cells.map((cell) => [cell.start_date, cell.end_date, cell.evidence_sha256]),
+  }));
+  const responseShape = await inventoryReceiptSha256(
+    canonicalInventoryJson({ executor: "native_range", cells: cells.length }),
+  );
+  const capability = {
+    status: capabilityStatus,
+    provider: range.provider,
+    contract_version: range.contract_version,
+    parser_version: range.parser_version,
+    evidence_sha256: evidence,
+    captured_at: capturedAt,
+    query_fingerprint_sha256: await inventoryReceiptSha256(canonicalInventoryJson(range)),
+    task_id: lease.task_id,
+    lease_id: lease.lease_id,
+    evidence_type: "visible_dom",
+    source_url: lease.query.search_url || null,
+    response_shape_sha256: responseShape,
+    reason: capabilityStatus === "confirmed"
+      ? "native_range_executor_completed_requested_cells"
+      : "bounded_date_shards_completed_with_partial_or_non_exact_cells",
+  };
+  const rangeCompletion = {
+    schema_version: "tripchord-browser-range-receipt-v1",
+    query: range,
+    capability,
+    cells,
+    receipt_sha256: "",
+    expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+  };
+  rangeCompletion.receipt_sha256 = await inventoryReceiptSha256(
+    canonicalInventoryJson({
+      schema_version: rangeCompletion.schema_version,
+      query: rangeCompletion.query,
+      capability: rangeCompletion.capability,
+      cells: rangeCompletion.cells,
+      expires_at: rangeCompletion.expires_at,
+    }),
+  );
+  return completeLease(lease, {
+    state: quotes.length ? "succeeded" : "failed",
+    quotes,
+    failure: quotes.length ? null : {
+      code: "range_no_price_cells",
+      message: "批量日期任务未取得可比较的真实价格单元",
       retryable: true,
       page_url: null,
-      details: {
-        range_executor_error: String(error && error.stack || error).slice(0, 2000),
-      },
-    };
-  } finally {
-    if (Number.isInteger(tab.id)) {
-      try { await chrome.tabs.remove(tab.id); } catch { /* best effort */ }
-    }
-  }
-  if (firstFailure) {
-    return completeLease(lease, {
-      state: firstFailure.code === "captcha_required" || firstFailure.code === "login_required"
-        ? "blocked" : "failed",
-      quotes: [],
-      failure: firstFailure,
-    });
-  }
-  return completeLease(lease, { state: "succeeded", quotes, failure: null });
+      details: { failures },
+    },
+    range_completion: rangeCompletion,
+    details: { executor: "native_range", cell_budget_ms: cellBudgetMs, failures },
+  });
+}
+
+async function executeLease(lease) {
+  if (lease && lease.range_query) return executeRangeLease(lease);
+  return runSinglePageQuery(lease, { submitCompletion: true });
 }
 
 async function executeClaimedLeasesProviderAware(
