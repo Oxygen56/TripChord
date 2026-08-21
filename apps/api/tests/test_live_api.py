@@ -55,6 +55,7 @@ from tripchord.main import (
 )
 from tripchord.planning.flexible_dates import AuditableDatePair
 from tripchord.planning.package import (
+    LodgingLocationConvenience,
     NormalizedFlightQuote,
     NormalizedLodgingQuote,
     PackageArea,
@@ -334,6 +335,11 @@ def test_live_final_projection_separates_confirmed_subtotal_from_icom_estimate()
         room_name="市景豪华间 - 带阳台",
         breakfast_included=True,
         cancellation_policy="免费取消",
+        location_address="Aabaadhee Hingun Road, 马富施, 马尔代夫",
+        nearby_location_evidence=(
+            "近Sinai Dive Club Maldives · Maafushi Dive & Water Sports.",
+        ),
+        location_convenience=LodgingLocationConvenience.CONFIRMED_NOT_REMOTE,
     )
     transfer = SimpleNamespace(
         id="icom:trip:7989",
@@ -390,6 +396,13 @@ def test_live_final_projection_separates_confirmed_subtotal_from_icom_estimate()
     assert plan.flight.display_amount_cents == 410_100
     assert plan.flight.total_for_party_cents == 820_200
     assert plan.lodgings[0].display_total_cents == 248_500
+    assert plan.lodgings[0].location_convenience == "confirmed_not_remote"
+    assert plan.lodgings[0].location_evidence_summary == (
+        "来源页面显示地址：Aabaadhee Hingun Road, 马富施, 马尔代夫；"
+        "页面显示邻近：近Sinai Dive Club Maldives · Maafushi Dive & Water Sports."
+    )
+    assert "码头" not in plan.lodgings[0].location_evidence_summary
+    assert "市中心" not in plan.lodgings[0].location_evidence_summary
     assert plan.confirmed_cny_subtotal_cents == 1_068_700
     assert plan.estimated_icom_transfer_cny_cents == 80_647
     assert plan.estimated_total_cny_cents == 1_149_347

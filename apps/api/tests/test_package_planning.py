@@ -8,6 +8,7 @@ import pytest
 from tripchord.agents.models import PreferenceMode
 from tripchord.planning.package import (
     FlightGroundTransferContract,
+    LodgingLocationConvenience,
     NormalizedFlightQuote,
     NormalizedFlightSegment,
     NormalizedLodgingQuote,
@@ -153,6 +154,7 @@ def intent(
     destination_place_key: PackagePlaceKey | None = None,
     allow_connections: bool | None = None,
     require_non_basic_lodging: bool = False,
+    require_non_remote_lodging: bool = False,
     maximum_quote_capture_skew_minutes: int = 20,
 ) -> PackageIntent:
     return PackageIntent(
@@ -169,6 +171,7 @@ def intent(
         allow_connections=allow_connections,
         require_breakfast=require_breakfast,
         require_non_basic_lodging=require_non_basic_lodging,
+        require_non_remote_lodging=require_non_remote_lodging,
         breakfast_preference_mode=breakfast_preference_mode,
         breakfast_preference_weight=breakfast_preference_weight,
         minimum_arrival_to_boat_minutes=120,
@@ -230,6 +233,9 @@ def lodging(
     availability: QuoteAvailability = QuoteAvailability.AVAILABLE,
     place_key: PackagePlaceKey | object | None = _UNSET_PLACE_KEY,
     room_name: str | None = None,
+    location_address: str | None = None,
+    nearby_location_evidence: tuple[str, ...] = (),
+    location_convenience: LodgingLocationConvenience = LodgingLocationConvenience.UNKNOWN,
 ) -> NormalizedLodgingQuote:
     default_place_key = {
         PackageArea.AIRPORT: PackagePlaceKey.VELANA_AIRPORT,
@@ -253,6 +259,9 @@ def lodging(
         rooms=1,
         breakfast_included=breakfast,
         room_name=room_name,
+        location_address=location_address,
+        nearby_location_evidence=nearby_location_evidence,
+        location_convenience=location_convenience,
         place_key=(
             default_place_key
             if place_key is _UNSET_PLACE_KEY
@@ -1081,6 +1090,52 @@ def test_non_basic_lodging_is_hard_filtered_and_equal_price_prefers_sea_view() -
         if item.lodgings[0].id == no_window.id
     )
     assert PackageViolationCode.LODGING_QUALITY_PREFERENCE in {
+        item.code for item in PackageVerifier().errors(required, unsafe, now=VERIFY_AT)
+    }
+
+
+def test_non_remote_lodging_requires_address_and_nearby_service_evidence() -> None:
+    exact_place_only = lodging(
+        "stay:exact-place-only",
+        "Island Beach Hotel",
+        PackageArea.DESTINATION_ISLAND,
+        date(2026, 8, 23),
+        date(2026, 8, 30),
+        240_000,
+        room_name="豪华海景阳台房",
+        location_address="Ziyaaraiy Magu Road, Maafushi",
+        nearby_location_evidence=("近Bikini Beach",),
+    )
+    service_nearby = lodging(
+        "stay:service-nearby",
+        "Island Service Hotel",
+        PackageArea.DESTINATION_ISLAND,
+        date(2026, 8, 23),
+        date(2026, 8, 30),
+        260_000,
+        room_name="市景豪华间 - 带阳台",
+        location_address="Aabaadhee Hingun Road, Maafushi",
+        nearby_location_evidence=("近Dive Club · Water Sports",),
+        location_convenience=LodgingLocationConvenience.CONFIRMED_NOT_REMOTE,
+    )
+    inventory = breakfast_ranking_inventory(exact_place_only, service_nearby)
+    required = intent(
+        budget_cents=2_000_000,
+        require_non_remote_lodging=True,
+    )
+
+    candidates = PackagePlanner().generate(required, inventory)
+
+    assert {candidate.lodgings[0].id for candidate in candidates} == {service_nearby.id}
+    unsafe = next(
+        candidate
+        for candidate in PackagePlanner().generate(
+            required.model_copy(update={"require_non_remote_lodging": False}),
+            inventory,
+        )
+        if candidate.lodgings[0].id == exact_place_only.id
+    )
+    assert PackageViolationCode.LODGING_LOCATION_PREFERENCE in {
         item.code for item in PackageVerifier().errors(required, unsafe, now=VERIFY_AT)
     }
 

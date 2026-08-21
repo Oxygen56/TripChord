@@ -331,8 +331,10 @@ async def test_verbatim_maldives_text_binds_male_gateway_profile_before_live_sea
         "2026-09-10",
     ]
     assert body["interpretation"]["intent_template"]["require_non_basic_lodging"] is True
+    assert body["interpretation"]["intent_template"]["require_non_remote_lodging"] is True
     assert pair_runner.calls[0][0].destination == "马累"
     assert pair_runner.calls[0][0].require_non_basic_lodging is True
+    assert pair_runner.calls[0][0].require_non_remote_lodging is True
     assert pair_runner.calls[0][1].destination == "马累"
     assert pair_runner.calls[0][1].options["gateway_destination"] == "马累"
     assert "stay_plan_candidate_set" in pair_runner.calls[0][1].options

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from tripchord.agents.stay_area import system_stay_area_search_profile
 from tripchord.planning.package import (
+    LodgingLocationConvenience,
     NormalizedFlightQuote,
     NormalizedLodgingQuote,
     PackageArea,
@@ -2310,6 +2311,58 @@ def test_lodging_per_night_and_transfer_are_normalized_without_llm_arithmetic() 
     assert len(result.transfers) == 1
     assert result.transfers[0].total_for_party_cents == 10_000
     assert result.issues == ()
+
+
+def test_visible_address_and_nearby_service_prove_non_remote_without_place_inference() -> None:
+    driver = dict(
+        _browser_context(BrowserVertical.LODGING, BrowserProvider.CTRIP, query())["driver"]
+    )
+    driver["detail_capture"] = {
+        "preview_location_evidence": [
+            "近Sinai Dive Club Maldives · Maafushi Dive & Water Sports.",
+            "近Sinai Dive Club Maldives · Maafushi Dive & Water Sports.查看地图",
+        ]
+    }
+    confirmed = BrowserQuoteNormalizer().normalize(
+        browser_quote(
+            BrowserVertical.LODGING,
+            details_update={
+                "area_text": "Aabaadhee Hingun Road, 马富施, 马尔代夫显示地图",
+                "driver": driver,
+            },
+            title_override="Kaani Beach Hotel",
+        ),
+        query(),
+    )
+
+    assert isinstance(confirmed.quote, NormalizedLodgingQuote)
+    assert confirmed.quote.location_convenience == (
+        LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+    )
+    assert confirmed.quote.location_address == (
+        "Aabaadhee Hingun Road, 马富施, 马尔代夫"
+    )
+    assert confirmed.quote.nearby_location_evidence == (
+        "近Sinai Dive Club Maldives · Maafushi Dive & Water Sports.",
+    )
+
+    beach_driver = dict(driver)
+    beach_driver["detail_capture"] = {
+        "preview_location_evidence": ["近Bikini Beach · Sunrise Beach"]
+    }
+    beach_only = BrowserQuoteNormalizer().normalize(
+        browser_quote(
+            BrowserVertical.LODGING,
+            details_update={
+                "area_text": "Kaani Villa, Ziyaaraiy Magu Road, 马富施, 马尔代夫显示地图",
+                "driver": beach_driver,
+            },
+        ),
+        query(),
+    )
+
+    assert isinstance(beach_only.quote, NormalizedLodgingQuote)
+    assert beach_only.quote.location_convenience == LodgingLocationConvenience.UNKNOWN
 
 
 def test_explicit_round_trip_window_contract_preserves_two_directions_and_one_price() -> None:

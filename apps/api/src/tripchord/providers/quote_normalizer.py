@@ -14,6 +14,7 @@ from pydantic import Field, JsonValue, model_validator
 from tripchord.domain.common import DomainModel
 from tripchord.planning.package import (
     FlightGroundTransferContract,
+    LodgingLocationConvenience,
     NormalizedFlightQuote,
     NormalizedFlightSegment,
     NormalizedLodgingQuote,
@@ -24,6 +25,7 @@ from tripchord.planning.package import (
     TransferPriceScope,
     TransferPurchaseScope,
     TransferScheduleMode,
+    lodging_non_remote_evidence_confirmed,
 )
 from tripchord.providers.browser_bridge import (
     PRODUCTION_VISIBLE_DOM_PARSER_VERSION,
@@ -2435,6 +2437,53 @@ class BrowserQuoteNormalizer:
     def _normalized_location_text(self, value: str) -> str:
         return "".join(character.lower() for character in value if character.isalnum())
 
+    def _lodging_location_evidence(
+        self,
+        *,
+        area_text: str,
+        area_source: str,
+        driver: object,
+    ) -> tuple[str | None, tuple[str, ...], LodgingLocationConvenience]:
+        """Project only visible address/proximity evidence from the same quote.
+
+        Exact search-place binding is deliberately not consulted: it proves the
+        requested island, not whether the property is remote within that island.
+        """
+
+        address: str | None = None
+        if area_source == "visible_label":
+            cleaned_address = re.sub(r"(?:显示|查看)地图\s*$", "", area_text).strip(" ,，")
+            if re.search(
+                r"\b(?:road|street|avenue|lane|drive|boulevard|highway|magu|hingun)\b|"
+                r"(?:路|街|道|大道|巷|弄|号)",
+                cleaned_address,
+                re.IGNORECASE,
+            ):
+                address = cleaned_address
+
+        nearby: list[str] = []
+        if isinstance(driver, dict):
+            detail_capture = driver.get("detail_capture")
+            if isinstance(detail_capture, dict):
+                raw_evidence = detail_capture.get("preview_location_evidence")
+                if isinstance(raw_evidence, list):
+                    for item in raw_evidence:
+                        if not isinstance(item, str):
+                            continue
+                        cleaned = re.sub(r"(?:显示|查看)地图\s*$", "", item).strip()
+                        if cleaned and cleaned not in nearby and len(cleaned) <= 1000:
+                            nearby.append(cleaned)
+                        if len(nearby) == 8:
+                            break
+
+        nearby_evidence = tuple(nearby)
+        convenience = (
+            LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+            if lodging_non_remote_evidence_confirmed(address, nearby_evidence)
+            else LodgingLocationConvenience.UNKNOWN
+        )
+        return address, nearby_evidence, convenience
+
     def _lodging(
         self,
         quote: BrowserQuote,
@@ -2531,6 +2580,13 @@ class BrowserQuoteNormalizer:
         breakfast = self._optional_bool(quote.details, "breakfast_included")
         if breakfast is not None:
             self._str(quote.details, "breakfast_text")
+        location_address, nearby_location_evidence, location_convenience = (
+            self._lodging_location_evidence(
+                area_text=area_text,
+                area_source=area_source,
+                driver=driver,
+            )
+        )
         return NormalizedLodgingQuote(
             id=self._quote_id(quote),
             provider=quote.provider.value,
@@ -2563,6 +2619,9 @@ class BrowserQuoteNormalizer:
                 "cancellation_text",
             ),
             payment_policy=self._visible_payment_policy(quote.details),
+            location_address=location_address,
+            nearby_location_evidence=nearby_location_evidence,
+            location_convenience=location_convenience,
         )
 
     def _transfers(

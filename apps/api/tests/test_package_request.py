@@ -472,7 +472,7 @@ async def test_real_natural_trip_request_ignores_current_date_and_keeps_return_t
             text=(
                 "当前日期 2026-08-19；杭州出发，马尔代夫及合理周边组合。"
                 "出发窗口从 2026-08-20 开始，4到8天，2位成人（本人和女朋友）。"
-                "住宿不能简陋、不能太偏，可以有一定品质但价格不能过高；"
+                "住宿不能简陋或偏僻，可以有一定品质但价格不能过高；"
                 "搜索时同时覆盖9月9日与9月10日返程。"
             ),
             reference_date=date(2026, 8, 19),
@@ -504,7 +504,9 @@ async def test_real_natural_trip_request_ignores_current_date_and_keeps_return_t
         result.preferences,
     )
     assert projected.require_non_basic_lodging is True
+    assert projected.require_non_remote_lodging is True
     assert "lodging_quality" not in unapplied
+    assert "lodging_location" not in unapplied
 
 
 @pytest.mark.asyncio

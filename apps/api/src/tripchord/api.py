@@ -376,6 +376,10 @@ class FinalLodgingProjection(ApiModel):
     room_name: str | None = None
     breakfast_included: bool | None = None
     cancellation_policy: str | None = None
+    location_convenience: str = "unknown"
+    location_address: str | None = None
+    nearby_location_evidence: tuple[str, ...] = ()
+    location_evidence_summary: str | None = None
     display_total_cents: int | None = None
     official_view_url: str | None = None
 
@@ -455,6 +459,15 @@ LIVE_FLEXIBLE_FROM_TEXT_EXECUTION_BOUNDARY = (
     "默认使用确定性优先的本地需求解析；模型增强未启用。仅当关键字段完整时才会"
     "启动实时浏览器搜索，报价排序只对本轮抽样日期与可见证据有效。"
 )
+
+
+def _lodging_location_evidence_summary(
+    lodging: NormalizedLodgingQuote,
+) -> str | None:
+    if lodging.location_address is None or not lodging.nearby_location_evidence:
+        return None
+    nearby = "；".join(lodging.nearby_location_evidence)
+    return f"来源页面显示地址：{lodging.location_address}；页面显示邻近：{nearby}"
 
 
 class LiveFlexibleFromTextPlanningResponse(ApiModel):
@@ -574,6 +587,10 @@ def build_live_final_plan_projection(run: LivePackageAgentRun) -> FinalPlanProje
             check_in=item.check_in, check_out=item.check_out, rooms=item.rooms,
             room_name=item.room_name, breakfast_included=item.breakfast_included,
             cancellation_policy=item.cancellation_policy,
+            location_convenience=item.location_convenience.value,
+            location_address=item.location_address,
+            nearby_location_evidence=item.nearby_location_evidence,
+            location_evidence_summary=_lodging_location_evidence_summary(item),
             display_total_cents=item.total_for_party_cents,
             official_view_url=_trusted_quote_view_url(item),
         ) for item in candidate.lodgings),
@@ -696,6 +713,12 @@ def build_final_plan_projection(
                     room_name=item.room_name,
                     breakfast_included=item.breakfast_included,
                     cancellation_policy=item.cancellation_policy,
+                    location_convenience=item.location_convenience.value,
+                    location_address=item.location_address,
+                    nearby_location_evidence=item.nearby_location_evidence,
+                    location_evidence_summary=_lodging_location_evidence_summary(item),
+                    display_total_cents=item.total_for_party_cents,
+                    official_view_url=_trusted_quote_view_url(item),
                 )
                 for item in candidate.lodgings
             )
@@ -990,6 +1013,10 @@ def build_best_available_plan_projection(
                 room_name=item.room_name,
                 breakfast_included=item.breakfast_included,
                 cancellation_policy=item.cancellation_policy,
+                location_convenience=item.location_convenience.value,
+                location_address=item.location_address,
+                nearby_location_evidence=item.nearby_location_evidence,
+                location_evidence_summary=_lodging_location_evidence_summary(item),
                 display_total_cents=item.total_for_party_cents,
                 official_view_url=_trusted_quote_view_url(item),
             )

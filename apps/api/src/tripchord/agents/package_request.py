@@ -225,6 +225,7 @@ class PackageIntentTemplate(DomainModel):
     allow_connections: bool | None = None
     require_breakfast: bool | None = None
     require_non_basic_lodging: bool = False
+    require_non_remote_lodging: bool = False
     breakfast_preference_mode: PreferenceMode | None = None
     breakfast_preference_weight: float | None = Field(default=None, ge=0, le=1)
     minimum_arrival_to_boat_minutes: int = Field(default=120, ge=0, le=1440)
@@ -249,6 +250,7 @@ class PackageIntentTemplate(DomainModel):
             allow_connections=self.allow_connections,
             require_breakfast=self.require_breakfast,
             require_non_basic_lodging=self.require_non_basic_lodging,
+            require_non_remote_lodging=self.require_non_remote_lodging,
             breakfast_preference_mode=self.breakfast_preference_mode,
             breakfast_preference_weight=self.breakfast_preference_weight,
             minimum_arrival_to_boat_minutes=self.minimum_arrival_to_boat_minutes,
@@ -262,7 +264,13 @@ class PackageIntentTemplate(DomainModel):
 # that is not represented here must remain visible as an unapplied diagnostic
 # rather than being presented as if it affected live ranking.
 _INTENT_TEMPLATE_PREFERENCE_KEYS = frozenset(
-    {"checked_baggage", "flight_connections", "hotel_breakfast", "lodging_quality"}
+    {
+        "checked_baggage",
+        "flight_connections",
+        "hotel_breakfast",
+        "lodging_quality",
+        "lodging_location",
+    }
 )
 
 
@@ -330,6 +338,17 @@ def project_preferences_to_intent_template(
         # model may describe trade-offs among eligible rooms, but it cannot
         # re-admit a room classified as windowless/basic.
         updates["require_non_basic_lodging"] = True
+
+    lodging_location = preferences.effective("lodging_location")
+    if (
+        lodging_location is not None
+        and lodging_location.mode == PreferenceMode.REQUIRED
+        and lodging_location.expected == "convenient_not_remote"
+    ):
+        # Location convenience is an evidence-backed hard gate.  An exact
+        # place search is not enough: a quote still needs an explicit address
+        # plus nearby service/commercial/transport evidence.
+        updates["require_non_remote_lodging"] = True
 
     unsupported = tuple(
         sorted(
@@ -1738,7 +1757,12 @@ class HybridPackageRequirementAgent:
                 reason=match.group(0),
                 captured_at=captured_at,
             )
-        if match := re.search(r"(?:酒店)?不能太偏|位置不能太偏|交通便利|位置方便", text):
+        if match := re.search(
+            r"(?:酒店|住宿|地址|位置)[^，。；;\n]{0,12}"
+            r"(?:不能(?:太)?|不可(?:太)?)[^，。；;\n]{0,8}(?:偏僻|偏)|"
+            r"交通便利|位置方便",
+            text,
+        ):
             draft.preferences["lodging_location"] = self._preference_rule(
                 key="lodging_location",
                 mode=PreferenceMode.REQUIRED,

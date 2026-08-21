@@ -809,6 +809,9 @@ function FlexiblePlanningSummary({
                     {lodging.room_name ?? "房型待确认"} ·
                     {lodging.breakfast_included === true ? " 含早餐" : " 早餐待确认"}
                   </small>
+                  {lodging.location_evidence_summary && (
+                    <small>位置依据：{lodging.location_evidence_summary}</small>
+                  )}
                 </article>
               ))}
             </div>

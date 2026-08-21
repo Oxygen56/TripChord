@@ -519,6 +519,7 @@ class FlexiblePackageConstraints(DomainModel):
     allow_connections: bool | None = None
     require_breakfast: bool | None = None
     require_non_basic_lodging: bool = False
+    require_non_remote_lodging: bool = False
     breakfast_preference_mode: PreferenceMode | None = None
     breakfast_preference_weight: float | None = Field(default=None, ge=0, le=1)
     minimum_arrival_to_boat_minutes: int = Field(default=120, ge=0, le=1440)
@@ -3431,6 +3432,7 @@ class FlexibleLiveAgentSystem:
             allow_connections=constraints.allow_connections,
             require_breakfast=constraints.require_breakfast,
             require_non_basic_lodging=constraints.require_non_basic_lodging,
+            require_non_remote_lodging=constraints.require_non_remote_lodging,
             breakfast_preference_mode=constraints.breakfast_preference_mode,
             breakfast_preference_weight=constraints.breakfast_preference_weight,
             minimum_arrival_to_boat_minutes=(constraints.minimum_arrival_to_boat_minutes),

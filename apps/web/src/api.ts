@@ -727,6 +727,10 @@ export type FinalPlanProjection = {
     room_name: string | null;
     breakfast_included: boolean | null;
     cancellation_policy: string | null;
+    location_convenience: "confirmed_not_remote" | "unknown";
+    location_address: string | null;
+    nearby_location_evidence: string[];
+    location_evidence_summary: string | null;
   }>;
   transfers: Array<{
     provider: string;

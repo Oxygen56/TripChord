@@ -431,6 +431,25 @@ def test_independent_audit_rejects_windowless_room_even_if_primary_candidate_is_
     assert PackageViolationCode.LODGING_QUALITY_PREFERENCE in primary_codes
 
 
+def test_non_remote_requirement_fails_closed_in_both_verifiers_without_location_proof() -> None:
+    before, after, _ = _candidates()
+    request = _intent().model_copy(update={"require_non_remote_lodging": True})
+
+    report = DeclarativePackageReVerifier().audit(
+        request,
+        before,
+        after,
+        diff_packages(before, after),
+        now=NOW,
+    )
+    primary_codes = {
+        item.code for item in PackageVerifier().errors(request, after, now=NOW)
+    }
+
+    assert PackageInvariantCode.HARD_PREFERENCES in report.failed_codes
+    assert PackageViolationCode.LODGING_LOCATION_PREFERENCE in primary_codes
+
+
 def test_missing_all_required_transfers_fails_closed_in_both_verifiers() -> None:
     before, after, _ = _candidates()
     before = before.model_copy(

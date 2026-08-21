@@ -48,6 +48,13 @@ class LodgingQualityTier(StrEnum):
     BASIC = "basic"
 
 
+class LodgingLocationConvenience(StrEnum):
+    """Evidence-backed assessment; a place or property name is never sufficient."""
+
+    CONFIRMED_NOT_REMOTE = "confirmed_not_remote"
+    UNKNOWN = "unknown"
+
+
 class TransferScheduleMode(StrEnum):
     EXACT_DEPARTURE = "exact_departure"
     SERVICE_WINDOW = "service_window"
@@ -99,6 +106,7 @@ class PackageViolationCode(StrEnum):
     CONNECTION_PREFERENCE = "connection_preference"
     BREAKFAST_PREFERENCE = "breakfast_preference"
     LODGING_QUALITY_PREFERENCE = "lodging_quality_preference"
+    LODGING_LOCATION_PREFERENCE = "lodging_location_preference"
     BUDGET_EXCEEDED = "budget_exceeded"
 
 
@@ -425,6 +433,9 @@ class NormalizedLodgingQuote(NormalizedQuote):
     bed_type: str | None = Field(default=None, min_length=1, max_length=500)
     cancellation_policy: str | None = Field(default=None, min_length=1, max_length=4000)
     payment_policy: str | None = Field(default=None, min_length=1, max_length=1000)
+    location_address: str | None = Field(default=None, min_length=1, max_length=1000)
+    nearby_location_evidence: tuple[str, ...] = ()
+    location_convenience: LodgingLocationConvenience = LodgingLocationConvenience.UNKNOWN
 
     @model_validator(mode="after")
     def validate_stay(self) -> Self:
@@ -441,6 +452,21 @@ class NormalizedLodgingQuote(NormalizedQuote):
             raise ValueError("Maafushi lodging must use destination_island area")
         if self.place_key == PackagePlaceKey.VELANA_AIRPORT:
             raise ValueError("lodging cannot use Velana Airport as its place")
+        if len(self.nearby_location_evidence) > 8:
+            raise ValueError("lodging nearby-location evidence is limited to eight items")
+        if any(not item.strip() or len(item) > 1000 for item in self.nearby_location_evidence):
+            raise ValueError("lodging nearby-location evidence must be bounded non-empty text")
+        if (
+            self.location_convenience == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+            and not lodging_non_remote_evidence_confirmed(
+                self.location_address,
+                self.nearby_location_evidence,
+            )
+        ):
+            raise ValueError(
+                "confirmed non-remote lodging requires an explicit address and visible "
+                "proximity to a service, commercial, or transport facility"
+            )
         return self
 
     @property
@@ -457,6 +483,45 @@ _BASIC_LODGING_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(r"床位|宿舍|公共卫浴|\bdormitory\b|\bshared bathroom\b", re.IGNORECASE),
     ),
 )
+
+_EXPLICIT_LODGING_ADDRESS_PATTERN = re.compile(
+    r"\b(?:road|street|avenue|lane|drive|boulevard|highway|magu|hingun)\b|"
+    r"(?:路|街|道|大道|巷|弄|号)",
+    re.IGNORECASE,
+)
+_NEARBY_PROXIMITY_PATTERN = re.compile(
+    r"(?:^|[\s,.;·])(?:近|靠近|邻近|附近|near(?:by)?|close\s+to|next\s+to|"
+    r"walking\s+distance)",
+    re.IGNORECASE,
+)
+_NEARBY_SERVICE_PATTERN = re.compile(
+    r"潜水|水上(?:活动|运动)|餐厅|咖啡|商店|市场|超市|商场|码头|港口|渡轮|"
+    r"公交|车站|医院|诊所|药房|银行|"
+    r"\b(?:dive|diving|water\s+sports?|restaurant|caf[eé]|shop|market|supermarket|"
+    r"mall|ferry|terminal|jetty|harbo(?:u)?r|bus\s+stop|station|hospital|clinic|"
+    r"pharmacy|bank|atm)\b",
+    re.IGNORECASE,
+)
+
+
+def lodging_non_remote_evidence_confirmed(
+    address: str | None,
+    nearby_evidence: tuple[str, ...],
+) -> bool:
+    """Require explicit address plus visible proximity to real-world services.
+
+    Exact island/place binding is intentionally absent: it proves the requested
+    search area, not whether a property is remote within that area.  Beaches and
+    other natural landmarks alone likewise do not satisfy this contract.
+    """
+
+    if address is None or not _EXPLICIT_LODGING_ADDRESS_PATTERN.search(address):
+        return False
+    return any(
+        _NEARBY_PROXIMITY_PATTERN.search(item)
+        and _NEARBY_SERVICE_PATTERN.search(item)
+        for item in nearby_evidence
+    )
 
 
 def lodging_basic_markers(lodging: NormalizedLodgingQuote) -> tuple[str, ...]:
@@ -789,6 +854,7 @@ class PackageIntent(DomainModel):
     allow_connections: bool | None = None
     require_breakfast: bool | None = None
     require_non_basic_lodging: bool = False
+    require_non_remote_lodging: bool = False
     breakfast_preference_mode: PreferenceMode | None = None
     breakfast_preference_weight: float | None = Field(default=None, ge=0, le=1)
     minimum_arrival_to_boat_minutes: int = Field(default=120, ge=0, le=1440)
@@ -2297,6 +2363,12 @@ class PackagePlanner:
         for lodging in inventory.lodgings:
             if intent.require_non_basic_lodging and lodging_basic_markers(lodging):
                 continue
+            if (
+                intent.require_non_remote_lodging
+                and lodging.location_convenience
+                != LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+            ):
+                continue
             lodging_key = (
                 lodging.area,
                 lodging.check_in,
@@ -2931,6 +3003,11 @@ class PackagePlanner:
             and (
                 not intent.require_non_basic_lodging
                 or not lodging_basic_markers(lodging)
+            )
+            and (
+                not intent.require_non_remote_lodging
+                or lodging.location_convenience
+                == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
             )
             and (
                 intent.destination_place_key is None
@@ -3944,6 +4021,35 @@ class PackageVerifier:
                                 len(markers) for _, markers in basic_lodgings
                             ),
                             "deterministic_hard_filter": True,
+                        },
+                    )
+                )
+        if intent.require_non_remote_lodging:
+            unproven_lodgings = tuple(
+                item
+                for item in candidate.lodgings
+                if (
+                    item.location_convenience
+                    != LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+                    or not lodging_non_remote_evidence_confirmed(
+                        item.location_address,
+                        item.nearby_location_evidence,
+                    )
+                )
+            )
+            if unproven_lodgings:
+                violations.append(
+                    PackageViolation(
+                        code=PackageViolationCode.LODGING_LOCATION_PREFERENCE,
+                        severity=PackageViolationSeverity.ERROR,
+                        message=(
+                            "用户明确要求住宿不能偏僻，但部分住宿缺少来源明确地址及"
+                            "邻近商业、服务或交通设施的页面证据"
+                        ),
+                        component_ids=tuple(item.id for item in unproven_lodgings),
+                        details={
+                            "unknown_location_quote_count": len(unproven_lodgings),
+                            "place_name_alone_is_insufficient": True,
                         },
                     )
                 )

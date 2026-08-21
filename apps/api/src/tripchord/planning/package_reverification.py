@@ -10,6 +10,7 @@ from pydantic import Field, field_validator
 
 from tripchord.domain.common import DomainModel
 from tripchord.planning.package import (
+    LodgingLocationConvenience,
     NormalizedLodgingQuote,
     PackageArea,
     PackageCandidateKind,
@@ -32,6 +33,37 @@ _INDEPENDENT_BASIC_LODGING_PATTERN = re.compile(
     r"\bdormitory\b|\bshared bathroom\b",
     re.IGNORECASE,
 )
+_INDEPENDENT_EXPLICIT_ADDRESS_PATTERN = re.compile(
+    r"\b(?:road|street|avenue|lane|drive|boulevard|highway|magu|hingun)\b|"
+    r"(?:路|街|道|大道|巷|弄|号)",
+    re.IGNORECASE,
+)
+_INDEPENDENT_NEARBY_PATTERN = re.compile(
+    r"(?:^|[\s,.;·])(?:近|靠近|邻近|附近|near(?:by)?|close\s+to|next\s+to|"
+    r"walking\s+distance)",
+    re.IGNORECASE,
+)
+_INDEPENDENT_SERVICE_PATTERN = re.compile(
+    r"潜水|水上(?:活动|运动)|餐厅|咖啡|商店|市场|超市|商场|码头|港口|渡轮|"
+    r"公交|车站|医院|诊所|药房|银行|"
+    r"\b(?:dive|diving|water\s+sports?|restaurant|caf[eé]|shop|market|supermarket|"
+    r"mall|ferry|terminal|jetty|harbo(?:u)?r|bus\s+stop|station|hospital|clinic|"
+    r"pharmacy|bank|atm)\b",
+    re.IGNORECASE,
+)
+
+
+def _independently_confirms_non_remote(lodging: NormalizedLodgingQuote) -> bool:
+    if lodging.location_convenience != LodgingLocationConvenience.CONFIRMED_NOT_REMOTE:
+        return False
+    address = lodging.location_address
+    if address is None or not _INDEPENDENT_EXPLICIT_ADDRESS_PATTERN.search(address):
+        return False
+    return any(
+        _INDEPENDENT_NEARBY_PATTERN.search(item)
+        and _INDEPENDENT_SERVICE_PATTERN.search(item)
+        for item in lodging.nearby_location_evidence
+    )
 
 
 class PackageInvariantCode(StrEnum):
@@ -421,16 +453,23 @@ class DeclarativePackageReVerifier:
                 if _INDEPENDENT_BASIC_LODGING_PATTERN.search(
                     f"{lodging.property_name} {lodging.room_name or ''}"
                 )
+                )
+        if intent.require_non_remote_lodging:
+            invalid.update(
+                lodging.id
+                for lodging in candidate.lodgings
+                if not _independently_confirms_non_remote(lodging)
             )
         return self._check(
             PackageInvariantCode.HARD_PREFERENCES,
             not invalid,
-            "显式托运行李、拒绝中转、早餐和非基础住宿硬偏好必须由报价字段直接证明",
+            "显式托运行李、拒绝中转、早餐、非基础住宿和非偏僻住宿硬偏好必须由报价字段直接证明",
             tuple(sorted(invalid)),
             checked_baggage_required=intent.require_checked_baggage is True,
             direct_flight_required=intent.allow_connections is False,
             breakfast_constraint_present=intent.require_breakfast is not None,
             non_basic_lodging_required=intent.require_non_basic_lodging,
+            non_remote_lodging_required=intent.require_non_remote_lodging,
         )
 
     def _lodging_kind_structure(
