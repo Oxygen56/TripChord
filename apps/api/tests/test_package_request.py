@@ -477,6 +477,28 @@ async def test_real_natural_trip_request_ignores_current_date_and_keeps_return_t
 
 
 @pytest.mark.asyncio
+async def test_date_start_and_completion_boundary_form_a_flexible_window() -> None:
+    result = await HybridPackageRequirementAgent(now=fixed_now).parse(
+        PackageRequirementRequest(
+            text=(
+                "2026-08-20起，需在2026-09-10边界内完成；杭州出发去马尔代夫，"
+                "4-8天，2名成人，1间房。"
+            ),
+            reference_date=date(2026, 8, 19),
+        )
+    )
+
+    assert result.state == PackageRequestState.READY
+    assert result.window is not None
+    assert result.window.earliest_departure == date(2026, 8, 20)
+    assert result.window.latest_departure == date(2026, 9, 7)
+    assert result.window.latest_arrival_date == date(2026, 9, 10)
+    assert result.window.latest_return_date == date(2026, 9, 10)
+    assert result.window.return_date_targets == (date(2026, 9, 9), date(2026, 9, 10))
+    assert (result.window.min_nights, result.window.max_nights) == (3, 7)
+
+
+@pytest.mark.asyncio
 async def test_verbatim_maldives_request_parses_gateway_and_island_comparison() -> None:
     text = (
         "我要从杭州出发去马尔代夫周边游，时间：从明天开始到9月10日前的4-8天游，"

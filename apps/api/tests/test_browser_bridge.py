@@ -109,6 +109,31 @@ async def test_durable_batch_capacity_counts_coalesced_submissions_once() -> Non
         await database.dispose()
 
 
+@pytest.mark.asyncio
+async def test_durable_companion_status_normalizes_sqlite_naive_timestamp() -> None:
+    database = Database("sqlite+aiosqlite://")
+    await database.create_schema()
+    try:
+        store = DurableBrowserTaskStore(
+            database, authority_partition_sha256="status-authority".ljust(64, "0")
+        )
+        bridge = BrowserTaskBridge(
+            durable_store=store,
+            durable_tenant_id="status-tenant",
+        )
+        await bridge.heartbeat(
+            "fixture-companion",
+            providers=tuple(BrowserProvider),
+        )
+
+        status = await bridge.companion_status()
+
+        assert status.status == "connected"
+        assert status.companions[0].is_fresh is True
+    finally:
+        await database.dispose()
+
+
 def submission(
     provider: BrowserProvider,
     kind: BrowserVertical,

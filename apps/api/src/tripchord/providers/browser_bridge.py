@@ -29,6 +29,10 @@ from tripchord.formal_live_source import FormalLiveSourceAuthority
 
 logger = logging.getLogger(__name__)
 
+
+def _aware(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
 BRIDGE_TOKEN_HEADER = "X-TripChord-Bridge-Token"
 CONTROL_TOKEN_HEADER = "X-TripChord-Control-Token"
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
@@ -3382,10 +3386,10 @@ class BrowserTaskBridge:
                 BrowserCompanionHeartbeat(
                     companion_id=row.companion_id,
                     providers=tuple(BrowserProvider(value) for value in row.providers),
-                    last_seen=row.last_seen_at,
-                    age_seconds=max(0.0, (now - row.last_seen_at).total_seconds()),
+                    last_seen=_aware(row.last_seen_at),
+                    age_seconds=max(0.0, (now - _aware(row.last_seen_at)).total_seconds()),
                     is_fresh=(
-                        now - row.last_seen_at
+                        now - _aware(row.last_seen_at)
                         <= timedelta(seconds=COMPANION_HEARTBEAT_STALE_AFTER_SECONDS)
                     ),
                     authorized_scope_keys=tuple(row.scopes),

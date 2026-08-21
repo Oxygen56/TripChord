@@ -56,7 +56,11 @@ from tripchord.planning.stay_plans import StayPlanCandidateSet
 from tripchord.planning.verifier import VerificationContext
 from tripchord.planning.workflow import PlanningWorkflow, WorkflowResult
 from tripchord.providers.base import OfferSearchQuery, OfferSearchResult, ProviderRegistry
-from tripchord.providers.browser_bridge import BrowserSearchQuery
+from tripchord.providers.browser_bridge import (
+    BrowserProvider,
+    BrowserSearchQuery,
+    _is_allowed_provider_url,
+)
 from tripchord.providers.user_snapshot import UserQuoteInput, import_user_quote
 
 
@@ -357,6 +361,7 @@ class FinalFlightProjection(ApiModel):
     display_amount_cents: int | None = None
     party_total_known: bool = True
     price_basis: str = "total_party"
+    official_view_url: str | None = None
 
 
 class FinalLodgingProjection(ApiModel):
@@ -370,6 +375,7 @@ class FinalLodgingProjection(ApiModel):
     breakfast_included: bool | None = None
     cancellation_policy: str | None = None
     display_total_cents: int | None = None
+    official_view_url: str | None = None
 
 
 class FinalTransferProjection(ApiModel):
@@ -662,6 +668,23 @@ def build_final_plan_projection(
     )
 
 
+def _trusted_quote_view_url(quote: Any) -> str | None:
+    """Expose only provider URLs already carried by the captured evidence."""
+
+    try:
+        provider = BrowserProvider(quote.provider)
+    except ValueError:
+        return None
+    for reference in quote.evidence_refs:
+        if (
+            isinstance(reference, str)
+            and reference.startswith("https://")
+            and _is_allowed_provider_url(provider, reference)
+        ):
+            return reference
+    return None
+
+
 def build_best_available_plan_projection(
     run: FlexibleLiveAgentRun,
 ) -> BestAvailablePlanProjection | None:
@@ -887,6 +910,7 @@ def build_best_available_plan_projection(
             ),
             party_total_known=flight.party_total_known,
             price_basis=flight.price_basis,
+            official_view_url=_trusted_quote_view_url(flight),
         ),
         lodgings=tuple(
             FinalLodgingProjection(
@@ -900,6 +924,7 @@ def build_best_available_plan_projection(
                 breakfast_included=item.breakfast_included,
                 cancellation_policy=item.cancellation_policy,
                 display_total_cents=item.total_for_party_cents,
+                official_view_url=_trusted_quote_view_url(item),
             )
             for item in chosen_lodgings
         ),

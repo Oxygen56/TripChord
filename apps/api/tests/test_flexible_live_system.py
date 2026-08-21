@@ -23,6 +23,7 @@ from tripchord.agents.live_system import (
     ExactQuoteComparisonCoverage,
     LiveCoverageMode,
     LivePackageAgentRun,
+    LivePackageAgentSystem,
     LodgingProviderQuoteEvidence,
     LodgingSegmentQuoteComparisonCoverage,
     PlatformSearchCoverage,
@@ -78,6 +79,47 @@ EXPIRES = NOW + timedelta(hours=1)
 MALDIVES = timezone(timedelta(hours=5))
 CHINA = timezone(timedelta(hours=8))
 REQUEST_SHA256 = "1" * 64
+
+
+def test_search_task_capabilities_sort_provider_delays() -> None:
+    query = BrowserSearchQuery(
+        origin="杭州",
+        destination="马尔代夫",
+        start_date=date(2026, 9, 3),
+        end_date=date(2026, 9, 9),
+        adults=2,
+    )
+    tasks = tuple(
+        AgentTask(
+            id=task_id,
+            role=AgentRole.LODGING,
+            goal="read-only lodging search",
+            allowed_tools=("browser_bridge_search",),
+            input={
+                "submission": BrowserTaskSubmission(
+                    provider=BrowserProvider.CTRIP,
+                    kind=BrowserVertical.LODGING,
+                    query=query,
+                    timeout_seconds=15,
+                    max_attempts=1,
+                ).model_dump(mode="json"),
+                "start_delay_ms": delay,
+            },
+        )
+        for task_id, delay in (
+            ("lodging-full", 4_000),
+            ("lodging-first", 1_000),
+            ("lodging-middle", 2_000),
+        )
+    )
+    system = LivePackageAgentSystem(BrowserTaskBridge(now=lambda: NOW))
+
+    capabilities = system._search_task_capabilities(
+        tasks,
+        mode=LiveCoverageMode.STRICT,
+    )
+
+    assert [item.current_start_delay_ms for item in capabilities] == [1_000, 2_000, 4_000]
 
 
 class ImmediateWaitTimeoutBrowserTaskBridge(BrowserTaskBridge):

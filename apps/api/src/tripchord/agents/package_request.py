@@ -46,6 +46,14 @@ _SAME_MONTH_RANGE_PATTERN = re.compile(
     r"(?P<start>\d{1,2})\s*日?\s*(?:-|–|—|~|～|到|至)\s*"
     r"(?P<end>\d{1,2})\s*日"
 )
+_DATE_WINDOW_BOUNDARY_PATTERN = re.compile(
+    r"(?P<start_year>20\d{2})\s*(?:年|[-/.])\s*(?P<start_month>\d{1,2})"
+    r"\s*(?:月|[-/.])\s*(?P<start_day>\d{1,2})\s*日?\s*(?:起|开始).*?"
+    r"(?:需在|截至|不晚于).*?"
+    r"(?P<end_year>20\d{2})\s*(?:年|[-/.])\s*(?P<end_month>\d{1,2})"
+    r"\s*(?:月|[-/.])\s*(?P<end_day>\d{1,2})\s*日?"
+    r"\s*(?:边界(?:内完成)?|之前|前|内)?"
+)
 _BARE_MONTH_PATTERN = re.compile(r"(?<!\d)(?P<month>\d{1,2})\s*月")
 _DURATION_PATTERN = re.compile(
     r"(?P<minimum>\d{1,2})\s*(?:-|–|—|~|～|到|至)\s*"
@@ -796,6 +804,53 @@ class HybridPackageRequirementAgent:
                     same_month_range.group(0),
                 )
                 return
+        semantic_window = _DATE_WINDOW_BOUNDARY_PATTERN.search(text)
+        if semantic_window is not None:
+            try:
+                earliest_departure = date(
+                    int(semantic_window.group("start_year")),
+                    int(semantic_window.group("start_month")),
+                    int(semantic_window.group("start_day")),
+                )
+                latest_arrival = date(
+                    int(semantic_window.group("end_year")),
+                    int(semantic_window.group("end_month")),
+                    int(semantic_window.group("end_day")),
+                )
+            except ValueError:
+                self._add_unresolved(
+                    draft,
+                    UnresolvedRequirement(
+                        field="date_window",
+                        reason=(
+                            f"用户提供的日期窗口无效：{semantic_window.group(0)}；"
+                            "禁止降级成固定出返日期"
+                        ),
+                        critical=True,
+                    ),
+                )
+                return
+            self._set_fact(
+                draft,
+                "earliest_departure",
+                earliest_departure,
+                RequirementFactSource.EXPLICIT_TEXT,
+                semantic_window.group(0),
+            )
+            draft.latest_return_date = latest_arrival
+            draft.latest_arrival_date = latest_arrival
+            draft.return_date_targets = (
+                latest_arrival - timedelta(days=1),
+                latest_arrival,
+            )
+            self._set_fact(
+                draft,
+                "latest_arrival_date",
+                latest_arrival,
+                RequirementFactSource.EXPLICIT_TEXT,
+                semantic_window.group(0),
+            )
+            return
         relative_departure = re.search(r"(?:从\s*)?明天(?:开始|起)?", text)
         deadline = re.search(
             r"(?:到|截至|不晚于)\s*(?P<month>\d{1,2})\s*月\s*"

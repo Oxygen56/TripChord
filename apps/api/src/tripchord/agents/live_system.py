@@ -5584,7 +5584,18 @@ class LivePackageAgentSystem:
                     capability_version=capability_version,
                 )
             )
-        return tuple(capabilities)
+        provider_order = tuple(dict.fromkeys(item.provider for item in capabilities))
+        provider_rank = {provider: index for index, provider in enumerate(provider_order)}
+        return tuple(
+            sorted(
+                capabilities,
+                key=lambda item: (
+                    provider_rank[item.provider],
+                    item.current_start_delay_ms,
+                    item.task_id,
+                ),
+            )
+        )
 
     async def _supervise_source_schedule(
         self,

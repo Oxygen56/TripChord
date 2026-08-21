@@ -349,7 +349,10 @@ def test_best_available_plan_keeps_display_fare_separate_from_lodging_total() ->
         captured_at=captured_at,
         expires_at=captured_at + timedelta(minutes=10),
         availability=QuoteAvailability.AVAILABLE,
-        evidence_refs=("flight-evidence",),
+        evidence_refs=(
+            "flight-evidence",
+            "https://www.ly.com/eliflight/book1.html?para=HGH*MLE*2026-09-03*2026-09-09*RT*2_0_0*Y%7CS%7CC%7CF",
+        ),
         origin="杭州",
         destination="马累",
         adults=2,
@@ -370,7 +373,10 @@ def test_best_available_plan_keeps_display_fare_separate_from_lodging_total() ->
         captured_at=captured_at,
         expires_at=captured_at + timedelta(minutes=10),
         availability=QuoteAvailability.AVAILABLE,
-        evidence_refs=("lodging-evidence",),
+        evidence_refs=(
+            "lodging-evidence",
+            "https://hotels.ctrip.com/hotels/detail/?cityEnName=Maafushi&hotelId=47330536&checkIn=2026-09-03&checkOut=2026-09-09&adult=2&children=0&crn=1",
+        ),
         property_name="Hotel Ocean Grand at Hulhumale",
         area=PackageArea.AIRPORT_ISLAND,
         check_in=date(2026, 9, 3),
@@ -416,6 +422,10 @@ def test_best_available_plan_keeps_display_fare_separate_from_lodging_total() ->
     assert plan.flight.display_amount_cents == 410_100
     assert plan.flight.party_total_known is False
     assert plan.lodgings[0].display_total_cents == 544_200
+    assert plan.flight.official_view_url is not None
+    assert plan.flight.official_view_url.startswith("https://www.ly.com/")
+    assert plan.lodgings[0].official_view_url is not None
+    assert plan.lodgings[0].official_view_url.startswith("https://hotels.ctrip.com/")
     assert plan.return_date == date(2026, 9, 9)
     assert plan.flight.return_arrive_at.date() == date(2026, 9, 10)
 
@@ -442,7 +452,7 @@ def test_best_available_plan_does_not_add_unknown_flight_fare_to_lodging() -> No
             captured_at=captured_at,
             expires_at=captured_at + timedelta(minutes=10),
             availability=QuoteAvailability.AVAILABLE,
-            evidence_refs=("flight-evidence",),
+            evidence_refs=("flight-evidence", "https://example.com/secret"),
             origin="杭州",
             destination="马累",
             adults=2,
@@ -531,6 +541,7 @@ def test_best_available_plan_does_not_add_unknown_flight_fare_to_lodging() -> No
     assert plan.departure_date == date(2026, 9, 3)
     assert plan.flight is not None
     assert plan.flight.display_amount_cents == 410_100
+    assert plan.flight.official_view_url is None
     assert plan.total_budget_cents is None
 
 
