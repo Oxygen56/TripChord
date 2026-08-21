@@ -39,6 +39,7 @@ from tripchord.agents.context_budget import (
 )
 from tripchord.agents.live_advisory import (
     AgenticRunSummary,
+    AgenticStageTrace,
     CandidateCurationProposal,
     EventDiagnosisProposal,
     EvidenceArbitrationProposal,
@@ -103,6 +104,7 @@ from tripchord.planning.event_contracts import (
 )
 from tripchord.planning.offer_semantics import stable_offer_identity
 from tripchord.planning.package import (
+    LodgingLocationConvenience,
     NormalizedFlightQuote,
     NormalizedFlightSegment,
     NormalizedLodgingQuote,
@@ -140,6 +142,7 @@ from tripchord.planning.package import (
     diff_packages,
     lodging_basic_markers,
     lodging_is_segment_comparison_eligible,
+    lodging_non_remote_evidence_confirmed,
     lodging_quality_tier,
 )
 from tripchord.planning.package_reverification import (
@@ -389,6 +392,28 @@ _EXPLORATION_MODEL_STAGE_IDS = (
     "recriticize-repaired-package",
     "recommend-final-decision",
 )
+
+_DETERMINISTIC_DOMINANCE_SKIP = "deterministic_dominance_skip"
+_DETERMINISTIC_DOMINANCE_POLICY_BOUNDARY = (
+    "只比较已通过全部硬约束的候选；同行可比人民币总价必须严格更低，且航班、"
+    "接驳、早餐、取消、位置与用户已声明的房型品质权益不得变差。用户只要求"
+    "非简陋时，海景、阳台、豪华等未声明营销属性不构成额外付费偏好，仅在同价"
+    "候选间作确定性择优。"
+)
+
+_MODEL_ROLE_CLAIM_LABELS: dict[AgentRole, str] = {
+    AgentRole.QUERY_STRATEGIST: "需求理解",
+    AgentRole.SEARCH_SUPERVISOR: "搜索调度",
+    AgentRole.EVIDENCE_ARBITER: "证据仲裁",
+    AgentRole.CANDIDATE_CURATOR: "候选策展",
+    AgentRole.RISK_CRITIC: "风险批判",
+    AgentRole.REPAIR_STRATEGIST: "修复策略",
+    AgentRole.RECRITIC: "修复后复审",
+    AgentRole.ORCHESTRATOR: "主控建议",
+    AgentRole.EXPLANATION: "结果解释",
+    AgentRole.MEMORY_CURATOR: "记忆策展",
+    AgentRole.EVENT_DIAGNOSER: "变化诊断",
+}
 
 
 class FlightSearchOutcomeState(StrEnum):
@@ -2284,6 +2309,7 @@ class LivePackageAgentSystem:
             )
         elif not state.publication_gate_passed:
             raise RuntimeError("deterministic publication gate did not complete")
+        state.claim_boundary += self._model_participation_claim(state, scheduler)
         model_applied_diffs: list[dict[str, JsonValue]] = []
         if (
             state.search_supervisor_proposal is not None
@@ -2655,6 +2681,67 @@ class LivePackageAgentSystem:
         return summary.model_copy(
             update={"model_concurrency_audits": (shard_audit.model_concurrency_audit,)}
         )
+
+    def _model_participation_claim(
+        self,
+        state: _RunState,
+        scheduler: SchedulerOutcome,
+    ) -> str:
+        """Describe model participation from completed traces, never configuration."""
+
+        successful: list[str] = []
+        attempted_failed: list[str] = []
+        deterministic_skips: list[str] = []
+        not_called: list[str] = []
+        for result in self._agentic_summary_results(state, scheduler):
+            raw_trace = result.output.get("agentic_trace")
+            if not isinstance(raw_trace, dict):
+                continue
+            try:
+                trace = AgenticStageTrace.model_validate(raw_trace)
+            except ValueError:
+                continue
+            label = (
+                f"{_MODEL_ROLE_CLAIM_LABELS.get(trace.role, trace.role.value)}"
+                f"（{trace.task_id}）"
+            )
+            if trace.execution_mode == "deterministic_skip":
+                deterministic_skips.append(label)
+            elif trace.logical_request_count > 0:
+                proposal_validation = result.output.get("proposal_validation")
+                proposal_rejected = bool(
+                    result.output.get("agent_required_failed") is True
+                    or result.output.get("proposal_applied") is False
+                    or result.output.get("proposal_rejected_reason")
+                    or (
+                        isinstance(proposal_validation, dict)
+                        and (
+                            proposal_validation.get("accepted") is False
+                            or proposal_validation.get("required_model_failure") is True
+                        )
+                    )
+                )
+                if trace.failure or not result.success or proposal_rejected:
+                    attempted_failed.append(label)
+                else:
+                    successful.append(label)
+            else:
+                not_called.append(label)
+
+        groups = (
+            ("模型请求成功", successful),
+            ("已尝试但失败", attempted_failed),
+            ("确定性跳过", deterministic_skips),
+            ("本轮未调用", not_called),
+        )
+        details = "；".join(
+            f"{heading}：{'\u3001'.join(dict.fromkeys(items))}"
+            for heading, items in groups
+            if items
+        )
+        if not details:
+            details = "本轮没有进入可声明的模型阶段"
+        return f"模型参与实录仅按本轮实际阶段轨迹生成：{details}；未据配置推断参与。"
 
     @staticmethod
     def _run_finalization_tasks(purpose: LiveRunPurpose) -> tuple[AgentTask, ...]:
@@ -3126,6 +3213,7 @@ class LivePackageAgentSystem:
                 "绝不作为发布证据；全部恢复仍缺即失败。随后在新 "
                 "normalized inventory 上重新执行 Planner-"
                 "Verifier-Repair-ReVerifier-主控与发布门。"
+                + self._model_participation_claim(state, scheduler)
             ),
             all_platforms_complete=previous.all_platforms_complete,
             source_execution_completeness=previous.source_execution_completeness,
@@ -4148,7 +4236,8 @@ class LivePackageAgentSystem:
                 "包含 Evidence Arbiter 排除的报价；只要存在 evidence_selection_eligible=true "
                 "的候选，就必须从中选择，不能把已排除报价重新带入后续验证。"
                 "必须比较真实的去返程时间与到达边界；若存在多个可选候选，至少根据"
-                "实际返程到达时间、接驳缓冲和用户偏好作出一个可解释的选择，不能返回空选择。",
+                "实际返程到达时间、接驳缓冲和用户偏好作出一个可解释的选择，不能返回空选择。"
+                "evidence/evidence_refs 必须为空；仅返回候选 ID 与短理由。",
                 CandidateCurationProposal,
             ),
             AgentRole.RISK_CRITIC: (
@@ -4231,6 +4320,195 @@ class LivePackageAgentSystem:
         state: _RunState,
     ) -> tuple[TravelPackageCandidate, ...]:
         return state.candidate_decision_frontier or state.candidate_shortlist
+
+    @staticmethod
+    def _cancellation_entitlement_rank(policy: str | None) -> int:
+        if policy is None:
+            return 0
+        normalized = policy.casefold()
+        if any(
+            marker in normalized
+            for marker in ("免费取消", "free cancellation", "free cancel")
+        ):
+            return 3
+        if any(
+            marker in normalized
+            for marker in ("不可取消", "不可退款", "non-refundable", "nonrefundable")
+        ):
+            return 1
+        return 2
+
+    @staticmethod
+    def _breakfast_entitlement_rank(value: bool | None) -> int:
+        return {None: 0, False: 1, True: 2}[value]
+
+    def _lodging_rights_no_worse(
+        self,
+        intent: PackageIntent,
+        preferred: NormalizedLodgingQuote,
+        alternative: NormalizedLodgingQuote,
+    ) -> bool:
+        if (
+            preferred.area,
+            preferred.place_key,
+            preferred.check_in,
+            preferred.check_out,
+            preferred.adults,
+            preferred.children,
+            preferred.children_ages,
+            preferred.infants,
+            preferred.rooms,
+            preferred.currency,
+        ) != (
+            alternative.area,
+            alternative.place_key,
+            alternative.check_in,
+            alternative.check_out,
+            alternative.adults,
+            alternative.children,
+            alternative.children_ages,
+            alternative.infants,
+            alternative.rooms,
+            alternative.currency,
+        ):
+            return False
+        if self._breakfast_entitlement_rank(
+            preferred.breakfast_included
+        ) < self._breakfast_entitlement_rank(alternative.breakfast_included):
+            return False
+        if self._cancellation_entitlement_rank(
+            preferred.cancellation_policy
+        ) < self._cancellation_entitlement_rank(alternative.cancellation_policy):
+            return False
+        if bool(preferred.payment_policy) < bool(alternative.payment_policy):
+            return False
+        if bool(preferred.bed_type) < bool(alternative.bed_type):
+            return False
+
+        preferred_non_basic = not lodging_basic_markers(preferred)
+        alternative_non_basic = not lodging_basic_markers(alternative)
+        if preferred_non_basic < alternative_non_basic:
+            return False
+        if not intent.require_non_basic_lodging:
+            quality_order = {
+                "sea_view": 4,
+                "balcony": 3,
+                "deluxe": 2,
+                "standard": 1,
+                "basic": 0,
+            }
+            if quality_order[lodging_quality_tier(preferred).value] < quality_order[
+                lodging_quality_tier(alternative).value
+            ]:
+                return False
+
+        preferred_not_remote = (
+            preferred.location_convenience
+            == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+            and lodging_non_remote_evidence_confirmed(
+                preferred.location_address,
+                preferred.nearby_location_evidence,
+            )
+        )
+        alternative_not_remote = (
+            alternative.location_convenience
+            == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+            and lodging_non_remote_evidence_confirmed(
+                alternative.location_address,
+                alternative.nearby_location_evidence,
+            )
+        )
+        return preferred_not_remote >= alternative_not_remote
+
+    def _candidate_strictly_dominates(
+        self,
+        intent: PackageIntent,
+        preferred: TravelPackageCandidate,
+        alternative: TravelPackageCandidate,
+    ) -> bool:
+        if (
+            preferred.id == alternative.id
+            or preferred.currency != intent.currency
+            or alternative.currency != intent.currency
+            or preferred.computed_total_cents >= alternative.computed_total_cents
+            or preferred.flight.id != alternative.flight.id
+            or preferred.kind != alternative.kind
+            or tuple(item.id for item in preferred.transfers)
+            != tuple(item.id for item in alternative.transfers)
+        ):
+            return False
+        preferred_lodgings = {
+            (item.area, item.check_in, item.check_out): item for item in preferred.lodgings
+        }
+        alternative_lodgings = {
+            (item.area, item.check_in, item.check_out): item for item in alternative.lodgings
+        }
+        return preferred_lodgings.keys() == alternative_lodgings.keys() and all(
+            self._lodging_rights_no_worse(
+                intent,
+                preferred_lodgings[key],
+                alternative_lodgings[key],
+            )
+            for key in preferred_lodgings
+        )
+
+    def _deterministic_dominance_winner(
+        self,
+        state: _RunState,
+        intent: PackageIntent,
+    ) -> tuple[TravelPackageCandidate, int] | None:
+        excluded_quote_ids = set(
+            state.evidence_proposal.excluded_quote_ids
+            if state.evidence_proposal is not None
+            else ()
+        )
+        eligible = tuple(
+            candidate
+            for candidate in state.candidates
+            if self._candidate_scope_eligible(state, candidate)
+            and not (set(candidate.component_ids) & excluded_quote_ids)
+            and not self._verifier.errors(intent, candidate, now=self._now())
+        )
+        if not eligible:
+            return None
+        if len(eligible) == 1:
+            return eligible[0], 1
+        winners = tuple(
+            candidate
+            for candidate in eligible
+            if all(
+                candidate.id == alternative.id
+                or self._candidate_strictly_dominates(intent, candidate, alternative)
+                for alternative in eligible
+            )
+        )
+        if len(winners) != 1:
+            return None
+        return winners[0], len(eligible)
+
+    @staticmethod
+    def _bind_initial_candidate(
+        state: _RunState,
+        intent: PackageIntent,
+        selected: TravelPackageCandidate,
+    ) -> None:
+        state.planner_handoff = PackagePlannerHandoff(
+            candidates=state.candidates,
+            selected_candidate_id=selected.id,
+        )
+        state.initial_candidate = selected
+        if state.stay_plan_candidate_set is not None:
+            state.stay_plan_planner_handoff = StayPlanPlannerHandoff.from_candidates(
+                state.stay_plan_candidate_set,
+                intent,
+                state.candidates,
+                selected.id,
+                inventory=state.inventory,
+                inventory_outcomes=state.stay_plan_inventory_outcomes,
+            )
+            state.selected_stay_plan_id = (
+                state.stay_plan_planner_handoff.selected_stay_plan_id
+            )
 
     def _candidate_curation_policy(
         self,
@@ -4912,6 +5190,39 @@ class LivePackageAgentSystem:
                 result = agent.unavailable_result(task, "bulk_exploration_model_deferred")
                 state.agentic_results[task.id] = result
                 return result
+            if (
+                role == AgentRole.CANDIDATE_CURATOR
+                and apply_proposal
+                and task.id == "curate-travel-candidates"
+                and (
+                    dominance := self._deterministic_dominance_winner(
+                        state,
+                        intent,
+                    )
+                )
+                is not None
+            ):
+                winner, eligible_count = dominance
+                state.candidate_decision_frontier = (winner,)
+                self._bind_initial_candidate(state, intent, winner)
+                result = agent.skipped_result(
+                    task,
+                    _DETERMINISTIC_DOMINANCE_SKIP,
+                    summary=(
+                        "候选存在唯一确定性支配赢家，已跳过 Candidate Curator 模型请求"
+                    ),
+                    output={
+                        "candidate_curation_mode": _DETERMINISTIC_DOMINANCE_SKIP,
+                        "selected_candidate_id": winner.id,
+                        "hard_eligible_candidate_count": eligible_count,
+                        "selected_total_for_party_cents": winner.computed_total_cents,
+                        "dominance_policy_boundary": (
+                            _DETERMINISTIC_DOMINANCE_POLICY_BOUNDARY
+                        ),
+                    },
+                )
+                state.agentic_results[task.id] = result
+                return result
             formal_model_role = os.environ.get("TRIPCHORD_FORMAL_MODEL_ROLE", "").strip()
             if formal_model_role and formal_model_role != role.value:
                 result = agent.unavailable_result(task, "formal_model_role_limited")
@@ -5245,21 +5556,7 @@ class LivePackageAgentSystem:
                     f"{sorted(selected_exclusions)}"
                 )
                 return
-            state.planner_handoff = PackagePlannerHandoff(
-                candidates=state.candidates,
-                selected_candidate_id=selected.id,
-            )
-            state.initial_candidate = selected
-            if state.stay_plan_candidate_set is not None:
-                state.stay_plan_planner_handoff = StayPlanPlannerHandoff.from_candidates(
-                    state.stay_plan_candidate_set,
-                    intent,
-                    state.candidates,
-                    selected.id,
-                    inventory=state.inventory,
-                    inventory_outcomes=state.stay_plan_inventory_outcomes,
-                )
-                state.selected_stay_plan_id = state.stay_plan_planner_handoff.selected_stay_plan_id
+            self._bind_initial_candidate(state, intent, selected)
             return
         if role in {AgentRole.RISK_CRITIC, AgentRole.RECRITIC}:
             proposal = proposal_from_result(result, RiskCritiqueProposal)
@@ -7463,6 +7760,29 @@ class LivePackageAgentSystem:
                     "it does not replace the request-wide flexible-search directive"
                 ),
             }
+            dominance = self._deterministic_dominance_winner(state, intent)
+            if dominance is not None:
+                winner, eligible_count = dominance
+                state.candidate_decision_frontier = (winner,)
+                common_output.update(
+                    {
+                        "mode": _DETERMINISTIC_DOMINANCE_SKIP,
+                        "scout_task_ids": [],
+                        "decision_frontier_candidate_ids": [winner.id],
+                        "candidate_shard_merge_audit": None,
+                        "hard_eligible_candidate_count": eligible_count,
+                        "selected_total_for_party_cents": winner.computed_total_cents,
+                        "dominance_policy_boundary": (
+                            _DETERMINISTIC_DOMINANCE_POLICY_BOUNDARY
+                        ),
+                    }
+                )
+                return self._stage_result(
+                    task,
+                    "deterministic candidate dominance removed model fan-out",
+                    common_output,
+                    topic="candidate_frontier_preparation",
+                )
             if directive.raw_logical_agents > 96 or directive.logical_saturated:
                 raise RuntimeError(
                     "candidate Scout fan-out exceeds the 96 logical-Agent cap; "
@@ -8449,21 +8769,8 @@ class LivePackageAgentSystem:
                         else "模型候选可见范围未形成证明；"
                     )
                 )
-                + (
-                    "本轮是批量日期探索：证据仲裁、候选策展、风险批判、修复策略、"
-                    "修复后复审、主控建议及解释模型均未调用；报价事实和确定性裁决由"
-                    "服务器流水线完成，最终模型复核仅在唯一发布重搜中执行；"
-                    if not state.model_agents_enabled
-                    else (
-                        "本轮模型 Agent 已通过白名单工具参与证据仲裁、"
-                        "候选策展、风险批判、修复策略、修复后复审和主控建议；"
-                        if self._model_router is not None
-                        else (
-                            "本条候选链的报价事实与确定性裁决未由模型改写；正式入口模型是否实际参与，"
-                            "以本次响应中的 model_trace 字段为准；"
-                        )
-                    )
-                )
+                + "模型参与情况在全部阶段完成后仅由本轮实际阶段轨迹生成，"
+                "不按配置或角色清单推断；"
                 + (
                     "最终候选已由 "
                     f"{state.package_reverification_audit.engine} 独立重算 "
@@ -8588,15 +8895,26 @@ class LivePackageAgentSystem:
                         isinstance(proposal_validation, dict)
                         and proposal_validation.get("required_model_failure") is True
                     )
+                    authorized_deterministic_skip = bool(
+                        task_id == "curate-travel-candidates"
+                        and isinstance(trace, dict)
+                        and trace.get("execution_mode") == "deterministic_skip"
+                        and trace.get("skip_reason") == _DETERMINISTIC_DOMINANCE_SKIP
+                        and result.output.get("candidate_curation_mode")
+                        == _DETERMINISTIC_DOMINANCE_SKIP
+                    )
                     if (
-                        result.output.get("agent_required_failed") is True
-                        or proposal_required_failure
-                        or not isinstance(trace, dict)
-                        or trace.get("model_called") is not True
-                        or not isinstance(logical_request_count, int)
-                        or isinstance(logical_request_count, bool)
-                        or logical_request_count < 1
-                        or trace.get("failure") not in (None, "")
+                        not authorized_deterministic_skip
+                        and (
+                            result.output.get("agent_required_failed") is True
+                            or proposal_required_failure
+                            or not isinstance(trace, dict)
+                            or trace.get("model_called") is not True
+                            or not isinstance(logical_request_count, int)
+                            or isinstance(logical_request_count, bool)
+                            or logical_request_count < 1
+                            or trace.get("failure") not in (None, "")
+                        )
                     ):
                         required_model_failures.append(task_id)
             state.exploration_required_model_failures = tuple(required_model_failures)

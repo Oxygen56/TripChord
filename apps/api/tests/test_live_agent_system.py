@@ -3187,6 +3187,10 @@ async def _run_agent_repair_closure(
         model_router=router,
         model_agents_required=model_agents_required,
     )
+    # These fixtures exercise the model-proposed soft-risk repair chain itself.
+    # Disable the independent dominance fast path so the scripted responses stay
+    # scoped to that contract; dedicated tests below cover dominance skipping.
+    system._deterministic_dominance_winner = lambda *_: None  # type: ignore[method-assign]
     run, _ = await asyncio.gather(
         system.run(
             intent().model_copy(update={"destination_place_key": None}),
@@ -4137,6 +4141,138 @@ async def test_candidate_curator_cannot_revive_evidence_excluded_quote() -> None
     assert state.planner_handoff is None
 
 
+def test_candidate_curator_discards_long_non_authoritative_evidence_locally() -> None:
+    long_url = "https://example.invalid/" + ("evidence-segment/" * 80)
+    proposal = CandidateCurationProposal.model_validate(
+        {
+            "summary": "候选说明" * 200,
+            "selected_candidate_id": "candidate:known",
+            "alternative_candidate_ids": [],
+            "tradeoffs": ["价格与权益取舍"],
+            "evidence": [long_url],
+            "evidence_refs": [long_url],
+            "confidence": 0.8,
+        }
+    )
+
+    assert len(proposal.summary) == 400
+    assert proposal.evidence == ()
+    assert proposal.evidence_refs == ()
+    schema = CandidateCurationProposal.model_json_schema()["properties"]
+    assert "maxLength" not in schema["evidence"]["items"]
+    assert "maxLength" not in schema["evidence_refs"]["items"]
+
+
+@pytest.mark.asyncio
+async def test_deterministic_dominance_skips_curator_without_a_failure() -> None:
+    _, _, run = await _run_v4(LiveCoverageMode.STRICT)
+
+    curator = next(
+        stage
+        for stage in run.agentic.stages
+        if stage.task_id == "curate-travel-candidates"
+    )
+    assert curator.execution_mode == "deterministic_skip"
+    assert curator.skip_reason == "deterministic_dominance_skip"
+    assert curator.failure is None
+    assert curator.logical_request_count == 0
+    assert run.agentic.logical_request_count == 0
+    assert "确定性跳过：候选策展（curate-travel-candidates）" in run.claim_boundary
+    assert "本轮模型 Agent 已通过白名单工具参与" not in run.claim_boundary
+
+
+@pytest.mark.asyncio
+async def test_pareto_candidate_scope_still_calls_one_curator_tool_chain() -> None:
+    first, second = await _two_visible_hard_valid_candidates()
+    first = first.model_copy(
+        update={
+            "lodgings": tuple(
+                lodging.model_copy(
+                    update={
+                        "breakfast_included": True,
+                        "cancellation_policy": "免费取消",
+                        "payment_policy": "到店支付",
+                    }
+                )
+                for lodging in first.lodgings
+            )
+        }
+    )
+    second = second.model_copy(
+        update={
+            "lodgings": tuple(
+                lodging.model_copy(
+                    update={
+                        "breakfast_included": False,
+                        "cancellation_policy": None,
+                        "payment_policy": None,
+                    }
+                )
+                for lodging in second.lodgings
+            )
+        }
+    )
+    model = ScriptedModelClient(
+        (
+            _agent_tool_response("inspect_package_candidates", "pareto-curator-tool"),
+            _agent_json_response(
+                {
+                    "summary": "两个候选不同航班与接驳，保留真实取舍",
+                    "selected_candidate_id": second.id,
+                    "alternative_candidate_ids": [first.id],
+                    "tradeoffs": ["价格与行程组件不可直接支配"],
+                    "evidence": ["https://example.invalid/" + ("long/" * 100)],
+                    "evidence_refs": [],
+                    "confidence": 0.7,
+                }
+            ),
+        ),
+        model="pareto-curator-fixture",
+    )
+    router = ModelRouter(
+        {AgentRole.CANDIDATE_CURATOR: model},
+        high_risk_client=model,
+    )
+    state = _RunState(
+        source_task_ids=(),
+        intent=intent(),
+        candidates=(first, second),
+        candidate_shortlist=(first, second),
+        candidate_decision_frontier=(first, second),
+    )
+    system = LivePackageAgentSystem(
+        BrowserTaskBridge(now=lambda: NOW),
+        now=lambda: NOW,
+        model_router=router,
+    )
+    task = AgentTask(
+        id="curate-travel-candidates",
+        role=AgentRole.CANDIDATE_CURATOR,
+        goal="在真实不可比权衡中选择候选",
+        allowed_tools=("inspect_package_candidates",),
+    )
+
+    result = await system._agentic_executor(
+        state,
+        intent(),
+        AgentRole.CANDIDATE_CURATOR,
+    )(
+        task,
+        ContextEngine(EvidenceBlackboard()),
+        system._tool_registry(state, source_task_count=0),
+    )
+
+    assert len(model.requests) == 2
+    trace = cast(dict[str, JsonValue], result.output["agentic_trace"])
+    assert trace["execution_mode"] == "model"
+    assert trace["failure"] is None
+    assert result.output["evidence"] == []
+    assert state.initial_candidate is not None
+    assert state.initial_candidate.id == second.id
+    assert state.planner_handoff is not None
+    assert state.planner_handoff.selected_candidate_id == second.id
+
+
 @pytest.mark.asyncio
 async def test_evidence_policy_keeps_disclosed_public_base_fare_out_of_exclusions() -> None:
     candidate, _ = await _two_visible_hard_valid_candidates()
@@ -4264,6 +4400,8 @@ async def test_soft_risk_switch_is_applied_then_reverified_and_recriticized() ->
         stage for stage in run.agentic.stages if stage.task_id == "recriticize-repaired-package"
     )
     assert recritic_trace.role == AgentRole.RECRITIC
+    assert "模型请求成功：" in run.claim_boundary
+    assert "本轮模型 Agent 已通过白名单工具参与" not in run.claim_boundary
     assert next(
         task for task in run.scheduler.graph.tasks if task.id == "recommend-final-decision"
     ).dependencies == ("recriticize-repaired-package",)
@@ -4304,6 +4442,7 @@ async def test_orchestrator_accept_must_bind_final_candidate_and_its_evidence(
     assert result.agent_role == AgentRole.ORCHESTRATOR
     assert result.output["proposal_applied"] is False
     assert result.output["proposal_rejected_reason"] == run.orchestrator_proposal_block_reason
+    assert "已尝试但失败：主控建议（recommend-final-decision）" in run.claim_boundary
 
 
 @pytest.mark.asyncio

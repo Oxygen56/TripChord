@@ -91,22 +91,60 @@ class CandidateCurationProposal(DomainModel):
     # Some local OpenAI-compatible models emit a bounded response-type label
     # alongside the JSON proposal.  It is transport metadata only: it is not
     # used for candidate identity, ranking, evidence, or approval.
-    response_type: str | None = Field(default=None, max_length=120)
-    recommendation_reason: str | None = Field(default=None, max_length=400)
-    evidence_refs: tuple[Annotated[str, Field(min_length=1, max_length=240)], ...] = Field(
-        default=(), max_length=16
-    )
+    response_type: str | None = None
+    recommendation_reason: str | None = None
+    evidence_refs: tuple[str, ...] = ()
     # A few local OpenAI-compatible models use ``evidence`` instead of the
     # canonical ``evidence_refs`` label.  It is bounded transport metadata and
     # is never trusted for candidate eligibility or factual claims.
-    evidence: tuple[Annotated[str, Field(min_length=1, max_length=240)], ...] = Field(
-        default=(), max_length=16
-    )
-    proposal_text: str | None = Field(default=None, max_length=400)
+    evidence: tuple[str, ...] = ()
+    proposal_text: str | None = None
     selected_candidate_id: str | None = None
     alternative_candidate_ids: tuple[str, ...] = ()
     tradeoffs: tuple[str, ...] = ()
     confidence: float = Field(default=0.5, ge=0, le=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_non_authoritative_transport_fields(cls, value: object) -> object:
+        """Normalize compatibility prose locally before semantic validation.
+
+        Some OpenAI-compatible local models copy long source URLs into
+        ``evidence``.  Candidate identity is authorized only by candidate IDs,
+        so those compatibility fields are intentionally discarded rather than
+        spending another model request to repair transport-only text.
+        """
+
+        if not isinstance(value, dict):
+            return value
+
+        def bounded_text(field: str, limit: int) -> str | None:
+            raw = value.get(field)
+            if not isinstance(raw, str):
+                return None
+            normalized = " ".join(raw.split())
+            return normalized[:limit] or None
+
+        summary = bounded_text("summary", 400) or (
+            "模型未提供候选说明；选择仍由服务端证据规则复核"
+        )
+        tradeoffs = tuple(
+            dict.fromkeys(
+                normalized[:400]
+                for item in value.get("tradeoffs", ())
+                if isinstance(item, str) and (normalized := " ".join(item.split()))
+            )
+        )[:8]
+        return {
+            **value,
+            "summary": summary,
+            "response_type": bounded_text("response_type", 120),
+            "recommendation_reason": bounded_text("recommendation_reason", 400),
+            "proposal_text": bounded_text("proposal_text", 400),
+            "tradeoffs": tradeoffs,
+            "evidence_refs": (),
+            "evidence": (),
+        }
 
 
 RiskText = Annotated[str, Field(min_length=1, max_length=400)]
@@ -501,6 +539,11 @@ class AgenticStageTrace(DomainModel):
     tool_protocol_repair_count: int = Field(default=0, ge=0, le=1)
     tool_names: tuple[str, ...] = ()
     fallback_used: bool = False
+    execution_mode: str | None = Field(
+        default=None,
+        pattern="^(model|not_called|deterministic_skip)$",
+    )
+    skip_reason: str | None = Field(default=None, max_length=200)
     failure: str | None = None
 
 
@@ -1450,6 +1493,7 @@ class StructuredLiveModelAgent:
                     task_id=task.id,
                     role=self.role,
                     model_called=logical_request_count > 0,
+                    execution_mode="model",
                     provider=provider,
                     model=model,
                     token_usage=total_tokens,
@@ -1884,6 +1928,7 @@ class StructuredLiveModelAgent:
             task_id=task.id,
             role=self.role,
             model_called=logical_request_count > 0,
+            execution_mode=("model" if logical_request_count > 0 else "not_called"),
             provider=provider,
             model=model,
             token_usage=token_usage,
@@ -1934,6 +1979,40 @@ class StructuredLiveModelAgent:
         """Expose a typed fail-closed result for context-construction failures."""
 
         return self._unavailable(task, failure)
+
+    def skipped_result(
+        self,
+        task: AgentTask,
+        reason: str,
+        *,
+        summary: str,
+        output: dict[str, JsonValue] | None = None,
+    ) -> AgentTaskResult:
+        """Record a policy-authorized no-model stage without calling it a failure."""
+
+        trace = AgenticStageTrace(
+            task_id=task.id,
+            role=self.role,
+            model_called=False,
+            execution_mode="deterministic_skip",
+            skip_reason=reason,
+            failure=None,
+        )
+        payload: dict[str, JsonValue] = {
+            "summary": summary,
+            "agent_required_failed": False,
+            "agentic_trace": TypeAdapter(JsonValue).validate_python(
+                trace.model_dump(mode="json")
+            ),
+            **(output or {}),
+        }
+        return AgentTaskResult(
+            task_id=task.id,
+            agent_role=self.role,
+            success=True,
+            summary=summary,
+            output=payload,
+        )
 
 
 def proposal_from_result(
