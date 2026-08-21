@@ -40,6 +40,14 @@ class PackageCandidateKind(StrEnum):
     SPLIT_AIRPORT_ISLAND = "split_airport_island"
 
 
+class LodgingQualityTier(StrEnum):
+    SEA_VIEW = "sea_view"
+    BALCONY = "balcony"
+    DELUXE = "deluxe"
+    STANDARD = "standard"
+    BASIC = "basic"
+
+
 class TransferScheduleMode(StrEnum):
     EXACT_DEPARTURE = "exact_departure"
     SERVICE_WINDOW = "service_window"
@@ -90,6 +98,7 @@ class PackageViolationCode(StrEnum):
     BAGGAGE_PREFERENCE = "baggage_preference"
     CONNECTION_PREFERENCE = "connection_preference"
     BREAKFAST_PREFERENCE = "breakfast_preference"
+    LODGING_QUALITY_PREFERENCE = "lodging_quality_preference"
     BUDGET_EXCEEDED = "budget_exceeded"
 
 
@@ -439,6 +448,54 @@ class NormalizedLodgingQuote(NormalizedQuote):
         return (self.check_out - self.check_in).days
 
 
+_BASIC_LODGING_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("windowless", re.compile(r"无窗|windowless|\bno[ -]?window\b", re.IGNORECASE)),
+    ("basic", re.compile(r"基础(?:房|客房|房型)?|\bbasic(?: room)?\b", re.IGNORECASE)),
+    ("economy", re.compile(r"经济(?:房|客房|房型)?|特价房|\beconomy room\b", re.IGNORECASE)),
+    (
+        "shared_or_dormitory",
+        re.compile(r"床位|宿舍|公共卫浴|\bdormitory\b|\bshared bathroom\b", re.IGNORECASE),
+    ),
+)
+
+
+def lodging_basic_markers(lodging: NormalizedLodgingQuote) -> tuple[str, ...]:
+    """Return generic room-quality markers; provider names are never special-cased."""
+
+    searchable = " ".join(
+        value.strip()
+        for value in (lodging.property_name, lodging.room_name or "")
+        if value.strip()
+    )
+    return tuple(name for name, pattern in _BASIC_LODGING_PATTERNS if pattern.search(searchable))
+
+
+def lodging_quality_tier(lodging: NormalizedLodgingQuote) -> LodgingQualityTier:
+    if lodging_basic_markers(lodging):
+        return LodgingQualityTier.BASIC
+    searchable = f"{lodging.property_name} {lodging.room_name or ''}".casefold()
+    if any(term in searchable for term in ("海景", "sea view", "seaview", "ocean view")):
+        return LodgingQualityTier.SEA_VIEW
+    if any(term in searchable for term in ("阳台", "balcony")):
+        return LodgingQualityTier.BALCONY
+    if any(
+        term in searchable
+        for term in ("超级豪华", "豪华", "高级", "deluxe", "superior", "premium")
+    ):
+        return LodgingQualityTier.DELUXE
+    return LodgingQualityTier.STANDARD
+
+
+def lodging_quality_rank(lodging: NormalizedLodgingQuote) -> int:
+    return {
+        LodgingQualityTier.SEA_VIEW: 0,
+        LodgingQualityTier.BALCONY: 1,
+        LodgingQualityTier.DELUXE: 2,
+        LodgingQualityTier.STANDARD: 3,
+        LodgingQualityTier.BASIC: 4,
+    }[lodging_quality_tier(lodging)]
+
+
 class TransferOption(NormalizedQuote):
     total_for_party_cents: int = Field(ge=0)
     origin_area: PackageArea
@@ -731,6 +788,7 @@ class PackageIntent(DomainModel):
     require_checked_baggage: bool | None = None
     allow_connections: bool | None = None
     require_breakfast: bool | None = None
+    require_non_basic_lodging: bool = False
     breakfast_preference_mode: PreferenceMode | None = None
     breakfast_preference_weight: float | None = Field(default=None, ge=0, le=1)
     minimum_arrival_to_boat_minutes: int = Field(default=120, ge=0, le=1440)
@@ -797,7 +855,7 @@ class PackageInventory(DomainModel):
     transfers: tuple[TransferOption, ...] = ()
 
 
-_PACKAGE_CANDIDATE_POLICY_VERSION = "package-candidate-beam-v3"
+_PACKAGE_CANDIDATE_POLICY_VERSION = "package-candidate-beam-v4"
 _PACKAGE_CANDIDATE_SELECTION_POLICY_VERSION = "provider-flight-kind-reservation-v1"
 
 
@@ -1870,7 +1928,7 @@ class PackagePlanner:
         if candidate_cap < 1 or candidate_cap > 2_000:
             raise ValueError("candidate_cap must be between one and two thousand")
         raw_upper = self._structural_candidate_upper_bound(intent, inventory)
-        prescreened = self._prescreen_live_inventory(inventory)
+        prescreened = self._prescreen_live_inventory(intent, inventory)
         prescreened_upper = self._structural_candidate_upper_bound(intent, prescreened)
         ranked_joined = self.rank_candidates(
             intent,
@@ -2205,7 +2263,11 @@ class PackagePlanner:
             selected.setdefault(candidate.id, candidate)
         return tuple(sorted(selected.values(), key=lambda item: rank_by_id[item.id]))
 
-    def _prescreen_live_inventory(self, inventory: PackageInventory) -> PackageInventory:
+    def _prescreen_live_inventory(
+        self,
+        intent: PackageIntent,
+        inventory: PackageInventory,
+    ) -> PackageInventory:
         # A provider display amount with no same-product 1/N-adult proof is
         # observation-only.  It must not reach ranking or package arithmetic,
         # even when the rest of its route evidence looks complete.
@@ -2233,6 +2295,8 @@ class PackagePlanner:
             list[NormalizedLodgingQuote],
         ] = {}
         for lodging in inventory.lodgings:
+            if intent.require_non_basic_lodging and lodging_basic_markers(lodging):
+                continue
             lodging_key = (
                 lodging.area,
                 lodging.check_in,
@@ -2584,7 +2648,7 @@ class PackagePlanner:
         intent: PackageIntent,
         candidates: tuple[TravelPackageCandidate, ...],
     ) -> tuple[TravelPackageCandidate, ...]:
-        def rank_key(item: TravelPackageCandidate) -> tuple[int, int, int, str]:
+        def rank_key(item: TravelPackageCandidate) -> tuple[int, int, int, int, int, str]:
             budget = package_budget(item)
             # A complete CNY party total is the only directly comparable primary
             # price.  Unknown taxes, foreign subtotals, and partial party totals
@@ -2594,6 +2658,8 @@ class PackagePlanner:
                 -complete_cny,
                 published_base_fare_contract_count(item.transfers),
                 item.declared_total_cents,
+                sum(lodging_quality_rank(lodging) for lodging in item.lodgings),
+                max(lodging_quality_rank(lodging) for lodging in item.lodgings),
                 item.id,
             )
 
@@ -2862,6 +2928,10 @@ class PackagePlanner:
             and lodging.children == intent.children
             and lodging.infants == intent.infants
             and lodging.rooms == intent.rooms
+            and (
+                not intent.require_non_basic_lodging
+                or not lodging_basic_markers(lodging)
+            )
             and (
                 intent.destination_place_key is None
                 or (
@@ -3853,6 +3923,27 @@ class PackageVerifier:
                             "confirmed_breakfast_quote_count": sum(
                                 item.breakfast_included is True for item in forbidden_or_unknown
                             ),
+                        },
+                    )
+                )
+        if intent.require_non_basic_lodging:
+            basic_lodgings = tuple(
+                (item, lodging_basic_markers(item))
+                for item in candidate.lodgings
+                if lodging_basic_markers(item)
+            )
+            if basic_lodgings:
+                violations.append(
+                    PackageViolation(
+                        code=PackageViolationCode.LODGING_QUALITY_PREFERENCE,
+                        severity=PackageViolationSeverity.ERROR,
+                        message="用户明确要求住宿不能简陋，但候选包含无窗或基础型房间",
+                        component_ids=tuple(item.id for item, _ in basic_lodgings),
+                        details={
+                            "basic_marker_count": sum(
+                                len(markers) for _, markers in basic_lodgings
+                            ),
+                            "deterministic_hard_filter": True,
                         },
                     )
                 )

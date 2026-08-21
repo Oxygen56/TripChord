@@ -2913,6 +2913,7 @@ async def _execute_live_flexible_from_text_body(
         require_checked_baggage=intent_template.require_checked_baggage,
         allow_connections=intent_template.allow_connections,
         require_breakfast=intent_template.require_breakfast,
+        require_non_basic_lodging=intent_template.require_non_basic_lodging,
         breakfast_preference_mode=intent_template.breakfast_preference_mode,
         breakfast_preference_weight=intent_template.breakfast_preference_weight,
         minimum_arrival_to_boat_minutes=(intent_template.minimum_arrival_to_boat_minutes),

@@ -2221,7 +2221,7 @@ def test_empty_raw_like_inventory_explains_exact_lodging_and_transfer_gaps() -> 
 
     assert generation.audit.raw_structural_candidate_upper_bound > 0
     assert generation.candidates == ()
-    assert generation.audit.policy_version == "package-candidate-beam-v3"
+    assert generation.audit.policy_version == "package-candidate-beam-v4"
     assert "global:no_candidate_after_hard_contract_join" in (generation.audit.rejection_reasons)
     assert any(
         reason.startswith("continuous_island:lodging:destination_island:")

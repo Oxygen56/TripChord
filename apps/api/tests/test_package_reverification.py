@@ -403,6 +403,34 @@ def test_independent_audit_recomputes_explicit_hard_preferences(
     assert PackageInvariantCode.HARD_PREFERENCES in report.failed_codes
 
 
+def test_independent_audit_rejects_windowless_room_even_if_primary_candidate_is_tampered() -> None:
+    before, after, _ = _candidates()
+    after = after.model_copy(
+        update={
+            "lodgings": (
+                after.lodgings[0].model_copy(
+                    update={"room_name": "标准双人房（无窗）"}
+                ),
+            )
+        }
+    )
+    request = _intent().model_copy(update={"require_non_basic_lodging": True})
+
+    report = DeclarativePackageReVerifier().audit(
+        request,
+        before,
+        after,
+        diff_packages(before, after),
+        now=NOW,
+    )
+    primary_codes = {
+        item.code for item in PackageVerifier().errors(request, after, now=NOW)
+    }
+
+    assert PackageInvariantCode.HARD_PREFERENCES in report.failed_codes
+    assert PackageViolationCode.LODGING_QUALITY_PREFERENCE in primary_codes
+
+
 def test_missing_all_required_transfers_fails_closed_in_both_verifiers() -> None:
     before, after, _ = _candidates()
     before = before.model_copy(

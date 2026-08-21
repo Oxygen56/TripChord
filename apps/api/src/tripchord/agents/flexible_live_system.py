@@ -518,6 +518,7 @@ class FlexiblePackageConstraints(DomainModel):
     require_checked_baggage: bool | None = None
     allow_connections: bool | None = None
     require_breakfast: bool | None = None
+    require_non_basic_lodging: bool = False
     breakfast_preference_mode: PreferenceMode | None = None
     breakfast_preference_weight: float | None = Field(default=None, ge=0, le=1)
     minimum_arrival_to_boat_minutes: int = Field(default=120, ge=0, le=1440)
@@ -3429,6 +3430,7 @@ class FlexibleLiveAgentSystem:
             require_checked_baggage=constraints.require_checked_baggage,
             allow_connections=constraints.allow_connections,
             require_breakfast=constraints.require_breakfast,
+            require_non_basic_lodging=constraints.require_non_basic_lodging,
             breakfast_preference_mode=constraints.breakfast_preference_mode,
             breakfast_preference_weight=constraints.breakfast_preference_weight,
             minimum_arrival_to_boat_minutes=(constraints.minimum_arrival_to_boat_minutes),

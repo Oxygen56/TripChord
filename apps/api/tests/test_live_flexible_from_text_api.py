@@ -304,7 +304,7 @@ async def test_verbatim_maldives_text_binds_male_gateway_profile_before_live_sea
     cache = LiveRunCache(capacity=8, ttl=timedelta(minutes=5), now=lambda: NOW)
     text = (
         "我要从杭州出发去马尔代夫周边游，时间：从明天开始到9月10日前的4-8天游，"
-        "人数：我和女朋友两个人，偏好：酒店不能太简陋，地址不能太偏，可以稍微有点品质但价格不能太高，"
+        "人数：我和女朋友两个人，偏好：住宿不能太简陋，地址不能太偏，可以稍微有点品质但价格不能太高，"
         "到达和返程可以住机场附近，但也要关注有没有更好的选择。"
     )
     monkeypatch.setattr(app.state, "package_requirement_agent", package_requirement_agent)
@@ -330,7 +330,9 @@ async def test_verbatim_maldives_text_binds_male_gateway_profile_before_live_sea
         "2026-09-09",
         "2026-09-10",
     ]
+    assert body["interpretation"]["intent_template"]["require_non_basic_lodging"] is True
     assert pair_runner.calls[0][0].destination == "马累"
+    assert pair_runner.calls[0][0].require_non_basic_lodging is True
     assert pair_runner.calls[0][1].destination == "马累"
     assert pair_runner.calls[0][1].options["gateway_destination"] == "马累"
     assert "stay_plan_candidate_set" in pair_runner.calls[0][1].options

@@ -152,6 +152,7 @@ def intent(
     breakfast_preference_weight: float | None = None,
     destination_place_key: PackagePlaceKey | None = None,
     allow_connections: bool | None = None,
+    require_non_basic_lodging: bool = False,
     maximum_quote_capture_skew_minutes: int = 20,
 ) -> PackageIntent:
     return PackageIntent(
@@ -167,6 +168,7 @@ def intent(
         require_checked_baggage=require_checked_baggage,
         allow_connections=allow_connections,
         require_breakfast=require_breakfast,
+        require_non_basic_lodging=require_non_basic_lodging,
         breakfast_preference_mode=breakfast_preference_mode,
         breakfast_preference_weight=breakfast_preference_weight,
         minimum_arrival_to_boat_minutes=120,
@@ -227,6 +229,7 @@ def lodging(
     expires_at: datetime = EXPIRES,
     availability: QuoteAvailability = QuoteAvailability.AVAILABLE,
     place_key: PackagePlaceKey | object | None = _UNSET_PLACE_KEY,
+    room_name: str | None = None,
 ) -> NormalizedLodgingQuote:
     default_place_key = {
         PackageArea.AIRPORT: PackagePlaceKey.VELANA_AIRPORT,
@@ -249,6 +252,7 @@ def lodging(
         adults=adults,
         rooms=1,
         breakfast_included=breakfast,
+        room_name=room_name,
         place_key=(
             default_place_key
             if place_key is _UNSET_PLACE_KEY
@@ -683,7 +687,7 @@ def test_live_candidate_generation_is_bounded_audited_and_deterministic_under_pr
     assert first.audit.generated_candidate_count == 10
     assert first.audit.generation_candidate_cap == 10
     assert first.audit.transfer_beam_width == planner.LIVE_TRANSFER_BEAM_WIDTH
-    assert first.audit.policy_version == "package-candidate-beam-v3"
+    assert first.audit.policy_version == "package-candidate-beam-v4"
     assert first.audit.selection_policy_version == "provider-flight-kind-reservation-v1"
     assert (
         first.audit.transfer_limit_per_contract_bucket
@@ -1026,6 +1030,59 @@ def test_weighted_breakfast_preference_changes_only_soft_candidate_ranking() -> 
     assert application.comparable_candidate_count == 2
     assert application.selected_breakfast_coverage == Decimal(1)
     assert application.selected_breakfast_evidence_complete
+
+
+def test_non_basic_lodging_is_hard_filtered_and_equal_price_prefers_sea_view() -> None:
+    no_window = lodging(
+        "stay:no-window",
+        "Island Hotel",
+        PackageArea.DESTINATION_ISLAND,
+        date(2026, 8, 23),
+        date(2026, 8, 30),
+        338_000,
+        room_name="标准双人房（无窗）",
+    )
+    city_view = lodging(
+        "stay:family-city-balcony",
+        "Island Hotel",
+        PackageArea.DESTINATION_ISLAND,
+        date(2026, 8, 23),
+        date(2026, 8, 30),
+        493_500,
+        room_name="豪华家庭城景阳台房",
+    )
+    sea_view = lodging(
+        "stay:double-sea-balcony",
+        "Island Hotel",
+        PackageArea.DESTINATION_ISLAND,
+        date(2026, 8, 23),
+        date(2026, 8, 30),
+        493_500,
+        room_name="豪华双人海景阳台房",
+    )
+    inventory = breakfast_ranking_inventory(no_window, city_view, sea_view)
+    required = intent(
+        budget_cents=2_000_000,
+        require_non_basic_lodging=True,
+    )
+
+    candidates = PackagePlanner().generate(required, inventory)
+
+    assert [item.lodgings[0].id for item in candidates] == [
+        sea_view.id,
+        city_view.id,
+    ]
+    unsafe = next(
+        item
+        for item in PackagePlanner().generate(
+            required.model_copy(update={"require_non_basic_lodging": False}),
+            inventory,
+        )
+        if item.lodgings[0].id == no_window.id
+    )
+    assert PackageViolationCode.LODGING_QUALITY_PREFERENCE in {
+        item.code for item in PackageVerifier().errors(required, unsafe, now=VERIFY_AT)
+    }
 
 
 def test_weighted_breakfast_never_promotes_incomplete_foreign_total_over_complete_cny() -> None:

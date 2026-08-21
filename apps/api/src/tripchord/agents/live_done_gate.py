@@ -391,6 +391,13 @@ def _check_source_dag(initial: LivePackageAgentRun) -> LiveDoneGateCheck:
         )
     }
     expected_browser_count = len(expected_browser)
+    source_tasks_by_id = {
+        task.id: task for task in initial.scheduler.graph.tasks if task.id in all_source_ids
+    }
+    initial_parallel_source_count = sum(
+        not (set(task.dependencies) & set(all_source_ids))
+        for task in source_tasks_by_id.values()
+    )
     coverage = initial.public_transfer_coverage
     public_coverage_complete = (
         coverage is not None
@@ -412,7 +419,12 @@ def _check_source_dag(initial: LivePackageAgentRun) -> LiveDoneGateCheck:
         and set(all_source_ids) <= graph_ids
         and public_coverage_complete
         and initial.scheduler.succeeded
-        and initial.scheduler.max_parallel_tasks >= len(all_source_ids)
+        # Exact-place lodging followers deliberately wait for their own
+        # representative canary.  The done gate verifies that every source
+        # which is safe to start immediately was actually concurrent; it no
+        # longer requires the followers to bypass that safety boundary.
+        and initial_parallel_source_count > 0
+        and initial.scheduler.max_parallel_tasks >= initial_parallel_source_count
     )
     return LiveDoneGateCheck(
         id="versioned_source_agent_dag",
@@ -437,6 +449,7 @@ def _check_source_dag(initial: LivePackageAgentRun) -> LiveDoneGateCheck:
             ),
             "scheduler_succeeded": initial.scheduler.succeeded,
             "scheduler_max_parallel_tasks": initial.scheduler.max_parallel_tasks,
+            "initial_parallel_source_count": initial_parallel_source_count,
         },
     )
 

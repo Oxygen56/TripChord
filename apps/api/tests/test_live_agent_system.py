@@ -918,11 +918,19 @@ _STANDARD_BROWSER_SOURCE_IDS = (
 )
 _STANDARD_BROWSER_SOURCE_TASK_COUNT = len(_STANDARD_BROWSER_SOURCE_IDS)
 _V4_BROWSER_SOURCE_IDS = (
-    *_STANDARD_BROWSER_SOURCE_IDS[:5],
+    "source-ctrip-flight",
+    "source-ctrip-lodging-full",
     "source-ctrip-lodging-hulhumale-full",
-    *_STANDARD_BROWSER_SOURCE_IDS[5:10],
+    "source-ctrip-lodging-first",
+    "source-ctrip-lodging-middle",
+    "source-ctrip-lodging-last",
+    "source-qunar-flight",
+    "source-qunar-lodging-full",
     "source-qunar-lodging-hulhumale-full",
-    *_STANDARD_BROWSER_SOURCE_IDS[10:],
+    "source-qunar-lodging-first",
+    "source-qunar-lodging-middle",
+    "source-qunar-lodging-last",
+    "source-tongcheng-flight",
 )
 _V4_BROWSER_SOURCE_TASK_COUNT = len(_V4_BROWSER_SOURCE_IDS)
 assert _V4_BROWSER_SOURCE_TASK_COUNT == 13
@@ -1602,7 +1610,9 @@ async def test_fixed_date_run_requeries_only_lodging_scopes_misaligned_with_arri
             mode=LiveCoverageMode.STRICT,
             timeout_seconds=15,
         ),
-        _serve(bridge, _V4_BROWSER_SOURCE_TASK_COUNT + 1, complete),
+        # Qunar's first DOM-drift canary opens the provider-wide lodging
+        # circuit; the other four Qunar lodging tasks are cancelled/skipped.
+        _serve(bridge, _V4_BROWSER_SOURCE_TASK_COUNT - 3 + 1, complete),
     )
 
     normalizer = next(
@@ -2587,7 +2597,7 @@ async def test_publication_refresh_builds_targeted_icom_coverage_from_current_re
 async def test_search_supervisor_model_schedule_changes_live_source_dag_waves() -> None:
     all_source_ids = _V4_BROWSER_SOURCE_IDS
     priority_id = "source-tongcheng-flight"
-    remaining = tuple(task_id for task_id in reversed(all_source_ids) if task_id != priority_id)
+    remaining = tuple(task_id for task_id in all_source_ids if task_id != priority_id)
     priority_wave = (priority_id, *remaining[:5])
     middle_wave = remaining[5:11]
     final_wave = remaining[11:]
@@ -2652,9 +2662,12 @@ async def test_search_supervisor_model_schedule_changes_live_source_dag_waves() 
     graph = {task.id: task for task in run.scheduler.graph.tasks}
     assert graph[priority_id].dependencies == ("supervise-source-search",)
     assert graph[priority_wave[1]].dependencies == ("supervise-source-search",)
-    assert graph[middle_wave[0]].dependencies == priority_wave
-    assert graph[final_wave[0]].dependencies == middle_wave
-    assert run.scheduler.max_parallel_tasks == 6
+    assert set(priority_wave) <= set(graph[middle_wave[0]].dependencies)
+    assert "source-ctrip-lodging-hulhumale-full" in graph[
+        middle_wave[0]
+    ].dependencies
+    assert set(middle_wave) <= set(graph[final_wave[0]].dependencies)
+    assert run.scheduler.max_parallel_tasks == 4
 
 
 @pytest.mark.asyncio
@@ -3868,6 +3881,9 @@ async def test_agent_quote_summary_exposes_offer_identity_rights_and_taint_bound
     assert lodging_summary["room_name"] == "Deluxe King Room"
     assert lodging_summary["bed_type"] == "1 King Bed"
     assert lodging_summary["breakfast_included"] is True
+    assert lodging_summary["lodging_quality_tier"] == "deluxe"
+    assert lodging_summary["lodging_non_basic"] is True
+    assert lodging_summary["lodging_basic_markers"] == []
     lodging_identity = cast(dict[str, JsonValue], lodging_summary["stable_identity"])
     assert lodging_identity["product_confidence"] == "high"
     assert lodging_identity["ambiguity_reasons"] == []
@@ -3894,6 +3910,26 @@ async def test_agent_quote_summary_exposes_offer_identity_rights_and_taint_bound
         trust["truncated_provider_identifier_fields"],
     )
     assert trust["provider_identifier_max_chars"] == 256
+
+    cheaper_basic = lodging_quote.model_copy(
+        update={
+            "id": "lodging:cheaper-windowless",
+            "room_name": "标准双人房（无窗）",
+            "total_for_party_cents": lodging_quote.total_for_party_cents - 10_000,
+        }
+    )
+    decision = system._candidate_agent_decision_row(
+        candidate.model_copy(update={"lodgings": (lodging_quote,)}),
+        run.inventory.model_copy(
+            update={"lodgings": (*run.inventory.lodgings, lodging_quote, cheaper_basic)}
+        ),
+    )
+    assert decision["lodging_non_basic_confirmed"] is True
+    assert decision["lodging_quality_price_premium_cents"] == 10_000
+    room_quality = cast(list[dict[str, JsonValue]], decision["lodging_room_quality"])
+    assert room_quality[0]["room_name"] == "Deluxe King Room"
+    assert room_quality[0]["quality_tier"] == "deluxe"
+    assert room_quality[0]["price_premium_to_lowest_same_scope_cents"] == 10_000
 
 
 @pytest.mark.asyncio
@@ -4680,7 +4716,9 @@ async def test_fifteen_agent_dag_merges_four_official_public_transfer_searches()
     )
 
     assert run.scheduler.succeeded
-    assert run.scheduler.max_parallel_tasks == _STANDARD_BROWSER_SOURCE_TASK_COUNT + 4
+    # Two lodging-place canaries per OTA plus flights and public transfers
+    # start together; their dependent segment searches follow only on success.
+    assert run.scheduler.max_parallel_tasks == 11
     assert len(run.source_task_ids) == _STANDARD_BROWSER_SOURCE_TASK_COUNT
     assert run.public_transfer_task_ids == (
         "public-transfer-icom-continuous-outbound",
@@ -5328,7 +5366,7 @@ async def test_thirteen_source_dag_rejects_fragile_v1_and_accepts_split_v2() -> 
     _, _, run = await _run_v4(LiveCoverageMode.STRICT)
 
     assert run.scheduler.succeeded
-    assert run.scheduler.max_parallel_tasks == _V4_BROWSER_SOURCE_TASK_COUNT
+    assert run.scheduler.max_parallel_tasks == 7
     assert run.browser_max_concurrency == 6
     assert run.scheduler.max_parallel_tasks > run.browser_max_concurrency
     assert len(run.source_task_ids) == _V4_BROWSER_SOURCE_TASK_COUNT
@@ -6761,7 +6799,7 @@ def _qunar_lodging_non_quote_completion(
         return _success(lease)
     if state == "login_required":
         return BrowserTaskCompletion(
-            state=BrowserTaskState.FAILED,
+            state=BrowserTaskState.BLOCKED,
             failure=BrowserFailure(
                 code=BrowserFailureCode.LOGIN_REQUIRED,
                 message="fixture account session requires login",
@@ -6918,6 +6956,8 @@ def _qunar_lodging_non_quote_completion(
 
 async def _run_v4_with_completion(
     completion: CompletionFactory,
+    *,
+    expected_browser_completions: int = 13,
 ) -> LivePackageAgentRun:
     bridge = BrowserTaskBridge(now=lambda: NOW)
     system = LivePackageAgentSystem(
@@ -6943,7 +6983,7 @@ async def _run_v4_with_completion(
             mode=LiveCoverageMode.STRICT,
             timeout_seconds=15,
         ),
-        _serve(bridge, 13, completion),
+        _serve(bridge, expected_browser_completions, completion),
     )
     return run
 
@@ -7797,7 +7837,10 @@ async def test_strict_single_lodging_quote_publishes_with_explicit_single_source
         lambda lease: _qunar_lodging_non_quote_completion(
             lease,
             state=non_quote_state,
-        )
+        ),
+        expected_browser_completions=(
+            10 if non_quote_state in {"bounded_provider_pending", "login_required"} else 13
+        ),
     )
 
     assert run.package is not None
@@ -7824,15 +7867,150 @@ async def test_strict_single_lodging_quote_publishes_with_explicit_single_source
         assert "partial evidence" not in run.claim_boundary
     assert "source_execution_completeness" in run.claim_boundary
     assert "exact_quote_comparison_coverage" in run.claim_boundary
+    if non_quote_state == "bounded_provider_pending":
+        assert len(run.provider_vertical_circuit_receipts) == 2
+        circuits = {
+            cast(str, item["scope"]): item
+            for item in run.provider_vertical_circuit_receipts
+        }
+        assert set(circuits) == {
+            "qunar:lodging:maafushi",
+            "qunar:lodging:hulhumale",
+        }
+        assert {
+            cast(str, item["trigger_source_task_id"])
+            for item in circuits.values()
+        } == {
+            "source-qunar-lodging-full",
+            "source-qunar-lodging-hulhumale-full",
+        }
+        assert all(
+            item["trigger_reason"] == "bounded_provider_pending"
+            and item["circuit_scope_type"] == "exact_place_cohort"
+            for item in circuits.values()
+        )
+        suppressed = tuple(
+            item
+            for item in run.scheduler.results
+            if item.task_id
+            in {
+                "source-qunar-lodging-middle",
+                "source-qunar-lodging-first",
+                "source-qunar-lodging-last",
+            }
+        )
+        assert len(suppressed) == 3
+        assert all(
+            item.output.get("terminal_semantics")
+            == "not_attempted_due_same_run_lodging_circuit"
+            and item.output.get("external_tool_called") is False
+            and item.output.get("inventory_claim") == "unknown_not_queried"
+            for item in suppressed
+        )
+    elif non_quote_state == "login_required":
+        assert len(run.provider_vertical_circuit_receipts) == 1
+        circuit = run.provider_vertical_circuit_receipts[0]
+        assert circuit["scope"] == "qunar:lodging"
+        assert circuit["trigger_source_task_id"] in {
+            "source-qunar-lodging-full",
+            "source-qunar-lodging-hulhumale-full",
+        }
+        assert circuit["trigger_reason"] == "login_required"
+        assert circuit["circuit_scope_type"] == "provider_vertical"
+        trigger_stage = next(
+            item
+            for item in run.scheduler.results
+            if item.task_id == circuit["trigger_source_task_id"]
+        )
+        trigger_snapshot = BrowserTaskSnapshot.model_validate(
+            trigger_stage.output["snapshot"]
+        )
+        assert (
+            LivePackageAgentSystem._provider_vertical_circuit_reason(trigger_snapshot)
+            == "login_required"
+        )
+        assert trigger_snapshot.failure is not None
+        captcha_snapshot = trigger_snapshot.model_copy(
+            update={
+                "failure": trigger_snapshot.failure.model_copy(
+                    update={"code": BrowserFailureCode.CAPTCHA_REQUIRED}
+                )
+            }
+        )
+        assert (
+            LivePackageAgentSystem._provider_vertical_circuit_reason(captcha_snapshot)
+            == "captcha_required"
+        )
+        assert (
+            LivePackageAgentSystem._provider_vertical_circuit_reason(
+                captcha_snapshot.model_copy(update={"state": BrowserTaskState.FAILED})
+            )
+            is None
+        )
+        sibling_results = tuple(
+            item
+            for item in run.scheduler.results
+            if item.task_id.startswith("source-qunar-lodging-")
+            and item.task_id != circuit["trigger_source_task_id"]
+        )
+        assert len(sibling_results) == 4
+        follower_ids = {
+            "source-qunar-lodging-first",
+            "source-qunar-lodging-middle",
+            "source-qunar-lodging-last",
+        }
+        suppressed = tuple(
+            item
+            for item in sibling_results
+            if item.task_id in follower_ids
+        )
+        assert len(suppressed) == 3
+        assert all(
+            item.output.get("terminal_semantics")
+            == "not_attempted_due_same_run_lodging_circuit"
+            and item.output.get("external_tool_called") is False
+            and item.output.get("inventory_claim") == "unknown_not_queried"
+            for item in suppressed
+        )
+        # Both exact-place canaries may already have been claimed in the same
+        # six-lease batch.  The second canary may therefore report the same
+        # honest login block; it is never converted into an inventory claim.
+        co_canary = next(item for item in sibling_results if item not in suppressed)
+        co_canary_snapshot = cast(dict[str, JsonValue], co_canary.output["snapshot"])
+        assert co_canary_snapshot["state"] in {"blocked", "cancelled"}
+        if co_canary_snapshot["state"] == "blocked":
+            co_canary_failure = cast(dict[str, JsonValue], co_canary_snapshot["failure"])
+            assert co_canary_failure["code"] == "login_required"
+        unaffected_browser_ids = {
+            "source-qunar-flight",
+            "source-tongcheng-flight",
+            *(
+                item.task_id
+                for item in run.scheduler.results
+                if item.task_id.startswith("source-ctrip-")
+            ),
+        }
+        for item in run.scheduler.results:
+            if item.task_id in unaffected_browser_ids:
+                assert cast(dict[str, JsonValue], item.output["snapshot"])["state"] == (
+                    "succeeded"
+                )
+        icom_results = tuple(
+            item
+            for item in run.scheduler.results
+            if item.task_id.startswith("public-transfer-icom-")
+        )
+        assert len(icom_results) == 4
+        assert all("result" in item.output for item in icom_results)
 
 
 @pytest.mark.asyncio
-async def test_planner_prefers_two_quote_hulhumale_over_single_quote_maafushi() -> None:
+async def test_destination_pending_circuit_preserves_hulhumale_two_source_comparison() -> None:
     def completion(lease: BrowserTaskLease) -> BrowserTaskCompletion:
         if (
             lease.provider == BrowserProvider.QUNAR
             and lease.kind == BrowserVertical.LODGING
-            and _lodging_segment(lease) != "hulhumale-full"
+            and _lodging_segment(lease) in {"full", "middle"}
         ):
             return _qunar_lodging_non_quote_completion(
                 lease,
@@ -7857,7 +8035,10 @@ async def test_planner_prefers_two_quote_hulhumale_over_single_quote_maafushi() 
             )
         return _success(lease)
 
-    run = await _run_v4_with_completion(completion)
+    run = await _run_v4_with_completion(
+        completion,
+        expected_browser_completions=12,
+    )
 
     assert run.package is not None
     assert run.selected_stay_plan_id == StayPlanId.HULHUMALE_CONTINUOUS
@@ -7913,9 +8094,20 @@ async def test_planner_prefers_two_quote_hulhumale_over_single_quote_maafushi() 
             for lodging in cast(list[dict[str, JsonValue]], candidate["lodgings"])
         )
     )
-    assert run.package.final_candidate.id in set(
-        planner_stage.output["comparison_ready_candidate_ids"]
+    assert len(run.provider_vertical_circuit_receipts) == 1
+    circuit = run.provider_vertical_circuit_receipts[0]
+    assert circuit["scope"] == "qunar:lodging:maafushi"
+    assert circuit["circuit_scope_type"] == "exact_place_cohort"
+    assert circuit["trigger_reason"] == "bounded_provider_pending"
+    middle_stage = next(
+        item
+        for item in run.scheduler.results
+        if item.task_id == "source-qunar-lodging-middle"
     )
+    assert middle_stage.output["terminal_semantics"] == (
+        "not_attempted_due_same_run_lodging_circuit"
+    )
+    assert middle_stage.output["inventory_claim"] == "unknown_not_queried"
 
 
 @pytest.mark.asyncio

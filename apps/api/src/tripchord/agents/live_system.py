@@ -138,6 +138,8 @@ from tripchord.planning.package import (
     TravelPackageCandidate,
     _transfer_connection_limits,
     diff_packages,
+    lodging_basic_markers,
+    lodging_quality_tier,
 )
 from tripchord.planning.package_reverification import (
     DeclarativePackageReVerifier,
@@ -1026,6 +1028,7 @@ class LivePackageAgentRun(DomainModel):
     scheduler: SchedulerOutcome
     source_task_ids: tuple[str, ...] = Field(min_length=1)
     public_transfer_task_ids: tuple[str, ...] = ()
+    provider_vertical_circuit_receipts: tuple[dict[str, JsonValue], ...] = ()
     search_supervisor_proposal: SearchSupervisorProposal | None = None
     search_schedule: AppliedSearchSchedule | None = None
     stay_plan_candidate_set: StayPlanCandidateSet | None = None
@@ -1517,6 +1520,16 @@ class _RunState:
     search_schedule: AppliedSearchSchedule | None = None
     source_schedule_started_monotonic: float | None = None
     snapshots: dict[str, BrowserTaskSnapshot] = field(default_factory=dict)
+    browser_task_ids_by_source: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    browser_task_scope_by_source: dict[str, str] = field(default_factory=dict)
+    browser_task_circuit_key_by_source: dict[str, str] = field(default_factory=dict)
+    provider_vertical_circuits: dict[str, dict[str, JsonValue]] = field(
+        default_factory=dict
+    )
+    provider_vertical_circuit_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        repr=False,
+    )
     party_price_validation_snapshots: dict[str, BrowserTaskSnapshot] = field(
         default_factory=dict
     )
@@ -1755,15 +1768,26 @@ def _settled_browser_source_events(
         snapshot = state.snapshots.get(source_task_id)
         provider, vertical = _browser_source_identity(source_task_id, snapshot)
         terminal_at = snapshot.updated_at if snapshot is not None else occurred_at
+        circuit_suppressed = state.source_errors.get(source_task_id, "").startswith(
+            "ProviderVerticalCircuitOpen:"
+        )
         events.append(
             {
                 "schema_version": "live-source-terminal-event-v1",
                 "source_task_id": source_task_id,
                 "provider": provider,
                 "vertical": vertical,
-                "terminal_state": _browser_source_terminal_state(snapshot).value,
+                "terminal_state": (
+                    SourceTerminalState.CANCELLED.value
+                    if circuit_suppressed
+                    else _browser_source_terminal_state(snapshot).value
+                ),
                 "occurred_at": terminal_at.isoformat(),
-                "detail": None,
+                "detail": (
+                    "not_attempted_due_same_run_lodging_circuit"
+                    if circuit_suppressed
+                    else None
+                ),
             }
         )
     return tuple(events)
@@ -1856,12 +1880,25 @@ class LivePackageAgentSystem:
             raise ValueError(f"source delay schedule has unknown task ids: {sorted(unknown)}")
         if any(delay < 0 or delay > 900_000 for delay in delays.values()):
             raise ValueError("source start delays must be between 0 and 900000 milliseconds")
+
+        def effective_source_delay_ms(task: AgentTask) -> int:
+            configured = delays.get(task.id, 0)
+            raw_canary_id = task.input.get("provider_vertical_canary_source_id")
+            if not isinstance(raw_canary_id, str):
+                return configured
+            canary_delay = delays.get(raw_canary_id, 0)
+            if canary_delay >= 900_000:
+                raise ValueError(
+                    "provider lodging canary delay must leave one millisecond for its cohort"
+                )
+            return max(configured, canary_delay + 1)
+
         browser_source_tasks = tuple(
             task.model_copy(
                 update={
                     "input": {
                         **task.input,
-                        "start_delay_ms": delays.get(task.id, 0),
+                        "start_delay_ms": effective_source_delay_ms(task),
                     }
                 }
             )
@@ -2289,6 +2326,10 @@ class LivePackageAgentSystem:
             scheduler=scheduler,
             source_task_ids=source_ids,
             public_transfer_task_ids=public_transfer_ids,
+            provider_vertical_circuit_receipts=tuple(
+                state.provider_vertical_circuits[key]
+                for key in sorted(state.provider_vertical_circuits)
+            ),
             search_supervisor_proposal=state.search_supervisor_proposal,
             search_schedule=state.search_schedule,
             stay_plan_candidate_set=stay_plan_candidate_set,
@@ -3071,6 +3112,10 @@ class LivePackageAgentSystem:
             scheduler=scheduler,
             source_task_ids=state.source_task_ids,
             public_transfer_task_ids=public_ids,
+            provider_vertical_circuit_receipts=tuple(
+                state.provider_vertical_circuits[key]
+                for key in sorted(state.provider_vertical_circuits)
+            ),
             stay_plan_candidate_set=previous.stay_plan_candidate_set,
             stay_plan_inventory_outcomes=previous.stay_plan_inventory_outcomes,
             stay_plan_planner_handoff=state.stay_plan_planner_handoff,
@@ -5928,6 +5973,193 @@ class LivePackageAgentSystem:
             ),
         )
 
+    @staticmethod
+    def _provider_vertical_circuit_reason(
+        snapshot: BrowserTaskSnapshot,
+    ) -> str | None:
+        """Return the narrow typed reason that makes a lodging cohort futile.
+
+        A cheap/no-inventory result is never a circuit signal.  We only stop
+        sibling searches when the same provider surface is unavailable or its
+        representative exact search remains structurally unreadable/pending.
+        """
+
+        if (
+            snapshot.kind is not BrowserVertical.LODGING
+            or snapshot.failure is None
+            or snapshot.failure.retryable
+        ):
+            return None
+        failure = snapshot.failure
+        if failure.code is BrowserFailureCode.CAPTCHA_REQUIRED:
+            return (
+                "captcha_required"
+                if snapshot.state is BrowserTaskState.BLOCKED
+                else None
+            )
+        if failure.code is BrowserFailureCode.LOGIN_REQUIRED:
+            return (
+                "login_required"
+                if snapshot.state is BrowserTaskState.BLOCKED
+                else None
+            )
+        if snapshot.state is not BrowserTaskState.FAILED:
+            return None
+        if failure.code is BrowserFailureCode.DOM_DRIFT:
+            return "dom_drift"
+        pending_state = failure.details.get("inventory_result_state")
+        if pending_state == LodgingInventoryReceiptState.BOUNDED_PROVIDER_PENDING.value:
+            return "bounded_provider_pending"
+        receipt_state = failure.details.get("receipt_state")
+        if receipt_state == LodgingInventoryReceiptState.BOUNDED_PROVIDER_PENDING.value:
+            return "bounded_provider_pending"
+        return None
+
+    def _provider_vertical_circuit_suppressed_result(
+        self,
+        state: _RunState,
+        task: AgentTask,
+        circuit_key: str,
+    ) -> AgentTaskResult:
+        receipt = state.provider_vertical_circuits[circuit_key]
+        trigger_source_task_id = str(receipt["trigger_source_task_id"])
+        trigger_reason = str(receipt["trigger_reason"])
+        circuit_scope_type = str(receipt["circuit_scope_type"])
+        state.source_errors[task.id] = (
+            "ProviderVerticalCircuitOpen: "
+            f"trigger={trigger_source_task_id}, reason={trigger_reason}; "
+            "this exact lodging scope was not queried"
+        )
+        output: dict[str, JsonValue] = {
+            "provider_vertical_circuit_open": True,
+            "scope": circuit_key,
+            "circuit_scope_type": circuit_scope_type,
+            "trigger_source_task_id": trigger_source_task_id,
+            "trigger_reason": trigger_reason,
+            "terminal_semantics": "not_attempted_due_same_run_lodging_circuit",
+            "external_tool_called": False,
+            "inventory_claim": "unknown_not_queried",
+        }
+        return AgentTaskResult(
+            task_id=task.id,
+            agent_role=task.role,
+            success=True,
+            summary=(
+                f"{task.id} skipped because {circuit_key} circuit opened at "
+                f"{trigger_source_task_id}"
+            ),
+            output=output,
+            evidence=(
+                self._evidence(
+                    task,
+                    topic="browser_result",
+                    subject=task.id,
+                    payload=output,
+                    source="tripchord:provider-vertical-circuit-v1",
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _open_lodging_circuit_key_for_task(
+        state: _RunState,
+        task: AgentTask,
+        scope: ProviderScopeKey,
+    ) -> str | None:
+        """Resolve the broad or exact-place circuit that suppresses ``task``.
+
+        Provider-wide failures (login/captcha/DOM drift) take precedence.  A
+        bounded provider-pending observation is only allowed to suppress the
+        exact lodging-place cohort carried by the frozen source task.
+        """
+
+        if scope.key in state.provider_vertical_circuits:
+            return scope.key
+        cohort_key = task.input.get("provider_lodging_cohort_key")
+        if (
+            isinstance(cohort_key, str)
+            and cohort_key in state.provider_vertical_circuits
+        ):
+            return cohort_key
+        return None
+
+    async def _open_provider_vertical_circuit(
+        self,
+        state: _RunState,
+        *,
+        scope: ProviderScopeKey,
+        circuit_key: str,
+        circuit_scope_type: str,
+        trigger_source_task_id: str,
+        trigger_browser_task_id: str,
+        trigger_reason: str,
+        trigger_snapshot: BrowserTaskSnapshot,
+    ) -> None:
+        async with state.provider_vertical_circuit_lock:
+            if circuit_key in state.provider_vertical_circuits:
+                return
+            receipt: dict[str, JsonValue] = {
+                "schema_version": "provider-lodging-circuit-v2",
+                "scope": circuit_key,
+                "provider_vertical_scope": scope.key,
+                "circuit_scope_type": circuit_scope_type,
+                "trigger_source_task_id": trigger_source_task_id,
+                "trigger_browser_task_id": trigger_browser_task_id,
+                "trigger_reason": trigger_reason,
+                "trigger_failure_code": (
+                    trigger_snapshot.failure.code.value
+                    if trigger_snapshot.failure is not None
+                    else None
+                ),
+                "opened_at": trigger_snapshot.updated_at.isoformat(),
+                "cancelled_sibling_browser_task_ids": [],
+            }
+            state.provider_vertical_circuits[circuit_key] = receipt
+            if circuit_scope_type == "provider_vertical":
+                _record_scope_cancellation(
+                    state,
+                    scope,
+                    generation=0,
+                    reason=(
+                        "same-run provider vertical circuit opened by "
+                        f"{trigger_source_task_id}: {trigger_reason}"
+                    ),
+                )
+            sibling_ids = tuple(
+                browser_task_id
+                for source_task_id, browser_task_ids in state.browser_task_ids_by_source.items()
+                if source_task_id != trigger_source_task_id
+                and (
+                    (
+                        circuit_scope_type == "provider_vertical"
+                        and state.browser_task_scope_by_source.get(source_task_id) == scope.key
+                    )
+                    or (
+                        circuit_scope_type == "exact_place_cohort"
+                        and state.browser_task_circuit_key_by_source.get(source_task_id)
+                        == circuit_key
+                    )
+                )
+                for browser_task_id in browser_task_ids
+                if browser_task_id != trigger_browser_task_id
+            )
+            if sibling_ids:
+                try:
+                    cancelled = await self._bridge.cancel_many(
+                        sibling_ids,
+                        reason=(
+                            "same-run provider vertical circuit: "
+                            f"{trigger_reason} at {trigger_source_task_id}"
+                        ),
+                    )
+                    receipt["cancelled_sibling_browser_task_ids"] = [
+                        item.id
+                        for item in cancelled
+                        if item.state is BrowserTaskState.CANCELLED
+                    ]
+                except Exception as exc:
+                    receipt["cancellation_error"] = type(exc).__name__
+
     def _needs_one_adult_price_validation(
         self,
         snapshot: BrowserTaskSnapshot,
@@ -6082,6 +6314,21 @@ class LivePackageAgentSystem:
             scope = _source_task_scope(task)
             raw_generation = task.input.get("__tripchord_attempt_generation", 0)
             attempt_generation = raw_generation if isinstance(raw_generation, int) else 0
+            if scope is not None:
+                cohort_key = task.input.get("provider_lodging_cohort_key")
+                if isinstance(cohort_key, str):
+                    state.browser_task_circuit_key_by_source[task.id] = cohort_key
+            open_circuit_key = (
+                self._open_lodging_circuit_key_for_task(state, task, scope)
+                if scope is not None
+                else None
+            )
+            if open_circuit_key is not None:
+                return self._provider_vertical_circuit_suppressed_result(
+                    state,
+                    task,
+                    open_circuit_key,
+                )
             if (
                 scope is not None
                 and state.cancellation_tombstones.rejects(scope, attempt_generation)
@@ -6123,6 +6370,17 @@ class LivePackageAgentSystem:
                 # closed the scope, leaking access (and its preserved/retry
                 # task could revive later).  Deterministic tombstone suppression
                 # — never touch the browser/model/network after cancellation.
+                open_circuit_key = (
+                    self._open_lodging_circuit_key_for_task(state, task, scope)
+                    if scope is not None
+                    else None
+                )
+                if open_circuit_key is not None:
+                    return self._provider_vertical_circuit_suppressed_result(
+                        state,
+                        task,
+                        open_circuit_key,
+                    )
                 if (
                     scope is not None
                     and state.cancellation_tombstones.rejects(scope, attempt_generation)
@@ -6388,6 +6646,9 @@ class LivePackageAgentSystem:
                 "source_error_count": len(state.source_errors),
                 "cancelled_scope_count": len(
                     state.cancellation_tombstones.tombstones
+                ),
+                "provider_vertical_circuit_count": len(
+                    state.provider_vertical_circuits
                 ),
             }
             summary = (
@@ -8563,6 +8824,16 @@ class LivePackageAgentSystem:
                 for attempt_index in range(tool_attempt_limit):
                     (submitted,) = await self._bridge.submit_many((retry_submission,))
                     submitted_ids.append(submitted.id)
+                    state.browser_task_ids_by_source[call.task_id] = tuple(
+                        dict.fromkeys(
+                            (
+                                *state.browser_task_ids_by_source.get(call.task_id, ()),
+                                submitted.id,
+                            )
+                        )
+                    )
+                    if retry_scope is not None:
+                        state.browser_task_scope_by_source[call.task_id] = retry_scope.key
                     (terminal,) = await self._bridge.wait_many(
                         (submitted.id,),
                         timeout_seconds=_browser_wait_timeout_seconds(
@@ -8581,6 +8852,32 @@ class LivePackageAgentSystem:
                         and terminal.failure is not None
                         and terminal.failure.retryable
                     )
+                    circuit_reason = self._provider_vertical_circuit_reason(terminal)
+                    if circuit_reason is not None and retry_scope is not None:
+                        circuit_scope_type = (
+                            "exact_place_cohort"
+                            if circuit_reason == "bounded_provider_pending"
+                            else "provider_vertical"
+                        )
+                        circuit_key = (
+                            state.browser_task_circuit_key_by_source.get(call.task_id)
+                            if circuit_scope_type == "exact_place_cohort"
+                            else retry_scope.key
+                        )
+                        # A provider-pending observation is only safe to share
+                        # when the frozen task carries an exact-place cohort.
+                        # Without that binding, fail closed to this task alone.
+                        if circuit_key is not None:
+                            await self._open_provider_vertical_circuit(
+                                state,
+                                scope=retry_scope,
+                                circuit_key=circuit_key,
+                                circuit_scope_type=circuit_scope_type,
+                                trigger_source_task_id=call.task_id,
+                                trigger_browser_task_id=terminal.id,
+                                trigger_reason=circuit_reason,
+                                trigger_snapshot=terminal,
+                            )
                     if not retryable_failure or attempt_index == tool_attempt_limit - 1:
                         return {
                             "snapshot": _json_value(terminal.model_dump(mode="json")),
@@ -8809,6 +9106,9 @@ class LivePackageAgentSystem:
                 "flight_checked_baggage_per_adult_kg",
                 "flight_fare_rules_known",
                 "lodging_breakfast_states",
+                "lodging_room_quality",
+                "lodging_non_basic_confirmed",
+                "lodging_quality_price_premium_cents",
                 "lodging_cancellation_known",
                 "lodging_payment_known",
                 "all_component_tax_scopes_confirmed",
@@ -8823,7 +9123,7 @@ class LivePackageAgentSystem:
             )
 
             def candidate_row(item: TravelPackageCandidate) -> list[JsonValue]:
-                decision = self._candidate_agent_decision_row(item)
+                decision = self._candidate_agent_decision_row(item, state.inventory)
                 excluded_components = sorted(set(item.component_ids) & evidence_excluded_quote_ids)
                 decision["evidence_excluded_component_ids"] = _json_value(excluded_components)
                 decision["evidence_selection_eligible"] = not excluded_components
@@ -9357,6 +9657,66 @@ class LivePackageAgentSystem:
                 for segment, segment_query in segment_queries.items()
             ),
         )
+        # Each exact lodging place has its own representative full-stay
+        # canary.  Maafushi and Hulhumale canaries run in parallel; a bounded
+        # pending result only suppresses followers for the same place.  This
+        # prevents one slow destination page from erasing the independent
+        # airport-island comparison.  Login/captcha/DOM failures are promoted
+        # separately to the broader provider+lodging circuit.
+        tasks_by_segment = {
+            segment: next(
+                task
+                for task in base
+                if task.id == f"source-{provider.value}-lodging-{segment}"
+            )
+            for segment in segment_queries
+        }
+
+        def exact_place_cohort_key(task: AgentTask) -> str:
+            submission = BrowserTaskSubmission.model_validate(task.input["submission"])
+            place_key = submission.query.options.get("expected_lodging_place_key")
+            if not isinstance(place_key, str) or not place_key:
+                place_key = submission.query.destination.strip().casefold().replace(" ", "-")
+            return f"{provider.value}:lodging:{place_key}"
+
+        cohort_specs: list[tuple[str, tuple[str, ...]]] = [
+            ("full", ("middle",)),
+        ]
+        if "hulhumale-full" in tasks_by_segment:
+            cohort_specs.append(("hulhumale-full", ("first", "last")))
+        else:
+            cohort_specs.append(("first", ("last",)))
+        rewritten_by_id = {task.id: task for task in base}
+        for canary_segment, follower_segments in cohort_specs:
+            canary = tasks_by_segment[canary_segment]
+            cohort_key = exact_place_cohort_key(canary)
+            rewritten_by_id[canary.id] = canary.model_copy(
+                update={
+                    "input": {
+                        **canary.input,
+                        "provider_lodging_cohort_key": cohort_key,
+                    }
+                }
+            )
+            for follower_segment in follower_segments:
+                follower = tasks_by_segment[follower_segment]
+                if exact_place_cohort_key(follower) != cohort_key:
+                    raise ValueError(
+                        "lodging canary and follower must bind the same exact place"
+                    )
+                rewritten_by_id[follower.id] = follower.model_copy(
+                    update={
+                        "dependencies": tuple(
+                            dict.fromkeys((*follower.dependencies, canary.id))
+                        ),
+                        "input": {
+                            **follower.input,
+                            "provider_vertical_canary_source_id": canary.id,
+                            "provider_lodging_cohort_key": cohort_key,
+                        },
+                    }
+                )
+        base = tuple(rewritten_by_id[task.id] for task in base)
         # ``hulhumale-full`` is already part of the canonical segment set
         # above.  Keep one task per provider/vertical/segment so the server
         # allow-list remains injective when a stay-plan candidate set exists.
@@ -10172,19 +10532,28 @@ class LivePackageAgentSystem:
                         and inventory_outcomes[0].state == StayInventoryResultState.QUOTE_FOUND
                     )
                 source_completed = (
-                    snapshot is not None
-                    and outcome_found
-                    and (
-                        snapshot.state == BrowserTaskState.SUCCEEDED
-                        or (
-                            vertical == BrowserVertical.FLIGHT
-                            and flight_outcome is not None
-                            and snapshot.failure is not None
+                    (
+                        state.source_errors.get(task_id, "").startswith(
+                            "ProviderVerticalCircuitOpen:"
                         )
-                        or (
-                            vertical == BrowserVertical.LODGING
-                            and outcome_found
-                            and snapshot.failure is not None
+                        and "reason=bounded_provider_pending;"
+                        in state.source_errors.get(task_id, "")
+                    )
+                    or (
+                        snapshot is not None
+                        and outcome_found
+                        and (
+                            snapshot.state == BrowserTaskState.SUCCEEDED
+                            or (
+                                vertical == BrowserVertical.FLIGHT
+                                and flight_outcome is not None
+                                and snapshot.failure is not None
+                            )
+                            or (
+                                vertical == BrowserVertical.LODGING
+                                and outcome_found
+                                and snapshot.failure is not None
+                            )
                         )
                     )
                 )
@@ -11631,6 +12000,7 @@ class LivePackageAgentSystem:
                 }
             )
         elif isinstance(quote, NormalizedLodgingQuote):
+            basic_markers = lodging_basic_markers(quote)
             common.update(
                 {
                     "kind": "lodging",
@@ -11665,6 +12035,9 @@ class LivePackageAgentSystem:
                         "payment_policy",
                         quote.payment_policy,
                     ),
+                    "lodging_quality_tier": lodging_quality_tier(quote).value,
+                    "lodging_non_basic": not basic_markers,
+                    "lodging_basic_markers": list(basic_markers),
                 }
             )
         else:
@@ -11824,6 +12197,7 @@ class LivePackageAgentSystem:
                 ]
             )
         elif isinstance(quote, NormalizedLodgingQuote):
+            basic_markers = lodging_basic_markers(quote)
             common["scope"] = _json_value(
                 [
                     quote.area.value,
@@ -11838,6 +12212,9 @@ class LivePackageAgentSystem:
                     quote.breakfast_included,
                     bool(quote.cancellation_policy),
                     bool(quote.payment_policy),
+                    lodging_quality_tier(quote).value,
+                    not basic_markers,
+                    list(basic_markers),
                 ]
             )
         else:
@@ -11881,6 +12258,7 @@ class LivePackageAgentSystem:
     def _candidate_agent_decision_row(
         self,
         candidate: TravelPackageCandidate,
+        inventory: PackageInventory,
     ) -> dict[str, JsonValue]:
         """Compact, typed candidate row for model selection and repair.
 
@@ -11890,6 +12268,47 @@ class LivePackageAgentSystem:
         up to 32 rows made one tool observation larger than the entire context
         budget without adding decision authority.
         """
+
+        lodging_quality_rows: list[dict[str, JsonValue]] = []
+        total_quality_premium_cents = 0
+        for lodging in candidate.lodgings:
+            same_scope = tuple(
+                item
+                for item in inventory.lodgings
+                if item.area == lodging.area
+                and item.place_key == lodging.place_key
+                and item.check_in == lodging.check_in
+                and item.check_out == lodging.check_out
+                and item.adults == lodging.adults
+                and item.children == lodging.children
+                and item.infants == lodging.infants
+                and item.rooms == lodging.rooms
+                and item.currency == lodging.currency
+            )
+            lowest_scope_total = min(
+                (item.total_for_party_cents for item in same_scope),
+                default=lodging.total_for_party_cents,
+            )
+            price_premium_cents = max(
+                lodging.total_for_party_cents - lowest_scope_total,
+                0,
+            )
+            total_quality_premium_cents += price_premium_cents
+            bounded_property, _ = self._bounded_agent_provider_text(lodging.property_name)
+            bounded_room, _ = self._bounded_agent_provider_text(lodging.room_name)
+            markers = lodging_basic_markers(lodging)
+            lodging_quality_rows.append(
+                {
+                    "lodging_id": lodging.id,
+                    "property_name": bounded_property,
+                    "room_name": bounded_room,
+                    "quality_tier": lodging_quality_tier(lodging).value,
+                    "non_basic": not markers,
+                    "basic_markers": list(markers),
+                    "total_for_party_cents": lodging.total_for_party_cents,
+                    "price_premium_to_lowest_same_scope_cents": price_premium_cents,
+                }
+            )
 
         return {
             "id": candidate.id,
@@ -11915,6 +12334,11 @@ class LivePackageAgentSystem:
             "lodging_breakfast_states": _json_value(
                 [item.breakfast_included for item in candidate.lodgings]
             ),
+            "lodging_room_quality": _json_value(lodging_quality_rows),
+            "lodging_non_basic_confirmed": all(
+                not lodging_basic_markers(item) for item in candidate.lodgings
+            ),
+            "lodging_quality_price_premium_cents": total_quality_premium_cents,
             "lodging_cancellation_known": all(
                 item.cancellation_policy is not None for item in candidate.lodgings
             ),

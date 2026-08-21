@@ -56,6 +56,12 @@ def test_effective_preferences_project_into_executable_template() -> None:
                 False,
                 PreferenceSource.EXPLICIT_LONG_TERM,
             ),
+            _rule(
+                "lodging_quality",
+                PreferenceMode.REQUIRED,
+                "not_basic",
+                PreferenceSource.EXPLICIT_CURRENT_TRIP,
+            ),
         )
     )
 
@@ -64,6 +70,7 @@ def test_effective_preferences_project_into_executable_template() -> None:
     assert projected.require_breakfast is True
     assert projected.require_checked_baggage is True
     assert projected.allow_connections is False
+    assert projected.require_non_basic_lodging is True
     assert unapplied == ()
 
 

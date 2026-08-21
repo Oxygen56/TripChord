@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import Counter
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -24,6 +25,13 @@ from tripchord.planning.package import (
     TravelPackageCandidate,
 )
 from tripchord.platform.booking import BookingLedger
+
+_INDEPENDENT_BASIC_LODGING_PATTERN = re.compile(
+    r"无窗|基础(?:房|客房|房型)?|经济(?:房|客房|房型)?|特价房|床位|宿舍|公共卫浴|"
+    r"\bwindowless\b|\bno[ -]?window\b|\bbasic(?: room)?\b|\beconomy room\b|"
+    r"\bdormitory\b|\bshared bathroom\b",
+    re.IGNORECASE,
+)
 
 
 class PackageInvariantCode(StrEnum):
@@ -406,14 +414,23 @@ class DeclarativePackageReVerifier:
                 for lodging in candidate.lodgings
                 if lodging.breakfast_included is not intent.require_breakfast
             )
+        if intent.require_non_basic_lodging:
+            invalid.update(
+                lodging.id
+                for lodging in candidate.lodgings
+                if _INDEPENDENT_BASIC_LODGING_PATTERN.search(
+                    f"{lodging.property_name} {lodging.room_name or ''}"
+                )
+            )
         return self._check(
             PackageInvariantCode.HARD_PREFERENCES,
             not invalid,
-            "显式托运行李、拒绝中转和早餐硬偏好必须由报价字段直接证明",
+            "显式托运行李、拒绝中转、早餐和非基础住宿硬偏好必须由报价字段直接证明",
             tuple(sorted(invalid)),
             checked_baggage_required=intent.require_checked_baggage is True,
             direct_flight_required=intent.allow_connections is False,
             breakfast_constraint_present=intent.require_breakfast is not None,
+            non_basic_lodging_required=intent.require_non_basic_lodging,
         )
 
     def _lodging_kind_structure(
