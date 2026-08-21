@@ -4182,45 +4182,44 @@ async def test_deterministic_dominance_skips_curator_without_a_failure() -> None
 
 
 @pytest.mark.asyncio
-async def test_pareto_candidate_scope_still_calls_one_curator_tool_chain() -> None:
-    first, second = await _two_visible_hard_valid_candidates()
-    first = first.model_copy(
+async def test_different_cancellation_deadlines_call_one_curator_tool_chain() -> None:
+    _, base = await _two_visible_hard_valid_candidates()
+    assert len(base.lodgings) == 1
+    cheap_lodging = base.lodgings[0].model_copy(
         update={
-            "lodgings": tuple(
-                lodging.model_copy(
-                    update={
-                        "breakfast_included": True,
-                        "cancellation_policy": "免费取消",
-                        "payment_policy": "到店支付",
-                    }
-                )
-                for lodging in first.lodgings
-            )
+            "cancellation_policy": "免费取消至 2026-08-25 18:00",
         }
     )
-    second = second.model_copy(
+    second = base.model_copy(
         update={
-            "lodgings": tuple(
-                lodging.model_copy(
-                    update={
-                        "breakfast_included": False,
-                        "cancellation_policy": None,
-                        "payment_policy": None,
-                    }
-                )
-                for lodging in second.lodgings
-            )
+            "id": "candidate:cancellation-deadline:cheap",
+            "lodgings": (cheap_lodging,),
         }
     )
+    expensive_lodging = base.lodgings[0].model_copy(
+        update={
+            "id": "lodging:cancellation-deadline:late",
+            "total_for_party_cents": base.lodgings[0].total_for_party_cents + 12_000,
+            "cancellation_policy": "免费取消至 2026-09-01 18:00",
+        }
+    )
+    first = base.model_copy(
+        update={
+            "id": "candidate:cancellation-deadline:late",
+            "lodgings": (expensive_lodging,),
+            "declared_total_cents": base.declared_total_cents + 12_000,
+        }
+    )
+    assert first.computed_total_cents == second.computed_total_cents + 12_000
     model = ScriptedModelClient(
         (
             _agent_tool_response("inspect_package_candidates", "pareto-curator-tool"),
             _agent_json_response(
                 {
-                    "summary": "两个候选不同航班与接驳，保留真实取舍",
+                    "summary": "两个候选的价格与取消截止时间存在真实取舍",
                     "selected_candidate_id": second.id,
                     "alternative_candidate_ids": [first.id],
-                    "tradeoffs": ["价格与行程组件不可直接支配"],
+                    "tradeoffs": ["价格与免费取消截止时间存在真实权衡"],
                     "evidence": ["https://example.invalid/" + ("long/" * 100)],
                     "evidence_refs": [],
                     "confidence": 0.7,
@@ -4245,6 +4244,7 @@ async def test_pareto_candidate_scope_still_calls_one_curator_tool_chain() -> No
         now=lambda: NOW,
         model_router=router,
     )
+    assert system._deterministic_dominance_winner(state, intent()) is None
     task = AgentTask(
         id="curate-travel-candidates",
         role=AgentRole.CANDIDATE_CURATOR,

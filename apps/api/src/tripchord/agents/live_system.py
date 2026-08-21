@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -4322,21 +4323,13 @@ class LivePackageAgentSystem:
         return state.candidate_decision_frontier or state.candidate_shortlist
 
     @staticmethod
-    def _cancellation_entitlement_rank(policy: str | None) -> int:
+    def _normalized_cancellation_contract(policy: str | None) -> str | None:
         if policy is None:
-            return 0
-        normalized = policy.casefold()
-        if any(
-            marker in normalized
-            for marker in ("免费取消", "free cancellation", "free cancel")
-        ):
-            return 3
-        if any(
-            marker in normalized
-            for marker in ("不可取消", "不可退款", "non-refundable", "nonrefundable")
-        ):
-            return 1
-        return 2
+            return None
+        normalized = " ".join(
+            unicodedata.normalize("NFKC", policy).casefold().split()
+        )
+        return normalized or None
 
     @staticmethod
     def _breakfast_entitlement_rank(value: bool | None) -> int:
@@ -4376,9 +4369,17 @@ class LivePackageAgentSystem:
             preferred.breakfast_included
         ) < self._breakfast_entitlement_rank(alternative.breakfast_included):
             return False
-        if self._cancellation_entitlement_rank(
+        preferred_cancellation = self._normalized_cancellation_contract(
             preferred.cancellation_policy
-        ) < self._cancellation_entitlement_rank(alternative.cancellation_policy):
+        )
+        alternative_cancellation = self._normalized_cancellation_contract(
+            alternative.cancellation_policy
+        )
+        if (
+            preferred_cancellation is None
+            or alternative_cancellation is None
+            or preferred_cancellation != alternative_cancellation
+        ):
             return False
         if bool(preferred.payment_policy) < bool(alternative.payment_policy):
             return False
