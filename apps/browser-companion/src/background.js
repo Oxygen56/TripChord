@@ -11934,10 +11934,23 @@ async function executeRangeLease(lease) {
     const cellDeadline = Math.min(totalDeadline - reserveMs, Date.now() + cellBudgetMs);
     let completion;
     try {
-      completion = await runSinglePageQuery(
-        cellLease,
-        { deadlineMs: cellDeadline, submitCompletion: false },
-      );
+      const remainingCellMs = Math.max(1000, cellDeadline - Date.now());
+      completion = await Promise.race([
+        runSinglePageQuery(
+          cellLease,
+          { deadlineMs: cellDeadline, submitCompletion: false },
+        ),
+        new Promise((resolve) => setTimeout(() => resolve({
+          state: "failed",
+          quotes: [],
+          failure: {
+            code: "range_cell_timeout",
+            message: "日期单元达到独立截止时间，批量任务继续提交回执",
+            retryable: true,
+            page_url: null,
+          },
+        }), remainingCellMs)),
+      ]);
     } catch (error) {
       completion = {
         state: "failed",
