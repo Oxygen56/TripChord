@@ -2,6 +2,6 @@
 globalThis.TRIPCHORD_COMPANION_BUILD_META = Object.freeze({
   "protocol_version": "tripchord-companion-control-v1",
   "manifest_version": "0.1.16",
-  "build_sha256": "b3c8b9daa7a0fd605ee8fefc54b3c8d5138ddb6b4804abfb2d01f22c184a40cb",
+  "build_sha256": "999658b839f3491ad33d96410d2d38a61840dccb0abf933d355dfef7138cbaa2",
   "content_runtime_version": "2026-08-05.18"
 });
