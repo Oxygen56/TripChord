@@ -1789,6 +1789,7 @@ class BrowserTaskSubmission(DomainModel):
     provider: BrowserProvider
     kind: BrowserVertical
     query: BrowserSearchQuery
+    range_query: BrowserDateRangeQuery | None = None
     timeout_seconds: int = Field(default=120, ge=15, le=300)
     max_attempts: int = Field(default=2, ge=1, le=3)
     # A privacy-preserving hash owned by the API composition layer. Exact
@@ -1801,6 +1802,19 @@ class BrowserTaskSubmission(DomainModel):
 
     @model_validator(mode="after")
     def validate_vertical_and_url(self) -> BrowserTaskSubmission:
+        if self.range_query is not None:
+            if self.range_query.provider != self.provider or self.range_query.kind != self.kind:
+                raise ValueError("range query provider or kind does not match the task")
+            if self.range_query.party.adults != self.query.adults:
+                raise ValueError("range query adults does not match the task query")
+            if self.range_query.party.children != self.query.children:
+                raise ValueError("range query children does not match the task query")
+            if self.range_query.party.infants != self.query.infants:
+                raise ValueError("range query infants does not match the task query")
+            if self.range_query.party.rooms != self.query.rooms:
+                raise ValueError("range query rooms does not match the task query")
+            if self.range_query.currency != self.query.currency:
+                raise ValueError("range query currency does not match the task query")
         if not self.query.party_shape_supported:
             raise ValueError(
                 self.query.party_shape_failure
@@ -2165,6 +2179,7 @@ class BrowserTaskCompletion(DomainModel):
     state: BrowserTaskState
     quotes: tuple[BrowserQuote, ...] = ()
     failure: BrowserFailure | None = None
+    range_completion: BrowserRangeCompletion | None = None
 
     @model_validator(mode="after")
     def validate_terminal_result(self) -> BrowserTaskCompletion:
@@ -2175,8 +2190,8 @@ class BrowserTaskCompletion(DomainModel):
         }:
             raise ValueError("completion state must be succeeded, blocked, or failed")
         if self.state == BrowserTaskState.SUCCEEDED:
-            if not self.quotes:
-                raise ValueError("successful completion requires at least one quote")
+            if not self.quotes and self.range_completion is None:
+                raise ValueError("successful completion requires at least one quote or range receipt")
             if self.failure is not None:
                 raise ValueError("successful completion cannot include a failure")
         elif self.failure is None:
@@ -2208,6 +2223,7 @@ class BrowserTaskSnapshot(DomainModel):
     claimed_by: str | None = None
     claimed_at: datetime | None = None
     quotes: tuple[BrowserQuote, ...] = ()
+    range_completion: BrowserRangeCompletion | None = None
     failure: BrowserFailure | None = None
     reused_from_task_id: str | None = None
     reuse_age_seconds: float | None = Field(default=None, ge=0)
@@ -2219,6 +2235,7 @@ class BrowserTaskLease(DomainModel):
     provider: BrowserProvider
     kind: BrowserVertical
     query: BrowserSearchQuery
+    range_query: BrowserDateRangeQuery | None = None
     timeout_seconds: int
     claim_token: str
     claimed_at: datetime
@@ -2576,6 +2593,7 @@ class _TaskRecord:
     claim_token: str | None = None
     lease_expires_at: datetime | None = None
     quotes: tuple[BrowserQuote, ...] = ()
+    range_completion: BrowserRangeCompletion | None = None
     failure: BrowserFailure | None = None
     reused_from_task_id: str | None = None
     reuse_age_seconds: float | None = None
@@ -2628,6 +2646,7 @@ class PersistedBrowserTaskRecord(DomainModel):
     updated_at: datetime
     attempt_count: int = Field(ge=0)
     quotes: tuple[BrowserQuote, ...] = ()
+    range_completion: BrowserRangeCompletion | None = None
     failure: BrowserFailure | None = None
     reused_from_task_id: str | None = None
     reuse_age_seconds: float | None = Field(default=None, ge=0)
@@ -2982,6 +3001,7 @@ class BrowserTaskBridge:
                     provider=lease.submission.provider,
                     kind=lease.submission.kind,
                     query=lease.submission.query,
+                    range_query=lease.submission.range_query,
                     timeout_seconds=lease.submission.timeout_seconds,
                     claim_token=lease.claim_token,
                     claimed_at=lease.claimed_at,
@@ -3014,6 +3034,7 @@ class BrowserTaskBridge:
             claim_token=lease.claim_token,
             lease_expires_at=lease.lease_expires_at,
             quotes=snapshot.quotes,
+            range_completion=snapshot.range_completion,
             failure=snapshot.failure,
             reused_from_task_id=snapshot.reused_from_task_id,
             reuse_age_seconds=snapshot.reuse_age_seconds,
@@ -3370,6 +3391,7 @@ class BrowserTaskBridge:
                     provider=record.submission.provider,
                     kind=record.submission.kind,
                     query=record.submission.query,
+                    range_query=record.submission.range_query,
                     timeout_seconds=record.submission.timeout_seconds,
                     claim_token=token,
                     claimed_at=now,
@@ -3691,6 +3713,7 @@ class BrowserTaskBridge:
             record.state = completion.state
             record.updated_at = now
             record.quotes = completion.quotes
+            record.range_completion = completion.range_completion
             record.failure = completion.failure
             record.source_execution_receipt = source_receipt
             if frozen_snapshot is None:
@@ -3774,6 +3797,7 @@ class BrowserTaskBridge:
             record.state = completion.state
             record.updated_at = now
             record.quotes = completion.quotes
+            record.range_completion = completion.range_completion
             record.failure = completion.failure
             record.source_execution_receipt = source_receipt
             snapshot = self._snapshot(record)
@@ -4916,6 +4940,7 @@ class BrowserTaskBridge:
                 updated_at=record.updated_at,
                 attempt_count=record.attempt_count,
                 quotes=record.quotes,
+                range_completion=record.range_completion,
                 failure=record.failure,
                 reused_from_task_id=record.reused_from_task_id,
                 reuse_age_seconds=record.reuse_age_seconds,
@@ -4973,6 +4998,7 @@ class BrowserTaskBridge:
             claimed_by=record.claimed_by,
             claimed_at=record.claimed_at,
             quotes=record.quotes,
+            range_completion=record.range_completion,
             failure=record.failure,
             reused_from_task_id=record.reused_from_task_id,
             reuse_age_seconds=record.reuse_age_seconds,

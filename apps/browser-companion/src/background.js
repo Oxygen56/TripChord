@@ -10960,8 +10960,12 @@ async function recordCompletionDiagnostic(
   });
 }
 
-async function executeLease(lease) {
-  let tabId = null;
+async function executeSingleLease(lease, executionOptions = {}) {
+  const sharedTabId = Number.isInteger(executionOptions.sharedTabId)
+    ? executionOptions.sharedTabId
+    : null;
+  const submitCompletion = executionOptions.submitCompletion !== false;
+  let tabId = sharedTabId;
   let reusedTabId = null;
   let reusedExactResult = false;
   let reusedResultUrlReadback = null;
@@ -11038,6 +11042,7 @@ async function executeLease(lease) {
       stageTrace,
       timingDiagnostic,
     );
+    if (!submitCompletion) return tracedCompletion;
     try {
       return await completeLease(
         lease,
@@ -11145,6 +11150,18 @@ async function executeLease(lease) {
         deadline,
         INITIAL_LANDING_STAGE_CAP_MS,
         async (stageDeadlineValue) => {
+          if (sharedTabId !== null) {
+            await chrome.tabs.update(sharedTabId, { url: requestedUrl, active: false });
+            const readiness = await waitForTabInteractive(
+              sharedTabId,
+              remainingTimeout(
+                stageDeadlineValue - INITIAL_LANDING_INNER_GUARD_MS,
+                INITIAL_LANDING_STAGE_CAP_MS - INITIAL_LANDING_INNER_GUARD_MS,
+              ),
+            );
+            const current = await chrome.tabs.get(sharedTabId);
+            return { current, readiness, shared_tab: true };
+          }
           const reusable =
             await claimReusableExactLodgingResultTab(lease) ||
             await claimReusableExactFlightResultTab(lease);
@@ -11775,8 +11792,10 @@ async function executeLease(lease) {
       return null;
     }
   } finally {
-    await closeOwnedWindows(ownedWindowIds, ownedTabIds);
-    await closeOwnedTabs(ownedTabIds);
+    if (sharedTabId === null) {
+      await closeOwnedWindows(ownedWindowIds, ownedTabIds);
+      await closeOwnedTabs(ownedTabIds);
+    }
     if (reusedTabId !== null) {
       leasedExistingTabIds.delete(reusedTabId);
     }
@@ -11799,6 +11818,76 @@ async function executeLease(lease) {
     }
     sweepExpiredPreservedResultTabs();
   }
+}
+
+function ctripRangeQueryUrl(query, startDate, endDate) {
+  const originCode = String(query.origin_code || "").toLowerCase();
+  const destinationCode = String(query.destination_code || "").toLowerCase();
+  return "https://flights.ctrip.com/international/search/" +
+    `round-${originCode}-${destinationCode}` +
+    `?depdate=${startDate}_${endDate}` +
+    `&cabin=y_s&adult=${query.adults}&child=${query.children || 0}` +
+    `&infant=${query.infants || 0}`;
+}
+
+async function executeLease(lease) {
+  const range = lease && lease.range_query;
+  if (!range || lease.provider !== "ctrip" || lease.kind !== "flight") {
+    return executeSingleLease(lease);
+  }
+  const pairs = Array.isArray(range.requested_pairs) ? range.requested_pairs : [];
+  if (!pairs.length) return executeSingleLease(lease);
+  const firstStart = String(pairs[0][0]);
+  const firstEnd = String(pairs[0][1]);
+  const firstQuery = {
+    ...lease.query,
+    start_date: firstStart,
+    end_date: firstEnd,
+    search_url: ctripRangeQueryUrl(lease.query, firstStart, firstEnd),
+  };
+  const tab = await chrome.tabs.create({ url: firstQuery.search_url, active: false });
+  const quotes = [];
+  let firstFailure = null;
+  try {
+    for (const pair of pairs) {
+      const startDate = String(pair[0]);
+      const endDate = String(pair[1]);
+      const query = {
+        ...lease.query,
+        start_date: startDate,
+        end_date: endDate,
+        search_url: ctripRangeQueryUrl(lease.query, startDate, endDate),
+      };
+      const completion = await executeSingleLease(
+        { ...lease, query, range_query: null },
+        { sharedTabId: tab.id, submitCompletion: false },
+      );
+      if (completion && Array.isArray(completion.quotes)) quotes.push(...completion.quotes);
+      if (!completion || completion.state !== "succeeded") {
+        firstFailure = completion && completion.failure || {
+          code: "extraction_error",
+          message: "批量日期中的一组查询未完成",
+          retryable: true,
+          page_url: null,
+          details: { range_pair: [startDate, endDate] },
+        };
+        break;
+      }
+    }
+  } finally {
+    if (Number.isInteger(tab.id)) {
+      try { await chrome.tabs.remove(tab.id); } catch { /* best effort */ }
+    }
+  }
+  if (firstFailure) {
+    return completeLease(lease, {
+      state: firstFailure.code === "captcha_required" || firstFailure.code === "login_required"
+        ? "blocked" : "failed",
+      quotes: [],
+      failure: firstFailure,
+    });
+  }
+  return completeLease(lease, { state: "succeeded", quotes, failure: null });
 }
 
 async function executeClaimedLeasesProviderAware(
