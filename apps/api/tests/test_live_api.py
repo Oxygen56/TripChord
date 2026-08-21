@@ -1049,6 +1049,88 @@ async def test_live_plan_modify_endpoint_parses_text_and_replaces_tenant_bound_c
 
 
 @pytest.mark.asyncio
+async def test_global_plan_modification_preserves_cache_on_failure_and_replaces_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_system = _FakeLiveSystem()
+    cache = LiveRunCache(capacity=4, ttl=timedelta(minutes=5))
+    original = _blocked_live_run()
+    run_id, _ = await cache.put("anonymous", original)
+    accepted_update: LivePackageAgentRun | None = None
+
+    async def modify_plan(
+        previous: LivePackageAgentRun,
+        modification: LivePlanModificationIntent,
+        **_kwargs: object,
+    ) -> tuple[LivePackageAgentRun, LivePlanModificationReceipt]:
+        nonlocal accepted_update
+        if modification.date_patch is not None and modification.date_patch.departure_date == date(
+            2026, 9, 4
+        ):
+            return previous, LivePlanModificationReceipt(
+                status=LivePlanModificationStatus.BLOCKED,
+                intent=modification,
+                summary="新日期未形成合格完整方案，原方案已保留。",
+            )
+        accepted_update = previous.model_copy(
+            update={"claim_boundary": "新日期完整方案已通过发布门。"}
+        )
+        return accepted_update, LivePlanModificationReceipt(
+            status=LivePlanModificationStatus.GLOBAL_REPLAN,
+            intent=modification,
+            summary="新日期完整方案已通过复验与发布门。",
+            verifier_passed=True,
+            reverifier_passed=True,
+        )
+
+    fake_system.modify_plan = modify_plan  # type: ignore[attr-defined]
+    monkeypatch.setattr(app.state, "live_package_agent_system", fake_system)
+    monkeypatch.setattr(app.state, "live_run_cache", cache)
+    monkeypatch.setattr(
+        main_module,
+        "_require_final_published_live_run_for_event",
+        lambda run: None,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+        base_url="http://test",
+    ) as client:
+        before_failure = await cache.get(run_id, "anonymous")
+        failed = await client.post(
+            f"/api/v1/agents/live-plans/{run_id}/modify",
+            json={
+                "instruction": "改成9月4日出发，9月10日返回",
+                "timeout_seconds": 20,
+            },
+        )
+        after_failure = await cache.get(run_id, "anonymous")
+
+        assert failed.status_code == 200
+        assert failed.json()["modification"]["status"] == "blocked"
+        assert before_failure is after_failure
+        assert after_failure is not None
+        assert after_failure.run is original
+        assert failed.json()["run"]["claim_boundary"] == original.claim_boundary
+
+        succeeded = await client.post(
+            f"/api/v1/agents/live-plans/{run_id}/modify",
+            json={
+                "instruction": "改成9月5日出发，9月11日返回",
+                "timeout_seconds": 20,
+            },
+        )
+
+    assert succeeded.status_code == 200
+    assert succeeded.json()["modification"]["status"] == "global_replan"
+    cached = await cache.get(run_id, "anonymous")
+    assert cached is not None
+    assert accepted_update is not None
+    assert cached.run is accepted_update
+    assert cached.run.claim_boundary == "新日期完整方案已通过发布门。"
+
+
+@pytest.mark.asyncio
 async def test_exploration_only_run_cannot_enter_event_replanning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

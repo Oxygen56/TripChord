@@ -3493,6 +3493,57 @@ class LivePackageAgentSystem:
                 memory_access=memory_access,
                 allow_recent_quote_reuse=False,
             )
+            publication_result = next(
+                (
+                    result
+                    for result in global_run.scheduler.results
+                    if result.task_id == "publish-live-run"
+                ),
+                None,
+            )
+            global_run_publishable = bool(
+                global_run.run_purpose == LiveRunPurpose.FINAL_PUBLICATION
+                and global_run.finalization_state == LiveFinalizationState.FINAL_PUBLISHED
+                and not global_run.deferred_stage_ids
+                and not global_run.exploration_seal_passed
+                and global_run.decision.state == PackageDecisionState.ACCEPT
+                and global_run.package is not None
+                and global_run.package.final_decision.state == PackageDecisionState.ACCEPT
+                and global_run.package_reverification_audit is not None
+                and global_run.package_reverification_audit.passed
+                and publication_result is not None
+                and publication_result.success
+                and publication_result.output.get("publication_gate_passed") is True
+            )
+            if not global_run_publishable:
+                previous_total = previous.package.budget.confirmed_subtotal_cents
+                return previous, LivePlanModificationReceipt(
+                    status=LivePlanModificationStatus.BLOCKED,
+                    intent=modification,
+                    summary=(
+                        "新日期未形成通过完整复验、可发布的合格完整方案；"
+                        "修改未完成，原方案及其航班、住宿和接驳均已保留。"
+                    ),
+                    before_candidate_id=current.id,
+                    after_candidate_id=current.id,
+                    preserved_component_ids=current.component_ids,
+                    before_confirmed_cny_cents=previous_total,
+                    after_confirmed_cny_cents=previous_total,
+                    difference_cny_cents=0,
+                    source_task_ids=global_run.source_task_ids,
+                    verifier_passed=(
+                        global_run.decision.state == PackageDecisionState.ACCEPT
+                        and global_run.package is not None
+                        and global_run.package.final_decision.state
+                        == PackageDecisionState.ACCEPT
+                    ),
+                    reverifier_passed=(
+                        global_run.package_reverification_audit.passed
+                        if global_run.package_reverification_audit is not None
+                        else None
+                    ),
+                )
+            assert global_run.package is not None
             global_candidate = (
                 global_run.package.final_candidate if global_run.package is not None else None
             )
@@ -3500,7 +3551,8 @@ class LivePackageAgentSystem:
                 status=LivePlanModificationStatus.GLOBAL_REPLAN,
                 intent=modification,
                 summary=(
-                    "日期同时变化，已升级为完整规划；未承诺保留旧航班、住宿或接驳。"
+                    "新日期完整方案已通过复验与发布门；"
+                    "这是完整重新规划，未承诺保留旧航班、住宿或接驳。"
                 ),
                 before_candidate_id=current.id,
                 after_candidate_id=(global_candidate.id if global_candidate is not None else None),

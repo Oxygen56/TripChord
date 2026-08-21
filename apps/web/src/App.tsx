@@ -65,6 +65,20 @@ import {
   type PriceState,
 } from "./domain";
 
+export function livePlanModificationHeading(
+  status: LivePlanModificationReceipt["status"],
+  affectedScope: LivePlanModificationReceipt["intent"]["affected_scope"],
+): string {
+  if (status === "modified") return "修改完成";
+  if (status === "global_replan") return "已按新日期完整规划";
+  if (status === "blocked") {
+    return affectedScope === "global"
+      ? "修改未完成，原方案保留"
+      : "没有安全替代项";
+  }
+  return "需要把指令说完整";
+}
+
 const stageLabels: Record<string, string> = {
   queued: "任务已入队",
   optimizing: "约束求解中",
@@ -1758,13 +1772,10 @@ function LivePlanModifier({
         >
           <header>
             <span>
-              {receipt.status === "modified"
-                ? "修改完成"
-                : receipt.status === "global_replan"
-                  ? "已按新日期完整规划"
-                  : receipt.status === "blocked"
-                    ? "没有安全替代项"
-                    : "需要把指令说完整"}
+              {livePlanModificationHeading(
+                receipt.status,
+                receipt.intent.affected_scope,
+              )}
             </span>
             <strong>{receipt.summary}</strong>
           </header>

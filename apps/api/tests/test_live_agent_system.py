@@ -1894,6 +1894,75 @@ def test_natural_language_plan_modification_routes_complete_dates_and_fails_clos
     assert partial.unresolved_reasons == ("日期修改必须同时写明出发日和返回日",)
 
 
+@pytest.mark.asyncio
+async def test_global_date_modification_only_replaces_a_fully_published_accepted_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    system, _, previous = await _run_v4_with_icom()
+    assert previous.package is not None
+    assert previous.decision.state == PackageDecisionState.ACCEPT
+    assert previous.package_reverification_audit is not None
+    assert previous.package_reverification_audit.passed
+    modification = parse_live_plan_modification(
+        "改成9月4日出发，9月10日返回",
+        current_departure_date=date(2026, 9, 3),
+    )
+
+    blocked_decision = PackageDecision(
+        state=PackageDecisionState.HUMAN_BLOCK,
+        summary="新日期未形成合格完整方案",
+    )
+    blocked_package = previous.package.model_copy(
+        update={
+            "decisions": (*previous.package.decisions, blocked_decision),
+            "final_decision": blocked_decision,
+        }
+    )
+    failed_global_run = previous.model_copy(
+        update={
+            "decision": blocked_decision,
+            "package": blocked_package,
+        }
+    )
+
+    async def return_failed_global_run(*_args: object, **_kwargs: object) -> LivePackageAgentRun:
+        return failed_global_run
+
+    monkeypatch.setattr(system, "run", return_failed_global_run)
+    unchanged, blocked = await system.modify_plan(previous, modification)
+
+    current = previous.package.final_candidate
+    previous_total = previous.package.budget.confirmed_subtotal_cents
+    assert unchanged is previous
+    assert blocked.status == LivePlanModificationStatus.BLOCKED
+    assert blocked.before_candidate_id == current.id
+    assert blocked.after_candidate_id == current.id
+    assert blocked.preserved_component_ids == current.component_ids
+    assert blocked.before_confirmed_cny_cents == previous_total
+    assert blocked.after_confirmed_cny_cents == previous_total
+    assert blocked.difference_cny_cents == 0
+    assert "原方案" in blocked.summary
+
+    successful_global_run = previous.model_copy(
+        update={"claim_boundary": "新日期完整方案已通过发布门。"}
+    )
+
+    async def return_successful_global_run(
+        *_args: object,
+        **_kwargs: object,
+    ) -> LivePackageAgentRun:
+        return successful_global_run
+
+    monkeypatch.setattr(system, "run", return_successful_global_run)
+    updated, accepted = await system.modify_plan(previous, modification)
+
+    assert updated is successful_global_run
+    assert accepted.status == LivePlanModificationStatus.GLOBAL_REPLAN
+    assert accepted.after_candidate_id == previous.package.final_candidate.id
+    assert accepted.verifier_passed is True
+    assert accepted.reverifier_passed is True
+
+
 def _select_segmented_stay_candidate(run: LivePackageAgentRun) -> LivePackageAgentRun:
     """Make event tests explicit about the lodging scope they exercise.
 
