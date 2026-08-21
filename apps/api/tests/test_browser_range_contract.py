@@ -1,4 +1,5 @@
 import hashlib
+import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -14,6 +15,7 @@ from tripchord.providers.browser_bridge import (
     BrowserRangeParty,
     BrowserRangePriceFinality,
     BrowserVertical,
+    CompleteBrowserTaskRequest,
     QuotePriceBasis,
     RangeCapabilityEvidence,
     browser_range_receipt_sha256,
@@ -108,13 +110,11 @@ def completion(
     )
     payload = {
         "schema_version": "tripchord-browser-range-receipt-v1",
-        "query": requested_query.model_dump(mode="json"),
-        "capability": capability.model_dump(mode="json"),
-        "cells": [item.model_dump(mode="json") for item in cells],
+        "query": requested_query.model_dump(mode="python"),
+        "capability": capability.model_dump(mode="python"),
+        "cells": [item.model_dump(mode="python") for item in cells],
         "expires_at": (
-            (CAPTURED_AT + timedelta(seconds=expires_seconds)).isoformat().replace(
-                "+00:00", "Z"
-            )
+            CAPTURED_AT + timedelta(seconds=expires_seconds)
             if expires_seconds is not None
             else None
         ),
@@ -137,6 +137,152 @@ def test_receipt_hash_is_canonical_and_bound_to_requested_range() -> None:
         invalid = receipt.model_dump(mode="python")
         invalid["receipt_sha256"] = "d" * 64
         BrowserRangeCompletion(**invalid)
+
+
+def _js_canonical_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("captured_at", "expires_at"),
+    (
+        ("2026-08-22T00:00:00.123Z", "2026-08-22T00:05:00.123Z"),
+        ("2026-08-22T00:00:00.000Z", "2026-08-22T00:05:00.000Z"),
+    ),
+)
+def test_complete_request_accepts_js_millisecond_range_receipt(
+    captured_at: str,
+    expires_at: str,
+) -> None:
+    range_query = {
+        "provider": "ctrip",
+        "kind": "flight",
+        "origin": "杭州",
+        "destination": "马累",
+        "origin_code": "HGH",
+        "destination_code": "MLE",
+        "requested_pairs": [
+            ["2026-09-03", "2026-09-09"],
+            ["2026-09-04", "2026-09-10"],
+        ],
+        "party": {
+            "adults": 2,
+            "children": 0,
+            "children_ages": [],
+            "infants": 0,
+            "rooms": 1,
+        },
+        "currency": "CNY",
+        "tenant_partition_sha256": "a" * 64,
+        "contract_version": "range-contract-v1",
+        "parser_version": "tripchord-visible-dom-v3",
+    }
+    capability = {
+        "status": "inconclusive",
+        "provider": "ctrip",
+        "contract_version": range_query["contract_version"],
+        "parser_version": range_query["parser_version"],
+        "evidence_sha256": "b" * 64,
+        "captured_at": captured_at,
+        "query_fingerprint_sha256": BrowserDateRangeQuery.model_validate(
+            range_query
+        ).fingerprint_sha256,
+        "task_id": None,
+        "lease_id": None,
+        "evidence_type": "visible_dom",
+        "source_url": (
+            "https://flights.ctrip.com/international/search/round-hgh-mle"
+            "?depdate=2026-09-03_2026-09-09&cabin=y_s&adult=2&child=0&infant=0"
+        ),
+        "response_shape_sha256": "c" * 64,
+        "reason": "bounded_date_shards_completed_with_partial_or_non_exact_cells",
+    }
+    cells = [
+        {
+            "start_date": start_date,
+            "end_date": end_date,
+            "party": range_query["party"],
+            "currency": "CNY",
+            "amount": None,
+            "price_basis": "unknown",
+            "party_total_known": False,
+            "taxes_and_fees_included": None,
+            "product_identity": None,
+            "quote": None,
+            "price_finality": "unknown",
+            "evidence_sha256": str(index) * 64,
+            "captured_at": captured_at,
+        }
+        for index, (start_date, end_date) in enumerate(
+            range_query["requested_pairs"],
+            start=1,
+        )
+    ]
+    range_completion = {
+        "schema_version": "tripchord-browser-range-receipt-v1",
+        "query": range_query,
+        "capability": capability,
+        "cells": cells,
+        "receipt_sha256": "",
+        "expires_at": expires_at,
+    }
+    range_completion["receipt_sha256"] = _js_canonical_sha256(
+        {key: value for key, value in range_completion.items() if key != "receipt_sha256"}
+    )
+    request = CompleteBrowserTaskRequest.model_validate(
+        {
+            "claim_token": "x" * 16,
+            "completion": {
+                "state": "failed",
+                "quotes": [],
+                "failure": {
+                    "code": "no_inventory",
+                    "message": "批量日期任务未取得可比较的真实价格单元",
+                    "retryable": True,
+                    "page_url": None,
+                    "captured_at": captured_at,
+                    "details": {
+                        "executor": "native_range",
+                        "cell_budget_ms": 71000,
+                        "failures": [],
+                    },
+                },
+                "range_completion": range_completion,
+            },
+            "source_execution_attestation": {
+                "schema_version": "tripchord-browser-source-execution-attestation-v1",
+                "task_id": "browser-task-range-wire",
+                "provider": "ctrip",
+                "kind": "flight",
+                "companion_id": "tripchord-browser-companion",
+                "runtime_instance_id": "runtime-instance-0001",
+                "build_identity": {
+                    "protocol_version": "tripchord-companion-control-v1",
+                    "manifest_version": "0.1.16",
+                    "build_sha256": "d" * 64,
+                    "content_runtime_version": "content-1",
+                },
+                "execution_environment": "chrome_extension_service_worker",
+                "parser_version": "tripchord-visible-dom-v3",
+                "query_sha256": "e" * 64,
+                "source_observation_sha256": "f" * 64,
+                "completed_at": captured_at,
+            },
+        }
+    )
+
+    assert request.completion.range_completion is not None
+    assert (
+        browser_range_receipt_sha256(request.completion.range_completion)
+        == range_completion["receipt_sha256"]
+    )
 
 
 @pytest.mark.parametrize(

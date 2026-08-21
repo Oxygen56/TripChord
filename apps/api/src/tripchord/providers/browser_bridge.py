@@ -759,17 +759,34 @@ class BrowserRangeCompletion(DomainModel):
         return self.expires_at is not None and datetime.now(UTC) >= self.expires_at
 
 
-def _range_json_default(value: object) -> str:
-    if isinstance(value, (date, datetime)):
+def _range_receipt_wire_value(value: object) -> object:
+    """Return the stable JSON value hashed by the browser range contract.
+
+    Chrome's ``Date.toISOString()`` always emits UTC with exactly three
+    fractional digits.  Pydantic's JSON serializer is intentionally not part
+    of this cross-runtime contract: depending on the parsed microseconds it
+    emits either no fraction or six fractional digits, which changes the
+    receipt digest even though the instant is identical.
+    """
+
+    if isinstance(value, datetime):
+        utc_value = _require_timezone(value).astimezone(UTC)
+        milliseconds = utc_value.microsecond // 1000
+        return f"{utc_value:%Y-%m-%dT%H:%M:%S}.{milliseconds:03d}Z"
+    if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, Decimal):
         return str(value)
-    raise TypeError(f"unsupported range receipt value: {type(value).__name__}")
+    if isinstance(value, dict):
+        return {key: _range_receipt_wire_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_range_receipt_wire_value(item) for item in value]
+    return value
 
 
 def browser_range_receipt_sha256(receipt: BrowserRangeCompletion | object) -> str:
     payload = (
-        receipt.model_dump(mode="json")
+        receipt.model_dump(mode="python")
         if isinstance(receipt, BrowserRangeCompletion)
         else receipt
     )
@@ -777,13 +794,13 @@ def browser_range_receipt_sha256(receipt: BrowserRangeCompletion | object) -> st
         payload = {
             key: value for key, value in payload.items() if key != "receipt_sha256"
         }
+    canonical_payload = _range_receipt_wire_value(payload)
     return hashlib.sha256(
         json.dumps(
-            payload,
+            canonical_payload,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
-            default=_range_json_default,
         ).encode("utf-8")
     ).hexdigest()
 
