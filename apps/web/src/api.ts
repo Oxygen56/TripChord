@@ -966,6 +966,63 @@ export type LiveEventReplanResponse = {
   final_plan?: FinalPlanProjection | null;
 };
 
+export type LivePlanModificationScope =
+  | "lodging"
+  | "flight"
+  | "transfer"
+  | "global";
+
+export type LivePlanModificationIntent = {
+  instruction: string;
+  affected_scope: LivePlanModificationScope | null;
+  preserve_scopes: LivePlanModificationScope[];
+  exclude_current_property: boolean;
+  required_room_features: Array<"sea_view">;
+  require_breakfast: boolean | null;
+  require_non_basic_lodging: boolean | null;
+  require_non_remote_lodging: boolean | null;
+  date_patch: {
+    departure_date: string | null;
+    return_date: string | null;
+  } | null;
+  unresolved_reasons: string[];
+  parse_boundary: string;
+};
+
+export type LivePlanModificationReceipt = {
+  status: "modified" | "blocked" | "unresolved" | "global_replan";
+  intent: LivePlanModificationIntent;
+  summary: string;
+  before_candidate_id: string | null;
+  after_candidate_id: string | null;
+  changed_component_ids: string[];
+  preserved_component_ids: string[];
+  before_confirmed_cny_cents: number | null;
+  after_confirmed_cny_cents: number | null;
+  difference_cny_cents: number | null;
+  source_task_ids: string[];
+  source_outcomes: Array<{
+    provider: string;
+    state: string;
+    source_task_id: string | null;
+    quote_count: number;
+    eligible_quote_count: number;
+    evidence_refs: string[];
+    detail: string | null;
+  }>;
+  verifier_passed: boolean | null;
+  reverifier_passed: boolean | null;
+  boundary: string;
+};
+
+export type LivePlanModificationResponse = {
+  run_id: string;
+  expires_at: string;
+  modification: LivePlanModificationReceipt;
+  run: LivePackageAgentRun;
+  final_plan?: FinalPlanProjection | null;
+};
+
 export type LiveProviderCoveragePresentation = {
   capability_label: string;
   completed_source_count: number;
@@ -1442,6 +1499,16 @@ export function replanLivePackage(
   },
 ): Promise<LiveEventReplanResponse> {
   return request(`/api/v1/agents/live-plans/${encodeURIComponent(runId)}/events/replan`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function modifyLivePackage(
+  runId: string,
+  input: { instruction: string; timeout_seconds: number },
+): Promise<LivePlanModificationResponse> {
+  return request(`/api/v1/agents/live-plans/${encodeURIComponent(runId)}/modify`, {
     method: "POST",
     body: JSON.stringify(input),
   });

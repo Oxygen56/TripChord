@@ -11,6 +11,7 @@ import {
   getBreakfastPreferenceApplication,
   getLiveMonitor,
   getLivePackage,
+  modifyLivePackage,
   normalizeBreakfastWeight,
   requireLiveBridgeAvailability,
   replanLivePackage,
@@ -646,6 +647,65 @@ describe("real multi-platform API boundary", () => {
     expect(JSON.parse(String(init.body))).toMatchObject({
       event: { kind: "sold_out", affected_provider: "ctrip" },
     });
+  });
+
+  it("sends a natural-language change only to the current live plan modify endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          run_id: "live-run/1",
+          expires_at: "2026-08-22T08:00:00Z",
+          modification: {
+            status: "modified",
+            intent: {
+              instruction: "酒店换成海景房，航班和接驳保持不变",
+              affected_scope: "lodging",
+              preserve_scopes: ["flight", "transfer"],
+              exclude_current_property: false,
+              required_room_features: ["sea_view"],
+              require_breakfast: null,
+              require_non_basic_lodging: null,
+              require_non_remote_lodging: null,
+              date_patch: null,
+              unresolved_reasons: [],
+              parse_boundary: "只解析明确修改",
+            },
+            summary: "只替换住宿",
+            before_candidate_id: "candidate-before",
+            after_candidate_id: "candidate-after",
+            changed_component_ids: ["lodging-before", "lodging-after"],
+            preserved_component_ids: ["flight", "transfer-out", "transfer-in"],
+            before_confirmed_cny_cents: 1068700,
+            after_confirmed_cny_cents: 1080700,
+            difference_cny_cents: 12000,
+            source_task_ids: ["modification-source-ctrip-lodging-full"],
+            source_outcomes: [],
+            verifier_passed: true,
+            reverifier_passed: true,
+            boundary: "不是下单或库存锁定",
+          },
+          run: { source_task_ids: [] },
+          final_plan: null,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await modifyLivePackage("live-run/1", {
+      instruction: "酒店换成海景房，航班和接驳保持不变",
+      timeout_seconds: 120,
+    });
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+
+    expect(path).toBe("/api/v1/agents/live-plans/live-run%2F1/modify");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({
+      instruction: "酒店换成海景房，航班和接驳保持不变",
+      timeout_seconds: 120,
+    });
+    expect(response.modification.status).toBe("modified");
+    expect(response.modification.difference_cny_cents).toBe(12000);
   });
 
   it("uses only the tenant-bound live monitor lifecycle endpoints", async () => {

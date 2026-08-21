@@ -77,6 +77,12 @@ from tripchord.agents.model_gateway import (
     ScriptedModelClient,
 )
 from tripchord.agents.models import AgentRole, AgentTask, AgentTaskResult
+from tripchord.agents.plan_modification import (
+    LivePlanModificationScope,
+    LivePlanModificationStatus,
+    LodgingRoomFeature,
+    parse_live_plan_modification,
+)
 from tripchord.agents.stay_area import system_stay_area_search_profile
 from tripchord.agents.tools import ToolRegistry
 from tripchord.planning.event_contracts import EventDisposition
@@ -1692,6 +1698,200 @@ async def _run_v4_with_icom() -> tuple[
         _serve(bridge, _V4_BROWSER_SOURCE_TASK_COUNT, _success),
     )
     return system, bridge, run
+
+
+@pytest.mark.asyncio
+async def test_natural_language_lodging_change_preserves_transport_and_blocks_unsafe_property(
+) -> None:
+    system, _, run = await _run_v4_with_icom()
+    assert run.package is not None
+    current = run.package.final_candidate
+    target = current.lodgings[0]
+    target_with_location = target.model_copy(
+        update={
+            "provider_property_id": "current-property",
+            "room_name": "市景豪华间 - 带阳台",
+            "location_address": "测试大道 1 号",
+            "nearby_location_evidence": ("近潜水与水上活动服务点",),
+            "location_convenience": (
+                LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+            ),
+        }
+    )
+    current = current.model_copy(update={"lodgings": (target_with_location,)})
+    package = run.package.model_copy(
+        update={
+            "initial_candidate": current,
+            "final_candidate": current,
+        }
+    )
+    run = run.model_copy(
+        update={
+            "intent": run.intent.model_copy(
+                update={
+                    "require_non_basic_lodging": True,
+                    "require_non_remote_lodging": True,
+                }
+            ),
+            "package": package,
+        }
+    )
+    sea_view = target_with_location.model_copy(
+        update={
+            "id": "lodging-current-property-sea-view",
+            "room_name": "海景豪华双人房带阳台",
+            "total_for_party_cents": target.total_for_party_cents + 12_000,
+        }
+    )
+    other_property_without_location = target_with_location.model_copy(
+        update={
+            "id": "lodging-other-property-sea-view",
+            "provider_property_id": "other-property",
+            "property_name": "另一家酒店",
+            "room_name": "海景豪华双人房带阳台",
+            "location_address": None,
+            "nearby_location_evidence": (),
+            "location_convenience": LodgingLocationConvenience.UNKNOWN,
+        }
+    )
+
+    sea_view_intent = parse_live_plan_modification(
+        "酒店换成海景房，航班和接驳保持不变",
+        current_departure_date=run.intent.start_date,
+    )
+    updated, receipt = await system.modify_plan(
+        run,
+        sea_view_intent,
+        offline_lodging_quotes=(sea_view, other_property_without_location),
+        verification_now=NOW,
+    )
+
+    assert receipt.status == LivePlanModificationStatus.MODIFIED
+    assert receipt.difference_cny_cents == 12_000
+    assert receipt.verifier_passed is True
+    assert receipt.reverifier_passed is True
+    assert updated.package is not None
+    assert updated.package.final_candidate.lodgings == (sea_view,)
+    assert updated.package.final_candidate.flight.id == current.flight.id
+    assert tuple(item.id for item in updated.package.final_candidate.transfers) == tuple(
+        item.id for item in current.transfers
+    )
+    assert receipt.preserved_component_ids == (
+        current.flight.id,
+        *(item.id for item in current.transfers),
+    )
+    LivePackageAgentRun.model_validate(updated.model_dump(mode="python"))
+
+    other_property_intent = parse_live_plan_modification(
+        "换一家酒店，航班和接驳保持不变",
+        current_departure_date=run.intent.start_date,
+    )
+    unchanged, blocked = await system.modify_plan(
+        run,
+        other_property_intent,
+        offline_lodging_quotes=(sea_view, other_property_without_location),
+        verification_now=NOW,
+    )
+
+    assert blocked.status == LivePlanModificationStatus.BLOCKED
+    assert blocked.difference_cny_cents == 0
+    assert unchanged.package is not None
+    assert unchanged.package.final_candidate.id == current.id
+    assert unchanged.package.final_candidate.component_ids == current.component_ids
+
+
+@pytest.mark.asyncio
+async def test_lodging_change_refreshes_all_lodging_sources_without_transport_tasks() -> None:
+    system, bridge, run = await _run_v4_with_icom()
+    assert run.package is not None
+    target = run.package.final_candidate.lodgings[0]
+    observed: list[BrowserTaskLease] = []
+
+    def sea_view_completion(lease: BrowserTaskLease) -> BrowserTaskCompletion:
+        observed.append(lease)
+        quote = _lodging_quote(lease)
+        details = dict(quote.details)
+        details["room_text"] = "海景豪华双人房带阳台"
+        return BrowserTaskCompletion(
+            state=BrowserTaskState.SUCCEEDED,
+            quotes=(
+                _sealed_quote(
+                    lease,
+                    page_url=quote.page_url,
+                    amount=quote.amount,
+                    basis=quote.price_basis,
+                    title=quote.title,
+                    details=cast(dict[str, JsonValue], details),
+                ),
+            ),
+        )
+
+    modification = parse_live_plan_modification(
+        "酒店换成海景房，航班和接驳保持不变",
+        current_departure_date=run.intent.start_date,
+    )
+    (updated, receipt), _ = await asyncio.gather(
+        system.modify_plan(run, modification, verification_now=NOW),
+        _serve(bridge, 2, sea_view_completion),
+    )
+
+    assert receipt.status == LivePlanModificationStatus.MODIFIED
+    assert {lease.provider for lease in observed} == {
+        BrowserProvider.CTRIP,
+        BrowserProvider.QUNAR,
+    }
+    assert all(lease.kind == BrowserVertical.LODGING for lease in observed)
+    assert all(
+        lease.query.start_date == target.check_in
+        and lease.query.end_date == target.check_out
+        and lease.query.adults == target.adults
+        and lease.query.rooms == target.rooms
+        for lease in observed
+    )
+    assert all(
+        lease.query.options["segment"] == "hulhumale-full" for lease in observed
+    )
+    assert receipt.source_task_ids == (
+        "modification-source-ctrip-lodging-hulhumale-full",
+        "modification-source-qunar-lodging-hulhumale-full",
+    )
+    assert updated.package is not None
+    assert updated.package.final_candidate.flight.id == run.package.final_candidate.flight.id
+    assert tuple(item.id for item in updated.package.final_candidate.transfers) == tuple(
+        item.id for item in run.package.final_candidate.transfers
+    )
+    LivePackageAgentRun.model_validate(updated.model_dump(mode="python"))
+
+
+def test_natural_language_plan_modification_routes_complete_dates_and_fails_closed_on_partial_dates(
+) -> None:
+    sea_view = parse_live_plan_modification(
+        "酒店换成海景房，航班和接驳保持不变",
+        current_departure_date=START,
+    )
+    assert sea_view.affected_scope == LivePlanModificationScope.LODGING
+    assert sea_view.required_room_features == (LodgingRoomFeature.SEA_VIEW,)
+    assert sea_view.preserve_scopes == (
+        LivePlanModificationScope.FLIGHT,
+        LivePlanModificationScope.TRANSFER,
+    )
+
+    global_change = parse_live_plan_modification(
+        "改成9月4日出发，9月10日返回",
+        current_departure_date=date(2026, 9, 3),
+    )
+    assert global_change.affected_scope == LivePlanModificationScope.GLOBAL
+    assert global_change.date_patch is not None
+    assert global_change.date_patch.departure_date == date(2026, 9, 4)
+    assert global_change.date_patch.return_date == date(2026, 9, 10)
+    assert global_change.unresolved_reasons == ()
+
+    partial = parse_live_plan_modification(
+        "改成9月4日出发",
+        current_departure_date=date(2026, 9, 3),
+    )
+    assert partial.affected_scope == LivePlanModificationScope.GLOBAL
+    assert partial.unresolved_reasons == ("日期修改必须同时写明出发日和返回日",)
 
 
 def _select_segmented_stay_candidate(run: LivePackageAgentRun) -> LivePackageAgentRun:

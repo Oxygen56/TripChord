@@ -34,6 +34,11 @@ from tripchord.agents.live_system import (
 )
 from tripchord.agents.models import AgentRole, AgentTask, AgentTaskResult, TaskGraph
 from tripchord.agents.persistent_memory import CorruptionPolicy
+from tripchord.agents.plan_modification import (
+    LivePlanModificationIntent,
+    LivePlanModificationReceipt,
+    LivePlanModificationStatus,
+)
 from tripchord.agents.runtime import SchedulerOutcome
 from tripchord.api import (
     LiveAgentPlanningResponse,
@@ -981,6 +986,66 @@ async def test_live_plan_and_event_replan_share_tenant_bound_serialized_run_stat
     cached = await cache.get(run_id, "anonymous")
     assert cached is not None
     assert len(cached.run.source_task_ids) == 13
+
+
+@pytest.mark.asyncio
+async def test_live_plan_modify_endpoint_parses_text_and_replaces_tenant_bound_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_system = _FakeLiveSystem()
+    cache = LiveRunCache(capacity=4, ttl=timedelta(minutes=5))
+    original = _blocked_live_run()
+    run_id, _ = await cache.put("anonymous", original)
+    observed: list[LivePlanModificationIntent] = []
+
+    async def modify_plan(
+        previous: LivePackageAgentRun,
+        modification: LivePlanModificationIntent,
+        **kwargs: object,
+    ) -> tuple[LivePackageAgentRun, LivePlanModificationReceipt]:
+        assert previous is original
+        assert kwargs["timeout_seconds"] == 20
+        observed.append(modification)
+        updated = previous.model_copy(
+            update={
+                "claim_boundary": "只替换住宿，航班和接驳保持不变。",
+            }
+        )
+        return updated, LivePlanModificationReceipt(
+            status=LivePlanModificationStatus.MODIFIED,
+            intent=modification,
+            summary="只替换住宿，航班和接驳保持不变。",
+            verifier_passed=True,
+            reverifier_passed=True,
+        )
+
+    fake_system.modify_plan = modify_plan  # type: ignore[attr-defined]
+    monkeypatch.setattr(app.state, "live_package_agent_system", fake_system)
+    monkeypatch.setattr(app.state, "live_run_cache", cache)
+    monkeypatch.setattr(
+        main_module,
+        "_require_final_published_live_run_for_event",
+        lambda run: None,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            f"/api/v1/agents/live-plans/{run_id}/modify",
+            json={
+                "instruction": "酒店换成海景房，航班和接驳保持不变",
+                "timeout_seconds": 20,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["modification"]["status"] == "modified"
+    assert observed[0].required_room_features == ("sea_view",)
+    cached = await cache.get(run_id, "anonymous")
+    assert cached is not None
+    assert cached.run.claim_boundary == "只替换住宿，航班和接驳保持不变。"
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,6 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
 import {
-  advanceLiveRunAfterEvent,
   ApiError,
   type AgenticRunSummary,
   type AgentRun,
@@ -22,13 +21,13 @@ import {
   type Job,
   type JsonValue,
   type LiveBridgeHealth,
-  type LiveEventReplanRun,
   type FinalPlanProjection,
   type LiveFlexibleFromTextResponse,
   type LiveFlexibleFromTextInput,
   type LiveMonitorStatus,
   type LivePackageAgentRun,
   type LivePlanningJobSnapshot,
+  type LivePlanModificationReceipt,
   type LiveProvider,
   type ProviderCapabilitiesResponse,
   loadWorkspace,
@@ -39,7 +38,7 @@ import {
   type ReplanResult,
   normalizeBreakfastWeight,
   requireLiveBridgeAvailability,
-  replanLivePackage,
+  modifyLivePackage,
   replanWorkspace,
   revokeAgentPreferenceMemory,
   resolveFlexibleOption,
@@ -91,7 +90,7 @@ const workflowSteps = [
   { key: "requirement", label: "需求", detail: "模式与行程约束" },
   { key: "platform", label: "平台", detail: "能力矩阵与授权" },
   { key: "progress", label: "进度", detail: "搜索与 Agent 调度" },
-  { key: "plan", label: "方案", detail: "候选、事件与预订" },
+  { key: "plan", label: "方案", detail: "候选、自然语言修改与预订" },
 ] as const;
 
 function deriveWorkflowStep(
@@ -141,14 +140,6 @@ function WorkflowSteps({ current }: { current: number }) {
 const decisionLabels = {
   accept: "接受",
   reject_and_replan: "拒绝并重新规划",
-  human_block: "阻塞并转人工",
-} as const;
-
-const eventDispositionLabels = {
-  no_change: "无需改变",
-  refresh: "刷新证据",
-  local_repair: "局部修复",
-  global_replan: "全局重规划",
   human_block: "阻塞并转人工",
 } as const;
 
@@ -1676,7 +1667,7 @@ function LivePackageConsole({
   );
 }
 
-function LiveEventLab({
+function LivePlanModifier({
   run,
   runId,
   onRunAdvanced,
@@ -1688,48 +1679,34 @@ function LiveEventLab({
   onFinalPlanChanged: (finalPlan: FinalPlanProjection | null) => void;
 }) {
   const candidate = run.package?.final_candidate;
-  const components = candidate
-    ? [candidate.flight, ...candidate.lodgings, ...candidate.transfers]
-    : [];
-  const [targetId, setTargetId] = useState(components[0]?.id ?? "");
-  const [eventKind, setEventKind] = useState<"price_changed" | "sold_out">("price_changed");
+  const [instruction, setInstruction] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
-  const [eventRun, setEventRun] = useState<LiveEventReplanRun | null>(null);
-  const target = components.find((item) => item.id === targetId);
+  const [receipt, setReceipt] = useState<LivePlanModificationReceipt | null>(null);
 
-  useEffect(() => {
-    if (!components.some((component) => component.id === targetId)) {
-      setTargetId(components[0]?.id ?? "");
-    }
-  }, [components.map((component) => component.id).join("|"), targetId]);
-
-  async function replan() {
-    if (!target || !isLiveProvider(target.provider)) {
-      setError("该组件没有可审计的专用实时重查适配器");
+  async function modifyPlan(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const requested = instruction.trim();
+    if (!requested) {
+      setError("请先用一句话说明你想怎么改");
       return;
     }
     setSubmitting(true);
     setError("");
-    setEventRun(null);
+    setReceipt(null);
     try {
-      const response = await replanLivePackage(runId, {
-        event: {
-          id: `ui-live-event-${crypto.randomUUID()}`,
-          kind: eventKind,
-          target_component_id: target.id,
-          affected_provider: target.provider,
-        },
+      const response = await modifyLivePackage(runId, {
+        instruction: requested,
         timeout_seconds: 120,
       });
-      setEventRun(response.run);
+      setReceipt(response.modification);
       onFinalPlanChanged(response.final_plan ?? null);
-      onRunAdvanced(advanceLiveRunAfterEvent(run, response.run));
+      onRunAdvanced(response.run);
     } catch (caught) {
       setError(
         caught instanceof Error
           ? caught.message
-          : "实时事件重规划入口未接通，且不会回退为演示结果。",
+          : "这次修改没有完成，原方案保持不变。",
       );
     } finally {
       setSubmitting(false);
@@ -1737,151 +1714,124 @@ function LiveEventLab({
   }
 
   return (
-    <section className="live-stage live-event-lab">
+    <section className="live-stage live-plan-modifier">
       <div className="stage-title">
-        <div><span>05</span><h3>事件注入与受影响平台精确重查</h3></div>
-        <strong>Diagnoser 建议 · 主控决定局部或全局动作</strong>
+        <div><span>05</span><h3>告诉 TripChord 你想怎么改</h3></div>
+        <strong>未提及的部分默认保留</strong>
       </div>
-      {components.length === 0 ? (
+      {!candidate ? (
         <div className="issue-box">
-          <strong>当前没有可重规划组件</strong>
-          <p>必须先形成并接受一个可验证整包候选，才能注入售罄或价格变化事件。</p>
+          <strong>当前没有可修改的完整方案</strong>
+          <p>TripChord 不会在缺少完整候选时猜测要保留哪些航班、住宿或接驳。</p>
         </div>
       ) : (
-        <>
-          <div className="live-event-controls">
-            <label>
-              受影响组件
-              <select value={targetId} onChange={(event) => setTargetId(event.target.value)}>
-                {components.map((item) => (
-                  <option value={item.id} key={item.id}>
-                    {providerLabel(item.provider)} · {item.id}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              实时事件
-              <select value={eventKind} onChange={(event) => setEventKind(event.target.value as typeof eventKind)}>
-                <option value="price_changed">报价变化，重新核价</option>
-                <option value="sold_out">库存售罄，寻找替代</option>
-              </select>
-            </label>
-            <button type="button" onClick={() => void replan()} disabled={submitting}>
-              {submitting ? "受影响平台重查中…" : "注入事件并动态重规划"}
+        <form className="live-modification-form" onSubmit={(event) => void modifyPlan(event)}>
+          <label htmlFor={`modify-${runId}`}>一句话修改当前方案</label>
+          <div>
+            <textarea
+              id={`modify-${runId}`}
+              value={instruction}
+              onChange={(event) => setInstruction(event.target.value)}
+              placeholder="例如：酒店换成海景房，航班和接驳保持不变"
+              rows={3}
+              maxLength={2000}
+              disabled={submitting}
+            />
+            <button type="submit" disabled={submitting || !instruction.trim()}>
+              {submitting ? "正在只重查受影响部分…" : "按这句话修改"}
             </button>
           </div>
-          <p className="live-event-boundary">
-            将只重新查询 {target ? providerLabel(target.provider) : "受影响平台"} 的对应日期与垂类；不会把旧报价改个数字当成新证据。
+          <p>
+            住宿修改只刷新同日期、同地点、同人数的住宿来源；航班和接驳不会重查。
+            同时改全套日期时，系统会明确升级为完整规划。TripChord 永不下单或付款。
           </p>
-        </>
+        </form>
       )}
       {error && (
-        <div className="error-banner">
-          {error}。请确认后端已启用 `/api/v1/agents/live-plans/{runId}/events/replan`。
-        </div>
+        <div className="error-banner">{error}</div>
       )}
-      {eventRun && (
+      {receipt && (
         <div
-          className={`event-run-result decision-${eventRun.decision.state}`}
+          className={`modification-result status-${receipt.status}`}
           role="status"
           aria-live="polite"
         >
-          <div>
-            <p className="eyebrow">LIVE EVENT REPLAN · 非回放</p>
-            <h4>{decisionLabels[eventRun.decision.state]}</h4>
-            <span>{eventRun.source_task_ids.length} 个受影响源 · {eventRun.requeried_providers.map(providerLabel).join("、")}</span>
-          </div>
-          <p>{eventRun.decision.summary}</p>
-          <div className="event-disposition-grid" aria-label="事件诊断建议与实际裁决">
+          <header>
+            <span>
+              {receipt.status === "modified"
+                ? "修改完成"
+                : receipt.status === "global_replan"
+                  ? "已按新日期完整规划"
+                  : receipt.status === "blocked"
+                    ? "没有安全替代项"
+                    : "需要把指令说完整"}
+            </span>
+            <strong>{receipt.summary}</strong>
+          </header>
+          <div className="modification-facts">
             <article>
-              <span>事件诊断 Agent 建议</span>
+              <span>改了什么</span>
               <strong>
-                {eventRun.event_diagnosis
-                  ? eventDispositionLabels[eventRun.event_diagnosis.recommended_disposition]
-                  : "未返回模型建议"}
+                {receipt.status === "modified"
+                  ? `仅住宿 · ${receipt.changed_component_ids.length} 个新旧组件`
+                  : receipt.status === "global_replan"
+                    ? "日期变化 · 完整重新规划"
+                    : "原方案未改动"}
               </strong>
-              <small>
-                {eventRun.event_diagnosis
-                  ? `${eventRun.event_diagnosis.summary} · 置信度 ${(eventRun.event_diagnosis.confidence * 100).toFixed(0)}%`
-                  : "主控不会补写不存在的诊断结果"}
-              </small>
             </article>
             <article>
-              <span>确定性事件解析</span>
+              <span>保留什么</span>
               <strong>
-                {eventRun.event_resolution
-                  ? eventDispositionLabels[eventRun.event_resolution.disposition]
-                  : "无解析回执"}
+                {receipt.intent.preserve_scopes.includes("flight") &&
+                receipt.intent.preserve_scopes.includes("transfer")
+                  ? `航班与 ${candidate?.transfers.length ?? 0} 段接驳`
+                  : receipt.preserved_component_ids.length > 0
+                    ? `${receipt.preserved_component_ids.length} 个原组件`
+                    : "完整规划不承诺保留旧组件"}
               </strong>
-              <small>{eventRun.event_resolution?.reason ?? "没有可展示的事件语义证据"}</small>
             </article>
-            <article className="applied">
-              <span>主控实际执行</span>
+            <article>
+              <span>新同行人民币已确认小计</span>
               <strong>
-                {eventRun.applied_disposition
-                  ? eventDispositionLabels[eventRun.applied_disposition]
-                  : "未执行"}
+                {receipt.after_confirmed_cny_cents === null
+                  ? "尚未形成"
+                  : formatCents(receipt.after_confirmed_cny_cents, "CNY")}
               </strong>
-              <small>
-                {eventRun.global_run
-                  ? "已生成完整的新一代全局运行，后续事件从该版本继续。"
-                  : "后续事件从本次局部更新后的候选继续，不再使用原始方案。"}
-              </small>
+            </article>
+            <article>
+              <span>与修改前相比</span>
+              <strong>
+                {receipt.difference_cny_cents === null
+                  ? "不可比较"
+                  : receipt.difference_cny_cents === 0
+                    ? "金额未变"
+                    : `${receipt.difference_cny_cents > 0 ? "+" : "−"}${formatCents(
+                        Math.abs(receipt.difference_cny_cents),
+                        "CNY",
+                      )}`}
+              </strong>
             </article>
           </div>
-          {eventRun.event_diagnosis &&
-            (eventRun.event_diagnosis.dependencies_to_refresh.length > 0 ||
-              eventRun.event_diagnosis.evidence_gaps.length > 0) && (
-              <div className="event-diagnosis-details">
-                <span>
-                  需刷新：{eventRun.event_diagnosis.dependencies_to_refresh.join("、") || "无"}
-                </span>
-                <span>
-                  证据缺口：{eventRun.event_diagnosis.evidence_gaps.join("；") || "无"}
-                </span>
-              </div>
-            )}
-          <AgenticRuntimePanel summary={eventRun.agentic} title="Event Diagnoser 模型与降级状态" />
-          {eventRun.global_run && (
-            <div className="global-run-receipt">
-              <div>
-                <span>GLOBAL RUN</span>
-                <strong>全局重规划已实际执行</strong>
-              </div>
-              <p>{eventRun.global_run.decision.summary}</p>
-              <small>
-                新运行包含 {eventRun.global_run.source_task_ids.length + eventRun.global_run.public_transfer_task_ids.length} 个源任务 · {eventRun.global_run.coverage.filter((item) => item.complete).length}/3 平台完成
-              </small>
-              <AgenticRuntimePanel
-                summary={eventRun.global_run.agentic}
-                title="全局重规划多 Agent 模型与降级状态"
-              />
-            </div>
+          {receipt.source_outcomes.length > 0 && (
+            <details className="modification-sources">
+              <summary>查看本次住宿来源结果</summary>
+              <ul>
+                {receipt.source_outcomes.map((outcome) => (
+                  <li key={`${outcome.provider}-${outcome.state}`}>
+                    <strong>{providerLabel(outcome.provider)}</strong>
+                    <span>
+                      {outcome.state === "succeeded" ||
+                      outcome.state === "historical_replay" ||
+                      outcome.state === "quote_found"
+                        ? `观察到 ${outcome.quote_count} 条，合格 ${outcome.eligible_quote_count} 条`
+                        : `未取得可用结果：${outcome.detail ?? outcome.state}`}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </details>
           )}
-          {eventRun.package ? (
-            <div className="event-result-facts">
-              <strong>
-                {formatCents(
-                  eventRun.package.budget.confirmed_subtotal_cents,
-                  eventRun.package.budget.currency,
-                )}
-                {eventRun.package.budget.is_all_in_total ? "" : " 已确认小计"}
-              </strong>
-              <span>
-                {eventRun.package.diff
-                  ? `移除 ${eventRun.package.diff.removed_component_ids.length} / 新增 ${eventRun.package.diff.added_component_ids.length} / 保留率 ${(Number(eventRun.package.diff.preservation_ratio) * 100).toFixed(0)}%`
-                  : "复查后无需替换组件"}
-              </span>
-              <small>{eventRun.package.budget.formula}</small>
-            </div>
-          ) : (
-            <div className="issue-box">
-              <strong>事件后没有安全替代方案</strong>
-              <p>主控保持阻塞，不输出无证据的新预算。</p>
-            </div>
-          )}
-          <small className="event-claim">{eventRun.claim_boundary}</small>
+          <small className="modification-boundary">{receipt.boundary}</small>
         </div>
       )}
     </section>
@@ -2634,7 +2584,7 @@ function App() {
           <p className="plan-panel-step">
             {planningMode === "live"
               ? liveFlexibleResponse
-                ? "STEP 4 · 方案 · 最终候选、事件注入与预订"
+                ? "STEP 4 · 方案 · 最终候选、自然语言修改与预订"
                 : livePlanningJob &&
                     !["succeeded", "failed", "cancelled"].includes(
                       livePlanningJob.state,
@@ -2664,8 +2614,8 @@ function App() {
                     />
                     {liveRunId ? (
                       <>
-                        <LiveEventLab
-                          key={`event-${selectedLiveDatePairId}-${liveRunId}`}
+                        <LivePlanModifier
+                          key={`modify-${selectedLiveDatePairId}-${liveRunId}`}
                           run={liveRun}
                           runId={liveRunId}
                           onRunAdvanced={(advancedRun) =>

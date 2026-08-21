@@ -29,6 +29,9 @@ from tripchord.agents.package_request import (
     HybridPackageRequirementResult,
     PackageRequirementRequest,
 )
+from tripchord.agents.plan_modification import (
+    LivePlanModificationReceipt,
+)
 from tripchord.agents.travel_runtime import TravelAgentRun
 from tripchord.domain.common import Coordinates
 from tripchord.domain.events import PlanEvent
@@ -1055,6 +1058,23 @@ class LiveAgentEventReplanResponse(ApiModel):
     run_id: str = Field(min_length=1)
     expires_at: datetime
     run: LiveEventReplanRun
+    final_plan: FinalPlanProjection | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_public(self, handler: Callable[[Any], Any]) -> Any:
+        return _sanitize_public_flight_totals(handler(self))
+
+
+class LivePlanModificationRequest(ApiModel):
+    instruction: str = Field(min_length=1, max_length=2000)
+    timeout_seconds: int | None = Field(default=None, ge=15, le=300)
+
+
+class LivePlanModificationResponse(ApiModel):
+    run_id: str = Field(min_length=1)
+    expires_at: datetime
+    modification: LivePlanModificationReceipt
+    run: LivePackageAgentRun
     final_plan: FinalPlanProjection | None = None
 
     @model_serializer(mode="wrap")

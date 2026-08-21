@@ -76,6 +76,14 @@ from tripchord.agents.models import (
     TaskGraph,
     ToolPermission,
 )
+from tripchord.agents.plan_modification import (
+    LivePlanModificationIntent,
+    LivePlanModificationReceipt,
+    LivePlanModificationScope,
+    LivePlanModificationSourceOutcome,
+    LivePlanModificationStatus,
+    LodgingRoomFeature,
+)
 from tripchord.agents.runtime import (
     AgentFunction,
     AgentRegistry,
@@ -111,6 +119,7 @@ from tripchord.planning.package import (
     NormalizedLodgingQuote,
     PackageArea,
     PackageCandidateGenerationAudit,
+    PackageCandidateKind,
     PackageDecision,
     PackageDecisionState,
     PackageEvent,
@@ -140,11 +149,15 @@ from tripchord.planning.package import (
     TransferPurchaseScope,
     TravelPackageCandidate,
     _transfer_connection_limits,
+    breakfast_preference_application,
     diff_packages,
     lodging_basic_markers,
+    lodging_is_comparison_eligible,
     lodging_is_segment_comparison_eligible,
     lodging_non_remote_evidence_confirmed,
     lodging_quality_tier,
+    package_budget,
+    transfer_contract_total_cents,
 )
 from tripchord.planning.package_reverification import (
     DeclarativePackageReVerifier,
@@ -230,6 +243,8 @@ _CANDIDATE_SCOUT_TASK_PREFIX = "candidate-scout-"
 _CANDIDATE_SCOUT_ALTERNATIVE_LIMIT = 3
 _AGENT_PROVIDER_TEXT_LIMIT = 600
 _AGENT_PROVIDER_IDENTIFIER_LIMIT = 256
+_MODIFICATION_NORMALIZATION_HISTORY_LIMIT = 256
+_MODIFICATION_SOURCE_HISTORY_LIMIT = 128
 _ALL_PROVIDERS = LIVE_V5_BROWSER_PROVIDERS
 _LODGING_PROVIDERS = frozenset({BrowserProvider.CTRIP, BrowserProvider.QUNAR})
 _OFFICIAL_LODGING_PROVIDER = "arena_official"
@@ -3410,6 +3425,770 @@ class LivePackageAgentSystem:
             mode=previous.mode,
             budget_ledger=budget_ledger,
             scope_start_admitted_count=scope_start,
+        )
+
+    async def modify_plan(
+        self,
+        previous: LivePackageAgentRun,
+        modification: LivePlanModificationIntent,
+        *,
+        timeout_seconds: int = 120,
+        memory_access: MemoryAccessContext | None = None,
+        booking_ledger: BookingLedger | None = None,
+        offline_lodging_quotes: tuple[NormalizedLodgingQuote, ...] | None = None,
+        verification_now: datetime | None = None,
+    ) -> tuple[LivePackageAgentRun, LivePlanModificationReceipt]:
+        """Apply one explicit natural-language change without inventing an event.
+
+        The public endpoint never supplies ``offline_lodging_quotes``.  That
+        argument exists only so a saved, already-normalized run can exercise
+        the exact same selection and verification chain without accessing an
+        OTA.  Runtime lodging changes refresh every configured source that can
+        query the exact place, dates and party; flight and transfer sources are
+        not touched.
+        """
+
+        if not 15 <= timeout_seconds <= 300:
+            raise ValueError("timeout_seconds must be between 15 and 300")
+        if previous.package is None:
+            return previous, LivePlanModificationReceipt(
+                status=LivePlanModificationStatus.BLOCKED,
+                intent=modification,
+                summary="当前运行没有已发布的完整候选，无法在其上执行局部修改。",
+            )
+        current = previous.package.final_candidate
+        if modification.unresolved_reasons:
+            return previous, LivePlanModificationReceipt(
+                status=LivePlanModificationStatus.UNRESOLVED,
+                intent=modification,
+                summary="；".join(modification.unresolved_reasons),
+                before_candidate_id=current.id,
+                after_candidate_id=current.id,
+                preserved_component_ids=current.component_ids,
+                before_confirmed_cny_cents=previous.package.budget.confirmed_subtotal_cents,
+                after_confirmed_cny_cents=previous.package.budget.confirmed_subtotal_cents,
+                difference_cny_cents=0,
+            )
+        if modification.affected_scope == LivePlanModificationScope.GLOBAL:
+            assert modification.date_patch is not None
+            assert modification.date_patch.departure_date is not None
+            assert modification.date_patch.return_date is not None
+            updated_intent = previous.intent.model_copy(
+                update={
+                    "start_date": modification.date_patch.departure_date,
+                    "end_date": modification.date_patch.return_date,
+                }
+            )
+            updated_query = previous.search_query.model_copy(
+                update={
+                    "start_date": modification.date_patch.departure_date,
+                    "end_date": modification.date_patch.return_date,
+                }
+            )
+            global_run = await self.run(
+                updated_intent,
+                updated_query,
+                mode=previous.mode,
+                timeout_seconds=timeout_seconds,
+                memory_access=memory_access,
+                allow_recent_quote_reuse=False,
+            )
+            global_candidate = (
+                global_run.package.final_candidate if global_run.package is not None else None
+            )
+            return global_run, LivePlanModificationReceipt(
+                status=LivePlanModificationStatus.GLOBAL_REPLAN,
+                intent=modification,
+                summary=(
+                    "日期同时变化，已升级为完整规划；未承诺保留旧航班、住宿或接驳。"
+                ),
+                before_candidate_id=current.id,
+                after_candidate_id=(global_candidate.id if global_candidate is not None else None),
+                before_confirmed_cny_cents=previous.package.budget.confirmed_subtotal_cents,
+                after_confirmed_cny_cents=(
+                    global_run.package.budget.confirmed_subtotal_cents
+                    if global_run.package is not None
+                    else None
+                ),
+                verifier_passed=(
+                    global_run.decision.state == PackageDecisionState.ACCEPT
+                ),
+                reverifier_passed=(
+                    global_run.package_reverification_audit.passed
+                    if global_run.package_reverification_audit is not None
+                    else None
+                ),
+            )
+        if modification.affected_scope != LivePlanModificationScope.LODGING:
+            return previous, LivePlanModificationReceipt(
+                status=LivePlanModificationStatus.UNRESOLVED,
+                intent=modification,
+                summary="当前版本尚未执行该范围的局部修改。",
+                before_candidate_id=current.id,
+                after_candidate_id=current.id,
+                preserved_component_ids=current.component_ids,
+            )
+        if len(current.lodgings) != 1:
+            return previous, LivePlanModificationReceipt(
+                status=LivePlanModificationStatus.UNRESOLVED,
+                intent=modification,
+                summary="当前方案含多段住宿，请在指令中明确要修改哪一段。",
+                before_candidate_id=current.id,
+                after_candidate_id=current.id,
+                preserved_component_ids=current.component_ids,
+            )
+
+        target = current.lodgings[0]
+        normalization_results: tuple[NormalizedBrowserQuoteResult, ...] = ()
+        source_task_ids: tuple[str, ...] = ()
+        if offline_lodging_quotes is None:
+            (
+                lodging_quotes,
+                normalization_results,
+                source_task_ids,
+                source_outcomes,
+            ) = await self._refresh_lodging_modification_sources(
+                previous,
+                target,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            lodging_quotes = offline_lodging_quotes
+            replay_outcomes: list[LivePlanModificationSourceOutcome] = []
+            target_segment = self._modification_lodging_segment(current.kind)
+            target_segment_id = (
+                f"{target.place_key.value}-{target_segment}"
+                if target.place_key is not None
+                else target_segment
+            )
+            for outcome in previous.stay_plan_inventory_outcomes:
+                if (
+                    outcome.exact_place_key == target.place_key
+                    and outcome.segment_id == target_segment_id
+                ):
+                    replay_outcomes.append(
+                        LivePlanModificationSourceOutcome(
+                            provider=outcome.provider,
+                            state=outcome.state.value,
+                            source_task_id=outcome.source_task_id,
+                            quote_count=len(outcome.quote_ids),
+                            evidence_refs=outcome.evidence_refs,
+                            detail="使用已保存的真实来源观察；未访问网络，也不是当前库存。",
+                        )
+                    )
+            observed_providers = {item.provider for item in replay_outcomes}
+            replay_outcomes.extend(
+                LivePlanModificationSourceOutcome(
+                    provider=provider,
+                    state="historical_replay",
+                    source_task_id=f"historical-replay:{provider}:{target_segment_id}",
+                    quote_count=sum(item.provider == provider for item in lodging_quotes),
+                    evidence_refs=tuple(
+                        dict.fromkeys(
+                            reference
+                            for item in lodging_quotes
+                            if item.provider == provider
+                            for reference in item.evidence_refs
+                        )
+                    ),
+                    detail="使用已保存的真实来源观察；未访问网络，也不是当前库存。",
+                )
+                for provider in sorted({item.provider for item in lodging_quotes})
+                if provider not in observed_providers
+            )
+            source_outcomes = tuple(replay_outcomes)
+
+        patched_intent = previous.intent.model_copy(
+            update={
+                "require_breakfast": (
+                    modification.require_breakfast
+                    if modification.require_breakfast is not None
+                    else previous.intent.require_breakfast
+                ),
+                "require_non_basic_lodging": (
+                    modification.require_non_basic_lodging
+                    if modification.require_non_basic_lodging is not None
+                    else previous.intent.require_non_basic_lodging
+                ),
+                "require_non_remote_lodging": (
+                    modification.require_non_remote_lodging
+                    if modification.require_non_remote_lodging is not None
+                    else previous.intent.require_non_remote_lodging
+                ),
+            }
+        )
+        eligible = tuple(
+            item
+            for item in lodging_quotes
+            if self._lodging_matches_modification(
+                item,
+                target=target,
+                intent=patched_intent,
+                modification=modification,
+            )
+        )
+        eligible_by_provider = {
+            provider: sum(item.provider == provider for item in eligible)
+            for provider in {item.provider for item in lodging_quotes}
+        }
+        source_outcomes = tuple(
+            outcome.model_copy(
+                update={
+                    "eligible_quote_count": eligible_by_provider.get(outcome.provider, 0)
+                }
+            )
+            for outcome in source_outcomes
+        )
+        previous_total = previous.package.budget.confirmed_subtotal_cents
+        if not eligible:
+            blocked_summary = (
+                "没有另一家同时满足原日期、人数、品质和位置硬条件的住宿；"
+                if modification.exclude_current_property
+                else "本轮住宿来源没有返回同时满足修改条件与原硬约束的房型；"
+            )
+            return previous, LivePlanModificationReceipt(
+                status=LivePlanModificationStatus.BLOCKED,
+                intent=modification,
+                summary=blocked_summary + "航班和接驳保持不变，未降低任何硬条件。",
+                before_candidate_id=current.id,
+                after_candidate_id=current.id,
+                preserved_component_ids=current.component_ids,
+                before_confirmed_cny_cents=previous_total,
+                after_confirmed_cny_cents=previous_total,
+                difference_cny_cents=0,
+                source_task_ids=source_task_ids,
+                source_outcomes=source_outcomes,
+                verifier_passed=None,
+                reverifier_passed=None,
+            )
+
+        selected = min(
+            eligible,
+            key=lambda item: (item.total_for_party_cents, item.provider, item.id),
+        )
+        repaired = self._replace_lodging_for_modification(
+            current,
+            target=target,
+            replacement=selected,
+            instruction=modification.instruction,
+        )
+        diff = diff_packages(current, repaired)
+        verified_at = verification_now or self._utc_now()
+        violations = self._verifier.verify(patched_intent, repaired, now=verified_at)
+        errors = tuple(
+            item
+            for item in violations
+            if item.severity == PackageViolationSeverity.ERROR
+        )
+        try:
+            independent_audit = self._package_reverifier.audit(
+                patched_intent,
+                current,
+                repaired,
+                diff,
+                now=verified_at,
+                booking_ledger=booking_ledger,
+            )
+        except Exception:
+            independent_audit = None
+        if errors or independent_audit is None or not independent_audit.passed:
+            reasons = "、".join(item.code.value for item in errors)
+            if independent_audit is None:
+                reasons = f"{reasons}、独立复验不可用".strip("、")
+            elif not independent_audit.passed:
+                audit_codes = "、".join(item.value for item in independent_audit.failed_codes)
+                reasons = f"{reasons}、{audit_codes}".strip("、")
+            return previous, LivePlanModificationReceipt(
+                status=LivePlanModificationStatus.BLOCKED,
+                intent=modification,
+                summary=f"找到住宿替代项，但确定性复验未通过（{reasons}）；原方案未改动。",
+                before_candidate_id=current.id,
+                after_candidate_id=current.id,
+                preserved_component_ids=current.component_ids,
+                before_confirmed_cny_cents=previous_total,
+                after_confirmed_cny_cents=previous_total,
+                difference_cny_cents=0,
+                source_task_ids=source_task_ids,
+                source_outcomes=source_outcomes,
+                verifier_passed=not errors,
+                reverifier_passed=(
+                    independent_audit.passed if independent_audit is not None else False
+                ),
+            )
+
+        warnings = tuple(
+            item
+            for item in violations
+            if item.severity == PackageViolationSeverity.WARNING
+        )
+        decision = PackageDecision(
+            state=PackageDecisionState.ACCEPT,
+            summary=(
+                f"住宿已改为 {selected.property_name} 的{selected.room_name or '已核验房型'}；"
+                "航班和接驳保持不变，Verifier 与独立 ReVerifier 均通过。"
+            ),
+            violation_codes=tuple(item.code for item in warnings),
+            evidence_refs=repaired.evidence_refs,
+        )
+        refreshed_inventory = previous.inventory.model_copy(
+            update={
+                "lodgings": (
+                    *tuple(
+                        item
+                        for item in previous.inventory.lodgings
+                        if not self._same_lodging_segment(item, target)
+                    ),
+                    *lodging_quotes,
+                )
+            }
+        )
+        package = PackageRunResult(
+            initial_candidate=current,
+            final_candidate=repaired,
+            decisions=(decision,),
+            final_decision=decision,
+            initial_violations=(),
+            final_violations=violations,
+            diff=diff,
+            preservation_ratio=diff.preservation_ratio,
+            budget=package_budget(repaired),
+            evidence_refs=repaired.evidence_refs,
+            preference_applications=(
+                breakfast_preference_application(
+                    patched_intent,
+                    (current, repaired),
+                    repaired,
+                ),
+            ),
+        )
+        exact_quote_coverage = self._modification_exact_quote_coverage(
+            previous,
+            target=target,
+            segment=self._modification_lodging_segment(current.kind),
+            lodging_quotes=lodging_quotes,
+            eligible_quotes=eligible,
+            source_outcomes=source_outcomes,
+        )
+        eligible_provider_count = sum(
+            outcome.eligible_quote_count > 0 for outcome in source_outcomes
+        )
+        source_summary = "、".join(
+            f"{item.provider}:{item.state}" for item in source_outcomes
+        ) or "无来源结果"
+        updated = previous.model_copy(
+            update={
+                "intent": patched_intent,
+                "decision": decision,
+                "claim_boundary": (
+                    "本次自然语言修改仅刷新住宿垂类，并保留原航班与接驳证据；"
+                    f"住宿来源结果为 {source_summary}，其中 {eligible_provider_count} 个来源"
+                    "返回满足同一硬条件的报价。若不足两个合格来源，不声明完成跨平台"
+                    "最低价证明。成功仅表示当前证据下的局部替换通过双重确定性复验，"
+                    "不是库存锁定、结算价或预订成功。"
+                ),
+                "inventory": refreshed_inventory,
+                "normalization_results": (
+                    *previous.normalization_results,
+                    *normalization_results,
+                )[-_MODIFICATION_NORMALIZATION_HISTORY_LIMIT:],
+                "package": package,
+                "package_reverification_audit": independent_audit,
+                "source_task_ids": (
+                    *previous.source_task_ids,
+                    *source_task_ids,
+                )[-_MODIFICATION_SOURCE_HISTORY_LIMIT:],
+                "exact_quote_comparison_coverage": exact_quote_coverage,
+                "explanation": None,
+                "memory_candidates": None,
+                "lodging_strategy_comparisons": (),
+                "daily_schedule": self._daily_schedule(repaired),
+            }
+        )
+        new_total = package.budget.confirmed_subtotal_cents
+        return updated, LivePlanModificationReceipt(
+            status=LivePlanModificationStatus.MODIFIED,
+            intent=modification,
+            summary=(
+                f"只把住宿改为 {selected.property_name} 的{selected.room_name or '已核验房型'}；"
+                f"航班与 {len(current.transfers)} 段接驳保持不变。"
+            ),
+            before_candidate_id=current.id,
+            after_candidate_id=repaired.id,
+            changed_component_ids=(
+                *diff.removed_component_ids,
+                *diff.added_component_ids,
+                *diff.changed_component_ids,
+            ),
+            preserved_component_ids=diff.preserved_component_ids,
+            before_confirmed_cny_cents=previous_total,
+            after_confirmed_cny_cents=new_total,
+            difference_cny_cents=new_total - previous_total,
+            source_task_ids=source_task_ids,
+            source_outcomes=source_outcomes,
+            verifier_passed=True,
+            reverifier_passed=True,
+        )
+
+    async def _refresh_lodging_modification_sources(
+        self,
+        previous: LivePackageAgentRun,
+        target: NormalizedLodgingQuote,
+        *,
+        timeout_seconds: int,
+    ) -> tuple[
+        tuple[NormalizedLodgingQuote, ...],
+        tuple[NormalizedBrowserQuoteResult, ...],
+        tuple[str, ...],
+        tuple[LivePlanModificationSourceOutcome, ...],
+    ]:
+        exact_query = previous.search_query.model_copy(
+            update={"start_date": target.check_in, "end_date": target.check_out}
+        )
+        assert previous.package is not None
+        segment = self._modification_lodging_segment(
+            previous.package.final_candidate.kind
+        )
+        browser_tasks = tuple(
+            self._source_task(
+                provider,
+                BrowserVertical.LODGING,
+                exact_query,
+                timeout_seconds,
+                prefix="modification-source",
+                segment=segment,
+                allow_recent_quote_reuse=False,
+            )
+            for provider in self._providers
+            if provider in _LODGING_PROVIDERS
+        )
+        state = _RunState(
+            source_task_ids=tuple(task.id for task in browser_tasks),
+            source_timeout_seconds=timeout_seconds,
+            intent=previous.intent,
+            mode=previous.mode,
+            stay_plan_candidate_set=previous.stay_plan_candidate_set,
+        )
+        official_task: asyncio.Task[ArenaOfficialLodgingResult] | None = None
+        if (
+            self._official_lodging_provider is not None
+            and previous.stay_plan_candidate_set is not None
+            and target.place_key == PackagePlaceKey.MAAFUSHI
+        ):
+            official_task = asyncio.create_task(
+                self._official_lodging_provider.search(
+                    previous.search_query,
+                    previous.intent,
+                    previous.stay_plan_candidate_set,
+                )
+            )
+
+        scheduler: SchedulerOutcome | None = None
+        if browser_tasks:
+            registry = AgentRegistry()
+            registry.register(FunctionAgent(AgentRole.LODGING, self._source_executor(state)))
+            scheduler = await DynamicTaskScheduler(
+                registry,
+                max_concurrency=len(browser_tasks),
+            ).run(
+                TaskGraph(tasks=browser_tasks),
+                ContextEngine(EvidenceBlackboard()),
+                self._tool_registry(state, source_task_count=len(browser_tasks)),
+            )
+        del scheduler
+        normalized: list[NormalizedBrowserQuoteResult] = []
+        outcomes: list[LivePlanModificationSourceOutcome] = []
+        for task in browser_tasks:
+            snapshot = state.snapshots.get(task.id)
+            provider = BrowserTaskSubmission.model_validate(
+                task.input.get("submission")
+            ).provider.value
+            if snapshot is None:
+                outcomes.append(
+                    LivePlanModificationSourceOutcome(
+                        provider=provider,
+                        state="failed",
+                        source_task_id=task.id,
+                        detail=state.source_errors.get(task.id, "未取得类型化终态"),
+                    )
+                )
+                continue
+            if snapshot.state == BrowserTaskState.SUCCEEDED:
+                task_results = self._normalizer.normalize_many(snapshot.quotes, snapshot.query)
+                normalized.extend(task_results)
+                quote_count = sum(
+                    result.usable and isinstance(result.quote, NormalizedLodgingQuote)
+                    for result in task_results
+                )
+                outcomes.append(
+                    LivePlanModificationSourceOutcome(
+                        provider=provider,
+                        state="succeeded",
+                        source_task_id=task.id,
+                        quote_count=quote_count,
+                        evidence_refs=tuple(
+                            dict.fromkeys(
+                                (
+                                    f"browser-task:{snapshot.id}",
+                                    *(
+                                        reference
+                                        for result in task_results
+                                        if isinstance(
+                                            result.quote,
+                                            NormalizedLodgingQuote,
+                                        )
+                                        for reference in result.quote.evidence_refs
+                                    ),
+                                )
+                            )
+                        ),
+                    )
+                )
+            else:
+                outcomes.append(
+                    LivePlanModificationSourceOutcome(
+                        provider=provider,
+                        state=snapshot.state.value,
+                        source_task_id=task.id,
+                        evidence_refs=(f"browser-task:{snapshot.id}",),
+                        detail=(
+                            snapshot.failure.code.value
+                            if snapshot.failure is not None
+                            else "未返回可用住宿报价"
+                        ),
+                    )
+                )
+
+        source_task_ids = [task.id for task in browser_tasks]
+        if official_task is not None:
+            source_task_ids.append("source-arena-official-lodging-modification")
+            try:
+                official = await official_task
+            except Exception as exc:
+                outcomes.append(
+                    LivePlanModificationSourceOutcome(
+                        provider=_OFFICIAL_LODGING_PROVIDER,
+                        state="failed",
+                        source_task_id="source-arena-official-lodging-modification",
+                        detail=f"{type(exc).__name__}: {exc}"[:1000],
+                    )
+                )
+            else:
+                normalized.append(official.result)
+                outcomes.append(
+                    LivePlanModificationSourceOutcome(
+                        provider=_OFFICIAL_LODGING_PROVIDER,
+                        state="succeeded",
+                        source_task_id=official.source_task_id,
+                        quote_count=int(
+                            official.result.usable
+                            and isinstance(
+                                official.result.quote,
+                                NormalizedLodgingQuote,
+                            )
+                        ),
+                        evidence_refs=(
+                            *(
+                                official.result.quote.evidence_refs
+                                if isinstance(
+                                    official.result.quote,
+                                    NormalizedLodgingQuote,
+                                )
+                                else ()
+                            ),
+                            f"arena-official-capture:{official.response_sha256}",
+                        ),
+                    )
+                )
+        lodgings = tuple(
+            result.quote
+            for result in normalized
+            if result.usable and isinstance(result.quote, NormalizedLodgingQuote)
+        )
+        return lodgings, tuple(normalized), tuple(source_task_ids), tuple(outcomes)
+
+    @staticmethod
+    def _modification_lodging_segment(kind: PackageCandidateKind) -> str:
+        if kind == PackageCandidateKind.CONTINUOUS_ISLAND:
+            return "full"
+        if kind == PackageCandidateKind.CONTINUOUS_AIRPORT_ISLAND:
+            return "hulhumale-full"
+        raise ValueError("segmented lodging changes require an explicit target segment")
+
+    @staticmethod
+    def _modification_exact_quote_coverage(
+        previous: LivePackageAgentRun,
+        *,
+        target: NormalizedLodgingQuote,
+        segment: str,
+        lodging_quotes: tuple[NormalizedLodgingQuote, ...],
+        eligible_quotes: tuple[NormalizedLodgingQuote, ...],
+        source_outcomes: tuple[LivePlanModificationSourceOutcome, ...],
+    ) -> ExactQuoteComparisonCoverage:
+        quote_ids_by_provider = {
+            provider: tuple(item.id for item in lodging_quotes if item.provider == provider)
+            for provider in {item.provider for item in lodging_quotes}
+        }
+        eligible_ids_by_provider = {
+            provider: tuple(item.id for item in eligible_quotes if item.provider == provider)
+            for provider in {item.provider for item in eligible_quotes}
+        }
+        provider_evidence: list[LodgingProviderQuoteEvidence] = []
+        for outcome in source_outcomes:
+            quote_ids = quote_ids_by_provider.get(outcome.provider, ())
+            inventory_state: StayInventoryResultState | None = None
+            if quote_ids:
+                inventory_state = StayInventoryResultState.QUOTE_FOUND
+            elif outcome.state == StayInventoryResultState.CONFIRMED_EMPTY.value:
+                inventory_state = StayInventoryResultState.CONFIRMED_EMPTY
+            elif outcome.state == StayInventoryResultState.BOUNDED_PROVIDER_PENDING.value:
+                inventory_state = StayInventoryResultState.BOUNDED_PROVIDER_PENDING
+            provider_evidence.append(
+                LodgingProviderQuoteEvidence(
+                    provider=outcome.provider,
+                    source_task_id=(
+                        outcome.source_task_id
+                        or f"modification-source:{outcome.provider}:{segment}"
+                    ),
+                    inventory_state=inventory_state,
+                    quote_ids=quote_ids,
+                    eligible_quote_ids=eligible_ids_by_provider.get(outcome.provider, ()),
+                    evidence_refs=outcome.evidence_refs,
+                    source_execution_terminal=inventory_state is not None,
+                )
+            )
+        if len(provider_evidence) < _MINIMUM_EXACT_LODGING_COMPARISON_PROVIDERS:
+            observed = {item.provider for item in provider_evidence}
+            for provider in (
+                item.value for item in _LODGING_PROVIDERS if item.value not in observed
+            ):
+                provider_evidence.append(
+                    LodgingProviderQuoteEvidence(
+                        provider=provider,
+                        source_task_id=f"modification-source:{provider}:{segment}",
+                        source_execution_terminal=False,
+                    )
+                )
+                if len(provider_evidence) >= _MINIMUM_EXACT_LODGING_COMPARISON_PROVIDERS:
+                    break
+        exact_count = sum(bool(item.eligible_quote_ids) for item in provider_evidence)
+        segment_coverage = LodgingSegmentQuoteComparisonCoverage(
+            segment_id=f"{target.place_key.value if target.place_key else 'unknown'}-{segment}",
+            exact_place_key=target.place_key,
+            check_in=target.check_in,
+            check_out=target.check_out,
+            provider_evidence=tuple(provider_evidence),
+            distinct_exact_quote_provider_count=exact_count,
+            complete=(exact_count >= _MINIMUM_EXACT_LODGING_COMPARISON_PROVIDERS),
+        )
+        return ExactQuoteComparisonCoverage(
+            selected_stay_plan_id=previous.selected_stay_plan_id,
+            segments=(segment_coverage,),
+            complete=segment_coverage.complete,
+            partial_evidence_only=exact_count > 0 and not segment_coverage.complete,
+        )
+
+    @staticmethod
+    def _same_lodging_segment(
+        left: NormalizedLodgingQuote,
+        right: NormalizedLodgingQuote,
+    ) -> bool:
+        return (
+            left.area == right.area
+            and left.place_key == right.place_key
+            and left.check_in == right.check_in
+            and left.check_out == right.check_out
+            and left.adults == right.adults
+            and left.children == right.children
+            and left.children_ages == right.children_ages
+            and left.infants == right.infants
+            and left.rooms == right.rooms
+        )
+
+    @staticmethod
+    def _same_provider_property(
+        left: NormalizedLodgingQuote,
+        right: NormalizedLodgingQuote,
+    ) -> bool:
+        if left.provider != right.provider:
+            return False
+        if left.provider_property_id is not None and right.provider_property_id is not None:
+            return left.provider_property_id == right.provider_property_id
+        return " ".join(left.property_name.casefold().split()) == " ".join(
+            right.property_name.casefold().split()
+        )
+
+    @staticmethod
+    def _lodging_has_room_feature(
+        lodging: NormalizedLodgingQuote,
+        feature: LodgingRoomFeature,
+    ) -> bool:
+        if feature == LodgingRoomFeature.SEA_VIEW:
+            room = (lodging.room_name or "").casefold()
+            return any(term in room for term in ("海景", "sea view", "seaview", "ocean view"))
+        return False
+
+    def _lodging_matches_modification(
+        self,
+        lodging: NormalizedLodgingQuote,
+        *,
+        target: NormalizedLodgingQuote,
+        intent: PackageIntent,
+        modification: LivePlanModificationIntent,
+    ) -> bool:
+        return (
+            self._same_lodging_segment(lodging, target)
+            and lodging_is_comparison_eligible(lodging, intent)
+            and (
+                not modification.exclude_current_property
+                or not self._same_provider_property(lodging, target)
+            )
+            and all(
+                self._lodging_has_room_feature(lodging, feature)
+                for feature in modification.required_room_features
+            )
+        )
+
+    @staticmethod
+    def _replace_lodging_for_modification(
+        current: TravelPackageCandidate,
+        *,
+        target: NormalizedLodgingQuote,
+        replacement: NormalizedLodgingQuote,
+        instruction: str,
+    ) -> TravelPackageCandidate:
+        lodgings = tuple(
+            replacement if item.id == target.id else item for item in current.lodgings
+        )
+        version = current.version + 1
+        identity = hashlib.sha256(
+            f"{current.id}|{replacement.id}|{instruction}".encode()
+        ).hexdigest()[:12]
+        flight_total = (
+            current.flight.total_for_party_cents
+            if current.flight.party_total_known
+            and current.flight.total_for_party_cents is not None
+            else 0
+        )
+        total = (
+            flight_total
+            + sum(
+                item.total_for_party_cents
+                for item in lodgings
+                if item.currency == current.currency
+            )
+            + transfer_contract_total_cents(
+                current.transfers,
+                currency=current.currency,
+            )
+        )
+        return current.model_copy(
+            update={
+                "id": f"{current.trip_id}:modification:{identity}:v{version}",
+                "version": version,
+                "parent_candidate_id": current.id,
+                "lodgings": lodgings,
+                "declared_total_cents": total,
+            }
         )
 
     async def _replan_after_event_impl(

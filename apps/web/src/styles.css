@@ -429,6 +429,31 @@ h1 { font-family: "Noto Sans SC", sans-serif; margin: 0; font-size: clamp(40px, 
 .evidence-ledger { margin-top: 10px; padding: 11px 12px; border: 1px solid #dfe5df; border-radius: 11px; font-size: 12px; }
 .evidence-ledger summary { cursor: pointer; color: #376c57; font-weight: 800; }
 .evidence-ledger ul { max-height: 130px; overflow: auto; margin: 8px 0 0; padding-left: 17px; color: #728078; overflow-wrap: anywhere; line-height: 1.65; }
+.live-plan-modifier { margin-top: 18px; }
+.live-modification-form { display: grid; gap: 9px; margin-top: 12px; }
+.live-modification-form > label { color: #48675c; font-size: 12px; font-weight: 800; }
+.live-modification-form > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: stretch; }
+.live-modification-form textarea { min-width: 0; resize: vertical; border: 1px solid #cfdcd4; border-radius: 12px; background: #fbfcfa; color: #183f34; padding: 11px 12px; font: inherit; line-height: 1.55; }
+.live-modification-form textarea:focus-visible { outline: 3px solid rgba(39, 130, 99, .2); border-color: #367e65; }
+.live-modification-form button { border: 0; border-radius: 12px; padding: 0 18px; background: #254f42; color: white; font-size: 12px; font-weight: 800; white-space: nowrap; }
+.live-modification-form button:disabled { cursor: wait; opacity: .58; }
+.live-modification-form > p { margin: 0; color: #71827a; font-size: 12px; line-height: 1.6; }
+.modification-result { margin-top: 13px; padding: 15px; border: 1px solid #c9dfd0; border-radius: 13px; background: #f2faf4; }
+.modification-result.status-blocked, .modification-result.status-unresolved { border-color: #e6c5bb; background: #fff5f1; }
+.modification-result > header { display: grid; gap: 5px; }
+.modification-result > header span { color: #2f725a; font-size: 12px; font-weight: 900; letter-spacing: .08em; }
+.modification-result.status-blocked > header span, .modification-result.status-unresolved > header span { color: #a65344; }
+.modification-result > header strong { color: #24473b; font-size: 15px; line-height: 1.55; }
+.modification-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+.modification-facts article { display: grid; gap: 4px; min-width: 0; padding: 10px; border: 1px solid rgba(54, 108, 87, .14); border-radius: 10px; background: rgba(255,255,255,.72); }
+.modification-facts span { color: #71827a; font-size: 12px; }
+.modification-facts strong { color: #24473b; font-size: 13px; overflow-wrap: anywhere; }
+.modification-sources { margin-top: 11px; border-top: 1px dashed #cbd8d0; padding-top: 9px; }
+.modification-sources summary { cursor: pointer; color: #376c57; font-size: 12px; font-weight: 800; }
+.modification-sources ul { display: grid; gap: 6px; margin: 8px 0 0; padding: 0; list-style: none; }
+.modification-sources li { display: flex; justify-content: space-between; gap: 12px; color: #687a71; font-size: 12px; }
+.modification-sources li strong { color: #345f4d; }
+.modification-boundary { display: block; margin-top: 10px; color: #7d725f; font-size: 12px; line-height: 1.55; }
 .live-event-lab { margin-top: 18px; }
 .live-event-controls { display: grid; grid-template-columns: 1.15fr 1fr auto; gap: 9px; align-items: end; }
 .live-event-controls label { display: grid; gap: 6px; color: #60736a; font-size: 12px; font-weight: 700; }
@@ -529,6 +554,9 @@ h1 { font-family: "Noto Sans SC", sans-serif; margin: 0; font-size: clamp(40px, 
   .stay-area-profile p { grid-column: 1; }
   .normalization-row { grid-template-columns: 1fr; }
   .live-event-controls { grid-template-columns: 1fr; }
+  .live-modification-form > div, .modification-facts { grid-template-columns: 1fr; }
+  .live-modification-form button { min-height: 44px; }
+  .modification-sources li { display: grid; gap: 3px; }
   .stage-title, .live-hero-head, .live-setup-head, .interpretation-head { align-items: flex-start; }
   .stage-title { flex-direction: column; }
   .interpretation-head { flex-direction: column; }

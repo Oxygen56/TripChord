@@ -107,6 +107,10 @@ from tripchord.agents.persistent_memory import (
     CorruptionPolicy,
     PersistentMemoryStore,
 )
+from tripchord.agents.plan_modification import (
+    LivePlanModificationStatus,
+    parse_live_plan_modification,
+)
 from tripchord.agents.rag import EvidenceRagRetriever
 from tripchord.agents.stay_area import system_stay_area_search_profile
 from tripchord.api import (
@@ -131,6 +135,8 @@ from tripchord.api import (
     LiveFlexibleFromTextPlanningResponse,
     LiveFlexiblePairRunHandle,
     LiveMonitorResponse,
+    LivePlanModificationRequest,
+    LivePlanModificationResponse,
     OptimizePlanRequest,
     OptimizePlanResponse,
     ParseTripRequest,
@@ -3752,6 +3758,80 @@ async def get_live_agent_plan_endpoint(
             run=entry.run,
             final_plan=build_final_plan_projection(entry.run),
         )
+
+
+@app.post(
+    "/api/v1/agents/live-plans/{run_id}/modify",
+    response_model=LivePlanModificationResponse,
+)
+async def modify_live_agent_plan_endpoint(
+    run_id: str,
+    request: LivePlanModificationRequest,
+    live_system: LiveSystemDep,
+    cache: LiveRunCacheDep,
+    principal: PrincipalDep,
+) -> LivePlanModificationResponse:
+    await rate_limiter.check(principal.tenant_id, "live-agent-plan-modify")
+    entry = await cache.get(run_id, principal.tenant_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="live planning run was not found or has expired",
+        )
+    async with entry.lock:
+        current = await cache.get(run_id, principal.tenant_id)
+        if current is not entry:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="live planning run was not found or has expired",
+            )
+        try:
+            _require_final_published_live_run_for_event(entry.run)
+            modification_intent = parse_live_plan_modification(
+                request.instruction,
+                current_departure_date=entry.run.intent.start_date,
+            )
+            updated, receipt = await live_system.modify_plan(
+                entry.run,
+                modification_intent,
+                timeout_seconds=_live_timeout_seconds(request.timeout_seconds),
+                memory_access=_memory_access(principal, entry.run.intent.trip_id),
+                booking_ledger=_load_booking_ledger_for_run(run_id),
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(exc),
+            ) from exc
+
+        if receipt.status in {
+            LivePlanModificationStatus.MODIFIED,
+            LivePlanModificationStatus.GLOBAL_REPLAN,
+        }:
+            if receipt.status == LivePlanModificationStatus.GLOBAL_REPLAN:
+                updated = await _attach_icom_cny_reference_estimate(updated)
+            expires_at = await cache.replace(
+                run_id,
+                principal.tenant_id,
+                entry,
+                updated,
+            )
+            if expires_at is None:
+                raise HTTPException(
+                    status_code=status.HTTP_410_GONE,
+                    detail="live planning run expired during natural-language modification",
+                )
+        else:
+            updated = entry.run
+            expires_at = entry.expires_at
+
+    return LivePlanModificationResponse(
+        run_id=run_id,
+        expires_at=expires_at,
+        modification=receipt,
+        run=updated,
+        final_plan=build_final_plan_projection(updated),
+    )
 
 
 @app.post(
