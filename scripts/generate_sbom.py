@@ -57,6 +57,16 @@ PROVENANCE_SCHEMA = "tripchord-build-provenance-v1"
 APPLICATION_NAME = "tripchord"
 
 
+def _application_version() -> str:
+    if tomllib is None:  # pragma: no cover
+        raise SbomError("tomllib is required (Python >= 3.11)")
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    version = project.get("project", {}).get("version")
+    if not isinstance(version, str) or not version:
+        raise SbomError("pyproject.toml does not contain a valid project version")
+    return version
+
+
 class SbomError(RuntimeError):
     pass
 
@@ -216,7 +226,7 @@ def _generate_sbom(
                 "type": "application",
                 "bom-ref": APPLICATION_NAME,
                 "name": APPLICATION_NAME,
-                "version": "0.1.0",
+                "version": _application_version(),
             },
             "properties": [
                 {"name": "tripchord:commit_sha", "value": commit_sha},
@@ -354,7 +364,7 @@ def check(output_dir: Path) -> int:
         "type": "application",
         "bom-ref": APPLICATION_NAME,
         "name": APPLICATION_NAME,
-        "version": "0.1.0",
+        "version": _application_version(),
     }:
         errors.append("metadata component differs from the application identity")
     if committed_provenance.get("source_digests") != source_digests:

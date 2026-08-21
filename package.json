@@ -1,6 +1,6 @@
 {
   "name": "tripchord-workspace",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "workspaces": ["apps/web"],
   "scripts": {
@@ -9,4 +9,3 @@
     "test": "npm run test --workspace @tripchord/web"
   }
 }
-

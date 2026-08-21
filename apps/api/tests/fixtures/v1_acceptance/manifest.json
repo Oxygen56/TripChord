@@ -1,0 +1,32 @@
+{
+  "schema_version": "tripchord-v1-acceptance-fixtures-v1",
+  "replay_mode": "historical_saved_source_replay",
+  "network_access": false,
+  "not_current_price_or_inventory": true,
+  "fixtures": [
+    {
+      "path": "flexible-exploration.json.gz",
+      "gzip_sha256": "ccfe6d0739b0a33eabe8800fbb50af6f49a91164f6589c27ccdc9927cfc9a371",
+      "uncompressed_sha256": "42be37f98141935407d152a0a2b67ca3ee9448c69227708a73ce5ea9150e08b2",
+      "captured_at": "2026-08-21T09:45:13.515449Z",
+      "source_type": "saved_flexible_live_job",
+      "boundary": "The deterministic window contains every legal date pair; this saved real run actually queried only the three recorded pairs selected by its strategy."
+    },
+    {
+      "path": "final-plan.json.gz",
+      "gzip_sha256": "748582695c1dd8fd11841470ebd750da402ac581d39b07b143aec9922c4030a5",
+      "uncompressed_sha256": "2bac7fcc348e8b061ccc2cb9d970cc5fc2bb014a5f40ceca27f1716603f51805",
+      "captured_at": "2026-08-21T19:37:37.105872Z",
+      "source_type": "saved_exact_pair_live_run",
+      "boundary": "Historical accepted reference assembled from saved read-only observations; not current price, inventory, booking, or a production-stability claim."
+    },
+    {
+      "path": "ctrip-lodging-quotes.json.gz",
+      "gzip_sha256": "d161cb04908a469239179897f0e562b3e922f386a245a69066018bb5788be40e",
+      "uncompressed_sha256": "21a541eef53b84a82632de04ab80e9b590c686c942b7e1ef894744798b1d7272",
+      "captured_at": "2026-08-21T19:36:22.770000Z",
+      "source_type": "saved_ctrip_browser_quotes",
+      "boundary": "Twenty saved room observations are re-normalized locally; no OTA is contacted and no availability is refreshed."
+    }
+  ]
+}

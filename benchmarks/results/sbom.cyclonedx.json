@@ -2919,21 +2919,21 @@
       "bom-ref": "tripchord",
       "name": "tripchord",
       "type": "application",
-      "version": "0.1.0"
+      "version": "1.0.0"
     },
     "properties": [
       {
         "name": "tripchord:commit_sha",
-        "value": "6c5199b765ce752a8365909370af5b26fa4fbe8e"
+        "value": "7ccd81b2c35b14868bdfc2ee899c00d5dd08dbab"
       },
       {
         "name": "tripchord:committed_at",
-        "value": "2026-08-18T10:09:45+08:00"
+        "value": "2026-08-22T05:49:55+08:00"
       }
     ],
-    "timestamp": "2026-08-18T03:24:22Z"
+    "timestamp": "2026-08-21T22:13:10Z"
   },
-  "serialNumber": "urn:uuid:c7e48ea3-ead8-4287-b0fd-928934a32538",
+  "serialNumber": "urn:uuid:1804b035-3622-4ae1-a7eb-d7c17dcd4765",
   "specVersion": "1.5",
   "version": 1
 }
