@@ -3580,9 +3580,20 @@ class FormalLiveSourceAuthority:
             "live_system": _qualified_type(live_system),
             "flexible_system": _qualified_type(flexible_system),
         }
+        live_bridge = getattr(live_system, "_bridge", None)
+        # Flexible date planning installs one audited run-scoped ledger view
+        # around the real bridge.  The trust root must still bind the exact
+        # production BrowserTaskBridge as the delegate; accepting arbitrary
+        # wrappers would make the formal composition spoofable.
+        live_bridge_is_composed = live_bridge is bridge or (
+            _qualified_type(live_bridge)
+            == "tripchord.agents.flexible_live_system._FlexibleAcquisitionLedger"
+            and getattr(live_bridge, "_delegate", None) is bridge
+            and getattr(flexible_system, "_acquisition_ledger", None) is live_bridge
+        )
         if (
             actual != _COMPOSITION_TYPES
-            or getattr(live_system, "_bridge", None) is not bridge
+            or not live_bridge_is_composed
             or getattr(live_system, "_icom_provider", None) is not icom_provider
             or getattr(flexible_system, "_live", None) is not live_system
         ):
@@ -3818,6 +3829,50 @@ class FormalLiveSourceAuthority:
             details=details or {},
             response_sha256=None,
         )
+
+    def ensure_browser_complete(
+        self,
+        *,
+        subject_id: str,
+        details: Mapping[str, object],
+    ) -> None:
+        """Append one browser completion exactly once, or accept an exact retry."""
+
+        with self._state_lock:
+            if self._active_challenge is None:
+                return
+            self._require_execution_capability()
+            with self._ledger_lock():
+                ledger = self._read_ledger()
+                challenge_id = str(self._active_challenge["challenge_id"])
+                row = ledger.get(challenge_id)
+                if not isinstance(row, dict) or row.get("state") != "issued":
+                    raise RuntimeError("formal source active challenge is not ledger-active")
+                self._apply_active_state(row["active_state"])
+                for event in self._events:
+                    if event.get("kind") != "browser_complete":
+                        continue
+                    subjects = event.get("subject_ids")
+                    if not isinstance(subjects, list) or subject_id not in subjects:
+                        continue
+                    if _canonical_bytes(event.get("details")) == _canonical_bytes(details):
+                        return
+                    raise ValueError("formal browser completion retry differs")
+                before = self._active_state_payload()
+                try:
+                    self._record_locked(
+                        kind="browser_complete",
+                        method="POST",
+                        path=_BROWSER_PATHS["browser_complete"],
+                        subject_ids=(subject_id,),
+                        details=details,
+                        response_sha256=None,
+                    )
+                    row["active_state"] = self._active_state_payload()
+                    self._write_ledger(ledger)
+                except Exception:
+                    self._apply_active_state(before)
+                    raise
 
     def record_icom_http(
         self,

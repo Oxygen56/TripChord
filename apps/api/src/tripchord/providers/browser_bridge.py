@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import secrets
 import unicodedata
@@ -25,6 +26,8 @@ from pydantic import Field, JsonValue, ValidationInfo, field_validator, model_va
 
 from tripchord.domain.common import DomainModel
 from tripchord.formal_live_source import FormalLiveSourceAuthority
+
+logger = logging.getLogger(__name__)
 
 BRIDGE_TOKEN_HEADER = "X-TripChord-Bridge-Token"
 CONTROL_TOKEN_HEADER = "X-TripChord-Control-Token"
@@ -2762,6 +2765,9 @@ class BrowserTaskBridge:
         max_companion_control_records: int = DEFAULT_MAX_COMPANION_CONTROL_RECORDS,
         now: Callable[[], datetime] | None = None,
         source_authority: FormalLiveSourceAuthority | None = None,
+        durable_store: Any | None = None,
+        durable_tenant_id: str | None = None,
+        durable_tenant_partition: str | None = None,
     ) -> None:
         if max_pending_tasks < 1:
             raise ValueError("max_pending_tasks must be positive")
@@ -2782,7 +2788,19 @@ class BrowserTaskBridge:
         self._max_terminal_records = max_terminal_records
         self._max_companion_control_records = max_companion_control_records
         self._now = now or (lambda: datetime.now(UTC))
-        self._state_store = state_store or browser_bridge_state_store_from_env()
+        if durable_store is not None and state_store is not None:
+            raise ValueError("durable browser bridge cannot also use JSON state")
+        self._durable_store = durable_store
+        self._durable_tenant_id = durable_tenant_id or "browser-bridge"
+        self._durable_tenant_partition = durable_tenant_partition or hashlib.sha256(
+            self._durable_tenant_id.encode("utf-8")
+        ).hexdigest()
+        self._durable_claims: dict[str, Any] = {}
+        self._state_store = (
+            None
+            if durable_store is not None
+            else state_store or browser_bridge_state_store_from_env()
+        )
         self._source_authority = source_authority
         self._changed = asyncio.Condition()
         self._restore_persisted_state()
@@ -2796,6 +2814,265 @@ class BrowserTaskBridge:
         if self._source_authority is not None and self._source_authority is not source_authority:
             raise RuntimeError("browser bridge already uses a different source authority")
         self._source_authority = source_authority
+
+    @property
+    def durable_enabled(self) -> bool:
+        return self._durable_store is not None
+
+    async def _durable_submit_many(
+        self,
+        values: tuple[BrowserTaskSubmission, ...],
+        capability: dict[str, object] | None,
+    ) -> tuple[BrowserTaskSnapshot, ...]:
+        assert self._durable_store is not None
+        pending = await self._durable_store.count_pending(tenant_id=self._durable_tenant_id)
+        task_ids = [f"browser-task-{uuid4()}" for _ in values]
+        projected_keys: set[str] = set()
+        for submission, task_id in zip(values, task_ids, strict=True):
+            options = submission.query.options
+            allow_reuse = options.get("__tripchord_allow_recent_quote_reuse") is True
+            force_fresh = options.get("__tripchord_force_fresh") is True
+            if not allow_reuse or force_fresh:
+                projected_keys.add(task_id)
+                continue
+            tenant_partition = (
+                submission.reuse_partition_sha256
+                or hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+            )
+            partition = self._durable_store._digest(
+                {
+                    "tenant_id": self._durable_tenant_id,
+                    "tenant_partition": tenant_partition,
+                    "capability": capability,
+                }
+            )
+            projected_keys.add(
+                self._durable_store._digest(
+                    {
+                        "authority": self._durable_store._authority_partition,
+                        "tenant": self._durable_tenant_id,
+                        "partition": partition,
+                        "fingerprint": self._durable_store._submission_fingerprint(
+                            submission
+                        ),
+                    }
+                )
+            )
+        if pending + len(projected_keys) > self._max_pending_tasks:
+            raise BrowserBridgeError("browser task queue capacity exceeded")
+        snapshots: list[BrowserTaskSnapshot] = []
+        for submission, task_id in zip(values, task_ids, strict=True):
+            job_id = (
+                str(capability["terminal_job_id"])
+                if capability is not None and capability.get("terminal_job_id") is not None
+                else None
+            )
+            request_sha256 = (
+                str(capability["request_sha256"])
+                if capability is not None and capability.get("request_sha256") is not None
+                else None
+            )
+            run_id = (
+                str(capability["run_id"])
+                if capability is not None and capability.get("run_id") is not None
+                else None
+            )
+            allow_reuse = (
+                submission.query.options.get("__tripchord_allow_recent_quote_reuse")
+                is True
+            )
+            force_fresh = (
+                submission.query.options.get("__tripchord_force_fresh") is True
+            )
+            projection = await self._durable_store.submit_consumer(
+                submission,
+                consumer_id=task_id,
+                tenant_id=self._durable_tenant_id,
+                # The browser protocol has no user-tenant field.  Reuse
+                # partitions are server-derived by the planner; absent one,
+                # isolate this request rather than trusting a client tenant.
+                tenant_partition=(
+                    submission.reuse_partition_sha256
+                    or hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+                ),
+                capability=capability,
+                job_id=job_id,
+                request_sha256=request_sha256,
+                run_id=run_id,
+                run_revision=None,
+                allow_recent_quote_reuse=allow_reuse,
+                force_fresh=force_fresh,
+            )
+            snapshots.append(projection.snapshot)
+        return tuple(snapshots)
+
+    async def _durable_session(
+        self,
+        companion_id: str,
+        *,
+        providers: tuple[BrowserProvider, ...],
+        scopes: tuple[str, ...] = (),
+        adapter_version: str | None = None,
+        contract_version: str | None = None,
+        build_identity: BrowserCompanionBuildIdentity | None = None,
+        runtime_instance_id: str | None = None,
+    ) -> Any:
+        assert self._durable_store is not None
+        session_row_id = hashlib.sha256(
+            f"{self._durable_store._authority_partition}:companion:{companion_id}".encode()
+        ).hexdigest()
+        return await self._durable_store.upsert_companion_session(
+            session_id=session_row_id,
+            companion_id=companion_id,
+            runtime_instance_id=runtime_instance_id,
+            build_identity=(
+                build_identity.model_dump(mode="json") if build_identity is not None else None
+            ),
+            providers=[provider.value for provider in providers],
+            scopes=list(scopes),
+            expires_at=self._utc_now()
+            + timedelta(seconds=COMPANION_HEARTBEAT_STALE_AFTER_SECONDS),
+            adapter_version=adapter_version,
+            contract_version=contract_version,
+        )
+
+    async def _durable_claim(
+        self,
+        companion_id: str,
+        *,
+        providers: tuple[BrowserProvider, ...],
+        authorized_scope_keys: tuple[str, ...] = (),
+        adapter_version: str | None = None,
+        contract_version: str | None = None,
+        build_identity: BrowserCompanionBuildIdentity | None = None,
+        runtime_instance_id: str | None = None,
+        limit: int = 6,
+    ) -> tuple[BrowserTaskLease, ...]:
+        assert self._durable_store is not None
+        session = await self._durable_session(
+            companion_id,
+            providers=providers or tuple(BrowserProvider),
+            scopes=authorized_scope_keys,
+            adapter_version=adapter_version,
+            contract_version=contract_version,
+            build_identity=build_identity,
+            runtime_instance_id=runtime_instance_id,
+        )
+        leases = await self._durable_store.claim_acquisitions(
+            owner=companion_id,
+            session_id=session.id,
+            session_generation=session.session_generation,
+            runtime_instance_id=runtime_instance_id,
+            build_identity=(
+                build_identity.model_dump(mode="json") if build_identity is not None else None
+            ),
+            limit=limit,
+        )
+        result: list[BrowserTaskLease] = []
+        for lease in leases:
+            public_id = lease.public_task_id
+            self._durable_claims[public_id] = lease
+            result.append(
+                BrowserTaskLease(
+                    task_id=public_id,
+                    provider=lease.submission.provider,
+                    kind=lease.submission.kind,
+                    query=lease.submission.query,
+                    timeout_seconds=lease.submission.timeout_seconds,
+                    claim_token=lease.claim_token,
+                    claimed_at=lease.claimed_at,
+                    lease_expires_at=lease.lease_expires_at,
+                )
+            )
+        return tuple(result)
+
+    async def _durable_record_for(
+        self,
+        task_id: str,
+        lease: Any,
+    ) -> _TaskRecord:
+        assert self._durable_store is not None
+        projection = await self._durable_store.get_consumer(
+            task_id, tenant_id=self._durable_tenant_id
+        )
+        if projection is None:
+            raise BrowserTaskNotFoundError(f"browser task not found: {task_id}")
+        snapshot = projection.snapshot
+        return _TaskRecord(
+            id=task_id,
+            submission=lease.submission,
+            state=snapshot.state,
+            created_at=snapshot.created_at,
+            updated_at=snapshot.updated_at,
+            attempt_count=snapshot.attempt_count,
+            claimed_by=lease.owner,
+            claimed_at=lease.claimed_at,
+            claim_token=lease.claim_token,
+            lease_expires_at=lease.lease_expires_at,
+            quotes=snapshot.quotes,
+            failure=snapshot.failure,
+            reused_from_task_id=snapshot.reused_from_task_id,
+            reuse_age_seconds=snapshot.reuse_age_seconds,
+            inflight_coalesce_count=1 if snapshot.inflight_coalesced else 0,
+            formal_execution_capability=lease.capability,
+        )
+
+    async def _durable_restore_claim_heartbeat(self, lease: Any) -> None:
+        """Rehydrate formal attestation identity when completion lands on B."""
+
+        assert self._durable_store is not None
+        if lease.capability is None:
+            return
+        session = await self._durable_store.get_companion_session(lease.session_id)
+        if session is None:
+            raise BrowserClaimError("claimed Companion session is unavailable")
+        heartbeat = _CompanionHeartbeatRecord(
+            companion_id=lease.owner,
+            providers=tuple(BrowserProvider(value) for value in session.providers),
+            last_seen=session.last_seen_at,
+            authorized_scope_keys=tuple(session.scopes),
+            adapter_version=session.adapter_version,
+            contract_version=session.contract_version,
+            build_identity=(
+                BrowserCompanionBuildIdentity.model_validate(session.build_identity)
+                if session.build_identity is not None
+                else None
+            ),
+            runtime_instance_id=session.runtime_instance_id,
+        )
+        self._companion_heartbeats[lease.owner] = heartbeat
+
+    async def publish_pending_completions(self) -> int:
+        """Finish prepared completions after a process crash or lease expiry."""
+
+        if self._durable_store is None:
+            return 0
+        published = 0
+        pending = await self._durable_store.list_pending_completions(
+            tenant_id=self._durable_tenant_id
+        )
+        for lease, completion, snapshot, receipt, digest, event_details in pending:
+            try:
+                record = await self._durable_record_for(lease.public_task_id, lease)
+                if record.formal_execution_capability is not None:
+                    self._record_formal_completion(
+                        record,
+                        completion,
+                        snapshot,
+                        receipt,
+                        event_details=event_details,
+                    )
+                await self._durable_store.finalize_acquisition_completion(
+                    lease.acquisition_id,
+                    tenant_id=self._durable_tenant_id,
+                    completion_sha256=digest,
+                )
+                published += 1
+            except (BrowserClaimError, RuntimeError):
+                # A conflicting formal event or a transient DB failure leaves
+                # the outbox intact for the next publisher pass.
+                continue
+        return published
 
     async def submit_many(
         self, submissions: Iterable[BrowserTaskSubmission]
@@ -2830,6 +3107,8 @@ class BrowserTaskBridge:
                 )
                 for submission in values
             )
+        if self._durable_store is not None:
+            return await self._durable_submit_many(values, capability)
         async with self._changed:
             self._housekeep_and_notify_locked()
             pending = sum(not record.state.terminal for record in self._records.values())
@@ -2906,6 +3185,12 @@ class BrowserTaskBridge:
     ) -> dict[str, object] | None:
         """Return only the signed scope attached at formal task submission."""
 
+        if self._durable_store is not None:
+            capability = await self._durable_store.get_consumer_capability(
+                task_id, tenant_id=self._durable_tenant_id
+            )
+            return dict(capability) if capability is not None else None
+
         async with self._changed:
             record = self._record(task_id)
             capability = record.formal_execution_capability
@@ -2916,6 +3201,14 @@ class BrowserTaskBridge:
         task_id: str,
     ) -> BrowserSourceExecutionReceipt | None:
         """Return the server-derived receipt attached to a terminal formal task."""
+
+        if self._durable_store is not None:
+            projection = await self._durable_store.get_consumer(
+                task_id, tenant_id=self._durable_tenant_id
+            )
+            if projection is None or projection.source_receipt is None:
+                return None
+            return BrowserSourceExecutionReceipt.model_validate(projection.source_receipt)
 
         async with self._changed:
             receipt = self._record(task_id).source_execution_receipt
@@ -2930,6 +3223,17 @@ class BrowserTaskBridge:
     ) -> tuple[BrowserTaskLease, ...]:
         self._validate_claim_arguments(companion_id, limit)
         requested_providers = tuple(dict.fromkeys(providers))
+        if self._durable_store is not None:
+            async with self._changed:
+                self._record_companion_heartbeat(
+                    companion_id,
+                    requested_providers or tuple(BrowserProvider),
+                )
+            return await self._durable_claim(
+                companion_id,
+                providers=requested_providers,
+                limit=limit,
+            )
         async with self._changed:
             self._housekeep_and_notify_locked()
             self._record_companion_heartbeat(
@@ -2986,10 +3290,23 @@ class BrowserTaskBridge:
             leases = (
                 ()
                 if control_blocks_leases
-                else self._claim_leases_locked(
-                    companion_id,
-                    requested_providers,
-                    limit,
+                else (
+                    await self._durable_claim(
+                        companion_id,
+                        providers=requested_providers,
+                        authorized_scope_keys=authorized_scope_keys,
+                        adapter_version=adapter_version,
+                        contract_version=contract_version,
+                        build_identity=build_identity,
+                        runtime_instance_id=runtime_instance_id,
+                        limit=limit,
+                    )
+                    if self._durable_store is not None
+                    else self._claim_leases_locked(
+                        companion_id,
+                        requested_providers,
+                        limit,
+                    )
                 )
             )
             if leases and control is not None:
@@ -3058,6 +3375,37 @@ class BrowserTaskBridge:
         return tuple(leases)
 
     async def companion_status(self) -> BrowserCompanionStatusResponse:
+        if self._durable_store is not None:
+            now = self._utc_now()
+            sessions = await self._durable_store.list_companion_sessions()
+            companions = tuple(
+                BrowserCompanionHeartbeat(
+                    companion_id=row.companion_id,
+                    providers=tuple(BrowserProvider(value) for value in row.providers),
+                    last_seen=row.last_seen_at,
+                    age_seconds=max(0.0, (now - row.last_seen_at).total_seconds()),
+                    is_fresh=(
+                        now - row.last_seen_at
+                        <= timedelta(seconds=COMPANION_HEARTBEAT_STALE_AFTER_SECONDS)
+                    ),
+                    authorized_scope_keys=tuple(row.scopes),
+                    adapter_version=row.adapter_version,
+                    contract_version=row.contract_version,
+                    build_identity=(
+                        BrowserCompanionBuildIdentity.model_validate(row.build_identity)
+                        if row.build_identity is not None
+                        else None
+                    ),
+                    runtime_instance_id=row.runtime_instance_id,
+                )
+                for row in sessions
+            )
+            return BrowserCompanionStatusResponse(
+                status="connected" if any(item.is_fresh for item in companions) else "disconnected",
+                server_time=now,
+                stale_after_seconds=COMPANION_HEARTBEAT_STALE_AFTER_SECONDS,
+                companions=companions,
+            )
         async with self._changed:
             now = self._utc_now()
             companions = tuple(
@@ -3094,6 +3442,39 @@ class BrowserTaskBridge:
             raise ValueError("companion_id must contain 1 to 128 characters")
         if not requested_providers:
             raise ValueError("heartbeat requires at least one provider")
+        if self._durable_store is not None:
+            async with self._changed:
+                self._record_companion_heartbeat(
+                    companion_id,
+                    requested_providers,
+                    authorized_scope_keys=authorized_scope_keys,
+                    adapter_version=adapter_version,
+                    contract_version=contract_version,
+                    build_identity=build_identity,
+                    runtime_instance_id=runtime_instance_id,
+                )
+                record = self._companion_heartbeats[companion_id]
+                response = self._heartbeat_snapshot(record, self._utc_now())
+            session = await self._durable_session(
+                companion_id,
+                providers=requested_providers,
+                scopes=authorized_scope_keys,
+                adapter_version=adapter_version,
+                contract_version=contract_version,
+                build_identity=build_identity,
+                runtime_instance_id=runtime_instance_id,
+            )
+            await self._durable_store.renew_session_leases(
+                session_id=session.id,
+                session_generation=session.session_generation,
+                runtime_instance_id=runtime_instance_id,
+                build_identity=(
+                    build_identity.model_dump(mode="json")
+                    if build_identity is not None
+                    else None
+                ),
+            )
+            return response
         async with self._changed:
             self._record_companion_heartbeat(
                 companion_id,
@@ -3240,6 +3621,128 @@ class BrowserTaskBridge:
         completion: BrowserTaskCompletion,
         source_execution_attestation: BrowserSourceExecutionAttestation | None = None,
     ) -> BrowserTaskSnapshot:
+        if self._durable_store is not None:
+            lease = self._durable_claims.get(task_id)
+            if lease is None:
+                lease = await self._durable_store.get_claim_lease(
+                    task_id,
+                    tenant_id=self._durable_tenant_id,
+                    claim_token=claim_token,
+                )
+            if lease is None:
+                raise BrowserClaimError("task does not have an active claim")
+            record = await self._durable_record_for(task_id, lease)
+            if record.claim_token is None or not hmac.compare_digest(
+                record.claim_token, claim_token
+            ):
+                raise BrowserClaimError("claim token does not match the task lease")
+            self._validate_completion(record.submission, completion)
+            pending = await self._durable_store.get_pending_completion(
+                lease.acquisition_id,
+                tenant_id=self._durable_tenant_id,
+            )
+            if pending is not None:
+                pending_completion, frozen_snapshot, pending_receipt, _pending_digest = pending
+                if (
+                    pending_completion != completion
+                    or (
+                        source_execution_attestation is not None
+                        and pending_receipt is not None
+                        and self._validate_source_execution_attestation(
+                            record,
+                            completion,
+                            source_execution_attestation,
+                            now=self._utc_now(),
+                        )
+                        != pending_receipt
+                    )
+                ):
+                    raise BrowserClaimError("completion retry differs")
+                # The DB outbox is the source of truth after prepare.  The
+                # old Companion session/lease may have expired by recovery.
+                source_receipt = pending_receipt
+                event_details = await self._durable_store.get_pending_completion_event_details(
+                    lease.acquisition_id,
+                    tenant_id=self._durable_tenant_id,
+                )
+            else:
+                if record.lease_expires_at is None or record.lease_expires_at <= self._utc_now():
+                    raise BrowserClaimError("task lease has expired")
+                await self._durable_restore_claim_heartbeat(lease)
+                source_receipt = self._validate_source_execution_attestation(
+                    record,
+                    completion,
+                    source_execution_attestation,
+                    now=self._utc_now(),
+                )
+                frozen_snapshot = None
+            now = self._utc_now()
+            previous = (
+                record.state,
+                record.updated_at,
+                record.quotes,
+                record.failure,
+                record.source_execution_receipt,
+            )
+            record.state = completion.state
+            record.updated_at = now
+            record.quotes = completion.quotes
+            record.failure = completion.failure
+            record.source_execution_receipt = source_receipt
+            if frozen_snapshot is None:
+                # Freeze the terminal public result exactly once.  In
+                # particular, do not hash the pre-completion CLAIMED snapshot.
+                frozen_snapshot = self._snapshot(record)
+                event_details = self._formal_completion_details(
+                    record, completion, frozen_snapshot, source_receipt
+                )
+            elif event_details is None:
+                event_details = self._formal_completion_details(
+                    record, completion, frozen_snapshot, source_receipt
+                )
+            try:
+                completion_digest = await self._durable_store.prepare_acquisition_completion(
+                    lease.acquisition_id,
+                    tenant_id=self._durable_tenant_id,
+                    owner=lease.owner,
+                    generation=lease.generation,
+                    claim_token=claim_token,
+                    session_id=lease.session_id,
+                    session_generation=lease.session_generation,
+                    completion=completion,
+                    completion_snapshot=(
+                        frozen_snapshot
+                        if frozen_snapshot is not None
+                        else self._snapshot(record)
+                    ),
+                    source_receipt=source_receipt,
+                    event_details=event_details,
+                    runtime_instance_id=lease.runtime_instance_id,
+                    build_identity=lease.build_identity,
+                )
+                self._record_formal_completion(
+                    record,
+                    completion,
+                    frozen_snapshot if frozen_snapshot is not None else self._snapshot(record),
+                    source_receipt,
+                    event_details=event_details,
+                )
+                projection = await self._durable_store.finalize_acquisition_completion(
+                    lease.acquisition_id,
+                    tenant_id=self._durable_tenant_id,
+                    completion_sha256=completion_digest,
+                )
+            except RuntimeError as exc:
+                (
+                    record.state,
+                    record.updated_at,
+                    record.quotes,
+                    record.failure,
+                    record.source_execution_receipt,
+                ) = previous
+                raise BrowserClaimError(str(exc)) from exc
+            self._durable_claims.pop(task_id, None)
+            return cast(BrowserTaskSnapshot, projection)
         async with self._changed:
             self._housekeep_and_notify_locked()
             record = self._record(task_id)
@@ -3301,6 +3804,7 @@ class BrowserTaskBridge:
         completion: BrowserTaskCompletion,
         snapshot: BrowserTaskSnapshot,
         source_receipt: BrowserSourceExecutionReceipt | None,
+        event_details: dict[str, Any] | None = None,
     ) -> None:
         capability = record.formal_execution_capability
         authority = self._source_authority
@@ -3308,30 +3812,55 @@ class BrowserTaskBridge:
             return
         if source_receipt is None:
             raise BrowserClaimError("formal task has no source execution receipt")
-        snapshot_payload = snapshot.model_dump(mode="json")
+        details = event_details or self._formal_completion_details(
+            record, completion, snapshot, source_receipt
+        )
+        if details is None:
+            raise BrowserClaimError("formal completion details are unavailable")
         try:
             with authority.execution_scope(capability):
-                authority.record_browser_http(
-                    "browser_complete",
-                    subject_ids=(record.id,),
-                    details={
-                        "task_id": record.id,
-                        "completion": completion.model_dump(mode="json"),
-                        "source_execution_receipt": source_receipt.model_dump(
-                            mode="json"
-                        ),
-                        "snapshot": snapshot_payload,
-                        "formal_query": authority.formal_browser_query(
-                            task_id=snapshot.id,
-                            provider=snapshot.provider.value,
-                            kind=snapshot.kind.value,
-                            query=snapshot.query.model_dump(mode="json"),
-                        ),
-                        "result_sha256": _canonical_json_sha256(snapshot_payload),
-                    },
-                )
+                ensure = getattr(authority, "ensure_browser_complete", None)
+                if ensure is not None:
+                    ensure(subject_id=record.id, details=details)
+                else:
+                    # Keep lightweight test/legacy authorities compatible;
+                    # production FormalLiveSourceAuthority always exposes the
+                    # idempotent ensure path.
+                    authority.record_browser_http(
+                        "browser_complete",
+                        subject_ids=(record.id,),
+                        details=details,
+                    )
         except ValueError as exc:
             raise BrowserClaimError(str(exc)) from exc
+
+    def _formal_completion_details(
+        self,
+        record: _TaskRecord,
+        completion: BrowserTaskCompletion,
+        snapshot: BrowserTaskSnapshot,
+        source_receipt: BrowserSourceExecutionReceipt | None,
+    ) -> dict[str, Any] | None:
+        capability = record.formal_execution_capability
+        authority = self._source_authority
+        if authority is None or capability is None:
+            return None
+        if source_receipt is None:
+            raise BrowserClaimError("formal task has no source execution receipt")
+        snapshot_payload = snapshot.model_dump(mode="json")
+        return {
+            "task_id": record.id,
+            "completion": completion.model_dump(mode="json"),
+            "source_execution_receipt": source_receipt.model_dump(mode="json"),
+            "snapshot": snapshot_payload,
+            "formal_query": authority.formal_browser_query(
+                task_id=snapshot.id,
+                provider=snapshot.provider.value,
+                kind=snapshot.kind.value,
+                query=snapshot.query.model_dump(mode="json"),
+            ),
+            "result_sha256": _canonical_json_sha256(snapshot_payload),
+        }
 
     def _validate_source_execution_attestation(
         self,
@@ -3361,7 +3890,13 @@ class BrowserTaskBridge:
             raise BrowserClaimError(
                 "source execution attestation has no fresh Companion runtime identity"
             )
-        query_payload = record.submission.query.model_dump(mode="json")
+        # The claim endpoint omits ``None`` fields from its response.  Hash the
+        # exact query shape delivered to Companion so a valid completion is not
+        # rejected merely because optional fields were absent on the wire.
+        query_payload = record.submission.query.model_dump(
+            mode="json",
+            exclude_none=True,
+        )
         query_sha256 = _canonical_json_sha256(query_payload)
         observation_payload = {
             "task_id": record.id,
@@ -3374,21 +3909,36 @@ class BrowserTaskBridge:
             "parser_version": attestation.parser_version,
         }
         expected_observation_sha256 = _canonical_json_sha256(observation_payload)
-        if (
-            attestation.task_id != record.id
-            or attestation.provider != record.submission.provider
-            or attestation.kind != record.submission.kind
-            or attestation.companion_id != record.claimed_by
-            or attestation.companion_id != heartbeat.companion_id
-            or attestation.runtime_instance_id != heartbeat.runtime_instance_id
-            or attestation.build_identity != heartbeat.build_identity
-            or attestation.parser_version != PRODUCTION_VISIBLE_DOM_PARSER_VERSION
-            or attestation.query_sha256 != query_sha256
-            or attestation.source_observation_sha256
-            != expected_observation_sha256
-        ):
+        mismatch_fields = tuple(
+            field
+            for field, differs in (
+                ("task_id", attestation.task_id != record.id),
+                ("provider", attestation.provider != record.submission.provider),
+                ("kind", attestation.kind != record.submission.kind),
+                ("claimed_companion", attestation.companion_id != record.claimed_by),
+                ("heartbeat_companion", attestation.companion_id != heartbeat.companion_id),
+                (
+                    "runtime_instance_id",
+                    attestation.runtime_instance_id != heartbeat.runtime_instance_id,
+                ),
+                ("build_identity", attestation.build_identity != heartbeat.build_identity),
+                (
+                    "parser_version",
+                    attestation.parser_version != PRODUCTION_VISIBLE_DOM_PARSER_VERSION,
+                ),
+                ("query_sha256", attestation.query_sha256 != query_sha256),
+                (
+                    "source_observation_sha256",
+                    attestation.source_observation_sha256
+                    != expected_observation_sha256,
+                ),
+            )
+            if differs
+        )
+        if mismatch_fields:
             raise BrowserClaimError(
-                "source execution attestation differs from the claimed task/runtime"
+                "source execution attestation differs from the claimed task/runtime: "
+                + ", ".join(mismatch_fields)
             )
         if any(
             quote.parser_version != attestation.parser_version
@@ -3461,6 +4011,14 @@ class BrowserTaskBridge:
         )
 
     async def get(self, task_id: str) -> BrowserTaskSnapshot:
+        if self._durable_store is not None:
+            await self.publish_pending_completions()
+            projection = await self._durable_store.get_consumer(
+                task_id, tenant_id=self._durable_tenant_id
+            )
+            if projection is None:
+                raise BrowserTaskNotFoundError(f"browser task not found: {task_id}")
+            return cast(BrowserTaskSnapshot, projection.snapshot)
         async with self._changed:
             self._housekeep_and_notify_locked()
             return self._snapshot(self._record(task_id))
@@ -3477,6 +4035,18 @@ class BrowserTaskBridge:
         normalized_reason = reason.strip()
         if not normalized_reason or len(normalized_reason) > 1000:
             raise ValueError("cancellation reason must contain 1 to 1000 characters")
+        if self._durable_store is not None:
+            snapshots: list[BrowserTaskSnapshot] = []
+            for task_id in ids:
+                projection = await self._durable_store.cancel_consumer(
+                    task_id,
+                    tenant_id=self._durable_tenant_id,
+                )
+                if projection is None:
+                    raise BrowserTaskNotFoundError(f"browser task not found: {task_id}")
+                snapshots.append(projection.snapshot)
+                self._durable_claims.pop(task_id, None)
+            return tuple(snapshots)
         async with self._changed:
             self._housekeep_and_notify_locked()
             records = tuple(self._record(task_id) for task_id in ids)
@@ -3524,6 +4094,21 @@ class BrowserTaskBridge:
         ids = tuple(dict.fromkeys(task_ids))
         if not ids:
             return ()
+        if self._durable_store is not None:
+            await self.publish_pending_completions()
+            projections = await asyncio.gather(
+                *(
+                    self._durable_store.wait_consumer(
+                        task_id,
+                        tenant_id=self._durable_tenant_id,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    for task_id in ids
+                )
+            )
+            if any(projection is None for projection in projections):
+                raise BrowserTaskNotFoundError("browser task not found")
+            return tuple(projection.snapshot for projection in projections if projection)
 
         async def wait_for_terminal() -> tuple[BrowserTaskSnapshot, ...]:
             async with self._changed:
@@ -4991,6 +5576,11 @@ def create_browser_bridge_app(
         except BrowserTaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except BrowserClaimError as exc:
+            logger.warning(
+                "browser task completion rejected for %s: %s",
+                task_id,
+                exc,
+            )
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     app.state.browser_task_bridge = task_bridge

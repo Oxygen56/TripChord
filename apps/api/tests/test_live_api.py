@@ -4,7 +4,7 @@ import asyncio
 import importlib
 import json
 import stat
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +12,10 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
+from tripchord.agents.flexible_live_system import (
+    FlexibleLiveAgentRun,
+    FlexiblePairExecution,
+)
 from tripchord.agents.live_monitor import (
     LiveMonitorCheck,
     LiveMonitorStatus,
@@ -30,7 +34,12 @@ from tripchord.agents.live_system import (
 from tripchord.agents.models import AgentRole, AgentTask, AgentTaskResult, TaskGraph
 from tripchord.agents.persistent_memory import CorruptionPolicy
 from tripchord.agents.runtime import SchedulerOutcome
-from tripchord.api import LiveAgentPlanningResponse, build_live_final_plan_projection
+from tripchord.api import (
+    LiveAgentPlanningResponse,
+    _sanitize_public_flight_totals,
+    build_best_available_plan_projection,
+    build_live_final_plan_projection,
+)
 from tripchord.config import Settings
 from tripchord.main import (
     LiveRunCache,
@@ -43,12 +52,17 @@ from tripchord.main import (
     protect_mounted_browser_bridge,
     settings,
 )
+from tripchord.planning.flexible_dates import AuditableDatePair
 from tripchord.planning.package import (
+    NormalizedFlightQuote,
+    NormalizedLodgingQuote,
+    PackageArea,
     PackageDecision,
     PackageDecisionState,
     PackageEventKind,
     PackageIntent,
     PackageInventory,
+    QuoteAvailability,
 )
 from tripchord.providers.browser_bridge import (
     BRIDGE_TOKEN_HEADER,
@@ -56,6 +70,10 @@ from tripchord.providers.browser_bridge import (
     BrowserProvider,
     BrowserSearchQuery,
     BrowserVertical,
+)
+from tripchord.providers.quote_normalizer import (
+    NormalizedBrowserQuoteResult,
+    QuoteNormalizationStatus,
 )
 
 main_module = importlib.import_module("tripchord.main")
@@ -295,6 +313,344 @@ def test_live_agent_response_schema_strongly_types_final_plan() -> None:
                 "final_plan": {"bad": True},
             }
         )
+
+
+def test_public_flight_sanitizer_preserves_provider_display_comparison_amount() -> None:
+    payload = {
+        "flight": {
+            "party_total_known": False,
+            "total_for_party_cents": 240_000,
+            "display_amount_cents": 120_000,
+            "price_basis": "per_person",
+        }
+    }
+    sanitized = _sanitize_public_flight_totals(payload)
+    assert sanitized == {
+        "flight": {
+            "party_total_known": False,
+            "total_for_party_cents": None,
+            "display_amount_cents": 120_000,
+            "price_basis": "comparison_only",
+        }
+    }
+
+
+def test_best_available_plan_keeps_display_fare_separate_from_lodging_total() -> None:
+    captured_at = datetime(2026, 8, 21, tzinfo=UTC)
+    flight = NormalizedFlightQuote(
+        id="flight-display",
+        provider="tongcheng",
+        currency="CNY",
+        total_for_party_cents=None,
+        display_amount_cents=410_100,
+        party_total_known=False,
+        price_basis="comparison_only",
+        taxes_and_fees_included=True,
+        captured_at=captured_at,
+        expires_at=captured_at + timedelta(minutes=10),
+        availability=QuoteAvailability.AVAILABLE,
+        evidence_refs=("flight-evidence",),
+        origin="杭州",
+        destination="马累",
+        adults=2,
+        party_availability_confirmed=False,
+        outbound_depart_at=datetime(2026, 9, 3, 21, 45, tzinfo=UTC),
+        outbound_arrive_at=datetime(2026, 9, 4, 12, 20, tzinfo=UTC),
+        return_depart_at=datetime(2026, 9, 9, 14, 20, tzinfo=UTC),
+        return_arrive_at=datetime(2026, 9, 10, 9, 25, tzinfo=UTC),
+        outbound_flight_numbers=("JD5907", "JD455"),
+        return_flight_numbers=("JD456", "JD5908"),
+    )
+    lodging = NormalizedLodgingQuote(
+        id="ocean-grand",
+        provider="ctrip",
+        currency="CNY",
+        total_for_party_cents=544_200,
+        taxes_and_fees_included=True,
+        captured_at=captured_at,
+        expires_at=captured_at + timedelta(minutes=10),
+        availability=QuoteAvailability.AVAILABLE,
+        evidence_refs=("lodging-evidence",),
+        property_name="Hotel Ocean Grand at Hulhumale",
+        area=PackageArea.AIRPORT_ISLAND,
+        check_in=date(2026, 9, 3),
+        check_out=date(2026, 9, 9),
+        adults=2,
+        rooms=1,
+        breakfast_included=True,
+        room_name="超级豪华大或双床房",
+        cancellation_policy="免费取消",
+    )
+    normalized = (
+        NormalizedBrowserQuoteResult(
+            provider="tongcheng",
+            kind=BrowserVertical.FLIGHT,
+            status=QuoteNormalizationStatus.USABLE,
+            quote=flight,
+        ),
+        NormalizedBrowserQuoteResult(
+            provider="ctrip",
+            kind=BrowserVertical.LODGING,
+            status=QuoteNormalizationStatus.USABLE,
+            quote=lodging,
+        ),
+    )
+    live_run = LivePackageAgentRun.model_construct(
+        intent=_intent(), normalization_results=normalized, coverage=()
+    )
+    date_pair = AuditableDatePair.model_construct(
+        id="date-pair:2026-09-03:2026-09-09",
+        departure_date=date(2026, 9, 3),
+        return_date=date(2026, 9, 9),
+    )
+    execution = FlexiblePairExecution.model_construct(
+        date_pair=date_pair, run=live_run, exploration_run=None
+    )
+    flexible_run = FlexibleLiveAgentRun.model_construct(pair_runs=(execution,))
+
+    plan = build_best_available_plan_projection(flexible_run)
+
+    assert plan is not None
+    assert plan.total_budget_cents is None
+    assert plan.flight is not None
+    assert plan.flight.display_amount_cents == 410_100
+    assert plan.flight.party_total_known is False
+    assert plan.lodgings[0].display_total_cents == 544_200
+    assert plan.return_date == date(2026, 9, 9)
+    assert plan.flight.return_arrive_at.date() == date(2026, 9, 10)
+
+
+def test_best_available_plan_does_not_add_unknown_flight_fare_to_lodging() -> None:
+    captured_at = datetime(2026, 8, 21, tzinfo=UTC)
+
+    def execution(
+        *,
+        departure_date: date,
+        return_date: date,
+        flight_display_cents: int,
+        lodging_total_cents: int,
+    ) -> FlexiblePairExecution:
+        flight = NormalizedFlightQuote(
+            id=f"flight-{departure_date.isoformat()}",
+            provider="tongcheng",
+            currency="CNY",
+            total_for_party_cents=None,
+            display_amount_cents=flight_display_cents,
+            party_total_known=False,
+            price_basis="comparison_only",
+            taxes_and_fees_included=True,
+            captured_at=captured_at,
+            expires_at=captured_at + timedelta(minutes=10),
+            availability=QuoteAvailability.AVAILABLE,
+            evidence_refs=("flight-evidence",),
+            origin="杭州",
+            destination="马累",
+            adults=2,
+            party_availability_confirmed=False,
+            outbound_depart_at=datetime.combine(
+                departure_date, time(21, 45), tzinfo=UTC
+            ),
+            outbound_arrive_at=datetime.combine(
+                departure_date + timedelta(days=1), time(12, 20), tzinfo=UTC
+            ),
+            return_depart_at=datetime.combine(return_date, time(14, 20), tzinfo=UTC),
+            return_arrive_at=datetime.combine(
+                return_date + timedelta(days=1), time(9, 25), tzinfo=UTC
+            ),
+            outbound_flight_numbers=("JD5907", "JD455"),
+            return_flight_numbers=("JD456", "JD5908"),
+        )
+        lodging = NormalizedLodgingQuote(
+            id=f"lodging-{departure_date.isoformat()}",
+            provider="ctrip",
+            currency="CNY",
+            total_for_party_cents=lodging_total_cents,
+            taxes_and_fees_included=True,
+            captured_at=captured_at,
+            expires_at=captured_at + timedelta(minutes=10),
+            availability=QuoteAvailability.AVAILABLE,
+            evidence_refs=("lodging-evidence",),
+            property_name="Hotel Ocean Grand at Hulhumale",
+            area=PackageArea.AIRPORT_ISLAND,
+            check_in=departure_date,
+            check_out=return_date,
+            adults=2,
+            rooms=1,
+            breakfast_included=True,
+            room_name="超级豪华大或双床房",
+            cancellation_policy="免费取消",
+        )
+        live_run = LivePackageAgentRun.model_construct(
+            intent=_intent(),
+            normalization_results=(
+                NormalizedBrowserQuoteResult(
+                    provider="tongcheng",
+                    kind=BrowserVertical.FLIGHT,
+                    status=QuoteNormalizationStatus.USABLE,
+                    quote=flight,
+                ),
+                NormalizedBrowserQuoteResult(
+                    provider="ctrip",
+                    kind=BrowserVertical.LODGING,
+                    status=QuoteNormalizationStatus.USABLE,
+                    quote=lodging,
+                ),
+            ),
+            coverage=(),
+        )
+        date_pair = AuditableDatePair.model_construct(
+            id=f"date-pair:{departure_date.isoformat()}:{return_date.isoformat()}",
+            departure_date=departure_date,
+            return_date=return_date,
+        )
+        return FlexiblePairExecution.model_construct(
+            date_pair=date_pair,
+            run=live_run,
+            exploration_run=None,
+        )
+
+    lower_flight_display = execution(
+        departure_date=date(2026, 9, 3),
+        return_date=date(2026, 9, 9),
+        flight_display_cents=410_100,
+        lodging_total_cents=544_200,
+    )
+    lower_fake_sum = execution(
+        departure_date=date(2026, 9, 4),
+        return_date=date(2026, 9, 10),
+        flight_display_cents=420_000,
+        lodging_total_cents=100_000,
+    )
+    flexible_run = FlexibleLiveAgentRun.model_construct(
+        pair_runs=(lower_flight_display, lower_fake_sum)
+    )
+
+    plan = build_best_available_plan_projection(flexible_run)
+
+    assert plan is not None
+    assert plan.departure_date == date(2026, 9, 3)
+    assert plan.flight is not None
+    assert plan.flight.display_amount_cents == 410_100
+    assert plan.total_budget_cents is None
+
+
+def test_best_available_plan_joins_destination_and_airport_lodging_segments() -> None:
+    captured_at = datetime(2026, 8, 21, tzinfo=UTC)
+    flight = NormalizedFlightQuote(
+        id="flight-segmented",
+        provider="tongcheng",
+        currency="CNY",
+        total_for_party_cents=None,
+        display_amount_cents=410_100,
+        party_total_known=False,
+        price_basis="comparison_only",
+        taxes_and_fees_included=True,
+        captured_at=captured_at,
+        expires_at=captured_at + timedelta(minutes=10),
+        availability=QuoteAvailability.AVAILABLE,
+        evidence_refs=("flight-evidence",),
+        origin="杭州",
+        destination="马累",
+        adults=2,
+        party_availability_confirmed=False,
+        outbound_depart_at=datetime(2026, 9, 3, 21, 45, tzinfo=UTC),
+        outbound_arrive_at=datetime(2026, 9, 4, 12, 20, tzinfo=UTC),
+        return_depart_at=datetime(2026, 9, 9, 14, 20, tzinfo=UTC),
+        return_arrive_at=datetime(2026, 9, 10, 9, 25, tzinfo=UTC),
+        outbound_flight_numbers=("JD5907", "JD455"),
+        return_flight_numbers=("JD456", "JD5908"),
+    )
+
+    def lodging(
+        *,
+        id: str,
+        property_name: str,
+        area: PackageArea,
+        check_in: date,
+        check_out: date,
+        room_name: str,
+        total_cents: int,
+    ) -> NormalizedLodgingQuote:
+        return NormalizedLodgingQuote(
+            id=id,
+            provider="ctrip",
+            currency="CNY",
+            total_for_party_cents=total_cents,
+            taxes_and_fees_included=True,
+            captured_at=captured_at,
+            expires_at=captured_at + timedelta(minutes=10),
+            availability=QuoteAvailability.AVAILABLE,
+            evidence_refs=(f"{id}-evidence",),
+            property_name=property_name,
+            area=area,
+            check_in=check_in,
+            check_out=check_out,
+            adults=2,
+            rooms=1,
+            breakfast_included=True,
+            room_name=room_name,
+            cancellation_policy="免费取消",
+        )
+
+    island = lodging(
+        id="kaani-sea-view",
+        property_name="Kaani Palm Beach",
+        area=PackageArea.DESTINATION_ISLAND,
+        check_in=date(2026, 9, 4),
+        check_out=date(2026, 9, 8),
+        room_name="豪华双人海景阳台房",
+        total_cents=395_200,
+    )
+    airport = lodging(
+        id="ocean-grand-sea-view",
+        property_name="Hotel Ocean Grand at Hulhumale",
+        area=PackageArea.AIRPORT_ISLAND,
+        check_in=date(2026, 9, 8),
+        check_out=date(2026, 9, 9),
+        room_name="海景房（带阳台）- 免费机场接送",
+        total_cents=149_300,
+    )
+    normalization_results = tuple(
+        NormalizedBrowserQuoteResult(
+            provider=item.provider,
+            kind=(
+                BrowserVertical.FLIGHT
+                if isinstance(item, NormalizedFlightQuote)
+                else BrowserVertical.LODGING
+            ),
+            status=QuoteNormalizationStatus.USABLE,
+            quote=item,
+        )
+        for item in (flight, island, airport)
+    )
+    live_run = LivePackageAgentRun.model_construct(
+        intent=_intent(), normalization_results=normalization_results, coverage=()
+    )
+    date_pair = AuditableDatePair.model_construct(
+        id="date-pair:segmented",
+        departure_date=date(2026, 9, 3),
+        return_date=date(2026, 9, 9),
+    )
+    flexible_run = FlexibleLiveAgentRun.model_construct(
+        pair_runs=(
+            FlexiblePairExecution.model_construct(
+                date_pair=date_pair,
+                run=live_run,
+                exploration_run=None,
+            ),
+        )
+    )
+
+    plan = build_best_available_plan_projection(flexible_run)
+
+    assert plan is not None
+    assert [item.area for item in plan.lodgings] == [
+        PackageArea.DESTINATION_ISLAND.value,
+        PackageArea.AIRPORT_ISLAND.value,
+    ]
+    assert [item.display_total_cents for item in plan.lodgings] == [395_200, 149_300]
+    assert plan.total_budget_cents is None
+    assert any("目的地岛住宿加返程前机场岛" in item for item in plan.unresolved_items)
 
 
 @pytest.mark.asyncio

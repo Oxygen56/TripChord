@@ -149,6 +149,7 @@ from tripchord.api import (
     WeatherRequest,
     WorkspaceReplanRequest,
     WorkspaceReplanResponse,
+    build_best_available_plan_projection,
     build_final_plan_projection,
     create_user_quote,
     optimize_plan,
@@ -181,6 +182,7 @@ from tripchord.jobs import (
 from tripchord.observability import configure_logging, metrics, observe_request
 from tripchord.persistence import Database, WorkspaceRepository
 from tripchord.persistence.booking_ledger import BookingLedgerStore
+from tripchord.persistence.browser_tasks import DurableBrowserTaskStore
 from tripchord.persistence.handoff_store import HandoffStore
 from tripchord.persistence.live_monitors import DbLiveMonitorStore, LiveMonitorNotFoundError
 from tripchord.persistence.live_planning_jobs import DurableLivePlanningJobStore
@@ -753,6 +755,9 @@ def _install_browser_bridge(
     | None = None,
     browser_bridge_override: Any | None = None,
     icom_provider_override: Any | None = None,
+    durable_browser_task_store: DurableBrowserTaskStore | None = None,
+    durable_browser_tenant_id: str | None = None,
+    durable_browser_tenant_partition: str | None = None,
     mount_browser_bridge: bool = True,
     formal_source_owned_by_parent: bool = False,
 ) -> tuple[BrowserTaskBridge | None, LivePackageAgentSystem | None]:
@@ -827,6 +832,9 @@ def _install_browser_bridge(
     bridge = browser_bridge_override or BrowserTaskBridge(
         now=now,
         source_authority=source_authority,
+        durable_store=durable_browser_task_store,
+        durable_tenant_id=durable_browser_tenant_id,
+        durable_tenant_partition=durable_browser_tenant_partition,
     )
     icom_provider = icom_provider_override or IComTransferProvider(
         client=icom_http_client,
@@ -1150,6 +1158,7 @@ async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
     model_enabled = getattr(target_app.state, "model_router", None) is not None
     model_http_started = False
     durable_recovery_task: asyncio.Task[None] | None = None
+    browser_completion_publisher_task: asyncio.Task[None] | None = None
     companion_supervisor = cast(
         BrowserCompanionRuntimeSupervisor | None,
         getattr(target_app.state, "browser_companion_runtime_supervisor", None),
@@ -1175,6 +1184,20 @@ async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
                 raise
             except Exception:
                 logger.exception("durable live planning recovery sweep failed")
+
+    async def browser_completion_publisher_loop() -> None:
+        bridge = getattr(target_app.state, "browser_task_bridge", None)
+        if bridge is None or not getattr(bridge, "durable_enabled", False):
+            return
+        while True:
+            try:
+                await bridge.publish_pending_completions()
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("durable browser completion publication failed")
+                await asyncio.sleep(5)
     try:
         if shared_model_http is not None and model_enabled:
             await shared_model_http.start()
@@ -1184,6 +1207,12 @@ async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
         if live_job_registry_startup is not None and live_planning_job_store is not None:
             durable_recovery_task = asyncio.create_task(
                 durable_recovery_loop(), name="tripchord:durable-recovery"
+            )
+        bridge = getattr(target_app.state, "browser_task_bridge", None)
+        if bridge is not None and getattr(bridge, "durable_enabled", False):
+            browser_completion_publisher_task = asyncio.create_task(
+                browser_completion_publisher_loop(),
+                name="tripchord:browser-completion-publisher",
             )
         yield
     finally:
@@ -1207,6 +1236,10 @@ async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
             durable_recovery_task.cancel()
             with suppress(asyncio.CancelledError):
                 await durable_recovery_task
+        if browser_completion_publisher_task is not None:
+            browser_completion_publisher_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await browser_completion_publisher_task
         # Every model consumer is stopped before the shared connection pool.
         # Closing earlier can deadlock while an in-flight monitor waits on HTTP.
         shutdown_steps: list[tuple[str, Callable[[], Awaitable[None]]]] = []
@@ -1376,12 +1409,35 @@ initial_bridge_settings = (
     if _LIVE_WORKER_SUBPROCESS
     else settings
 )
+durable_browser_task_store = None
+durable_browser_tenant_id = None
+durable_browser_tenant_partition = None
+if initial_bridge_settings.browser_bridge_enabled and not _LIVE_WORKER_SUBPROCESS:
+    bridge_token = initial_bridge_settings.browser_bridge_token
+    if bridge_token is None:
+        raise RuntimeError("durable browser bridge requires a configured bridge token")
+    durable_authority = hashlib.sha256(
+        f"tripchord-browser-authority:{bridge_token}".encode()
+    ).hexdigest()
+    durable_browser_task_store = DurableBrowserTaskStore(
+        database,
+        authority_partition_sha256=durable_authority,
+    )
+    durable_browser_tenant_id = hashlib.sha256(
+        f"tripchord-browser-tenant:{bridge_token}".encode()
+    ).hexdigest()
+    durable_browser_tenant_partition = hashlib.sha256(
+        f"tripchord-browser-partition:{bridge_token}".encode()
+    ).hexdigest()
 browser_task_bridge, live_package_agent_system = _install_browser_bridge(
     app,
     initial_bridge_settings,
     model_router=model_router,
     context_builder=context_builder,
     memory_store=memory_store,
+    durable_browser_task_store=durable_browser_task_store,
+    durable_browser_tenant_id=durable_browser_tenant_id,
+    durable_browser_tenant_partition=durable_browser_tenant_partition,
 )
 
 
@@ -2996,6 +3052,7 @@ async def _execute_live_flexible_from_text_body(
         interpretation=interpretation,
         run=run,
         final_plan=build_final_plan_projection(run),
+        best_available_plan=build_best_available_plan_projection(run),
         cached_pair_runs=handles,
         model_enhancement_enabled=model_enabled,
         model_trace_scope_sha256=model_trace_scope_sha256,
@@ -3283,6 +3340,40 @@ def _build_live_flexible_from_text_worker_command(
     )
 
 
+def _build_live_flexible_from_text_operation(
+    payload: LiveFlexibleFromTextPlanningRequest,
+    *,
+    request_digest: str,
+    target_app: FastAPI,
+    cache: LiveRunCache,
+    principal: Principal,
+) -> Callable[[LiveJobProgressReporter], Awaitable[dict[str, Any]]]:
+    """Run an ordinary user job against the API's connected live sources.
+
+    The signed subprocess source path is reserved for explicitly prepared formal
+    evidence runs.  A normal product request has no formal execution capability,
+    so it must use the already connected Browser Companion owned by this API
+    process instead of entering a worker runtime that can only accept a signed
+    formal activation.
+    """
+
+    async def operation(report: LiveJobProgressReporter) -> dict[str, Any]:
+        response = await _execute_live_flexible_from_text(
+            payload,
+            target_app=target_app,
+            cache=cache,
+            principal=principal,
+            report_progress=report,
+            report_pair_checkpoint=report.report_pair_checkpoint,
+            expected_request_sha256=request_digest,
+            model_trace_scope_id=report.job_id,
+            report_model_trace_summary=report.report_model_trace_summary,
+        )
+        return response.model_dump(mode="json")
+
+    return operation
+
+
 def _live_planning_job_boundary(registry: LivePlanningJobRegistry) -> str:
     return (
         DURABLE_LIVE_PLANNING_BOUNDARY
@@ -3332,12 +3423,28 @@ async def start_live_flexible_from_text_job_endpoint(
             # gate accepts this new key. A full collection therefore performs
             # zero worker-command / UUID / runtime construction and the existing
             # identity bytes stay untouched, even under concurrent admissions.
-            operation_factory=lambda: _build_live_flexible_from_text_worker_command(
-                payload,
-                request_digest=request_digest,
-                target_app=target_app,
-                cache=cache,
-                principal=principal,
+            operation_factory=lambda: (
+                _build_live_flexible_from_text_operation(
+                    payload,
+                    request_digest=request_digest,
+                    target_app=target_app,
+                    cache=cache,
+                    principal=principal,
+                )
+                if (
+                    not defer_start
+                    and getattr(
+                        target_app.state, "formal_live_source_authority", None
+                    )
+                    is not None
+                )
+                else _build_live_flexible_from_text_worker_command(
+                    payload,
+                    request_digest=request_digest,
+                    target_app=target_app,
+                    cache=cache,
+                    principal=principal,
+                )
             ),
             idempotency_key=idempotency_key,
             request_digest=request_digest,

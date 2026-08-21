@@ -6961,6 +6961,99 @@ def test_live_state_lease_preflight_is_strictly_read_only(tmp_path: Path) -> Non
     assert not (tmp_path / "live.db-wal").exists()
 
 
+def _make_durable_browser_db(
+    db_path: Path,
+    *,
+    acquisition_state: str | None = None,
+    active_consumer: bool = False,
+) -> None:
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE browser_acquisitions (
+            id TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE browser_task_consumers (
+            id TEXT PRIMARY KEY,
+            acquisition_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+    if acquisition_state is not None:
+        connection.execute(
+            "INSERT INTO browser_acquisitions VALUES (?, ?, ?)",
+            ("acq-1", acquisition_state, "2026-08-21T00:00:00+00:00"),
+        )
+    if active_consumer:
+        connection.execute(
+            "INSERT INTO browser_task_consumers VALUES (?, ?, ?, ?)",
+            ("consumer-1", "acq-1", "active", "2026-08-21T00:00:00+00:00"),
+        )
+    connection.commit()
+    connection.close()
+
+
+@pytest.mark.parametrize("state", ["queued", "claimed", "completing"])
+def test_durable_browser_preflight_detects_pending_acquisition(
+    tmp_path: Path, state: str
+) -> None:
+    db_path = tmp_path / "durable.db"
+    _make_durable_browser_db(db_path, acquisition_state=state)
+    residual = gate._durable_browser_task_lease_preflight(db_path)
+    assert residual
+    assert "acq-1" in residual[0]
+    assert state in residual[0]
+
+
+def test_durable_browser_preflight_detects_active_consumer(tmp_path: Path) -> None:
+    db_path = tmp_path / "durable.db"
+    _make_durable_browser_db(db_path, acquisition_state="queued", active_consumer=True)
+    residual = gate._durable_browser_task_lease_preflight(db_path)
+    assert residual
+    assert any("consumer-1" in item for item in residual)
+
+
+def test_durable_browser_preflight_ignores_terminal_history_binding(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "durable.db"
+    _make_durable_browser_db(db_path, acquisition_state="succeeded", active_consumer=True)
+    assert gate._durable_browser_task_lease_preflight(db_path) == []
+
+
+def test_durable_browser_preflight_checks_active_binding_for_pending_acquisition(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "durable.db"
+    _make_durable_browser_db(db_path, acquisition_state="queued", active_consumer=True)
+    residual = gate._durable_browser_task_lease_preflight(db_path)
+    assert len(residual) == 2
+    assert any("consumer-1" in item for item in residual)
+
+
+def test_durable_browser_preflight_passes_clean_and_is_read_only(tmp_path: Path) -> None:
+    db_path = tmp_path / "durable.db"
+    _make_durable_browser_db(db_path)
+    before = _db_sha256(db_path)
+    assert gate._durable_browser_task_lease_preflight(db_path) == []
+    assert gate._durable_browser_task_postcheck(db_path) == []
+    assert _db_sha256(db_path) == before
+    assert not (tmp_path / "durable.db-journal").exists()
+    assert not (tmp_path / "durable.db-wal").exists()
+
+
+def test_durable_browser_preflight_fails_closed_without_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "durable.db"
+    sqlite3.connect(db_path).close()
+    residual = gate._durable_browser_task_lease_preflight(db_path)
+    assert residual
+    assert "required table" in residual[0]
+
+
 def test_resolve_live_state_db_honors_explicit_and_local_url(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -6975,6 +7068,30 @@ def test_resolve_live_state_db_honors_explicit_and_local_url(
     assert gate._resolve_live_state_db().name == "custom2.db"
     monkeypatch.delenv("TRIPCHORD_DATABASE_URL")
     assert gate._resolve_live_state_db() == gate.ROOT / "tripchord.db"
+
+
+def test_resolve_durable_browser_database_url_normalizes_asyncpg_scheme(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "TRIPCHORD_DONE_GATE_DURABLE_DATABASE_URL",
+        "postgresql+asyncpg://user:secret@example.invalid/tripchord",
+    )
+    assert gate._resolve_durable_browser_database_url() == (
+        "postgresql://user:secret@example.invalid/tripchord"
+    )
+
+
+def test_resolve_durable_browser_database_url_prefers_explicit_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "TRIPCHORD_DONE_GATE_DURABLE_DATABASE_URL",
+        "postgresql://env.invalid/tripchord",
+    )
+    assert gate._resolve_durable_browser_database_url(
+        "postgresql+asyncpg://cli.invalid/tripchord"
+    ) == "postgresql://cli.invalid/tripchord"
 
 
 def test_layer6_fails_when_residual_lease_present(
@@ -14467,7 +14584,16 @@ def _c4_validate_formal_composition(
     for value, expected_type, label in expected:
         if type(value) is not expected_type:
             raise AssertionError(f"formal composition did not create the real {label}")
-    if getattr(live_system, "_bridge", None) is not bridge:
+    live_bridge = getattr(live_system, "_bridge", None)
+    if not (
+        live_bridge is bridge
+        or (
+            f"{type(live_bridge).__module__}.{type(live_bridge).__qualname__}"
+            == "tripchord.agents.flexible_live_system._FlexibleAcquisitionLedger"
+            and getattr(live_bridge, "_delegate", None) is bridge
+            and getattr(flexible_system, "_acquisition_ledger", None) is live_bridge
+        )
+    ):
         raise AssertionError("formal live system is not bound to its composed bridge")
     if getattr(live_system, "_icom_provider", None) is not icom_provider:
         raise AssertionError("formal live system bypassed its composed iCom provider")

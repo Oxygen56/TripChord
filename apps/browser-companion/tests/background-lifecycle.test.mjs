@@ -265,6 +265,7 @@ context = vm.createContext({
   URL,
   URLSearchParams,
   chrome,
+  clearInterval,
   clearTimeout,
   console,
   Date,
@@ -279,6 +280,7 @@ context = vm.createContext({
     throw new Error("unexpected bridge fetch");
   },
   Promise,
+  setInterval,
   setTimeout,
   __TRIPCHORD_BACKGROUND_TEST_HOOKS__: hooks,
 });
@@ -478,6 +480,7 @@ assert.equal(hooks.dynamicLeaseCompletionReserveMs(120000), 20000);
 {
   const releases = [];
   const started = [];
+  let activeLeaseHeartbeats = 0;
   let activeQunarLodging = 0;
   let maxActiveQunarLodging = 0;
   const leases = [
@@ -499,6 +502,9 @@ assert.equal(hooks.dynamicLeaseCompletionReserveMs(120000), 20000);
       await new Promise((resolve) => releases.push(resolve));
       activeQunarLodging -= 1;
     },
+    async () => {
+      activeLeaseHeartbeats += 1;
+    },
   );
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(started.includes("c1"), true);
@@ -513,6 +519,7 @@ assert.equal(hooks.dynamicLeaseCompletionReserveMs(120000), 20000);
   while (releases.length) releases.shift()();
   await running;
   assert.equal(maxActiveQunarLodging, 1);
+  assert.equal(activeLeaseHeartbeats >= 1, true);
 }
 {
   tabs.set(901, {
@@ -658,6 +665,22 @@ assert.equal(hooks.dynamicLeaseCompletionReserveMs(1200), 480);
       timing.work_deadline_ms,
     ),
     4000,
+  );
+
+  const renewable = hooks.leaseTiming(
+    {
+      timeout_seconds: 180,
+      claimed_at: new Date(claimedAtMs).toISOString(),
+      lease_expires_at: new Date(claimedAtMs + 30000).toISOString(),
+    },
+    receivedAtMs,
+  );
+  assert.equal(renewable.deadline_source, "renewable_server_lease");
+  assert.equal(renewable.lease_duration_ms, 180000);
+  assert.equal(renewable.completion_reserve_ms, 20000);
+  assert.equal(
+    renewable.work_deadline_ms,
+    receivedAtMs + 180000 - 20000,
   );
 
   const fallback = hooks.leaseTiming(

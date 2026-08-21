@@ -42,7 +42,12 @@ from tripchord.planning import ChineseRequirementParser, ItineraryOptimizer, Pla
 from tripchord.planning.adaptive import AdaptiveReplanResult
 from tripchord.planning.flexible_dates import FlexibleTravelWindow, PlatformFareCalendar
 from tripchord.planning.impact import PlanDependency
-from tripchord.planning.package import PackageDecisionState, PackageIntent
+from tripchord.planning.package import (
+    NormalizedFlightQuote,
+    NormalizedLodgingQuote,
+    PackageDecisionState,
+    PackageIntent,
+)
 from tripchord.planning.policy import ReplanPreference
 from tripchord.planning.problem import OptimizationResult, PlanningProblem
 from tripchord.planning.replanner import LocalReplanner, LocalReplanResult
@@ -63,7 +68,8 @@ def _sanitize_public_flight_totals(value: Any) -> Any:
     if isinstance(value, dict):
         result = {key: _sanitize_public_flight_totals(item) for key, item in value.items()}
         if result.get("party_total_known") is False and "total_for_party_cents" in result:
-            result["display_amount_cents"] = result.get("total_for_party_cents")
+            if result.get("display_amount_cents") is None:
+                result["display_amount_cents"] = result.get("total_for_party_cents")
             result["total_for_party_cents"] = None
             result["price_basis"] = "comparison_only"
         return result
@@ -348,6 +354,9 @@ class FinalFlightProjection(ApiModel):
     return_flight_numbers: tuple[str, ...] = ()
     return_depart_at: datetime
     return_arrive_at: datetime
+    display_amount_cents: int | None = None
+    party_total_known: bool = True
+    price_basis: str = "total_party"
 
 
 class FinalLodgingProjection(ApiModel):
@@ -360,6 +369,7 @@ class FinalLodgingProjection(ApiModel):
     room_name: str | None = None
     breakfast_included: bool | None = None
     cancellation_policy: str | None = None
+    display_total_cents: int | None = None
 
 
 class FinalTransferProjection(ApiModel):
@@ -397,6 +407,12 @@ class FinalPlanProjection(ApiModel):
     unresolved_items: tuple[str, ...] = ()
 
 
+class BestAvailablePlanProjection(FinalPlanProjection):
+    """A useful current recommendation when a confirmed party total is absent."""
+
+    advisory_note: str = Field(min_length=1)
+
+
 LiveAgentPlanningResponse.model_rebuild(
     _types_namespace={"FinalPlanProjection": FinalPlanProjection}
 )
@@ -429,6 +445,7 @@ class LiveFlexibleFromTextPlanningResponse(ApiModel):
     interpretation: HybridPackageRequirementResult
     run: FlexibleLiveAgentRun | None = None
     final_plan: FinalPlanProjection | None = None
+    best_available_plan: BestAvailablePlanProjection | None = None
     cached_pair_runs: tuple[LiveFlexiblePairRunHandle, ...] = ()
     model_enhancement_enabled: bool = False
     model_trace_scope_sha256: str = Field(pattern="^[0-9a-f]{64}$")
@@ -642,6 +659,264 @@ def build_final_plan_projection(
         failed_source_ids=failed_source_ids,
         price_comparability=price_comparability,
         unresolved_items=tuple(dict.fromkeys(unresolved_items)),
+    )
+
+
+def build_best_available_plan_projection(
+    run: FlexibleLiveAgentRun,
+) -> BestAvailablePlanProjection | None:
+    """Return one useful itinerary without promoting display prices to party totals."""
+
+    choices: list[
+        tuple[
+            tuple[int, int, int, str],
+            Any,
+            LivePackageAgentRun,
+            NormalizedFlightQuote,
+            tuple[NormalizedLodgingQuote, ...],
+        ]
+    ] = []
+    for execution in run.pair_runs:
+        live_run = execution.run or execution.exploration_run
+        if live_run is None:
+            continue
+        flights: list[NormalizedFlightQuote] = []
+        lodgings: list[NormalizedLodgingQuote] = []
+        for result in live_run.normalization_results:
+            quote = result.quote
+            if not result.usable or quote is None:
+                continue
+            if isinstance(quote, NormalizedFlightQuote):
+                amount = (
+                    quote.total_for_party_cents
+                    if quote.party_total_known
+                    else quote.display_amount_cents
+                )
+                if (
+                    quote.currency == "CNY"
+                    and quote.availability.value == "available"
+                    and quote.outbound_depart_at.date() == execution.date_pair.departure_date
+                    and quote.return_depart_at.date() == execution.date_pair.return_date
+                    and amount is not None
+                    and amount > 0
+                ):
+                    flights.append(quote)
+            elif isinstance(quote, NormalizedLodgingQuote):
+                searchable_text = f"{quote.property_name} {quote.room_name or ''}".lower()
+                cancellation = quote.cancellation_policy or ""
+                if (
+                    quote.currency == "CNY"
+                    and quote.availability.value == "available"
+                    and quote.breakfast_included is True
+                    and "免费取消" in cancellation
+                    and "不可取消" not in cancellation
+                    and "基础" not in searchable_text
+                    and "b&b" not in searchable_text
+                    and "无窗" not in searchable_text
+                    and "标准房" not in searchable_text
+                ):
+                    lodgings.append(quote)
+        if not flights or not lodgings:
+            continue
+        flight = min(
+            flights,
+            key=lambda item: (
+                0 if item.party_total_known else 1,
+                item.total_for_party_cents
+                if item.party_total_known
+                else item.display_amount_cents or 10**18,
+                item.id,
+            ),
+        )
+        def lodging_rank(item: NormalizedLodgingQuote) -> tuple[int, int, str]:
+            text = f"{item.property_name} {item.room_name or ''}".lower()
+            if "海景" in text or "sea view" in text:
+                quality_tier = 0
+            elif "阳台" in text or "balcony" in text:
+                quality_tier = 1
+            elif any(
+                term in text
+                for term in ("超级豪华", "豪华", "高级", "deluxe", "superior")
+            ):
+                quality_tier = 2
+            else:
+                quality_tier = 3
+            return (
+                quality_tier,
+                item.total_for_party_cents,
+                item.id,
+            )
+
+        available_lodgings = tuple(lodgings)
+        lodging_end_date = execution.date_pair.return_date
+
+        def best_lodging_cover(
+            start: date,
+            available: tuple[NormalizedLodgingQuote, ...] = available_lodgings,
+            end: date = lodging_end_date,
+        ) -> tuple[NormalizedLodgingQuote, ...] | None:
+            by_start: dict[date, list[NormalizedLodgingQuote]] = {}
+            for item in available:
+                if start <= item.check_in < item.check_out <= end:
+                    by_start.setdefault(item.check_in, []).append(item)
+
+            covers: list[tuple[NormalizedLodgingQuote, ...]] = []
+
+            def visit(
+                cursor: date,
+                selected: tuple[NormalizedLodgingQuote, ...],
+            ) -> None:
+                if cursor == end:
+                    covers.append(selected)
+                    return
+                if len(selected) >= 4:
+                    return
+                for item in by_start.get(cursor, ()):
+                    visit(item.check_out, (*selected, item))
+
+            visit(start, ())
+            if not covers:
+                return None
+            return min(
+                covers,
+                key=lambda cover: (
+                    sum(lodging_rank(item)[0] for item in cover),
+                    sum(item.total_for_party_cents for item in cover),
+                    len(cover),
+                    tuple(item.id for item in cover),
+                ),
+            )
+
+        lodging_cover = best_lodging_cover(flight.outbound_arrive_at.date())
+        if lodging_cover is None:
+            lodging_cover = best_lodging_cover(execution.date_pair.departure_date)
+        if lodging_cover is None:
+            continue
+        lodging_total = sum(item.total_for_party_cents for item in lodging_cover)
+        flight_amount = (
+            flight.total_for_party_cents
+            if flight.party_total_known
+            else flight.display_amount_cents
+        )
+        assert flight_amount is not None
+        choices.append(
+            (
+                (
+                    0 if flight.party_total_known else 1,
+                    (
+                        flight_amount + lodging_total
+                        if flight.party_total_known
+                        else flight_amount
+                    ),
+                    0 if flight.party_total_known else lodging_total,
+                    execution.date_pair.id,
+                ),
+                execution,
+                live_run,
+                flight,
+                lodging_cover,
+            )
+        )
+    if not choices:
+        return None
+    _, execution, live_run, flight, chosen_lodgings = min(
+        choices, key=lambda item: item[0]
+    )
+    covered = tuple(
+        dict.fromkeys(
+            source_id
+            for coverage in live_run.coverage
+            for source_id in coverage.successful_source_ids
+        )
+    )
+    failed = tuple(
+        dict.fromkeys(
+            source_id
+            for coverage in live_run.coverage
+            for source_id in coverage.failed_source_ids
+        )
+    )
+    unresolved = []
+    if not flight.party_total_known:
+        unresolved.append(
+            "航班页面展示价尚未确认为全部出行人的合计价，因此不计入行程总价"
+        )
+    lodging_areas = {item.area.value for item in chosen_lodgings}
+    if lodging_areas == {"airport_island"}:
+        unresolved.extend(
+            (
+                "当前选中住宿位于胡鲁马累机场岛，交通便利，但不是度假岛体验",
+                "目的地岛住宿本轮未形成可直接与人民币价格同口径比较的方案",
+            )
+        )
+    elif "destination_island" in lodging_areas and "airport_island" in lodging_areas:
+        unresolved.append(
+            "当前采用目的地岛住宿加返程前机场岛过渡住宿；岛间接驳仍需确认人民币总价和可衔接班次"
+        )
+    elif "destination_island" in lodging_areas:
+        unresolved.append("目的地岛住宿已找到；机场往返接驳仍需确认人民币总价和班次")
+    if flight.outbound_arrive_at.date() > chosen_lodgings[0].check_in:
+        unresolved.append(
+            "当前酒店报价从出发日起算，航班次日抵达；预订前应再查次日入住价格"
+        )
+    return BestAvailablePlanProjection(
+        option_id=f"best-available:{execution.date_pair.id}",
+        date_pair_id=execution.date_pair.id,
+        departure_date=execution.date_pair.departure_date,
+        return_date=execution.date_pair.return_date,
+        total_budget_cents=None,
+        optimality_status="best_available_not_final",
+        claim_boundary=(
+            "这是基于本轮已成功返回的实时结果生成的唯一最佳可用建议，"
+            "不等同于已确认的全部人员总价或全平台最低价。"
+        ),
+        flight_component_id=flight.id,
+        lodging_component_ids=tuple(item.id for item in chosen_lodgings),
+        flight=FinalFlightProjection(
+            provider=flight.provider,
+            origin=flight.origin,
+            destination=flight.destination,
+            outbound_flight_numbers=flight.outbound_flight_numbers,
+            outbound_depart_at=flight.outbound_depart_at,
+            outbound_arrive_at=flight.outbound_arrive_at,
+            return_flight_numbers=flight.return_flight_numbers,
+            return_depart_at=flight.return_depart_at,
+            return_arrive_at=flight.return_arrive_at,
+            display_amount_cents=(
+                None if flight.party_total_known else flight.display_amount_cents
+            ),
+            party_total_known=flight.party_total_known,
+            price_basis=flight.price_basis,
+        ),
+        lodgings=tuple(
+            FinalLodgingProjection(
+                provider=item.provider,
+                property_name=item.property_name,
+                area=item.area.value,
+                check_in=item.check_in,
+                check_out=item.check_out,
+                rooms=item.rooms,
+                room_name=item.room_name,
+                breakfast_included=item.breakfast_included,
+                cancellation_policy=item.cancellation_policy,
+                display_total_cents=item.total_for_party_cents,
+            )
+            for item in chosen_lodgings
+        ),
+        party={
+            "adults": live_run.intent.adults,
+            "children": live_run.intent.children,
+            "infants": live_run.intent.infants,
+            "rooms": live_run.intent.rooms,
+        },
+        covered_source_ids=covered,
+        failed_source_ids=failed,
+        price_comparability="flight_display_only_lodging_total_confirmed",
+        unresolved_items=tuple(unresolved),
+        advisory_note=(
+            "航班只显示平台页面可见价；住宿为人民币已含税同行价。"
+            "未经确认的航班价与住宿价不相加。"
+        ),
     )
 
 class StartLiveFlexibleFromTextJobResponse(ApiModel):

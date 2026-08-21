@@ -89,6 +89,130 @@ class TerminalReceiptRow(Base):
     search_run: Mapped[SearchRunRow] = relationship(back_populates="receipts")
 
 
+class BrowserAcquisitionRow(Base):
+    """Shared platform acquisition; request-specific bindings live separately."""
+
+    __tablename__ = "browser_acquisitions"
+    __table_args__ = (
+        Index("ix_browser_acquisitions_lookup", "tenant_partition", "fingerprint_sha256"),
+        Index("ix_browser_acquisitions_claimable", "state", "lease_expires_at"),
+        Index(
+            "uq_browser_acquisitions_active_singleflight",
+            "active_singleflight_key",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    # Non-null only while this acquisition is queued/claimed.  It gives
+    # SQLite the same single-flight guarantee as PostgreSQL's locking path.
+    active_singleflight_key: Mapped[str | None] = mapped_column(
+        String(220), nullable=True
+    )
+    public_task_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    authority_partition_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(100), index=True)
+    tenant_partition: Mapped[str] = mapped_column(String(200), index=True)
+    reference_count: Mapped[int] = mapped_column(Integer, default=0)
+    inflight_coalesced_count: Mapped[int] = mapped_column(Integer, default=0)
+    companion_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    session_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    session_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    runtime_instance_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    build_identity: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    fingerprint_sha256: Mapped[str] = mapped_column(String(64))
+    provider: Mapped[str] = mapped_column(String(40))
+    kind: Mapped[str] = mapped_column(String(40))
+    submission: Mapped[dict[str, Any]] = mapped_column(JSON)
+    state: Mapped[str] = mapped_column(String(20), index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    attempt_deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    claim_consumer_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    lease_generation: Mapped[int] = mapped_column(Integer, default=0)
+    claim_token_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    quotes: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    source_receipt: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    completion_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    completion_receipt: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    completion_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    completion_event_details: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    completion_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    completion_published_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    completion_published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    failure: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reused_from_task_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    reuse_age_seconds: Mapped[float | None] = mapped_column(nullable=True)
+
+
+class BrowserTaskConsumerRow(Base):
+    """Per-request binding to a shared acquisition, including lineage/capability."""
+
+    __tablename__ = "browser_task_consumers"
+    __table_args__ = (
+        Index("ix_browser_task_consumers_acquisition", "acquisition_id"),
+        Index("ix_browser_task_consumers_tenant", "tenant_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    authority_partition_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(100), index=True)
+    acquisition_id: Mapped[str] = mapped_column(String(80), index=True)
+    job_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    request_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    run_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    capability: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    binding_receipt: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    is_primary: Mapped[bool] = mapped_column(default=False)
+    state: Mapped[str] = mapped_column(String(20), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reused_from_task_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    reuse_age_seconds: Mapped[float | None] = mapped_column(nullable=True)
+
+
+class CompanionSessionRow(Base):
+    """Durable Companion identity used to fence claims across API instances."""
+
+    __tablename__ = "browser_companion_sessions"
+    __table_args__ = (
+        Index("ix_browser_companion_sessions_active", "authority_partition_sha256", "companion_id"),
+    )
+
+    # The Companion's client session id is only unique within an authority
+    # partition.  Keeping both columns in the primary key prevents one
+    # authority from colliding with another while preserving the public
+    # session id used by the browser protocol.
+    id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    authority_partition_sha256: Mapped[str] = mapped_column(
+        String(64), index=True, primary_key=True
+    )
+    companion_id: Mapped[str] = mapped_column(String(128))
+    session_generation: Mapped[int] = mapped_column(Integer, default=1)
+    runtime_instance_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    build_identity: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    providers: Mapped[list[str]] = mapped_column(JSON)
+    scopes: Mapped[list[str]] = mapped_column(JSON)
+    adapter_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    contract_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class ProviderSelectionRow(Base):
     """Persisted per-scope user selection (v0.2 deviation: DB-backed store)."""
 

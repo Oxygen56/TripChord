@@ -119,6 +119,16 @@ export TRIPCHORD_BROWSER_BRIDGE_STATE_PATH="$PWD/.runtime/browser-bridge-state.j
 uv run python scripts/start_live_api.py
 ```
 
+The production browser bridge is database-backed when
+`TRIPCHORD_BROWSER_BRIDGE_ENABLED=true` and a migrated database is configured.
+In that mode the `browser_acquisitions` and `browser_task_consumers` tables are
+the only queue authority; the JSON state path is a legacy/dev-only adapter and
+is neither read nor written. The product done gate checks both those durable
+tables and the planning-job tables from the same explicitly selected local
+SQLite state file. It does not guess or connect to an arbitrary remote
+`DATABASE_URL`; a production PostgreSQL gate run must pass an approved,
+explicit database configuration.
+
 The `0600` atomic state file excludes pairing tokens, lease tokens and browser
 heartbeat identity. It can contain request fields, sanitized visible evidence,
 provider URLs and failure diagnostics, so it must be treated as private travel

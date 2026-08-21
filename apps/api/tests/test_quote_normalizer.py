@@ -524,6 +524,72 @@ def test_normalizer_preserves_explicit_lodging_room_rate_and_payment_identity() 
     assert result.quote.payment_policy == "pay online"
 
 
+def test_normalizer_accepts_companion_minimal_query_snapshot() -> None:
+    submitted = query().model_copy(
+        update={
+            "options": {
+                "gateway_destination": "Male",
+                "stay_plan_candidate_set": {"source": "planner-only"},
+                "segment": "middle",
+                "expected_package_area": "destination_island",
+                "__tripchord_ledger_terminal_retention": True,
+            }
+        }
+    )
+    full = submitted.model_dump(mode="json")
+    minimal = {
+        key: full[key]
+        for key in BrowserQuoteNormalizer._BROWSER_QUERY_EVIDENCE_KEYS
+    }
+    minimal["options"] = {
+        "segment": "middle",
+        "expected_package_area": "destination_island",
+    }
+
+    result = BrowserQuoteNormalizer().normalize(
+        browser_quote(
+            BrowserVertical.LODGING,
+            search_query=submitted,
+            details_update={"query": minimal},
+        ),
+        submitted,
+    )
+
+    assert result.status == QuoteNormalizationStatus.USABLE
+
+
+def test_normalizer_rejects_legacy_snapshot_for_mixed_party() -> None:
+    submitted = query().model_copy(
+        update={"children": 1, "children_ages": (7,)}
+    )
+    full = submitted.model_dump(mode="json")
+    legacy = {
+        key: full[key]
+        for key in BrowserQuoteNormalizer._BROWSER_QUERY_EVIDENCE_KEYS
+        if key
+        not in {
+            "children",
+            "children_ages",
+            "infants",
+            "party_shape_supported",
+            "party_shape_failure",
+        }
+    }
+    legacy["options"] = {}
+
+    result = BrowserQuoteNormalizer().normalize(
+        browser_quote(
+            BrowserVertical.LODGING,
+            search_query=submitted,
+            details_update={"query": legacy},
+        ),
+        submitted,
+    )
+
+    assert result.status == QuoteNormalizationStatus.REJECTED
+    assert result.issues[0].code == QuoteNormalizationCode.QUERY_CONTEXT_MISMATCH
+
+
 def test_flight_route_accepts_visible_velana_chinese_transliteration() -> None:
     source = browser_quote(BrowserVertical.FLIGHT)
     outbound = dict(source.details["outbound_route_evidence"])

@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
+from tripchord.persistence.browser_tasks import DurableBrowserTaskStore
+from tripchord.persistence.database import Database
 from tripchord.providers.browser_bridge import (
     BRIDGE_TOKEN_HEADER,
     CONTROL_TOKEN_HEADER,
@@ -67,6 +69,44 @@ def reload_request_body() -> BrowserCompanionReloadRequestBody:
         expires_in_seconds=120,
         max_drain_seconds=90,
     )
+
+
+@pytest.mark.asyncio
+async def test_durable_batch_capacity_counts_coalesced_submissions_once() -> None:
+    """Two identical opt-in requests occupy one durable queue slot."""
+    database = Database("sqlite+aiosqlite://")
+    await database.create_schema()
+    try:
+        store = DurableBrowserTaskStore(
+            database, authority_partition_sha256="capacity-authority".ljust(64, "0")
+        )
+        bridge = BrowserTaskBridge(
+            durable_store=store,
+            durable_tenant_id="capacity-tenant",
+            max_pending_tasks=1,
+        )
+        base = submission(
+            BrowserProvider.CTRIP,
+            BrowserVertical.LODGING,
+            reuse_partition_sha256=reuse_partition("capacity"),
+        )
+        request = base.model_copy(
+            update={
+                "query": base.query.model_copy(
+                    update={
+                        "options": {
+                            "__tripchord_allow_recent_quote_reuse": True,
+                        }
+                    }
+                )
+            }
+        )
+        snapshots = await bridge.submit_many((request, request))
+        assert len(snapshots) == 2
+        assert snapshots[0].id == snapshots[1].id
+        assert snapshots[1].inflight_coalesced is True
+    finally:
+        await database.dispose()
 
 
 def submission(

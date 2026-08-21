@@ -454,7 +454,7 @@ async def test_formal_source_receipt_hashes_its_serialized_timestamp() -> None:
             captured_at=now,
         ),
     )
-    query_payload = query.model_dump(mode="json")
+    query_payload = query.model_dump(mode="json", exclude_none=True)
     observation = {
         "task_id": task.id,
         "provider": "ctrip",

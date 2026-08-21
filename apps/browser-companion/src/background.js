@@ -61,6 +61,7 @@ const MAX_CONCURRENT_LEASES = 6;
 // this provider/vertical serial while other providers still use the global
 // six-lease pool.
 const MAX_CONCURRENT_QUNAR_LODGING_LEASES = 1;
+const ACTIVE_LEASE_HEARTBEAT_INTERVAL_MS = 10000;
 const QUNAR_LODGING_ISOLATION_SCOPE =
   "companion_owned_unfocused_normal_window_active_tab";
 const QUNAR_LODGING_WINDOW_CLEANUP_ATTEMPTS = 2;
@@ -3211,16 +3212,30 @@ function leaseTiming(lease, receivedAtMs = Date.now()) {
     serverExpiresAtMs > claimedAtMs
       ? serverExpiresAtMs - claimedAtMs
       : null;
-  const durationMs = serverDurationMs === null
+  // Durable task ownership is renewed by Companion heartbeats in short
+  // server-side slices (currently 30s).  That renewable lease is not the
+  // provider execution budget carried by timeout_seconds.  Treating it as the
+  // work deadline made every real lodging search fail before extraction even
+  // though the heartbeat kept ownership valid.  Use the configured execution
+  // budget when it is longer, while the server continues to fence completion
+  // against the independently renewed ownership lease.
+  const renewableServerLease =
+    serverDurationMs !== null && configuredDurationMs > serverDurationMs;
+  const durationMs = renewableServerLease
     ? configuredDurationMs
-    : serverDurationMs;
-  const expiresAtMs = serverExpiresAtMs === null
+    : serverDurationMs === null
+      ? configuredDurationMs
+      : serverDurationMs;
+  const expiresAtMs = renewableServerLease || serverExpiresAtMs === null
     ? receivedAtMs + durationMs
     : serverExpiresAtMs;
   const completionReserveMs = dynamicLeaseCompletionReserveMs(durationMs);
   return {
-    deadline_source:
-      serverExpiresAtMs === null ? "receipt_fallback" : "server_absolute",
+    deadline_source: renewableServerLease
+      ? "renewable_server_lease"
+      : serverExpiresAtMs === null
+        ? "receipt_fallback"
+        : "server_absolute",
     received_at_ms: receivedAtMs,
     claimed_at_ms: claimedAtMs,
     lease_expires_at_ms: expiresAtMs,
@@ -11789,8 +11804,22 @@ async function executeLease(lease) {
 async function executeClaimedLeasesProviderAware(
   leases,
   executor = executeLease,
+  leaseHeartbeat = null,
+  heartbeatIntervalMs = ACTIVE_LEASE_HEARTBEAT_INTERVAL_MS,
 ) {
   const values = Array.isArray(leases) ? leases : [];
+  let heartbeatTimer = null;
+  const renewActiveLeases = () => {
+    if (typeof leaseHeartbeat !== "function") return Promise.resolve();
+    return Promise.resolve(leaseHeartbeat()).catch(() => null);
+  };
+  if (values.length && typeof leaseHeartbeat === "function") {
+    await renewActiveLeases();
+    heartbeatTimer = setInterval(
+      renewActiveLeases,
+      Math.max(1000, Number(heartbeatIntervalMs) || 0),
+    );
+  }
   const trackedExecutor = async (lease) => {
     const taskId = String(lease && lease.task_id || "");
     if (!taskId || activeLeaseIds.has(taskId)) {
@@ -11830,10 +11859,14 @@ async function executeClaimedLeasesProviderAware(
       }
     },
   );
-  await Promise.allSettled([
-    ...unrestricted.map((lease) => trackedExecutor(lease)),
-    ...qunarWorkers,
-  ]);
+  try {
+    await Promise.allSettled([
+      ...unrestricted.map((lease) => trackedExecutor(lease)),
+      ...qunarWorkers,
+    ]);
+  } finally {
+    clearInterval(heartbeatTimer);
+  }
 }
 
 async function pollOnce() {
@@ -11857,13 +11890,21 @@ async function pollOnce() {
     // last-seen timestamp; it never receives Chrome profile or account data.
     const reloadReceipt = await reloadReceiptForClaim();
     const authorized = await authorizedScopeKeys();
+    const availableLeaseSlots = Math.max(
+      0,
+      MAX_CONCURRENT_LEASES - activeLeaseIds.size,
+    );
+    if (availableLeaseSlots === 0) {
+      await heartbeatOnce();
+      return;
+    }
     const claimBody = {
       companion_id: COMPANION_ID,
       providers: [...new Set(authorized.map((scope) => scope.split(":")[0]))],
       authorized_scope_keys: authorized,
       adapter_version: "0.2.0",
       contract_version: "tripchord-capability-v1",
-      limit: MAX_CONCURRENT_LEASES,
+      limit: availableLeaseSlots,
       build_identity: currentBuildIdentity(),
       runtime_instance_id: RUNTIME_INSTANCE_ID,
       reload_receipt: reloadReceipt,
@@ -11888,7 +11929,11 @@ async function pollOnce() {
       await stageReloadControl(control);
       return;
     }
-    await executeClaimedLeasesProviderAware(leases);
+    void executeClaimedLeasesProviderAware(
+      leases,
+      executeLease,
+      heartbeatOnce,
+    ).catch(() => null);
   } catch (error) {
     if (terminalOrphanedReloadReceipt(error)) {
       const storage = await connectionStorage();

@@ -28,6 +28,7 @@ Layer reference (contract section 六 v1.0):
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -4732,6 +4733,7 @@ def _live_state_lease_preflight(db_path: Path) -> list[str]:
     """
     if not db_path.is_file():
         return [f"live-state DB {db_path} missing; cannot prove lease isolation"]
+    connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(
             f"file:{db_path}?mode=ro", uri=True, timeout=5
@@ -4788,6 +4790,207 @@ def _live_state_lease_preflight(db_path: Path) -> list[str]:
             residual.append(
                 f"job {job_id} status={status} holds lease until {expires.isoformat()}"
             )
+    return residual
+
+
+def _durable_browser_mode() -> bool:
+    """Whether the production bridge uses the database-backed queue.
+
+    The done gate must never inspect the legacy JSON queue when the API is
+    configured for the durable bridge: that file is intentionally absent or
+    stale in this mode.  Worker subprocesses do not own the browser queue.
+    """
+    enabled = os.environ.get("TRIPCHORD_BROWSER_BRIDGE_ENABLED", "").strip().lower()
+    worker = os.environ.get("TRIPCHORD_LIVE_WORKER_SUBPROCESS", "").strip().lower()
+    return enabled in {"1", "true", "yes", "on"} and worker not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+_DURABLE_BROWSER_SNAPSHOT: dict[str, Any] | None = None
+_DURABLE_BROWSER_SNAPSHOT_AFTER: dict[str, Any] | None = None
+
+
+def _durable_browser_task_lease_validate(
+    db_path: Path, *, after: bool = False
+) -> list[str]:
+    """Read-only preflight for durable BrowserTaskBridge state.
+
+    ``browser_acquisitions`` is the queue and ``browser_task_consumers`` holds
+    active request references.  Both are checked from the same SQLite file as
+    planning jobs; no remote DATABASE_URL is guessed by this gate.
+    """
+    global _DURABLE_BROWSER_SNAPSHOT, _DURABLE_BROWSER_SNAPSHOT_AFTER
+    if not db_path.is_file():
+        residual = [
+            f"durable browser DB {db_path} missing; cannot prove queue isolation"
+        ]
+        snapshot = {
+            "file": _bridge_state_rel_identifier(db_path),
+            "sha256": None,
+            "residual": residual,
+        }
+        if after:
+            _DURABLE_BROWSER_SNAPSHOT_AFTER = snapshot
+        else:
+            _DURABLE_BROWSER_SNAPSHOT = snapshot
+        return residual
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True, timeout=5
+        )
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        required = {"browser_acquisitions", "browser_task_consumers"}
+        missing = sorted(required - tables)
+        if missing:
+            residual = [
+                "durable browser DB missing required table(s): " + ", ".join(missing)
+            ]
+        else:
+            residual = []
+            acquisitions = connection.execute(
+                "SELECT id, state FROM browser_acquisitions "
+                "WHERE state IN ('queued', 'claimed', 'completing') "
+                "ORDER BY created_at, id"
+            ).fetchall()
+            consumers = connection.execute(
+                "SELECT c.id, c.acquisition_id FROM browser_task_consumers c "
+                "JOIN browser_acquisitions a ON a.id = c.acquisition_id "
+                "WHERE c.state = 'active' "
+                "AND a.state IN ('queued', 'claimed', 'completing') "
+                "ORDER BY c.created_at, c.id"
+            ).fetchall()
+            residual.extend(
+                f"durable acquisition {row[0]} state={row[1]} is pending"
+                for row in acquisitions
+            )
+            residual.extend(
+                f"durable consumer {row[0]} references acquisition {row[1]}"
+                for row in consumers
+            )
+        connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        residual = [
+            f"durable browser DB {db_path} query failed "
+            f"({exc.__class__.__name__}); cannot prove queue isolation"
+        ]
+        if connection is not None:
+            connection.close()
+    snapshot = {
+        "file": _bridge_state_rel_identifier(db_path),
+        "sha256": _sha256_file(db_path),
+        "residual": list(residual),
+    }
+    if after:
+        _DURABLE_BROWSER_SNAPSHOT_AFTER = snapshot
+    else:
+        _DURABLE_BROWSER_SNAPSHOT = snapshot
+    return residual
+
+
+def _durable_browser_task_lease_preflight(db_path: Path) -> list[str]:
+    return _durable_browser_task_lease_validate(db_path, after=False)
+
+
+def _durable_browser_task_postcheck(db_path: Path) -> list[str]:
+    return _durable_browser_task_lease_validate(db_path, after=True)
+
+
+def _resolve_durable_browser_database_url(explicit: str | None = None) -> str | None:
+    """Resolve only an explicitly approved PostgreSQL authority.
+
+    A remote ``DATABASE_URL`` is never silently replaced with the repository's
+    local SQLite file.  The dedicated env var is useful for supervised gate
+    runners that do not want a secret-bearing DSN in argv; an explicit CLI
+    value has precedence and is never copied into evidence.
+    """
+    value = (
+        explicit
+        or os.environ.get("TRIPCHORD_DONE_GATE_DURABLE_DATABASE_URL")
+        or os.environ.get("TRIPCHORD_DATABASE_URL")
+        or os.environ.get("DATABASE_URL")
+    )
+    if value and value.startswith(("postgresql://", "postgres://")):
+        return value
+    if value and value.startswith("postgresql+asyncpg://"):
+        return "postgresql://" + value.removeprefix("postgresql+asyncpg://")
+    return None
+
+
+def _postgres_live_state_lease_validate(
+    database_url: str, *, after: bool = False
+) -> list[str]:
+    """Query the approved PostgreSQL authority without exposing its DSN."""
+    global _DURABLE_BROWSER_SNAPSHOT, _DURABLE_BROWSER_SNAPSHOT_AFTER
+    authority_id = hashlib.sha256(database_url.encode("utf-8")).hexdigest()
+
+    async def query() -> list[str]:
+        try:
+            import asyncpg
+
+            connection = await asyncpg.connect(database_url, timeout=5)
+            try:
+                rows = await connection.fetch(
+                    "SELECT id, status FROM jobs "
+                    "WHERE status IN ('queued', 'running') ORDER BY id"
+                )
+                acquisitions = await connection.fetch(
+                    "SELECT id, state FROM browser_acquisitions "
+                    "WHERE state IN ('queued', 'claimed', 'completing') ORDER BY id"
+                )
+                consumers = await connection.fetch(
+                    "SELECT c.id, c.acquisition_id "
+                    "FROM browser_task_consumers c "
+                    "JOIN browser_acquisitions a ON a.id = c.acquisition_id "
+                    "WHERE c.state = 'active' "
+                    "AND a.state IN ('queued', 'claimed', 'completing') "
+                    "ORDER BY c.id"
+                )
+            finally:
+                await connection.close()
+        except Exception as exc:
+            return [
+                "approved durable PostgreSQL authority query failed "
+                f"({exc.__class__.__name__}); cannot prove queue isolation"
+            ]
+        return [
+            *(f"job {row['id']} status={row['status']} is pending" for row in rows),
+            *(
+                f"durable acquisition {row['id']} state={row['state']} is pending"
+                for row in acquisitions
+            ),
+            *(
+                f"durable consumer {row['id']} references acquisition "
+                f"{row['acquisition_id']}"
+                for row in consumers
+            ),
+        ]
+
+    try:
+        residual = asyncio.run(query())
+    except (RuntimeError, OSError) as exc:
+        residual = [
+            "approved durable PostgreSQL authority query failed "
+            f"({exc.__class__.__name__}); cannot prove queue isolation"
+        ]
+    snapshot = {
+        "file": f"postgresql-authority-{authority_id}",
+        "sha256": authority_id,
+        "residual": list(residual),
+    }
+    if after:
+        _DURABLE_BROWSER_SNAPSHOT_AFTER = snapshot
+    else:
+        _DURABLE_BROWSER_SNAPSHOT = snapshot
     return residual
 
 
@@ -4882,6 +5085,21 @@ def _bridge_state_binding() -> dict[str, Any]:
     that snapshot is returned; otherwise the file is re-read (direct-call /
     fallback path).
     """
+    if _durable_browser_mode():
+        snapshot = _DURABLE_BROWSER_SNAPSHOT
+        path = _resolve_live_state_db()
+        rel_id = _bridge_state_rel_identifier(path)
+        if snapshot is not None and snapshot.get("file") == rel_id:
+            return {
+                "file": snapshot["file"],
+                "sha256": snapshot.get("sha256"),
+                "residual": list(snapshot.get("residual") or ()),
+            }
+        return {
+            "file": rel_id,
+            "sha256": _sha256_file(path) if path.is_file() else None,
+            "residual": [],
+        }
     path = _resolve_bridge_state_path()
     rel_id = _bridge_state_rel_identifier(path)
     snapshot = _BRIDGE_STATE_SNAPSHOT
@@ -4914,6 +5132,21 @@ def _bridge_state_after_binding() -> dict[str, Any]:
     currently-resolved path, that snapshot is returned; otherwise the file is
     re-read (direct-call / fallback path).
     """
+    if _durable_browser_mode():
+        snapshot = _DURABLE_BROWSER_SNAPSHOT_AFTER
+        path = _resolve_live_state_db()
+        rel_id = _bridge_state_rel_identifier(path)
+        if snapshot is not None and snapshot.get("file") == rel_id:
+            return {
+                "file": snapshot["file"],
+                "sha256": snapshot.get("sha256"),
+                "residual": list(snapshot.get("residual") or ()),
+            }
+        return {
+            "file": rel_id,
+            "sha256": _sha256_file(path) if path.is_file() else None,
+            "residual": [],
+        }
     path = _resolve_bridge_state_path()
     rel_id = _bridge_state_rel_identifier(path)
     snapshot = _BRIDGE_STATE_SNAPSHOT_AFTER
@@ -5303,6 +5536,7 @@ def layer6_full_e2e(
     *,
     run_id: str,
     live_state_db: Path | None = None,
+    durable_browser_database_url: str | None = None,
 ) -> LayerResult:
     """Full-platform real E2E only when every external condition is met.
 
@@ -5346,14 +5580,23 @@ def layer6_full_e2e(
                 "authorise the bounded live model cost, then re-run"
             ),
         )
-    # C-118: the residual-lease gate reads BOTH the planning job store AND the
-    # persisted Browser-Bridge state JSON.  The bridge keeps its own queued/
-    # claimed task and pending-reorder state outside the ``jobs`` table, so a
-    # fresh live run must not start while either holds in-flight work.
-    lease_problems = _live_state_lease_preflight(
-        _resolve_live_state_db(live_state_db)
+    # C-118: the residual-lease gate reads planning jobs plus the queue that
+    # the running bridge actually owns.  Durable mode has no authoritative
+    # JSON queue, so bind both checks to the same local database instead.
+    resolved_live_db = _resolve_live_state_db(live_state_db)
+    approved_pg_url = (
+        _resolve_durable_browser_database_url(durable_browser_database_url)
+        if _durable_browser_mode()
+        else None
     )
-    lease_problems += _bridge_state_lease_preflight()
+    if _durable_browser_mode() and approved_pg_url is not None:
+        lease_problems = _postgres_live_state_lease_validate(approved_pg_url)
+    elif _durable_browser_mode():
+        lease_problems = _live_state_lease_preflight(resolved_live_db)
+        lease_problems += _durable_browser_task_lease_preflight(resolved_live_db)
+    else:
+        lease_problems = _live_state_lease_preflight(resolved_live_db)
+        lease_problems += _bridge_state_lease_preflight()
     if lease_problems:
         return LayerResult(
             name="6_full_e2e",
@@ -5387,7 +5630,14 @@ def layer6_full_e2e(
     # AFTER the run completes and require it to hold no residual queued/claimed
     # work or pending reorder — the E2E must consume its own lease.  The compact
     # certifies this post-run binding alongside the pre-run preflight binding.
-    postcheck_problems = _bridge_state_postcheck()
+    if _durable_browser_mode() and approved_pg_url is not None:
+        postcheck_problems = _postgres_live_state_lease_validate(
+            approved_pg_url, after=True
+        )
+    elif _durable_browser_mode():
+        postcheck_problems = _durable_browser_task_postcheck(resolved_live_db)
+    else:
+        postcheck_problems = _bridge_state_postcheck()
     if postcheck_problems:
         mismatches.append(
             "bridge-state postcheck failed (residual queued/claimed work or "
@@ -5601,6 +5851,7 @@ def run_gate(
     commit: str | None = None,
     run_id: str | None = None,
     live_state_db: Path | None = None,
+    durable_browser_database_url: str | None = None,
 ) -> GateReport:
     """Run all six layers and return the report.
 
@@ -5641,6 +5892,7 @@ def run_gate(
             start,
             run_id=resolved_run_id,
             live_state_db=live_state_db,
+            durable_browser_database_url=durable_browser_database_url,
         ),
     ]
     # B1 secret scan: bridge token + model API keys must never reach logs or
@@ -11168,6 +11420,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--durable-browser-database-url",
+        default=None,
+        help=(
+            "explicit approved PostgreSQL authority for durable browser and "
+            "planning lease checks; its secret-bearing value is never written "
+            "to evidence (the TRIPCHORD_DONE_GATE_DURABLE_DATABASE_URL env var "
+            "is preferred for supervised runs)"
+        ),
+    )
+    parser.add_argument(
         "--commit-evidence",
         action="store_true",
         help=(
@@ -11282,6 +11544,7 @@ def main(argv: list[str] | None = None) -> int:
             commit=args.commit,
             run_id=run_id,
             live_state_db=args.live_state_db,
+            durable_browser_database_url=args.durable_browser_database_url,
         )
     except (GateStateChangedError, OSError) as exc:
         if args.quiet:

@@ -1272,6 +1272,19 @@
       start_date: value.start_date || null,
       end_date: value.end_date || null,
       adults: Number.isInteger(value.adults) ? value.adults : null,
+      children: Number.isInteger(value.children) ? value.children : null,
+      children_ages: Array.isArray(value.children_ages)
+        ? value.children_ages.filter((age) => Number.isInteger(age))
+        : [],
+      infants: Number.isInteger(value.infants) ? value.infants : null,
+      party_shape_supported:
+        typeof value.party_shape_supported === "boolean"
+          ? value.party_shape_supported
+          : null,
+      party_shape_failure:
+        typeof value.party_shape_failure === "string"
+          ? value.party_shape_failure
+          : null,
       rooms: Number.isInteger(value.rooms) ? value.rooms : null,
       currency: value.currency || null,
       origin_code: value.origin_code || null,
@@ -10051,10 +10064,18 @@
       action_trace: actionTrace,
       outbound_leg: outboundLeg,
       return_leg: returnLeg,
-      outbound_flight_numbers: outboundFlightNumbers,
-      return_flight_numbers: returnFlightNumbers,
-      outbound_segments: outboundSegments,
-      return_segments: returnSegments,
+      ...(outboundFlightNumbers.length
+        ? { outbound_flight_numbers: outboundFlightNumbers }
+        : {}),
+      ...(returnFlightNumbers.length
+        ? { return_flight_numbers: returnFlightNumbers }
+        : {}),
+      ...(outboundSegments.length
+        ? { outbound_segments: outboundSegments }
+        : {}),
+      ...(returnSegments.length
+        ? { return_segments: returnSegments }
+        : {}),
       outbound_route_evidence: outboundRouteEvidence,
       return_route_evidence: returnRouteEvidence,
     };
@@ -10634,6 +10655,19 @@
     const carrier =
       visibleCarrier ||
       (["ctrip", "tongcheng"].includes(provider) ? driverCarrier : null);
+    const outboundFlightNumbers = qunarVisibleFlightNumbers(
+      `${summaryText} ${cleanText(
+        effectiveDriver &&
+        effectiveDriver.selected_outbound &&
+        effectiveDriver.selected_outbound.selection_evidence,
+      )} ${cleanText(
+        effectiveDriver &&
+        Array.isArray(effectiveDriver.action_trace) &&
+        effectiveDriver.action_trace.find(
+          (entry) => entry && entry.action === "select_outbound",
+        )?.evidence,
+      )}`,
+    );
     if (
       !outboundLeg ||
       !outboundRouteEvidence ||
@@ -10681,6 +10715,13 @@
         continue;
       }
       const returnCarrier = flightCarrierText(card) || carrier;
+      const returnFlightNumbers = qunarVisibleFlightNumbers(
+        `${cleanText(card.textContent)} ${cleanText(
+          effectiveDriver &&
+          effectiveDriver.selected_return &&
+          effectiveDriver.selected_return.selection_evidence,
+        )}`,
+      );
       const quote = await flightQuoteFromCombination({
         provider,
         root: card,
@@ -10696,6 +10737,8 @@
         availabilityEvidence,
         outboundLeg,
         returnLeg,
+        outboundFlightNumbers,
+        returnFlightNumbers,
         outboundRouteEvidence,
         returnRouteEvidence,
         selectionEvidence: sanitizeDiagnosticText(summaryText),
@@ -10742,6 +10785,19 @@
       "selected_outbound_summary",
     );
     const outboundCarrier = tongchengSelectedOutboundCarrier(summary);
+    const outboundFlightNumbers = qunarVisibleFlightNumbers(
+      `${summaryText} ${cleanText(
+        effectiveDriver &&
+        effectiveDriver.selected_outbound &&
+        effectiveDriver.selected_outbound.selection_evidence,
+      )} ${cleanText(
+        effectiveDriver &&
+        Array.isArray(effectiveDriver.action_trace) &&
+        effectiveDriver.action_trace.find(
+          (entry) => entry && entry.action === "select_outbound",
+        )?.evidence,
+      )}`,
+    );
     if (
       !outboundLeg ||
       !outboundRoute ||
@@ -10779,6 +10835,9 @@
         "return_card",
       );
       const returnCarrier = card && flightCarrierText(card);
+      const returnFlightNumbers = qunarVisibleFlightNumbers(
+        `${cardText} ${cleanText(selectedReturn.selection_evidence)}`,
+      );
       if (
         !card ||
         !returnLeg ||
@@ -10847,6 +10906,8 @@
             "visible_enabled_预订_control_observed_not_clicked",
           outboundLeg,
           returnLeg,
+          outboundFlightNumbers,
+          returnFlightNumbers,
           outboundRouteEvidence: outboundRoute,
           returnRouteEvidence: returnRoute,
           selectionEvidence:

@@ -121,11 +121,29 @@ class BrowserQuoteNormalizer:
     _BROWSER_OMITTED_ORCHESTRATION_OPTION_KEYS = frozenset(
         {
             "__tripchord_allow_recent_quote_reuse",
+            "__tripchord_ledger_terminal_retention",
             "__tripchord_reuse_exact_result_tab",
             "gateway_destination",
             "stay_area_search_profile",
             "stay_plan_candidate_set",
         }
+    )
+    _BROWSER_QUERY_EVIDENCE_KEYS = (
+        "origin",
+        "destination",
+        "start_date",
+        "end_date",
+        "adults",
+        "children",
+        "children_ages",
+        "infants",
+        "party_shape_supported",
+        "party_shape_failure",
+        "rooms",
+        "currency",
+        "origin_code",
+        "destination_code",
+        "search_url",
     )
     _AUDITED_CTRIP_PROPERTY_SEEDS: ClassVar[
         dict[str, tuple[str, str, frozenset[str]]]
@@ -551,18 +569,45 @@ class BrowserQuoteNormalizer:
                 field="query",
             )
         full_expected_snapshot = query.model_dump(mode="json")
-        expected_snapshot = json.loads(json.dumps(full_expected_snapshot))
-        # The companion intentionally emits the smallest query evidence needed
-        # to bind a visible browser quote.  Planner-only objects can be large and
-        # are never read by the browser, so requiring them here both expands the
-        # extension trust boundary and rejects an otherwise exact quote.  Keep
-        # every browser-driving option fail-closed; omit only this audited set of
-        # orchestration metadata, mirroring parser.js safeOptions().
-        expected_options = expected_snapshot.get("options")
-        if isinstance(expected_options, dict):
-            for key in self._BROWSER_OMITTED_ORCHESTRATION_OPTION_KEYS:
-                expected_options.pop(key, None)
-        if snapshot not in (full_expected_snapshot, expected_snapshot):
+        # Mirror parser.js safeQuery(): bind every browser-driving party and
+        # route field while keeping planner-only orchestration objects outside
+        # the extension trust boundary.
+        expected_snapshot = {
+            key: full_expected_snapshot.get(key)
+            for key in self._BROWSER_QUERY_EVIDENCE_KEYS
+        }
+        raw_options = full_expected_snapshot.get("options")
+        expected_options = (
+            json.loads(json.dumps(raw_options))
+            if isinstance(raw_options, dict)
+            else {}
+        )
+        for key in self._BROWSER_OMITTED_ORCHESTRATION_OPTION_KEYS:
+            expected_options.pop(key, None)
+        expected_snapshot["options"] = expected_options
+        allowed_snapshots = [full_expected_snapshot, expected_snapshot]
+        # Builds before the mixed-party fields were added emitted the same
+        # minimal snapshot without zero/default party-shape values.  That shape
+        # is equivalent only for the two-adult/default case; mixed parties stay
+        # fail-closed.
+        if (
+            query.children == 0
+            and not query.children_ages
+            and query.infants == 0
+            and query.party_shape_supported
+            and query.party_shape_failure is None
+        ):
+            legacy_snapshot = dict(expected_snapshot)
+            for key in (
+                "children",
+                "children_ages",
+                "infants",
+                "party_shape_supported",
+                "party_shape_failure",
+            ):
+                legacy_snapshot.pop(key, None)
+            allowed_snapshots.append(legacy_snapshot)
+        if snapshot not in allowed_snapshots:
             raise _RejectNormalization(
                 QuoteNormalizationCode.QUERY_CONTEXT_MISMATCH,
                 "quote query snapshot differs from the submitted search",

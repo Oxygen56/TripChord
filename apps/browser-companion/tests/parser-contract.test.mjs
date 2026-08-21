@@ -1165,6 +1165,12 @@ assert.equal(
     ["MU6550", "MU235"],
   );
   assert.deepEqual(
+    parserHooks.qunarVisibleFlightNumbers(
+      "新海航｜首都航空JD5907 空客A321（中）JD455 空客A330（大）",
+    ),
+    ["JD5907", "JD455"],
+  );
+  assert.deepEqual(
     parserHooks.qunarDirectFlightSegment(
       { textContent: visibleConnection },
       {
