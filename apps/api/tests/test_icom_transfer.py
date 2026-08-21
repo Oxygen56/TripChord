@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -20,6 +20,7 @@ from tripchord.providers.icom_transfer import (
     IComTransferOption,
     IComTransferProvider,
     IComTransferQuery,
+    fetch_icom_cny_reference_estimate,
     to_package_transfer_option,
 )
 
@@ -575,3 +576,37 @@ async def test_loopback_transport_preserves_canonical_icom_evidence_url() -> Non
     assert parsed.hostname == "sfs-api.icomtours.com"
     assert "127.0.0.1" not in packaged.detail_url
     assert packaged.detail_url == option.source_url
+
+
+@pytest.mark.asyncio
+async def test_icom_usd_base_fare_gets_bounded_ecb_cny_reference_estimate() -> None:
+    payload = b"""<?xml version='1.0' encoding='UTF-8'?>
+    <gesmes:Envelope xmlns:gesmes='http://www.gesmes.org/xml/2002-08-01'
+      xmlns='http://www.ecb.int/vocabulary/2002-08-01/eurofxref'>
+      <Cube><Cube time='2026-08-21'>
+        <Cube currency='USD' rate='1.1699'/>
+        <Cube currency='CNY' rate='7.8624'/>
+      </Cube></Cube>
+    </gesmes:Envelope>"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == (
+            "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+        )
+        return httpx.Response(200, content=payload, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        estimate = await fetch_icom_cny_reference_estimate(
+            source_usd_base_fare_cents=12_000,
+            price_contract_ids=("icom:outbound", "icom:return"),
+            transfer_ids=("icom:trip:7989", "icom:trip:8564"),
+            client=client,
+            now=lambda: datetime(2026, 8, 22, 2, 30, tzinfo=UTC),
+        )
+
+    assert estimate.rate_date == date(2026, 8, 21)
+    assert estimate.usd_to_cny_reference_rate == Decimal("6.720574")
+    assert estimate.source_usd_base_fare_cents == 12_000
+    assert estimate.estimated_cny_cents == 80_647
+    assert estimate.taxes_and_fees_included is None
+    assert len(estimate.response_sha256) == 64

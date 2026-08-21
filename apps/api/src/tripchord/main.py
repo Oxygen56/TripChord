@@ -220,7 +220,7 @@ from tripchord.platform.terminal import SearchRun
 from tripchord.platform.wiring_api import router as wiring_api_router
 from tripchord.providers.amap import AmapTravelDataProvider
 from tripchord.providers.arena_official import ArenaOfficialLodgingProvider
-from tripchord.providers.base import OfferSearchQuery, OfferSearchResult
+from tripchord.providers.base import OfferSearchQuery, OfferSearchResult, ProviderError
 from tripchord.providers.browser_bridge import (
     BRIDGE_TOKEN_HEADER,
     CONTROL_TOKEN_HEADER,
@@ -232,7 +232,10 @@ from tripchord.providers.browser_bridge import (
     is_loopback_client,
 )
 from tripchord.providers.factory import build_amap_provider, build_provider_registry
-from tripchord.providers.icom_transfer import IComTransferProvider
+from tripchord.providers.icom_transfer import (
+    IComTransferProvider,
+    fetch_icom_cny_reference_estimate,
+)
 from tripchord.providers.user_snapshot import UserQuoteInput
 from tripchord.rate_limit import RateLimiter
 from tripchord.runtime_provenance import PROVENANCE
@@ -3630,6 +3633,45 @@ async def cancel_live_flexible_from_text_job_endpoint(
     return job
 
 
+async def _attach_icom_cny_reference_estimate(
+    run: LivePackageAgentRun,
+) -> LivePackageAgentRun:
+    """Attach a display-only ECB estimate without changing package truth."""
+
+    if run.decision.state != PackageDecisionState.ACCEPT or run.package is None:
+        return run
+    budget = run.package.budget
+    if budget.is_all_in_total or budget.foreign_currency_subtotals:
+        return run
+    supplemental = tuple(
+        item
+        for item in budget.supplemental_published_base_fares
+        if item.currency == "USD"
+    )
+    if len(supplemental) != 1:
+        return run
+    source = supplemental[0]
+    try:
+        estimate = await fetch_icom_cny_reference_estimate(
+            source_usd_base_fare_cents=source.total_for_party_cents,
+            price_contract_ids=source.price_contract_ids,
+            transfer_ids=source.transfer_ids,
+        )
+    except ProviderError as exc:
+        logger.warning(
+            "iCom CNY reference estimate unavailable: provider=%s code=%s",
+            exc.provider,
+            exc.code,
+        )
+        return run
+    return LivePackageAgentRun.model_validate(
+        {
+            **run.model_dump(mode="python"),
+            "icom_cny_reference_estimate": estimate,
+        }
+    )
+
+
 @app.post("/api/v1/agents/live-plan", response_model=LiveAgentPlanningResponse)
 async def live_agent_plan_endpoint(
     request: LiveAgentPlanningRequest,
@@ -3667,21 +3709,7 @@ async def live_agent_plan_endpoint(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
-    # The legacy loopback route must never publish an ACCEPT-shaped partial
-    # CNY package.  The flexible route owns incomplete diagnostics; this
-    # public contract is fail-closed until every party amount is all-in.
-    if (
-        run.decision.state == PackageDecisionState.ACCEPT
-        and (
-            run.package is None
-            or run.package.budget.currency != "CNY"
-            or not run.package.budget.is_all_in_total
-        )
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="legacy live-plan cannot publish an incomplete non-all-in CNY package",
-        )
+    run = await _attach_icom_cny_reference_estimate(run)
     run_id, expires_at = await cache.put(principal.tenant_id, run)
     return LiveAgentPlanningResponse(
         run_id=run_id,

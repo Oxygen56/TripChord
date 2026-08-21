@@ -193,6 +193,7 @@ from tripchord.providers.browser_bridge import (
     trusted_search_url_contract,
 )
 from tripchord.providers.icom_transfer import (
+    IComCnyReferenceEstimate,
     IComLocation,
     IComTransferQuery,
     IComTransferSearchResult,
@@ -1049,6 +1050,7 @@ class LivePackageAgentRun(DomainModel):
     memory_candidates: MemoryCurationProposal | None = None
     lodging_strategy_comparisons: tuple[LodgingStrategyComparison, ...] = ()
     daily_schedule: tuple[DailyScheduleEntry, ...] = ()
+    icom_cny_reference_estimate: IComCnyReferenceEstimate | None = None
     browser_max_concurrency: int = Field(
         default=_BROWSER_MAX_CONCURRENCY,
         ge=_BROWSER_MAX_CONCURRENCY,
@@ -1080,6 +1082,29 @@ class LivePackageAgentRun(DomainModel):
 
     @model_validator(mode="after")
     def validate_evidence_scope(self) -> LivePackageAgentRun:
+        if self.icom_cny_reference_estimate is not None:
+            if self.decision.state != PackageDecisionState.ACCEPT or self.package is None:
+                raise PydanticCustomError(
+                    "live_run_icom_cny_estimate_without_accepted_package",
+                    "iCom CNY estimate requires an accepted package",
+                )
+            supplemental = tuple(
+                item
+                for item in self.package.budget.supplemental_published_base_fares
+                if item.currency == "USD"
+            )
+            estimate = self.icom_cny_reference_estimate
+            if (
+                len(supplemental) != 1
+                or supplemental[0].total_for_party_cents
+                != estimate.source_usd_base_fare_cents
+                or supplemental[0].price_contract_ids != estimate.price_contract_ids
+                or supplemental[0].transfer_ids != estimate.transfer_ids
+            ):
+                raise PydanticCustomError(
+                    "live_run_icom_cny_estimate_binding_mismatch",
+                    "iCom CNY estimate must bind the selected USD supplemental fare",
+                )
         if self.candidate_shard_merge_audit is not None:
             if self.candidate_scale_directive is None:
                 raise PydanticCustomError(

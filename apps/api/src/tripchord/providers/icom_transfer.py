@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any, Literal, TypeVar
 from urllib.parse import parse_qs, urlsplit
@@ -40,6 +41,11 @@ _API_ORIGIN = f"https://{_API_HOST}"
 _OPERATOR = "iCom Tours"
 _MVT = timezone(timedelta(hours=5), name="MVT")
 _FORBIDDEN_PATH_WORDS = frozenset({"booking", "payment", "order"})
+_ECB_DAILY_REFERENCE_URL = (
+    "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+)
+_ECB_MAX_RESPONSE_BYTES = 128_000
+_ECB_RATE_QUANTUM = Decimal("0.000001")
 
 
 class _Endpoint(StrEnum):
@@ -123,6 +129,51 @@ class IComCurrencyPolicyEvidence(DomainModel):
     evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     response_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     captured_at: AwareDatetime
+
+
+class IComCnyReferenceEstimate(DomainModel):
+    """Display-only CNY estimate for an observed iCom USD base fare."""
+
+    schema_version: Literal["tripchord-icom-cny-reference-estimate-v1"] = (
+        "tripchord-icom-cny-reference-estimate-v1"
+    )
+    source_name: Literal["European Central Bank"] = "European Central Bank"
+    source_url: Literal[
+        "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+    ] = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+    rate_date: date
+    captured_at: AwareDatetime
+    usd_per_eur: Decimal = Field(gt=0)
+    cny_per_eur: Decimal = Field(gt=0)
+    usd_to_cny_reference_rate: Decimal = Field(gt=0)
+    source_usd_base_fare_cents: int = Field(ge=0)
+    estimated_cny_cents: int = Field(ge=0)
+    price_contract_ids: tuple[str, ...] = Field(min_length=1)
+    transfer_ids: tuple[str, ...] = Field(min_length=1)
+    taxes_and_fees_included: None = None
+    response_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    boundary: str = (
+        "仅按欧洲央行参考汇率换算已观察到的 iCom 美元基础价；"
+        "不是交易汇率、不是税费证明，也不是结算锁价。"
+    )
+
+    @model_validator(mode="after")
+    def validate_reference_calculation(self) -> IComCnyReferenceEstimate:
+        expected_rate = (self.cny_per_eur / self.usd_per_eur).quantize(
+            _ECB_RATE_QUANTUM,
+            rounding=ROUND_HALF_UP,
+        )
+        if self.usd_to_cny_reference_rate != expected_rate:
+            raise ValueError("USD/CNY reference rate does not reconcile with ECB cross rates")
+        expected_cny_cents = int(
+            (
+                Decimal(self.source_usd_base_fare_cents)
+                * self.usd_to_cny_reference_rate
+            ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
+        if self.estimated_cny_cents != expected_cny_cents:
+            raise ValueError("iCom CNY estimate does not reconcile with source USD cents")
+        return self
 
 
 class IComTransferOption(DomainModel):
@@ -393,6 +444,148 @@ class _FetchedPayload:
 
 
 PayloadT = TypeVar("PayloadT", bound=BaseModel)
+
+
+async def fetch_icom_cny_reference_estimate(
+    *,
+    source_usd_base_fare_cents: int,
+    price_contract_ids: tuple[str, ...],
+    transfer_ids: tuple[str, ...],
+    client: httpx.AsyncClient | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> IComCnyReferenceEstimate:
+    """Fetch one official daily cross-rate for an iCom display estimate.
+
+    The source publishes EUR-base reference rates. USD/CNY is therefore
+    derived as CNY-per-EUR divided by USD-per-EUR. This helper neither changes
+    the iCom quote nor claims its unknown taxes are included.
+    """
+
+    if source_usd_base_fare_cents < 0:
+        raise ValueError("iCom USD base fare cents cannot be negative")
+    if not price_contract_ids or not transfer_ids:
+        raise ValueError("iCom CNY estimate requires bound contracts and transfers")
+    captured_at = (now or (lambda: datetime.now(UTC)))()
+    if captured_at.tzinfo is None:
+        raise ValueError("iCom CNY estimate capture time must be timezone-aware")
+    captured_at = captured_at.astimezone(UTC)
+    owned_client = client is None
+    http_client = client or httpx.AsyncClient(
+        timeout=8,
+        follow_redirects=False,
+        headers={"user-agent": "TripChord/0.1 (+read-only ECB reference-rate estimate)"},
+    )
+    try:
+        try:
+            response = await http_client.get(
+                _ECB_DAILY_REFERENCE_URL,
+                headers={"accept": "application/xml,text/xml"},
+            )
+        except httpx.TimeoutException as exc:
+            raise ProviderError(
+                "ecb-reference-rate",
+                "timeout",
+                "ECB daily reference-rate read timed out",
+                retryable=True,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError(
+                "ecb-reference-rate",
+                "network_error",
+                f"ECB daily reference-rate read failed: {type(exc).__name__}",
+                retryable=True,
+            ) from exc
+        if response.history or str(response.url) != _ECB_DAILY_REFERENCE_URL:
+            raise ProviderError(
+                "ecb-reference-rate",
+                "redirect_forbidden",
+                "ECB reference-rate source redirected away from the audited URL",
+            )
+        if response.status_code != 200:
+            raise ProviderError(
+                "ecb-reference-rate",
+                "http_status",
+                f"ECB reference-rate source returned HTTP {response.status_code}",
+                retryable=response.status_code >= 500,
+            )
+        payload = response.content
+        if not payload or len(payload) > _ECB_MAX_RESPONSE_BYTES:
+            raise ProviderError(
+                "ecb-reference-rate",
+                "response_size",
+                "ECB reference-rate response was empty or exceeded the bounded size",
+            )
+        try:
+            root = ET.fromstring(payload)
+        except ET.ParseError as exc:
+            raise ProviderError(
+                "ecb-reference-rate",
+                "invalid_xml",
+                "ECB reference-rate response was not valid XML",
+            ) from exc
+        day_node = next(
+            (
+                node
+                for node in root.iter()
+                if node.tag.endswith("Cube") and "time" in node.attrib
+            ),
+            None,
+        )
+        if day_node is None:
+            raise ProviderError(
+                "ecb-reference-rate",
+                "schema_drift",
+                "ECB reference-rate response did not contain a dated rate set",
+            )
+        try:
+            rate_date = date.fromisoformat(day_node.attrib["time"])
+            rates = {
+                node.attrib["currency"]: Decimal(node.attrib["rate"])
+                for node in day_node
+                if node.tag.endswith("Cube")
+                and "currency" in node.attrib
+                and "rate" in node.attrib
+            }
+            usd_per_eur = rates["USD"]
+            cny_per_eur = rates["CNY"]
+        except (KeyError, InvalidOperation, ValueError) as exc:
+            raise ProviderError(
+                "ecb-reference-rate",
+                "schema_drift",
+                "ECB reference-rate response lacked valid USD/CNY rates",
+            ) from exc
+        rate_age_days = (captured_at.date() - rate_date).days
+        if rate_age_days < 0 or rate_age_days > 4:
+            raise ProviderError(
+                "ecb-reference-rate",
+                "stale_rate",
+                "ECB reference-rate date was outside the four-day weekend-safe window",
+            )
+        reference_rate = (cny_per_eur / usd_per_eur).quantize(
+            _ECB_RATE_QUANTUM,
+            rounding=ROUND_HALF_UP,
+        )
+        estimated_cny_cents = int(
+            (Decimal(source_usd_base_fare_cents) * reference_rate).quantize(
+                Decimal("1"),
+                rounding=ROUND_HALF_UP,
+            )
+        )
+        return IComCnyReferenceEstimate(
+            rate_date=rate_date,
+            captured_at=captured_at,
+            usd_per_eur=usd_per_eur,
+            cny_per_eur=cny_per_eur,
+            usd_to_cny_reference_rate=reference_rate,
+            source_usd_base_fare_cents=source_usd_base_fare_cents,
+            estimated_cny_cents=estimated_cny_cents,
+            price_contract_ids=price_contract_ids,
+            transfer_ids=transfer_ids,
+            response_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+    finally:
+        if owned_client:
+            await http_client.aclose()
 
 
 class IComTransferProvider:

@@ -61,6 +61,7 @@ from tripchord.providers.browser_bridge import (
     BrowserSearchQuery,
     _is_allowed_provider_url,
 )
+from tripchord.providers.icom_transfer import IComCnyReferenceEstimate
 from tripchord.providers.user_snapshot import UserQuoteInput, import_user_quote
 
 
@@ -358,6 +359,7 @@ class FinalFlightProjection(ApiModel):
     return_flight_numbers: tuple[str, ...] = ()
     return_depart_at: datetime
     return_arrive_at: datetime
+    total_for_party_cents: int | None = None
     display_amount_cents: int | None = None
     party_total_known: bool = True
     price_basis: str = "total_party"
@@ -386,6 +388,10 @@ class FinalTransferProjection(ApiModel):
     schedule_mode: str
     depart_at: datetime | None = None
     arrive_at: datetime | None = None
+    currency: str | None = None
+    total_for_party_cents: int | None = None
+    taxes_and_fees_included: bool | None = None
+    price_guarantee: str | None = None
 
 
 class FinalPlanProjection(ApiModel):
@@ -398,6 +404,10 @@ class FinalPlanProjection(ApiModel):
     departure_date: date
     return_date: date
     total_budget_cents: int | None = None
+    confirmed_cny_subtotal_cents: int | None = None
+    estimated_icom_transfer_cny_cents: int | None = None
+    estimated_total_cny_cents: int | None = None
+    icom_cny_reference_estimate: IComCnyReferenceEstimate | None = None
     optimality_status: str
     claim_boundary: str
     flight_component_id: str | None = None
@@ -489,11 +499,37 @@ def build_live_final_plan_projection(run: LivePackageAgentRun) -> FinalPlanProje
         and package.budget.currency == "CNY"
         and candidate.currency == "CNY"
     )
-    if not comparable:
-        return None
+    confirmed_cny_subtotal_cents = (
+        package.budget.confirmed_subtotal_cents
+        if package.budget.currency == "CNY" and candidate.currency == "CNY"
+        else None
+    )
+    reference_estimate = run.icom_cny_reference_estimate
+    estimated_icom_transfer_cny_cents = (
+        reference_estimate.estimated_cny_cents
+        if reference_estimate is not None
+        and not package.budget.foreign_currency_subtotals
+        else None
+    )
+    estimated_total_cny_cents = (
+        confirmed_cny_subtotal_cents + estimated_icom_transfer_cny_cents
+        if confirmed_cny_subtotal_cents is not None
+        and estimated_icom_transfer_cny_cents is not None
+        else None
+    )
     covered = tuple(source_id for item in run.coverage for source_id in item.successful_source_ids)
     failed = tuple(source_id for item in run.coverage for source_id in item.failed_source_ids)
-    unresolved = ["尚未获得全部人数、税费和币种一致的可比总价"] if not comparable else []
+    unresolved: list[str] = []
+    if not comparable:
+        if reference_estimate is not None:
+            unresolved.append(
+                "iCom 接驳人民币金额按欧洲央行参考汇率估算；税费可能浮动，"
+                "预计总价不是结算锁价。"
+            )
+        else:
+            unresolved.append(
+                "尚未取得 iCom 美元基础价的当日人民币参考估算；接驳税费仍未知。"
+            )
     if failed:
         unresolved.append("部分已连接来源未返回可用结果：" + "、".join(failed))
     for lodging in candidate.lodgings:
@@ -505,6 +541,10 @@ def build_live_final_plan_projection(run: LivePackageAgentRun) -> FinalPlanProje
         departure_date=run.intent.start_date,
         return_date=run.intent.end_date,
         total_budget_cents=package.budget.total_cents if comparable else None,
+        confirmed_cny_subtotal_cents=confirmed_cny_subtotal_cents,
+        estimated_icom_transfer_cny_cents=estimated_icom_transfer_cny_cents,
+        estimated_total_cny_cents=estimated_total_cny_cents,
+        icom_cny_reference_estimate=reference_estimate,
         optimality_status="best_verified",
         claim_boundary=run.claim_boundary,
         flight_component_id=candidate.flight.id if candidate.flight else None,
@@ -519,6 +559,11 @@ def build_live_final_plan_projection(run: LivePackageAgentRun) -> FinalPlanProje
             return_flight_numbers=candidate.flight.return_flight_numbers,
             return_depart_at=candidate.flight.return_depart_at,
             return_arrive_at=candidate.flight.return_arrive_at,
+            total_for_party_cents=(
+                candidate.flight.total_for_party_cents
+                if candidate.flight.party_total_known
+                else None
+            ),
             display_amount_cents=candidate.flight.display_amount_cents,
             party_total_known=candidate.flight.party_total_known,
             price_basis=candidate.flight.price_basis,
@@ -529,6 +574,8 @@ def build_live_final_plan_projection(run: LivePackageAgentRun) -> FinalPlanProje
             check_in=item.check_in, check_out=item.check_out, rooms=item.rooms,
             room_name=item.room_name, breakfast_included=item.breakfast_included,
             cancellation_policy=item.cancellation_policy,
+            display_total_cents=item.total_for_party_cents,
+            official_view_url=_trusted_quote_view_url(item),
         ) for item in candidate.lodgings),
         transfers=tuple(FinalTransferProjection(
             provider=item.provider, origin_area=item.origin_area.value,
@@ -536,11 +583,23 @@ def build_live_final_plan_projection(run: LivePackageAgentRun) -> FinalPlanProje
             schedule_mode=item.schedule_mode.value,
             depart_at=item.depart_at,
             arrive_at=item.arrive_at,
+            currency=item.currency,
+            total_for_party_cents=item.total_for_party_cents,
+            taxes_and_fees_included=item.taxes_and_fees_included,
+            price_guarantee=item.price_guarantee.value,
         ) for item in candidate.transfers),
         party={"adults": run.intent.adults, "children": run.intent.children,
                "infants": run.intent.infants, "rooms": run.intent.rooms},
         covered_source_ids=covered, failed_source_ids=failed,
-        price_comparability="complete_cny" if comparable else "total_not_comparable",
+        price_comparability=(
+            "complete_cny"
+            if comparable
+            else (
+                "confirmed_cny_subtotal_plus_icom_estimate"
+                if estimated_total_cny_cents is not None
+                else "confirmed_cny_subtotal"
+            )
+        ),
         unresolved_items=tuple(dict.fromkeys(unresolved)),
     )
 

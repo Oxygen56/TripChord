@@ -5,6 +5,7 @@ import importlib
 import json
 import stat
 from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -71,6 +72,7 @@ from tripchord.providers.browser_bridge import (
     BrowserSearchQuery,
     BrowserVertical,
 )
+from tripchord.providers.icom_transfer import IComCnyReferenceEstimate
 from tripchord.providers.quote_normalizer import (
     NormalizedBrowserQuoteResult,
     QuoteNormalizationStatus,
@@ -286,17 +288,114 @@ def _live_request_payload() -> dict[str, object]:
     }
 
 
-def test_live_final_projection_rejects_non_all_in_accept_package() -> None:
+def test_live_final_projection_separates_confirmed_subtotal_from_icom_estimate() -> None:
+    captured_at = datetime(2026, 8, 22, 2, 30, tzinfo=UTC)
+    flight = NormalizedFlightQuote(
+        id="flight-tongcheng-jd",
+        provider="tongcheng",
+        currency="CNY",
+        total_for_party_cents=820_200,
+        display_amount_cents=410_100,
+        party_total_known=True,
+        price_basis="per_person",
+        taxes_and_fees_included=True,
+        captured_at=captured_at,
+        expires_at=captured_at + timedelta(minutes=10),
+        availability=QuoteAvailability.AVAILABLE,
+        evidence_refs=("flight-party-comparison:sha256:" + "a" * 64,),
+        origin="杭州",
+        destination="马累",
+        adults=2,
+        outbound_depart_at=datetime(2026, 9, 3, 21, 45, tzinfo=UTC),
+        outbound_arrive_at=datetime(2026, 9, 4, 12, 20, tzinfo=UTC),
+        return_depart_at=datetime(2026, 9, 9, 23, 10, tzinfo=UTC),
+        return_arrive_at=datetime(2026, 9, 10, 9, 25, tzinfo=UTC),
+        outbound_flight_numbers=("JD5907", "JD455"),
+        return_flight_numbers=("JD456", "JD5908"),
+    )
+    lodging = NormalizedLodgingQuote(
+        id="lodging-kaani-beach",
+        provider="ctrip",
+        currency="CNY",
+        total_for_party_cents=248_500,
+        taxes_and_fees_included=True,
+        captured_at=captured_at,
+        expires_at=captured_at + timedelta(minutes=10),
+        availability=QuoteAvailability.AVAILABLE,
+        evidence_refs=(
+            "https://hotels.ctrip.com/hotels/detail/?hotelId=2192724",
+        ),
+        property_name="Kaani Beach Hotel",
+        area=PackageArea.DESTINATION_ISLAND,
+        check_in=date(2026, 9, 4),
+        check_out=date(2026, 9, 9),
+        adults=2,
+        rooms=1,
+        room_name="市景豪华间 - 带阳台",
+        breakfast_included=True,
+        cancellation_policy="免费取消",
+    )
+    transfer = SimpleNamespace(
+        id="icom:trip:7989",
+        provider="icom-public-transfer",
+        origin_area=PackageArea.AIRPORT,
+        destination_area=PackageArea.DESTINATION_ISLAND,
+        service_date=date(2026, 9, 4),
+        schedule_mode=SimpleNamespace(value="exact_departure"),
+        depart_at=datetime(2026, 9, 4, 15, 25, tzinfo=UTC),
+        arrive_at=datetime(2026, 9, 4, 16, 15, tzinfo=UTC),
+        currency="USD",
+        total_for_party_cents=6_000,
+        taxes_and_fees_included=None,
+        price_guarantee=SimpleNamespace(value="published_base_fare"),
+    )
+    estimate = IComCnyReferenceEstimate(
+        rate_date=date(2026, 8, 21),
+        captured_at=captured_at,
+        usd_per_eur=Decimal("1.1699"),
+        cny_per_eur=Decimal("7.8624"),
+        usd_to_cny_reference_rate=Decimal("6.720574"),
+        source_usd_base_fare_cents=12_000,
+        estimated_cny_cents=80_647,
+        price_contract_ids=("icom:outbound", "icom:return"),
+        transfer_ids=("icom:trip:7989", "icom:trip:8564"),
+        response_sha256="b" * 64,
+    )
     run = _blocked_live_run().model_copy(
         update={
             "decision": PackageDecision(state=PackageDecisionState.ACCEPT, summary="accepted"),
             "package": SimpleNamespace(
-                final_candidate=SimpleNamespace(currency="CNY"),
-                budget=SimpleNamespace(currency="CNY", is_all_in_total=False),
+                final_candidate=SimpleNamespace(
+                    id="candidate-maafushi",
+                    currency="CNY",
+                    flight=flight,
+                    lodgings=(lodging,),
+                    transfers=(transfer,),
+                ),
+                budget=SimpleNamespace(
+                    currency="CNY",
+                    is_all_in_total=False,
+                    total_cents=1_068_700,
+                    confirmed_subtotal_cents=1_068_700,
+                    foreign_currency_subtotals=(),
+                ),
             ),
+            "icom_cny_reference_estimate": estimate,
         }
     )
-    assert build_live_final_plan_projection(run) is None
+    plan = build_live_final_plan_projection(run)
+    assert plan is not None
+    assert plan.total_budget_cents is None
+    assert plan.flight is not None
+    assert plan.flight.display_amount_cents == 410_100
+    assert plan.flight.total_for_party_cents == 820_200
+    assert plan.lodgings[0].display_total_cents == 248_500
+    assert plan.confirmed_cny_subtotal_cents == 1_068_700
+    assert plan.estimated_icom_transfer_cny_cents == 80_647
+    assert plan.estimated_total_cny_cents == 1_149_347
+    assert plan.price_comparability == "confirmed_cny_subtotal_plus_icom_estimate"
+    assert plan.icom_cny_reference_estimate == estimate
+    assert any("税费可能浮动" in item for item in plan.unresolved_items)
 
 
 def test_live_agent_response_schema_strongly_types_final_plan() -> None:
@@ -665,11 +764,11 @@ def test_best_available_plan_joins_destination_and_airport_lodging_segments() ->
 
 
 @pytest.mark.asyncio
-async def test_legacy_live_plan_rejects_non_all_in_accept_without_caching(
+async def test_legacy_live_plan_caches_and_returns_non_all_in_accept(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_system = _FakeLiveSystem()
-    partial = _blocked_live_run().model_copy(
+    partial = _blocked_live_run(mode=LiveCoverageMode.DEGRADED).model_copy(
         update={
             "decision": PackageDecision(state=PackageDecisionState.ACCEPT, summary="accepted"),
             "package": SimpleNamespace(
@@ -684,18 +783,29 @@ async def test_legacy_live_plan_rejects_non_all_in_accept_without_caching(
         fake_system.run_calls += 1
         return partial
 
+    async def keep_partial_run(run: LivePackageAgentRun) -> LivePackageAgentRun:
+        return run
+
     fake_system.run = run  # type: ignore[method-assign]
     cache = LiveRunCache(capacity=4, ttl=timedelta(minutes=5))
     monkeypatch.setattr(app.state, "live_package_agent_system", fake_system)
     monkeypatch.setattr(app.state, "live_run_cache", cache)
     monkeypatch.setattr(settings, "browser_bridge_require_all_providers", False)
+    monkeypatch.setattr(
+        main_module,
+        "_attach_icom_cny_reference_estimate",
+        keep_partial_run,
+    )
+    monkeypatch.setattr(main_module, "build_final_plan_projection", lambda run: None)
     async with AsyncClient(
         transport=ASGITransport(app=app, client=("127.0.0.1", 51342)),
         base_url="http://test",
     ) as client:
         response = await client.post("/api/v1/agents/live-plan", json=_live_request_payload())
-    assert response.status_code == 422
-    assert not cache._entries
+    assert response.status_code == 200
+    assert response.json()["run"]["decision"]["state"] == "accept"
+    assert response.json()["final_plan"] is None
+    assert len(cache._entries) == 1
 
 
 def test_browser_bridge_mount_requires_explicit_enablement() -> None:
