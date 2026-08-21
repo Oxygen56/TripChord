@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TripChord local launcher / installer (v0.8).
+"""TripChord 1.0 local launcher.
 
 A single entry point that manages the local-first stack — API, Web, database
 migration and Browser Bridge — plus a first-run setup wizard.  Everything stays
