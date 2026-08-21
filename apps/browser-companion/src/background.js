@@ -11874,6 +11874,16 @@ async function executeLease(lease) {
         break;
       }
     }
+  } catch (error) {
+    firstFailure = {
+      code: "extraction_error",
+      message: `批量日期执行异常：${String(error && error.message || error)}`,
+      retryable: true,
+      page_url: null,
+      details: {
+        range_executor_error: String(error && error.stack || error).slice(0, 2000),
+      },
+    };
   } finally {
     if (Number.isInteger(tab.id)) {
       try { await chrome.tabs.remove(tab.id); } catch { /* best effort */ }

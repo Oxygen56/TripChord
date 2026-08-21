@@ -2216,6 +2216,7 @@ class BrowserTaskSnapshot(DomainModel):
     provider: BrowserProvider
     kind: BrowserVertical
     query: BrowserSearchQuery
+    range_query: BrowserDateRangeQuery | None = None
     state: BrowserTaskState
     created_at: datetime
     updated_at: datetime
@@ -4991,6 +4992,7 @@ class BrowserTaskBridge:
             provider=record.submission.provider,
             kind=record.submission.kind,
             query=record.submission.query,
+            range_query=record.submission.range_query,
             state=record.state,
             created_at=record.created_at,
             updated_at=record.updated_at,
