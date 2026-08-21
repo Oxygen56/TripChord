@@ -81,6 +81,7 @@ from tripchord.agents.stay_area import system_stay_area_search_profile
 from tripchord.agents.tools import ToolRegistry
 from tripchord.planning.event_contracts import EventDisposition
 from tripchord.planning.package import (
+    LodgingLocationConvenience,
     NormalizedFlightQuote,
     NormalizedLodgingQuote,
     PackageArea,
@@ -99,6 +100,7 @@ from tripchord.planning.package import (
     PackageViolation,
     PackageViolationCode,
     PackageViolationSeverity,
+    QuoteAvailability,
     TransferOption,
     TransferPriceGuarantee,
     TransferPurchaseScope,
@@ -112,6 +114,10 @@ from tripchord.planning.stay_plans import (
 )
 from tripchord.platform.booking import BookingLedger
 from tripchord.platform.booking_gate import BookingService
+from tripchord.providers.arena_official import (
+    ArenaOfficialLodgingProvider,
+    ArenaOfficialLodgingResult,
+)
 from tripchord.providers.base import ProviderError
 from tripchord.providers.browser_bridge import (
     LIVE_V5_BROWSER_PROVIDERS,
@@ -145,6 +151,10 @@ from tripchord.providers.icom_transfer import (
     IComTransferOption,
     IComTransferQuery,
     IComTransferSearchResult,
+)
+from tripchord.providers.quote_normalizer import (
+    NormalizedBrowserQuoteResult,
+    QuoteNormalizationStatus,
 )
 
 from benchmarks import run_live_done_gate_v4
@@ -6986,6 +6996,183 @@ async def _run_v4_with_completion(
         _serve(bridge, expected_browser_completions, completion),
     )
     return run
+
+
+def _success_with_ctrip_non_remote_full_stay(
+    lease: BrowserTaskLease,
+) -> BrowserTaskCompletion:
+    if (
+        lease.provider != BrowserProvider.CTRIP
+        or lease.kind != BrowserVertical.LODGING
+        or _lodging_segment(lease) != "full"
+    ):
+        return _success(lease)
+    quote = _lodging_quote(lease)
+    details = dict(quote.details)
+    driver = dict(cast(dict[str, JsonValue], details["driver"]))
+    driver["detail_capture"] = {
+        "preview_location_evidence": [
+            "近Sinai Dive Club Maldives · Maafushi Dive & Water Sports."
+        ]
+    }
+    details.update(
+        {
+            "area_text": "Aabaadhee Hingun Road, 马富施, 马尔代夫显示地图",
+            "driver": driver,
+        }
+    )
+    return BrowserTaskCompletion(
+        state=BrowserTaskState.SUCCEEDED,
+        quotes=(
+            _sealed_quote(
+                lease,
+                page_url=quote.page_url,
+                amount=quote.amount,
+                basis=quote.price_basis,
+                title=quote.title,
+                details=cast(dict[str, JsonValue], details),
+            ),
+        ),
+    )
+
+
+class _FixtureOfficialLodgingProvider:
+    def __init__(self, *, eligible_non_remote: bool) -> None:
+        self._eligible_non_remote = eligible_non_remote
+
+    async def search(
+        self,
+        query: BrowserSearchQuery,
+        request: PackageIntent,
+        candidate_set: object,
+    ) -> ArenaOfficialLodgingResult:
+        del query, candidate_set
+        location_fields: dict[str, object] = {}
+        if self._eligible_non_remote:
+            location_fields = {
+                "location_address": "Harbour Road, Maafushi",
+                "nearby_location_evidence": ("Near Dive Centre",),
+                "location_convenience": (
+                    LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+                ),
+            }
+        quote = NormalizedLodgingQuote(
+            id="arena-official:fixture:full",
+            provider="arena_official",
+            currency="CNY",
+            total_for_party_cents=400_000,
+            taxes_and_fees_included=True,
+            captured_at=NOW,
+            expires_at=NOW + timedelta(minutes=10),
+            availability=QuoteAvailability.AVAILABLE,
+            evidence_refs=("https://arenabeachmaldives.com/booking/",),
+            property_name="Arena Beach Hotel",
+            area=PackageArea.DESTINATION_ISLAND,
+            check_in=request.start_date,
+            check_out=request.end_date,
+            adults=request.adults,
+            children=request.children,
+            children_ages=request.children_ages,
+            infants=request.infants,
+            rooms=request.rooms,
+            breakfast_included=False,
+            place_key=PackagePlaceKey.MAAFUSHI,
+            room_name="Deluxe room",
+            cancellation_policy="fixture cancellation policy",
+            **location_fields,
+        )
+        result = NormalizedBrowserQuoteResult(
+            provider="arena_official",
+            kind=BrowserVertical.LODGING,
+            status=QuoteNormalizationStatus.USABLE,
+            quote=quote,
+        )
+        return ArenaOfficialLodgingResult(
+            result=result,
+            source_task_id="source-arena-official-lodging-full",
+            query={
+                "start_date": request.start_date.isoformat(),
+                "end_date": request.end_date.isoformat(),
+                "adults": request.adults,
+                "rooms": request.rooms,
+            },
+            response_sha256="a" * 64,
+            captured_at=NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    ("official_eligible", "expected_provider_count", "expected_complete"),
+    [(False, 1, False), (True, 2, True)],
+)
+@pytest.mark.asyncio
+async def test_exact_lodging_comparison_counts_only_quotes_eligible_for_same_intent(
+    official_eligible: bool,
+    expected_provider_count: int,
+    expected_complete: bool,
+) -> None:
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(
+        bridge,
+        icom_provider=_FakeIComProvider(),
+        official_lodging_provider=cast(
+            ArenaOfficialLodgingProvider,
+            _FixtureOfficialLodgingProvider(eligible_non_remote=official_eligible),
+        ),
+        now=lambda: NOW,
+    )
+    candidate_set = system_stay_plan_candidate_set("MLE")
+    request = intent().model_copy(
+        update={
+            "destination_place_key": None,
+            "require_non_remote_lodging": True,
+        }
+    )
+    base_query = query()
+    exact_query = base_query.model_copy(
+        update={
+            "options": {
+                **base_query.options,
+                "stay_plan_candidate_set": candidate_set.model_dump(mode="json"),
+            }
+        }
+    )
+
+    run, _ = await asyncio.gather(
+        system.run(
+            request,
+            exact_query,
+            mode=LiveCoverageMode.STRICT,
+            timeout_seconds=15,
+        ),
+        _serve(
+            bridge,
+            _V4_BROWSER_SOURCE_TASK_COUNT,
+            _success_with_ctrip_non_remote_full_stay,
+        ),
+    )
+
+    assert run.decision.state == PackageDecisionState.ACCEPT
+    assert run.selected_stay_plan_id == StayPlanId.MAAFUSHI_ICOM
+    comparison = run.exact_quote_comparison_coverage
+    assert comparison is not None
+    assert comparison.complete is expected_complete
+    assert comparison.single_source_publishable
+    segment = comparison.segments[0]
+    assert segment.distinct_exact_quote_provider_count == expected_provider_count
+    ctrip = next(item for item in segment.provider_evidence if item.provider == "ctrip")
+    arena = next(
+        item for item in segment.provider_evidence if item.provider == "arena_official"
+    )
+    assert ctrip.quote_ids and ctrip.eligible_quote_ids == ctrip.quote_ids
+    assert arena.quote_ids
+    assert bool(arena.eligible_quote_ids) is official_eligible
+    if official_eligible:
+        assert "已完成精确跨平台比价" in run.claim_boundary
+    else:
+        assert "未完成跨平台比价" in run.claim_boundary
+        assert "已完成精确跨平台比价" not in run.claim_boundary
+        assert "不声明最低价" in run.claim_boundary
 
 
 @pytest.mark.asyncio

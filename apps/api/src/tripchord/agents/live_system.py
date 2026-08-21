@@ -139,6 +139,7 @@ from tripchord.planning.package import (
     _transfer_connection_limits,
     diff_packages,
     lodging_basic_markers,
+    lodging_is_segment_comparison_eligible,
     lodging_quality_tier,
 )
 from tripchord.planning.package_reverification import (
@@ -635,9 +636,23 @@ class LodgingProviderQuoteEvidence(DomainModel):
     provider: str
     source_task_id: str = Field(min_length=1)
     inventory_state: StayInventoryResultState | None = None
+    # quote_ids preserve what the source query returned. eligible_quote_ids are
+    # the subset satisfying the final same-intent comparison contract.
     quote_ids: tuple[str, ...] = ()
+    eligible_quote_ids: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
     source_execution_terminal: bool
+
+    @model_validator(mode="before")
+    @classmethod
+    def backfill_legacy_eligible_quote_ids(cls, value: object) -> object:
+        if (
+            isinstance(value, dict)
+            and "eligible_quote_ids" not in value
+            and value.get("quote_ids")
+        ):
+            return {**value, "eligible_quote_ids": value["quote_ids"]}
+        return value
 
     @model_validator(mode="after")
     def validate_quote_boundary(self) -> LodgingProviderQuoteEvidence:
@@ -648,6 +663,12 @@ class LodgingProviderQuoteEvidence(DomainModel):
             raise ValueError("only quote_found lodging evidence can carry exact quote ids")
         if len(set(self.quote_ids)) != len(self.quote_ids):
             raise ValueError("exact lodging quote ids must be unique per provider")
+        if len(set(self.eligible_quote_ids)) != len(self.eligible_quote_ids):
+            raise ValueError("eligible lodging quote ids must be unique per provider")
+        if not set(self.eligible_quote_ids) <= set(self.quote_ids):
+            raise ValueError("eligible lodging quotes must be a subset of observed quotes")
+        if not quote_found and self.eligible_quote_ids:
+            raise ValueError("non-quote lodging outcomes cannot carry eligible quote ids")
         return self
 
 
@@ -672,10 +693,7 @@ class LodgingSegmentQuoteComparisonCoverage(DomainModel):
         providers = tuple(item.provider for item in self.provider_evidence)
         if len(set(providers)) != len(providers):
             raise ValueError("lodging comparison provider evidence must be unique")
-        exact_count = sum(
-            item.inventory_state == StayInventoryResultState.QUOTE_FOUND
-            for item in self.provider_evidence
-        )
+        exact_count = sum(bool(item.eligible_quote_ids) for item in self.provider_evidence)
         if self.distinct_exact_quote_provider_count != exact_count:
             raise ValueError("distinct exact quote provider count does not match evidence")
         if self.complete != (exact_count >= self.required_distinct_provider_count):
@@ -683,10 +701,16 @@ class LodgingSegmentQuoteComparisonCoverage(DomainModel):
         return self
 
 
-_EXACT_QUOTE_COMPARISON_EVIDENCE_BOUNDARY = (
+_LEGACY_EXACT_QUOTE_COMPARISON_EVIDENCE_BOUNDARY = (
     "source_execution_completeness 仅表示来源任务形成终态；"
     "exact_quote_comparison_coverage 仅计算同一住宿分段的不同平台精确报价。"
     "每个选中分段有一份新鲜精确来源时可发布单来源建议，但不得宣称完成多平台比价或最低价。"
+)
+_EXACT_QUOTE_COMPARISON_EVIDENCE_BOUNDARY = (
+    "source_execution_completeness 仅表示来源任务形成终态；"
+    "exact_quote_comparison_coverage 仅计算同一住宿分段中满足当前全部住宿硬条件的不同平台精确报价；"
+    "已查询但不满足硬条件的报价只保留为执行证据。每个选中分段有一份合格新鲜精确来源时"
+    "可发布单来源建议，但不得宣称完成多平台比价或最低合格价。"
 )
 
 
@@ -704,7 +728,10 @@ class ExactQuoteComparisonCoverage(DomainModel):
 
     @model_validator(mode="after")
     def validate_aggregate(self) -> ExactQuoteComparisonCoverage:
-        if self.evidence_boundary != _EXACT_QUOTE_COMPARISON_EVIDENCE_BOUNDARY:
+        if self.evidence_boundary not in {
+            _LEGACY_EXACT_QUOTE_COMPARISON_EVIDENCE_BOUNDARY,
+            _EXACT_QUOTE_COMPARISON_EVIDENCE_BOUNDARY,
+        }:
             raise ValueError("exact quote coverage must retain its partial-evidence boundary")
         if any(
             item.required_distinct_provider_count != self.required_distinct_providers_per_segment
@@ -10161,9 +10188,12 @@ class LivePackageAgentSystem:
                 candidate,
             )
         inherited = state.inherited_exact_quote_comparison_coverage
-        if inherited is not None and (inherited.selected_stay_plan_id == selected_stay_plan_id):
+        if (
+            inherited is not None
+            and inherited.selected_stay_plan_id == selected_stay_plan_id
+            and inherited.evidence_boundary == _EXACT_QUOTE_COMPARISON_EVIDENCE_BOUNDARY
+        ):
             return inherited
-
         lodging_providers = tuple(
             provider for provider in self._providers if provider in _LODGING_PROVIDERS
         )
@@ -10188,6 +10218,7 @@ class LivePackageAgentSystem:
                     segment.segment_id,
                     segment.query_segment,
                     segment.exact_place_key,
+                    segment.area,
                     segment.check_in.resolve(quote_window_intent),
                     segment.check_out.resolve(quote_window_intent),
                     lodging_providers,
@@ -10233,6 +10264,7 @@ class LivePackageAgentSystem:
         segment_id: str,
         query_segment: str,
         exact_place_key: PackagePlaceKey,
+        area: PackageArea,
         check_in: date,
         check_out: date,
         lodging_providers: tuple[BrowserProvider, ...],
@@ -10255,12 +10287,24 @@ class LivePackageAgentSystem:
                 )
             outcome = matches[0] if matches else None
             snapshot = state.snapshots.get(task_id)
+            observed_quote_ids = outcome.quote_ids if outcome is not None else ()
+            eligible_quote_ids = self._eligible_lodging_quote_ids(
+                state,
+                intent,
+                provider=provider.value,
+                observed_quote_ids=observed_quote_ids,
+                area=area,
+                exact_place_key=exact_place_key,
+                check_in=check_in,
+                check_out=check_out,
+            )
             evidence.append(
                 LodgingProviderQuoteEvidence(
                     provider=provider,
                     source_task_id=task_id,
                     inventory_state=(outcome.state if outcome is not None else None),
-                    quote_ids=(outcome.quote_ids if outcome is not None else ()),
+                    quote_ids=observed_quote_ids,
+                    eligible_quote_ids=eligible_quote_ids,
                     evidence_refs=(
                         outcome.evidence_refs
                         if outcome is not None
@@ -10269,9 +10313,6 @@ class LivePackageAgentSystem:
                     source_execution_terminal=outcome is not None,
                 )
             )
-        exact_count = sum(
-            item.inventory_state == StayInventoryResultState.QUOTE_FOUND for item in evidence
-        )
         official = state.official_lodging_result
         if (
             official is not None
@@ -10280,17 +10321,31 @@ class LivePackageAgentSystem:
             quote = official.result.quote
             if (
                 quote.place_key == exact_place_key
+                and quote.area == area
                 and quote.check_in == check_in
                 and quote.check_out == check_out
                 and quote.adults == intent.adults
                 and quote.rooms == intent.rooms
             ):
+                eligible_quote_ids = (
+                    (quote.id,)
+                    if lodging_is_segment_comparison_eligible(
+                        quote,
+                        intent,
+                        area=area,
+                        check_in=check_in,
+                        check_out=check_out,
+                        exact_place_key=exact_place_key,
+                    )
+                    else ()
+                )
                 evidence.append(
                     LodgingProviderQuoteEvidence(
                         provider=_OFFICIAL_LODGING_PROVIDER,
                         source_task_id=official.source_task_id,
                         inventory_state=StayInventoryResultState.QUOTE_FOUND,
                         quote_ids=(quote.id,),
+                        eligible_quote_ids=eligible_quote_ids,
                         evidence_refs=(
                             *quote.evidence_refs,
                             f"arena-official-capture:{official.response_sha256}",
@@ -10298,7 +10353,7 @@ class LivePackageAgentSystem:
                         source_execution_terminal=True,
                     )
                 )
-                exact_count += 1
+        exact_count = sum(bool(item.eligible_quote_ids) for item in evidence)
         return LodgingSegmentQuoteComparisonCoverage(
             segment_id=segment_id,
             exact_place_key=exact_place_key,
@@ -10308,6 +10363,41 @@ class LivePackageAgentSystem:
             distinct_exact_quote_provider_count=exact_count,
             complete=(exact_count >= _MINIMUM_EXACT_LODGING_COMPARISON_PROVIDERS),
         )
+
+    @staticmethod
+    def _eligible_lodging_quote_ids(
+        state: _RunState,
+        intent: PackageIntent,
+        *,
+        provider: str,
+        observed_quote_ids: tuple[str, ...],
+        area: PackageArea,
+        exact_place_key: PackagePlaceKey | None,
+        check_in: date,
+        check_out: date,
+    ) -> tuple[str, ...]:
+        by_id: dict[str, NormalizedLodgingQuote] = {}
+        for quote in state.inventory.lodgings:
+            if quote.id in by_id:
+                raise ValueError("lodging inventory contains duplicate quote ids")
+            by_id[quote.id] = quote
+        eligible_ids: list[str] = []
+        for quote_id in observed_quote_ids:
+            candidate_quote = by_id.get(quote_id)
+            if (
+                candidate_quote is not None
+                and candidate_quote.provider == provider
+                and lodging_is_segment_comparison_eligible(
+                    candidate_quote,
+                    intent,
+                    area=area,
+                    check_in=check_in,
+                    check_out=check_out,
+                    exact_place_key=exact_place_key,
+                )
+            ):
+                eligible_ids.append(quote_id)
+        return tuple(eligible_ids)
 
     def _legacy_segment_quote_comparison_coverage(
         self,
@@ -10353,14 +10443,24 @@ class LivePackageAgentSystem:
                 quote
                 for quote in state.inventory.lodgings
                 if quote.provider == provider.value
-                and quote.availability == QuoteAvailability.AVAILABLE
                 and quote.place_key == lodging.place_key
                 and quote.area == lodging.area
                 and quote.check_in == lodging.check_in
                 and quote.check_out == lodging.check_out
                 and quote.adults == intent.adults
                 and quote.rooms == intent.rooms
-                and quote.currency == intent.currency
+            )
+            eligible_quotes = tuple(
+                quote
+                for quote in quotes
+                if lodging_is_segment_comparison_eligible(
+                    quote,
+                    intent,
+                    area=lodging.area,
+                    check_in=lodging.check_in,
+                    check_out=lodging.check_out,
+                    exact_place_key=lodging.place_key,
+                )
             )
             inventory_state: StayInventoryResultState | None = None
             evidence_refs: tuple[str, ...] = ()
@@ -10391,14 +10491,11 @@ class LivePackageAgentSystem:
                     source_task_id=task_id,
                     inventory_state=inventory_state,
                     quote_ids=tuple(quote.id for quote in quotes),
+                    eligible_quote_ids=tuple(quote.id for quote in eligible_quotes),
                     evidence_refs=evidence_refs,
                     source_execution_terminal=inventory_state is not None,
                 )
             )
-        exact_count = sum(
-            item.inventory_state == StayInventoryResultState.QUOTE_FOUND
-            for item in provider_evidence
-        )
         official = state.official_lodging_result
         if (
             official is not None
@@ -10413,12 +10510,25 @@ class LivePackageAgentSystem:
                 and quote.adults == intent.adults
                 and quote.rooms == intent.rooms
             ):
+                eligible_quote_ids = (
+                    (quote.id,)
+                    if lodging_is_segment_comparison_eligible(
+                        quote,
+                        intent,
+                        area=lodging.area,
+                        check_in=lodging.check_in,
+                        check_out=lodging.check_out,
+                        exact_place_key=lodging.place_key,
+                    )
+                    else ()
+                )
                 provider_evidence.append(
                     LodgingProviderQuoteEvidence(
                         provider=_OFFICIAL_LODGING_PROVIDER,
                         source_task_id=official.source_task_id,
                         inventory_state=StayInventoryResultState.QUOTE_FOUND,
                         quote_ids=(quote.id,),
+                        eligible_quote_ids=eligible_quote_ids,
                         evidence_refs=(
                             *quote.evidence_refs,
                             f"arena-official-capture:{official.response_sha256}",
@@ -10426,7 +10536,7 @@ class LivePackageAgentSystem:
                         source_execution_terminal=True,
                     )
                 )
-                exact_count += 1
+        exact_count = sum(bool(item.eligible_quote_ids) for item in provider_evidence)
         place = lodging.place_key.value if lodging.place_key is not None else "unknown"
         return LodgingSegmentQuoteComparisonCoverage(
             segment_id=(

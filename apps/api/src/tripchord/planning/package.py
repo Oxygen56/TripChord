@@ -915,6 +915,84 @@ class PackageIntent(DomainModel):
         return (self.end_date - self.start_date).days
 
 
+def lodging_is_comparison_eligible(
+    lodging: NormalizedLodgingQuote,
+    intent: PackageIntent,
+) -> bool:
+    """Return whether a quote may support a same-hard-contract comparison claim.
+
+    Candidate generation deliberately keeps some repairable mismatches (for
+    example breakfast) so the repair audit can replace them.  Comparison
+    coverage is stricter: only a quote already satisfying every final lodging
+    contract may count toward a lowest-qualified-price claim.
+    """
+
+    return (
+        lodging.availability == QuoteAvailability.AVAILABLE
+        and lodging.currency == intent.currency
+        and lodging.taxes_and_fees_included is True
+        and lodging.adults == intent.adults
+        and lodging.children == intent.children
+        and lodging.children_ages == intent.children_ages
+        and lodging.infants == intent.infants
+        and lodging.rooms == intent.rooms
+        and (
+            intent.require_breakfast is None
+            or lodging.breakfast_included is intent.require_breakfast
+        )
+        and (
+            not intent.require_non_basic_lodging
+            or not lodging_basic_markers(lodging)
+        )
+        and (
+            not intent.require_non_remote_lodging
+            or (
+                lodging.location_convenience
+                == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+                and lodging_non_remote_evidence_confirmed(
+                    lodging.location_address,
+                    lodging.nearby_location_evidence,
+                )
+            )
+        )
+    )
+
+
+def lodging_is_segment_comparison_eligible(
+    lodging: NormalizedLodgingQuote,
+    intent: PackageIntent,
+    *,
+    area: PackageArea,
+    check_in: date,
+    check_out: date,
+    exact_place_key: PackagePlaceKey | None = None,
+) -> bool:
+    """Match one quote to the exact segment and final hard comparison contract."""
+
+    if not lodging_is_comparison_eligible(lodging, intent):
+        return False
+    if (
+        lodging.area != area
+        or lodging.check_in != check_in
+        or lodging.check_out != check_out
+    ):
+        return False
+    if exact_place_key is not None:
+        return lodging.place_key == exact_place_key
+    return (
+        intent.destination_place_key is None
+        or (
+            intent.destination_place_key == PackagePlaceKey.MAAFUSHI
+            and area != PackageArea.DESTINATION_ISLAND
+        )
+        or (
+            intent.destination_place_key == PackagePlaceKey.HULHUMALE
+            and area != PackageArea.AIRPORT_ISLAND
+        )
+        or lodging.place_key == intent.destination_place_key
+    )
+
+
 class PackageInventory(DomainModel):
     flights: tuple[NormalizedFlightQuote, ...] = ()
     lodgings: tuple[NormalizedLodgingQuote, ...] = ()
@@ -2361,12 +2439,23 @@ class PackagePlanner:
             list[NormalizedLodgingQuote],
         ] = {}
         for lodging in inventory.lodgings:
+            # Quality and location are fail-closed before candidate generation:
+            # neither can be made true by a deterministic package repair.  Other
+            # hard requirements remain visible to the verifier/repair chain, so
+            # an otherwise compatible quote can still be replaced rather than
+            # silently disappearing from the candidate audit.
             if intent.require_non_basic_lodging and lodging_basic_markers(lodging):
                 continue
             if (
                 intent.require_non_remote_lodging
-                and lodging.location_convenience
-                != LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+                and (
+                    lodging.location_convenience
+                    != LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+                    or not lodging_non_remote_evidence_confirmed(
+                        lodging.location_address,
+                        lodging.nearby_location_evidence,
+                    )
+                )
             ):
                 continue
             lodging_key = (
@@ -3006,8 +3095,14 @@ class PackagePlanner:
             )
             and (
                 not intent.require_non_remote_lodging
-                or lodging.location_convenience
-                == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+                or (
+                    lodging.location_convenience
+                    == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+                    and lodging_non_remote_evidence_confirmed(
+                        lodging.location_address,
+                        lodging.nearby_location_evidence,
+                    )
+                )
             )
             and (
                 intent.destination_place_key is None
