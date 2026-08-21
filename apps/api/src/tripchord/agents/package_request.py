@@ -49,7 +49,7 @@ _SAME_MONTH_RANGE_PATTERN = re.compile(
 _DATE_WINDOW_BOUNDARY_PATTERN = re.compile(
     r"(?P<start_year>20\d{2})\s*(?:年|[-/.])\s*(?P<start_month>\d{1,2})"
     r"\s*(?:月|[-/.])\s*(?P<start_day>\d{1,2})\s*日?\s*(?:起|开始).*?"
-    r"(?:需在|截至|不晚于).*?"
+    r"(?:需在|截至|不晚于|最晚在|最晚于).*?"
     r"(?P<end_year>20\d{2})\s*(?:年|[-/.])\s*(?P<end_month>\d{1,2})"
     r"\s*(?:月|[-/.])\s*(?P<end_day>\d{1,2})\s*日?"
     r"\s*(?:边界(?:内完成)?|之前|前|内)?"
@@ -1365,6 +1365,22 @@ class HybridPackageRequirementAgent:
                 RequirementFactSource.EXPLICIT_TEXT,
                 rooms.group(0),
             )
+        if (
+            rooms is None
+            and "rooms" not in draft.values
+            and draft.values.get("adults") == 2
+            and draft.values.get("children", 0) == 0
+            and draft.values.get("infants", 0) == 0
+        ):
+            self._set_fact(
+                draft,
+                "rooms",
+                1,
+                RequirementFactSource.SYSTEM_DEFAULT,
+                "用户未提供房间数；2位成人默认按1间房比较，可在确认前调整",
+                explicit=False,
+            )
+            draft.notes.append("2位成人未提供房间数，已采用可见的系统默认值1间房")
 
     def _apply_return_boundary(self, draft: _Draft) -> None:
         latest_return = draft.latest_return_date

@@ -89,6 +89,29 @@ async def test_deterministic_parser_handles_original_request_without_model() -> 
 
 
 @pytest.mark.asyncio
+async def test_natural_flexible_window_defaults_two_adults_to_one_room() -> None:
+    result = await HybridPackageRequirementAgent(now=fixed_now).parse(
+        PackageRequirementRequest(
+            text=(
+                "我想从杭州出发去马尔代夫，2026年8月20日起、最晚在2026年9月10日前完成，"
+                "玩4到8天。先按2位成人，不带儿童。"
+            ),
+            reference_date=date(2026, 8, 20),
+        )
+    )
+
+    assert result.state == PackageRequestState.READY
+    assert result.window is not None
+    assert result.window.latest_departure == date(2026, 9, 7)
+    assert (result.window.adults, result.window.children, result.window.rooms) == (2, 0, 1)
+    rooms = next(item for item in result.facts if item.field == "rooms")
+    assert rooms.value == 1
+    assert rooms.source == RequirementFactSource.SYSTEM_DEFAULT
+    assert rooms.explicit is False
+    assert "默认值1间房" in result.claim_boundary
+
+
+@pytest.mark.asyncio
 async def test_explicit_no_connections_becomes_a_typed_execution_constraint() -> None:
     result = await HybridPackageRequirementAgent(now=fixed_now).parse(
         "出发地：杭州，目的地：马累，2026年8月出发，玩5晚，"
