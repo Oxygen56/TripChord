@@ -11974,12 +11974,17 @@ async function executeRangeLease(lease) {
     cells.push(await rangeCellFromCompletion(range, pair, completion));
   }
   const capturedAt = new Date().toISOString();
-  const exactCount = cells.filter((cell) => cell.price_finality === "exact").length;
-  const capabilityStatus = exactCount === pairs.length && pairs.length > 0
-    ? "confirmed" : "inconclusive";
+  // This task has no server-issued range lease id.  Keep the receipt
+  // explicitly inconclusive and downgrade visible totals to starting prices;
+  // the API only permits exact-cell binding when the capability carries both
+  // task and lease lineage.
+  const capabilityStatus = "inconclusive";
+  const receiptCells = cells.map((cell) => cell.price_finality === "exact"
+    ? { ...cell, price_finality: "starting" }
+    : cell);
   const evidence = await inventoryReceiptSha256(canonicalInventoryJson({
-    task_id: lease.task_id,
-    lease_id: lease.lease_id,
+    task_id: null,
+    lease_id: null,
     provider: lease.provider,
     pairs: cells.map((cell) => [cell.start_date, cell.end_date, cell.evidence_sha256]),
   }));
@@ -12007,7 +12012,7 @@ async function executeRangeLease(lease) {
     schema_version: "tripchord-browser-range-receipt-v1",
     query: range,
     capability,
-    cells,
+    cells: receiptCells,
     receipt_sha256: "",
     expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
   };
@@ -12020,19 +12025,54 @@ async function executeRangeLease(lease) {
       expires_at: rangeCompletion.expires_at,
     }),
   );
-  return completeLease(lease, {
+  const completion = {
     state: quotes.length ? "succeeded" : "failed",
     quotes,
     failure: quotes.length ? null : {
-      code: "range_no_price_cells",
-      message: "批量日期任务未取得可比较的真实价格单元",
+      code: failures.some((item) => item.code === "range_cell_timeout" || item.code === "range_deadline")
+        ? "timeout" : "no_inventory",
+      message: quotes.length
+        ? ""
+        : "批量日期任务未取得可比较的真实价格单元",
       retryable: true,
       page_url: null,
-      details: { failures },
+      captured_at: capturedAt,
+      details: { executor: "native_range", cell_budget_ms: cellBudgetMs, failures },
     },
     range_completion: rangeCompletion,
-    details: { executor: "native_range", cell_budget_ms: cellBudgetMs, failures },
-  });
+  };
+  try {
+    return await completeLease(lease, completion);
+  } catch (error) {
+    await recordCompletionDiagnostic(error, completion, false);
+    if (!completionContractRejected(error)) throw error;
+    const fallback = {
+      state: "failed",
+      quotes: [],
+      failure: {
+        code: "extraction_error",
+        message: "批量日期回执未通过桥接契约校验",
+        retryable: false,
+        page_url: null,
+        captured_at: new Date().toISOString(),
+        details: {
+          executor: "native_range",
+          range_completion_contract_rejected: true,
+          bridge_http_status: error.status,
+          validation_diagnostic: Array.isArray(error.validationDiagnostic)
+            ? error.validationDiagnostic : [],
+          bridge_detail: typeof error.bridgeDetail === "string"
+            ? error.bridgeDetail.slice(0, 500) : null,
+        },
+      },
+    };
+    try {
+      return await completeLease(lease, fallback);
+    } catch (fallbackError) {
+      await recordCompletionDiagnostic(fallbackError, fallback, true);
+      return null;
+    }
+  }
 }
 
 async function executeLease(lease) {
