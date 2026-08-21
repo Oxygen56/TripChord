@@ -6997,8 +6997,13 @@ async def test_hard_stopped_unrecovered_restart_two_cold_boots_no_fake_terminal(
         await _hard_teardown_registry(registry, stop, runtime)
         await registry.close()
 
-    # Unrecovered restart: the DURABLE deadline provenance now provably passed.
-    first = LivePlanningJobRegistry(state_path=state_path)
+    # Unrecovered restart: use a deterministic clock strictly after the
+    # durable deadline.  This tests the cold-boot rule itself, not scheduler or
+    # wall-clock timing around a 150ms deadline.
+    def expired_now() -> datetime:
+        return snapshot.deadline_at + timedelta(seconds=1)
+
+    first = LivePlanningJobRegistry(state_path=state_path, now=expired_now)
     try:
         recovered = await first.get(snapshot.id, "tenant-a")
         assert recovered is not None
@@ -7011,7 +7016,7 @@ async def test_hard_stopped_unrecovered_restart_two_cold_boots_no_fake_terminal(
         await first.close()
 
     # A second cold boot reads exactly the same durable facts — no drift.
-    second = LivePlanningJobRegistry(state_path=state_path)
+    second = LivePlanningJobRegistry(state_path=state_path, now=expired_now)
     try:
         again = await second.get(snapshot.id, "tenant-a")
         assert again is not None

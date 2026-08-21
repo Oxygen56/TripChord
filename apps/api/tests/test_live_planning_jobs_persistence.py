@@ -6,10 +6,12 @@ import subprocess
 import sys
 from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from tripchord.agents.live_jobs import (
     LiveJobWorkerCommand,
+    LivePlanningJobCancellationPendingError,
     LivePlanningJobInactiveError,
     LivePlanningJobRegistry,
     LivePlanningJobSnapshot,
@@ -78,8 +80,9 @@ async def test_live_job_repository_idempotency_claim_restart_and_terminal_guard(
             snapshot=initial,
         )
         assert repeated.id == created.id
-        claimed = await repository.claim(created.id)
-        assert claimed is not None
+        lease = await repository.claim_with_identity(created.id)
+        assert lease is not None
+        claimed = lease.snapshot
         assert claimed.state == LivePlanningJobState.RUNNING
         assert await repository.claim(created.id) is None
         with pytest.raises(DurableLivePlanningJobConflict, match="stale live job lease"):
@@ -89,11 +92,39 @@ async def test_live_job_repository_idempotency_claim_restart_and_terminal_guard(
                 owner="old-worker",
                 lease_generation=0,
             )
+        with pytest.raises(DurableLivePlanningJobConflict, match="stale or cancelled"):
+            await repository.settle(
+                created.id,
+                state=LivePlanningJobState.SUCCEEDED,
+                result={"late": True},
+                owner="old-worker",
+                lease_generation=0,
+            )
+        checkpoint = LivePlanningPairCheckpoint.create(
+            sequence=1,
+            request_sha256=REQUEST_SHA,
+            date_pair_id="pair-1",
+            departure_date=date(2026, 8, 21),
+            return_date=date(2026, 8, 24),
+            state=LivePlanningPairCheckpointState.FAILED,
+            query_task_ids=("query-1",),
+            failure_class="TestFailure",
+            captured_at=datetime.now(UTC),
+        )
+        with pytest.raises(DurableLivePlanningJobConflict, match="stale or cancelled"):
+            await repository.append_checkpoint(
+                created.id,
+                checkpoint,
+                owner="old-worker",
+                lease_generation=0,
+            )
         await repository.cancel(created.id)
         late = await repository.settle(
             created.id,
             state=LivePlanningJobState.SUCCEEDED,
             result={"late": True},
+            owner=lease.owner,
+            lease_generation=lease.generation,
         )
         assert late.state == LivePlanningJobState.CANCELLED
 
@@ -193,8 +224,10 @@ async def test_pair_result_is_fenced_and_same_digest_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_registry_recover_durable_rebuilds_allowlisted_worker_command() -> None:
-    database = Database("sqlite+aiosqlite://")
+async def test_registry_recover_durable_rebuilds_allowlisted_worker_command(
+    tmp_path: Path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'recovery-command.db'}")
     await database.create_schema()
     store = DurableLivePlanningJobStore(database)
     command = LiveJobWorkerCommand(
@@ -228,19 +261,191 @@ async def test_registry_recover_durable_rebuilds_allowlisted_worker_command() ->
             tenant_id="tenant-recovery", command_resolver=resolver
         )
         assert recovered == (created.id,)
-        deadline = asyncio.get_running_loop().time() + 15
-        current = None
-        while asyncio.get_running_loop().time() < deadline:
-            current = await second.get(created.id, "tenant-recovery")
-            if current is not None and current.state == LivePlanningJobState.SUCCEEDED:
-                break
-            await asyncio.sleep(0.01)
+        # The first registry never claimed the row.  Closing it while the
+        # second registry owns the recovered worker must be a detach/no-op and
+        # must not request cancellation or write a stale revision.
+        await first.close()
+        peer_view = await second.get(created.id, "tenant-recovery")
+        assert peer_view is not None
+        assert peer_view.cancel_pending is False
+        # Await the actual recovered worker task rather than polling a second
+        # registry snapshot.  This makes a stuck subprocess/terminal barrier
+        # fail at the owning task, instead of looking like an unexplained
+        # RUNNING record under a loaded CI event loop.
+        recovered_runtime = second._records[created.id]
+        assert recovered_runtime.task is not None
+        await asyncio.wait_for(recovered_runtime.task, timeout=5)
+        current = await second.get(created.id, "tenant-recovery")
         assert current is not None
         assert current.state == LivePlanningJobState.SUCCEEDED
         assert current.result == {"status": "recovered"}
     finally:
-        await first.close()
+        # ``first`` still holds the pre-claim queued snapshot while ``second``
+        # owns the authoritative terminal revision.  Suspend the prepared
+        # registry without trying to persist a stale cancellation over it.
+        await first.suspend_for_restart()
         await second.close()
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_registry_close_stops_local_executor_without_touching_new_lease() -> None:
+    """A stale registry must stop only its own operation after lease handoff."""
+    database = Database("sqlite+aiosqlite://")
+    await database.create_schema()
+    store = DurableLivePlanningJobStore(database)
+    first = LivePlanningJobRegistry(durable_store=store, cancel_wait_seconds=0.05)
+    second = LivePlanningJobRegistry(durable_store=store, cancel_wait_seconds=0.05)
+    started = asyncio.Event()
+    effects: list[int] = []
+
+    async def operation(_report: object) -> dict[str, str]:
+        started.set()
+        while True:
+            effects.append(len(effects))
+            await asyncio.sleep(0.005)
+
+    try:
+        created, replayed = await first.start_idempotent(
+            tenant_id="tenant-stale",
+            operation=operation,
+            idempotency_key="stale-close",
+            request_digest=REQUEST_SHA,
+        )
+        assert not replayed
+        await asyncio.wait_for(started.wait(), timeout=3)
+        runtime = first._records[created.id]
+        assert runtime.durable_lease_owner is not None
+        assert runtime.durable_lease_generation is not None
+        if runtime.lease_heartbeat_task is not None:
+            runtime.lease_heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await runtime.lease_heartbeat_task
+            runtime.lease_heartbeat_task = None
+        assert await store.release_lease(
+            created.id,
+            tenant_id="tenant-stale",
+            owner=runtime.durable_lease_owner,
+            lease_generation=runtime.durable_lease_generation,
+        )
+        replacement = await store.claim_with_identity(
+            created.id, tenant_id="tenant-stale"
+        )
+        assert replacement is not None
+        b_owner = replacement.owner
+        b_generation = replacement.generation
+        before = await store.get(created.id, tenant_id="tenant-stale")
+        assert before is not None
+        assert await store.lease_matches(
+            created.id,
+            tenant_id="tenant-stale",
+            owner=b_owner,
+            generation=b_generation,
+        )
+        await first.close()
+        effects_at_return = len(effects)
+        await asyncio.sleep(0.04)
+        after = await store.get(created.id, tenant_id="tenant-stale")
+        assert after == before
+        assert len(effects) == effects_at_return
+        assert await store.lease_matches(
+            created.id,
+            tenant_id="tenant-stale",
+            owner=b_owner,
+            generation=b_generation,
+        )
+        assert runtime.task is not None and runtime.task.done()
+        assert runtime.operation_task is not None and runtime.operation_task.done()
+        assert first._closed is True
+    finally:
+        with suppress(BaseException):
+            await first.suspend_for_restart()
+        with suppress(BaseException):
+            await second.suspend_for_restart()
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stubborn_stale_registry_close_fails_closed_until_executor_stops() -> None:
+    database = Database("sqlite+aiosqlite://")
+    await database.create_schema()
+    store = DurableLivePlanningJobStore(database)
+    first = LivePlanningJobRegistry(durable_store=store, cancel_wait_seconds=0.02)
+    started = asyncio.Event()
+    stop = asyncio.Event()
+
+    async def stubborn(_report: object) -> dict[str, str]:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            while not stop.is_set():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(0.005)
+        return {"status": "stopped"}
+
+    try:
+        created, _ = await first.start_idempotent(
+            tenant_id="tenant-stubborn",
+            operation=stubborn,
+            idempotency_key="stubborn-stale-close",
+            request_digest=REQUEST_SHA,
+        )
+        await asyncio.wait_for(started.wait(), timeout=3)
+        runtime = first._records[created.id]
+        assert runtime.durable_lease_owner is not None
+        assert runtime.durable_lease_generation is not None
+        if runtime.lease_heartbeat_task is not None:
+            runtime.lease_heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await runtime.lease_heartbeat_task
+            runtime.lease_heartbeat_task = None
+        assert await store.release_lease(
+            created.id,
+            tenant_id="tenant-stubborn",
+            owner=runtime.durable_lease_owner,
+            lease_generation=runtime.durable_lease_generation,
+        )
+        replacement = await store.claim_with_identity(
+            created.id, tenant_id="tenant-stubborn"
+        )
+        assert replacement is not None
+        b_owner = replacement.owner
+        b_generation = replacement.generation
+        before = await store.get(created.id, tenant_id="tenant-stubborn")
+        assert before is not None
+        assert await store.lease_matches(
+            created.id,
+            tenant_id="tenant-stubborn",
+            owner=b_owner,
+            generation=b_generation,
+        )
+        with pytest.raises(LivePlanningJobCancellationPendingError):
+            await first.close()
+        assert first._closed is False
+        assert await store.get(created.id, tenant_id="tenant-stubborn") == before
+        assert await store.lease_matches(
+            created.id,
+            tenant_id="tenant-stubborn",
+            owner=b_owner,
+            generation=b_generation,
+        )
+        stop.set()
+        await first.close()
+        assert first._closed is True
+        assert await store.get(created.id, tenant_id="tenant-stubborn") == before
+        assert await store.lease_matches(
+            created.id,
+            tenant_id="tenant-stubborn",
+            owner=b_owner,
+            generation=b_generation,
+        )
+        assert runtime.task is not None and runtime.task.done()
+        assert runtime.operation_task is not None and runtime.operation_task.done()
+    finally:
+        stop.set()
+        with suppress(BaseException):
+            await first.suspend_for_restart()
         await database.dispose()
 
 

@@ -165,6 +165,24 @@ class DurableLivePlanningJobRepository:
             LivePlanningJobSnapshot.model_validate(row.snapshot), row.command_spec
         )
 
+    async def lease_matches(self, job_id: str, *, owner: str, generation: int) -> bool:
+        row = await self._session.scalar(
+            select(LivePlanningJobRow).where(
+                LivePlanningJobRow.id == job_id,
+                LivePlanningJobRow.tenant_id == self._tenant_id,
+            )
+        )
+        if row is None:
+            return False
+        snapshot = LivePlanningJobSnapshot.model_validate(row.snapshot)
+        return (
+            snapshot.state == LivePlanningJobState.RUNNING
+            and not snapshot.cancel_pending
+            and not snapshot.cancellation_requested
+            and row.lease_owner == owner
+            and row.lease_generation == generation
+        )
+
     async def store_pair_result(
         self,
         job_id: str,
@@ -235,17 +253,19 @@ class DurableLivePlanningJobRepository:
         snapshot: LivePlanningJobSnapshot,
         *,
         expected_revision: int | None = None,
-        owner: str | None = None,
-        lease_generation: int | None = None,
+        owner: str,
+        lease_generation: int,
     ) -> LivePlanningJobSnapshot:
         row = await self._locked(job_id)
         current = LivePlanningJobSnapshot.model_validate(row.snapshot)
         if current.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
             await self._session.rollback()
             return current
-        if owner is not None and (
-            row.lease_owner != owner or row.lease_generation != lease_generation
-        ):
+        # Every non-terminal durable snapshot mutation is owned by the current
+        # lease.  In particular, ``owner=None`` must never act as a control
+        # plane bypass: a stale registry instance may retain a prepared local
+        # snapshot after another instance has claimed this job.
+        if row.lease_owner != owner or row.lease_generation != lease_generation:
             await self._session.rollback()
             raise DurableLivePlanningJobConflict("stale live job lease")
         if current.cancel_pending or current.cancellation_requested:
@@ -351,14 +371,14 @@ class DurableLivePlanningJobRepository:
         job_id: str,
         checkpoint: LivePlanningPairCheckpoint,
         *,
-        owner: str | None = None,
-        lease_generation: int | None = None,
+        owner: str,
+        lease_generation: int,
     ) -> LivePlanningJobSnapshot:
         row = await self._locked(job_id)
         snapshot = LivePlanningJobSnapshot.model_validate(row.snapshot)
         if snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
             raise DurableLivePlanningJobConflict("terminal job cannot accept a checkpoint")
-        if owner is not None and (
+        if (
             snapshot.state != LivePlanningJobState.RUNNING
             or snapshot.cancel_pending
             or snapshot.cancellation_requested
@@ -492,8 +512,8 @@ class DurableLivePlanningJobRepository:
         state: LivePlanningJobState,
         result: dict[str, Any] | None = None,
         error: str | None = None,
-        owner: str | None = None,
-        lease_generation: int | None = None,
+        owner: str,
+        lease_generation: int,
     ) -> LivePlanningJobSnapshot:
         if state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
             raise ValueError("settle requires a terminal state")
@@ -502,7 +522,7 @@ class DurableLivePlanningJobRepository:
         if snapshot.state in TERMINAL_LIVE_PLANNING_JOB_STATES:
             await self._session.rollback()
             return snapshot
-        if owner is not None and (
+        if (
             snapshot.state != LivePlanningJobState.RUNNING
             or snapshot.cancel_pending
             or snapshot.cancellation_requested
@@ -903,6 +923,14 @@ class DurableLivePlanningJobStore:
         async with self._database.sessions() as session:
             return await self._repo(session, tenant_id).recovery_record(job_id)
 
+    async def lease_matches(
+        self, job_id: str, *, tenant_id: str, owner: str, generation: int
+    ) -> bool:
+        async with self._database.sessions() as session:
+            return await self._repo(session, tenant_id).lease_matches(
+                job_id, owner=owner, generation=generation
+            )
+
     async def store_pair_result(self, job_id: str, *, tenant_id: str, **kwargs: Any) -> bool:
         async with self._database.sessions() as session:
             return await self._repo(session, tenant_id).store_pair_result(job_id, **kwargs)
@@ -992,7 +1020,22 @@ class DurableLivePlanningJobStore:
             return await self._repo(session, tenant_id).request_cancel(job_id)
 
     async def settle(
-        self, job_id: str, *, tenant_id: str, **kwargs: Any
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        state: LivePlanningJobState,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+        owner: str,
+        lease_generation: int,
     ) -> LivePlanningJobSnapshot:
         async with self._database.sessions() as session:
-            return await self._repo(session, tenant_id).settle(job_id, **kwargs)
+            return await self._repo(session, tenant_id).settle(
+                job_id,
+                state=state,
+                result=result,
+                error=error,
+                owner=owner,
+                lease_generation=lease_generation,
+            )

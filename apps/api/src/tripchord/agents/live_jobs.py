@@ -59,7 +59,13 @@ class LivePlanningDurableStore(Protocol):
         self, key: str, *, tenant_id: str
     ) -> LivePlanningJobSnapshot | None: ...
     async def replace_snapshot(
-        self, job_id: str, snapshot: LivePlanningJobSnapshot, *, tenant_id: str, **kwargs: Any
+        self,
+        job_id: str,
+        snapshot: LivePlanningJobSnapshot,
+        *,
+        tenant_id: str,
+        owner: str,
+        lease_generation: int,
     ) -> LivePlanningJobSnapshot: ...
     async def cancel(self, job_id: str, *, tenant_id: str) -> LivePlanningJobSnapshot: ...
     async def consume_orphan_death_proof(
@@ -77,6 +83,9 @@ class LivePlanningDurableStore(Protocol):
     async def list_recoverable(self, *, tenant_id: str) -> tuple[str, ...]: ...
     async def list_expired_reaping(self, *, tenant_id: str) -> tuple[str, ...]: ...
     async def recovery_record(self, job_id: str, *, tenant_id: str) -> Any: ...
+    async def lease_matches(
+        self, job_id: str, *, tenant_id: str, owner: str, generation: int
+    ) -> bool: ...
     async def list_tenants(self) -> tuple[str, ...]: ...
     async def authorize_orphan_reap(
         self,
@@ -2497,6 +2506,10 @@ class LivePlanningJobRegistry:
         store = self._durable_store
         if store is None:
             return
+        if runtime.durable_lease_owner is None or runtime.durable_lease_generation is None:
+            # A prepared or stale local runtime is never allowed to bypass the
+            # durable lease fence with an owner-less snapshot write.
+            raise RuntimeError("durable snapshot publish requires an active lease")
         await store.replace_snapshot(
             runtime.snapshot.id,
             runtime.snapshot,
@@ -3746,16 +3759,7 @@ class LivePlanningJobRegistry:
             if runtime.lease_heartbeat_task is not None:
                 runtime.lease_heartbeat_task.cancel()
                 runtime.lease_heartbeat_task = None
-            if runtime.task is not None and not runtime.task.done():
-                runtime.task.cancel()
-            if runtime.operation_task is not None and not runtime.operation_task.done():
-                runtime.operation_task.cancel()
-            if runtime.task is not None:
-                with suppress(asyncio.CancelledError, Exception):
-                    await runtime.task
-            if runtime.operation_task is not None:
-                with suppress(asyncio.CancelledError, Exception):
-                    await runtime.operation_task
+            await self._stop_local_runtime(runtime)
             if runtime.durable_lease_owner is not None:
                 await store.release_lease(
                     runtime.snapshot.id,
@@ -3763,6 +3767,39 @@ class LivePlanningJobRegistry:
                     owner=runtime.durable_lease_owner,
                     lease_generation=runtime.durable_lease_generation,
                 )
+
+    async def _stop_local_runtime(self, runtime: _RuntimeJob) -> bool:
+        """Stop only this registry's executors, without a durable write."""
+        worker_stopped = True
+        operation_task = runtime.operation_task
+        worker = runtime.worker_handle
+        if operation_task is not None and not operation_task.done():
+            if worker is not None:
+                worker_stopped = await worker.kill_and_confirm(self._cancel_wait_seconds)
+            else:
+                operation_task.cancel()
+        task = runtime.task
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        waitables = tuple(
+            item
+            for item in (task, operation_task)
+            if item is not None and not item.done()
+        )
+        if waitables:
+            await asyncio.wait(waitables, timeout=self._cancel_wait_seconds + 0.1)
+        stopped = (
+            worker_stopped
+            and (task is None or task.done())
+            and (operation_task is None or operation_task.done())
+        )
+        if not stopped:
+            error = LivePlanningJobCancellationPendingError(
+                "local live planning executor did not stop"
+            )
+            error.job_id = runtime.snapshot.id
+            raise error
+        return True
 
     async def close(self) -> None:
         """Close the registry, reusing the exact durable drain state machine as a
@@ -3780,6 +3817,39 @@ class LivePlanningJobRegistry:
         ``operation_task`` reference is never dropped while the operation lives.
         """
         self._spawn_deferred_cleanup_owners()
+        owned_durable_ids: set[str] | None = None
+        if self._durable_store is not None:
+            # A registry may retain a prepared snapshot after another registry
+            # has claimed the durable row.  Only the current lease owner may
+            # enter close's cancellation protocol; stale/prepared instances
+            # must detach without writing or stopping the peer's executor.
+            async with self._lock:
+                candidates = tuple(self._records.values())
+            owned_durable_ids = set()
+            for candidate in candidates:
+                owner = candidate.durable_lease_owner
+                generation = candidate.durable_lease_generation
+                if owner is not None and generation is not None:
+                    owns_lease = await self._durable_store.lease_matches(
+                        candidate.snapshot.id,
+                        tenant_id=candidate.tenant_id,
+                        owner=owner,
+                        generation=generation,
+                    )
+                else:
+                    owns_lease = False
+                if owns_lease:
+                    owned_durable_ids.add(candidate.snapshot.id)
+            stale_local = tuple(
+                candidate
+                for candidate in candidates
+                if candidate.snapshot.id not in owned_durable_ids
+                and candidate.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
+            )
+            for candidate in stale_local:
+                await self._stop_local_runtime(candidate)
+        else:
+            stale_local = ()
         async with self._changed:
             # C-145 P0 supplement / C-146 P0 supplement (P0-4): a quarantined
             # record has NO provable terminal outcome — close() must never guess
@@ -3794,6 +3864,10 @@ class LivePlanningJobRegistry:
                 for runtime in self._records.values()
                 if runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES
                 and not runtime.quarantined
+                and (
+                    owned_durable_ids is None
+                    or runtime.snapshot.id in owned_durable_ids
+                )
             )
             if not active:
                 self._closed = True
