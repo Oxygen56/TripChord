@@ -123,8 +123,6 @@ class FlightPartyPriceObservation(DomainModel):
             raise ValueError("party-price observation requires query/readback confirmation")
         if not self.taxes_included:
             raise ValueError("party-price observation requires tax-inclusive evidence")
-        if not self.available_for_requested_adults:
-            raise ValueError("party-price observation requires requested-party availability")
         return self
 
 
@@ -171,6 +169,7 @@ class FlightPartyComparisonReceipt(DomainModel):
     requested_party: FlightPartyPriceObservation
     settlement_locked: bool = False
     inventory_locked: bool = False
+    comparison_only: bool = False
 
     @model_validator(mode="after")
     def validate_receipt(self) -> FlightPartyComparisonReceipt:
@@ -209,6 +208,11 @@ class FlightPartyComparisonReceipt(DomainModel):
                 raise ValueError("party-total proof must use the requested-party amount")
         if self.settlement_locked or self.inventory_locked:
             raise ValueError("comparison receipt cannot claim settlement or inventory lock")
+        if not self.comparison_only and any(
+            not item.available_for_requested_adults
+            for item in (self.one_adult, self.requested_party)
+        ):
+            raise ValueError("non-comparison receipt requires requested-party availability")
         return self
 
 

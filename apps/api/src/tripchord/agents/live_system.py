@@ -190,6 +190,7 @@ from tripchord.providers.arena_official import (
 from tripchord.providers.base import ProviderError
 from tripchord.providers.browser_bridge import (
     LIVE_V5_BROWSER_PROVIDERS,
+    PRODUCTION_VISIBLE_DOM_PARSER_VERSION,
     BrowserFailure,
     BrowserFailureCode,
     BrowserProvider,
@@ -203,6 +204,7 @@ from tripchord.providers.browser_bridge import (
     FlightSearchReceiptState,
     LodgingInventoryReceipt,
     LodgingInventoryReceiptState,
+    QuotePriceBasis,
     ctrip_trusted_flight_search_url,
     fliggy_trusted_flight_search_url,
     flight_search_receipt_sha256,
@@ -222,6 +224,7 @@ from tripchord.providers.icom_transfer import (
 from tripchord.providers.quote_normalizer import (
     BrowserQuoteNormalizer,
     FlightPartyComparisonReceipt,
+    FlightPartyPriceObservation,
     NormalizedBrowserQuoteResult,
     QuoteNormalizationStatus,
     flight_party_comparison_receipt_sha256,
@@ -7312,13 +7315,45 @@ class LivePackageAgentSystem:
 
         query = snapshot.query
         if (
-            snapshot.state != BrowserTaskState.SUCCEEDED
-            or snapshot.kind != BrowserVertical.FLIGHT
+            snapshot.kind != BrowserVertical.FLIGHT
             or query.adults <= 1
             or query.children != 0
             or query.infants != 0
         ):
             return False
+        if snapshot.state != BrowserTaskState.SUCCEEDED:
+            failure = snapshot.failure
+            if failure is None or failure.code != BrowserFailureCode.EXTRACTION_ERROR:
+                return False
+            raw = failure.details.get("flight_search_receipt") if failure else None
+            sealed = failure.details.get("flight_search_receipt_sha256") if failure else None
+            if not isinstance(raw, dict) or not isinstance(sealed, str):
+                return False
+            try:
+                receipt = FlightSearchReceipt.model_validate(raw)
+            except ValueError:
+                return False
+            if (
+                flight_search_receipt_sha256(raw) != sealed
+                or receipt.provider != snapshot.provider
+                or receipt.state != FlightSearchReceiptState.COMPARISON_PRICE_ONLY
+                or receipt.confirmed_query.origin != query.origin
+                or receipt.confirmed_query.destination != query.destination
+                or receipt.confirmed_query.origin_code != query.origin_code
+                or receipt.confirmed_query.destination_code != query.destination_code
+                or receipt.confirmed_query.adults != query.adults
+                or receipt.confirmed_query.start_date != query.start_date
+                or receipt.confirmed_query.end_date != query.end_date
+                or receipt.captured_at != failure.captured_at
+            ):
+                return False
+            return any(
+                candidate.amount is not None
+                and candidate.currency == query.currency
+                and candidate.price_classification.value == "comparison_only"
+                and candidate.price_basis.value in {"per_person", "total_party"}
+                for candidate in receipt.candidate_summaries
+            )
         for raw_quote in snapshot.quotes:
             price_basis_source = raw_quote.details.get("price_basis_source")
             if not (
@@ -8242,9 +8277,18 @@ class LivePackageAgentSystem:
             if snapshot is None:
                 continue
             if snapshot.state != BrowserTaskState.SUCCEEDED:
+                validation_snapshot = state.party_price_validation_snapshots.get(task_id)
+                party_price_comparisons: tuple[FlightPartyComparisonReceipt, ...] = ()
+                if validation_snapshot is not None:
+                    party_price_comparisons = self._derive_sealed_receipt_party_comparisons(
+                        snapshot,
+                        validation_snapshot,
+                    )
+                    state.party_price_comparison_receipts[task_id] = party_price_comparisons
                 comparison_results = self._normalize_comparison_flight_receipt(
                     snapshot,
                     state.intent,
+                    party_price_comparisons=party_price_comparisons,
                 )
                 state.normalization_by_task[task_id] = comparison_results
                 results.extend(comparison_results)
@@ -8274,6 +8318,8 @@ class LivePackageAgentSystem:
     def _normalize_comparison_flight_receipt(
         snapshot: BrowserTaskSnapshot,
         intent: PackageIntent,
+        *,
+        party_price_comparisons: tuple[FlightPartyComparisonReceipt, ...] = (),
     ) -> tuple[NormalizedBrowserQuoteResult, ...]:
         """Turn typed visible comparison candidates into route-only quotes.
 
@@ -8364,6 +8410,23 @@ class LivePackageAgentSystem:
                 f"flight-search-receipt:sha256:{sealed}",
                 f"flight-comparison-candidate:{sealed}:{candidate.candidate_index}",
             )
+            party_receipt = next(
+                (
+                    item
+                    for item in party_price_comparisons
+                    if item.same_product_fingerprint
+                    == LivePackageAgentSystem._sealed_candidate_fingerprint(
+                        candidate,
+                        outbound_depart=outbound_depart,
+                        outbound_arrive=outbound_arrive,
+                        return_depart=return_depart,
+                        return_arrive=return_arrive,
+                        outbound_segments=outbound_segments,
+                        return_segments=return_segments,
+                    )
+                ),
+                None,
+            )
             results.append(
                 NormalizedBrowserQuoteResult(
                     provider=receipt.provider.value,
@@ -8376,8 +8439,12 @@ class LivePackageAgentSystem:
                         ),
                         provider=receipt.provider.value,
                         currency=candidate.currency,
-                        total_for_party_cents=amount,
-                        party_total_known=False,
+                        total_for_party_cents=(
+                            party_receipt.total_for_party_cents
+                            if party_receipt is not None
+                            else None
+                        ),
+                        party_total_known=party_receipt is not None,
                         display_amount_cents=amount,
                         price_basis="comparison_only",
                         taxes_and_fees_included=(
@@ -8386,12 +8453,12 @@ class LivePackageAgentSystem:
                         ),
                         captured_at=receipt.captured_at,
                         expires_at=receipt.captured_at + timedelta(minutes=10),
-                        availability=QuoteAvailability.AVAILABLE,
+                        availability=QuoteAvailability.COMPARISON_ONLY,
                         evidence_refs=evidence_refs,
                         origin=confirmed.origin,
                         destination=confirmed.destination,
                         adults=confirmed.adults,
-                        party_availability_confirmed=True,
+                        party_availability_confirmed=False,
                         outbound_depart_at=outbound_depart,
                         outbound_arrive_at=outbound_arrive,
                         return_depart_at=return_depart,
@@ -8407,6 +8474,205 @@ class LivePackageAgentSystem:
                 )
             )
         return tuple(results)
+
+    @staticmethod
+    def _sealed_candidate_fingerprint(
+        candidate: object,
+        *,
+        outbound_depart: datetime,
+        outbound_arrive: datetime,
+        return_depart: datetime,
+        return_arrive: datetime,
+        outbound_segments: tuple[NormalizedFlightSegment, ...],
+        return_segments: tuple[NormalizedFlightSegment, ...],
+    ) -> str:
+        """Fingerprint only identity proven by a sealed visible candidate."""
+
+        payload = {
+            "outbound_flight_numbers": tuple(
+                getattr(candidate, "outbound_flight_numbers", ())
+            ),
+            "return_flight_numbers": tuple(getattr(candidate, "return_flight_numbers", ())),
+            "outbound_times": (outbound_depart.isoformat(), outbound_arrive.isoformat()),
+            "return_times": (return_depart.isoformat(), return_arrive.isoformat()),
+            "origin_airport_code": getattr(candidate, "origin_airport_code", None),
+            "destination_airport_code": getattr(candidate, "destination_airport_code", None),
+            "outbound_segments": tuple(
+                segment.model_dump(mode="json") for segment in outbound_segments
+            ),
+            "return_segments": tuple(
+                segment.model_dump(mode="json") for segment in return_segments
+            ),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def _derive_sealed_receipt_party_comparisons(
+        self,
+        requested_snapshot: BrowserTaskSnapshot,
+        one_adult_snapshot: BrowserTaskSnapshot,
+    ) -> tuple[FlightPartyComparisonReceipt, ...]:
+        """Compare two sealed comparison receipts without manufacturing raw quotes."""
+
+        def receipt_for(snapshot: BrowserTaskSnapshot) -> FlightSearchReceipt | None:
+            failure = snapshot.failure
+            raw = failure.details.get("flight_search_receipt") if failure else None
+            sealed = failure.details.get("flight_search_receipt_sha256") if failure else None
+            if (
+                snapshot.kind != BrowserVertical.FLIGHT
+                or snapshot.state != BrowserTaskState.FAILED
+                or not failure
+                or failure.code != BrowserFailureCode.EXTRACTION_ERROR
+                or not isinstance(raw, dict)
+                or not isinstance(sealed, str)
+                or flight_search_receipt_sha256(raw) != sealed
+            ):
+                return None
+            try:
+                receipt = FlightSearchReceipt.model_validate(raw)
+            except ValueError:
+                return None
+            query = snapshot.query
+            confirmed = receipt.confirmed_query
+            if (
+                receipt.provider != snapshot.provider
+                or receipt.state != FlightSearchReceiptState.COMPARISON_PRICE_ONLY
+                or receipt.parser_version != PRODUCTION_VISIBLE_DOM_PARSER_VERSION
+                or confirmed.origin != query.origin
+                or confirmed.destination != query.destination
+                or confirmed.origin_code != query.origin_code
+                or confirmed.destination_code != query.destination_code
+                or confirmed.start_date != query.start_date
+                or confirmed.end_date != query.end_date
+                or confirmed.adults != query.adults
+                or receipt.captured_at != failure.captured_at
+            ):
+                return None
+            return receipt
+
+        requested = receipt_for(requested_snapshot)
+        one_adult = receipt_for(one_adult_snapshot)
+        if requested is None or one_adult is None:
+            return ()
+        query = requested.confirmed_query
+        if (
+            query.adults <= 1
+            or one_adult.confirmed_query.adults != 1
+            or requested.provider != one_adult.provider
+            or query.origin_code != one_adult.confirmed_query.origin_code
+            or query.destination_code != one_adult.confirmed_query.destination_code
+            or query.start_date != one_adult.confirmed_query.start_date
+            or query.end_date != one_adult.confirmed_query.end_date
+        ):
+            return ()
+
+        def rows(
+            receipt: FlightSearchReceipt,
+        ) -> dict[str, tuple[object, int, tuple[datetime, ...]]]:
+            output: dict[str, tuple[object, int, tuple[datetime, ...]]] = {}
+            for candidate in receipt.candidate_summaries:
+                if (
+                    candidate.price_classification.value != "comparison_only"
+                    or candidate.amount is None
+                    or candidate.currency != requested_snapshot.query.currency
+                    or candidate.price_evidence is None
+                    or "含税" not in candidate.price_evidence
+                    or not candidate.outbound_flight_numbers
+                    or not candidate.return_flight_numbers
+                    or not candidate.outbound_segments
+                    or not candidate.return_segments
+                ):
+                    continue
+                try:
+                    timestamps = re.findall(
+                        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
+                        candidate.schedule_evidence or "",
+                    )
+                    if len(timestamps) != 4:
+                        continue
+                    times = tuple(
+                        datetime.fromisoformat(value.replace("Z", "+00:00"))
+                        for value in timestamps
+                    )
+                    out_segments = tuple(
+                        NormalizedFlightSegment.model_validate(item)
+                        for item in candidate.outbound_segments
+                    )
+                    ret_segments = tuple(
+                        NormalizedFlightSegment.model_validate(item)
+                        for item in candidate.return_segments
+                    )
+                except (ValueError, TypeError):
+                    continue
+                fingerprint = self._sealed_candidate_fingerprint(
+                    candidate,
+                    outbound_depart=times[0], outbound_arrive=times[1],
+                    return_depart=times[2], return_arrive=times[3],
+                    outbound_segments=out_segments, return_segments=ret_segments,
+                )
+                output.setdefault(
+                    fingerprint,
+                    (candidate, int(Decimal(str(candidate.amount)) * 100), times),
+                )
+            return output
+
+        requested_rows = rows(requested)
+        one_rows = rows(one_adult)
+        receipts: list[FlightPartyComparisonReceipt] = []
+        for fingerprint, (candidate, amount, requested_times) in requested_rows.items():
+            one_row = one_rows.get(fingerprint)
+            if one_row is None or one_row[1] != amount:
+                continue
+            requested_expires = requested.captured_at + timedelta(minutes=10)
+            one_expires = one_adult.captured_at + timedelta(minutes=10)
+            overlap_start = max(requested.captured_at, one_adult.captured_at)
+            overlap_end = min(requested_expires, one_expires)
+            if overlap_end <= overlap_start:
+                continue
+            receipts.append(
+                FlightPartyComparisonReceipt(
+                    provider=requested_snapshot.provider,
+                    currency=requested_snapshot.query.currency,
+                    origin_code=query.origin_code,
+                    destination_code=query.destination_code,
+                    start_date=query.start_date,
+                    end_date=query.end_date,
+                    requested_adults=query.adults,
+                    same_product_fingerprint=fingerprint,
+                    outbound_flight_numbers=tuple(candidate.outbound_flight_numbers),
+                    return_flight_numbers=tuple(candidate.return_flight_numbers),
+                    outbound_times=(requested_times[0], requested_times[1]),
+                    return_times=(requested_times[2], requested_times[3]),
+                    price_basis=QuotePriceBasis.PER_PERSON.value,
+                    derivation_method="equal_display_amounts_imply_per_adult",
+                    display_amount_cents=amount,
+                    total_for_party_cents=amount * query.adults,
+                    capture_skew_seconds=abs(
+                        (requested.captured_at - one_adult.captured_at).total_seconds()
+                    ),
+                    validity_overlap_start=overlap_start,
+                    validity_overlap_end=overlap_end,
+                    one_adult=FlightPartyPriceObservation(
+                        task_id=one_adult_snapshot.id,
+                        evidence_sha256=flight_search_receipt_sha256(one_adult.model_dump(mode="json")),
+                        adults=1, amount_cents=one_row[1], captured_at=one_adult.captured_at,
+                        expires_at=one_adult.captured_at + timedelta(minutes=10),
+                        same_product_fingerprint=fingerprint,
+                        available_for_requested_adults=False,
+                    ),
+                    requested_party=FlightPartyPriceObservation(
+                        task_id=requested_snapshot.id,
+                        evidence_sha256=flight_search_receipt_sha256(requested.model_dump(mode="json")),
+                        adults=query.adults, amount_cents=amount, captured_at=requested.captured_at,
+                        expires_at=requested.captured_at + timedelta(minutes=10),
+                        same_product_fingerprint=fingerprint,
+                        available_for_requested_adults=False,
+                    ),
+                    comparison_only=True,
+                )
+            )
+        return tuple(receipts)
 
     def _planner_executor(
         self,

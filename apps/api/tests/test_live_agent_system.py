@@ -7928,6 +7928,8 @@ async def test_flight_outcome_gate_rejects_tampered_receipt_query_sha_and_parser
     )
     snapshot = BrowserTaskSnapshot.model_validate(source_result.output["snapshot"])
     assert snapshot.failure is not None
+    validation_system = LivePackageAgentSystem(BrowserTaskBridge(now=lambda: NOW), now=lambda: NOW)
+    assert validation_system._needs_one_adult_price_validation(snapshot)
     raw_receipt = cast(
         dict[str, JsonValue],
         snapshot.failure.details["flight_search_receipt"],
@@ -8044,6 +8046,128 @@ async def test_flight_outcome_gate_rejects_tampered_receipt_query_sha_and_parser
         now=NOW,
         maximum_quote_age=timedelta(minutes=15),
     ).passed
+
+
+@pytest.mark.asyncio
+async def test_failed_sealed_receipts_derive_comparison_only_party_total() -> None:
+    _, _, run = await _run(LiveCoverageMode.STRICT, _mixed_flight_outcome_completion)
+    source_result = next(
+        item for item in run.scheduler.results if item.task_id == "source-ctrip-flight"
+    )
+    requested = BrowserTaskSnapshot.model_validate(source_result.output["snapshot"])
+    assert requested.failure is not None
+    requested_raw = json.loads(
+        json.dumps(requested.failure.details["flight_search_receipt"])
+    )
+    candidate = requested_raw["candidate_summaries"][0]
+    candidate.update(
+        {
+            "schedule_evidence": (
+                f"{START.isoformat()}T08:00:00+08:00 "
+                f"{START.isoformat()}T18:00:00+05:00 "
+                f"{END.isoformat()}T10:00:00+05:00 "
+                f"{END.isoformat()}T23:00:00+08:00"
+            ),
+            "price_evidence": "含税总价 CNY 5200",
+            "currency": "CNY",
+            "amount": "5200",
+            "price_basis": "per_person",
+            "price_classification": "comparison_only",
+            "outbound_flight_numbers": ["MU6550"],
+            "return_flight_numbers": ["MU235"],
+            "origin_airport_code": "HGH",
+            "destination_airport_code": "MLE",
+            "outbound_segments": [
+                {
+                    "flight_number": "MU6550",
+                    "departure_airport_code": "HGH",
+                    "arrival_airport_code": "MLE",
+                    "departure_at": f"{START.isoformat()}T08:00:00+08:00",
+                    "arrival_at": f"{START.isoformat()}T18:00:00+05:00",
+                }
+            ],
+            "return_segments": [
+                {
+                    "flight_number": "MU235",
+                    "departure_airport_code": "MLE",
+                    "arrival_airport_code": "HGH",
+                    "departure_at": f"{END.isoformat()}T10:00:00+05:00",
+                    "arrival_at": f"{END.isoformat()}T23:00:00+08:00",
+                }
+            ],
+        }
+    )
+
+    def sealed_snapshot(base: BrowserTaskSnapshot, adults: int, amount: str) -> BrowserTaskSnapshot:
+        raw = json.loads(json.dumps(requested_raw))
+        raw["confirmed_query"]["adults"] = adults
+        raw["candidate_summaries"][0]["amount"] = amount
+        failure_details = dict(base.failure.details) if base.failure else {}
+        failure_details["flight_search_receipt"] = raw
+        failure_details["flight_search_receipt_sha256"] = flight_search_receipt_sha256(raw)
+        failure = base.failure.model_copy(update={"details": failure_details})
+        return base.model_copy(
+            update={
+                "id": f"{base.id}-{adults}",
+                "query": base.query.model_copy(update={"adults": adults}),
+                "failure": failure,
+            }
+        )
+
+    requested = sealed_snapshot(requested, 2, "5200")
+    one_adult = sealed_snapshot(requested, 1, "5200")
+    system = LivePackageAgentSystem(BrowserTaskBridge(now=lambda: NOW), now=lambda: NOW)
+    receipts = system._derive_sealed_receipt_party_comparisons(requested, one_adult)
+    assert len(receipts) == 1
+    assert receipts[0].total_for_party_cents == 10_400_00
+    assert receipts[0].comparison_only
+    assert not receipts[0].one_adult.available_for_requested_adults
+    assert not receipts[0].requested_party.available_for_requested_adults
+    normalized = system._normalize_comparison_flight_receipt(
+        requested,
+        intent(),
+        party_price_comparisons=receipts,
+    )
+    assert len(normalized) == 1
+    assert normalized[0].quote is not None
+    assert normalized[0].quote.party_total_known
+    assert normalized[0].quote.total_for_party_cents == 1_040_000
+    assert normalized[0].quote.availability == QuoteAvailability.COMPARISON_ONLY
+    assert not normalized[0].quote.party_availability_confirmed
+    assert not normalized[0].quote.has_publishable_execution_contract
+
+    dynamic = sealed_snapshot(requested, 1, "5199")
+    assert not system._derive_sealed_receipt_party_comparisons(requested, dynamic)
+
+    tampered = one_adult.model_copy(
+        update={
+            "failure": one_adult.failure.model_copy(
+                update={
+                    "details": {
+                        **one_adult.failure.details,
+                        "flight_search_receipt_sha256": "0" * 64,
+                    }
+                }
+            )
+        }
+    )
+    assert not system._derive_sealed_receipt_party_comparisons(requested, tampered)
+
+    for field, value in (("origin_code", "SHA"), ("parser_version", "tripchord-visible-dom-v2")):
+        bad_raw = json.loads(json.dumps(one_adult.failure.details["flight_search_receipt"]))
+        if field == "parser_version":
+            bad_raw[field] = value
+        else:
+            bad_raw["confirmed_query"][field] = value
+        bad_details = {
+            **one_adult.failure.details,
+            "flight_search_receipt": bad_raw,
+            "flight_search_receipt_sha256": flight_search_receipt_sha256(bad_raw),
+        }
+        bad_snapshot = one_adult.model_copy(
+            update={"failure": one_adult.failure.model_copy(update={"details": bad_details})}
+        )
+        assert not system._derive_sealed_receipt_party_comparisons(requested, bad_snapshot)
 
 
 @pytest.mark.parametrize(

@@ -32,6 +32,7 @@ class PackagePlaceKey(StrEnum):
 class QuoteAvailability(StrEnum):
     AVAILABLE = "available"
     SOLD_OUT = "sold_out"
+    COMPARISON_ONLY = "comparison_only"
 
 
 class PackageCandidateKind(StrEnum):
