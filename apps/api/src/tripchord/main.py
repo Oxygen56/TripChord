@@ -2722,6 +2722,7 @@ async def live_flexible_agent_plan_endpoint(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
+    run = await _attach_flexible_pair_icom_reference_estimates(run)
     handles = await _cache_flexible_pair_runs(run, cache, principal.tenant_id)
     return LiveFlexibleAgentPlanningResponse(
         run=run,
@@ -3005,6 +3006,7 @@ async def _execute_live_flexible_from_text_body(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
+    run = await _attach_flexible_pair_icom_reference_estimates(run)
     await report("caching_pair_runs", 90)
     if report_progress is not None:
         barrier_released_at = datetime.now(UTC)
@@ -3646,9 +3648,12 @@ async def _attach_icom_cny_reference_estimate(
 ) -> LivePackageAgentRun:
     """Attach a display-only ECB estimate without changing package truth."""
 
-    if run.decision.state != PackageDecisionState.ACCEPT or run.package is None:
+    if run.decision.state == PackageDecisionState.ACCEPT and run.package is not None:
+        budget = run.package.budget
+    elif run.decision_only_candidate is not None:
+        budget = run.decision_only_candidate.budget
+    else:
         return run
-    budget = run.package.budget
     if budget.is_all_in_total or budget.foreign_currency_subtotals:
         return run
     supplemental = tuple(
@@ -3678,6 +3683,34 @@ async def _attach_icom_cny_reference_estimate(
             "icom_cny_reference_estimate": estimate,
         }
     )
+
+
+async def _attach_flexible_pair_icom_reference_estimates(
+    run: FlexibleLiveAgentRun,
+) -> FlexibleLiveAgentRun:
+    """Attach iCom reference estimates to every flexible pair independently."""
+
+    updated_pairs: list[FlexiblePairExecution] = []
+    for pair in run.pair_runs:
+        updated_run = (
+            await _attach_icom_cny_reference_estimate(pair.run)
+            if pair.run is not None
+            else None
+        )
+        updated_exploration = (
+            await _attach_icom_cny_reference_estimate(pair.exploration_run)
+            if pair.exploration_run is not None
+            else None
+        )
+        updated_pairs.append(
+            pair.model_copy(
+                update={
+                    "run": updated_run,
+                    "exploration_run": updated_exploration,
+                }
+            )
+        )
+    return run.model_copy(update={"pair_runs": tuple(updated_pairs)})
 
 
 @app.post("/api/v1/agents/live-plan", response_model=LiveAgentPlanningResponse)

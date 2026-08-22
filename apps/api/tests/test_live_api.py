@@ -44,6 +44,7 @@ from tripchord.api import (
     LiveAgentPlanningResponse,
     _sanitize_public_flight_totals,
     build_best_available_plan_projection,
+    build_final_plan_projection,
     build_live_final_plan_projection,
 )
 from tripchord.config import Settings
@@ -60,16 +61,26 @@ from tripchord.main import (
 )
 from tripchord.planning.flexible_dates import AuditableDatePair
 from tripchord.planning.package import (
+    DecisionOnlyPackageCandidate,
     LodgingLocationConvenience,
     NormalizedFlightQuote,
     NormalizedLodgingQuote,
     PackageArea,
+    PackageCandidateKind,
     PackageDecision,
     PackageDecisionState,
     PackageEventKind,
     PackageIntent,
     PackageInventory,
+    PackagePlaceKey,
     QuoteAvailability,
+    TransferOption,
+    TransferPriceGuarantee,
+    TransferPriceScope,
+    TransferPurchaseScope,
+    TransferScheduleMode,
+    TravelPackageCandidate,
+    package_budget,
 )
 from tripchord.providers.browser_bridge import (
     BRIDGE_TOKEN_HEADER,
@@ -1639,3 +1650,213 @@ async def test_event_replace_is_durable_and_keeps_original_expiry(tmp_path: Path
     assert durable is not None
     assert durable.expires_at == expires_at
     assert durable.run.decision.summary == "event handled and durably replaced"
+
+
+def test_decision_only_response_projection_contract_fixture() -> None:
+    captured_at = datetime(2026, 8, 22, 2, 30, tzinfo=UTC)
+    flight = NormalizedFlightQuote.model_validate(
+        {
+            "id": "fixture-qunar-comparison-flight",
+            "provider": "qunar",
+            "currency": "CNY",
+            "total_for_party_cents": 846_000,
+            "display_amount_cents": 423_000,
+            "party_total_known": True,
+            "price_basis": "comparison_only",
+            "taxes_and_fees_included": True,
+            "captured_at": captured_at,
+            "expires_at": captured_at + timedelta(minutes=10),
+            "availability": QuoteAvailability.COMPARISON_ONLY,
+            "evidence_refs": ("flight-party-comparison:sha256:" + "a" * 64,),
+            "origin": "杭州",
+            "destination": "马累",
+            "adults": 2,
+            "children": 0,
+            "infants": 0,
+            "party_availability_confirmed": False,
+            "outbound_depart_at": datetime(2026, 9, 3, 21, 45, tzinfo=UTC),
+            "outbound_arrive_at": datetime(2026, 9, 4, 12, 20, tzinfo=UTC),
+            "return_depart_at": datetime(2026, 9, 9, 14, 20, tzinfo=UTC),
+            "return_arrive_at": datetime(2026, 9, 10, 9, 25, tzinfo=UTC),
+            "outbound_flight_numbers": ("JD5907", "JD455"),
+            "return_flight_numbers": ("JD456", "JD5908"),
+        }
+    )
+    ctrip = NormalizedLodgingQuote.model_validate(
+        {
+            "id": "fixture-ctrip-kaani-seaview",
+            "provider": "ctrip",
+            "currency": "CNY",
+            "total_for_party_cents": 260_500,
+            "taxes_and_fees_included": True,
+            "captured_at": captured_at,
+            "expires_at": captured_at + timedelta(minutes=10),
+            "availability": QuoteAvailability.AVAILABLE,
+            "evidence_refs": ("fixture:ctrip:lodging",),
+            "property_name": "Kaani Beach Hotel",
+            "area": PackageArea.DESTINATION_ISLAND,
+            "place_key": PackagePlaceKey.MAAFUSHI,
+            "check_in": date(2026, 9, 4),
+            "check_out": date(2026, 9, 9),
+            "adults": 2,
+            "rooms": 1,
+            "room_name": "海景豪华双人房带阳台",
+            "breakfast_included": True,
+            "cancellation_policy": "免费取消",
+        }
+    )
+    arena = NormalizedLodgingQuote.model_validate(
+        {
+            "id": "fixture-arena-official",
+            "provider": "arena_official",
+            "currency": "USD",
+            "total_for_party_cents": 105_826,
+            "reference_total_cents": 711_211,
+            "reference_currency": "CNY",
+            "reference_rate_source": "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml",
+            "reference_rate_date": date(2026, 8, 21),
+            "taxes_and_fees_included": None,
+            "captured_at": captured_at,
+            "expires_at": captured_at + timedelta(minutes=10),
+            "availability": QuoteAvailability.AVAILABLE,
+            "evidence_refs": ("fixture:arena:official",),
+            "property_name": "Arena Beach Hotel",
+            "area": PackageArea.DESTINATION_ISLAND,
+            "place_key": PackagePlaceKey.MAAFUSHI,
+            "check_in": date(2026, 9, 4),
+            "check_out": date(2026, 9, 9),
+            "adults": 2,
+            "rooms": 1,
+            "room_name": "Deluxe Double Room with Balcony and Seaview",
+            "breakfast_included": True,
+            "location_convenience": LodgingLocationConvenience.UNKNOWN,
+        }
+    )
+    transfer_data = {
+        "provider": "icom-public-transfer",
+        "currency": "USD",
+        "total_for_party_cents": 6_000,
+        "taxes_and_fees_included": None,
+        "captured_at": captured_at,
+        "expires_at": captured_at + timedelta(minutes=10),
+        "availability": QuoteAvailability.AVAILABLE,
+        "evidence_refs": ("fixture:icom:published-base-fare",),
+        "adults": 2,
+        "children": 0,
+        "infants": 0,
+        "schedule_mode": TransferScheduleMode.EXACT_DEPARTURE,
+        "duration_minutes": 50,
+        "operates_24_hours": False,
+        "requires_reservation": True,
+        "price_scope": TransferPriceScope.ROUND_TRIP,
+        "price_contract_id": "fixture-icom-contract",
+        "purchase_scope": TransferPurchaseScope.PUBLIC_INDEPENDENT,
+        "price_guarantee": TransferPriceGuarantee.PUBLISHED_BASE_FARE,
+        "contract_evidence_text": "公开基础价，税费未知",
+        "detail_url": "https://example.com/read-only-transfer",
+    }
+    transfer = TransferOption.model_validate(
+        {
+            **transfer_data,
+            "id": "fixture-icom-outbound",
+            "origin_area": PackageArea.AIRPORT,
+            "destination_area": PackageArea.DESTINATION_ISLAND,
+            "origin_place_key": PackagePlaceKey.VELANA_AIRPORT,
+            "destination_place_key": PackagePlaceKey.MAAFUSHI,
+            "service_date": date(2026, 9, 4),
+            "depart_at": datetime(2026, 9, 4, 15, 25, tzinfo=UTC),
+            "arrive_at": datetime(2026, 9, 4, 16, 15, tzinfo=UTC),
+        }
+    )
+    returning_transfer = TransferOption.model_validate(
+        {
+            **transfer_data,
+            "id": "fixture-icom-return",
+            "origin_area": PackageArea.DESTINATION_ISLAND,
+            "destination_area": PackageArea.AIRPORT,
+            "origin_place_key": PackagePlaceKey.MAAFUSHI,
+            "destination_place_key": PackagePlaceKey.VELANA_AIRPORT,
+            "service_date": date(2026, 9, 9),
+            "depart_at": datetime(2026, 9, 9, 15, 25, tzinfo=UTC),
+            "arrive_at": datetime(2026, 9, 9, 16, 15, tzinfo=UTC),
+        }
+    )
+    candidate = TravelPackageCandidate.model_validate(
+        {
+            "id": "fixture-decision-only-package",
+            "trip_id": "hgh-mle-live-fixture",
+            "kind": PackageCandidateKind.CONTINUOUS_ISLAND,
+            "flight": flight,
+            "lodgings": (ctrip,),
+            "transfers": (transfer, returning_transfer),
+            "declared_total_cents": 1_106_500,
+            "currency": "CNY",
+        }
+    )
+    transfer_ids = (transfer.id, returning_transfer.id)
+    price_contract_ids = ("fixture-icom-contract",)
+    decision_only = DecisionOnlyPackageCandidate.model_validate(
+        {
+            "candidate": candidate,
+            "budget": package_budget(candidate),
+            "execution_eligible": False,
+            "decision_boundary": "fixture decision-only response; not bookable",
+        }
+    )
+    estimate = IComCnyReferenceEstimate(
+        rate_date=date(2026, 8, 21),
+        captured_at=datetime(2026, 8, 22, 2, 30, tzinfo=UTC),
+        usd_per_eur=Decimal("1.1699"),
+        cny_per_eur=Decimal("7.8624"),
+        usd_to_cny_reference_rate=Decimal("6.720574"),
+        source_usd_base_fare_cents=12_000,
+        estimated_cny_cents=80_647,
+        price_contract_ids=price_contract_ids,
+        transfer_ids=transfer_ids,
+        response_sha256="c" * 64,
+    )
+    live_run = _blocked_live_run()
+    updated = live_run.model_copy(
+        update={
+            "normalization_results": (
+                NormalizedBrowserQuoteResult(
+                    provider="ctrip", kind=BrowserVertical.LODGING,
+                    status=QuoteNormalizationStatus.USABLE, quote=ctrip,
+                ),
+                NormalizedBrowserQuoteResult(
+                    provider="arena_official", kind=BrowserVertical.LODGING,
+                    status=QuoteNormalizationStatus.USABLE, quote=arena,
+                ),
+            ),
+            "decision_only_candidate": decision_only,
+            "icom_cny_reference_estimate": estimate,
+        }
+    )
+    pair = FlexiblePairExecution.model_construct(
+        date_pair=AuditableDatePair.model_construct(
+            id="date-pair:2026-09-03:2026-09-09",
+            departure_date=date(2026, 9, 3),
+            return_date=date(2026, 9, 9),
+        ),
+        run=updated,
+        exploration_run=None,
+    )
+    response = build_best_available_plan_projection(
+        FlexibleLiveAgentRun.model_construct(pair_runs=(pair,))
+    )
+    assert response is not None
+    assert response.total_budget_cents is None
+    assert build_final_plan_projection(updated) is None
+    assert response.flight is not None
+    assert response.flight.provider == "qunar"
+    assert response.flight.price_basis == "comparison_only"
+    assert response.flight.has_publishable_execution_contract is False
+    assert len(response.transfers) == 2
+    assert all(item.provider == "icom-public-transfer" for item in response.transfers)
+    assert response.confirmed_cny_subtotal_cents == 1_106_500
+    assert response.estimated_icom_transfer_cny_cents == 80_647
+    assert response.estimated_total_cny_cents == 1_187_147
+    assert response.lodging_source_comparisons[0].source_type == "ota"
+    assert response.lodging_source_comparisons[1].source_type == "hotel_official"
+    assert response.lodging_source_comparisons[1].eligible is False
+    assert "位置依据不足" in response.lodging_source_comparisons[1].reason

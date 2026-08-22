@@ -113,6 +113,7 @@ from tripchord.planning.event_contracts import (
 )
 from tripchord.planning.offer_semantics import stable_offer_identity
 from tripchord.planning.package import (
+    DecisionOnlyPackageCandidate,
     LodgingLocationConvenience,
     NormalizedFlightQuote,
     NormalizedFlightSegment,
@@ -1096,6 +1097,7 @@ class LivePackageAgentRun(DomainModel):
     normalization_results: tuple[NormalizedBrowserQuoteResult, ...]
     flight_search_outcomes: tuple[FlightSearchOutcome, ...] = ()
     package: PackageRunResult | None = None
+    decision_only_candidate: DecisionOnlyPackageCandidate | None = None
     scheduler: SchedulerOutcome
     source_task_ids: tuple[str, ...] = Field(min_length=1)
     public_transfer_task_ids: tuple[str, ...] = ()
@@ -1157,14 +1159,18 @@ class LivePackageAgentRun(DomainModel):
     @model_validator(mode="after")
     def validate_evidence_scope(self) -> LivePackageAgentRun:
         if self.icom_cny_reference_estimate is not None:
-            if self.decision.state != PackageDecisionState.ACCEPT or self.package is None:
+            if self.decision.state == PackageDecisionState.ACCEPT and self.package is not None:
+                budget = self.package.budget
+            elif self.decision_only_candidate is not None:
+                budget = self.decision_only_candidate.budget
+            else:
                 raise PydanticCustomError(
                     "live_run_icom_cny_estimate_without_accepted_package",
                     "iCom CNY estimate requires an accepted package",
                 )
             supplemental = tuple(
                 item
-                for item in self.package.budget.supplemental_published_base_fares
+                for item in budget.supplemental_published_base_fares
                 if item.currency == "USD"
             )
             estimate = self.icom_cny_reference_estimate
@@ -1658,6 +1664,7 @@ class _RunState:
     stay_plan_planning_handoff: StayPlanPlanningHandoff | None = None
     selected_stay_plan_id: StayPlanId | None = None
     package: PackageRunResult | None = None
+    decision_only_candidate: DecisionOnlyPackageCandidate | None = None
     decision: PackageDecision | None = None
     claim_boundary: str = ""
     agentic_results: dict[str, AgentTaskResult] = field(default_factory=dict)
@@ -2316,6 +2323,7 @@ class LivePackageAgentSystem:
         elif not state.publication_gate_passed:
             raise RuntimeError("deterministic publication gate did not complete")
         state.claim_boundary += self._model_participation_claim(state, scheduler)
+        state.decision_only_candidate = self._build_decision_only_candidate(state)
         model_applied_diffs: list[dict[str, JsonValue]] = []
         if (
             state.search_supervisor_proposal is not None
@@ -2382,6 +2390,7 @@ class LivePackageAgentSystem:
             normalization_results=state.normalization_results,
             flight_search_outcomes=state.flight_search_outcomes,
             package=state.package,
+            decision_only_candidate=state.decision_only_candidate,
             scheduler=scheduler,
             source_task_ids=source_ids,
             public_transfer_task_ids=public_transfer_ids,
@@ -2418,6 +2427,64 @@ class LivePackageAgentSystem:
                 state.package.final_candidate if state.package is not None else None
             ),
             browser_max_concurrency=_BROWSER_MAX_CONCURRENCY,
+        )
+
+    def _build_decision_only_candidate(
+        self,
+        state: _RunState,
+    ) -> DecisionOnlyPackageCandidate | None:
+        """Build one decision-only package from a sealed comparison flight."""
+
+        intent = state.intent
+        if intent is None:
+            return None
+        comparison_flights = tuple(
+            result.quote
+            for result in state.normalization_results
+            if result.usable
+            and isinstance(result.quote, NormalizedFlightQuote)
+            and result.quote.provider == BrowserProvider.QUNAR.value
+            and result.quote.currency == intent.currency
+            and result.quote.party_total_known
+            and result.quote.total_for_party_cents is not None
+            and result.quote.total_for_party_cents > 0
+            and result.quote.price_basis == "comparison_only"
+            and result.quote.availability == QuoteAvailability.COMPARISON_ONLY
+            and not result.quote.party_availability_confirmed
+            and any(
+                reference.startswith("flight-party-comparison:sha256:")
+                for reference in result.quote.evidence_refs
+            )
+        )
+        if not comparison_flights:
+            return None
+        inventory = PackageInventory(
+            flights=comparison_flights,
+            lodgings=state.inventory.lodgings,
+            transfers=state.inventory.transfers,
+        )
+        planner = PackagePlanner()
+        candidates = tuple(
+            candidate
+            for flight in comparison_flights
+            for candidate in (
+                planner.build_decision_only_candidate(
+                    intent,
+                    flight,
+                    inventory,
+                    transfer_provider="icom-public-transfer",
+                ),
+            )
+            if candidate is not None
+        )
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda item: (
+                item.budget.confirmed_subtotal_cents,
+                item.candidate.id,
+            ),
         )
 
     @staticmethod
@@ -3230,6 +3297,7 @@ class LivePackageAgentSystem:
             normalization_results=state.normalization_results,
             flight_search_outcomes=state.flight_search_outcomes,
             package=state.package,
+            decision_only_candidate=state.decision_only_candidate,
             scheduler=scheduler,
             source_task_ids=state.source_task_ids,
             public_transfer_task_ids=public_ids,
@@ -8405,11 +8473,6 @@ class LivePackageAgentSystem:
                 or amount <= 0
             ):
                 continue
-            evidence_refs = (
-                f"browser-task:{snapshot.id}",
-                f"flight-search-receipt:sha256:{sealed}",
-                f"flight-comparison-candidate:{sealed}:{candidate.candidate_index}",
-            )
             party_receipt = next(
                 (
                     item
@@ -8426,6 +8489,19 @@ class LivePackageAgentSystem:
                     )
                 ),
                 None,
+            )
+            evidence_refs = (
+                f"browser-task:{snapshot.id}",
+                f"flight-search-receipt:sha256:{sealed}",
+                f"flight-comparison-candidate:{sealed}:{candidate.candidate_index}",
+                *(
+                    (
+                        "flight-party-comparison:sha256:"
+                        f"{flight_party_comparison_receipt_sha256(party_receipt)}",
+                    )
+                    if party_receipt is not None
+                    else ()
+                ),
             )
             results.append(
                 NormalizedBrowserQuoteResult(

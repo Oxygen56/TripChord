@@ -1345,6 +1345,23 @@ class PackageBudgetBreakdown(DomainModel):
         return self
 
 
+class DecisionOnlyPackageCandidate(DomainModel):
+    """A complete comparison candidate that can never become executable."""
+
+    candidate: TravelPackageCandidate
+    budget: PackageBudgetBreakdown
+    execution_eligible: bool = False
+    decision_boundary: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def enforce_decision_only(self) -> Self:
+        if self.execution_eligible:
+            raise ValueError("decision-only candidates cannot be execution eligible")
+        if self.candidate.flight.availability != QuoteAvailability.COMPARISON_ONLY:
+            raise ValueError("decision-only candidate requires a comparison-only flight")
+        return self
+
+
 class PackageViolation(DomainModel):
     code: PackageViolationCode
     severity: PackageViolationSeverity
@@ -2055,6 +2072,57 @@ class PackagePlanner:
     LIVE_LODGING_LIMIT_PER_SEGMENT = 8
     LIVE_TRANSFER_BEAM_WIDTH = 64
     LIVE_TRANSFER_LIMIT_PER_CONTRACT_BUCKET = 8
+
+    def build_decision_only_candidate(
+        self,
+        intent: PackageIntent,
+        flight: NormalizedFlightQuote,
+        inventory: PackageInventory,
+        *,
+        transfer_provider: str,
+    ) -> DecisionOnlyPackageCandidate | None:
+        """Join a sealed comparison flight with normal package rules."""
+
+        if not (
+            flight.provider == "qunar"
+            and flight.currency == intent.currency
+            and flight.party_total_known
+            and flight.total_for_party_cents is not None
+            and flight.total_for_party_cents > 0
+            and flight.price_basis == "comparison_only"
+            and flight.availability == QuoteAvailability.COMPARISON_ONLY
+            and not flight.party_availability_confirmed
+            and any(
+                reference.startswith("flight-party-comparison:sha256:")
+                for reference in flight.evidence_refs
+            )
+        ):
+            return None
+        variants = tuple(
+            candidate
+            for candidate in self._continuous_candidates(intent, flight, inventory)
+            if candidate.transfers
+            and all(item.provider == transfer_provider for item in candidate.transfers)
+            and all(item.currency == intent.currency for item in candidate.lodgings)
+        )
+        if not variants:
+            return None
+        candidate = min(
+            variants,
+            key=lambda item: (
+                sum(lodging_quality_rank(lodging) for lodging in item.lodgings),
+                package_budget(item).confirmed_subtotal_cents,
+                item.declared_total_cents,
+                item.id,
+            ),
+        )
+        return DecisionOnlyPackageCandidate(
+            candidate=candidate,
+            budget=package_budget(candidate),
+            decision_boundary=(
+                "仅用于当前已封存比较价的行程决策；不代表余位、可订性、成交或库存锁定。"
+            ),
+        )
 
     def generate(
         self,

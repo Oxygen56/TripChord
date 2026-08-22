@@ -11,6 +11,7 @@ from tripchord.agents.companion_control_tools import (
 from tripchord.agents.flexible_live_system import (
     FlexibleLiveAgentRun,
     FlexiblePackageConstraints,
+    FlexiblePairExecution,
 )
 from tripchord.agents.live_jobs import (
     NON_DURABLE_LIVE_PLANNING_BOUNDARY,
@@ -366,6 +367,9 @@ class FinalFlightProjection(ApiModel):
     display_amount_cents: int | None = None
     party_total_known: bool = True
     price_basis: str = "total_party"
+    availability: str = "available"
+    party_availability_confirmed: bool = True
+    has_publishable_execution_contract: bool = True
     official_view_url: str | None = None
 
 
@@ -401,6 +405,26 @@ class FinalTransferProjection(ApiModel):
     price_guarantee: str | None = None
 
 
+class LodgingSourceComparisonProjection(ApiModel):
+    provider: str
+    source_type: str = Field(pattern=r"^(?:ota|hotel_official)$")
+    property_name: str
+    room_name: str | None = None
+    currency: str
+    total_for_party_cents: int | None = None
+    reference_total_cents: int | None = None
+    reference_currency: str | None = None
+    reference_rate_source: str | None = None
+    reference_rate_date: date | None = None
+    taxes_and_fees_included: bool | None = None
+    captured_at: datetime
+    evidence_refs: tuple[str, ...] = ()
+    check_in: date
+    check_out: date
+    eligible: bool
+    reason: str
+
+
 class FinalPlanProjection(ApiModel):
     """The sole user-facing flexible result; ranked options remain diagnostics."""
 
@@ -423,6 +447,7 @@ class FinalPlanProjection(ApiModel):
     flight: FinalFlightProjection | None = None
     lodgings: tuple[FinalLodgingProjection, ...] = ()
     transfers: tuple[FinalTransferProjection, ...] = ()
+    lodging_source_comparisons: tuple[LodgingSourceComparisonProjection, ...] = ()
     party: dict[str, int] = Field(default_factory=dict)
     covered_source_ids: tuple[str, ...] = ()
     failed_source_ids: tuple[str, ...] = ()
@@ -782,6 +807,193 @@ def build_best_available_plan_projection(
     run: FlexibleLiveAgentRun,
 ) -> BestAvailablePlanProjection | None:
     """Return one useful itinerary without promoting display prices to party totals."""
+
+    def decision_sort_key(execution: FlexiblePairExecution) -> tuple[int, str]:
+        live_run = execution.run or execution.exploration_run
+        candidate = live_run.decision_only_candidate if live_run is not None else None
+        return (
+            candidate.budget.confirmed_subtotal_cents if candidate is not None else 10**18,
+            execution.date_pair.id,
+        )
+
+    ordered_pair_runs = tuple(
+        sorted(
+            run.pair_runs,
+            key=decision_sort_key,
+        )
+    )
+    for execution in ordered_pair_runs:
+        live_run = execution.run or execution.exploration_run
+        decision_only = (
+            live_run.decision_only_candidate if live_run is not None else None
+        )
+        if decision_only is None or live_run is None:
+            continue
+        candidate = decision_only.candidate
+        budget = decision_only.budget
+        flight = candidate.flight
+        estimate = live_run.icom_cny_reference_estimate
+        source_comparisons: list[LodgingSourceComparisonProjection] = []
+        selected_ids = {item.id for item in candidate.lodgings}
+        seen_providers: set[str] = set()
+        for result in live_run.normalization_results:
+            quote = result.quote
+            if not isinstance(quote, NormalizedLodgingQuote):
+                continue
+            if (
+                quote.provider in seen_providers
+                or quote.provider not in {"ctrip", "arena_official"}
+                or quote.check_in != flight.outbound_arrive_at.date()
+                or quote.check_out != flight.return_depart_at.date()
+                or quote.adults != live_run.intent.adults
+                or quote.rooms != live_run.intent.rooms
+                or quote.area.value != "destination_island"
+                or (quote.provider == "ctrip" and quote.id not in selected_ids)
+            ):
+                continue
+            arena = quote.provider == "arena_official"
+            source_comparisons.append(
+                LodgingSourceComparisonProjection(
+                    provider=quote.provider,
+                    source_type="hotel_official" if arena else "ota",
+                    property_name=quote.property_name,
+                    room_name=quote.room_name,
+                    currency=quote.currency,
+                    total_for_party_cents=quote.total_for_party_cents,
+                    reference_total_cents=quote.reference_total_cents,
+                    reference_currency=quote.reference_currency,
+                    reference_rate_source=quote.reference_rate_source,
+                    reference_rate_date=quote.reference_rate_date,
+                    taxes_and_fees_included=quote.taxes_and_fees_included,
+                    captured_at=quote.captured_at,
+                    evidence_refs=quote.evidence_refs,
+                    check_in=quote.check_in,
+                    check_out=quote.check_out,
+                    eligible=not arena and quote.currency == "CNY",
+                    reason=(
+                        "位置依据不足，Arena 官方报价不能计作第二个合格完整方案"
+                        if arena
+                        else "携程当前人民币住宿报价，可进入决策候选"
+                    ),
+                )
+            )
+            seen_providers.add(quote.provider)
+        covered_source_ids = tuple(
+            source_id
+            for coverage in live_run.coverage
+            for source_id in coverage.successful_source_ids
+        )
+        if any(item.provider == "arena_official" for item in source_comparisons):
+            covered_source_ids = (*covered_source_ids, "source-arena-official-lodging")
+        failed_source_ids = tuple(
+            source_id
+            for coverage in live_run.coverage
+            for source_id in coverage.failed_source_ids
+        )
+        lodging_failures = tuple(
+            source_id for source_id in failed_source_ids if "lodging" in source_id
+        )
+        unresolved_items = [
+            "航班为封存的当前页面比较价，未确认余位、可订性或成交合同",
+            "iCom 接驳为公开 USD 基础价，税费未知；人民币金额仅按 ECB 参考汇率估算",
+        ]
+        if lodging_failures:
+            unresolved_items.append(
+                "部分住宿来源未形成合格报价：" + "、".join(lodging_failures)
+            )
+        return BestAvailablePlanProjection(
+            option_id=f"best-available:decision-only:{execution.date_pair.id}",
+            date_pair_id=execution.date_pair.id,
+            departure_date=execution.date_pair.departure_date,
+            return_date=execution.date_pair.return_date,
+            total_budget_cents=None,
+            confirmed_cny_subtotal_cents=budget.confirmed_subtotal_cents,
+            estimated_icom_transfer_cny_cents=(
+                estimate.estimated_cny_cents if estimate is not None else None
+            ),
+            estimated_total_cny_cents=(
+                budget.confirmed_subtotal_cents + estimate.estimated_cny_cents
+                if estimate is not None
+                else None
+            ),
+            icom_cny_reference_estimate=estimate,
+            optimality_status="best_available_not_final",
+            claim_boundary=decision_only.decision_boundary,
+            flight_component_id=flight.id,
+            lodging_component_ids=tuple(item.id for item in candidate.lodgings),
+            transfer_component_ids=tuple(item.id for item in candidate.transfers),
+            flight=FinalFlightProjection(
+                provider=flight.provider,
+                origin=flight.origin,
+                destination=flight.destination,
+                outbound_flight_numbers=flight.outbound_flight_numbers,
+                outbound_depart_at=flight.outbound_depart_at,
+                outbound_arrive_at=flight.outbound_arrive_at,
+                return_flight_numbers=flight.return_flight_numbers,
+                return_depart_at=flight.return_depart_at,
+                return_arrive_at=flight.return_arrive_at,
+                total_for_party_cents=flight.total_for_party_cents,
+                display_amount_cents=flight.display_amount_cents,
+                party_total_known=True,
+                price_basis="comparison_only",
+                availability=flight.availability.value,
+                party_availability_confirmed=False,
+                has_publishable_execution_contract=False,
+                official_view_url=_trusted_quote_view_url(flight),
+            ),
+            lodgings=tuple(
+                FinalLodgingProjection(
+                    provider=item.provider,
+                    property_name=item.property_name,
+                    area=item.area.value,
+                    check_in=item.check_in,
+                    check_out=item.check_out,
+                    rooms=item.rooms,
+                    room_name=item.room_name,
+                    breakfast_included=item.breakfast_included,
+                    cancellation_policy=item.cancellation_policy,
+                    location_convenience=item.location_convenience.value,
+                    location_address=item.location_address,
+                    nearby_location_evidence=item.nearby_location_evidence,
+                    location_evidence_summary=_lodging_location_evidence_summary(item),
+                    display_total_cents=item.total_for_party_cents,
+                    official_view_url=_trusted_quote_view_url(item),
+                )
+                for item in candidate.lodgings
+            ),
+            transfers=tuple(
+                FinalTransferProjection(
+                    provider=item.provider,
+                    origin_area=item.origin_area.value,
+                    destination_area=item.destination_area.value,
+                    service_date=item.service_date,
+                    schedule_mode=item.schedule_mode.value,
+                    depart_at=item.depart_at,
+                    arrive_at=item.arrive_at,
+                    currency=item.currency,
+                    total_for_party_cents=item.total_for_party_cents,
+                    taxes_and_fees_included=item.taxes_and_fees_included,
+                    price_guarantee=item.price_guarantee.value,
+                )
+                for item in candidate.transfers
+            ),
+            lodging_source_comparisons=tuple(source_comparisons),
+            party={
+                "adults": live_run.intent.adults,
+                "children": live_run.intent.children,
+                "infants": live_run.intent.infants,
+                "rooms": live_run.intent.rooms,
+            },
+            covered_source_ids=covered_source_ids,
+            failed_source_ids=failed_source_ids,
+            price_comparability=(
+                "confirmed_cny_subtotal_plus_icom_estimate"
+                if estimate is not None
+                else "confirmed_cny_subtotal"
+            ),
+            unresolved_items=tuple(unresolved_items),
+            advisory_note="这是决策用完整候选，不是可订或可付款方案。",
+        )
 
     choices: list[
         tuple[
