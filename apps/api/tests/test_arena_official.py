@@ -70,6 +70,7 @@ async def test_arena_official_normalizes_exact_maafushi_segment() -> None:
         query,
         intent,
         system_stay_plan_candidate_set("马累"),
+        arrival_date=date(2026, 9, 4),
     )
     assert client.calls[0]["url"] == "https://live.ipms247.com/booking/book-rooms-92"
     assert client.calls[0]["params"] == {}
@@ -177,7 +178,13 @@ async def test_captured_arena_evidence_binds_to_next_day_arrival_window(
     result = await ArenaOfficialLodgingProvider(
         captured_evidence_path=str(evidence),
         captured_evidence_root=str(tmp_path),
-    ).search(query, intent, system_stay_plan_candidate_set("马累"))
+    ).search(
+        query,
+        intent,
+        system_stay_plan_candidate_set("马累"),
+        arrival_date=date(2026, 9, 4),
+    )
+
     assert result.result.usable
     assert result.result.quote is not None
     assert result.result.quote.check_in == date(2026, 9, 4)

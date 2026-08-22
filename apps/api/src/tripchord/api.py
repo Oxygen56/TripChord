@@ -903,9 +903,11 @@ def build_best_available_plan_projection(
                 ),
             )
 
+        # An overnight outbound flight means the stay starts on the local
+        # arrival date.  Never fall back to the pair's departure date here:
+        # that would publish a lodging quote for a night before the traveler
+        # reaches the destination.
         lodging_cover = best_lodging_cover(flight.outbound_arrive_at.date())
-        if lodging_cover is None:
-            lodging_cover = best_lodging_cover(execution.date_pair.departure_date)
         if lodging_cover is None:
             continue
         lodging_total = sum(item.total_for_party_cents for item in lodging_cover)

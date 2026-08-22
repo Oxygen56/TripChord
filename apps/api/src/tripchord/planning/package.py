@@ -157,6 +157,15 @@ class NormalizedQuote(DomainModel):
     # evidence changes; a provider offer id, when actually exposed, is allowed to
     # participate in cross-observation identity.
     provider_offer_id: str | None = Field(default=None, min_length=1, max_length=500)
+    reference_total_cents: int | None = Field(default=None, ge=0)
+    reference_currency: str | None = Field(default=None, min_length=3, max_length=3)
+    reference_rate_source: str | None = Field(default=None, min_length=1)
+    reference_rate_date: date | None = None
+    reference_usd_to_cny: Decimal | None = Field(default=None, gt=0)
+    reference_rate_response_sha256: str | None = Field(
+        default=None, pattern="^[0-9a-f]{64}$"
+    )
+    reference_rate_captured_at: datetime | None = None
 
     @field_validator("currency")
     @classmethod

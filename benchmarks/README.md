@@ -157,6 +157,16 @@ the generated pool stays inside the audited structural bound. This is a
 regression claim for that fixed fixture only; it is not live OTA, bookability,
 platform-superiority, exhaustive-search, recall, or production-SLA evidence.
 
+`scenarios/live-best-available-arrival-v1.json` freezes the live-plan date rule:
+each flight window uses its local arrival date as lodging check-in, and a
+departure-date lodging quote is rejected rather than published. When live
+search exposes multiple `(arrival_date, return_departure_date)` windows, each
+window is queried and retained separately; a planner may only combine matching
+flight and lodging windows. The focused projection regression is covered by
+`test_best_available_plan_keeps_display_fare_separate_from_lodging_total`, and
+the live window re-query regression is covered by
+`test_fixed_date_run_requeries_only_lodging_scopes_misaligned_with_arrival`.
+
 `agent-suite-v1.jsonl` adds 240 balanced tasks across 12 categories. Its evaluator
 compares a deterministic baseline, a single-candidate deterministic proxy, and
 the complete multi-agent path, then checks constraint violations, explicit

@@ -16,7 +16,7 @@ import re
 import stat
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -30,7 +30,12 @@ from tripchord.planning.package import (
     PackagePlaceKey,
 )
 from tripchord.planning.stay_plans import StayPlanCandidateSet, StayPlanId
+from tripchord.providers.base import ProviderError
 from tripchord.providers.browser_bridge import BrowserSearchQuery, BrowserVertical
+from tripchord.providers.fx_reference import (
+    ECB_DAILY_REFERENCE_URL,
+    fetch_usd_cny_reference_rate,
+)
 from tripchord.providers.quote_normalizer import (
     NormalizedBrowserQuoteResult,
     QuoteNormalizationStatus,
@@ -126,6 +131,8 @@ class ArenaOfficialLodgingProvider:
         query: BrowserSearchQuery,
         intent: PackageIntent,
         candidate_set: StayPlanCandidateSet,
+        *,
+        arrival_date: date,
     ) -> ArenaOfficialLodgingResult:
         preferred_plan_ids = (
             StayPlanId.MAAFUSHI_ICOM,
@@ -144,16 +151,13 @@ class ArenaOfficialLodgingProvider:
         segment = next(
             item for item in plan.segments if item.exact_place_key == PackagePlaceKey.MAAFUSHI
         )
-        # The flight query dates are departure dates.  The official Maafushi
-        # quote must bind to the actual stay window used by the selected
-        # flight skeleton: arrival on the following local date through the
-        # return-departure date.  This keeps the live official lookup aligned
-        # with the package verifier's flight-arrival-bound stay dates rather
-        # than accidentally reusing the old middle-segment (9/4-9/8) window.
+        # The flight query start date is a departure date, not necessarily the
+        # lodging check-in date.  The caller must provide the actual local
+        # arrival date selected from the current flight evidence.
         if query.destination_code == "MLE":
             if query.end_date is None:
                 raise ValueError("Arena official source requires a return date")
-            check_in: date = query.start_date + timedelta(days=1)
+            check_in = arrival_date
             check_out: date = query.end_date
         else:
             check_in = segment.check_in.resolve(intent)
@@ -259,6 +263,28 @@ class ArenaOfficialLodgingProvider:
             raise ValueError("Arena official source has no available exact room")
         total_usd, row = min(candidates, key=lambda item: item[0])
         captured_at = self._now().astimezone(UTC)
+        reference_total_cents: int | None = None
+        reference_rate_captured_at: datetime | None = None
+        reference_rate_date: date | None = None
+        reference_usd_to_cny: Decimal | None = None
+        reference_rate_response_sha256: str | None = None
+        try:
+            reference_rate = await fetch_usd_cny_reference_rate(
+                now=self._now,
+            )
+            reference_total_cents = int(
+                (total_usd * Decimal(100) * reference_rate.usd_to_cny).quantize(
+                    Decimal("1"), rounding=ROUND_HALF_UP
+                )
+            )
+            reference_rate_captured_at = reference_rate.captured_at
+            reference_rate_date = reference_rate.rate_date
+            reference_usd_to_cny = reference_rate.usd_to_cny
+            reference_rate_response_sha256 = reference_rate.response_sha256
+        except (AttributeError, ProviderError, httpx.HTTPError, ValueError):
+            # The official USD quote remains valid when the optional reference
+            # conversion source is unavailable; it must not be fabricated.
+            pass
         response_sha256 = hashlib.sha256(raw).hexdigest()
         self._persist_observation(
             raw=raw,
@@ -295,6 +321,15 @@ class ArenaOfficialLodgingProvider:
             payment_policy="not captured before booking; no booking action taken",
             provider_offer_id=f"{ARENA_HOTEL_CODE}:{room_rate_id}",
             evidence_refs=(f"arena-official-response:{response_sha256}",),
+            reference_total_cents=reference_total_cents,
+            reference_currency="CNY" if reference_total_cents is not None else None,
+            reference_rate_source=(
+                ECB_DAILY_REFERENCE_URL if reference_total_cents is not None else None
+            ),
+            reference_rate_date=reference_rate_date,
+            reference_usd_to_cny=reference_usd_to_cny,
+            reference_rate_response_sha256=reference_rate_response_sha256,
+            reference_rate_captured_at=reference_rate_captured_at,
         )
         result = NormalizedBrowserQuoteResult(
             provider="arena_official",

@@ -492,11 +492,11 @@ def test_best_available_plan_keeps_display_fare_separate_from_lodging_total() ->
         availability=QuoteAvailability.AVAILABLE,
         evidence_refs=(
             "lodging-evidence",
-            "https://hotels.ctrip.com/hotels/detail/?cityEnName=Maafushi&hotelId=47330536&checkIn=2026-09-03&checkOut=2026-09-09&adult=2&children=0&crn=1",
+            "https://hotels.ctrip.com/hotels/detail/?cityEnName=Maafushi&hotelId=47330536&checkIn=2026-09-04&checkOut=2026-09-09&adult=2&children=0&crn=1",
         ),
         property_name="Hotel Ocean Grand at Hulhumale",
         area=PackageArea.AIRPORT_ISLAND,
-        check_in=date(2026, 9, 3),
+        check_in=date(2026, 9, 4),
         check_out=date(2026, 9, 9),
         adults=2,
         rooms=1,
@@ -545,6 +545,27 @@ def test_best_available_plan_keeps_display_fare_separate_from_lodging_total() ->
     assert plan.lodgings[0].official_view_url.startswith("https://hotels.ctrip.com/")
     assert plan.return_date == date(2026, 9, 9)
     assert plan.flight.return_arrive_at.date() == date(2026, 9, 10)
+
+    # A quote covering the departure date must not be used when the flight
+    # reaches the destination on the following calendar day.
+    misaligned_lodging = lodging.model_copy(
+        update={"check_in": date(2026, 9, 3)}
+    )
+    misaligned_run = live_run.model_copy(
+        update={
+            "normalization_results": (
+                normalized[0],
+                normalized[1].model_copy(update={"quote": misaligned_lodging}),
+            )
+        }
+    )
+    misaligned_execution = execution.model_copy(update={"run": misaligned_run})
+    assert (
+        build_best_available_plan_projection(
+            FlexibleLiveAgentRun.model_construct(pair_runs=(misaligned_execution,))
+        )
+        is None
+    )
 
 
 def test_best_available_plan_does_not_add_unknown_flight_fare_to_lodging() -> None:
@@ -599,7 +620,7 @@ def test_best_available_plan_does_not_add_unknown_flight_fare_to_lodging() -> No
             evidence_refs=("lodging-evidence",),
             property_name="Hotel Ocean Grand at Hulhumale",
             area=PackageArea.AIRPORT_ISLAND,
-            check_in=departure_date,
+            check_in=departure_date + timedelta(days=1),
             check_out=return_date,
             adults=2,
             rooms=1,

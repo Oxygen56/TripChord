@@ -1,0 +1,20 @@
+{
+  "id": "live-best-available-arrival-v1",
+  "description": "Each outbound flight window must anchor its lodging nights to that flight's local arrival date; multiple windows must remain separately bound.",
+  "flight": {
+    "departure_date": "2026-09-03",
+    "arrival_date": "2026-09-04",
+    "return_date": "2026-09-09"
+  },
+  "expected": {
+    "aligned_lodging_window": {
+      "check_in": "2026-09-04",
+      "check_out": "2026-09-09"
+    },
+    "departure_date_lodging_is_not_publishable": true,
+    "multi_window_binding": {
+      "same_return_departure_date_is_allowed": true,
+      "lodging_must_match_flight_window": true
+    }
+  }
+}

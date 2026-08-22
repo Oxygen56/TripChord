@@ -116,6 +116,7 @@ from tripchord.planning.package_reverification import PackageInvariantCode
 from tripchord.planning.stay_plans import (
     StayInventoryResultState,
     StayPlanId,
+    StayPlanInventoryOutcome,
     system_stay_plan_candidate_set,
 )
 from tripchord.platform.booking import BookingLedger
@@ -1224,7 +1225,14 @@ def _with_ctrip_first_area_mismatch(
                     lease,
                     page_url=quote.page_url,
                     amount=quote.amount,
-                    basis=quote.price_basis,
+                    # Keep the flight's route/timestamps authoritative while
+                    # withholding a final party-total contract.  Lodging
+                    # alignment must still use these date facts.
+                    basis=(
+                        QuotePriceBasis.COMPARISON_ONLY
+                        if lease.kind == BrowserVertical.FLIGHT
+                        else quote.price_basis
+                    ),
                     title=quote.title,
                     details=cast(dict[str, JsonValue], details),
                 ),
@@ -1638,9 +1646,12 @@ async def test_fixed_date_run_requeries_only_lodging_scopes_misaligned_with_arri
     )
     alignment = cast(dict[str, JsonValue], normalizer.output["lodging_window_alignment"])
     assert alignment["state"] == "applied"
-    assert alignment["stay_start"] == "2026-09-04"
-    assert alignment["stay_end"] == "2026-09-09"
-    assert alignment["replacement_count"] == 1
+    windows = cast(list[dict[str, JsonValue]], alignment["windows"])
+    assert {
+        (window["stay_start"], window["stay_end"])
+        for window in windows
+    } == {("2026-09-04", "2026-09-09")}
+    assert sum(int(window["replacement_count"]) for window in windows) == 1
     ctrip_full_queries = [
         item_query
         for provider, item_query in observed_lodging_queries
@@ -7453,6 +7464,8 @@ class _FixtureOfficialLodgingProvider:
         query: BrowserSearchQuery,
         request: PackageIntent,
         candidate_set: object,
+        *,
+        arrival_date: date,
     ) -> ArenaOfficialLodgingResult:
         del query, candidate_set
         location_fields: dict[str, object] = {}
@@ -7476,7 +7489,7 @@ class _FixtureOfficialLodgingProvider:
             evidence_refs=("https://arenabeachmaldives.com/booking/",),
             property_name="Arena Beach Hotel",
             area=PackageArea.DESTINATION_ISLAND,
-            check_in=request.start_date,
+            check_in=arrival_date,
             check_out=request.end_date,
             adults=request.adults,
             children=request.children,
@@ -7581,6 +7594,142 @@ async def test_exact_lodging_comparison_counts_only_quotes_eligible_for_same_int
         assert "未完成跨平台比价" in run.claim_boundary
         assert "已完成精确跨平台比价" not in run.claim_boundary
         assert "不声明最低价" in run.claim_boundary
+
+
+@pytest.mark.asyncio
+async def test_multi_window_official_quote_binding_and_failure_isolation() -> None:
+    """A 09-04 candidate must never consume the 09-03 official quote."""
+
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+    request = intent().model_copy(
+        update={
+            "start_date": date(2026, 9, 3),
+            "end_date": date(2026, 9, 9),
+            "destination_place_key": PackagePlaceKey.MAAFUSHI,
+            "require_non_remote_lodging": False,
+        }
+    )
+    ctrip_quote = NormalizedLodgingQuote(
+        id="browser:ctrip:window-0904",
+        provider=BrowserProvider.CTRIP.value,
+        currency="CNY",
+        total_for_party_cents=320_000,
+        taxes_and_fees_included=True,
+        captured_at=NOW,
+        expires_at=NOW + timedelta(minutes=10),
+        evidence_refs=("browser:ctrip:sha256:" + "1" * 64,),
+        property_name="Ctrip Maafushi",
+        area=PackageArea.DESTINATION_ISLAND,
+        check_in=date(2026, 9, 4),
+        check_out=date(2026, 9, 9),
+        adults=2,
+        rooms=1,
+        breakfast_included=True,
+        place_key=PackagePlaceKey.MAAFUSHI,
+        room_name="Deluxe room",
+        location_address="Harbour Road, Maafushi",
+        nearby_location_evidence=("Near Dive Centre",),
+        location_convenience=LodgingLocationConvenience.CONFIRMED_NOT_REMOTE,
+    )
+    candidate_set = system_stay_plan_candidate_set("MLE")
+    state = _RunState(
+        source_task_ids=("source-ctrip-lodging-full",),
+        intent=request,
+        stay_plan_candidate_set=candidate_set,
+        inventory=PackageInventory(lodgings=(ctrip_quote,)),
+        stay_plan_inventory_outcomes=(
+            StayPlanInventoryOutcome(
+                source_task_id="source-ctrip-lodging-full",
+                provider="ctrip",
+                stay_plan_id=StayPlanId.MAAFUSHI_ICOM,
+                segment_id="maafushi-full",
+                state=StayInventoryResultState.QUOTE_FOUND,
+                exact_place_key=PackagePlaceKey.MAAFUSHI,
+                scan_limit=12,
+                scanned_count=1,
+                quote_ids=(ctrip_quote.id,),
+                normalization_result_refs=("normalization:window-0904",),
+                raw_snapshot_id="window-0904",
+                raw_quote_evidence_sha256s=("1" * 64,),
+                evidence_refs=("browser-task:window-0904", *ctrip_quote.evidence_refs),
+                reason="fixture exact quote",
+            ),
+        ),
+    )
+    class WindowedOfficialProvider(_FixtureOfficialLodgingProvider):
+        async def search(self, query, request, candidate_set, *, arrival_date):
+            if arrival_date == date(2026, 9, 3):
+                raise ProviderError(
+                    "arena-official",
+                    "no_inventory",
+                    "09-03 fixture window unavailable",
+                )
+            return await super().search(
+                query, request, candidate_set, arrival_date=arrival_date
+            )
+
+    official_provider = WindowedOfficialProvider(eligible_non_remote=True)
+    failed_0903: str | None = None
+    try:
+        await official_provider.search(
+            query(), request, candidate_set, arrival_date=date(2026, 9, 3)
+        )
+    except Exception as exc:
+        failed_0903 = f"{type(exc).__name__}: {exc}"
+    official_0904 = await official_provider.search(
+        query(), request, candidate_set, arrival_date=date(2026, 9, 4)
+    )
+    stale_provider = _FixtureOfficialLodgingProvider(eligible_non_remote=True)
+    stale_0903 = await stale_provider.search(
+        query(), request, candidate_set, arrival_date=date(2026, 9, 3)
+    )
+    stale_quote = stale_0903.result.quote.model_copy(
+        update={"id": "arena-official:fixture:window-0903"}
+    )
+    stale_0903 = ArenaOfficialLodgingResult(
+        result=stale_0903.result.model_copy(update={"quote": stale_quote}),
+        source_task_id=stale_0903.source_task_id,
+        query=stale_0903.query,
+        response_sha256=stale_0903.response_sha256,
+        captured_at=stale_0903.captured_at,
+    )
+    state.official_lodging_results = (stale_0903, official_0904)
+    state.official_lodging_window_errors["2026-09-03"] = failed_0903 or "missing failure"
+    exact = system._stay_plan_segment_quote_comparison_coverage(
+        state,
+        request,
+        StayPlanId.MAAFUSHI_ICOM,
+        "maafushi-full",
+        "full",
+        PackagePlaceKey.MAAFUSHI,
+        PackageArea.DESTINATION_ISLAND,
+        date(2026, 9, 4),
+        date(2026, 9, 9),
+        (BrowserProvider.CTRIP, BrowserProvider.QUNAR),
+    )
+    legacy = system._legacy_segment_quote_comparison_coverage(
+        state,
+        request,
+        ctrip_quote,
+        index=0,
+        lodging_providers=(BrowserProvider.CTRIP, BrowserProvider.QUNAR),
+    )
+    exact_arena = next(
+        item for item in exact.provider_evidence if item.provider == "arena_official"
+    )
+    legacy_arena = next(
+        item for item in legacy.provider_evidence if item.provider == "arena_official"
+    )
+    assert failed_0903 is not None
+    assert "2026-09-03" in state.official_lodging_window_errors
+    assert exact_arena.quote_ids == (official_0904.result.quote.id,)
+    assert legacy_arena.quote_ids == (official_0904.result.quote.id,)
+    assert system._official_single_source_matches_candidate(
+        state, request, (ctrip_quote,)
+    )
+    assert exact.distinct_exact_quote_provider_count == 2
+    assert legacy.distinct_exact_quote_provider_count == 2
 
 
 @pytest.mark.asyncio
