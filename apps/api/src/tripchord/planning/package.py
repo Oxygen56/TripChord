@@ -925,9 +925,37 @@ class PackageIntent(DomainModel):
         return (self.end_date - self.start_date).days
 
 
+def lodging_reference_cny_if_comparable(
+    lodging: NormalizedLodgingQuote,
+    intent_currency: str,
+) -> int | None:
+    """Return a CNY comparison amount only with a complete FX evidence contract."""
+
+    if lodging.currency == intent_currency:
+        return lodging.total_for_party_cents if lodging.total_for_party_cents > 0 else None
+    response_sha = lodging.reference_rate_response_sha256
+    if (
+        lodging.reference_total_cents is None
+        or lodging.reference_total_cents <= 0
+        or lodging.reference_currency != "CNY"
+        or not lodging.reference_rate_source
+        or lodging.reference_rate_date is None
+        or lodging.reference_usd_to_cny is None
+        or lodging.reference_usd_to_cny <= 0
+        or response_sha is None
+        or len(response_sha) != 64
+        or any(char not in "0123456789abcdef" for char in response_sha)
+        or lodging.reference_rate_captured_at is None
+    ):
+        return None
+    return lodging.reference_total_cents
+
+
 def lodging_is_comparison_eligible(
     lodging: NormalizedLodgingQuote,
     intent: PackageIntent,
+    *,
+    allow_reference_currency: bool = False,
 ) -> bool:
     """Return whether a quote may support a same-hard-contract comparison claim.
 
@@ -939,7 +967,13 @@ def lodging_is_comparison_eligible(
 
     return (
         lodging.availability == QuoteAvailability.AVAILABLE
-        and lodging.currency == intent.currency
+        and (
+            lodging.currency == intent.currency
+            or (
+                allow_reference_currency
+                and lodging_reference_cny_if_comparable(lodging, intent.currency) is not None
+            )
+        )
         and lodging.taxes_and_fees_included is True
         and lodging.adults == intent.adults
         and lodging.children == intent.children
@@ -976,10 +1010,13 @@ def lodging_is_segment_comparison_eligible(
     check_in: date,
     check_out: date,
     exact_place_key: PackagePlaceKey | None = None,
+    allow_reference_currency: bool = False,
 ) -> bool:
     """Match one quote to the exact segment and final hard comparison contract."""
 
-    if not lodging_is_comparison_eligible(lodging, intent):
+    if not lodging_is_comparison_eligible(
+        lodging, intent, allow_reference_currency=allow_reference_currency
+    ):
         return False
     if (
         lodging.area != area
@@ -1359,6 +1396,41 @@ class DecisionOnlyPackageCandidate(DomainModel):
             raise ValueError("decision-only candidates cannot be execution eligible")
         if self.candidate.flight.availability != QuoteAvailability.COMPARISON_ONLY:
             raise ValueError("decision-only candidate requires a comparison-only flight")
+        return self
+
+
+class DecisionOnlyCandidateSet(DomainModel):
+    """Authoritative set of complete, non-executable comparison candidates."""
+
+    candidates: tuple[DecisionOnlyPackageCandidate, ...] = Field(min_length=2)
+    selected_candidate_id: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_set(self) -> Self:
+        ids = tuple(item.candidate.id for item in self.candidates)
+        if len(ids) != len(set(ids)):
+            raise ValueError("decision-only candidate IDs must be unique")
+        if len({item.candidate.flight.id for item in self.candidates}) != 1:
+            raise ValueError("decision-only candidates must share one flight")
+        providers = tuple(item.candidate.lodgings[0].provider for item in self.candidates)
+        if len(providers) != len(set(providers)):
+            raise ValueError("decision-only candidates must use unique lodging providers")
+        transfer_fingerprints = {
+            tuple(transfer.id for transfer in item.candidate.transfers)
+            for item in self.candidates
+        }
+        if len(transfer_fingerprints) != 1:
+            raise ValueError("decision-only candidates must share transfers")
+        if self.selected_candidate_id not in ids:
+            raise ValueError("selected decision-only candidate is not in the set")
+        if any(item.execution_eligible for item in self.candidates):
+            raise ValueError("decision-only candidate set cannot contain executable items")
+        contract_ids = {
+            tuple(transfer.price_contract_id for transfer in item.candidate.transfers)
+            for item in self.candidates
+        }
+        if len(contract_ids) != 1:
+            raise ValueError("decision-only candidates must share transfer price contracts")
         return self
 
 
@@ -2098,30 +2170,57 @@ class PackagePlanner:
             )
         ):
             return None
+        variants = self.build_decision_only_candidates(
+            intent, flight, inventory, transfer_provider=transfer_provider
+        )
+        if not variants:
+            return None
+        return min(
+            variants,
+            key=lambda item: (
+                sum(lodging_quality_rank(lodging) for lodging in item.candidate.lodgings),
+                item.budget.confirmed_subtotal_cents,
+                item.candidate.declared_total_cents,
+                item.candidate.id,
+            ),
+        )
+
+    def build_decision_only_candidates(
+        self,
+        intent: PackageIntent,
+        flight: NormalizedFlightQuote,
+        inventory: PackageInventory,
+        *,
+        transfer_provider: str,
+    ) -> tuple[DecisionOnlyPackageCandidate, ...]:
+        """Build all bounded lodging variants for decision-only comparison."""
         variants = tuple(
             candidate
             for candidate in self._continuous_candidates(intent, flight, inventory)
             if candidate.transfers
             and all(item.provider == transfer_provider for item in candidate.transfers)
-            and all(item.currency == intent.currency for item in candidate.lodgings)
         )
-        if not variants:
-            return None
-        candidate = min(
-            variants,
-            key=lambda item: (
-                sum(lodging_quality_rank(lodging) for lodging in item.lodgings),
-                package_budget(item).confirmed_subtotal_cents,
-                item.declared_total_cents,
-                item.id,
-            ),
-        )
-        return DecisionOnlyPackageCandidate(
-            candidate=candidate,
-            budget=package_budget(candidate),
-            decision_boundary=(
-                "仅用于当前已封存比较价的行程决策；不代表余位、可订性、成交或库存锁定。"
-            ),
+        representatives: dict[str, TravelPackageCandidate] = {}
+        for candidate in variants:
+            provider_key = candidate.lodgings[0].provider
+            current = representatives.get(provider_key)
+            if current is None or (
+                package_budget(candidate).confirmed_subtotal_cents,
+                candidate.id,
+            ) < (
+                package_budget(current).confirmed_subtotal_cents,
+                current.id,
+            ):
+                representatives[provider_key] = candidate
+        return tuple(
+            DecisionOnlyPackageCandidate(
+                candidate=candidate,
+                budget=package_budget(candidate),
+                decision_boundary=(
+                    "仅用于当前已封存比较价的行程决策；不代表余位、可订性、成交或库存锁定。"
+                ),
+            )
+            for candidate in representatives.values()
         )
 
     def generate(

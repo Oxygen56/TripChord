@@ -47,10 +47,12 @@ from tripchord.planning.adaptive import AdaptiveReplanResult
 from tripchord.planning.flexible_dates import FlexibleTravelWindow, PlatformFareCalendar
 from tripchord.planning.impact import PlanDependency
 from tripchord.planning.package import (
+    DecisionOnlyPackageCandidate,
     NormalizedFlightQuote,
     NormalizedLodgingQuote,
     PackageDecisionState,
     PackageIntent,
+    lodging_reference_cny_if_comparable,
 )
 from tripchord.planning.policy import ReplanPreference
 from tripchord.planning.problem import OptimizationResult, PlanningProblem
@@ -461,6 +463,51 @@ class BestAvailablePlanProjection(FinalPlanProjection):
     advisory_note: str = Field(min_length=1)
 
 
+class DecisionCandidateProjection(ApiModel):
+    candidate_id: str
+    selected: bool
+    flight_component_id: str
+    lodging_component_ids: tuple[str, ...]
+    transfer_component_ids: tuple[str, ...]
+    lodging_provider: str
+    lodging_property: str | None
+    lodging_room: str | None
+    lodging_dates: tuple[date, date]
+    confirmed_cny_subtotal_cents: int
+    foreign_lodging_currency: str | None = None
+    foreign_lodging_total_cents: int | None = None
+    lodging_reference_cny_cents: int | None = None
+    lodging_reference_source: str | None = None
+    lodging_reference_date: date | None = None
+    lodging_reference_sha256: str | None = None
+    lodging_reference_captured_at: datetime | None = None
+    icom_usd_base_cents: int | None = None
+    icom_reference_cny_cents: int | None = None
+    estimated_total_cny_cents: int | None = None
+    is_all_in: bool = False
+    unresolved_items: tuple[str, ...] = ()
+    claim_boundary: str
+
+
+def _decision_estimated_total_cents(
+    live_run: LivePackageAgentRun,
+    item: DecisionOnlyPackageCandidate,
+) -> int | None:
+    estimate = live_run.icom_cny_reference_estimate
+    foreign_reference = 0
+    for lodging in item.candidate.lodgings:
+        if lodging.currency != item.candidate.currency:
+            reference = lodging_reference_cny_if_comparable(
+                lodging, item.candidate.currency
+            )
+            if reference is None:
+                return None
+            foreign_reference += reference
+    if estimate is None:
+        return None
+    return item.budget.confirmed_subtotal_cents + foreign_reference + estimate.estimated_cny_cents
+
+
 LiveAgentPlanningResponse.model_rebuild(
     _types_namespace={"FinalPlanProjection": FinalPlanProjection}
 )
@@ -503,6 +550,7 @@ class LiveFlexibleFromTextPlanningResponse(ApiModel):
     run: FlexibleLiveAgentRun | None = None
     final_plan: FinalPlanProjection | None = None
     best_available_plan: BestAvailablePlanProjection | None = None
+    decision_candidates: tuple[DecisionCandidateProjection, ...] = ()
     cached_pair_runs: tuple[LiveFlexiblePairRunHandle, ...] = ()
     model_enhancement_enabled: bool = False
     model_trace_scope_sha256: str = Field(pattern="^[0-9a-f]{64}$")
@@ -803,6 +851,73 @@ def _trusted_quote_view_url(quote: Any) -> str | None:
     return None
 
 
+def _decision_candidate_projections(
+    live_run: LivePackageAgentRun,
+) -> tuple[DecisionCandidateProjection, ...]:
+    candidate_set = live_run.decision_only_candidate_set
+    if candidate_set is None:
+        return ()
+    estimate = live_run.icom_cny_reference_estimate
+    rows: list[DecisionCandidateProjection] = []
+    for item in candidate_set.candidates:
+        candidate = item.candidate
+        lodging = candidate.lodgings[0]
+        foreign = lodging.currency != candidate.currency
+        reference = (
+            lodging_reference_cny_if_comparable(lodging, candidate.currency)
+            if foreign
+            else None
+        )
+        estimated = _decision_estimated_total_cents(live_run, item)
+        rows.append(
+            DecisionCandidateProjection(
+                candidate_id=candidate.id,
+                selected=candidate.id == candidate_set.selected_candidate_id,
+                flight_component_id=candidate.flight.id,
+                lodging_component_ids=tuple(item.id for item in candidate.lodgings),
+                transfer_component_ids=tuple(item.id for item in candidate.transfers),
+                lodging_provider=lodging.provider,
+                lodging_property=lodging.property_name,
+                lodging_room=lodging.room_name,
+                lodging_dates=(lodging.check_in, lodging.check_out),
+                confirmed_cny_subtotal_cents=item.budget.confirmed_subtotal_cents,
+                foreign_lodging_currency=lodging.currency if foreign else None,
+                foreign_lodging_total_cents=lodging.total_for_party_cents if foreign else None,
+                lodging_reference_cny_cents=reference if foreign else None,
+                lodging_reference_source=(
+                    lodging.reference_rate_source if reference is not None else None
+                ),
+                lodging_reference_date=(
+                    lodging.reference_rate_date if reference is not None else None
+                ),
+                lodging_reference_sha256=(
+                    lodging.reference_rate_response_sha256 if reference is not None else None
+                ),
+                lodging_reference_captured_at=(
+                    lodging.reference_rate_captured_at if reference is not None else None
+                ),
+                icom_usd_base_cents=(
+                    estimate.source_usd_base_fare_cents if estimate is not None else None
+                ),
+                icom_reference_cny_cents=(
+                    estimate.estimated_cny_cents if estimate is not None else None
+                ),
+                estimated_total_cny_cents=estimated,
+                unresolved_items=(
+                    "航班比较价未确认余位与成交合同",
+                    "iCom 为公开 USD 基础价，税费未知",
+                    *(
+                        ("住宿非人民币价格仅为 ECB 参考折算",)
+                        if foreign
+                        else ()
+                    ),
+                ),
+                claim_boundary=item.decision_boundary,
+            )
+        )
+    return tuple(rows)
+
+
 def build_best_available_plan_projection(
     run: FlexibleLiveAgentRun,
 ) -> BestAvailablePlanProjection | None:
@@ -811,8 +926,13 @@ def build_best_available_plan_projection(
     def decision_sort_key(execution: FlexiblePairExecution) -> tuple[int, str]:
         live_run = execution.run or execution.exploration_run
         candidate = live_run.decision_only_candidate if live_run is not None else None
+        estimated = (
+            _decision_estimated_total_cents(live_run, candidate)
+            if live_run is not None and candidate is not None
+            else None
+        )
         return (
-            candidate.budget.confirmed_subtotal_cents if candidate is not None else 10**18,
+            estimated if estimated is not None else 10**18,
             execution.date_pair.id,
         )
 
@@ -834,28 +954,19 @@ def build_best_available_plan_projection(
         flight = candidate.flight
         estimate = live_run.icom_cny_reference_estimate
         source_comparisons: list[LodgingSourceComparisonProjection] = []
-        selected_ids = {item.id for item in candidate.lodgings}
-        seen_providers: set[str] = set()
-        for result in live_run.normalization_results:
-            quote = result.quote
-            if not isinstance(quote, NormalizedLodgingQuote):
-                continue
-            if (
-                quote.provider in seen_providers
-                or quote.provider not in {"ctrip", "arena_official"}
-                or quote.check_in != flight.outbound_arrive_at.date()
-                or quote.check_out != flight.return_depart_at.date()
-                or quote.adults != live_run.intent.adults
-                or quote.rooms != live_run.intent.rooms
-                or quote.area.value != "destination_island"
-                or (quote.provider == "ctrip" and quote.id not in selected_ids)
-            ):
-                continue
-            arena = quote.provider == "arena_official"
-            source_comparisons.append(
-                LodgingSourceComparisonProjection(
+        candidate_set = live_run.decision_only_candidate_set
+        source_candidates = (
+            candidate_set.candidates if candidate_set is not None else (decision_only,)
+        )
+        for source_candidate in source_candidates:
+            for quote in source_candidate.candidate.lodgings:
+                if quote.area.value != "destination_island":
+                    continue
+                official = quote.provider in {"arena_official", "kaani_official"}
+                source_comparisons.append(
+                    LodgingSourceComparisonProjection(
                     provider=quote.provider,
-                    source_type="hotel_official" if arena else "ota",
+                    source_type="hotel_official" if official else "ota",
                     property_name=quote.property_name,
                     room_name=quote.room_name,
                     currency=quote.currency,
@@ -869,15 +980,48 @@ def build_best_available_plan_projection(
                     evidence_refs=quote.evidence_refs,
                     check_in=quote.check_in,
                     check_out=quote.check_out,
-                    eligible=not arena and quote.currency == "CNY",
+                    eligible=(quote.provider == "ctrip" and quote.currency == "CNY")
+                    or quote.provider == "kaani_official",
                     reason=(
                         "位置依据不足，Arena 官方报价不能计作第二个合格完整方案"
-                        if arena
-                        else "携程当前人民币住宿报价，可进入决策候选"
+                        if quote.provider == "arena_official"
+                        else (
+                            "Kaani 官方当前 USD 住宿报价，已按 ECB 参考汇率保留可比金额"
+                            if quote.provider == "kaani_official"
+                            else "携程当前人民币住宿报价，可进入决策候选"
+                        )
                     ),
+                    )
                 )
-            )
-            seen_providers.add(quote.provider)
+        if candidate_set is None:
+            for result in live_run.normalization_results:
+                quote = result.quote
+                if (
+                    not isinstance(quote, NormalizedLodgingQuote)
+                    or quote.provider != "arena_official"
+                ):
+                    continue
+                source_comparisons.append(
+                    LodgingSourceComparisonProjection(
+                        provider=quote.provider,
+                        source_type="hotel_official",
+                        property_name=quote.property_name,
+                        room_name=quote.room_name,
+                        currency=quote.currency,
+                        total_for_party_cents=quote.total_for_party_cents,
+                        reference_total_cents=quote.reference_total_cents,
+                        reference_currency=quote.reference_currency,
+                        reference_rate_source=quote.reference_rate_source,
+                        reference_rate_date=quote.reference_rate_date,
+                        taxes_and_fees_included=quote.taxes_and_fees_included,
+                        captured_at=quote.captured_at,
+                        evidence_refs=quote.evidence_refs,
+                        check_in=quote.check_in,
+                        check_out=quote.check_out,
+                        eligible=False,
+                        reason="位置依据不足，Arena 官方报价不能计作第二个合格完整方案",
+                    )
+                )
         covered_source_ids = tuple(
             source_id
             for coverage in live_run.coverage
@@ -911,11 +1055,7 @@ def build_best_available_plan_projection(
             estimated_icom_transfer_cny_cents=(
                 estimate.estimated_cny_cents if estimate is not None else None
             ),
-            estimated_total_cny_cents=(
-                budget.confirmed_subtotal_cents + estimate.estimated_cny_cents
-                if estimate is not None
-                else None
-            ),
+            estimated_total_cny_cents=_decision_estimated_total_cents(live_run, decision_only),
             icom_cny_reference_estimate=estimate,
             optimality_status="best_available_not_final",
             claim_boundary=decision_only.decision_boundary,

@@ -113,6 +113,7 @@ from tripchord.planning.event_contracts import (
 )
 from tripchord.planning.offer_semantics import stable_offer_identity
 from tripchord.planning.package import (
+    DecisionOnlyCandidateSet,
     DecisionOnlyPackageCandidate,
     LodgingLocationConvenience,
     NormalizedFlightQuote,
@@ -157,6 +158,7 @@ from tripchord.planning.package import (
     lodging_is_segment_comparison_eligible,
     lodging_non_remote_evidence_confirmed,
     lodging_quality_tier,
+    lodging_reference_cny_if_comparable,
     package_budget,
     transfer_contract_total_cents,
 )
@@ -222,6 +224,7 @@ from tripchord.providers.icom_transfer import (
     IComTransferSearchResult,
     to_package_transfer_option,
 )
+from tripchord.providers.kaani_official import KaaniOfficialLodgingProvider
 from tripchord.providers.quote_normalizer import (
     BrowserQuoteNormalizer,
     FlightPartyComparisonReceipt,
@@ -1098,6 +1101,7 @@ class LivePackageAgentRun(DomainModel):
     flight_search_outcomes: tuple[FlightSearchOutcome, ...] = ()
     package: PackageRunResult | None = None
     decision_only_candidate: DecisionOnlyPackageCandidate | None = None
+    decision_only_candidate_set: DecisionOnlyCandidateSet | None = None
     scheduler: SchedulerOutcome
     source_task_ids: tuple[str, ...] = Field(min_length=1)
     public_transfer_task_ids: tuple[str, ...] = ()
@@ -1158,6 +1162,21 @@ class LivePackageAgentRun(DomainModel):
 
     @model_validator(mode="after")
     def validate_evidence_scope(self) -> LivePackageAgentRun:
+        if self.decision_only_candidate_set is not None:
+            selected = next(
+                (
+                    item
+                    for item in self.decision_only_candidate_set.candidates
+                    if item.candidate.id
+                    == self.decision_only_candidate_set.selected_candidate_id
+                ),
+                None,
+            )
+            if selected is None or self.decision_only_candidate != selected:
+                raise PydanticCustomError(
+                    "live_run_decision_only_selected_mismatch",
+                    "legacy decision_only_candidate must equal selected candidate",
+                )
         if self.icom_cny_reference_estimate is not None:
             if self.decision.state == PackageDecisionState.ACCEPT and self.package is not None:
                 budget = self.package.budget
@@ -1621,6 +1640,7 @@ class _RunState:
     source_errors: dict[str, str] = field(default_factory=dict)
     official_lodging_task: asyncio.Task[ArenaOfficialLodgingResult] | None = None
     official_lodging_result: ArenaOfficialLodgingResult | None = None
+    kaani_lodging_results: tuple[NormalizedBrowserQuoteResult, ...] = ()
     icom_results: dict[str, IComTransferSearchResult] = field(default_factory=dict)
     icom_transfers_by_task: dict[str, tuple[TransferOption, ...]] = field(default_factory=dict)
     normalization_by_task: dict[str, tuple[NormalizedBrowserQuoteResult, ...]] = field(
@@ -1665,6 +1685,7 @@ class _RunState:
     selected_stay_plan_id: StayPlanId | None = None
     package: PackageRunResult | None = None
     decision_only_candidate: DecisionOnlyPackageCandidate | None = None
+    decision_only_candidate_set: DecisionOnlyCandidateSet | None = None
     decision: PackageDecision | None = None
     claim_boundary: str = ""
     agentic_results: dict[str, AgentTaskResult] = field(default_factory=dict)
@@ -1894,6 +1915,7 @@ class LivePackageAgentSystem:
         providers: tuple[BrowserProvider, ...] = LIVE_V5_BROWSER_PROVIDERS,
         source_terminal_reporter: LiveSourceTerminalReporter | None = None,
         official_lodging_provider: ArenaOfficialLodgingProvider | None = None,
+        kaani_lodging_provider: KaaniOfficialLodgingProvider | None = None,
     ) -> None:
         if max_concurrency < 15:
             raise ValueError("max_concurrency must be at least fifteen for platform fan-out")
@@ -1913,6 +1935,7 @@ class LivePackageAgentSystem:
         self._memory_store = memory_store
         self._source_terminal_reporter = source_terminal_reporter
         self._official_lodging_provider = official_lodging_provider
+        self._kaani_lodging_provider = kaani_lodging_provider
         self._planner = PackagePlanner()
         self._verifier = PackageVerifier()
         self._package_reverifier = DeclarativePackageReVerifier()
@@ -2323,7 +2346,20 @@ class LivePackageAgentSystem:
         elif not state.publication_gate_passed:
             raise RuntimeError("deterministic publication gate did not complete")
         state.claim_boundary += self._model_participation_claim(state, scheduler)
-        state.decision_only_candidate = self._build_decision_only_candidate(state)
+        state.decision_only_candidate_set = self._build_decision_only_candidate_set(state)
+        state.decision_only_candidate = (
+            next(
+                (
+                    item
+                    for item in state.decision_only_candidate_set.candidates
+                    if item.candidate.id
+                    == state.decision_only_candidate_set.selected_candidate_id
+                ),
+                None,
+            )
+            if state.decision_only_candidate_set is not None
+            else self._build_decision_only_candidate(state)
+        )
         model_applied_diffs: list[dict[str, JsonValue]] = []
         if (
             state.search_supervisor_proposal is not None
@@ -2391,6 +2427,7 @@ class LivePackageAgentSystem:
             flight_search_outcomes=state.flight_search_outcomes,
             package=state.package,
             decision_only_candidate=state.decision_only_candidate,
+            decision_only_candidate_set=state.decision_only_candidate_set,
             scheduler=scheduler,
             source_task_ids=source_ids,
             public_transfer_task_ids=public_transfer_ids,
@@ -2467,15 +2504,12 @@ class LivePackageAgentSystem:
         candidates = tuple(
             candidate
             for flight in comparison_flights
-            for candidate in (
-                planner.build_decision_only_candidate(
-                    intent,
-                    flight,
-                    inventory,
-                    transfer_provider="icom-public-transfer",
-                ),
+            for candidate in planner.build_decision_only_candidates(
+                intent,
+                flight,
+                inventory,
+                transfer_provider="icom-public-transfer",
             )
-            if candidate is not None
         )
         if not candidates:
             return None
@@ -2485,6 +2519,64 @@ class LivePackageAgentSystem:
                 item.budget.confirmed_subtotal_cents,
                 item.candidate.id,
             ),
+        )
+
+    def _build_decision_only_candidate_set(
+        self, state: _RunState
+    ) -> DecisionOnlyCandidateSet | None:
+        intent = state.intent
+        if intent is None:
+            return None
+        comparison_flights = tuple(
+            result.quote
+            for result in state.normalization_results
+            if result.usable
+            and isinstance(result.quote, NormalizedFlightQuote)
+            and result.quote.provider == BrowserProvider.QUNAR.value
+            and result.quote.currency == intent.currency
+            and result.quote.party_total_known
+            and result.quote.total_for_party_cents is not None
+            and result.quote.total_for_party_cents > 0
+            and result.quote.price_basis == "comparison_only"
+            and result.quote.availability == QuoteAvailability.COMPARISON_ONLY
+            and not result.quote.party_availability_confirmed
+            and any(
+                reference.startswith("flight-party-comparison:sha256:")
+                for reference in result.quote.evidence_refs
+            )
+        )
+        inventory = PackageInventory(
+            flights=comparison_flights,
+            lodgings=state.inventory.lodgings,
+            transfers=state.inventory.transfers,
+        )
+        candidates = tuple(
+            candidate
+            for flight in comparison_flights
+            for candidate in PackagePlanner().build_decision_only_candidates(
+                intent,
+                flight,
+                inventory,
+                transfer_provider="icom-public-transfer",
+            )
+        )
+        if len(candidates) < 2:
+            return None
+        selected = min(
+            candidates,
+            key=lambda item: (
+                item.budget.confirmed_subtotal_cents
+                + sum(
+                    lodging_reference_cny_if_comparable(lodging, intent.currency) or 10**18
+                    for lodging in item.candidate.lodgings
+                    if lodging.currency != item.candidate.currency
+                ),
+                item.candidate.id,
+            ),
+        )
+        return DecisionOnlyCandidateSet(
+            candidates=candidates,
+            selected_candidate_id=selected.candidate.id,
         )
 
     @staticmethod
@@ -7955,6 +8047,7 @@ class LivePackageAgentSystem:
                 ),
                 None,
             )
+            arrival_dates: tuple[date, ...] = ()
             if (
                 state.official_lodging_task is None
                 and state.official_lodging_result is None
@@ -7967,9 +8060,9 @@ class LivePackageAgentSystem:
                 # from the current flight evidence.  Start it only after the
                 # browser wave and bounded lodging-window alignment have
                 # produced normalized flight facts; never assume departure+1.
-                windows = state.lodging_window_alignment.get("windows")
+                windows = (state.lodging_window_alignment or {}).get("windows")
                 arrival_dates = tuple(
-                    date.fromisoformat(item["stay_start"])
+                    date.fromisoformat(cast(str, item["stay_start"]))
                     for item in windows
                     if isinstance(item, dict) and isinstance(item.get("stay_start"), str)
                 ) if isinstance(windows, list) else ()
@@ -8016,8 +8109,52 @@ class LivePackageAgentSystem:
                     state.source_errors["source-arena-official-lodging"] = (
                         f"{type(exc).__name__}: {exc}"
                     )
+            if not arrival_dates and self._kaani_lodging_provider is not None:
+                arrival_dates = tuple(
+                    sorted(
+                        {
+                            result.quote.outbound_arrive_at.date()
+                            for result in browser_results
+                            if result.usable
+                            and isinstance(result.quote, NormalizedFlightQuote)
+                        }
+                    )
+                ) or ((state.intent.start_date,) if state.intent is not None else ())
             official_results = tuple(item.result for item in state.official_lodging_results)
-            state.normalization_results = (*browser_results, *official_results)
+            assert flight_snapshot is not None
+            if (
+                self._kaani_lodging_provider is not None
+                and state.intent is not None
+                and arrival_dates
+            ):
+                kaani_attempts = await asyncio.gather(
+                    *(
+                        self._kaani_lodging_provider.search(
+                            flight_snapshot.query,
+                            state.intent,
+                            state.stay_plan_candidate_set,
+                            arrival_date=arrival_date,
+                        )
+                        for arrival_date in arrival_dates
+                    ),
+                    return_exceptions=True,
+                )
+                state.kaani_lodging_results = tuple(
+                    attempt.result
+                    for attempt in kaani_attempts
+                    if not isinstance(attempt, BaseException)
+                )
+                if any(isinstance(attempt, BaseException) for attempt in kaani_attempts):
+                    state.source_errors["source-kaani-official-lodging"] = "; ".join(
+                        f"{type(attempt).__name__}: {attempt}"
+                        for attempt in kaani_attempts
+                        if isinstance(attempt, BaseException)
+                    )
+            state.normalization_results = (
+                *browser_results,
+                *official_results,
+                *state.kaani_lodging_results,
+            )
             browser_inventory = self._inventory_from_results(state.normalization_results)
             if task.id == _PUBLICATION_PRIMARY_NORMALIZE_TASK_ID:
                 if state.publication_target_candidate is None:
@@ -11899,6 +12036,58 @@ class LivePackageAgentSystem:
                         source_execution_terminal=True,
                     )
                 )
+        kaani = next(
+            (
+                result
+                for result in state.kaani_lodging_results
+                if isinstance(result.quote, NormalizedLodgingQuote)
+                and result.quote.place_key == exact_place_key
+                and result.quote.area == area
+                and result.quote.check_in == check_in
+                and result.quote.check_out == check_out
+                and result.quote.adults == intent.adults
+                and result.quote.rooms == intent.rooms
+            ),
+            None,
+        )
+        if kaani is not None and isinstance(kaani.quote, NormalizedLodgingQuote):
+            quote = kaani.quote
+            eligible_quote_ids = (
+                (quote.id,)
+                if lodging_is_segment_comparison_eligible(
+                    quote,
+                    intent,
+                    area=area,
+                    check_in=check_in,
+                    check_out=check_out,
+                    exact_place_key=exact_place_key,
+                    allow_reference_currency=True,
+                )
+                else ()
+            )
+            evidence.append(
+                LodgingProviderQuoteEvidence(
+                    provider="kaani_official",
+                    source_task_id="source-kaani-official-lodging",
+                    inventory_state=StayInventoryResultState.QUOTE_FOUND,
+                    quote_ids=(quote.id,),
+                    eligible_quote_ids=eligible_quote_ids,
+                    evidence_refs=quote.evidence_refs,
+                    source_execution_terminal=True,
+                )
+            )
+        elif "source-kaani-official-lodging" in state.source_errors:
+            evidence.append(
+                LodgingProviderQuoteEvidence(
+                    provider="kaani_official",
+                    source_task_id="source-kaani-official-lodging",
+                    inventory_state=StayInventoryResultState.BOUNDED_NO_EXACT_QUOTE,
+                    evidence_refs=(
+                        f"source-error:{state.source_errors['source-kaani-official-lodging']}",
+                    ),
+                    source_execution_terminal=True,
+                )
+            )
         exact_count = sum(bool(item.eligible_quote_ids) for item in evidence)
         return LodgingSegmentQuoteComparisonCoverage(
             segment_id=segment_id,

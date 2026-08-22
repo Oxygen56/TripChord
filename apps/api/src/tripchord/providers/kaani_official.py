@@ -74,7 +74,14 @@ class KaaniOfficialLodgingProvider:
         self._client = client
         self._now = now or (lambda: datetime.now(UTC))
 
-    async def search(self, query: BrowserSearchQuery) -> KaaniOfficialLodgingResult:
+    async def search(
+        self,
+        query: BrowserSearchQuery,
+        *_: object,
+        arrival_date: date | None = None,
+    ) -> KaaniOfficialLodgingResult:
+        if arrival_date is not None:
+            query = query.model_copy(update={"start_date": arrival_date})
         if (
             query.start_date is None
             or query.end_date is None

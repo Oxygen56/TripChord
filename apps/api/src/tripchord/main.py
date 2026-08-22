@@ -155,6 +155,7 @@ from tripchord.api import (
     WeatherRequest,
     WorkspaceReplanRequest,
     WorkspaceReplanResponse,
+    _decision_candidate_projections,
     build_best_available_plan_projection,
     build_final_plan_projection,
     create_user_quote,
@@ -242,6 +243,7 @@ from tripchord.providers.icom_transfer import (
     IComTransferProvider,
     fetch_icom_cny_reference_estimate,
 )
+from tripchord.providers.kaani_official import KaaniOfficialLodgingProvider
 from tripchord.providers.user_snapshot import UserQuoteInput
 from tripchord.rate_limit import RateLimiter
 from tripchord.runtime_provenance import PROVENANCE
@@ -881,6 +883,7 @@ def _install_browser_bridge(
             ),
             observation_dir=os.environ.get("TRIPCHORD_ARENA_OBSERVATION_DIR"),
         ),
+        kaani_lodging_provider=KaaniOfficialLodgingProvider(),
     )
     flexible_system = FlexibleLiveAgentSystem(
         cast(LiveDatePairRunner, live_system),
@@ -3066,6 +3069,13 @@ async def _execute_live_flexible_from_text_body(
         run=run,
         final_plan=build_final_plan_projection(run),
         best_available_plan=build_best_available_plan_projection(run),
+        decision_candidates=tuple(
+            candidate
+            for pair in run.pair_runs
+            for live_run in (pair.run or pair.exploration_run,)
+            if live_run is not None
+            for candidate in _decision_candidate_projections(live_run)
+        ),
         cached_pair_runs=handles,
         model_enhancement_enabled=model_enabled,
         model_trace_scope_sha256=model_trace_scope_sha256,
@@ -3654,7 +3664,7 @@ async def _attach_icom_cny_reference_estimate(
         budget = run.decision_only_candidate.budget
     else:
         return run
-    if budget.is_all_in_total or budget.foreign_currency_subtotals:
+    if budget.is_all_in_total:
         return run
     supplemental = tuple(
         item
