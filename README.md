@@ -1,6 +1,6 @@
 # TripChord（旅弦）
 
-[![CI](https://github.com/Oxygen56/TripChord/actions/workflows/ci.yml/badge.svg?branch=productization%2Fv1.0)](https://github.com/Oxygen56/TripChord/actions/workflows/ci.yml?query=branch%3Aproductization%2Fv1.0)
+[![CI](https://github.com/Oxygen56/TripChord/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Oxygen56/TripChord/actions/workflows/ci.yml?query=branch%3Amain)
 [![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](pyproject.toml)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![React](https://img.shields.io/badge/React-19-61DAFB)](https://react.dev/)
@@ -115,7 +115,7 @@ TripChord 不让多个模型自由聊天。每个角色只看到完成自己工�
 需要 Python 3.12 或 3.13、Node.js 22 和 [uv](https://docs.astral.sh/uv/)。
 
 ```bash
-git clone --branch productization/v1.0 https://github.com/Oxygen56/TripChord.git
+git clone https://github.com/Oxygen56/TripChord.git
 cd TripChord
 uv run python scripts/tripchord_launcher.py check
 uv run python scripts/tripchord_launcher.py setup
