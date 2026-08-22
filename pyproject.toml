@@ -7,7 +7,6 @@ requires-python = ">=3.12,<3.14"
 license = { text = "MIT" }
 keywords = ["agent", "travel", "planning", "rag", "fastapi"]
 classifiers = [
-  "Development Status :: 4 - Beta",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
