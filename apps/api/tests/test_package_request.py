@@ -706,3 +706,38 @@ def test_non_weighted_breakfast_mode_rejects_noncanonical_weight() -> None:
             breakfast_mode=PreferenceMode.REQUIRED,
             breakfast_weight=0.8,
         )
+
+
+@pytest.mark.asyncio
+async def test_full_chinese_fixed_departure_and_return_dates_are_ready() -> None:
+    result = await HybridPackageRequirementAgent(
+        now=lambda: datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+    ).parse(
+        "2026年9月3日从杭州出发去马尔代夫，2026年9月9日返程，2名成人，1间房。"
+        "住宿不能简陋或偏僻，兼顾品质与价格；比较机场附近过渡住宿和更优选择。"
+        "只查询、比较和建议，不下单、不付款。"
+    )
+
+    assert result.state == PackageRequestState.READY
+    assert result.window is not None
+    assert result.window.earliest_departure == date(2026, 9, 3)
+    assert result.window.latest_departure == date(2026, 9, 3)
+    assert result.window.latest_arrival_date == date(2026, 9, 9)
+    assert (result.window.min_nights, result.window.max_nights) == (6, 6)
+
+
+@pytest.mark.asyncio
+async def test_return_date_with_destination_departure_context_is_not_second_outbound() -> None:
+    result = await HybridPackageRequirementAgent(
+        now=lambda: datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+    ).parse(
+        "2026年9月3日从杭州出发去马尔代夫，2026年9月9日从马累出发返程，"
+        "2名成人，1间房。住宿不能简陋或偏僻，兼顾品质与价格。"
+    )
+
+    assert result.state == PackageRequestState.READY
+    assert result.window is not None
+    assert result.window.earliest_departure == date(2026, 9, 3)
+    assert result.window.latest_departure == date(2026, 9, 3)
+    assert result.window.latest_arrival_date == date(2026, 9, 9)
+    assert (result.window.min_nights, result.window.max_nights) == (6, 6)

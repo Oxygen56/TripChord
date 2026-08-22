@@ -990,16 +990,72 @@ class HybridPackageRequirementAgent:
             )
             return
         if parsed_dates:
+            contextual_departures: list[tuple[date, str]] = []
+            for match in _FULL_DATE_PATTERN.finditer(text):
+                date_end = match.start() + len(match.group(0).rstrip())
+                suffix = text[date_end : date_end + 32]
+                contextual = re.match(
+                    r"[ \t]*(?:从(?P<origin>[\u4e00-\u9fffA-Za-z]{2,20})[ \t]*)?出发",
+                    suffix,
+                )
+                if contextual is None or re.match(
+                    r"[ \t]*(?:从[\u4e00-\u9fffA-Za-z]{2,20}[ \t]*出发[ \t]*)?"
+                    r"(?:返程|回程|返回|回来)",
+                    suffix,
+                ):
+                    continue
+                labelled_origin = contextual.group("origin")
+                if labelled_origin is not None:
+                    origin_code = _LOCATION_IATA_BY_ALIAS.get(
+                        re.sub(r"\s+", "", labelled_origin).casefold()
+                    )
+                    if origin_code != draft.values.get("origin_code"):
+                        continue
+                contextual_departures.append(
+                    (
+                        date(
+                            int(match.group("year")),
+                            int(match.group("month")),
+                            int(match.group("day")),
+                        ),
+                        match.group(0),
+                    )
+                )
             departure_dates = self._dates_from_labels(
                 text,
                 ("去程", "出发日期", "出发时间"),
                 reference_date,
             )
+            departure_dates = tuple(contextual_departures) + departure_dates
             return_dates = self._dates_from_labels(
                 text,
                 ("返程", "回程", "返回日期", "返程日期"),
                 reference_date,
             )
+            contextual_returns: list[tuple[date, str]] = []
+            for match in _FULL_DATE_PATTERN.finditer(text):
+                date_end = match.start() + len(match.group(0).rstrip())
+                suffix = text[date_end : date_end + 32]
+                if not re.match(
+                    r"[ \t]*(?:从[\u4e00-\u9fffA-Za-z]{2,20}[ \t]*出发[ \t]*)?"
+                    r"(?:返程|回程|返回|回来)",
+                    suffix,
+                ):
+                    continue
+                prefix_tail = text[max(0, match.start() - 24) : match.start()]
+                if re.search(r"(?:去程|出发日期|出发时间)", prefix_tail):
+                    continue
+                contextual_returns.append(
+                    (
+                        date(
+                            int(match.group("year")),
+                            int(match.group("month")),
+                            int(match.group("day")),
+                        ),
+                        match.group(0),
+                    )
+                )
+            return_dates = tuple(contextual_returns) + return_dates
             for suffix_match in re.finditer(
                 r"(?P<value>(?:\d{1,2}\s*月\s*\d{1,2}\s*日"
                 r"(?:\s*(?:与|和|或|/|、)\s*\d{1,2}\s*月\s*\d{1,2}\s*日)*)\s*返程)",
