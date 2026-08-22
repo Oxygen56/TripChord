@@ -1,0 +1,1335 @@
+{
+  "schema_version": "tripchord.agent-runtime-framework-selection.v1",
+  "captured_at": "2026-08-22T16:37:27.102408+00:00",
+  "evidence_tier": "framework_harness_validation",
+  "winner_claim_allowed": false,
+  "case_path": "docs/case-studies/maldives-2026-08-19/case-bundle.json",
+  "case_bundle_sha256": "8d1e1e2ef2e0fbdcda1fb6c16b5acba1a9f96ce3b4f65ce072bc0a9b3a211869",
+  "canonical_digest_source": "case_bundle.bundle_canonical_sha256 (declared historical artifact digest; no whole-file recomputation claim)",
+  "frameworks": [
+    "custom",
+    "pydanticai",
+    "langgraph",
+    "openai_agents",
+    "google_adk"
+  ],
+  "scenarios": [
+    "baseline",
+    "controlled_recovery",
+    "invalid_or_ambiguous"
+  ],
+  "all_contracts_passed": true,
+  "results": [
+    {
+      "framework": "custom",
+      "scenario": "baseline",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.07202037499519065,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 68,
+      "framework_version": "TripChord custom baseline"
+    },
+    {
+      "framework": "custom",
+      "scenario": "controlled_recovery",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.06936204200610518,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 68,
+      "framework_version": "TripChord custom baseline"
+    },
+    {
+      "framework": "custom",
+      "scenario": "invalid_or_ambiguous",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.06862612499389797,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 68,
+      "framework_version": "TripChord custom baseline"
+    },
+    {
+      "framework": "pydanticai",
+      "scenario": "baseline",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.005632624961435795,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 44,
+      "framework_version": "1.107.5"
+    },
+    {
+      "framework": "pydanticai",
+      "scenario": "controlled_recovery",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.005603583005722612,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 44,
+      "framework_version": "1.107.5"
+    },
+    {
+      "framework": "pydanticai",
+      "scenario": "invalid_or_ambiguous",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.005485625006258488,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 44,
+      "framework_version": "1.107.5"
+    },
+    {
+      "framework": "langgraph",
+      "scenario": "baseline",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.005599749973043799,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 66,
+      "framework_version": "1.2.11"
+    },
+    {
+      "framework": "langgraph",
+      "scenario": "controlled_recovery",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.005430374993011355,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 66,
+      "framework_version": "1.2.11"
+    },
+    {
+      "framework": "langgraph",
+      "scenario": "invalid_or_ambiguous",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.0055389999761246145,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 66,
+      "framework_version": "1.2.11"
+    },
+    {
+      "framework": "openai_agents",
+      "scenario": "baseline",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.005827207991387695,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 107,
+      "framework_version": "0.22.0"
+    },
+    {
+      "framework": "openai_agents",
+      "scenario": "controlled_recovery",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.005454750033095479,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 107,
+      "framework_version": "0.22.0"
+    },
+    {
+      "framework": "openai_agents",
+      "scenario": "invalid_or_ambiguous",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.0054549999767914414,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 107,
+      "framework_version": "0.22.0"
+    },
+    {
+      "framework": "google_adk",
+      "scenario": "baseline",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.006476125039625913,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 74,
+      "framework_version": "1.39.0"
+    },
+    {
+      "framework": "google_adk",
+      "scenario": "controlled_recovery",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.005939208960626274,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 74,
+      "framework_version": "1.39.0"
+    },
+    {
+      "framework": "google_adk",
+      "scenario": "invalid_or_ambiguous",
+      "status": "success",
+      "output_correct": true,
+      "tool_contract_ok": true,
+      "warmup_status": "success",
+      "warmup_error": null,
+      "measurement_statuses": [
+        "success",
+        "success",
+        "success"
+      ],
+      "measurement_errors": [
+        null,
+        null,
+        null
+      ],
+      "tool_call_order": [
+        "inspect_requirements",
+        "inspect_candidate",
+        "verify_candidate"
+      ],
+      "tool_calls": 3,
+      "run_audits": [
+        {
+          "kind": "warmup",
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 1,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 2,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        },
+        {
+          "kind": "measurement",
+          "index": 3,
+          "status": "success",
+          "error": null,
+          "output_correct": true,
+          "tool_contract_ok": true,
+          "tool_call_order": [
+            "inspect_requirements",
+            "inspect_candidate",
+            "verify_candidate"
+          ],
+          "tool_calls": 3
+        }
+      ],
+      "wall_time_seconds_median_warm": 0.0057294589933007956,
+      "latency_used_for_selection": false,
+      "error": null,
+      "adapter_loc": 74,
+      "framework_version": "1.39.0"
+    }
+  ],
+  "limitations": [
+    "historical replay only",
+    "offline scripted harness; no model quality claim",
+    "latency is reported as warm median but excluded from selection",
+    "no OTA/network/booking"
+  ]
+}

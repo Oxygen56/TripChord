@@ -1,0 +1,128 @@
+{
+  "schema_version": "tripchord.durable-runtime-framework-selection.v1",
+  "captured_at": "2026-08-22T16:41:44.428395+00:00",
+  "input": {
+    "source": "evidence/live-runs/2026-08-19-maldives-formal/recovery-baseline-probe-v1.json",
+    "request_sha256": "13f8454b1305e8ac164b0d722dba4eb63d73bc2189d079af36181b54355010af",
+    "date_pairs": [
+      {
+        "id": "pair-1",
+        "departure": "2026-09-03",
+        "return": "2026-09-09"
+      },
+      {
+        "id": "pair-2",
+        "departure": "2026-09-04",
+        "return": "2026-09-10"
+      },
+      {
+        "id": "pair-3",
+        "departure": "2026-09-05",
+        "return": "2026-09-10"
+      }
+    ],
+    "fault_contract": [
+      "F1 persisted pair then lease handoff or native process-crash recovery",
+      "F2 production local-replan evidence"
+    ]
+  },
+  "frameworks": {
+    "custom_tripchord": {
+      "status": "supported",
+      "framework_version": "TripChord 1.0.0 repository baseline",
+      "adapter_loc": 92,
+      "state_source": "TripChord DurableLivePlanningJobRepository + SQLite test database",
+      "faults": {
+        "F1": "lease_handoff_passed",
+        "F2": "external_production_evidence"
+      },
+      "recovered_pair_ids": [
+        "pair-1"
+      ],
+      "query_count_by_pair": {
+        "pair-1": 1,
+        "pair-2": 1,
+        "pair-3": 1
+      },
+      "duplicate_completed_pair_queries": 0,
+      "unique_job_identity": true,
+      "unique_pair_results": true,
+      "worker_crash": "not injected; only stale-lease/graceful handoff was run",
+      "local_replan_evidence": {
+        "status": "see_existing_production_tests",
+        "command": "uv run pytest apps/api/tests/test_replanner.py -q",
+        "implementation": "tripchord.planning.replanner.LocalReplanner",
+        "note": "The isolated framework harness does not fabricate a PlanVersion; F2 is not claimed as a same-run dict simulation."
+      },
+      "limitations": [
+        "This is a saved replay, not live OTA or inventory proof."
+      ]
+    },
+    "langgraph": {
+      "status": "partial",
+      "framework_version": "1.2.11",
+      "checkpoint_version": "3.1.1",
+      "adapter_loc": 69,
+      "state_source": "LangGraph native SqliteSaver",
+      "faults": {
+        "F1": "passed",
+        "F2": "not run (production evidence only)"
+      },
+      "first_run_error": "RuntimeError: F1 injected after pair-1 checkpoint",
+      "execution_count_by_pair": {
+        "pair-1": 1,
+        "pair-2": 2,
+        "pair-3": 1
+      },
+      "duplicate_completed_pair_executions": 0,
+      "recovery_result": {
+        "counts": {
+          "pair-1": 1,
+          "pair-2": 2,
+          "pair-3": 1
+        }
+      },
+      "required_uncovered": [
+        "TripChord job identity",
+        "lease fencing",
+        "pair digest uniqueness",
+        "local replan"
+      ],
+      "limitations": [
+        "SQLite checkpoint resumes graph state, but does not replace TripChord's authoritative job/pair tables."
+      ]
+    },
+    "dbos": {
+      "status": "partial",
+      "version_probe": "DBOS 2.30.0",
+      "adapter_loc": 48,
+      "state_source": "DBOS 2.x SQLite system database + cross-process JSON side-effect log",
+      "workflow_definition_stable": true,
+      "workflow_input_stable": true,
+      "fault_model": "same workflow crash-once step writes marker then first process os._exit(73); second process DBOS launch native recovery; no restart/fork",
+      "first_process_exit": 73,
+      "second_process_exit": 0,
+      "workflow_id": "817ad644-8adf-416b-ac4c-b1adfd003faf",
+      "execution_count_by_pair": {
+        "pair-1": 1,
+        "pair-2": 1,
+        "pair-3": 1
+      },
+      "completed_pair_repeated": false,
+      "crash_step_retried": true,
+      "workflow_completed": true,
+      "limitations": [
+        "SQLite is DBOS development/test mode; PostgreSQL is recommended for production."
+      ],
+      "framework_version": "2.30.0",
+      "required_uncovered": [
+        "TripChord job identity",
+        "lease fencing",
+        "pair digest uniqueness",
+        "local replan"
+      ]
+    }
+  },
+  "selection_note": "TripChord remains the production durability baseline. LangGraph and DBOS proved native recovery paths in the stated fault models, but neither probe replaces TripChord job identity, lease fencing, pair uniqueness, or local replanning without introducing another state authority.",
+  "all_contracts_passed": true
+}

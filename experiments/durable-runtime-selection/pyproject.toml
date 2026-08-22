@@ -1,0 +1,17 @@
+[project]
+name = "tripchord-durable-runtime-selection"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "aiosqlite>=0.20,<1",
+  "sqlalchemy>=2.0,<3",
+  "greenlet>=3,<4",
+  "pydantic>=2.7,<3",
+  "ortools>=9.10,<10",
+  "langgraph>=0.2,<2",
+  "langgraph-checkpoint-sqlite>=2,<4",
+  "dbos>=2,<3",
+]
+
+[tool.uv]
+package = false
