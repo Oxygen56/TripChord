@@ -2208,7 +2208,9 @@ class BrowserTaskCompletion(DomainModel):
             raise ValueError("completion state must be succeeded, blocked, or failed")
         if self.state == BrowserTaskState.SUCCEEDED:
             if not self.quotes and self.range_completion is None:
-                raise ValueError("successful completion requires at least one quote or range receipt")
+                raise ValueError(
+                    "successful completion requires at least one quote or range receipt"
+                )
             if self.failure is not None:
                 raise ValueError("successful completion cannot include a failure")
         elif self.failure is None:
