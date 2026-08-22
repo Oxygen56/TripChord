@@ -1,36 +1,29 @@
-# 模型接线、上下文工程、记忆与 RAG
+# 模型、上下文与偏好记忆
 
-## 现在的直接答案
+本文面向希望了解模型怎样参与 TripChord 的开发者。它回答三个问题：模型负责什么、每个角色能看到什么、用户偏好为什么不会和实时价格混在一起。下面保留具体运行记录，方便复核项目的真实接线状态，但这些记录不是普通用户使用产品的前提。
 
-- 仓库安全默认：`MODEL_PROVIDER=none`、`MODEL_AGENTS_REQUIRED=false`，不会自动产生付费调用；
-- 推荐的 required-model 配置：OpenAI-compatible 网关 + DeepSeek `deepseek-v4-flash`；
-- 历史模型记录：2026-08-03 JSON 记载了一次结构化输出和一次有界 tool loop，但原始一次性
-  调用早于可复现 runner，不能仅凭该文件做字节级独立复现；
-- 当前复现入口：`scripts/run_model_runtime_smoke.py` 强制 `--ack-live-cost`、只从环境读取 key，
-  输出 request/response/schema/code hash、trace、usage 与 latency；2026-08-04 已用
-  `deepseek-v4-flash` 真实执行 3 次有界请求，结构化 JSON 与工具循环均通过；
-- 同日 required-model Chrome canary 真实进入 10 个模型 Agent 阶段、20 次逻辑请求，但因部分
-  复杂结构化阶段失败及严格平台覆盖不完整而由最终发布门输出 `HUMAN_BLOCK`；该负结果证明
-  fail-closed，不是完整 OTA 模型 E2E 成功证据；
-- 后续三日期 Round 17 记录 job-bound 47/47 成功模型调用和三个 pair checkpoint，但业务 runner
-  为 `done_gate_failed`；其中 Evidence Arbiter policy 冲突修复后的同日期 focused 运行又以
-  23/23 成功调用完成。最终仍因住宿精确报价 provider 只有 1/2 而 `HUMAN_BLOCK`；
-- 尚无证据：DeepSeek 驱动整套 Chrome OTA Done-Gate 成功、长期生产稳定性或比其他模型更优；
-- 也支持 Anthropic Messages，但当前没有同等级 live smoke 证据。
+## 先看结论
 
-模型接通后，需求理解、日期查询、来源调度、证据仲裁、候选策展、Risk Critic、Repair
-Strategist、ReCritic、Event Diagnoser、主控建议、解释与记忆候选会走受限模型 Agent；
-报价解析、金额、稳定身份、新鲜度、权限、Verifier/ReVerifier、Repair Executor 和最终
-Safety Gate 始终保持确定性。
+- TripChord 默认不开启外部模型，也不会自动产生模型费用；
+- 它支持 OpenAI-compatible 和 Anthropic 两类模型接口，不绑定某一家供应商；
+- 模型负责理解语言、判断体验与解释取舍，日期、人数、金额、产品身份、行程是否成立和最终发布由程序负责；
+- 每个模型角色只接收完成本次任务需要的信息，不共享全部网页、候选和历史记录；
+- 长期记忆只保存用户确认过的稳定偏好，机票价格、房价、库存和班次必须从本次查询重新取得；
+- 真实模型和 Chrome 平台查询已经在同一条路径中运行过，但完整实时端到端结果仍被“住宿只有一个平台返回准确可比报价”阻断，不能描述成已经完成多平台实时闭环。
 
-TripChord 不依赖 Codex 或 ChatGPT runtime。真实 OTA 运行也不可能只靠 LLM API Key：还要
-本地 browser bridge、Chrome Companion、用户授予的 provider 域名权限、有效登录态、网络和
-仍匹配当前网页的 DOM 合同。
+TripChord 不依赖 Codex 或 ChatGPT 才能运行。启用真实网页查询时，除了模型服务，还需要本机 Chrome Companion、用户已经授予的平台只读权限、有效登录状态、网络，以及仍能匹配平台页面的解析规则。
 
-## 历史审计与当前接线状态
+### 文中术语
 
-早期审计发现，仓库当时只有模型适配器和 replay `ScriptedModelClient`，实时浏览器整包路径并未
-显式构造真实 router。这个缺口现已修复：`main.py` 会根据显式 `MODEL_PROVIDER` 配置构造
+- **RAG**：从历史记录中找回与当前任务有关的信息；TripChord 只用它找偏好和非实时资料，不用它恢复旧价格。
+- **Context Pack**：为某个模型角色准备的最小信息包，避免把整次旅行的所有内容都塞给每个角色。
+- **live**：本次直接访问当前模型或在线来源；**replay**：只使用已经保存的数据重新执行，不代表当前价格。
+- **HUMAN_BLOCK**：关键事实不足，系统停止发布结果；它表示“现在不能可靠回答”，不是一次成功规划。
+
+## 开发者验证记录
+
+早期检查发现，仓库当时只有模型适配器和回放用的 `ScriptedModelClient`，实时浏览器整包路径并未
+显式构造真实模型路由。这个缺口现已修复：`main.py` 会根据显式 `MODEL_PROVIDER` 配置构造
 primary/fast client 与 `ModelRouter`，并把同一个 router 接入 `HybridPackageRequirementAgent`、
 `FlexibleLiveAgentSystem` 和 `LivePackageAgentSystem`。需求理解、Query Strategist、Search
 Supervisor、证据仲裁、候选策展、Risk Critic、Repair Strategist、ReCritic、Event Diagnoser、
@@ -38,16 +31,15 @@ Supervisor、证据仲裁、候选策展、Risk Critic、Repair Strategist、ReC
 
 仍需区分三个事实：
 
-- `/api/v1/agents/plan` / `replay-plan` 仍是明确标注的 replay 演示路径，不能作为 live 模型证据；
+- `/api/v1/agents/plan` / `replay-plan` 仍是明确标注的保存数据回放路径，不能作为实时模型运行依据；
 - 默认 `MODEL_PROVIDER=none` 时 router 为 `None`，可选 Agent 会带原因降级；只有显式配置模型并在
   trace 中看到非 scripted provider/model，才能说本次 live run 实际使用了模型；
 - LoRA SFT/DPO 仍只是离线训练与 adapter reload 证据，没有接入 live 推理链路；Round 17 已证明
   DeepSeek + Chrome + 多阶段 Agent 可以完成三日期控制面，但统一 OTA 业务 Done-Gate 仍未通过。
 
-因此准确表述是“主应用已完成真实模型接线；DeepSeek V4 Flash 网关 smoke 与 Round 17/focused
-真实模型路径均已运行，但被双平台住宿证据门阻塞；完整 OTA 模型 E2E 尚未通过”，而不是旧结论
+因此准确表述是“主应用已接入真实模型；DeepSeek V4 Flash 的接口检查与后续模型路径均已运行，但同一次住宿查询尚未取得两个平台的准确可比报价；完整实时端到端规划尚未通过”，而不是旧结论
 “实时路径没有 LLM”，也不是
-过度结论“只填 API Key 就已经完成真实 OTA 多 Agent 闭环”。
+过度结论“只填 API Key 就已经完成真实平台 Multi-Agent 闭环”。
 
 2026-08-04 canary 与当前 strict bundle 的可复核证据包括
 `benchmarks/results/model-runtime-smoke-deepseek-v4-flash-2026-08-04.json`、
@@ -115,8 +107,8 @@ TTL、置信度、可见角色、敏感标记和污染标记。存储契约还�
 生产多实例需用持久层实现同一契约。
 
 Memory Curator 只生成 pending-confirmation 候选；无论 `trip` 还是 `user` 作用域都强制
-`requires_user_confirmation=true`，不会由最终 Publication Gate 自动写进 RAG。自动持久化只
-保存确定性 Safety Gate 的历史决策回执。用户偏好只能通过显式确认接口写入，且提供按 record id 的撤销接口。
+`requires_user_confirmation=true`，不会由最终发布流程自动写进 RAG。自动持久化只
+保存程序最终核对后的历史决策回执。用户偏好只能通过显式确认接口写入，且提供按 record id 的撤销接口。
 `development-anonymous` 没有稳定用户身份，因此不允许创建、查看或撤销 USER 长期记忆，
 也不会将共享字面值 `anonymous` 写成私有用户/行程记忆。
 

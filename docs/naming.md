@@ -1,22 +1,44 @@
-# Product identity
+# TripChord 为什么叫这个名字
 
-## Chosen name
+## 名字的含义
 
-**TripChord（旅弦）**
+**TripChord（旅弦）**由 `Trip` 和 `Chord` 组成：
 
-The name describes coordinating transport, lodging, time, budget, and personal
-preferences into one executable plan, much like notes resolving into a chord.
+- `Trip` 直接说明它服务于旅行；
+- `Chord` 是和弦，多个音符只有在节奏和关系上协调，才会成为完整的音乐。
 
-## Collision check
+这与 TripChord 的工作方式很像。航班、酒店和接驳单独看都只是一个选项；只有日期能对上、时间接得住、所有人的费用算得清，而且符合这位用户在意的体验，它们才组成一份真正可行的旅行方案。
 
-Checked on 2026-07-27:
+中文名“旅弦”保留了“把旅行中的不同部分协调起来”的含义，但项目在代码、GitHub 和英文交流中统一使用 `TripChord`。
 
-- GitHub repository names containing exact `tripchord`: 0 results.
-- npm package `tripchord`: not found.
-- PyPI projects `tripchord` and `tripchord-ai`: not found.
-- General web search found an unrelated historical use of the word, not a
-  current travel-planning software product.
+## 这个名字的优点与不足
 
-This is a practical package-name check, not a trademark clearance. No public
-registration or trademark claim has been made.
+优点是辨识度高，也能承载项目最重要的技术主张：TripChord 不是只找一张便宜机票，而是在多个日期、平台和旅行组件之间做组合与取舍。无论以后接入更多交通方式、住宿或活动，`Chord` 的含义仍然成立。
 
+不足是第一次看到的人未必立刻知道它是旅行规划产品。因此项目名不单独出现，而是固定配合一句直白说明：
+
+> **TripChord（旅弦）｜把多个平台的交通、住宿和接驳，组合成更适合你的旅行方案。**
+
+## 是否有更合适的名字
+
+本轮比较过几个方向：
+
+| 名字 | 优点 | 不采用的原因 |
+| --- | --- | --- |
+| `TripSift` | 容易理解为替用户筛选旅行选项 | 更像筛选器，弱化完整行程组合；目前已有 [TripSift](https://tripsift.ai/) 旅行产品使用这个名称 |
+| `JourneyChord` | 保留“协调成完整方案”的含义 | 比 TripChord 更长，读写和记忆都更费力 |
+| `RouteWeave` | 有把路线编织起来的画面感 | 容易被理解为路线规划器，而且已有 [RouteWeave 旅行规划商品](https://www.etsy.com/nz/listing/4513384345/interactive-travel-planner-route) 使用这个名称 |
+| `FareWeave` | 突出跨平台价格组合 | 过度强调价格，不能覆盖舒适度、时间和住宿偏好 |
+| `Waywise` | 简短，带有聪明出行的感觉 | 含义太宽，难以建立独特的旅行组合认知 |
+
+这些候选都没有同时在辨识度、产品范围和长期延展性上明显超过 `TripChord`。因此当前建议是**保留 TripChord，不进行仓库、包名和产品名迁移；用清楚的中文副标题解决第一次理解成本**。
+
+## 什么时候才值得改名
+
+只有出现下面任一事实，才重新评估：
+
+- 同类旅行产品或商标形成无法回避的名称冲突；
+- 面向目标用户的测试持续表明，即使配合副标题仍无法理解或记住；
+- 产品方向不再是组合完整旅行，而变成单一机票比价或纯路线工具。
+
+2026 年 7 月的 GitHub、npm 和 PyPI 实用检查，以及 2026 年 8 月的网页复查，都没有发现本项目之外正在运营的同名旅行规划产品。这个结果只能说明目前没有明显的软件包冲突，不构成商标检索、注册或法律结论。
