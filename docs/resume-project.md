@@ -42,7 +42,7 @@ Docker / Nginx / Transformers / TRL / PEFT
   Source worker；浏览器始终由最多 6 个任务并发执行，不把 worker 数
   包装成浏览器并发数。
 - 建立 Provider-neutral 模型网关与上下文工程：默认 `MODEL_PROVIDER=none`，required-model 模式
-  失败关闭；Query/Planner/Repair 使用 1600/4000/3000 token 的按角色 Context Pack，工具回执与
+  失败关闭；Query/Planner/Repair 使用 2400/4000/3000 token 的按角色 Context Pack，工具回执与
   历史记忆共享预算。实现 tenant/user/session/trip 隔离、长期偏好确认/撤销和 BM25 词法 RAG，
   强制实时价格/库存只从本轮工具回执进入上下文；用 DeepSeek `deepseek-v4-flash` 真实完成
   固定 3 请求的 JSON/tool-loop smoke；在后续 focused required-model Chrome 运行中，模型阶段和
