@@ -22,7 +22,7 @@ Round 17 又记录 job-bound 47/47 成功模型调用和三个 checkpoint，但 
 ### 上下文、记忆和 RAG 是什么？
 
 - 当前事实先进入带来源、版本、采集时间和过期时间的 Evidence Blackboard；
-- Query / Planner / Repair 分别使用 1600 / 4000 / 3000 token 的按角色 Context Pack；
+- Query / Planner / Repair 分别使用 2400 / 4000 / 3000 token 的按角色 Context Pack；
 - 工具回执和历史记忆共用同一预算，超长回执只留下预览、原始字节数和 SHA-256；
 - 记忆按 tenant、user、session、trip、TTL、隐私和可见角色隔离；用户长期偏好必须确认，
   可按 record id 撤销；匿名模式禁止写共享的长期用户记忆；
