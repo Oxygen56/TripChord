@@ -55,6 +55,29 @@ _DATE_WINDOW_BOUNDARY_PATTERN = re.compile(
     r"\s*(?:边界(?:内完成)?|之前|前|内)?"
 )
 _BARE_MONTH_PATTERN = re.compile(r"(?<!\d)(?P<month>\d{1,2})\s*月")
+_MONTH_DAY_PATTERN = re.compile(
+    r"(?<!\d)(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日"
+)
+_EXPLICIT_RETURN_HOME_BEFORE_DEADLINE = (
+    r"(?:回到[^,，。；;]{0,12}?|"
+    r"回(?!程|返|来|去)[\u4e00-\u9fffA-Za-z]{1,12}?)"
+)
+_EXPLICIT_RETURN_HOME_AFTER_DATE = (
+    r"(?:回到[^,，。；;]{0,12}|"
+    r"回(?!程|返|来|去)[\u4e00-\u9fffA-Za-z]{1,12})"
+)
+_ARRIVAL_OR_COMPLETION_BEFORE_DATE = re.compile(
+    rf"(?:{_EXPLICIT_RETURN_HOME_BEFORE_DEADLINE}|抵达[^,，。；;]{{0,12}}?|"
+    r"到达[^,，。；;]{0,12}?|结束|完成)"
+    r"(?:不晚于|最晚(?:在|于)?|截至|截止(?:到)?)\s*$"
+)
+_ARRIVAL_DEADLINE_BEFORE_DATE = re.compile(
+    r"(?:不晚于|最晚(?:在|于)?|截至|截止(?:到)?|需在)\s*$"
+)
+_ARRIVAL_OR_COMPLETION_AFTER_DATE = re.compile(
+    r"^\s*(?:边界)?\s*(?:内|前|之前|以前)?\s*"
+    rf"(?:{_EXPLICIT_RETURN_HOME_AFTER_DATE}|抵达|到达|结束|完成)"
+)
 _DURATION_PATTERN = re.compile(
     r"(?P<minimum>\d{1,2})\s*(?:-|–|—|~|～|到|至)\s*"
     r"(?P<maximum>\d{1,2})\s*(?P<unit>晚|夜|天)"
@@ -787,6 +810,32 @@ class HybridPackageRequirementAgent:
         reference_date: date,
         draft: _Draft,
     ) -> None:
+        arrival_boundaries = self._explicit_latest_arrival_boundaries(
+            text,
+            reference_date,
+        )
+        if arrival_boundaries:
+            latest_arrival, evidence_text = arrival_boundaries[0]
+            draft.latest_arrival_date = latest_arrival
+            self._set_fact(
+                draft,
+                "latest_arrival_date",
+                latest_arrival,
+                RequirementFactSource.EXPLICIT_TEXT,
+                evidence_text,
+            )
+            unique_arrivals = tuple(
+                dict.fromkeys(value for value, _ in arrival_boundaries)
+            )
+            if len(unique_arrivals) > 1:
+                draft.conflicts.append(
+                    RequirementConflict(
+                        field="latest_arrival_date",
+                        deterministic_value=unique_arrivals[0].isoformat(),
+                        model_value=unique_arrivals[1].isoformat(),
+                        reason="用户输入了多个不同的明确抵达或完成边界",
+                    )
+                )
         same_month_range = _SAME_MONTH_RANGE_PATTERN.search(text)
         if same_month_range is not None:
             try:
@@ -870,17 +919,9 @@ class HybridPackageRequirementAgent:
                 semantic_window.group(0),
             )
             draft.latest_return_date = latest_arrival
-            draft.latest_arrival_date = latest_arrival
             draft.return_date_targets = (
                 latest_arrival - timedelta(days=1),
                 latest_arrival,
-            )
-            self._set_fact(
-                draft,
-                "latest_arrival_date",
-                latest_arrival,
-                RequirementFactSource.EXPLICIT_TEXT,
-                semantic_window.group(0),
             )
             return
         relative_departure = re.search(r"(?:从\s*)?明天(?:开始|起)?", text)
@@ -931,7 +972,6 @@ class HybridPackageRequirementAgent:
                     )
                     return
                 draft.latest_return_date = return_deadline
-                draft.latest_arrival_date = return_deadline
                 # A natural-language arrival deadline is an explicit search
                 # boundary, not a single guessed return leg.  Preserve the
                 # boundary and probe the last two legal return dates so the
@@ -951,13 +991,6 @@ class HybridPackageRequirementAgent:
                             )
                         )
                     )
-                self._set_fact(
-                    draft,
-                    "latest_arrival_date",
-                    return_deadline,
-                    RequirementFactSource.EXPLICIT_TEXT,
-                    deadline.group(0),
-                )
             return
         parsed_dates: list[tuple[date, str]] = []
         invalid_dates: list[str] = []
@@ -1104,7 +1137,6 @@ class HybridPackageRequirementAgent:
                     return_date, return_text = return_dates[0]
                     unique_returns = tuple(dict.fromkeys(item[0] for item in return_dates))
                     if len(unique_returns) == 1:
-                        draft.latest_arrival_date = unique_returns[0]
                         self._set_fact(
                             draft,
                             "exact_return_date",
@@ -1115,7 +1147,6 @@ class HybridPackageRequirementAgent:
                     else:
                         draft.return_date_targets = unique_returns
                         draft.latest_return_date = max(unique_returns)
-                        draft.latest_arrival_date = max(unique_returns)
                         draft.notes.append("多个明确返程日期作为候选目标共同纳入日期遍历")
                         minimum = draft.values.get("min_nights")
                         if departure is not None and isinstance(minimum, int):
@@ -1215,6 +1246,75 @@ class HybridPackageRequirementAgent:
             evidence_text,
         )
         draft.notes.append("月份需求已确定性展开为该月首日至末日的可选出发窗口")
+
+    def _explicit_latest_arrival_boundaries(
+        self,
+        text: str,
+        reference_date: date,
+    ) -> tuple[tuple[date, str], ...]:
+        """Return only dates explicitly bound to home-arrival or completion.
+
+        A normal ``X 日返程`` is the date the return leg leaves the
+        destination.  It must not silently become a home-arrival deadline.
+        """
+
+        dated_spans: list[tuple[int, int, date]] = []
+        full_spans: list[tuple[int, int]] = []
+        for match in _FULL_DATE_PATTERN.finditer(text):
+            try:
+                value = date(
+                    int(match.group("year")),
+                    int(match.group("month")),
+                    int(match.group("day")),
+                )
+            except ValueError:
+                continue
+            dated_spans.append((match.start(), match.end(), value))
+            full_spans.append((match.start(), match.end()))
+        for match in _MONTH_DAY_PATTERN.finditer(text):
+            if any(
+                match.start() < full_end and match.end() > full_start
+                for full_start, full_end in full_spans
+            ):
+                continue
+            month = int(match.group("month"))
+            day = int(match.group("day"))
+            year = (
+                reference_date.year
+                if month >= reference_date.month
+                else reference_date.year + 1
+            )
+            try:
+                value = date(year, month, day)
+            except ValueError:
+                continue
+            dated_spans.append((match.start(), match.end(), value))
+
+        boundaries: list[tuple[date, str]] = []
+        for start, end, value in sorted(dated_spans):
+            prefix = text[max(0, start - 32) : start]
+            suffix = text[end : min(len(text), end + 32)]
+            semantic_before = _ARRIVAL_OR_COMPLETION_BEFORE_DATE.search(prefix)
+            deadline_before = _ARRIVAL_DEADLINE_BEFORE_DATE.search(prefix)
+            semantic_after = _ARRIVAL_OR_COMPLETION_AFTER_DATE.match(suffix)
+            if semantic_before is None and not (
+                deadline_before is not None and semantic_after is not None
+            ):
+                continue
+            if semantic_before is not None:
+                evidence_start = max(0, start - 24)
+            else:
+                assert deadline_before is not None
+                evidence_start = max(0, start - len(deadline_before.group(0)))
+            evidence_end = (
+                min(len(text), end + len(semantic_after.group(0)))
+                if semantic_after is not None
+                else end
+            )
+            boundaries.append(
+                (value, text[evidence_start:evidence_end].strip(" \\t,，。；;"))
+            )
+        return tuple(boundaries)
 
     def _validate_departure_recency(self, draft: _Draft, reference_date: date) -> None:
         earliest = draft.values.get("earliest_departure")

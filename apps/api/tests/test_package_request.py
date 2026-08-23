@@ -486,7 +486,7 @@ async def test_real_natural_trip_request_ignores_current_date_and_keeps_return_t
     assert result.window.earliest_departure == date(2026, 8, 20)
     assert result.window.latest_departure == date(2026, 9, 7)
     assert result.window.latest_return_date == date(2026, 9, 10)
-    assert result.window.latest_arrival_date == date(2026, 9, 10)
+    assert result.window.latest_arrival_date is None
     assert result.window.return_date_targets == (date(2026, 9, 9), date(2026, 9, 10))
     assert (result.window.min_nights, result.window.max_nights) == (3, 7)
     assert result.window.adults == 2
@@ -552,7 +552,7 @@ async def test_verbatim_maldives_request_parses_gateway_and_island_comparison() 
     assert result.window.destination_code == "MLE"
     assert result.window.earliest_departure == date(2026, 8, 20)
     assert result.window.latest_departure == date(2026, 9, 7)
-    assert result.window.latest_arrival_date == date(2026, 9, 10)
+    assert result.window.latest_arrival_date is None
     assert result.window.latest_return_date == date(2026, 9, 10)
     assert result.window.return_date_targets == (date(2026, 9, 9), date(2026, 9, 10))
     assert (result.window.min_nights, result.window.max_nights) == (3, 7)
@@ -722,8 +722,38 @@ async def test_full_chinese_fixed_departure_and_return_dates_are_ready() -> None
     assert result.window is not None
     assert result.window.earliest_departure == date(2026, 9, 3)
     assert result.window.latest_departure == date(2026, 9, 3)
-    assert result.window.latest_arrival_date == date(2026, 9, 9)
+    assert result.window.latest_arrival_date is None
+    assert next(item for item in result.facts if item.field == "exact_return_date").value == (
+        "2026-09-09"
+    )
     assert (result.window.min_nights, result.window.max_nights) == (6, 6)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "return_clause",
+    (
+        "回程最晚在2026年9月9日",
+        "最晚在2026年9月9日回程",
+        "2026年9月9日返回",
+    ),
+)
+async def test_return_departure_wording_is_not_a_home_arrival_deadline(
+    return_clause: str,
+) -> None:
+    result = await HybridPackageRequirementAgent(
+        now=lambda: datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+    ).parse(
+        f"2026年9月3日从杭州出发去马尔代夫，{return_clause}，"
+        "2名成人，1间房。"
+    )
+
+    assert result.state == PackageRequestState.READY
+    assert result.window is not None
+    assert result.window.latest_arrival_date is None
+    assert next(item for item in result.facts if item.field == "exact_return_date").value == (
+        "2026-09-09"
+    )
 
 
 @pytest.mark.asyncio
@@ -739,5 +769,5 @@ async def test_return_date_with_destination_departure_context_is_not_second_outb
     assert result.window is not None
     assert result.window.earliest_departure == date(2026, 9, 3)
     assert result.window.latest_departure == date(2026, 9, 3)
-    assert result.window.latest_arrival_date == date(2026, 9, 9)
+    assert result.window.latest_arrival_date is None
     assert (result.window.min_nights, result.window.max_nights) == (6, 6)

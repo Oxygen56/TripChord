@@ -8068,7 +8068,7 @@ async def test_failed_sealed_receipts_derive_comparison_only_party_total() -> No
                 f"{END.isoformat()}T10:00:00+05:00 "
                 f"{END.isoformat()}T23:00:00+08:00"
             ),
-            "price_evidence": "含税总价 CNY 5200",
+            "price_evidence": "人均含税价 CNY 5200",
             "currency": "CNY",
             "amount": "5200",
             "price_basis": "per_person",
@@ -8098,10 +8098,18 @@ async def test_failed_sealed_receipts_derive_comparison_only_party_total() -> No
         }
     )
 
-    def sealed_snapshot(base: BrowserTaskSnapshot, adults: int, amount: str) -> BrowserTaskSnapshot:
+    def sealed_snapshot(
+        base: BrowserTaskSnapshot,
+        adults: int,
+        amount: str,
+        *,
+        price_evidence: str | None = None,
+    ) -> BrowserTaskSnapshot:
         raw = json.loads(json.dumps(requested_raw))
         raw["confirmed_query"]["adults"] = adults
         raw["candidate_summaries"][0]["amount"] = amount
+        if price_evidence is not None:
+            raw["candidate_summaries"][0]["price_evidence"] = price_evidence
         failure_details = dict(base.failure.details) if base.failure else {}
         failure_details["flight_search_receipt"] = raw
         failure_details["flight_search_receipt_sha256"] = flight_search_receipt_sha256(raw)
@@ -8136,8 +8144,85 @@ async def test_failed_sealed_receipts_derive_comparison_only_party_total() -> No
     assert not normalized[0].quote.party_availability_confirmed
     assert not normalized[0].quote.has_publishable_execution_contract
 
+    for explicit_label in (
+        "人均含税价 CNY 5200",
+        "每人含税价 CNY 5200",
+        "每名成人含税价 CNY 5200",
+        "每位成人含税价 CNY 5200",
+        "CNY 5200/人含税",
+        "含税价 CNY 5200 per person",
+    ):
+        labelled_requested = sealed_snapshot(
+            requested,
+            2,
+            "5200",
+            price_evidence=explicit_label,
+        )
+        labelled_one_adult = sealed_snapshot(
+            requested,
+            1,
+            "5200",
+            price_evidence=explicit_label,
+        )
+        assert len(
+            system._derive_sealed_receipt_party_comparisons(
+                labelled_requested,
+                labelled_one_adult,
+            )
+        ) == 1
+
+    plain_total_requested = sealed_snapshot(
+        requested,
+        2,
+        "4230",
+        price_evidence="含税总价 CNY 4230",
+    )
+    plain_total_one_adult = sealed_snapshot(
+        requested,
+        1,
+        "4230",
+        price_evidence="含税总价 CNY 4230",
+    )
+    assert not system._derive_sealed_receipt_party_comparisons(
+        plain_total_requested,
+        plain_total_one_adult,
+    )
+
     dynamic = sealed_snapshot(requested, 1, "5199")
     assert not system._derive_sealed_receipt_party_comparisons(requested, dynamic)
+
+    ambiguous_raw = json.loads(
+        json.dumps(requested.failure.details["flight_search_receipt"])
+    )
+    ambiguous_raw["candidate_summaries"][0]["price_evidence"] = "含税总价 CNY 5200"
+    ambiguous_raw["candidate_summaries"][0]["price_basis"] = "total_party"
+
+    def ambiguous_snapshot(adults: int, amount: str) -> BrowserTaskSnapshot:
+        raw = json.loads(json.dumps(ambiguous_raw))
+        raw["confirmed_query"]["adults"] = adults
+        raw["candidate_summaries"][0]["amount"] = amount
+        details = {
+            **requested.failure.details,
+            "flight_search_receipt": raw,
+            "flight_search_receipt_sha256": flight_search_receipt_sha256(raw),
+        }
+        return requested.model_copy(
+            update={
+                "id": f"{requested.id}-ambiguous-{adults}-{amount}",
+                "query": requested.query.model_copy(update={"adults": adults}),
+                "failure": requested.failure.model_copy(update={"details": details}),
+            }
+        )
+
+    ambiguous_requested = ambiguous_snapshot(2, "4230")
+    assert not system._derive_sealed_receipt_party_comparisons(
+        ambiguous_requested,
+        ambiguous_snapshot(1, "4230"),
+    )
+    assert not system._derive_sealed_receipt_party_comparisons(
+        ambiguous_requested,
+        ambiguous_snapshot(1, "4830"),
+    )
 
     tampered = one_adult.model_copy(
         update={

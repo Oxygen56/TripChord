@@ -1442,6 +1442,40 @@ class PackageViolation(DomainModel):
     details: dict[str, str | int | bool] = Field(default_factory=dict)
 
 
+def package_date_violations(
+    intent: PackageIntent,
+    candidate: TravelPackageCandidate,
+) -> tuple[PackageViolation, ...]:
+    """Apply the one authoritative date contract to every candidate class."""
+
+    departure_matches = candidate.flight.outbound_depart_at.date() == intent.start_date
+    return_departure_matches = (
+        candidate.flight.return_depart_at.date() == intent.end_date
+    )
+    if departure_matches and return_departure_matches:
+        if (
+            intent.latest_arrival_date is None
+            or candidate.flight.return_arrive_at.date() <= intent.latest_arrival_date
+        ):
+            return ()
+        return (
+            PackageViolation(
+                code=PackageViolationCode.DATE_MISMATCH,
+                severity=PackageViolationSeverity.ERROR,
+                message="返程实际到达日期晚于用户要求的回杭边界",
+                component_ids=(candidate.flight.id,),
+            ),
+        )
+    return (
+        PackageViolation(
+            code=PackageViolationCode.DATE_MISMATCH,
+            severity=PackageViolationSeverity.ERROR,
+            message="航班日期与用户旅行日期不一致",
+            component_ids=(candidate.flight.id,),
+        ),
+    )
+
+
 class PackageDiff(DomainModel):
     before_candidate_id: str
     after_candidate_id: str
@@ -2197,7 +2231,8 @@ class PackagePlanner:
         variants = tuple(
             candidate
             for candidate in self._continuous_candidates(intent, flight, inventory)
-            if candidate.transfers
+            if not package_date_violations(intent, candidate)
+            and candidate.transfers
             and all(item.provider == transfer_provider for item in candidate.transfers)
         )
         representatives: dict[str, TravelPackageCandidate] = {}
@@ -3521,37 +3556,7 @@ class PackageVerifier:
         intent: PackageIntent,
         candidate: TravelPackageCandidate,
     ) -> list[PackageViolation]:
-        if (
-            candidate.flight.outbound_depart_at.date() == intent.start_date
-            and candidate.flight.return_depart_at.date() == intent.end_date
-            and (
-                intent.latest_arrival_date is None
-                or candidate.flight.return_arrive_at.date() <= intent.latest_arrival_date
-            )
-        ):
-            return []
-        if (
-            candidate.flight.outbound_depart_at.date() == intent.start_date
-            and candidate.flight.return_depart_at.date() == intent.end_date
-            and intent.latest_arrival_date is not None
-            and candidate.flight.return_arrive_at.date() > intent.latest_arrival_date
-        ):
-            return [
-                PackageViolation(
-                    code=PackageViolationCode.DATE_MISMATCH,
-                    severity=PackageViolationSeverity.ERROR,
-                    message="返程实际到达日期晚于用户要求的回杭边界",
-                    component_ids=(candidate.flight.id,),
-                )
-            ]
-        return [
-            PackageViolation(
-                code=PackageViolationCode.DATE_MISMATCH,
-                severity=PackageViolationSeverity.ERROR,
-                message="航班日期与用户旅行日期不一致",
-                component_ids=(candidate.flight.id,),
-            )
-        ]
+        return list(package_date_violations(intent, candidate))
 
     def _check_party(
         self,

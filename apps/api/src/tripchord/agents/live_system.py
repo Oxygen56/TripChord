@@ -203,6 +203,7 @@ from tripchord.providers.browser_bridge import (
     BrowserTaskState,
     BrowserTaskSubmission,
     BrowserVertical,
+    FlightSearchCandidateSummary,
     FlightSearchReceipt,
     FlightSearchReceiptState,
     LodgingInventoryReceipt,
@@ -8498,22 +8499,24 @@ class LivePackageAgentSystem:
                 state.normalization_by_task[task_id] = comparison_results
                 results.extend(comparison_results)
                 continue
-            party_price_comparisons: tuple[FlightPartyComparisonReceipt, ...] = ()
+            successful_party_price_comparisons: tuple[
+                FlightPartyComparisonReceipt, ...
+            ] = ()
             validation_snapshot = state.party_price_validation_snapshots.get(task_id)
             if validation_snapshot is not None:
-                party_price_comparisons = (
+                successful_party_price_comparisons = (
                     self._normalizer.derive_flight_party_comparison_receipts(
                         snapshot,
                         validation_snapshot,
                     )
                 )
                 state.party_price_comparison_receipts[task_id] = (
-                    party_price_comparisons
+                    successful_party_price_comparisons
                 )
             task_results = self._normalizer.normalize_many(
                 snapshot.quotes,
                 snapshot.query,
-                party_price_comparisons=party_price_comparisons,
+                party_price_comparisons=successful_party_price_comparisons,
             )
             state.normalization_by_task[task_id] = task_results
             results.extend(task_results)
@@ -8782,8 +8785,11 @@ class LivePackageAgentSystem:
 
         def rows(
             receipt: FlightSearchReceipt,
-        ) -> dict[str, tuple[object, int, tuple[datetime, ...]]]:
-            output: dict[str, tuple[object, int, tuple[datetime, ...]]] = {}
+        ) -> dict[str, tuple[FlightSearchCandidateSummary, int, tuple[datetime, ...]]]:
+            output: dict[
+                str,
+                tuple[FlightSearchCandidateSummary, int, tuple[datetime, ...]],
+            ] = {}
             for candidate in receipt.candidate_summaries:
                 if (
                     candidate.price_classification.value != "comparison_only"
@@ -8791,6 +8797,20 @@ class LivePackageAgentSystem:
                     or candidate.currency != requested_snapshot.query.currency
                     or candidate.price_evidence is None
                     or "含税" not in candidate.price_evidence
+                    # A sealed comparison receipt currently carries the
+                    # itinerary identity, not a stable fare-product identity
+                    # (cabin/fare family/rules/selection id).  Equal amounts
+                    # from separate 1-adult and N-adult searches can therefore
+                    # be an accidental fare refresh.  Only an explicit visible
+                    # per-adult label makes multiplication safe on this
+                    # reduced receipt surface.
+                    or candidate.price_basis != QuotePriceBasis.PER_PERSON
+                    or not re.search(
+                        r"(?:人均|每\s*人|每\s*(?:名|位)\s*成人|/\s*人|"
+                        r"\bper\s+person\b)",
+                        candidate.price_evidence,
+                        flags=re.IGNORECASE,
+                    )
                     or not candidate.outbound_flight_numbers
                     or not candidate.return_flight_numbers
                     or not candidate.outbound_segments

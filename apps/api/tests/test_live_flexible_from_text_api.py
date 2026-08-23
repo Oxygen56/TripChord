@@ -411,16 +411,23 @@ def _two_candidate_live_run(
     )
     comparison_system = LivePackageAgentSystem(bridge=None)  # type: ignore[arg-type]
     candidate_set = comparison_system._build_decision_only_candidate_set(state)
-    assert candidate_set is not None
-    ctrip_decision = next(
-        item for item in candidate_set.candidates
-        if item.candidate.lodgings[0].provider == "ctrip"
+    ctrip_decision = (
+        next(
+            item
+            for item in candidate_set.candidates
+            if item.candidate.lodgings[0].provider == "ctrip"
+        )
+        if candidate_set is not None
+        else None
     )
-    ctrip_candidate = ctrip_decision.candidate
-    exact_coverage = comparison_system._candidate_exact_quote_comparison_coverage(
-        state,
-        intent,
-        ctrip_candidate,
+    exact_coverage = (
+        comparison_system._candidate_exact_quote_comparison_coverage(
+            state,
+            intent,
+            ctrip_decision.candidate,
+        )
+        if ctrip_decision is not None
+        else None
     )
     estimate = IComCnyReferenceEstimate(
         rate_date=date(2026, 8, 22),
@@ -444,7 +451,9 @@ def _two_candidate_live_run(
             "selected_stay_plan_id": StayPlanId.MAAFUSHI_ICOM,
             "decision_only_candidate": ctrip_decision,
             "decision_only_candidate_set": candidate_set,
-            "icom_cny_reference_estimate": estimate,
+            "icom_cny_reference_estimate": (
+                estimate if ctrip_decision is not None else None
+            ),
         }
     )
     return LivePackageAgentRun.model_validate(payload)
@@ -525,6 +534,7 @@ async def test_http_endpoint_projects_and_ranks_two_complete_decision_candidates
     date_pair = body["run"]["pair_runs"][0]["date_pair"]
     assert date_pair["departure_date"] == "2026-09-03"
     assert date_pair["return_date"] == "2026-09-09"
+    assert body["interpretation"]["window"]["latest_arrival_date"] is None
     candidates = body["decision_candidates"]
     assert {item["lodging_provider"] for item in candidates} == {
         "ctrip",
@@ -558,6 +568,7 @@ async def test_http_endpoint_projects_and_ranks_two_complete_decision_candidates
     assert best["return_date"] == "2026-09-09"
     assert best["flight"]["outbound_depart_at"].startswith("2026-09-03")
     assert best["flight"]["return_depart_at"].startswith("2026-09-09")
+    assert best["flight"]["return_arrive_at"].startswith("2026-09-10")
     assert best["lodgings"][0]["check_in"] == "2026-09-04"
     assert best["lodgings"][0]["check_out"] == "2026-09-09"
     assert best["lodging_source_comparisons"]
@@ -573,6 +584,49 @@ async def test_http_endpoint_projects_and_ranks_two_complete_decision_candidates
             "provider_evidence"
         ]
     } >= {"ctrip", "kaani_official"}
+
+    return_departure_text = (
+        "2026年9月3日从杭州出发去马尔代夫，回程最晚在2026年9月9日，"
+        "2名成人，1间房。"
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51352)),
+        base_url="http://test",
+    ) as client:
+        return_departure_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=return_departure_text, max_pairs=1),
+        )
+
+    assert return_departure_response.status_code == 200, return_departure_response.text
+    return_departure = return_departure_response.json()
+    assert return_departure["interpretation"]["window"]["latest_arrival_date"] is None
+    return_pair = return_departure["run"]["pair_runs"][0]["date_pair"]
+    assert return_pair["departure_date"] == "2026-09-03"
+    assert return_pair["return_date"] == "2026-09-09"
+    assert return_pair["night_count"] == 6
+    assert return_departure["best_available_plan"]["flight"][
+        "return_arrive_at"
+    ].startswith("2026-09-10")
+
+    arrival_boundary_text = (
+        "2026年9月3日从杭州出发去马尔代夫，2026年9月9日返程，"
+        "最晚在2026年9月9日回到杭州，2名成人，1间房。"
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51353)),
+        base_url="http://test",
+    ) as client:
+        blocked_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=arrival_boundary_text, max_pairs=1),
+        )
+
+    assert blocked_response.status_code == 200, blocked_response.text
+    blocked = blocked_response.json()
+    assert blocked["interpretation"]["window"]["latest_arrival_date"] == "2026-09-09"
+    assert blocked["decision_candidates"] == []
+    assert blocked["best_available_plan"] is None
 
 
 @pytest.mark.asyncio
