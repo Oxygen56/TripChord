@@ -1,0 +1,50 @@
+{
+  "schema_version": "tripchord-public-run-projection-v1",
+  "projection_note": "Selected non-sensitive fields copied from the durable local job snapshot. Raw browser payloads, tenant state and credentials are intentionally excluded.",
+  "source": {
+    "job_id": "live-job-b96edeb2-98c1-4b20-8c1b-33ee734c4f2c",
+    "request_sha256": "d9c29a3a8374c39c8ebd7a69261e6878b0425174120b143bb8ca6420f1f612b3",
+    "created_at": "2026-08-24T02:41:05.101743Z",
+    "updated_at": "2026-08-24T02:42:46.663406Z"
+  },
+  "task": {
+    "state": "succeeded",
+    "stage": "complete",
+    "progress": 100
+  },
+  "search": {
+    "minimum_departure_lead_days": 7,
+    "effective_earliest_departure": "2026-08-31",
+    "legal_date_pair_count": 30,
+    "batch_requested_pair_count": 30,
+    "batch_observed_pair_count": 30,
+    "batch_priced_pair_count": 8,
+    "detailed_pair_count": 3,
+    "selected_pair_ids": [
+      "date-pair:2026-08-31:2026-09-04:c1a6f10abd7e",
+      "date-pair:2026-09-03:2026-09-07:8e40eb7d99b6",
+      "date-pair:2026-09-07:2026-09-10:b5787babe013"
+    ],
+    "sampled_not_exhaustive": true
+  },
+  "execution": {
+    "wall_time_seconds": 99.91458254196914,
+    "model_call_count": 0,
+    "model_call_reason": "Model stages were deferred during bulk exploration and no candidate entered publication refresh.",
+    "completed_detailed_pair_count": 3,
+    "failed_detailed_pair_count": 0
+  },
+  "decision": {
+    "state": "human_block",
+    "final_plan_present": false,
+    "best_available_plan_present": true,
+    "best_available_departure_date": "2026-09-03",
+    "best_available_return_date": "2026-09-07",
+    "best_available_estimated_total_cny_cents": 1504815
+  },
+  "unresolved_preference_application": [
+    "lodging_price",
+    "lodging_zone_comparison"
+  ],
+  "claim_boundary": "All 30 legal date pairs were represented in the batch screen, but only the selected Top 3 received detailed queries. The result is best_verified_in_evaluated_set, not an all-window or all-platform lowest bookable price."
+}

@@ -1,143 +1,125 @@
-# 简历项目成稿
+# TripChord 简历与面试项目说明
 
-## TripChord（旅弦）— 证据驱动的自由行多 Agent 规划与动态恢复系统
+这一页写给第一次了解 TripChord 的面试官：先给出可直接放进简历的版本，再说明 Agent 架构、关键取舍、真实运行结果和声明边界。
 
-技术栈：Python / FastAPI / Pydantic / 自研 Typed Dynamic DAG / OpenAI-compatible Model Gateway /
-BM25 RAG / OR-Tools CP-SAT / SQLAlchemy / PostgreSQL / Redis / React 19 / TypeScript / Chrome Extension /
-Docker / Nginx / Transformers / TRL / PEFT
+## 简历可直接使用的版本
 
-- 从 0 设计可独立运行的自由行多 Agent 系统，将需求理解、日期策略、来源调度、证据仲裁、候选
-  策展、风险批判、Repair、ReCritic 与主控裁决拆为具有阶段专属 Context、工具 allowlist、结构化
-  输出和失败归因的 Agent；它们可共享同一 Router/进程，不能宣称基础设施故障域独立。模型提案
-  真实改变日期精查顺序、Source DAG 波次与候选换选，确定性
-  Verifier/Safety Gate 保留金额、权限和硬约束发布权。
-- 实现“固定硬上限 + 动态 ReAct 日期分片”的 Agent Budget Controller：按日期/候选/证据缺口和
-  pipeline 阶段生成可复算 `ScaleDirective`，经 16 个模板白名单与 96 个逻辑模型 Agent hard cap
-  分配；自然语言入口将 Requirement Agent 以 `CONTEXT` 角色与后续规划纳入同一 request-wide
-  ledger，并用 Flexible scope start 区分规划增量和整个请求累计；ScaleDirective 只计划规划阶段。
-  日期每 12 行分片，400 日期集成测试走通
-  34 scout → 3 intermediate merger → 1 final merger，每个节点只能调用只读日期工具并选择合法 ID；
-  模型请求门从 1–2 起步、成功加一、失败减半，进程级模型 HTTP 并发最多 12，同时保持 Chrome
-  lease 6、去哪儿住宿 1 和日期对 1 不变。四类 synthetic 冻结预算回归为
-  `8/19/57/143 → 8/19/57/96`、模型 ceiling `2/6/8/12`；明确该基准无模型/浏览器/OTA 调用，
-  也不含文本 Requirement admission，不包装成全请求 Agent 数、真实价格覆盖或性能收益。
-- 将发布前重核价 fallback 纳入可审计动态预算：首批和每次额外尝试前，按累计尝试数
-  重派生 `ScaleDirective + AgentTemplatePlan`，每个 publication attempt 计 8 个基础模型 Agent，
-  最多 `exact_pair_budget=8`；结合已审计 Candidate Scout 增量与 request-wide 96 Agent
-  ledger 在下一次浏览器/模型调用前 fail-closed，预算不足写入
-  `publication_refresh_shortfall` 并结构化 `HUMAN_BLOCK`，无 500 或隐藏超限。本地回归验证
-  3 次逐次 refreeze 与第 2 次不足时无新副作用；不声称真实 OTA 已触发 8 次 fallback。
-- 实现 Candidate Scout live 决策分片链：确定性 Planner 生成最多 256 个有界候选，`C>32`
-  时按 32 分成最多 8 个可并发调度、服务端绑定的只读 Scout，每个 Scout 仅能调用候选检查
-  工具并提名本分片 ID；确定性 Collector 收敛为最多 32 个 decision frontier，Evidence
-  Arbiter 逐项审核后只有唯一 `candidate_merger` 可以更新 Planner 初案。候选阶段复用全请求
-  96 Agent ledger 与成功加一/失败减半并发门，启动前预留后续必需 Agent 名额，并对
-  scope/pool/frontier SHA-256、fallback、并发和 Merger admission 留下类型化回执。65 候选
-  32/32/1 集成测试验证越权提名拒绝、伪造 hash 拒绝、预算前置拒绝和唯一写入者；
-  该证据来自本地结构化模型/fixture，不声称真实 OTA 已触发 `C>32`。2,000 候选只是
-  离线 synthetic controller 预算算术，不是 live Planner 池或全网穷举。
-- 实现 Search Supervisor：先通过只读工具检查 provider capability、缓存、延迟、硬预算与 Chrome
-  lease，再生成搜索 waves；校验后的提案被物化为实际 DAG dependencies，未知 Source、漏必需项、
-  超预算或非只读任务整份拒绝。当前每个精确日期对构建 13 路浏览器 + 4 路 iCom tool-bound
-  Source worker；浏览器始终由最多 6 个任务并发执行，不把 worker 数
-  包装成浏览器并发数。
-- 建立 Provider-neutral 模型网关与上下文工程：默认 `MODEL_PROVIDER=none`，required-model 模式
-  失败关闭；Query/Planner/Repair 使用 2400/4000/3000 token 的按角色 Context Pack，工具回执与
-  历史记忆共享预算。实现 tenant/user/session/trip 隔离、长期偏好确认/撤销和 BM25 词法 RAG，
-  强制实时价格/库存只从本轮工具回执进入上下文；用 DeepSeek `deepseek-v4-flash` 真实完成
-  固定 3 请求的 JSON/tool-loop smoke；在后续 focused required-model Chrome 运行中，模型阶段和
-  全部浏览器 Source 均真实完成，但住宿精确报价平台仅 1/2，最终 `HUMAN_BLOCK`。将“模型参与”“Source
-  执行完整”和“方案可发布”分层记账，不夸大为完整 OTA Done-Gate 成功。
-- 针对跨平台报价一致性实现 product/offer 两级稳定身份、10 分钟同分区精确报价复用与
-  single-flight、默认 20 分钟抓取时差拒绝门；候选生成使用可审计 beam 与默认 256 cap，输出
-  raw/prescreen 数量、结构上界、ID hash 和截断状态；模型候选阶段只能看服务端绑定的
-  32 候选 Scout scope 或最终 `<=32` decision frontier，不能声称穷举全部原始组合。
-- 设计 `Hard Verifier → Risk Critic → Repair Strategist → deterministic Repair Executor →
-  heterogeneous ReVerifier → ReCritic → Orchestrator → Safety Gate` 闭环；第二套 ReVerifier 不调用
-  主 Verifier/diff 实现，独立重算 13 类金额/父链/diff/硬偏好/住宿/报价/接驳不变量，反例证明
-  即使主 Verifier 被 stub 为通过仍能拦截篡改；handoff 绑定候选 ID、版本、组件 diff 与错误码，任何
-  Agent 均不能静默覆盖硬拒绝。
-  解释 Agent 的事实陈述必须绑定最终组件与 evidence_ref；在 Explanation/Memory 之后增加
-  确定性 Publication Gate，required-model 模式下任一必需阶段失败均不会漏出 `ACCEPT`。
-  主控的接受提案还必须绑定 Repair/ReVerifier 的实际最终候选 ID，且证据只能来自该候选；
-  未知候选或无关 evidence_ref 在 advisory 模式也会被 Safety Gate 拒绝。Memory Curator 的
-  trip/user 候选全部停留在待确认区，只有显式用户确认接口才能写入 RAG。
-- 实现有界事件重规划：browser local/iCom 路径只允许一个模型 Event Diagnoser，后续 Repair、
-  主 Verifier、异构 ReVerifier 与事件安全门均为确定性；只有 global 升级才禁用近期报价复用并
-  重跑完整正常模型 pipeline。`replan_after_event` 与 nested global 复用 request-wide 96 ledger，
-  在全局浏览器 fan-out 前按 `C=256、E=true、R=false、raw=18` 做最坏容量预检，额度不足返回含
-  required/available 的结构化 `HUMAN_BLOCK`；`AgenticRunSummary.combine` 保留两段 stage/request/
-  HTTP 与模型并发审计。增加用户显式开启的周期重核价 monitor，每轮只读重查一个组件；当前
-  证据仅为代码和本机 structured-model/fixture，不包装成真实 OTA event 已验证、供应商 push 或
-  库存锁定。
-- 对“8 月全部日期应该怎么搜”做完整宇宙评测：低成本枚举 124 个日期对，将昂贵 OTA 精查限制
-  在 1–8 对；冻结 benchmark 发现旧 adaptive 总体输给粗价 Top-K，后续 guarded hybrid 在新的
-  4–7 晚 sealed holdout 也未过不退化门，因此 live 默认改为 `Query Strategist 重排 + bounded
-  Top-K`，adaptive 仅保留为实验项，并在输出中明确“抽样、未穷举”。
-- 建设分层评测与反例门：240 条/12 类固定种子 synthetic suite 中，静默硬约束/明确偏好违规、
-  过期事实、未授权 L3 和死循环均为 0；另构建同任务、同工具、同模型标识、同总预算和共同
-  最终审计的 single-vs-multi scripted A/B，两组均为 100%，多 Agent 消耗更多调用与 token，
-  因而不宣称质量优势，其可证价值限定为最小权限、阶段化失败归因、结构化交接和并发等待重叠。
-- 完成 FastAPI + React + Chrome Companion 全栈控制面，展示 Agent proposal/applied action、模型
-  调用、Context 裁剪、候选空间与证据链；将长耗时 live 搜索改为 `POST 202 + job_id → GET/SSE
-  进度 → DELETE 取消`，支持五态、tenant 隔离、容量/TTL、错误脱敏与 `Idempotency-Key`，取消
-  可传播到 browser bridge；strict runner 使用异步轮询、日期对 checkpoint 与冻结 3600 秒预算。
-  正式 live 任务已把幂等身份、租约、取消意图和逐日期结果写入 PostgreSQL，同机 API/worker
-  中断后只恢复未完成日期；浏览器采集、短期报价和偏好仍未纳入同一恢复链，因此不包装跨主机
-  恢复、平台副作用恰好一次或生产 SLA。
-- 为 Chrome Companion 设计受限后台自动重载：当前 `0.1.16` 只有 source SHA、manifest/runtime、
-  0600 release seal 与当前 runtime instance 全部匹配时才允许一次有界幂等 reload，并验证新实例；
-  不打开/聚焦页面，也不能安装扩展、扩大域名权限、恢复登录或绕验证码。
-- 将住宿来源结果建模为 `QUOTE_FOUND / CONFIRMED_EMPTY / BOUNDED_NO_EXACT_QUOTE /
-  BOUNDED_PROVIDER_PENDING` 四态；`confirmed_empty` 要求同查询、同 tab/window/runtime lineage 的
-  receipt-v2 双观测，Bridge/normalizer/Done-Gate 独立复核。Source 全部完成仍不等于可推荐，选中
-  分段必须有 2 个不同 provider 的精确报价。
-- 三日期 Round 17 已在异步 job/checkpoint/3600 秒预算下真实完成控制面并封存：47/47 模型调用
-  成功，checkpoint 为 completed/failed/completed，runner 为 `done_gate_failed`。中间 pair 的
-  Evidence Arbiter 专用 policy 与泛化 Repair 规则冲突已修复；相同 2026-08-21 至 2026-08-26
-  聚焦复测以 23/23 模型调用成功完成，但携程仍是唯一 `quote_found`，去哪儿为
-  `bounded_provider_pending`，最终 `HUMAN_BLOCK`。同程住宿单路 canary 为 `login_required`，
-  用户已明确跳过该来源；它不再是待登录事项，也不贡献覆盖率。
-  因此简历只写“真实运行、日期对隔离和失败关闭”，不写当前 Done-Gate 已通过。
-  2026-08-03 两推荐日期与 75% 局部保留率仅作为历史 v3/canary 证据。
+### TripChord（旅弦）——确定性内核与多角色协作的自由行决策 Agent
 
-## 可选的训练工程追加项
+**技术栈：** Python、FastAPI、Pydantic、SQLAlchemy/PostgreSQL、React/TypeScript、Chrome Extension、OpenAI-compatible Model Gateway
 
-- 构造城市组隔离的合成编排 SFT/DPO 数据；小规模未见城市组 Base/SFT/SFT+DPO 为
-  66.67%/100%/100%，DPO 未证明高于 SFT。另跑通 SmolLM2-135M-Instruct 的 3-step LoRA
-  SFT→DPO 与 4 个 adapter reload；只作为离线训练链路证据，不写“提升中文规划质量”或“已接入 live”。
+- 从 0 设计交通、住宿与接驳一体化的旅行决策系统，将自然语言需求转成合法日期空间，统一不同平台的产品身份、同行人数和费用口径，再生成包含完整日期、衔接关系、人民币总费用及来源链接的行程方案。
+- 设计确定性探索与多角色 Agent 分层的架构：各角色使用专属 Context Pack、工具白名单、结构化输出和类型化交接；LLM 只处理需求语义、偏好权衡和软风险，确定性内核负责日期、人数、金额、产品身份、行程衔接和发布判定；全窗口探索可延后模型阶段，只有候选进入相应决策路径时才承担模型成本。
+- 实现固定工作池、跨日期查询指纹、single-flight 复用和异步任务，避免逐日期串行查询及相同请求重复执行。一次真实只读运行约 100 秒覆盖 30/30 个可行日期组合的批量价格线索、详查 Top 3，并组合出含航班、酒店、接驳、总价和官方入口的当前最佳候选。
+- 将长期偏好设计为可确认、可撤销、可过期的数据；实时价格、库存和班次禁止进入长期记忆。对同任务、同工具、同预算的 12 组脚本化 A/B 评测中，单 Agent 与 Multi-Agent 的有效方案率均为 100%，而 Multi-Agent 成本更高，因此不把固定执行全部角色当作最终方向，并保留按问题复杂度继续收窄触发范围的演进路径。
 
-## 面试主线
+项目地址：[github.com/Oxygen56/TripChord](https://github.com/Oxygen56/TripChord)
 
-先讲两个被实验推翻的方案，而不是从架构名词开始：
+## 30 秒口述版
 
-1. 原以为 CP-SAT 会让 greedy 在硬约束上大量领先，实际 120 条合成基准中二者都 100% 有效，
-   CP-SAT 平均效用仅 +0.83%；因此把重点从“算法名字”转向证据、新鲜度和异常恢复。
-2. 原以为 adaptive 日期探索必然优于粗价 Top-K，冻结 full-universe 基准和新 sealed holdout 均未
-   支持该假设；因此保留负结果并切回有证据的保守默认。
+TripChord 不是生成旅游文案的聊天机器人，而是一个把灵活日期、航班、酒店、接驳和同行总费用放进同一个决策问题的旅行 Agent。它把不确定的语义理解、个人偏好和软风险交给受限的模型角色，但把日期、金额、产品身份、行程衔接和最终发布权留给可复算的程序。多 Agent 的价值不是“角色越多越智能”，而是隔离上下文、工具权限、审查责任和修改责任。最新一次真实运行中，模型阶段在全窗口探索时被延后，且没有候选进入发布重搜，因此模型调用为 0；它说明模型成本不是每次查询都固定发生，但不证明本次需求已经完成。
 
-随后解释为什么仍需要多 Agent：不是因为公平 scripted 评测显示更准——两者都是 100%，而且
-多 Agent 更贵——而是旅行系统需要把搜索权限、证据冲突、候选取舍、反方批判和返工隔离成独立
-失败域，并让 Verifier/Safety Gate 对模型保持否决权。最后展示最新 strict `HUMAN_BLOCK` 与
-Round 17 的 `done_gate_failed` 与后续聚焦 `HUMAN_BLOCK`，说明系统没有拿历史 v3/canary 成功、
-HTTP job 成功或模型调用成功掩盖当前双平台住宿门禁未过。
+## 一页 Agent 架构
 
-## 简历绝对禁区
+```mermaid
+flowchart LR
+  A[自然语言需求] --> B[程序锁定事实与日期空间]
+  B --> C[交通、住宿、接驳并行查询]
+  C --> D[统一产品身份、人数与价格]
+  D --> E[程序生成完整候选]
+  E -->|结果唯一且无需语义取舍| G[程序复算]
+  E -->|需要偏好、风险或修改判断| F[按需进入专业 Agent 路径]
+  F --> G
+  G --> H[一张行程卡或明确阻断]
+  M[用户确认的稳定偏好] --> B
+  H -.价格、库存和班次不写入记忆.-> M
+```
 
-- 不写“多 Agent 相比单 Agent 从 75% 提升到 100%”。75% 是历史单候选确定性代理消融，
-  不是公平 one-shot LLM Agent；
-- 不写“默认使用 DeepSeek 完成实时 OTA 闭环”。默认模型是 none；DeepSeek 已真实参与 focused
-  required-model 运行，但最终是 `HUMAN_BLOCK`，不能包装成 Done-Gate 成功；
-- 不写“Source execution complete 等于多平台报价完整”，也不把 `confirmed_empty` 或 pending
-  计作第二个平台价格；
-- 不写“向量 RAG”“全月最低”“全网最低”“库存锁定”“自动下单”“真实用户转化提升”或
-  “生产 QPS/SLA”；
-- 不写“adaptive 优于 Top-K”或“LoRA 提升中文行程质量”。
-- 不写“当前事件预算链已被真实 OTA 自然涨价/售罄验证”；2026-08-03 只是旧 v3/canary 的验收器
-  注入页面重查，不包含当前共享 ledger、global preflight 与 summary-combine 合同。
-- 不写“96 是实验得到的最优 Agent 数”“96 个 Agent 同时请求模型/浏览器”；可写 Candidate
-  Scout/Merger 已接入 live 决策代码并通过本地结构化模型/fixture 集成测试，不写“真实
-  OTA 已运行 256 候选”、“并行穷举 2,000 个候选”或“穷举全网组合”。
+这些是不同运行路径可以使用的能力角色，不代表每次运行都会调用全部角色；当前进入 required-model 主链后，多数审查与修改职责仍按固定任务图执行：
 
-证据明细见 `docs/claim-ledger.md`，压力问答见 `docs/interview-guide.md` 与
-`docs/interview-red-team.md`。
+| 角色 | 真正负责的决定 | 为什么单独存在 | 不能做什么 |
+| --- | --- | --- | --- |
+| Context | 把用户表达整理成当前需求和待确认偏好 | 隔离当前事实、历史偏好与工具回执 | 不能生成价格或放宽明确要求 |
+| Query Strategist | 在程序生成的合法日期中调整搜索优先级 | 灵活日期过多时需要语义化探索顺序 | 不能删除合法日期或扩大工具权限 |
+| Search Supervisor | 根据来源能力、预算和缓存安排查询波次 | 把来源调度与旅行取舍分开 | 不能把失败解释成无票或无房 |
+| Evidence Arbiter | 判断页面是否对应同一航班、房型或班次 | 跨平台名称和价格口径常不一致 | 不能修改金额、人数或来源原文 |
+| Candidate Curator | 在已通过硬约束的完整方案中处理体验取舍 | 价格、位置、舒适度常不存在唯一答案 | 不能让低价覆盖用户明确要求 |
+| Risk Critic | 识别中转、入住、位置等软风险 | 与方案选择者形成独立反方视角 | 不能直接改写候选或否决程序结论 |
+| Repair Strategist | 提出保留组件、替换组件和扩大重查的边界 | 将修复建议与实际修改权限分开 | 不能直接执行修改或覆盖原方案 |
+| ReCritic | 检查修改后是否出现新的软风险 | 修复建议者不能给自己的结果验收 | 不能代替程序重新计算硬约束 |
+| Event Diagnoser | 判断价格、余位或班次变化影响哪些组件 | 避免每次变化都重跑整条规划链 | 不能接收供应商推送或直接执行修改 |
+| Orchestrator | 汇总已核准意见并建议输出状态 | 统一多角色结论和失败语义 | 不能越过程序的最终发布判定 |
+| Explanation | 把获准事实组织成用户能理解的说明 | 将表达能力与事实生产分离 | 不能新增未被来源支持的事实 |
+| Memory Curator | 提议可长期保存的稳定偏好 | 防止一次性需求污染长期记忆 | 未经用户确认不能写入记忆 |
+
+交通、住宿和接驳的来源查询是受控工具任务，不是会自行决策的 Agent。日期与金额计算、Hard Verifier、修改执行、ReVerifier 和最终发布均由确定性程序完成，而不是“再问一次模型”。
+
+## 最值得面试追问的取舍
+
+### 1. 为什么不用一个强模型接全部工具？
+
+单模型更简单、调用更少，但也会把需求理解、搜索权限、证据判断、自我审查和结果说明耦合在同一个上下文里。TripChord 只在这种耦合确实影响责任隔离时启用多个角色；即使启用，金额、硬约束和发布权仍不交给模型。
+
+### 2. 为什么不是每次都固定执行 Multi-Agent？
+
+在 12 组同任务、同工具、同模型标识和同预算的脚本化比较中，单 Agent 与 Multi-Agent 的有效方案率都为 100%；平均调用数分别为 4.25 和 10.25，Multi-Agent 的 token 和延迟也更高。因此项目保留它在权限隔离、独立反方检查和修改协同上的价值，但不把“更多 Agent”当作质量指标。
+
+### 3. 为什么没有直接迁移 LangGraph？
+
+项目比较过 PydanticAI、LangGraph、OpenAI Agents SDK、Google ADK 和 DBOS。旅行领域状态、报价身份、组合优化、修改边界和最终判定仍必须由 TripChord 自己维护；现阶段没有实验表明重写运行时能改善真实旅行结果、耗时或维护成本。因此保留自有旅行内核，只把 PydanticAI 作为未来可替换的模型交互层候选，而不是为了框架名称重写主链。
+
+### 4. 为什么不对所有日期和平台逐一做精确查询？
+
+程序会完整生成合法日期空间，但 OTA 精确查询成本高、页面不稳定且常受登录状态限制。当前策略先获取低成本批量线索，再用固定工作池详查有希望的 Top K；如果没有完成全空间精查，结果必须明确写成“本次已评估范围内的当前候选”，不能宣称全月或全网最低。
+
+### 5. 为什么旧价格不能放进 RAG？
+
+“偏爱海景、少中转、住市中心”是可复用偏好；价格、余位和班次是随时变化的当前事实。TripChord 为两者使用不同的数据合同：前者经用户确认后可进入长期记忆，后者只能来自本轮工具回执。
+
+### 6. 为什么把修改建议和修改执行分开？
+
+模型只提出“保留什么、调整什么、何时扩大重查范围”；程序执行组件替换并重新计算完整行程，独立 ReVerifier 再检查金额、衔接和硬要求。新方案不成立时保留原方案，避免模型为了完成任务静默扩大修改范围。
+
+## 当前真实证据和声明边界
+
+| 证据 | 能说明什么 | 不能说明什么 |
+| --- | --- | --- |
+| [2026-08-24 马尔代夫真实只读运行](real-run-maldives-2026-08-24.md) | 约 100 秒覆盖 30/30 批量价格线索、详查 Top 3、产出当前最佳候选；本次模型调用为 0 | 不能说这次是多 LLM 协作，也不能说得到全窗口、全平台最低可订价 |
+| [公开声明与运行记录](claim-ledger.md) | 一次 required-model 聚焦运行的本机诊断记录显示模型阶段完成，但因合格住宿精确报价不足而阻断；该次尚无公开封存的机器记录 | 不能把本机诊断或“模型阶段完成”写成“旅行方案已经可发布” |
+| [单 Agent 与 Multi-Agent 对比](benchmark-agent-architectures.md) | 脚本化 12 任务中两种方案的有效方案率均为 100%，Multi-Agent 调用更多 | 不能宣称 Multi-Agent 已证明更准确 |
+| [1.0 验收记录](v1.0-acceptance.md) | 保存的真实来源数据可以重复验证组合、费用和局部修改边界 | 回放不是当前 OTA 价格或库存 |
+
+TripChord 当前不能声称全网最低、稳定覆盖所有 OTA、锁定库存、自动下单、拥有生产用户或达到生产 SLA。`1.0.0` 表示桌面核心产品合同已经形成，不等于成熟商业服务。
+
+## 可直接交给 GPT 面试官的提示词
+
+```text
+你是第一次了解 TripChord 的资深 Agent 系统面试官，请从问题定义、Agent 架构、上下文工程、工具权限、确定性系统边界、组合优化、记忆、失败语义、性能和框架取舍等角度，对候选人进行高强度技术面试。
+
+项目背景：TripChord 是一个本地优先的自由行决策系统。它把自然语言需求转成合法日期空间，并行查询交通、住宿和接驳来源，统一产品身份、同行人数和费用口径，生成完整行程。LLM 只处理语义理解、偏好权衡、软风险和修改策略；日期、金额、产品身份、衔接、修改执行与最终发布由确定性程序负责。全窗口探索可以延后模型阶段；进入 required-model 主链后，多数审查和修改角色目前仍按固定任务图执行。
+
+你必须基于以下已知事实提问：
+1. 一次真实只读运行约 100 秒，覆盖 30/30 个日期组合的批量价格线索、详查 Top 3，产出当前最佳候选；模型阶段被延后且没有候选进入发布重搜，因此模型调用为 0，但整份需求没有完成。
+2. 另一次 required-model 聚焦运行的本机诊断记录显示模型阶段完成，但合格住宿精确报价不足，因此结果为 HUMAN_BLOCK；该次尚无公开封存的机器记录。
+3. 12 组同任务、同工具、同预算的脚本化比较中，单 Agent 与 Multi-Agent 的有效方案率均为 100%，Multi-Agent 成本更高。
+4. 长期记忆只保存用户确认的稳定偏好，价格、库存和班次不能进入长期记忆。
+5. 项目不能声称全网最低、稳定覆盖所有 OTA、库存锁定、自动下单、生产 SLA 或 Multi-Agent 更准确。
+6. 最近一次真实运行保留了住宿价格取舍和机场过渡住宿比较的偏好，但它们尚未实际影响候选生成或排序；这是当前产品缺口，不得包装成已完成。
+
+面试方式：
+- 每次只问一个精准问题，根据我的回答继续追问，不要一次给出问题清单。
+- 按“产品问题 → LLM 与程序的权力边界 → 每个角色的必要性 → Context 与工具权限 → 单/多 Agent A/B → 日期搜索 → 跨平台报价可比性 → 偏好记忆 → 修改与恢复 → 框架选择 → 延迟和成本”逐步深入。
+- 不接受“更智能、更可靠、可扩展”等空泛回答；要求我说清数据怎样流动、谁拥有状态、失败如何表示、有什么反例、为什么不选更简单方案。
+- 如果我把历史回放、模型调用成功或当前候选夸大成实时可订方案，立即指出声明越界。
+- 每轮追问结束后，简短评价回答的准确性、深度和遗漏，再进入下一问。
+
+现在从这个问题开始：为什么这个问题需要 Agent 系统，而不是一个带搜索工具的单模型？
+```
+
+## 继续阅读
+
+- [最近一次真实只读运行](real-run-maldives-2026-08-24.md)
+- [系统架构](architecture.md)
+- [重要架构决策与框架对比](architecture-decisions.md)
+- [架构面试指南](interview-guide.md)
+- [高压追问与回答边界](interview-red-team.md)
