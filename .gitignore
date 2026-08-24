@@ -20,6 +20,8 @@ coverage/
 .artifacts/
 /training/runs/
 /tripchord.db
+/tripchord.db-shm
+/tripchord.db-wal
 /.runtime/
 # Runtime-only state under apps/api must never be committed (MUL-4252).
 /apps/api/tripchord.db

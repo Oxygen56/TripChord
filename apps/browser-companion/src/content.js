@@ -3530,7 +3530,119 @@
     };
   }
 
-  globalThis.TripChordContentRuntimeVersion = "2026-08-05.18";
+  function ctripVisibleDateStrip(provider, kind, range = {}, root = document) {
+    if (provider !== "ctrip" || kind !== "flight") {
+      return {
+        state: "unsupported",
+        strip_found: false,
+        cells: [],
+      };
+    }
+    const requested = Array.isArray(range.requested_pairs)
+      ? range.requested_pairs
+      : [];
+    const requestedByToken = new Map();
+    for (const pair of requested) {
+      if (!Array.isArray(pair) || pair.length !== 2) continue;
+      const start = String(pair[0] || "");
+      const end = String(pair[1] || "");
+      const startMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(start);
+      const endMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(end);
+      if (!startMatch || !endMatch) continue;
+      requestedByToken.set(
+        `${Number(startMatch[2])}-${Number(startMatch[3])}/` +
+          `${Number(endMatch[2])}-${Number(endMatch[3])}`,
+        { start_date: start, end_date: end },
+      );
+    }
+    const bodyText = String(
+      root.body && (root.body.innerText || root.body.textContent) || "",
+    ).replace(/\s+/g, " ").trim();
+    if (/(?:滑块|验证码|安全验证|登录后查看)/.test(bodyText.slice(0, 6000))) {
+      return {
+        state: "human_action_required",
+        strip_found: false,
+        cells: [],
+      };
+    }
+    const stripFound = bodyText.includes("更多日期") &&
+      (bodyText.includes("自由搭配") || bodyText.includes("往返组合"));
+    if (!stripFound) {
+      return {
+        state: "pending",
+        strip_found: false,
+        cells: [],
+        document_title: String(root.title || "").slice(0, 160),
+        source_url: String(location.href || ""),
+        surface_markers: {
+          more_dates: bodyText.includes("更多日期"),
+          free_pairing: bodyText.includes("自由搭配"),
+          round_trip_pairing: bodyText.includes("往返组合"),
+          no_flights: /(?:暂无|没有|未找到).{0,8}(?:航班|机票)/.test(bodyText),
+        },
+        date_text_samples: (bodyText.match(
+          /\d{1,2}\s*[-/.月]\s*\d{1,2}(?:\s*日)?[^¥￥]{0,42}?(?:¥|￥)?\s*\d{0,6}/g,
+        ) || []).slice(0, 16),
+      };
+    }
+    const pairPattern = /(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*(?:日)?[\s\S]{0,10}?(?:去|出发)[\s\S]{0,36}?(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*(?:日)?[\s\S]{0,10}?(?:返|回)/;
+    const candidates = [...root.querySelectorAll("li, div, a, span")]
+      .filter(visible)
+      .map((node) => ({
+        node,
+        text: String(node.innerText || node.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim(),
+      }))
+      .filter(({ text }) => text.length >= 8 && text.length <= 180)
+      .map(({ node, text }) => ({ node, text, match: pairPattern.exec(text) }))
+      .filter(({ match }) => Boolean(match));
+    const byPair = new Map();
+    for (const { text, match } of candidates) {
+      const token = `${Number(match[1])}-${Number(match[2])}/` +
+        `${Number(match[3])}-${Number(match[4])}`;
+      const exactPair = requestedByToken.get(token);
+      if (!exactPair) continue;
+      const priceMatch = /(?:¥|￥)\s*([0-9][0-9,]*)/.exec(text);
+      const amount = priceMatch
+        ? String(Number(priceMatch[1].replace(/,/g, "")))
+        : null;
+      const candidate = {
+        ...exactPair,
+        amount: amount && amount !== "0" ? amount : null,
+        visible_text: text.slice(0, 180),
+      };
+      const existing = byPair.get(token);
+      if (
+        !existing ||
+        (candidate.amount !== null && existing.amount === null) ||
+        (
+          (candidate.amount === null) === (existing.amount === null) &&
+          candidate.visible_text.length < existing.visible_text.length
+        )
+      ) {
+        byPair.set(token, candidate);
+      }
+    }
+    const cells = [...byPair.values()];
+    const pricedPairCount = cells.filter((cell) => cell.amount !== null).length;
+    return {
+      state: pricedPairCount ? "ready" : "pending",
+      strip_found: true,
+      cells,
+      requested_pair_count: requestedByToken.size,
+      visible_pair_count: byPair.size,
+      priced_pair_count: pricedPairCount,
+      document_title: String(root.title || "").slice(0, 160),
+      source_url: String(location.href || ""),
+      markers: [
+        "更多日期",
+        bodyText.includes("自由搭配") ? "自由搭配" : "往返组合",
+      ],
+    };
+  }
+
+  globalThis.TripChordContentRuntimeVersion = "2026-08-24.6";
   globalThis.TripChordVisibleSearchDriver = {
     ctripCalendarMonthOrdinal,
     ctripCalendarNavigationDirection,
@@ -3552,6 +3664,7 @@
     auditedCtripFlightRecoveryNotice,
     controlDiagnostics,
     normalizeCtripFlightExtractionSurface,
+    ctripVisibleDateStrip,
     tongchengLodgingDetailCandidates,
     waitForTongchengFlightCards,
     OCCUPANCY_PROFILES,
@@ -3596,6 +3709,13 @@
           new Date(),
           message.query || {},
           message.driver || null,
+        );
+      }
+      if (message.type === "tripchord:extract-ctrip-date-strip") {
+        return ctripVisibleDateStrip(
+          message.provider,
+          message.kind,
+          message.range || {},
         );
       }
       if (message.type === "tripchord:safe-select-outbound") {

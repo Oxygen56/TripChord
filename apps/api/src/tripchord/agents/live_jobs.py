@@ -606,6 +606,20 @@ def _diagnostic_exception(exc: BaseException) -> BaseException:
     return value_error or timeout_error or chain[0]
 
 
+def _is_transient_database_contention(exc: BaseException) -> bool:
+    """Recognize SQLite's retryable single-writer contention through wrappers."""
+
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if "database is locked" in message or "database table is locked" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _safe_failure_details_digest(
     code: LivePlanningSafeFailureCode,
     details: LivePlanningSafeFailureDetails,
@@ -2524,13 +2538,34 @@ class LivePlanningJobRegistry:
             return
 
         async def heartbeat() -> None:
+            loop = asyncio.get_running_loop()
+            poll_seconds = min(1.0, max(0.1, self._durable_lease_seconds / 3))
+            renew_seconds = max(0.1, self._durable_lease_seconds / 3)
+            last_renewed = loop.time()
+            next_renewal = last_renewed + renew_seconds
             try:
                 while runtime.snapshot.state not in TERMINAL_LIVE_PLANNING_JOB_STATES:
-                    await asyncio.sleep(min(1.0, self._durable_lease_seconds / 3))
-                    authoritative = await store.get(
-                        runtime.snapshot.id, tenant_id=runtime.tenant_id
-                    )
+                    await asyncio.sleep(poll_seconds)
+                    try:
+                        authoritative = await store.get(
+                            runtime.snapshot.id, tenant_id=runtime.tenant_id
+                        )
+                    except Exception as exc:
+                        if not _is_transient_database_contention(exc):
+                            raise
+                        # A single busy SQLite writer does not mean this worker
+                        # lost ownership.  Retry while the already-acquired
+                        # lease still has a conservative safety margin.
+                        if loop.time() - last_renewed >= self._durable_lease_seconds * 0.8:
+                            raise
+                        logger.warning(
+                            "durable live planning heartbeat delayed by database contention",
+                            extra={"job_id": runtime.snapshot.id},
+                        )
+                        continue
                     if authoritative is None:
+                        if runtime.task is not None and not runtime.task.done():
+                            runtime.task.cancel()
                         return
                     if authoritative.cancellation_requested or authoritative.cancel_pending:
                         # Drain both executors before publishing terminal state;
@@ -2560,17 +2595,32 @@ class LivePlanningJobRegistry:
                                 runtime.snapshot.id, tenant_id=runtime.tenant_id
                             )
                         return
-                    renewed = await store.renew_lease(
-                        runtime.snapshot.id,
-                        tenant_id=runtime.tenant_id,
-                        owner=runtime.durable_lease_owner,
-                        lease_generation=runtime.durable_lease_generation,
-                        lease_seconds=self._durable_lease_seconds,
-                    )
+                    if loop.time() < next_renewal:
+                        continue
+                    try:
+                        renewed = await store.renew_lease(
+                            runtime.snapshot.id,
+                            tenant_id=runtime.tenant_id,
+                            owner=runtime.durable_lease_owner,
+                            lease_generation=runtime.durable_lease_generation,
+                            lease_seconds=self._durable_lease_seconds,
+                        )
+                    except Exception as exc:
+                        if not _is_transient_database_contention(exc):
+                            raise
+                        if loop.time() - last_renewed >= self._durable_lease_seconds * 0.8:
+                            raise
+                        logger.warning(
+                            "durable live planning lease renewal delayed by database contention",
+                            extra={"job_id": runtime.snapshot.id},
+                        )
+                        continue
                     if not renewed:
                         if runtime.task is not None and not runtime.task.done():
                             runtime.task.cancel()
                         return
+                    last_renewed = loop.time()
+                    next_renewal = last_renewed + renew_seconds
             except Exception:
                 logger.exception(
                     "durable live planning lease heartbeat failed",
@@ -4030,6 +4080,15 @@ class LivePlanningJobRegistry:
             done, _ = await asyncio.wait((operation_task,), timeout=remaining)
             if operation_task not in done:
                 raise TimeoutError
+            # ``Task.result()`` raises ``CancelledError`` when the child
+            # operation cancelled itself.  That is distinct from cancellation
+            # of this registry runner: treating both as the latter used to let
+            # the runner exit while its snapshot stayed ``running`` forever.
+            # Convert only the child outcome into an ordinary execution failure;
+            # a real runner cancellation still enters the dedicated bounded
+            # drain path below.
+            if operation_task.cancelled():
+                raise RuntimeError("live planning operation cancelled before producing a result")
             result = operation_task.result()
         except asyncio.CancelledError:
             # P0-1 bounded cleanup: request the operation to stop and wait within

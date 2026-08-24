@@ -2,7 +2,7 @@ importScripts("build-meta.js");
 
 const DEFAULT_BRIDGE_URL = "http://127.0.0.1:8000/browser-bridge";
 const POLL_ALARM = "tripchord-read-only-poll";
-const CONTENT_RUNTIME_VERSION = "2026-08-05.18";
+const CONTENT_RUNTIME_VERSION = "2026-08-24.6";
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const COMPANION_ID = `chrome-mv3-${chrome.runtime.id}`;
 const SOURCE_EXECUTION_ATTESTATION_SCHEMA =
@@ -101,7 +101,12 @@ const LEASE_COMPLETION_SHORT_LEASE_MAX_RATIO = 0.4;
 const LEASE_COMPLETION_NETWORK_GUARD_MS = 500;
 const INITIAL_LANDING_STAGE_CAP_MS = 40000;
 const INITIAL_LANDING_INNER_GUARD_MS = 1000;
-const MAX_CONCURRENT_INITIAL_LANDINGS = 3;
+// Three simultaneous OTA page startups repeatedly exhausted Chrome's page
+// hydration budget in a real 30-date run, while the same pages completed in
+// 5-9 seconds in isolation. Keep date work parallel, but serialize only this
+// heavyweight first navigation so the browser produces results instead of
+// timing every provider out together.
+const MAX_CONCURRENT_INITIAL_LANDINGS = 1;
 const READY_STATE_PROBE_CAP_MS = 1000;
 const CONTENT_BOOTSTRAP_STAGE_CAP_MS = 25000;
 const PREPARE_SEARCH_STAGE_CAP_MS = 35000;
@@ -202,6 +207,7 @@ const VISIBLE_CONTENT_MESSAGE_TYPES = new Set([
   "tripchord:trigger-search",
   "tripchord:read-result-query",
   "tripchord:extract",
+  "tripchord:extract-ctrip-date-strip",
   "tripchord:safe-select-outbound",
   "tripchord:safe-select-return",
   "tripchord:safe-expand-qunar-flight-detail",
@@ -3546,11 +3552,46 @@ async function withStageBudget(
   }
 }
 
-async function assertLeaseActive(lease, timeoutMs = 5000) {
-  const snapshot = await bridgeFetch(
-    `/v1/tasks/${encodeURIComponent(lease.task_id)}`,
-    { timeoutMs },
+function isBridgeFetchTimeout(error) {
+  return Boolean(
+    error &&
+    (
+      error.name === "AbortError" ||
+      /signal is aborted|operation was aborted|fetch.*aborted/i.test(
+        String(error.message || error),
+      )
+    )
   );
+}
+
+async function assertLeaseActive(lease, timeoutMs = 5000, deadline = null) {
+  const path =
+    `/v1/tasks/${encodeURIComponent(lease.task_id)}/lease-status`;
+  const requestTimeoutMs = () => {
+    if (deadline === null) return timeoutMs;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error("provider task timed out before completion");
+    }
+    // Unlike general Chrome lifecycle waits, a local lease read must never use
+    // the 250ms minimum from remainingTimeout: the caller's absolute stage
+    // deadline is authoritative even when only a few milliseconds remain.
+    return Math.max(1, Math.min(timeoutMs, remaining));
+  };
+  let snapshot;
+  try {
+    snapshot = await bridgeFetch(path, { timeoutMs: requestTimeoutMs() });
+  } catch (error) {
+    // A busy local bridge can occasionally take slightly longer than the
+    // per-call cap while many date/provider workers settle together. Retrying
+    // this read-only lease check once prevents that local control-plane delay
+    // from being misreported as a provider extraction failure. The enclosing
+    // stage deadline remains authoritative.
+    if (!isBridgeFetchTimeout(error)) {
+      throw error;
+    }
+    snapshot = await bridgeFetch(path, { timeoutMs: requestTimeoutMs() });
+  }
   if (
     !snapshot ||
     snapshot.state !== "claimed" ||
@@ -4116,6 +4157,7 @@ function withVisibleTab(
     await assertLeaseActive(
       lease,
       remainingTimeout(deadline, 5000),
+      deadline,
     );
     remainingTimeout(deadline, 15000);
     const targetTab = await chrome.tabs.get(tabId);
@@ -6150,7 +6192,11 @@ async function prepareSearchWithLifecycle(
         activePageUrl = adopted.pageUrl;
         navigationTrace = adopted.navigationTrace;
         await installContent(activeTabId);
-        await assertLeaseActive(lease);
+        await assertLeaseActive(
+          lease,
+          remainingTimeout(deadline, 5000),
+          deadline,
+        );
         continue;
       }
       observer.cancel();
@@ -6196,7 +6242,11 @@ async function prepareSearchWithLifecycle(
       activePageUrl = adopted.pageUrl;
       navigationTrace = adopted.navigationTrace;
       await installContent(activeTabId);
-      await assertLeaseActive(lease);
+      await assertLeaseActive(
+        lease,
+        remainingTimeout(deadline, 5000),
+        deadline,
+      );
     }
   }
   throw lifecycleError(
@@ -7373,7 +7423,12 @@ async function enrichOneLodgingQuoteWithTransferDetail(
     return quote;
   }
   try {
-    await assertLeaseActive(lease);
+    await assertLeaseActive(
+      lease,
+      remainingTimeout(deadline, 5000),
+      deadline,
+    );
+    remainingTimeout(deadline, 1);
     await chrome.tabs.update(reusableTabId, { url: detailUrl, active: false });
     await waitForTabComplete(
       reusableTabId,
@@ -9695,7 +9750,9 @@ async function orchestrateFliggyLodgingDetails(
       await assertLeaseActive(
         lease,
         remainingTimeout(detailDeadline, 5000),
+        detailDeadline,
       );
+      remainingTimeout(detailDeadline, 1);
       const detailTab = await chrome.tabs.create({
         url: target.href,
         active: false,
@@ -10397,7 +10454,9 @@ async function orchestrateCtripLodgingDetails(
       await assertLeaseActive(
         lease,
         remainingTimeout(detailDeadline, 5000),
+        detailDeadline,
       );
+      remainingTimeout(detailDeadline, 1);
       const detailTab = await chrome.tabs.create({
         url: target.href,
         active: false,
@@ -10675,7 +10734,9 @@ async function orchestrateCtripAuditedSeedDetails(
       await assertLeaseActive(
         lease,
         remainingTimeout(detailDeadline, 5000),
+        detailDeadline,
       );
+      remainingTimeout(detailDeadline, 1);
       const detailTab = await chrome.tabs.create({
         url: target.href,
         active: false,
@@ -11318,6 +11379,7 @@ async function runSinglePageQuery(lease, executionOptions = {}) {
         await assertLeaseActive(
           lease,
           remainingTimeout(stageDeadlineValue, 5000),
+          stageDeadlineValue,
         );
       },
     );
@@ -11510,6 +11572,7 @@ async function runSinglePageQuery(lease, executionOptions = {}) {
           await assertLeaseActive(
             lease,
             remainingTimeout(stageDeadlineValue, 5000),
+            stageDeadlineValue,
           );
           return { current, pageUrl: nextPageUrl };
         },
@@ -11825,11 +11888,9 @@ async function runSinglePageQuery(lease, executionOptions = {}) {
 function ctripRangeQueryUrl(query, startDate, endDate) {
   const originCode = String(query.origin_code || "").toLowerCase();
   const destinationCode = String(query.destination_code || "").toLowerCase();
-  return "https://flights.ctrip.com/international/search/" +
+  return "https://flights.ctrip.com/online/list/" +
     `round-${originCode}-${destinationCode}` +
-    `?depdate=${startDate}_${endDate}` +
-    `&cabin=y_s&adult=${query.adults}&child=${query.children || 0}` +
-    `&infant=${query.infants || 0}`;
+    `?_=1&depdate=${startDate}_${endDate}&dateOffset=7_14`;
 }
 
 function rangePairKey(pair) {
@@ -11898,149 +11959,248 @@ async function executeRangeLease(lease) {
   const pairs = range && Array.isArray(range.requested_pairs)
     ? range.requested_pairs : [];
   const timing = leaseTiming(lease);
-  const totalDeadline = Math.min(
-    timing.work_deadline_ms,
-    Date.now() + Math.max(10000, (Number(range && range.timeout_seconds) || 300) * 1000),
-  );
-  const reserveMs = Math.max(LEASE_COMPLETION_MAX_RESERVE_MS, 8000);
-  const cellBudgetMs = Math.max(
-    15000,
-    Math.min(90000, Math.floor((totalDeadline - Date.now() - reserveMs) / Math.max(1, pairs.length))),
-  );
-  const cells = [];
-  const quotes = [];
-  const failures = [];
+  const totalDeadline = timing.work_deadline_ms;
+  const ownedTabIds = new Set();
+  const ownedWindowIds = new Set();
   const stageTrace = [];
-  for (const pair of pairs) {
-    if (Date.now() + reserveMs >= totalDeadline) {
-      failures.push({ pair, code: "range_deadline", message: "批量任务为提交回执保留时间" });
-      cells.push(await rangeCellFromCompletion(range, pair, {
-        state: "failed",
-        failure: { code: "range_deadline" },
-      }));
-      continue;
-    }
-    const startDate = String(pair[0]);
-    const endDate = String(pair[1]);
-    const query = {
-      ...lease.query,
-      start_date: startDate,
-      end_date: endDate,
-      search_url: lease.provider === "ctrip"
-        ? ctripRangeQueryUrl(lease.query, startDate, endDate)
-        : lease.query.search_url,
-    };
-    const cellLease = { ...lease, query, range_query: null };
-    const cellDeadline = Math.min(totalDeadline - reserveMs, Date.now() + cellBudgetMs);
-    let completion;
-    try {
-      const remainingCellMs = Math.max(1000, cellDeadline - Date.now());
-      completion = await Promise.race([
-        runSinglePageQuery(
-          cellLease,
-          { deadlineMs: cellDeadline, submitCompletion: false },
-        ),
-        new Promise((resolve) => setTimeout(() => resolve({
-          state: "failed",
-          quotes: [],
-          failure: {
-            code: "range_cell_timeout",
-            message: "日期单元达到独立截止时间，批量任务继续提交回执",
-            retryable: true,
-            page_url: null,
-          },
-        }), remainingCellMs)),
-      ]);
-    } catch (error) {
-      completion = {
-        state: "failed",
-        quotes: [],
-        failure: {
-          code: "range_cell_error",
-          message: String(error && error.message || error),
-          retryable: true,
-          page_url: null,
+  let completion;
+  try {
+    if (
+      lease.provider !== "ctrip" ||
+      lease.kind !== "flight" ||
+      !pairs.length
+    ) {
+      completion = failure(
+        "failed",
+        "unsupported_query",
+        "当前批量日期读取只支持携程国际往返航班",
+      );
+    } else if (!await hasProviderPermission("ctrip")) {
+      completion = failure(
+        "blocked",
+        "permission_denied",
+        "用户尚未授予携程只读域名权限",
+      );
+    } else {
+      const anchor = pairs[Math.floor((pairs.length - 1) / 2)];
+      const requestedUrl = ctripRangeQueryUrl(
+        lease.query,
+        String(anchor[0]),
+        String(anchor[1]),
+      );
+      const tab = await withInitialLandingSlot(
+        stageTrace,
+        totalDeadline,
+        async () => {
+          const createdWindow = await chrome.windows.create({
+            url: requestedUrl,
+            focused: false,
+            state: "normal",
+            type: "normal",
+          });
+          if (!createdWindow || !Number.isInteger(createdWindow.id)) {
+            throw new Error("Chrome did not return a window id for the batch-date page");
+          }
+          ownedWindowIds.add(createdWindow.id);
+          const activeTabs = await chrome.tabs.query({
+            windowId: createdWindow.id,
+            active: true,
+          });
+          const created = activeTabs.find((candidate) =>
+            candidate && Number.isInteger(candidate.id)
+          );
+          if (!created) {
+            throw new Error("Chrome did not return an active tab for the batch-date page");
+          }
+          ownedTabIds.add(created.id);
+          await waitForTabInteractive(
+            created.id,
+            remainingTimeout(totalDeadline, INITIAL_LANDING_STAGE_CAP_MS),
+          );
+          return chrome.tabs.get(created.id);
         },
-      };
+      );
+      const tabId = tab.id;
+      await installContent(tabId);
+      let extraction = null;
+      do {
+        await assertLeaseActive(
+          lease,
+          remainingTimeout(totalDeadline, 5000),
+          totalDeadline,
+        );
+        extraction = await visibleContentCall(
+          tabId,
+          {
+            type: "tripchord:extract-ctrip-date-strip",
+            provider: lease.provider,
+            kind: lease.kind,
+            range,
+          },
+          {
+            lease,
+            deadline: totalDeadline,
+            ownedTabIds,
+            timeoutCapMs: 8000,
+          },
+        );
+        if (
+          extraction &&
+          (
+            extraction.state === "ready" ||
+            extraction.state === "human_action_required"
+          )
+        ) {
+          break;
+        }
+        await delay(Math.min(750, Math.max(0, totalDeadline - Date.now())));
+      } while (Date.now() + 1000 < totalDeadline);
+
+      if (extraction && extraction.state === "human_action_required") {
+        completion = failure(
+          "blocked",
+          "captcha_required",
+          "携程批量日期页要求人工验证，本轮已跳过该批次",
+          requestedUrl,
+        );
+      } else if (!extraction || extraction.strip_found !== true) {
+        completion = failure(
+          "failed",
+          "timeout",
+          "携程批量日期栏未在限定时间内出现",
+          requestedUrl,
+          true,
+          {
+            executor: "ctrip_visible_date_strip",
+            document_title: extraction && extraction.document_title || null,
+            source_url: extraction && extraction.source_url || null,
+            surface_markers: extraction && extraction.surface_markers || null,
+            date_text_samples: extraction && extraction.date_text_samples || [],
+          },
+        );
+      } else {
+        const current = await chrome.tabs.get(tabId);
+        const sourceUrl = String(
+          extraction.source_url || current.url || requestedUrl,
+        );
+        const capturedAt = new Date().toISOString();
+        const extractedByPair = new Map(
+          (Array.isArray(extraction.cells) ? extraction.cells : []).map(
+            (cell) => [rangePairKey([cell.start_date, cell.end_date]), cell],
+          ),
+        );
+        const receiptCells = [];
+        for (const pair of pairs) {
+          const extracted = extractedByPair.get(rangePairKey(pair));
+          if (!extracted) continue;
+          const amount = /^\d+(?:\.\d+)?$/.test(String(extracted.amount || ""))
+            ? String(extracted.amount)
+            : null;
+          const evidence = await inventoryReceiptSha256(canonicalInventoryJson({
+            provider: "ctrip",
+            source_url: sourceUrl,
+            start_date: String(pair[0]),
+            end_date: String(pair[1]),
+            visible_text: String(extracted.visible_text || "").slice(0, 180),
+          }));
+          receiptCells.push({
+            start_date: String(pair[0]),
+            end_date: String(pair[1]),
+            party: range.party,
+            currency: range.currency,
+            amount,
+            price_basis: amount === null ? "unknown" : "per_person",
+            party_total_known: false,
+            taxes_and_fees_included: null,
+            product_identity: null,
+            quote: null,
+            price_finality: amount === null ? "unknown" : "starting",
+            evidence_sha256: evidence,
+            captured_at: capturedAt,
+          });
+        }
+        const evidence = await inventoryReceiptSha256(canonicalInventoryJson({
+          provider: "ctrip",
+          source_url: sourceUrl,
+          markers: extraction.markers || [],
+          cells: receiptCells.map((cell) => [
+            cell.start_date,
+            cell.end_date,
+            cell.evidence_sha256,
+          ]),
+        }));
+        const responseShape = await inventoryReceiptSha256(
+          canonicalInventoryJson({
+            executor: "ctrip_visible_date_strip",
+            requested_cells: pairs.length,
+            observed_cells: receiptCells.length,
+          }),
+        );
+        const capability = {
+          status: "confirmed",
+          provider: range.provider,
+          contract_version: range.contract_version,
+          parser_version: range.parser_version,
+          evidence_sha256: evidence,
+          captured_at: capturedAt,
+          query_fingerprint_sha256: await inventoryReceiptSha256(
+            canonicalInventoryJson(range),
+          ),
+          task_id: null,
+          lease_id: null,
+          evidence_type: "visible_dom",
+          source_url: sourceUrl,
+          response_shape_sha256: responseShape,
+          reason: "ctrip_visible_same_duration_date_strip",
+        };
+        const rangeCompletion = {
+          schema_version: "tripchord-browser-range-receipt-v1",
+          query: range,
+          capability,
+          cells: receiptCells,
+          receipt_sha256: "",
+          expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+        };
+        rangeCompletion.receipt_sha256 = await inventoryReceiptSha256(
+          canonicalInventoryJson({
+            schema_version: rangeCompletion.schema_version,
+            query: rangeCompletion.query,
+            capability: rangeCompletion.capability,
+            cells: rangeCompletion.cells,
+            expires_at: rangeCompletion.expires_at,
+          }),
+        );
+        completion = {
+          state: "succeeded",
+          quotes: [],
+          failure: null,
+          range_completion: rangeCompletion,
+        };
+      }
     }
-    if (completion && Array.isArray(completion.quotes)) quotes.push(...completion.quotes);
-    if (!completion || completion.state !== "succeeded") {
-      failures.push({
-        pair,
-        code: completion && completion.failure && completion.failure.code || "range_cell_failed",
-        message: completion && completion.failure && completion.failure.message || "日期单元未完成",
-      });
-    }
-    cells.push(await rangeCellFromCompletion(range, pair, completion));
+  } catch (error) {
+    const loginRequired = loginRequiredFailure(error);
+    const timedOut =
+      error && error.tripchordCode === "stage_timeout" ||
+      /timed out|timeout/i.test(String(error && error.message || error));
+    completion = failure(
+      loginRequired ? "blocked" : "failed",
+      loginRequired ? "login_required" : timedOut ? "timeout" : "extraction_error",
+      loginRequired
+        ? "携程批量日期页要求重新登录，本轮已跳过"
+        : "携程批量日期栏读取失败",
+      null,
+      timedOut,
+      {
+        executor: "ctrip_visible_date_strip",
+        error: String(error && error.message || error).slice(0, 300),
+        stage_trace: stageTraceSnapshot(stageTrace),
+      },
+    );
+  } finally {
+    await closeOwnedWindows(ownedWindowIds, ownedTabIds).catch(() => null);
+    await closeOwnedTabs(ownedTabIds);
   }
-  const capturedAt = new Date().toISOString();
-  // This task has no server-issued range lease id.  Keep the receipt
-  // explicitly inconclusive and downgrade visible totals to starting prices;
-  // the API only permits exact-cell binding when the capability carries both
-  // task and lease lineage.
-  const capabilityStatus = "inconclusive";
-  const receiptCells = cells.map((cell) => cell.price_finality === "exact"
-    ? { ...cell, price_finality: "starting" }
-    : cell);
-  const evidence = await inventoryReceiptSha256(canonicalInventoryJson({
-    task_id: null,
-    lease_id: null,
-    provider: lease.provider,
-    pairs: cells.map((cell) => [cell.start_date, cell.end_date, cell.evidence_sha256]),
-  }));
-  const responseShape = await inventoryReceiptSha256(
-    canonicalInventoryJson({ executor: "native_range", cells: cells.length }),
-  );
-  const capability = {
-    status: capabilityStatus,
-    provider: range.provider,
-    contract_version: range.contract_version,
-    parser_version: range.parser_version,
-    evidence_sha256: evidence,
-    captured_at: capturedAt,
-    query_fingerprint_sha256: await inventoryReceiptSha256(canonicalInventoryJson(range)),
-    task_id: null,
-    lease_id: null,
-    evidence_type: "visible_dom",
-    source_url: lease.query.search_url || null,
-    response_shape_sha256: responseShape,
-    reason: capabilityStatus === "confirmed"
-      ? "native_range_executor_completed_requested_cells"
-      : "bounded_date_shards_completed_with_partial_or_non_exact_cells",
-  };
-  const rangeCompletion = {
-    schema_version: "tripchord-browser-range-receipt-v1",
-    query: range,
-    capability,
-    cells: receiptCells,
-    receipt_sha256: "",
-    expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
-  };
-  rangeCompletion.receipt_sha256 = await inventoryReceiptSha256(
-    canonicalInventoryJson({
-      schema_version: rangeCompletion.schema_version,
-      query: rangeCompletion.query,
-      capability: rangeCompletion.capability,
-      cells: rangeCompletion.cells,
-      expires_at: rangeCompletion.expires_at,
-    }),
-  );
-  const completion = {
-    state: quotes.length ? "succeeded" : "failed",
-    quotes,
-    failure: quotes.length ? null : {
-      code: failures.some((item) => item.code === "range_cell_timeout" || item.code === "range_deadline")
-        ? "timeout" : "no_inventory",
-      message: quotes.length
-        ? ""
-        : "批量日期任务未取得可比较的真实价格单元",
-      retryable: true,
-      page_url: null,
-      captured_at: capturedAt,
-      details: { executor: "native_range", cell_budget_ms: cellBudgetMs, failures },
-    },
-    range_completion: rangeCompletion,
-  };
   try {
     return await completeLease(lease, completion);
   } catch (error) {
@@ -12477,6 +12637,8 @@ if (globalThis.__TRIPCHORD_BACKGROUND_TEST_HOOKS__) {
     TRIGGER_SEARCH_STAGE_CAP_MS,
     completionWithStageTrace,
     completionRequestTimeoutMs,
+    assertLeaseActive,
+    isBridgeFetchTimeout,
     bridgeValidationDiagnostic,
     completionContractRejected,
     recordCompletionDiagnostic,

@@ -748,10 +748,18 @@ export type FinalPlanProjection = {
   unresolved_items: string[];
 };
 
+export type BestAvailablePlanProjection = FinalPlanProjection & {
+  confirmed_cny_subtotal_cents: number | null;
+  estimated_icom_transfer_cny_cents: number | null;
+  estimated_total_cny_cents: number | null;
+  advisory_note: string;
+};
+
 export type LiveFlexibleFromTextResponse = {
   interpretation: PackageRequirementInterpretation;
   run: FlexibleLiveAgentRun | null;
   final_plan?: FinalPlanProjection | null;
+  best_available_plan?: BestAvailablePlanProjection | null;
   cached_pair_runs: LiveFlexiblePairRunHandle[];
   model_enhancement_enabled: boolean;
   execution_boundary: string;
@@ -1424,6 +1432,21 @@ export function retryDelayMs(attempt: number): number {
   return Math.min(8_000, 500 * 2 ** Math.max(0, attempt - 1));
 }
 
+type ServerSentEvent = {
+  event: string;
+  data: string;
+};
+
+function parseServerSentEvent(block: string): ServerSentEvent | null {
+  let event = "message";
+  const data: string[] = [];
+  for (const line of block.split(/\r?\n/)) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+  }
+  return data.length > 0 ? { event, data: data.join("\n") } : null;
+}
+
 export function subscribeToLiveFlexiblePlanningJob(
   jobId: string,
   onJob: (job: LivePlanningJobSnapshot) => void,
@@ -1431,35 +1454,90 @@ export function subscribeToLiveFlexiblePlanningJob(
 ): () => void {
   let active = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let controller: AbortController | undefined;
   let retryAttempt = 0;
   const terminalStates = new Set<LivePlanningJobState>([
     "succeeded",
     "failed",
     "cancelled",
   ]);
-  const poll = async () => {
+  const scheduleReconnect = () => {
+    if (!active) return;
+    retryAttempt += 1;
+    timer = setTimeout(connect, retryDelayMs(retryAttempt));
+  };
+  const connect = async () => {
+    controller = new AbortController();
     try {
-      const job = await getLiveFlexiblePlanningJob(jobId);
-      if (!active) return;
-      onJob(job);
+      const response = await fetch(
+        `/api/v1/agents/live-flexible-plan-from-text/jobs/${encodeURIComponent(jobId)}/events`,
+        {
+          headers: {
+            Accept: "text/event-stream",
+            ...(apiCredential ? { Authorization: `Bearer ${apiCredential}` } : {}),
+          },
+          signal: controller.signal,
+        },
+      );
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as { detail?: string } | null;
+        throw new ApiError(body?.detail ?? `请求失败 (${response.status})`, response.status);
+      }
+      if (!response.body) throw new ApiError("实时规划进度流不可用");
+
       retryAttempt = 0;
-      if (!terminalStates.has(job.state)) timer = setTimeout(poll, 500);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let terminal = false;
+      while (active && !terminal) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary >= 0) {
+          const parsed = parseServerSentEvent(buffer.slice(0, boundary));
+          buffer = buffer.slice(boundary + 2);
+          boundary = buffer.indexOf("\n\n");
+          if (!parsed || parsed.event === "heartbeat" || parsed.event === "barrier") continue;
+          if (parsed.event === "error") {
+            const payload = JSON.parse(parsed.data) as { detail?: string };
+            onError(payload.detail ?? "实时规划任务已失效", 410);
+            terminal = true;
+            break;
+          }
+          if (parsed.event !== "job" && parsed.event !== "result") continue;
+          let job = JSON.parse(parsed.data) as LivePlanningJobSnapshot;
+          terminal = terminalStates.has(job.state);
+          if (
+            terminal &&
+            parsed.event === "job" &&
+            (!("result" in job) || job.result === null)
+          ) {
+            job = await getLiveFlexiblePlanningJob(jobId);
+          }
+          if (!active) return;
+          onJob(job);
+        }
+      }
+      if (active && !terminal) scheduleReconnect();
     } catch (caught) {
       if (!active) return;
+      if (caught instanceof DOMException && caught.name === "AbortError") return;
       onError(
         caught instanceof Error ? caught.message : "实时规划进度查询中断，请稍后重试",
         caught instanceof ApiError ? caught.status : null,
       );
       const status = caught instanceof ApiError ? caught.status : null;
       if (active && status !== 401 && status !== 404 && status !== 410) {
-        retryAttempt += 1;
-        timer = setTimeout(poll, retryDelayMs(retryAttempt));
+        scheduleReconnect();
       }
     }
   };
-  void poll();
+  void connect();
   return () => {
     active = false;
+    controller?.abort();
     if (timer) clearTimeout(timer);
   };
 }

@@ -333,6 +333,33 @@ async def test_wait_housekeeps_expired_max_attempts_without_a_new_claimer() -> N
 
 
 @pytest.mark.asyncio
+async def test_wait_never_returns_a_nonterminal_snapshot_at_its_deadline() -> None:
+    database = Database("sqlite+aiosqlite://")
+    await database.create_schema()
+    try:
+        store = DurableBrowserTaskStore(database, authority_partition_sha256="9" * 64)
+        submitted = await store.submit_consumer(
+            _submission(),
+            consumer_id="wait-nonterminal",
+            tenant_id="tenant",
+            tenant_partition="user",
+        )
+
+        with pytest.raises(TimeoutError, match="terminal state"):
+            await store.wait_consumer(
+                submitted.consumer_id,
+                tenant_id="tenant",
+                timeout_seconds=0.01,
+            )
+
+        current = await store.get_consumer(submitted.consumer_id, tenant_id="tenant")
+        assert current is not None
+        assert current.acquisition_state == BrowserTaskState.QUEUED
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
 async def test_completion_outbox_rehydrates_after_lease_expiry_and_is_idempotent() -> None:
     database = Database("sqlite+aiosqlite://")
     await database.create_schema()

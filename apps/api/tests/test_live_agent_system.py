@@ -16,6 +16,7 @@ from tripchord.agents.agent_budget import (
     current_agent_budget,
 )
 from tripchord.agents.context import ContextEngine, EvidenceBlackboard
+from tripchord.agents.flexible_live_system import _provider_flight_failure_class
 from tripchord.agents.live_advisory import (
     CandidateCurationProposal,
     EvidenceArbitrationProposal,
@@ -1004,10 +1005,7 @@ def _success_with_tongcheng_one_n_comparison(
             "price_basis_source": "visible_total_label_unverified_party_v1",
             "party_availability_status": "observed_party_context",
             "availability_evidence": "visible_enabled_预订_control_observed_not_clicked",
-            "selection_evidence": (
-                "JD5907+JD455 HGH→MLE；JD456+JD5908 MLE→HGH；"
-                "当前查询可见余5张"
-            ),
+            "selection_evidence": ("JD5907+JD455 HGH→MLE；JD456+JD5908 MLE→HGH；当前查询可见余5张"),
             "combination_id": "stable-jd5907-jd455-jd456-jd5908",
             "outbound_flight_numbers": ["JD5907", "JD455"],
             "return_flight_numbers": ["JD456", "JD5908"],
@@ -1476,12 +1474,14 @@ class _RetryOnceIComProvider:
 async def _run(
     mode: LiveCoverageMode,
     completion: CompletionFactory = _success,
+    *,
+    expected_browser_completions: int = _STANDARD_BROWSER_SOURCE_TASK_COUNT,
 ) -> tuple[LivePackageAgentSystem, BrowserTaskBridge, LivePackageAgentRun]:
     bridge = BrowserTaskBridge(now=lambda: NOW)
     system = LivePackageAgentSystem(bridge, now=lambda: NOW)
     run, _ = await asyncio.gather(
         system.run(intent(), query(), mode=mode, timeout_seconds=15),
-        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT, completion),
+        _serve(bridge, expected_browser_completions, completion),
     )
     return system, bridge, run
 
@@ -1640,35 +1640,34 @@ async def test_fixed_date_run_requeries_only_lodging_scopes_misaligned_with_arri
     )
 
     normalizer = next(
-        result
-        for result in run.scheduler.results
-        if result.task_id == "normalize-browser-quotes"
+        result for result in run.scheduler.results if result.task_id == "normalize-browser-quotes"
     )
     alignment = cast(dict[str, JsonValue], normalizer.output["lodging_window_alignment"])
     assert alignment["state"] == "applied"
     windows = cast(list[dict[str, JsonValue]], alignment["windows"])
-    assert {
-        (window["stay_start"], window["stay_end"])
-        for window in windows
-    } == {("2026-09-04", "2026-09-09")}
+    assert {(window["stay_start"], window["stay_end"]) for window in windows} == {
+        ("2026-09-04", "2026-09-09")
+    }
     assert sum(int(window["replacement_count"]) for window in windows) == 1
     ctrip_full_queries = [
         item_query
         for provider, item_query in observed_lodging_queries
-        if provider == BrowserProvider.CTRIP
-        and item_query.options["segment"] == "full"
+        if provider == BrowserProvider.CTRIP and item_query.options["segment"] == "full"
     ]
     assert [(item.start_date, item.end_date) for item in ctrip_full_queries] == [
         (trip_start, trip_end),
         (date(2026, 9, 4), trip_end),
     ]
-    assert sum(
-        provider == BrowserProvider.QUNAR
-        and item_query.start_date == date(2026, 9, 4)
-        and item_query.end_date == trip_end
-        and item_query.options["segment"] == "full"
-        for provider, item_query in observed_lodging_queries
-    ) == 0
+    assert (
+        sum(
+            provider == BrowserProvider.QUNAR
+            and item_query.start_date == date(2026, 9, 4)
+            and item_query.end_date == trip_end
+            and item_query.options["segment"] == "full"
+            for provider, item_query in observed_lodging_queries
+        )
+        == 0
+    )
 
 
 async def _run_v4(
@@ -1712,8 +1711,9 @@ async def _run_v4_with_icom() -> tuple[
 
 
 @pytest.mark.asyncio
-async def test_natural_language_lodging_change_preserves_transport_and_blocks_unsafe_property(
-) -> None:
+async def test_natural_language_lodging_change_preserves_transport_and_blocks_unsafe_property() -> (
+    None
+):
     system, _, run = await _run_v4_with_icom()
     assert run.package is not None
     current = run.package.final_candidate
@@ -1724,9 +1724,7 @@ async def test_natural_language_lodging_change_preserves_transport_and_blocks_un
             "room_name": "市景豪华间 - 带阳台",
             "location_address": "测试大道 1 号",
             "nearby_location_evidence": ("近潜水与水上活动服务点",),
-            "location_convenience": (
-                LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
-            ),
+            "location_convenience": (LodgingLocationConvenience.CONFIRMED_NOT_REMOTE),
         }
     )
     current = current.model_copy(update={"lodgings": (target_with_location,)})
@@ -1859,9 +1857,7 @@ async def test_lodging_change_refreshes_all_lodging_sources_without_transport_ta
         and lease.query.rooms == target.rooms
         for lease in observed
     )
-    assert all(
-        lease.query.options["segment"] == "hulhumale-full" for lease in observed
-    )
+    assert all(lease.query.options["segment"] == "hulhumale-full" for lease in observed)
     assert receipt.source_task_ids == (
         "modification-source-ctrip-lodging-hulhumale-full",
         "modification-source-qunar-lodging-hulhumale-full",
@@ -1874,8 +1870,7 @@ async def test_lodging_change_refreshes_all_lodging_sources_without_transport_ta
     LivePackageAgentRun.model_validate(updated.model_dump(mode="python"))
 
 
-def test_natural_language_plan_modification_routes_complete_dates_and_fails_closed_on_partial_dates(
-) -> None:
+def test_plan_modification_routes_complete_dates_and_rejects_partial_dates() -> None:
     sea_view = parse_live_plan_modification(
         "酒店换成海景房，航班和接驳保持不变",
         current_departure_date=START,
@@ -2728,15 +2723,15 @@ async def test_publication_failover_seed_is_lineage_party_currency_bound() -> No
 
     repriced_results = tuple(
         result.model_copy(
-                update={
-                    "quote": result.quote.model_copy(
-                        update={
-                                "total_for_party_cents": 9_999_999,
-                            "party_total_known": True,
-                            "price_basis": "total_party",
-                        }
-                    )
-                }
+            update={
+                "quote": result.quote.model_copy(
+                    update={
+                        "total_for_party_cents": 9_999_999,
+                        "party_total_known": True,
+                        "price_basis": "total_party",
+                    }
+                )
+            }
         )
         if isinstance(result.quote, NormalizedFlightQuote)
         and result.quote.provider == BrowserProvider.TONGCHENG.value
@@ -2953,9 +2948,7 @@ async def test_search_supervisor_model_schedule_changes_live_source_dag_waves() 
     assert graph[priority_id].dependencies == ("supervise-source-search",)
     assert graph[priority_wave[1]].dependencies == ("supervise-source-search",)
     assert set(priority_wave) <= set(graph[middle_wave[0]].dependencies)
-    assert "source-ctrip-lodging-hulhumale-full" in graph[
-        middle_wave[0]
-    ].dependencies
+    assert "source-ctrip-lodging-hulhumale-full" in graph[middle_wave[0]].dependencies
     assert set(middle_wave) <= set(graph[final_wave[0]].dependencies)
     assert run.scheduler.max_parallel_tasks == 4
 
@@ -3885,11 +3878,13 @@ async def test_no_candidate_model_chain_seals_exploration_as_human_block() -> No
             purpose=LiveRunPurpose.EXPLORATION_SELECTION,
             timeout_seconds=15,
         ),
-        _serve(bridge, _STANDARD_BROWSER_SOURCE_TASK_COUNT, no_exact_flights),
+        _serve(bridge, 9, no_exact_flights),
     )
 
     assert run.package is None
     assert run.decision.state == PackageDecisionState.HUMAN_BLOCK
+    assert _provider_flight_failure_class(run, BrowserProvider.CTRIP) is None
+    assert _provider_flight_failure_class(run, BrowserProvider.TONGCHENG) is None
     assert run.finalization_state == LiveFinalizationState.EXPLORATION_SEALED
     assert run.exploration_seal_passed
     results = {result.task_id: result for result in run.scheduler.results}
@@ -4448,9 +4443,7 @@ async def test_deterministic_dominance_skips_curator_without_a_failure() -> None
     _, _, run = await _run_v4(LiveCoverageMode.STRICT)
 
     curator = next(
-        stage
-        for stage in run.agentic.stages
-        if stage.task_id == "curate-travel-candidates"
+        stage for stage in run.agentic.stages if stage.task_id == "curate-travel-candidates"
     )
     assert curator.execution_mode == "deterministic_skip"
     assert curator.skip_reason == "deterministic_dominance_skip"
@@ -5728,10 +5721,7 @@ async def test_event_replan_cannot_silently_replace_booked_component() -> None:
 
     assert replanned.decision.state == PackageDecisionState.HUMAN_BLOCK
     if replanned.package is not None:
-        assert (
-            replanned.package.final_decision.state
-            == PackageDecisionState.HUMAN_BLOCK
-        )
+        assert replanned.package.final_decision.state == PackageDecisionState.HUMAN_BLOCK
 
 
 @pytest.mark.asyncio
@@ -5907,9 +5897,7 @@ async def test_thirteen_source_dag_rejects_fragile_v1_and_accepts_split_v2() -> 
             else task.id.rsplit("-", maxsplit=1)[-1]
         )
         assert task_query["destination"] == (
-            "Hulhumalé"
-            if segment in {"first", "last", "hulhumale-full"}
-            else "Maafushi"
+            "Hulhumalé" if segment in {"first", "last", "hulhumale-full"} else "Maafushi"
         )
         assert task_query["destination_code"] is None
         assert options["segment"] == segment
@@ -5919,9 +5907,7 @@ async def test_thirteen_source_dag_rejects_fragile_v1_and_accepts_split_v2() -> 
             else "destination_island"
         )
         assert options["expected_lodging_place_key"] == (
-            "hulhumale"
-            if segment in {"first", "last", "hulhumale-full"}
-            else "maafushi"
+            "hulhumale" if segment in {"first", "last", "hulhumale-full"} else "maafushi"
         )
         source_result = result_by_task[task.id]
         snapshot = cast(dict[str, JsonValue], source_result.output["snapshot"])
@@ -7430,9 +7416,7 @@ def _success_with_ctrip_non_remote_full_stay(
     details = dict(quote.details)
     driver = dict(cast(dict[str, JsonValue], details["driver"]))
     driver["detail_capture"] = {
-        "preview_location_evidence": [
-            "近Sinai Dive Club Maldives · Maafushi Dive & Water Sports."
-        ]
+        "preview_location_evidence": ["近Sinai Dive Club Maldives · Maafushi Dive & Water Sports."]
     }
     details.update(
         {
@@ -7473,9 +7457,7 @@ class _FixtureOfficialLodgingProvider:
             location_fields = {
                 "location_address": "Harbour Road, Maafushi",
                 "nearby_location_evidence": ("Near Dive Centre",),
-                "location_convenience": (
-                    LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
-                ),
+                "location_convenience": (LodgingLocationConvenience.CONFIRMED_NOT_REMOTE),
             }
         quote = NormalizedLodgingQuote(
             id="arena-official:fixture:full",
@@ -7582,9 +7564,7 @@ async def test_exact_lodging_comparison_counts_only_quotes_eligible_for_same_int
     segment = comparison.segments[0]
     assert segment.distinct_exact_quote_provider_count == expected_provider_count
     ctrip = next(item for item in segment.provider_evidence if item.provider == "ctrip")
-    arena = next(
-        item for item in segment.provider_evidence if item.provider == "arena_official"
-    )
+    arena = next(item for item in segment.provider_evidence if item.provider == "arena_official")
     assert ctrip.quote_ids and ctrip.eligible_quote_ids == ctrip.quote_ids
     assert arena.quote_ids
     assert bool(arena.eligible_quote_ids) is official_eligible
@@ -7657,6 +7637,7 @@ async def test_multi_window_official_quote_binding_and_failure_isolation() -> No
             ),
         ),
     )
+
     class WindowedOfficialProvider(_FixtureOfficialLodgingProvider):
         async def search(self, query, request, candidate_set, *, arrival_date):
             if arrival_date == date(2026, 9, 3):
@@ -7665,9 +7646,7 @@ async def test_multi_window_official_quote_binding_and_failure_isolation() -> No
                     "no_inventory",
                     "09-03 fixture window unavailable",
                 )
-            return await super().search(
-                query, request, candidate_set, arrival_date=arrival_date
-            )
+            return await super().search(query, request, candidate_set, arrival_date=arrival_date)
 
     official_provider = WindowedOfficialProvider(eligible_non_remote=True)
     failed_0903: str | None = None
@@ -7725,9 +7704,7 @@ async def test_multi_window_official_quote_binding_and_failure_isolation() -> No
     assert "2026-09-03" in state.official_lodging_window_errors
     assert exact_arena.quote_ids == (official_0904.result.quote.id,)
     assert legacy_arena.quote_ids == (official_0904.result.quote.id,)
-    assert system._official_single_source_matches_candidate(
-        state, request, (ctrip_quote,)
-    )
+    assert system._official_single_source_matches_candidate(state, request, (ctrip_quote,))
     assert exact.distinct_exact_quote_provider_count == 2
     assert legacy.distinct_exact_quote_provider_count == 2
 
@@ -7868,9 +7845,7 @@ async def test_tongcheng_source_adds_one_adult_proof_and_ranks_derived_party_tot
     assert tongcheng_outcome.state == FlightSearchOutcomeState.QUOTE_FOUND
     assert tongcheng_outcome.quote_ids == (tongcheng.id,)
     source_result = next(
-        result
-        for result in run.scheduler.results
-        if result.task_id == "source-tongcheng-flight"
+        result for result in run.scheduler.results if result.task_id == "source-tongcheng-flight"
     )
     validation = source_result.output["party_price_validation_snapshot"]
     assert isinstance(validation, dict)
@@ -8056,9 +8031,7 @@ async def test_failed_sealed_receipts_derive_comparison_only_party_total() -> No
     )
     requested = BrowserTaskSnapshot.model_validate(source_result.output["snapshot"])
     assert requested.failure is not None
-    requested_raw = json.loads(
-        json.dumps(requested.failure.details["flight_search_receipt"])
-    )
+    requested_raw = json.loads(json.dumps(requested.failure.details["flight_search_receipt"]))
     candidate = requested_raw["candidate_summaries"][0]
     candidate.update(
         {
@@ -8164,12 +8137,15 @@ async def test_failed_sealed_receipts_derive_comparison_only_party_total() -> No
             "5200",
             price_evidence=explicit_label,
         )
-        assert len(
-            system._derive_sealed_receipt_party_comparisons(
-                labelled_requested,
-                labelled_one_adult,
+        assert (
+            len(
+                system._derive_sealed_receipt_party_comparisons(
+                    labelled_requested,
+                    labelled_one_adult,
+                )
             )
-        ) == 1
+            == 1
+        )
 
     plain_total_requested = sealed_snapshot(
         requested,
@@ -8188,12 +8164,69 @@ async def test_failed_sealed_receipts_derive_comparison_only_party_total() -> No
         plain_total_one_adult,
     )
 
+    # Real Qunar cards show the same tax-inclusive display amount for an exact
+    # 1-adult and 2-adult search, with all round-trip flight numbers and whole-
+    # journey timestamps but without expanding the connection segments.  That
+    # proves the comparison arithmetic, not party inventory or a settlement
+    # price, so it may feed only the decision-only package path.
+    def qunar_snapshot(adults: int) -> BrowserTaskSnapshot:
+        raw = json.loads(json.dumps(requested_raw))
+        raw["provider"] = BrowserProvider.QUNAR.value
+        raw["page_url"] = (
+            "https://flight.qunar.com/site/oneway_list.htm?"
+            f"searchDepartureAirport=HGH&searchArrivalAirport=MLE&"
+            f"searchDepartureTime={START.isoformat()}&"
+            f"searchReturnTime={END.isoformat()}&adultNum={adults}"
+        )
+        raw["confirmed_query"]["adults"] = adults
+        raw_candidate = raw["candidate_summaries"][0]
+        raw_candidate.update(
+            {
+                "title": "MU6550 MU235 / MU236 MU6549",
+                "amount": "5328",
+                "currency": "CNY",
+                "price_evidence": "含税总价 CNY 5328",
+                "price_basis": "total_party",
+                "price_classification": "comparison_only",
+                "outbound_flight_numbers": ["MU6550", "MU235"],
+                "return_flight_numbers": ["MU236", "MU6549"],
+                "origin_airport_code": "HGH",
+                "destination_airport_code": "MLE",
+                "outbound_segments": [],
+                "return_segments": [],
+            }
+        )
+        details = {
+            **requested.failure.details,
+            "flight_search_receipt": raw,
+            "flight_search_receipt_sha256": flight_search_receipt_sha256(raw),
+        }
+        return requested.model_copy(
+            update={
+                "id": f"browser-task-qunar-{adults}",
+                "provider": BrowserProvider.QUNAR,
+                "query": requested.query.model_copy(update={"adults": adults}),
+                "failure": requested.failure.model_copy(update={"details": details}),
+            }
+        )
+
+    qunar_requested = qunar_snapshot(2)
+    qunar_one_adult = qunar_snapshot(1)
+    qunar_receipts = system._derive_sealed_receipt_party_comparisons(
+        qunar_requested,
+        qunar_one_adult,
+    )
+    assert len(qunar_receipts) == 1
+    assert qunar_receipts[0].price_basis == "per_person"
+    assert qunar_receipts[0].total_for_party_cents == 1_065_600
+    assert qunar_receipts[0].comparison_only
+    assert not qunar_receipts[0].one_adult.available_for_requested_adults
+    assert not qunar_receipts[0].requested_party.available_for_requested_adults
+
     dynamic = sealed_snapshot(requested, 1, "5199")
     assert not system._derive_sealed_receipt_party_comparisons(requested, dynamic)
 
-    ambiguous_raw = json.loads(
-        json.dumps(requested.failure.details["flight_search_receipt"])
-    )
+    ambiguous_raw = json.loads(json.dumps(requested.failure.details["flight_search_receipt"]))
     ambiguous_raw["candidate_summaries"][0]["price_evidence"] = "含税总价 CNY 5200"
     ambiguous_raw["candidate_summaries"][0]["price_basis"] = "total_party"
 
@@ -8311,17 +8344,260 @@ async def test_all_non_exact_flight_outcomes_cannot_pass_or_plan() -> None:
             ),
         )
 
-    _, _, run = await _run(LiveCoverageMode.STRICT, no_exact)
+    _, _, run = await _run(
+        LiveCoverageMode.STRICT,
+        no_exact,
+        expected_browser_completions=9,
+    )
 
-    assert run.all_platforms_complete
+    assert not run.all_platforms_complete
     assert not run.inventory.flights
     assert run.package is None
     assert run.decision.state == PackageDecisionState.HUMAN_BLOCK
+    assert (
+        sum(
+            result.output.get("external_tool_called") is False
+            for result in run.scheduler.results
+            if "lodging" in result.task_id
+        )
+        >= 2
+    )
     assert not _check_v4_flight_search_outcomes(
         run,
         now=NOW,
         maximum_quote_age=timedelta(minutes=15),
     ).passed
+
+
+@pytest.mark.asyncio
+async def test_bulk_exploration_does_not_open_lodging_without_usable_flight() -> None:
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+    claimed_kinds: list[BrowserVertical] = []
+
+    def no_exact(lease: BrowserTaskLease) -> BrowserTaskCompletion:
+        claimed_kinds.append(lease.kind)
+        assert lease.kind == BrowserVertical.FLIGHT
+        return _flight_search_receipt_completion(
+            lease,
+            state=(
+                "comparison_price_only"
+                if lease.provider != BrowserProvider.TONGCHENG
+                else "bounded_no_exact_quote"
+            ),
+        )
+
+    run, _ = await asyncio.gather(
+        system.run(
+            intent(),
+            query(),
+            mode=LiveCoverageMode.STRICT,
+            purpose=LiveRunPurpose.EXPLORATION_SELECTION,
+            model_agents_enabled=False,
+            timeout_seconds=15,
+        ),
+        _serve(bridge, 3, no_exact),
+    )
+
+    assert claimed_kinds == [BrowserVertical.FLIGHT] * 3
+    assert not run.inventory.flights
+    assert run.package is None
+    assert run.decision.state == PackageDecisionState.HUMAN_BLOCK
+    assert all(
+        result.output.get("external_tool_called") is False
+        for result in run.scheduler.results
+        if "lodging" in result.task_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_bulk_provider_failure_circuit_settles_without_browser() -> None:
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+    suppressed_query = query().model_copy(
+        update={
+            "options": {
+                **query().options,
+                "__tripchord_skip_flight_providers": [
+                    provider.value for provider in LIVE_V5_BROWSER_PROVIDERS
+                ],
+            }
+        }
+    )
+
+    run = await system.run(
+        intent(),
+        suppressed_query,
+        mode=LiveCoverageMode.DEGRADED,
+        purpose=LiveRunPurpose.EXPLORATION_SELECTION,
+        model_agents_enabled=False,
+        timeout_seconds=15,
+    )
+
+    source_results = {
+        result.task_id: result
+        for result in run.scheduler.results
+        if result.task_id in run.source_task_ids
+    }
+    assert set(source_results) == set(run.source_task_ids)
+    assert all(
+        result.output.get("external_tool_called") is False for result in source_results.values()
+    )
+    assert run.package is None
+    assert run.decision.state == PackageDecisionState.HUMAN_BLOCK
+
+
+@pytest.mark.asyncio
+async def test_unusable_flight_prices_stop_remaining_lodging_work() -> None:
+    def unusable_flights(lease: BrowserTaskLease) -> BrowserTaskCompletion:
+        if lease.kind == BrowserVertical.FLIGHT:
+            return _success_with_unusable_flight_price(lease)
+        return _success(lease)
+
+    _, _, run = await _run(
+        LiveCoverageMode.STRICT,
+        unusable_flights,
+        expected_browser_completions=7,
+    )
+
+    assert not run.inventory.flights
+    assert run.package is None
+    assert run.decision.state == PackageDecisionState.HUMAN_BLOCK
+    assert (
+        sum(
+            result.output.get("external_tool_called") is False
+            for result in run.scheduler.results
+            if "lodging" in result.task_id
+        )
+        >= 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_lodging_waits_for_inflight_party_price_validation() -> None:
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+
+    def complete(lease: BrowserTaskLease) -> BrowserTaskCompletion:
+        if lease.kind != BrowserVertical.FLIGHT:
+            return _success(lease)
+        if lease.provider == BrowserProvider.TONGCHENG:
+            return _success_with_tongcheng_one_n_comparison(lease)
+        return _flight_search_receipt_completion(
+            lease,
+            state="bounded_no_exact_quote",
+        )
+
+    async def serve_with_delayed_validation() -> None:
+        claimed = 0
+        pending: list[asyncio.Task[None]] = []
+        deadline = asyncio.get_running_loop().time() + 5
+
+        async def finish_later(lease: BrowserTaskLease) -> None:
+            await asyncio.sleep(0.05)
+            await bridge.complete(
+                lease.task_id,
+                lease.claim_token,
+                complete(lease),
+            )
+
+        while claimed < _STANDARD_BROWSER_SOURCE_TASK_COUNT + 1:
+            leases = await bridge.claim("paired-test-companion", limit=6)
+            if not leases:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise AssertionError(
+                        "companion timed out before delayed party validation was claimed"
+                    )
+                await asyncio.sleep(0)
+                continue
+            for lease in leases:
+                claimed += 1
+                if (
+                    lease.kind == BrowserVertical.FLIGHT
+                    and lease.provider == BrowserProvider.TONGCHENG
+                    and lease.query.adults == 1
+                ):
+                    pending.append(asyncio.create_task(finish_later(lease)))
+                else:
+                    await bridge.complete(
+                        lease.task_id,
+                        lease.claim_token,
+                        complete(lease),
+                    )
+        await asyncio.gather(*pending)
+
+    run, _ = await asyncio.gather(
+        system.run(
+            intent(),
+            query(),
+            mode=LiveCoverageMode.STRICT,
+            timeout_seconds=15,
+        ),
+        serve_with_delayed_validation(),
+    )
+
+    assert any(
+        flight.provider == BrowserProvider.TONGCHENG.value
+        and flight.has_publishable_execution_contract
+        for flight in run.inventory.flights
+    )
+    assert not any(
+        result.output.get("external_tool_called") is False
+        for result in run.scheduler.results
+        if "lodging" in result.task_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_optional_candidate_curator_is_not_called_without_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRIPCHORD_FORMAL_MODEL_ROLE", "candidate_curator")
+    model = ScriptedModelClient((), model="must-not-be-called")
+    router = ModelRouter(
+        {role: model for role in AgentRole},
+        high_risk_client=model,
+    )
+    bridge = BrowserTaskBridge(now=lambda: NOW)
+    system = LivePackageAgentSystem(
+        bridge,
+        now=lambda: NOW,
+        model_router=router,
+        model_agents_required=False,
+    )
+
+    def no_exact(lease: BrowserTaskLease) -> BrowserTaskCompletion:
+        if lease.kind != BrowserVertical.FLIGHT:
+            return _success(lease)
+        return _flight_search_receipt_completion(
+            lease,
+            state=(
+                "comparison_price_only"
+                if lease.provider != BrowserProvider.TONGCHENG
+                else "bounded_no_exact_quote"
+            ),
+        )
+
+    run, _ = await asyncio.gather(
+        system.run(
+            intent(),
+            query(),
+            mode=LiveCoverageMode.STRICT,
+            timeout_seconds=15,
+        ),
+        _serve(bridge, 9, no_exact),
+    )
+
+    assert run.package is None
+    assert run.decision.state == PackageDecisionState.HUMAN_BLOCK
+    assert model.requests == []
+    curator = next(
+        result for result in run.scheduler.results if result.task_id == "curate-travel-candidates"
+    )
+    assert curator.output["candidate_curation_mode"] == "no_candidate_model_skip"
+    trace = cast(dict[str, JsonValue], curator.output["agentic_trace"])
+    assert trace["model_called"] is False
+    assert trace["skip_reason"] == "no_candidate_model_skip"
 
 
 @pytest.mark.asyncio
@@ -8823,17 +9099,13 @@ async def test_strict_single_lodging_quote_publishes_with_explicit_single_source
     if non_quote_state == "bounded_provider_pending":
         assert len(run.provider_vertical_circuit_receipts) == 2
         circuits = {
-            cast(str, item["scope"]): item
-            for item in run.provider_vertical_circuit_receipts
+            cast(str, item["scope"]): item for item in run.provider_vertical_circuit_receipts
         }
         assert set(circuits) == {
             "qunar:lodging:maafushi",
             "qunar:lodging:hulhumale",
         }
-        assert {
-            cast(str, item["trigger_source_task_id"])
-            for item in circuits.values()
-        } == {
+        assert {cast(str, item["trigger_source_task_id"]) for item in circuits.values()} == {
             "source-qunar-lodging-full",
             "source-qunar-lodging-hulhumale-full",
         }
@@ -8854,8 +9126,7 @@ async def test_strict_single_lodging_quote_publishes_with_explicit_single_source
         )
         assert len(suppressed) == 3
         assert all(
-            item.output.get("terminal_semantics")
-            == "not_attempted_due_same_run_lodging_circuit"
+            item.output.get("terminal_semantics") == "not_attempted_due_same_run_lodging_circuit"
             and item.output.get("external_tool_called") is False
             and item.output.get("inventory_claim") == "unknown_not_queried"
             for item in suppressed
@@ -8875,9 +9146,7 @@ async def test_strict_single_lodging_quote_publishes_with_explicit_single_source
             for item in run.scheduler.results
             if item.task_id == circuit["trigger_source_task_id"]
         )
-        trigger_snapshot = BrowserTaskSnapshot.model_validate(
-            trigger_stage.output["snapshot"]
-        )
+        trigger_snapshot = BrowserTaskSnapshot.model_validate(trigger_stage.output["snapshot"])
         assert (
             LivePackageAgentSystem._provider_vertical_circuit_reason(trigger_snapshot)
             == "login_required"
@@ -8912,15 +9181,10 @@ async def test_strict_single_lodging_quote_publishes_with_explicit_single_source
             "source-qunar-lodging-middle",
             "source-qunar-lodging-last",
         }
-        suppressed = tuple(
-            item
-            for item in sibling_results
-            if item.task_id in follower_ids
-        )
+        suppressed = tuple(item for item in sibling_results if item.task_id in follower_ids)
         assert len(suppressed) == 3
         assert all(
-            item.output.get("terminal_semantics")
-            == "not_attempted_due_same_run_lodging_circuit"
+            item.output.get("terminal_semantics") == "not_attempted_due_same_run_lodging_circuit"
             and item.output.get("external_tool_called") is False
             and item.output.get("inventory_claim") == "unknown_not_queried"
             for item in suppressed
@@ -8945,9 +9209,7 @@ async def test_strict_single_lodging_quote_publishes_with_explicit_single_source
         }
         for item in run.scheduler.results:
             if item.task_id in unaffected_browser_ids:
-                assert cast(dict[str, JsonValue], item.output["snapshot"])["state"] == (
-                    "succeeded"
-                )
+                assert cast(dict[str, JsonValue], item.output["snapshot"])["state"] == ("succeeded")
         icom_results = tuple(
             item
             for item in run.scheduler.results
@@ -9053,9 +9315,7 @@ async def test_destination_pending_circuit_preserves_hulhumale_two_source_compar
     assert circuit["circuit_scope_type"] == "exact_place_cohort"
     assert circuit["trigger_reason"] == "bounded_provider_pending"
     middle_stage = next(
-        item
-        for item in run.scheduler.results
-        if item.task_id == "source-qunar-lodging-middle"
+        item for item in run.scheduler.results if item.task_id == "source-qunar-lodging-middle"
     )
     assert middle_stage.output["terminal_semantics"] == (
         "not_attempted_due_same_run_lodging_circuit"
@@ -9164,6 +9424,5 @@ async def test_source_executor_suppresses_tombstoned_scope_without_external_call
     assert called == []
     # The suppressed attempt must not produce a usable quote source in coverage.
     assert not any(
-        "source-ctrip-flight" in item.usable_quote_source_ids
-        for item in system._coverage(state)
+        "source-ctrip-flight" in item.usable_quote_source_ids for item in system._coverage(state)
     )

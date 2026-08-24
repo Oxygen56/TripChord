@@ -182,6 +182,26 @@ async def _available_option() -> IComTransferOption:
 
 
 @pytest.mark.asyncio
+async def test_identical_public_reads_are_shared_across_route_queries() -> None:
+    requests: list[httpx.Request] = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler(requests=requests))
+    ) as client:
+        provider = IComTransferProvider(client=client)
+        await provider.search(_query())
+        await provider.search(
+            IComTransferQuery(
+                travel_date=TRAVEL_DATE,
+                origin=IComLocation.MAAFUSHI,
+                destination=IComLocation.AIRPORT,
+                adults=2,
+            )
+        )
+
+    assert len(requests) == 3
+
+
+@pytest.mark.asyncio
 async def test_success_normalizes_official_public_transfer_with_field_evidence() -> None:
     requests: list[httpx.Request] = []
     async with httpx.AsyncClient(
@@ -281,7 +301,7 @@ async def test_formal_recording_is_observational_outside_active_challenge() -> N
         after = await provider.search(_query(), query_task_id="ordinary-task")
 
     assert before.options and after.options
-    assert len(requests) == 6
+    assert len(requests) == 3
     assert authority.calls == 0
 
 
@@ -346,6 +366,34 @@ async def test_insufficient_remaining_capacity_is_not_eligible_for_party() -> No
     assert option.availability_status == IComAvailabilityStatus.INSUFFICIENT_REMAINING
     assert option.eligible_for_party is False
     assert to_package_transfer_option(option, adults=2) is None
+
+
+@pytest.mark.asyncio
+async def test_unrelated_inconsistent_capacity_does_not_poison_requested_route() -> None:
+    schedules = _schedule_payload()
+    unrelated = schedules["data"][1]  # type: ignore[index]
+    unrelated["remainingCapacity"] = 47  # type: ignore[index]
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler(schedules=schedules))
+    ) as client:
+        result = await IComTransferProvider(client=client).search(_query())
+
+    assert [option.trip_id for option in result.options] == [3445]
+
+
+@pytest.mark.asyncio
+async def test_inconsistent_capacity_on_requested_route_is_excluded() -> None:
+    schedules = _schedule_payload()
+    requested = schedules["data"][0]  # type: ignore[index]
+    requested["remainingCapacity"] = 47  # type: ignore[index]
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler(schedules=schedules))
+    ) as client:
+        result = await IComTransferProvider(client=client).search(_query())
+
+    assert result.options == ()
 
 
 @pytest.mark.asyncio
@@ -590,9 +638,7 @@ async def test_icom_usd_base_fare_gets_bounded_ecb_cny_reference_estimate() -> N
     </gesmes:Envelope>"""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == (
-            "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
-        )
+        assert str(request.url) == ("https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml")
         return httpx.Response(200, content=payload, request=request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:

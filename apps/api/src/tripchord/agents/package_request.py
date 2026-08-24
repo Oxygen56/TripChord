@@ -505,12 +505,14 @@ class HybridPackageRequirementAgent:
         model_client: ModelClient | None = None,
         model_router: ModelRouter | None = None,
         now: Callable[[], datetime] | None = None,
+        skip_model_when_deterministic_ready: bool = False,
     ) -> None:
         if model_client is not None and model_router is not None:
             raise ValueError("provide either model_client or model_router, not both")
         self._model_client = model_client
         self._model_router = model_router
         self._now = now or (lambda: datetime.now(UTC))
+        self._skip_model_when_deterministic_ready = skip_model_when_deterministic_ready
 
     async def parse(
         self,
@@ -539,7 +541,17 @@ class HybridPackageRequirementAgent:
         proposal: ModelPackageRequirementProposal | None = None
         model_response: ModelResponse | None = None
         model_error: str | None = None
-        if self._model_client is not None or self._model_router is not None:
+        deterministic_ready = (
+            _CRITICAL_FIELDS.issubset(draft.values)
+            and not draft.conflicts
+            and not any(item.critical for item in draft.unresolved)
+        )
+        should_call_model = (
+            self._model_client is not None or self._model_router is not None
+        ) and not (
+            self._skip_model_when_deterministic_ready and deterministic_ready
+        )
+        if should_call_model:
             budget = current_agent_budget()
             try:
                 if budget is not None:
@@ -624,9 +636,9 @@ class HybridPackageRequirementAgent:
         self._normalize_destination_scope(draft)
         self._resolve_location_codes(draft)
         self._extract_dates(text, request.reference_date, draft)
-        self._validate_departure_recency(draft, request.reference_date)
         self._extract_duration(text, draft)
         self._apply_return_boundary(draft)
+        self._validate_departure_recency(draft, request.reference_date)
         self._extract_party(text, draft)
         if request.children_ages:
             self._set_fact(
@@ -1023,6 +1035,23 @@ class HybridPackageRequirementAgent:
             )
             return
         if parsed_dates:
+            for match in _FULL_DATE_PATTERN.finditer(text):
+                date_end = match.start() + len(match.group(0).rstrip())
+                suffix = text[date_end : date_end + 24]
+                if re.match(r"[ \t]*(?:以后|之后)[ \t]*(?:可以|可)?[ \t]*出发", suffix):
+                    lower_bound = date(
+                        int(match.group("year")),
+                        int(match.group("month")),
+                        int(match.group("day")),
+                    )
+                    self._set_fact(
+                        draft,
+                        "earliest_departure",
+                        lower_bound,
+                        RequirementFactSource.EXPLICIT_TEXT,
+                        text[match.start() : date_end + len(suffix)].strip(),
+                    )
+                    return
             contextual_departures: list[tuple[date, str]] = []
             for match in _FULL_DATE_PATTERN.finditer(text):
                 date_end = match.start() + len(match.group(0).rstrip())
@@ -1572,6 +1601,8 @@ class HybridPackageRequirementAgent:
 
     def _apply_return_boundary(self, draft: _Draft) -> None:
         latest_return = draft.latest_return_date
+        if latest_return is None and "latest_departure" not in draft.values:
+            latest_return = draft.latest_arrival_date
         earliest = draft.values.get("earliest_departure")
         minimum = draft.values.get("min_nights")
         if not isinstance(latest_return, date) or not isinstance(earliest, date):
@@ -1902,7 +1933,7 @@ class HybridPackageRequirementAgent:
                 captured_at=captured_at,
             )
         if match := re.search(
-            r"(?:酒店|住宿)(?:不能(?:太)?|不可(?:太)?)简陋|可稍有品质|(?:酒店|住宿)品质",
+            r"(?:酒店|住宿)(?:不能(?:太)?|不可(?:太)?|不要)简陋|可稍有品质|(?:酒店|住宿)品质",
             text,
         ):
             draft.preferences["lodging_quality"] = self._preference_rule(
@@ -1915,7 +1946,7 @@ class HybridPackageRequirementAgent:
             )
         if match := re.search(
             r"(?:酒店|住宿|地址|位置)[^，。；;\n]{0,12}"
-            r"(?:不能(?:太)?|不可(?:太)?)[^，。；;\n]{0,8}(?:偏僻|偏)|"
+            r"(?:不能(?:太)?|不可(?:太)?|不要)[^，。；;\n]{0,8}(?:偏僻|偏)|"
             r"交通便利|位置方便",
             text,
         ):
@@ -1927,7 +1958,11 @@ class HybridPackageRequirementAgent:
                 reason=match.group(0),
                 captured_at=captured_at,
             )
-        if match := re.search(r"价格不能过高|价格不宜过高|价格合理|价格适中|不能太贵", text):
+        if match := re.search(
+            r"价格不能过高|价格不宜过高|价格合理|价格适中|不能太贵|"
+            r"兼顾[^，。；;\n]{0,8}价格",
+            text,
+        ):
             draft.preferences["lodging_price"] = self._preference_rule(
                 key="lodging_price",
                 mode=PreferenceMode.WEIGHTED,

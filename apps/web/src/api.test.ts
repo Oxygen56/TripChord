@@ -23,6 +23,7 @@ import {
   startLiveFlexiblePlanningFromTextJob,
   startLiveMonitor,
   stopLiveMonitor,
+  subscribeToLiveFlexiblePlanningJob,
   summarizeLiveProviderCoverage,
   type AgenticRunSummary,
   type LiveFlexibleFromTextResponse,
@@ -33,6 +34,50 @@ import {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("live planning progress stream", () => {
+  it("does not publish an old terminal refetch after unsubscribe", async () => {
+    let finishRefetch: ((response: Response) => void) | undefined;
+    const refetch = new Promise<Response>((resolve) => {
+      finishRefetch = resolve;
+    });
+    const reader = {
+      read: vi.fn().mockResolvedValueOnce({
+        done: false,
+        value: new TextEncoder().encode(
+          'event: job\ndata: {"state":"failed"}\n\n',
+        ),
+      }),
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        body: { getReader: () => reader },
+      })
+      .mockImplementationOnce(() => refetch);
+    vi.stubGlobal("fetch", fetchMock);
+    const onJob = vi.fn();
+
+    const unsubscribe = subscribeToLiveFlexiblePlanningJob(
+      "old-job",
+      onJob,
+      vi.fn(),
+    );
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    unsubscribe();
+    finishRefetch!(
+      new Response(JSON.stringify({ state: "failed", result: null }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(onJob).not.toHaveBeenCalled();
+  });
 });
 
 function makeAgenticSummary({

@@ -278,9 +278,7 @@ def _two_candidate_live_run(
             "provider": "kaani_official",
             "currency": "USD",
             "total_for_party_cents": 54_650,
-            "evidence_refs": (
-                "https://kaanihotels.com/stays/Beach-Hotel/book",
-            ),
+            "evidence_refs": ("https://kaanihotels.com/stays/Beach-Hotel/book",),
             "reference_total_cents": 367_279,
             "reference_currency": "CNY",
             "reference_rate_source": "European Central Bank",
@@ -315,7 +313,9 @@ def _two_candidate_live_run(
             captured_at=captured_at,
             expires_at=captured_at + timedelta(minutes=10),
             availability=QuoteAvailability.AVAILABLE,
-            evidence_refs=("https://sfs-api.icomtours.com/api/v1/public/ferry-fares/schedule-base-price",),
+            evidence_refs=(
+                "https://sfs-api.icomtours.com/api/v1/public/ferry-fares/schedule-base-price",
+            ),
             origin_area=origin_area,
             destination_area=destination_area,
             origin_place_key=origin_place_key,
@@ -392,19 +392,21 @@ def _two_candidate_live_run(
         intent=intent,
         mode=mode,
         stay_plan_candidate_set=stay_plan_set,
-        inventory=PackageInventory(
-            flights=(flight,), lodgings=(ctrip, kaani), transfers=transfers
-        ),
+        inventory=PackageInventory(flights=(flight,), lodgings=(ctrip, kaani), transfers=transfers),
         stay_plan_inventory_outcomes=(ctrip_outcome,),
         kaani_lodging_results=(kaani_result,),
         normalization_results=(
             NormalizedBrowserQuoteResult(
-                provider="qunar", kind=BrowserVertical.FLIGHT,
-                status=QuoteNormalizationStatus.USABLE, quote=flight,
+                provider="qunar",
+                kind=BrowserVertical.FLIGHT,
+                status=QuoteNormalizationStatus.USABLE,
+                quote=flight,
             ),
             NormalizedBrowserQuoteResult(
-                provider="ctrip", kind=BrowserVertical.LODGING,
-                status=QuoteNormalizationStatus.USABLE, quote=ctrip,
+                provider="ctrip",
+                kind=BrowserVertical.LODGING,
+                status=QuoteNormalizationStatus.USABLE,
+                quote=ctrip,
             ),
             kaani_result,
         ),
@@ -451,12 +453,68 @@ def _two_candidate_live_run(
             "selected_stay_plan_id": StayPlanId.MAAFUSHI_ICOM,
             "decision_only_candidate": ctrip_decision,
             "decision_only_candidate_set": candidate_set,
-            "icom_cny_reference_estimate": (
-                estimate if ctrip_decision is not None else None
-            ),
+            "icom_cny_reference_estimate": (estimate if ctrip_decision is not None else None),
         }
     )
     return LivePackageAgentRun.model_validate(payload)
+
+
+def test_decision_only_set_compares_lodgings_within_one_flight() -> None:
+    intent = PackageIntent(
+        trip_id="decision-only-multi-flight",
+        origin="杭州",
+        destination="马累",
+        start_date=date(2026, 9, 3),
+        end_date=date(2026, 9, 9),
+        adults=2,
+        rooms=1,
+    )
+    query = BrowserSearchQuery(
+        origin="杭州",
+        destination="马累",
+        start_date=intent.start_date,
+        end_date=intent.end_date,
+        adults=2,
+        rooms=1,
+        origin_code="HGH",
+        destination_code="MLE",
+    )
+    base = _two_candidate_live_run(intent, query, LiveCoverageMode.DEGRADED)
+    first_flight = base.inventory.flights[0]
+    second_flight = first_flight.model_copy(
+        update={
+            "id": "flight-qunar-second-itinerary",
+            "total_for_party_cents": first_flight.total_for_party_cents + 10_000,
+            "display_amount_cents": first_flight.display_amount_cents + 10_000,
+        }
+    )
+    state = _RunState(
+        source_task_ids=base.source_task_ids,
+        intent=intent,
+        mode=LiveCoverageMode.DEGRADED,
+        inventory=base.inventory.model_copy(update={"flights": (first_flight, second_flight)}),
+        normalization_results=(
+            NormalizedBrowserQuoteResult(
+                provider="qunar",
+                kind=BrowserVertical.FLIGHT,
+                status=QuoteNormalizationStatus.USABLE,
+                quote=first_flight,
+            ),
+            NormalizedBrowserQuoteResult(
+                provider="qunar",
+                kind=BrowserVertical.FLIGHT,
+                status=QuoteNormalizationStatus.USABLE,
+                quote=second_flight,
+            ),
+        ),
+    )
+
+    candidate_set = LivePackageAgentSystem(bridge=None)._build_decision_only_candidate_set(  # type: ignore[arg-type]
+        state
+    )
+
+    assert candidate_set is not None
+    assert {item.candidate.flight.id for item in candidate_set.candidates} == {first_flight.id}
 
 
 class _TwoCandidatePairRunner(_RecordingPairRunner):
@@ -540,21 +598,20 @@ async def test_http_endpoint_projects_and_ranks_two_complete_decision_candidates
         "ctrip",
         "kaani_official",
     }
-    assert {
-        tuple(item["lodging_dates"])
-        for item in candidates
-    } == {("2026-09-04", "2026-09-09")}
+    assert {tuple(item["lodging_dates"]) for item in candidates} == {("2026-09-04", "2026-09-09")}
     by_provider = {item["lodging_provider"]: item for item in candidates}
     assert by_provider["ctrip"]["selected"] is True
     assert by_provider["kaani_official"]["selected"] is False
     assert by_provider["ctrip"]["estimated_total_cny_cents"] == 1_187_147
     assert by_provider["kaani_official"]["estimated_total_cny_cents"] == 1_293_926
-    assert by_provider["ctrip"]["flight_component_id"] == by_provider["kaani_official"][
-        "flight_component_id"
-    ]
-    assert by_provider["ctrip"]["transfer_component_ids"] == by_provider["kaani_official"][
-        "transfer_component_ids"
-    ]
+    assert (
+        by_provider["ctrip"]["flight_component_id"]
+        == by_provider["kaani_official"]["flight_component_id"]
+    )
+    assert (
+        by_provider["ctrip"]["transfer_component_ids"]
+        == by_provider["kaani_official"]["transfer_component_ids"]
+    )
     assert by_provider["ctrip"]["is_all_in"] is False
     assert by_provider["kaani_official"]["is_all_in"] is False
     assert by_provider["kaani_official"]["foreign_lodging_currency"] == "USD"
@@ -580,14 +637,11 @@ async def test_http_endpoint_projects_and_ranks_two_complete_decision_candidates
     pair_run = body["run"]["pair_runs"][0]["run"]
     assert {
         item["provider"]
-        for item in pair_run["exact_quote_comparison_coverage"]["segments"][0][
-            "provider_evidence"
-        ]
+        for item in pair_run["exact_quote_comparison_coverage"]["segments"][0]["provider_evidence"]
     } >= {"ctrip", "kaani_official"}
 
     return_departure_text = (
-        "2026年9月3日从杭州出发去马尔代夫，回程最晚在2026年9月9日，"
-        "2名成人，1间房。"
+        "2026年9月3日从杭州出发去马尔代夫，回程最晚在2026年9月9日，2名成人，1间房。"
     )
     async with AsyncClient(
         transport=ASGITransport(app=app, client=("127.0.0.1", 51352)),
@@ -605,9 +659,9 @@ async def test_http_endpoint_projects_and_ranks_two_complete_decision_candidates
     assert return_pair["departure_date"] == "2026-09-03"
     assert return_pair["return_date"] == "2026-09-09"
     assert return_pair["night_count"] == 6
-    assert return_departure["best_available_plan"]["flight"][
-        "return_arrive_at"
-    ].startswith("2026-09-10")
+    assert return_departure["best_available_plan"]["flight"]["return_arrive_at"].startswith(
+        "2026-09-10"
+    )
 
     arrival_boundary_text = (
         "2026年9月3日从杭州出发去马尔代夫，2026年9月9日返程，"
@@ -664,13 +718,10 @@ async def test_http_endpoint_does_not_rank_foreign_candidate_without_ecb_evidenc
     date_pair = body["run"]["pair_runs"][0]["date_pair"]
     assert date_pair["departure_date"] == "2026-09-03"
     assert date_pair["return_date"] == "2026-09-09"
-    candidates = {
-        item["lodging_provider"]: item for item in body["decision_candidates"]
+    candidates = {item["lodging_provider"]: item for item in body["decision_candidates"]}
+    assert {tuple(item["lodging_dates"]) for item in candidates.values()} == {
+        ("2026-09-04", "2026-09-09")
     }
-    assert {
-        tuple(item["lodging_dates"])
-        for item in candidates.values()
-    } == {("2026-09-04", "2026-09-09")}
     assert candidates["ctrip"]["selected"] is True
     assert candidates["ctrip"]["estimated_total_cny_cents"] == 1_187_147
     assert candidates["kaani_official"]["selected"] is False
@@ -683,21 +734,15 @@ async def test_http_endpoint_does_not_rank_foreign_candidate_without_ecb_evidenc
     assert body["best_available_plan"]["lodgings"][0]["provider"] == "ctrip"
     assert body["best_available_plan"]["departure_date"] == "2026-09-03"
     assert body["best_available_plan"]["return_date"] == "2026-09-09"
-    assert body["best_available_plan"]["flight"]["outbound_depart_at"].startswith(
-        "2026-09-03"
-    )
-    assert body["best_available_plan"]["flight"]["return_depart_at"].startswith(
-        "2026-09-09"
-    )
+    assert body["best_available_plan"]["flight"]["outbound_depart_at"].startswith("2026-09-03")
+    assert body["best_available_plan"]["flight"]["return_depart_at"].startswith("2026-09-09")
     assert body["best_available_plan"]["lodgings"][0]["check_in"] == "2026-09-04"
     assert body["best_available_plan"]["lodgings"][0]["check_out"] == "2026-09-09"
     assert body["best_available_plan"]["estimated_total_cny_cents"] == 1_187_147
     pair_run = body["run"]["pair_runs"][0]["run"]
     kaani_evidence = next(
         item
-        for item in pair_run["exact_quote_comparison_coverage"]["segments"][0][
-            "provider_evidence"
-        ]
+        for item in pair_run["exact_quote_comparison_coverage"]["segments"][0]["provider_evidence"]
         if item["provider"] == "kaani_official"
     )
     assert kaani_evidence["quote_ids"]
@@ -975,10 +1020,7 @@ async def test_human_block_response_binds_successful_model_trace_to_this_request
             response = await client.post(
                 "/api/v1/agents/live-flexible-plan-from-text",
                 json=_payload(
-                    text=(
-                        "出发地：杭州，去程：2026年8月，玩5-8天，"
-                        "人数：2名成人，酒店：1间房"
-                    )
+                    text=("出发地：杭州，去程：2026年8月，玩5-8天，人数：2名成人，酒店：1间房")
                 ),
             )
 

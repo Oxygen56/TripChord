@@ -655,7 +655,8 @@ function FlexiblePlanningSummary({
   const interpretation = response.interpretation;
   const window = interpretation.window;
   const run = response.run;
-  const finalPlan = response.final_plan;
+  const isBestAvailable = !response.final_plan && Boolean(response.best_available_plan);
+  const finalPlan = response.final_plan ?? response.best_available_plan;
   const breakfastApplication = getBreakfastPreferenceApplication(response);
   const pairById = new Map(
     run?.pair_runs.map((pair) => [pair.date_pair.id, pair]) ?? [],
@@ -770,14 +771,23 @@ function FlexiblePlanningSummary({
       </section>
 
       {finalPlan ? (
-        <section className="final-plan-card" aria-label="最终最佳方案">
+        <section
+          className="final-plan-card"
+          aria-label={isBestAvailable ? "当前最优方案" : "最终最佳方案"}
+        >
           <div className="final-plan-heading">
             <div>
-              <p className="eyebrow">最终方案</p>
-              <h2>这趟行程的最佳可执行方案</h2>
+              <p className="eyebrow">{isBestAvailable ? "当前最优方案" : "最终方案"}</p>
+              <h2>
+                {isBestAvailable
+                  ? "当前能组成完整行程的最优选择"
+                  : "这趟行程的最佳可执行方案"}
+              </h2>
             </div>
             <strong>
-              {finalPlan.optimality_status === "optimality_proven"
+              {isBestAvailable
+                ? "下单前确认航班余位"
+                : finalPlan.optimality_status === "optimality_proven"
                 ? "覆盖范围内总价最优"
                 : "当前已验证最优"}
             </strong>
@@ -837,22 +847,35 @@ function FlexiblePlanningSummary({
             </div>
           )}
           <div className="final-plan-route">
-            <div><span>去程</span><strong>{finalPlan.departure_date}</strong></div>
+            <div><span>出发</span><strong>{finalPlan.departure_date}</strong></div>
             <div className="route-arrow" aria-hidden="true">→</div>
-            <div><span>返程</span><strong>{finalPlan.return_date}</strong></div>
+            <div>
+              <span>返程起飞</span>
+              <strong>{finalPlan.return_date}</strong>
+              {finalPlan.flight && (
+                <small>抵达杭州 {formatDateTime(finalPlan.flight.return_arrive_at)}</small>
+              )}
+            </div>
           </div>
           <div className="final-plan-facts">
             <article>
-              <span>人民币总价</span>
+              <span>{isBestAvailable ? "预计人民币总价" : "人民币总价"}</span>
               <strong>
-                {finalPlan.price_comparability === "complete_cny" &&
-                finalPlan.total_budget_cents !== null
+                {isBestAvailable && response.best_available_plan?.estimated_total_cny_cents !== null
+                  ? formatCents(
+                      response.best_available_plan?.estimated_total_cny_cents ?? 0,
+                      "CNY",
+                    )
+                  : finalPlan.price_comparability === "complete_cny" &&
+                    finalPlan.total_budget_cents !== null
                   ? formatCents(finalPlan.total_budget_cents, "CNY")
                   : "总价待确认"}
               </strong>
-              {finalPlan.price_comparability !== "complete_cny" && (
+              {isBestAvailable ? (
+                <small>航班比较价、住宿参考折算与接驳公开基础价合计</small>
+              ) : finalPlan.price_comparability !== "complete_cny" ? (
                 <small>报价条件尚不能完整比较</small>
-              )}
+              ) : null}
             </article>
             <article>
               <span>出行人数</span>
@@ -874,6 +897,9 @@ function FlexiblePlanningSummary({
                 {finalPlan.unresolved_items.map((item) => <li key={item}>{item}</li>)}
               </ul>
             </div>
+          )}
+          {isBestAvailable && response.best_available_plan && (
+            <p className="claim-boundary">{response.best_available_plan.advisory_note}</p>
           )}
           <p className="claim-boundary">{finalPlan.claim_boundary}</p>
         </section>
@@ -991,12 +1017,12 @@ function FlexiblePlanningSummary({
 
       {run && (
         <details className="diagnostics-disclosure option-diagnostics">
-          <summary>查看内部诊断：日期核价与预算记录</summary>
-          <section className="option-comparison" aria-label="灵活日期核价记录">
+          <summary>查看内部诊断：日期处理与预算记录</summary>
+          <section className="option-comparison" aria-label="灵活日期处理记录">
           <div className="stage-title">
-            <div><span>00</span><h3>已核价日期与预算记录</h3></div>
+            <div><span>00</span><h3>已处理日期与预算记录</h3></div>
             <strong>
-              {run.ranked_options.length} 个日期组合已核价
+              {run.ranked_options.length} 个日期组合已处理（含实际查询与按本轮平台状态跳过）
             </strong>
           </div>
           <div className="option-grid">
@@ -1010,7 +1036,7 @@ function FlexiblePlanningSummary({
                   key={option.date_pair_id}
                 >
                   <span>
-                    {option.complete_cny_party_total ? `本轮核价第 ${option.rank} 名` : "金额不完整"}
+                    {option.complete_cny_party_total ? `本轮结果第 ${option.rank} 名` : "金额不完整"}
                   </span>
                   <strong>
                     {!option.complete_cny_party_total
@@ -1036,8 +1062,8 @@ function FlexiblePlanningSummary({
           </div>
           <p className="sampling-boundary">
             {run.sampled_not_exhaustive
-              ? `这里只比较本轮 ${run.ranked_options.length} 个精确日期对，是抽样结果，不是全月或全网最低价。`
-              : "排序只在有完整日历支持并执行精确查询的候选日期对内有效。"}
+              ? `本轮处理了 ${run.ranked_options.length} 个精确日期对，是抽样结果，不是全月或全网最低价。`
+              : "排序只在有完整日历支持并完成本轮处理的候选日期对内有效；被跳过的日期不会被当作已获得实时价格。"}
           </p>
           <p className="claim-boundary">{run.claim_boundary}</p>
           </section>
@@ -2332,7 +2358,9 @@ function App() {
             breakfast_mode: breakfastMode,
             breakfast_weight: normalizeBreakfastWeight(breakfastMode, breakfastWeight),
           },
-          coverage_mode: "strict",
+          // Logged-out or CAPTCHA-gated providers are skipped while the
+          // accessible sources still produce a clearly scoped best plan.
+          coverage_mode: "degraded",
           timeout_seconds: 120,
           total_timeout_seconds: 600,
           max_pairs: liveMaxPairs,
@@ -2502,7 +2530,7 @@ function App() {
                 <div className="form-row compact-row">
                   <div className="live-policy-card">
                     <span>日期与平台覆盖</span>
-                    <strong>穷举支持范围内的合法日期组合 · 三路并行核价</strong>
+                    <strong>覆盖支持范围内的合法日期组合 · 可用平台并行查询</strong>
                     <small>只有完成硬约束校验且总价可完整比较的方案，才能进入最终排序。</small>
                   </div>
                 </div>

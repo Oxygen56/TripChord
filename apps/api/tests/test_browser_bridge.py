@@ -134,6 +134,44 @@ async def test_durable_companion_status_normalizes_sqlite_naive_timestamp() -> N
         await database.dispose()
 
 
+@pytest.mark.asyncio
+async def test_durable_lease_status_does_not_materialize_large_task_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database("sqlite+aiosqlite://")
+    await database.create_schema()
+    try:
+        store = DurableBrowserTaskStore(
+            database, authority_partition_sha256="lease-status".ljust(64, "0")
+        )
+        bridge = BrowserTaskBridge(
+            durable_store=store,
+            durable_tenant_id="lease-status-tenant",
+        )
+        base = submission(BrowserProvider.CTRIP, BrowserVertical.FLIGHT)
+        large = base.model_copy(
+            update={
+                "query": base.query.model_copy(
+                    update={"options": {"large_fixture_blob": "x" * 200_000}}
+                )
+            }
+        )
+        await bridge.submit_many((large,))
+        (lease,) = await bridge.claim("lease-status-companion")
+
+        async def unexpected_publication() -> int:
+            raise AssertionError("lease status must not publish completions")
+
+        monkeypatch.setattr(bridge, "publish_pending_completions", unexpected_publication)
+        status = await bridge.get_lease_status(lease.task_id)
+
+        assert status.state == BrowserTaskState.CLAIMED
+        assert status.claimed_by == "lease-status-companion"
+        assert len(status.model_dump_json()) < 300
+    finally:
+        await database.dispose()
+
+
 def submission(
     provider: BrowserProvider,
     kind: BrowserVertical,
@@ -212,9 +250,7 @@ def quote(
             "price_basis_evidence": "页面可见的每人往返价",
             "tax_evidence": "页面可见含税",
             "party_availability_status": (
-                "comparison_only"
-                if provider == BrowserProvider.FLIGGY
-                else "confirmed_for_party"
+                "comparison_only" if provider == BrowserProvider.FLIGGY else "confirmed_for_party"
             ),
             "selection_evidence": (
                 "组合卡同时包含去返两程"
@@ -321,10 +357,7 @@ async def test_large_claim_batch_applies_qunar_lodging_backpressure_before_lease
 
     concurrent = await bridge.claim("second-companion", limit=6)
     assert all(
-        not (
-            lease.provider == BrowserProvider.QUNAR
-            and lease.kind == BrowserVertical.LODGING
-        )
+        not (lease.provider == BrowserProvider.QUNAR and lease.kind == BrowserVertical.LODGING)
         for lease in concurrent
     )
 
@@ -333,11 +366,13 @@ async def test_large_claim_batch_applies_qunar_lodging_backpressure_before_lease
         reason="test batch completed",
     )
     after_release = await bridge.claim("chrome-profile-companion", limit=6)
-    assert sum(
-        lease.provider == BrowserProvider.QUNAR
-        and lease.kind == BrowserVertical.LODGING
-        for lease in after_release
-    ) == 1
+    assert (
+        sum(
+            lease.provider == BrowserProvider.QUNAR and lease.kind == BrowserVertical.LODGING
+            for lease in after_release
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -739,9 +774,7 @@ def test_reuse_fingerprint_covers_every_price_affecting_query_field() -> None:
         base.model_copy(update={"destination_code": "DXB"}),
         base.model_copy(update={"search_url": "https://hotels.ctrip.com/hotels/list"}),
         base.model_copy(update={"options": {**base.options, "segment": "middle"}}),
-        base.model_copy(
-            update={"options": {**base.options, "fare_family": "non_refundable"}}
-        ),
+        base.model_copy(update={"options": {**base.options, "fare_family": "non_refundable"}}),
     )
     assert all(BrowserTaskBridge._reuse_fingerprint(item) != original for item in variants)
 
@@ -936,9 +969,7 @@ async def test_optional_file_store_requeues_claim_without_persisting_lease_token
     state_path = (tmp_path / "bridge-state.json").resolve()
     store = JsonFileBrowserBridgeStateStore(state_path)
     bridge = BrowserTaskBridge(state_store=store)
-    (task,) = await bridge.submit_many(
-        (submission(BrowserProvider.CTRIP, BrowserVertical.FLIGHT),)
-    )
+    (task,) = await bridge.submit_many((submission(BrowserProvider.CTRIP, BrowserVertical.FLIGHT),))
     (first_lease,) = await bridge.claim("companion-before-restart")
 
     persisted = json.loads(state_path.read_text(encoding="utf-8"))
@@ -1055,9 +1086,7 @@ def test_corrupted_persisted_bridge_state_fails_closed(tmp_path: Path) -> None:
 async def test_reload_control_runs_drain_accept_apply_closed_loop() -> None:
     bridge = BrowserTaskBridge()
     companion_id = "chrome-mv3-control-fixture"
-    (task,) = await bridge.submit_many(
-        (submission(BrowserProvider.CTRIP, BrowserVertical.FLIGHT),)
-    )
+    (task,) = await bridge.submit_many((submission(BrowserProvider.CTRIP, BrowserVertical.FLIGHT),))
     claimed = await bridge.claim_response(
         companion_id,
         build_identity=companion_build(OLD_BUILD_SHA256),
@@ -1158,9 +1187,7 @@ async def test_reload_receipts_reject_wrong_token_same_runtime_and_wrong_build()
         runtime_instance_id=OLD_RUNTIME_INSTANCE_ID,
     )
     with pytest.raises(BrowserCompanionControlError, match="token or delivery"):
-        await bridge.record_reload_receipt(
-            base.model_copy(update={"receipt_token": "x" * 40})
-        )
+        await bridge.record_reload_receipt(base.model_copy(update={"receipt_token": "x" * 40}))
     await bridge.record_reload_receipt(base)
     with pytest.raises(BrowserCompanionControlError, match="new runtime"):
         await bridge.record_reload_receipt(
@@ -1211,9 +1238,7 @@ async def test_reload_idempotency_and_persistence_never_store_plain_receipt_toke
         await bridge.request_reload(
             companion_id,
             idempotency_key="reload-persist-0001",
-            request=reload_request_body().model_copy(
-                update={"target_build_sha256": "4" * 64}
-            ),
+            request=reload_request_body().model_copy(update={"target_build_sha256": "4" * 64}),
         )
     dispatch = await bridge.claim_response(
         companion_id,
@@ -1297,9 +1322,7 @@ async def test_reload_http_control_auth_and_receipt_boundary() -> None:
             headers=bridge_headers,
             json={
                 "companion_id": companion_id,
-                "build_identity": companion_build(OLD_BUILD_SHA256).model_dump(
-                    mode="json"
-                ),
+                "build_identity": companion_build(OLD_BUILD_SHA256).model_dump(mode="json"),
                 "runtime_instance_id": OLD_RUNTIME_INSTANCE_ID,
             },
         )
@@ -1313,9 +1336,7 @@ async def test_reload_http_control_auth_and_receipt_boundary() -> None:
                 "receipt_token": control["receipt_token"],
                 "delivery_generation": control["delivery_generation"],
                 "state": "accepted",
-                "build_identity": companion_build(OLD_BUILD_SHA256).model_dump(
-                    mode="json"
-                ),
+                "build_identity": companion_build(OLD_BUILD_SHA256).model_dump(mode="json"),
                 "runtime_instance_id": OLD_RUNTIME_INSTANCE_ID,
             },
         )
@@ -1513,9 +1534,7 @@ def test_lodging_checkout_date_is_not_misclassified_as_transaction_checkout() ->
         "https://hotel.fliggy.com/hotel_list3.htm"
         "?city=933081&checkIn=2026-08-01&checkOut=2026-08-05"
     )
-    accepted_fliggy = BrowserQuote.model_validate(
-        {**fliggy_source, "page_url": fliggy_url}
-    )
+    accepted_fliggy = BrowserQuote.model_validate({**fliggy_source, "page_url": fliggy_url})
     assert accepted_fliggy.page_url == fliggy_url
 
     fliggy_detail_url = (
@@ -1536,30 +1555,20 @@ def test_lodging_checkout_date_is_not_misclassified_as_transaction_checkout() ->
         "https://hotels.ctrip.com/hotels/detail/"
         "?hotelId=6210622&checkIn=2026-08-01&checkOut=2026-08-05"
     )
-    accepted_ctrip = BrowserQuote.model_validate(
-        {**ctrip_source, "page_url": ctrip_url}
-    )
+    accepted_ctrip = BrowserQuote.model_validate({**ctrip_source, "page_url": ctrip_url})
     assert accepted_ctrip.page_url == ctrip_url
 
     for rejected in (
         "https://hotel.fliggy.com/hotel_list3.htm?checkOut=2026-08-05",
-        (
-            "https://hotel.fliggy.com/hotel_list3.htm"
-            "?checkIn=2026-08-05&checkOut=2026-08-01"
-        ),
-        (
-            "https://hotel.fliggy.com/checkout"
-            "?checkIn=2026-08-01&checkOut=2026-08-05"
-        ),
+        ("https://hotel.fliggy.com/hotel_list3.htm?checkIn=2026-08-05&checkOut=2026-08-01"),
+        ("https://hotel.fliggy.com/checkout?checkIn=2026-08-01&checkOut=2026-08-05"),
         (
             "https://hotel.fliggy.com/hotel_list3.htm"
             "?checkIn=2026-08-01&checkOut=2026-08-05&order=create"
         ),
     ):
         with pytest.raises(ValidationError, match="page_url"):
-            BrowserQuote.model_validate(
-                {**fliggy_source, "page_url": rejected}
-            )
+            BrowserQuote.model_validate({**fliggy_source, "page_url": rejected})
 
 
 def test_qunar_trusted_flight_url_uses_audited_names_and_exact_percent_encoding() -> None:
@@ -1653,9 +1662,7 @@ def test_tongcheng_trusted_lodging_url_is_exact_and_submission_allows_it() -> No
         BrowserTaskSubmission(
             provider=BrowserProvider.TONGCHENG,
             kind=BrowserVertical.LODGING,
-            query=canonical.model_copy(
-                update={"search_url": f"{expected}&tracking=unexpected"}
-            ),
+            query=canonical.model_copy(update={"search_url": f"{expected}&tracking=unexpected"}),
         )
 
 
@@ -1953,6 +1960,10 @@ async def test_local_http_bridge_round_trip_and_remote_rejection() -> None:
             json={"companion_id": "fixture-companion"},
         )
         lease = claimed.json()["leases"][0]
+        lease_status = await client.get(
+            f"/v1/tasks/{lease['task_id']}/lease-status",
+            headers=headers,
+        )
         completed = await client.post(
             f"/v1/tasks/{lease['task_id']}/complete",
             headers=headers,
@@ -1972,6 +1983,10 @@ async def test_local_http_bridge_round_trip_and_remote_rejection() -> None:
 
     assert submitted.status_code == 200
     assert claimed.status_code == 200
+    assert lease_status.status_code == 200
+    assert lease_status.json()["state"] == "claimed"
+    assert lease_status.json()["claimed_by"] == "fixture-companion"
+    assert set(lease_status.json()) == {"id", "state", "claimed_by", "updated_at"}
     assert completed.status_code == 200
     assert completed.json()["state"] == "succeeded"
     assert completed.json()["quotes"][0]["details"]["connection_text"] == "香港中转"

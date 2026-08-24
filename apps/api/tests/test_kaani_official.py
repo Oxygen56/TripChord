@@ -15,28 +15,28 @@ from tripchord.providers.kaani_official import (
 )
 
 BOOKING_HTML = (
-    b'''<html><body>
+    b"""<html><body>
 Check-in 2026-09-04 Check-out 2026-09-09 Guests 2 Adults Nights 5
 Bed & Breakfast Rates inclusive of all applicable taxes, service charge, and green tax
 Deluxe Double Room Seaview + Balcony
-<script src="/_next/static/chunks/app/stays/[property]/book/page-6bc33c7732fbd0d6.js"></script>
-<script>self.__next_f.push([1,"22:{\\"title\\":\\"Deluxe Double Room Seaview + Balcony\\",'''
-    b'''\\"adults\\":2,\\"ezeeRoomId\\":\\"1861800000000000002\\"}"])</script>
+<script src="/_next/static/chunks/app/stays/[property]/book/page-3456a8de1272d033.js"></script>
+<script>self.__next_f.push([1,"22:{\\"title\\":\\"Deluxe Double Room Seaview + Balcony\\","""
+    b"""\\"adults\\":2,\\"ezeeRoomId\\":\\"1861800000000000002\\"}"])</script>
 <script>self.__next_f.push([1,"23:{\\"1861800000000000002\\":{\\"qty\\":12,\\"rate\\":546.5}}"])</script>
-</body></html>'''
+</body></html>"""
 )
 PROPERTY_HTML = (
-    b'''<html><body>
+    b"""<html><body>
 <script type="application/ld+json">[{"@type":"Hotel","name":"Kaani Beach Hotel",
 "description":"A beachfront hotel","starRating":{"ratingValue":"3"},
 "address":{"streetAddress":"Aabaadhee Hingun Road"},
 "geo":{"latitude":"4.17","longitude":"73.51"},
 "amenityFeature":[{"name":"Free WiFi","value":true}]},
 {"@type":"FAQPage","mainEntity":[{"name":"Kaani Beach Hotel location",
-"acceptedAnswer":{"text":"Kaani Beach Hotel is steps from Maafushi's main '''
-    b'''ferry jetty."}}]}]</script>
+"acceptedAnswer":{"text":"Kaani Beach Hotel is steps from Maafushi's main """
+    b"""ferry jetty."}}]}]</script>
 Deluxe Double Room Seaview + Balcony. Balcony, Sea View, Free WiFi, In-Room Safe.
-</body></html>'''
+</body></html>"""
 )
 
 
@@ -53,9 +53,7 @@ class _Client:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, str]]] = []
 
-    async def get(
-        self, url: str, *, params: dict[str, str] | None = None
-    ) -> _Response:
+    async def get(self, url: str, *, params: dict[str, str] | None = None) -> _Response:
         self.calls.append((url, params or {}))
         return _Response(
             BOOKING_HTML if url == KAANI_OFFICIAL_BOOKING_URL else PROPERTY_HTML,
@@ -113,10 +111,7 @@ async def test_kaani_official_parses_current_seaview_ssr_fixture(
     assert quote.provider_property_id == "Beach-Hotel"
     assert quote.provider_room_id == "1861800000000000002"
     assert quote.cancellation_policy is None
-    assert any(
-        ref == "kaani-official-room-id:1861800000000000002"
-        for ref in quote.evidence_refs
-    )
+    assert any(ref == "kaani-official-room-id:1861800000000000002" for ref in quote.evidence_refs)
     assert "kaani-official-currency-from-audited-rate-chunk:USD" in quote.evidence_refs
     assert client.calls[0] == (
         KAANI_OFFICIAL_BOOKING_URL,

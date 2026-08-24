@@ -215,7 +215,7 @@ assert.ok(metaMatch, "generated build metadata must be parseable");
 const buildMeta = JSON.parse(metaMatch[1]);
 assert.equal(buildMeta.protocol_version, "tripchord-companion-control-v1");
 assert.equal(buildMeta.manifest_version, manifest.version);
-assert.equal(buildMeta.content_runtime_version, "2026-08-05.18");
+assert.equal(buildMeta.content_runtime_version, "2026-08-24.6");
 assert.match(buildMeta.build_sha256, /^[0-9a-f]{64}$/);
 assert.notEqual(buildMeta.build_sha256, "0".repeat(64));
 const buildDigest = createHash("sha256");

@@ -841,6 +841,7 @@ def _install_browser_bridge(
             **authority_kwargs,
         )
     bridge = browser_bridge_override or BrowserTaskBridge(
+        max_pending_tasks=512,
         now=now,
         source_authority=source_authority,
         durable_store=durable_browser_task_store,
@@ -1052,7 +1053,14 @@ rate_limiter = RateLimiter(
 planning_assembler = PlanningProblemAssembler(ReplayPlaceCatalog())
 replan_policy = ReplanPolicySelector.from_package_data()
 live_run_cache = _build_live_run_cache(settings)
-package_requirement_agent = HybridPackageRequirementAgent(model_router=model_router)
+package_requirement_agent = HybridPackageRequirementAgent(
+    model_router=model_router,
+    # When model participation is optional, a complete deterministic parse is
+    # already executable.  Calling the context model again added roughly one
+    # minute to the live product path without changing any locked fact.  A
+    # deployment that explicitly requires model agents still keeps the call.
+    skip_model_when_deterministic_ready=not settings.model_agents_required,
+)
 configured_job_registry_path = settings.live_planning_job_registry_state_path
 if configured_job_registry_path is None and os.environ.get(
     "TRIPCHORD_FORMAL_SOURCE_TRUST_ROOT"

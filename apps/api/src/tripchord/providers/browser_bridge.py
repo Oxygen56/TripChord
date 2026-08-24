@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 def _aware(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
+
 BRIDGE_TOKEN_HEADER = "X-TripChord-Bridge-Token"
 CONTROL_TOKEN_HEADER = "X-TripChord-Control-Token"
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
@@ -40,15 +41,11 @@ COMPANION_HEARTBEAT_STALE_AFTER_SECONDS = 45
 RECENT_EXACT_QUOTE_REUSE_SECONDS = 600
 RANGE_RECEIPT_MAX_CLOCK_SKEW_SECONDS = 30
 PRODUCTION_VISIBLE_DOM_PARSER_VERSION = "tripchord-visible-dom-v3"
-SOURCE_EXECUTION_ATTESTATION_SCHEMA = (
-    "tripchord-browser-source-execution-attestation-v1"
-)
+SOURCE_EXECUTION_ATTESTATION_SCHEMA = "tripchord-browser-source-execution-attestation-v1"
 SOURCE_EXECUTION_RECEIPT_SCHEMA = "tripchord-browser-source-execution-receipt-v1"
 PRODUCTION_SOURCE_EXECUTION_ENVIRONMENT = "chrome_extension_service_worker"
 UNTRUSTED_SOURCE_EXECUTION_ENVIRONMENT = "untrusted_external_executor"
-_FORMAL_WORKER_SOURCE_TOKEN_CONTEXT = (
-    b"tripchord-formal-worker-parent-source-v1"
-)
+_FORMAL_WORKER_SOURCE_TOKEN_CONTEXT = b"tripchord-formal-worker-parent-source-v1"
 _FORMAL_ACTIVATION_FAILPOINT_ACK_FLUSH_SECONDS = 0.05
 DEFAULT_TERMINAL_RECORD_RETENTION_SECONDS = 3600
 DEFAULT_MAX_TERMINAL_RECORDS = 256
@@ -60,9 +57,7 @@ DEFAULT_MAX_COMPANION_CONTROL_RECORDS = 64
 COMPANION_CONTROL_PROTOCOL_VERSION = "tripchord-companion-control-v1"
 BROWSER_BRIDGE_STATE_PATH_ENV = "TRIPCHORD_BROWSER_BRIDGE_STATE_PATH"
 QUNAR_DETAIL_SEED_SELECTION_POLICY = "query-fingerprint-rotation-v1"
-QUNAR_CURRENT_DETAIL_FALLBACK_SUMMARY_VERSION = (
-    "tripchord-qunar-detail-fallback-summary-v2"
-)
+QUNAR_CURRENT_DETAIL_FALLBACK_SUMMARY_VERSION = "tripchord-qunar-detail-fallback-summary-v2"
 QUNAR_AUDITED_LODGING_DETAIL_PROPERTY_IDS = (
     "2112",
     "2055",
@@ -71,9 +66,7 @@ QUNAR_AUDITED_LODGING_DETAIL_PROPERTY_IDS = (
     "2075",
     "2142",
 )
-_ALLOW_HISTORICAL_QUNAR_FALLBACK_V1_CONTEXT_KEY = (
-    "allow_historical_qunar_detail_fallback_v1"
-)
+_ALLOW_HISTORICAL_QUNAR_FALLBACK_V1_CONTEXT_KEY = "allow_historical_qunar_detail_fallback_v1"
 _PROVIDER_DOMAINS = {
     "ctrip": ("ctrip.com",),
     "fliggy": ("fliggy.com", "fliggy.hk"),
@@ -336,8 +329,7 @@ def _is_allowed_provider_url(provider: BrowserProvider, url: str) -> bool:
         and parsed.username is None
         and parsed.password is None
         and not any(
-            marker in segment
-            and not _is_audited_read_only_search_path(provider, parsed, segment)
+            marker in segment and not _is_audited_read_only_search_path(provider, parsed, segment)
             for segment in path_segments
             for marker in _FORBIDDEN_URL_MARKERS
         )
@@ -554,12 +546,7 @@ class BrowserDateRangeQuery(DomainModel):
             raise ValueError("range flight probes require an origin")
         if self.kind == BrowserVertical.FLIGHT:
             for code in (self.origin_code, self.destination_code):
-                if (
-                    code is None
-                    or len(code) != 3
-                    or not code.isascii()
-                    or not code.isalpha()
-                ):
+                if code is None or len(code) != 3 or not code.isascii() or not code.isalpha():
                     raise ValueError(
                         "range flight probes require audited IATA origin and destination"
                     )
@@ -711,8 +698,7 @@ class BrowserRangeCompletion(DomainModel):
             and (
                 cell.quote is not None
                 and (
-                    cell.quote.provider != self.query.provider
-                    or cell.quote.kind != self.query.kind
+                    cell.quote.provider != self.query.provider or cell.quote.kind != self.query.kind
                 )
             )
             for cell in self.cells
@@ -722,9 +708,11 @@ class BrowserRangeCompletion(DomainModel):
             raise ValueError("range receipt_sha256 does not match canonical receipt payload")
         if self.expires_at is not None and self.expires_at <= self.capability.captured_at:
             raise ValueError("range receipt expires_at must be after captured_at")
-        if self.expires_at is not None and (
-            self.expires_at - self.capability.captured_at
-        ).total_seconds() > RECENT_EXACT_QUOTE_REUSE_SECONDS:
+        if (
+            self.expires_at is not None
+            and (self.expires_at - self.capability.captured_at).total_seconds()
+            > RECENT_EXACT_QUOTE_REUSE_SECONDS
+        ):
             raise ValueError("range receipt TTL cannot exceed exact quote freshness window")
         return self
 
@@ -791,9 +779,7 @@ def browser_range_receipt_sha256(receipt: BrowserRangeCompletion | object) -> st
         else receipt
     )
     if isinstance(payload, dict):
-        payload = {
-            key: value for key, value in payload.items() if key != "receipt_sha256"
-        }
+        payload = {key: value for key, value in payload.items() if key != "receipt_sha256"}
     canonical_payload = _range_receipt_wire_value(payload)
     return hashlib.sha256(
         json.dumps(
@@ -867,9 +853,7 @@ class QunarLodgingExplicitEmptyEvidence(DomainModel):
 class QunarLodgingPendingEvidence(DomainModel):
     contract_version: str = Field(pattern="^qunar-visible-search-pending-v1$")
     result_count_text: str = Field(pattern="^共 家酒店满足条件$")
-    pending_message: str = Field(
-        pattern=r"^请稍等,您查询的结果正在实时搜索中\.\.\.$"
-    )
+    pending_message: str = Field(pattern=r"^请稍等,您查询的结果正在实时搜索中\.\.\.$")
     observed_duration_ms: int = Field(ge=25_000, le=120_000)
 
 
@@ -933,9 +917,7 @@ class QunarLodgingConfirmedEmptyObservationReceipt(DomainModel):
 
 class QunarLodgingObservationLineage(DomainModel):
     schema_version: str = Field(pattern="^tripchord-browser-lineage-hash-v1$")
-    isolation_scope: str = Field(
-        pattern="^companion_owned_unfocused_normal_window_active_tab$"
-    )
+    isolation_scope: str = Field(pattern="^companion_owned_unfocused_normal_window_active_tab$")
     runtime_lineage_sha256: str = Field(pattern="^[a-f0-9]{64}$")
     window_lineage_sha256: str = Field(pattern="^[a-f0-9]{64}$")
     tab_lineage_sha256: str = Field(pattern="^[a-f0-9]{64}$")
@@ -971,12 +953,8 @@ def _qunar_detail_seed_offset(query: LodgingInventoryConfirmedQuery) -> int:
         "adults": query.adults,
         "destination": query.destination.strip().lower(),
         "end_date": query.end_date.isoformat(),
-        "expected_lodging_place_key": str(
-            options["expected_lodging_place_key"]
-        ).strip().lower(),
-        "expected_package_area": str(options["expected_package_area"])
-        .strip()
-        .lower(),
+        "expected_lodging_place_key": str(options["expected_lodging_place_key"]).strip().lower(),
+        "expected_package_area": str(options["expected_package_area"]).strip().lower(),
         "rooms": query.rooms,
         "segment": str(options["segment"]).strip().lower(),
         "start_date": query.start_date.isoformat(),
@@ -1006,9 +984,7 @@ def qunar_detail_seed_selection(
 
 
 class QunarLodgingDetailFallbackSummary(DomainModel):
-    contract_version: str = Field(
-        pattern="^tripchord-qunar-detail-fallback-summary-v[12]$"
-    )
+    contract_version: str = Field(pattern="^tripchord-qunar-detail-fallback-summary-v[12]$")
     attempted: bool
     target_limit: int = Field(ge=1, le=2)
     seed_selection_policy: str | None = None
@@ -1028,27 +1004,20 @@ class QunarLodgingDetailFallbackSummary(DomainModel):
         if self.contract_version.endswith("-v1"):
             historical_context = bool(
                 isinstance(info.context, dict)
-                and info.context.get(
-                    _ALLOW_HISTORICAL_QUNAR_FALLBACK_V1_CONTEXT_KEY
-                )
-                is True
+                and info.context.get(_ALLOW_HISTORICAL_QUNAR_FALLBACK_V1_CONTEXT_KEY) is True
             )
             if not historical_context:
                 raise ValueError(
-                    "legacy Qunar fallback-summary-v1 requires the explicit "
-                    "historical parsing path"
+                    "legacy Qunar fallback-summary-v1 requires the explicit historical parsing path"
                 )
             expected = ("2112", "2055")
             selection_contract_valid = (
-                self.seed_selection_policy is None
-                and self.seed_selection_offset is None
+                self.seed_selection_policy is None and self.seed_selection_offset is None
             )
         else:
             offset = self.seed_selection_offset
             expected = (
-                _rotated_qunar_detail_property_ids(offset)
-                if offset is not None
-                else ("", "")
+                _rotated_qunar_detail_property_ids(offset) if offset is not None else ("", "")
             )
             selection_contract_valid = (
                 self.seed_selection_policy == QUNAR_DETAIL_SEED_SELECTION_POLICY
@@ -1241,9 +1210,7 @@ class QunarLodgingReceiptObservation(DomainModel):
 
 
 class QunarLodgingConfirmedEmptyObservationChain(DomainModel):
-    schema_version: str = Field(
-        pattern="^tripchord-qunar-empty-observation-chain-v1$"
-    )
+    schema_version: str = Field(pattern="^tripchord-qunar-empty-observation-chain-v1$")
     query_fingerprint_sha256: str = Field(pattern="^[a-f0-9]{64}$")
     observations: tuple[
         QunarLodgingReceiptObservation,
@@ -1392,9 +1359,7 @@ class LodgingInventoryReceipt(DomainModel):
                 )
         if self.observation_chain is not None:
             first, second = self.observation_chain.observations
-            second_at = datetime.fromisoformat(
-                second.captured_at.replace("Z", "+00:00")
-            )
+            second_at = datetime.fromisoformat(second.captured_at.replace("Z", "+00:00"))
             if (
                 self.confirmed_query != second.receipt.confirmed_query
                 or self.page_url != second.receipt.page_url
@@ -1405,8 +1370,7 @@ class LodgingInventoryReceipt(DomainModel):
                 or self.scan_limit != second.receipt.scan_limit
                 or self.scanned_count != second.receipt.scanned_count
                 or self.explicit_empty_evidence != second.receipt.explicit_empty_evidence
-                or self.provider_pending_evidence
-                != second.receipt.provider_pending_evidence
+                or self.provider_pending_evidence != second.receipt.provider_pending_evidence
                 or first.receipt.page_url != self.page_url
             ):
                 raise ValueError(
@@ -1662,9 +1626,7 @@ def tongcheng_trusted_flight_search_url(query: BrowserSearchQuery) -> str:
 def tongcheng_trusted_lodging_search_url(query: BrowserSearchQuery) -> str:
     """Build the extension's exact, read-only Tongcheng lodging result URL."""
 
-    expected_place_key = str(
-        query.options.get("expected_lodging_place_key", "")
-    ).strip().lower()
+    expected_place_key = str(query.options.get("expected_lodging_place_key", "")).strip().lower()
     city_ids = {
         "hulhumale": "110018578",
         "maafushi": "110018575",
@@ -1676,9 +1638,7 @@ def tongcheng_trusted_lodging_search_url(query: BrowserSearchQuery) -> str:
         or query.end_date is None
         or query.end_date <= query.start_date
     ):
-        raise ValueError(
-            "Tongcheng trusted lodging URL requires an audited city and one room"
-        )
+        raise ValueError("Tongcheng trusted lodging URL requires an audited city and one room")
     return (
         "https://www.ly.com/hotel/hotellist"
         f"?city={city_id}"
@@ -2068,7 +2028,8 @@ class BrowserQuote(DomainModel):
                     "staged flight action_trace must prove a read-only outbound selection"
                 )
         elif any(
-            action in {
+            action
+            in {
                 "select_outbound",
                 "reselect_outbound",
                 "provider_auto_selected_outbound",
@@ -2097,9 +2058,7 @@ def exact_cell_binding_error(
     if any(timestamp > maximum_future_time for timestamp in timestamps):
         return "range evidence is future-dated beyond allowed clock skew"
     if expires_at > now + timedelta(
-        seconds=(
-            RECENT_EXACT_QUOTE_REUSE_SECONDS + RANGE_RECEIPT_MAX_CLOCK_SKEW_SECONDS
-        )
+        seconds=(RECENT_EXACT_QUOTE_REUSE_SECONDS + RANGE_RECEIPT_MAX_CLOCK_SKEW_SECONDS)
     ):
         return "range receipt expiry is future-dated beyond its freshness window"
     if now - quote.captured_at > timedelta(seconds=RECENT_EXACT_QUOTE_REUSE_SECONDS):
@@ -2116,14 +2075,11 @@ def exact_cell_binding_error(
         return "confirmed range evidence requires task and lease lineage"
     if not capability.task_id.strip() or not capability.lease_id.strip():
         return "confirmed range evidence requires non-blank task and lease lineage"
-    if (
-        not capability.source_url.startswith("https://")
-        or not _is_allowed_provider_url(query.provider, capability.source_url)
+    if not capability.source_url.startswith("https://") or not _is_allowed_provider_url(
+        query.provider, capability.source_url
     ):
         return "confirmed range evidence source_url is not an allowed provider URL"
-    visible_evidence_sha256 = hashlib.sha256(
-        quote.visible_evidence.encode("utf-8")
-    ).hexdigest()
+    visible_evidence_sha256 = hashlib.sha256(quote.visible_evidence.encode("utf-8")).hexdigest()
     if (
         quote.provider != query.provider
         or quote.kind != query.kind
@@ -2250,6 +2206,17 @@ class BrowserTaskSnapshot(DomainModel):
     inflight_coalesced: bool = False
 
 
+class BrowserTaskLeaseStatus(DomainModel):
+    """Small control-plane projection used while a Companion owns a lease."""
+
+    id: str
+    state: BrowserTaskState
+    claimed_by: str | None = None
+    updated_at: datetime
+
+    _validate_updated_at = field_validator("updated_at")(_require_timezone)
+
+
 class BrowserTaskLease(DomainModel):
     task_id: str
     provider: BrowserProvider
@@ -2321,9 +2288,7 @@ class BrowserCompanionReloadReceipt(DomainModel):
     delivery_generation: int = Field(ge=1, le=32)
     state: BrowserCompanionReloadReceiptState
     build_identity: BrowserCompanionBuildIdentity
-    runtime_instance_id: str = Field(
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$"
-    )
+    runtime_instance_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$")
     previous_runtime_instance_id: str | None = Field(
         default=None,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$",
@@ -2353,9 +2318,7 @@ class BrowserCompanionReloadControl(DomainModel):
     )
     request_id: str
     target_build_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    expected_runtime_instance_id: str = Field(
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$"
-    )
+    expected_runtime_instance_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$")
     delivery_generation: int = Field(ge=1, le=32)
     receipt_token: str = Field(min_length=32, max_length=128)
     expires_at: datetime
@@ -2428,9 +2391,7 @@ class ClaimBrowserTasksRequest(DomainModel):
     @model_validator(mode="after")
     def validate_control_identity(self) -> ClaimBrowserTasksRequest:
         if (self.build_identity is None) != (self.runtime_instance_id is None):
-            raise ValueError(
-                "build_identity and runtime_instance_id must be supplied together"
-            )
+            raise ValueError("build_identity and runtime_instance_id must be supplied together")
         if (
             self.reload_receipt is not None
             and self.reload_receipt.companion_id != self.companion_id
@@ -2442,9 +2403,7 @@ class ClaimBrowserTasksRequest(DomainModel):
             self.reload_receipt.build_identity != self.build_identity
             or self.reload_receipt.runtime_instance_id != self.runtime_instance_id
         ):
-            raise ValueError(
-                "reload_receipt identity must match the claim runtime identity"
-            )
+            raise ValueError("reload_receipt identity must match the claim runtime identity")
         return self
 
 
@@ -2474,9 +2433,7 @@ class BrowserCompanionHeartbeatRequest(DomainModel):
     @model_validator(mode="after")
     def validate_runtime_identity(self) -> BrowserCompanionHeartbeatRequest:
         if (self.build_identity is None) != (self.runtime_instance_id is None):
-            raise ValueError(
-                "build_identity and runtime_instance_id must be supplied together"
-            )
+            raise ValueError("build_identity and runtime_instance_id must be supplied together")
         return self
 
 
@@ -2525,15 +2482,10 @@ class BrowserSourceExecutionAttestation(DomainModel):
     provider: BrowserProvider
     kind: BrowserVertical
     companion_id: str = Field(min_length=1, max_length=128)
-    runtime_instance_id: str = Field(
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$"
-    )
+    runtime_instance_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$")
     build_identity: BrowserCompanionBuildIdentity
     execution_environment: str = Field(
-        pattern=(
-            "^(chrome_extension_service_worker|"
-            "untrusted_external_executor)$"
-        )
+        pattern=("^(chrome_extension_service_worker|untrusted_external_executor)$")
     )
     parser_version: str = Field(min_length=1, max_length=64)
     query_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -2763,9 +2715,7 @@ class JsonFileBrowserBridgeStateStore:
 
     def save(self, state: BrowserBridgePersistedState) -> None:
         self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        temporary = self._path.with_name(
-            f".{self._path.name}.{secrets.token_hex(8)}.tmp"
-        )
+        temporary = self._path.with_name(f".{self._path.name}.{secrets.token_hex(8)}.tmp")
         descriptor = os.open(
             temporary,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
@@ -2815,9 +2765,7 @@ class BrowserTaskBridge:
         if max_pending_tasks < 1:
             raise ValueError("max_pending_tasks must be positive")
         if terminal_retention_seconds < RECENT_EXACT_QUOTE_REUSE_SECONDS:
-            raise ValueError(
-                "terminal retention must cover the exact-quote reuse window"
-            )
+            raise ValueError("terminal retention must cover the exact-quote reuse window")
         if max_terminal_records < 1:
             raise ValueError("max_terminal_records must be positive")
         if max_companion_control_records < 1:
@@ -2835,9 +2783,10 @@ class BrowserTaskBridge:
             raise ValueError("durable browser bridge cannot also use JSON state")
         self._durable_store = durable_store
         self._durable_tenant_id = durable_tenant_id or "browser-bridge"
-        self._durable_tenant_partition = durable_tenant_partition or hashlib.sha256(
-            self._durable_tenant_id.encode("utf-8")
-        ).hexdigest()
+        self._durable_tenant_partition = (
+            durable_tenant_partition
+            or hashlib.sha256(self._durable_tenant_id.encode("utf-8")).hexdigest()
+        )
         self._durable_claims: dict[str, Any] = {}
         self._state_store = (
             None
@@ -2895,9 +2844,7 @@ class BrowserTaskBridge:
                         "authority": self._durable_store._authority_partition,
                         "tenant": self._durable_tenant_id,
                         "partition": partition,
-                        "fingerprint": self._durable_store._submission_fingerprint(
-                            submission
-                        ),
+                        "fingerprint": self._durable_store._submission_fingerprint(submission),
                     }
                 )
             )
@@ -2921,12 +2868,9 @@ class BrowserTaskBridge:
                 else None
             )
             allow_reuse = (
-                submission.query.options.get("__tripchord_allow_recent_quote_reuse")
-                is True
+                submission.query.options.get("__tripchord_allow_recent_quote_reuse") is True
             )
-            force_fresh = (
-                submission.query.options.get("__tripchord_force_fresh") is True
-            )
+            force_fresh = submission.query.options.get("__tripchord_force_fresh") is True
             projection = await self._durable_store.submit_consumer(
                 submission,
                 consumer_id=task_id,
@@ -2973,8 +2917,7 @@ class BrowserTaskBridge:
             ),
             providers=[provider.value for provider in providers],
             scopes=list(scopes),
-            expires_at=self._utc_now()
-            + timedelta(seconds=COMPANION_HEARTBEAT_STALE_AFTER_SECONDS),
+            expires_at=self._utc_now() + timedelta(seconds=COMPANION_HEARTBEAT_STALE_AFTER_SECONDS),
             adapter_version=adapter_version,
             contract_version=contract_version,
         )
@@ -3144,8 +3087,7 @@ class BrowserTaskBridge:
                     update={
                         "reuse_partition_sha256": hashlib.sha256(
                             (
-                                f"{submission.reuse_partition_sha256 or ''}\0"
-                                f"{capability_partition}"
+                                f"{submission.reuse_partition_sha256 or ''}\0{capability_partition}"
                             ).encode()
                         ).hexdigest()
                     }
@@ -3202,9 +3144,7 @@ class BrowserTaskBridge:
                     continue
                 active = self._active_reusable_record(submission)
                 if active is not None:
-                    self._active_consumers[active.id] = (
-                        self._active_consumers.get(active.id, 1) + 1
-                    )
+                    self._active_consumers[active.id] = self._active_consumers.get(active.id, 1) + 1
                     active.inflight_coalesce_count += 1
                     snapshots.append(self._snapshot(active))
                     continue
@@ -3310,9 +3250,7 @@ class BrowserTaskBridge:
     ) -> ClaimBrowserTasksResponse:
         self._validate_claim_arguments(companion_id, limit)
         if (build_identity is None) != (runtime_instance_id is None):
-            raise ValueError(
-                "build_identity and runtime_instance_id must be supplied together"
-        )
+            raise ValueError("build_identity and runtime_instance_id must be supplied together")
         requested_providers = tuple(dict.fromkeys(providers))
         async with self._changed:
             self._housekeep_and_notify_locked()
@@ -3515,9 +3453,7 @@ class BrowserTaskBridge:
                 session_generation=session.session_generation,
                 runtime_instance_id=runtime_instance_id,
                 build_identity=(
-                    build_identity.model_dump(mode="json")
-                    if build_identity is not None
-                    else None
+                    build_identity.model_dump(mode="json") if build_identity is not None else None
                 ),
             )
             return response
@@ -3587,9 +3523,7 @@ class BrowserTaskBridge:
                 or heartbeat.build_identity is None
                 or heartbeat.runtime_instance_id is None
             ):
-                raise BrowserCompanionControlError(
-                    "companion runtime identity is absent or stale"
-                )
+                raise BrowserCompanionControlError("companion runtime identity is absent or stale")
             if not hmac.compare_digest(
                 heartbeat.build_identity.build_sha256,
                 request.expected_current_build_sha256,
@@ -3693,19 +3627,16 @@ class BrowserTaskBridge:
             )
             if pending is not None:
                 pending_completion, frozen_snapshot, pending_receipt, _pending_digest = pending
-                if (
-                    pending_completion != completion
-                    or (
-                        source_execution_attestation is not None
-                        and pending_receipt is not None
-                        and self._validate_source_execution_attestation(
-                            record,
-                            completion,
-                            source_execution_attestation,
-                            now=self._utc_now(),
-                        )
-                        != pending_receipt
+                if pending_completion != completion or (
+                    source_execution_attestation is not None
+                    and pending_receipt is not None
+                    and self._validate_source_execution_attestation(
+                        record,
+                        completion,
+                        source_execution_attestation,
+                        now=self._utc_now(),
                     )
+                    != pending_receipt
                 ):
                     raise BrowserClaimError("completion retry differs")
                 # The DB outbox is the source of truth after prepare.  The
@@ -3762,9 +3693,7 @@ class BrowserTaskBridge:
                     session_generation=lease.session_generation,
                     completion=completion,
                     completion_snapshot=(
-                        frozen_snapshot
-                        if frozen_snapshot is not None
-                        else self._snapshot(record)
+                        frozen_snapshot if frozen_snapshot is not None else self._snapshot(record)
                     ),
                     source_receipt=source_receipt,
                     event_details=event_details,
@@ -3925,9 +3854,7 @@ class BrowserTaskBridge:
         capability = record.formal_execution_capability
         if attestation is None:
             if capability is not None:
-                raise BrowserClaimError(
-                    "formal task requires a source execution attestation"
-                )
+                raise BrowserClaimError("formal task requires a source execution attestation")
             return None
         if record.claimed_by is None or record.claimed_at is None:
             raise BrowserClaimError("source execution attestation has no active claim")
@@ -3955,9 +3882,7 @@ class BrowserTaskBridge:
             "provider": record.submission.provider.value,
             "kind": record.submission.kind.value,
             "query": query_payload,
-            "quote_evidence_sha256": [
-                quote.evidence_sha256 for quote in completion.quotes
-            ],
+            "quote_evidence_sha256": [quote.evidence_sha256 for quote in completion.quotes],
             "parser_version": attestation.parser_version,
         }
         expected_observation_sha256 = _canonical_json_sha256(observation_payload)
@@ -3981,8 +3906,7 @@ class BrowserTaskBridge:
                 ("query_sha256", attestation.query_sha256 != query_sha256),
                 (
                     "source_observation_sha256",
-                    attestation.source_observation_sha256
-                    != expected_observation_sha256,
+                    attestation.source_observation_sha256 != expected_observation_sha256,
                 ),
             )
             if differs
@@ -3992,27 +3916,16 @@ class BrowserTaskBridge:
                 "source execution attestation differs from the claimed task/runtime: "
                 + ", ".join(mismatch_fields)
             )
-        if any(
-            quote.parser_version != attestation.parser_version
-            for quote in completion.quotes
-        ):
-            raise BrowserClaimError(
-                "source execution attestation parser differs from its quotes"
-            )
+        if any(quote.parser_version != attestation.parser_version for quote in completion.quotes):
+            raise BrowserClaimError("source execution attestation parser differs from its quotes")
         completed_at = attestation.completed_at.astimezone(UTC)
-        if (
-            completed_at < record.claimed_at.astimezone(UTC)
-            or completed_at > now.astimezone(UTC) + timedelta(seconds=1)
-        ):
-            raise BrowserClaimError(
-                "source execution attestation timestamp is outside its claim"
-            )
+        if completed_at < record.claimed_at.astimezone(UTC) or completed_at > now.astimezone(
+            UTC
+        ) + timedelta(seconds=1):
+            raise BrowserClaimError("source execution attestation timestamp is outside its claim")
         if capability is None:
             return None
-        if (
-            attestation.execution_environment
-            != PRODUCTION_SOURCE_EXECUTION_ENVIRONMENT
-        ):
+        if attestation.execution_environment != PRODUCTION_SOURCE_EXECUTION_ENVIRONMENT:
             raise BrowserClaimError(
                 "formal task requires the production extension execution environment"
             )
@@ -4026,13 +3939,10 @@ class BrowserTaskBridge:
             "attempt_digest",
         }
         if any(
-            not isinstance(capability.get(field), str)
-            or not capability.get(field)
+            not isinstance(capability.get(field), str) or not capability.get(field)
             for field in required_capability_fields
         ):
-            raise BrowserClaimError(
-                "source execution attestation has an invalid formal capability"
-            )
+            raise BrowserClaimError("source execution attestation has an invalid formal capability")
         serialized_attestation = attestation.model_dump(mode="json")
         unsigned = {
             "schema_version": SOURCE_EXECUTION_RECEIPT_SCHEMA,
@@ -4046,13 +3956,8 @@ class BrowserTaskBridge:
             "parser_version": attestation.parser_version,
             "query_sha256": query_sha256,
             "source_observation_sha256": expected_observation_sha256,
-            "completion_sha256": _canonical_json_sha256(
-                completion.model_dump(mode="json")
-            ),
-            **{
-                field: capability[field]
-                for field in sorted(required_capability_fields)
-            },
+            "completion_sha256": _canonical_json_sha256(completion.model_dump(mode="json")),
+            **{field: capability[field] for field in sorted(required_capability_fields)},
             "completed_at": serialized_attestation["completed_at"],
         }
         return BrowserSourceExecutionReceipt.model_validate(
@@ -4074,6 +3979,40 @@ class BrowserTaskBridge:
         async with self._changed:
             self._housekeep_and_notify_locked()
             return self._snapshot(self._record(task_id))
+
+    async def get_lease_status(self, task_id: str) -> BrowserTaskLeaseStatus:
+        """Return only the fields needed to prove that a lease is still active.
+
+        The full task projection may include a large query, quotes, and retained
+        completion material.  Loading and serializing that payload from every
+        browser stage caused the local lease check itself to exceed its timeout
+        under a flexible-date burst.  This read deliberately avoids completion
+        publication and large JSON columns.
+        """
+
+        if self._durable_store is not None:
+            value = await self._durable_store.get_consumer_lease_status(
+                task_id,
+                tenant_id=self._durable_tenant_id,
+            )
+            if value is None:
+                raise BrowserTaskNotFoundError(f"browser task not found: {task_id}")
+            state, claimed_by, updated_at = value
+            return BrowserTaskLeaseStatus(
+                id=task_id,
+                state=BrowserTaskState(state),
+                claimed_by=claimed_by,
+                updated_at=updated_at,
+            )
+        async with self._changed:
+            self._housekeep_and_notify_locked()
+            record = self._record(task_id)
+            return BrowserTaskLeaseStatus(
+                id=record.id,
+                state=record.state,
+                claimed_by=record.claimed_by,
+                updated_at=record.updated_at,
+            )
 
     async def cancel_many(
         self,
@@ -4107,8 +4046,7 @@ class BrowserTaskBridge:
             for record in records:
                 if record.state.terminal:
                     retention_released = (
-                        self._release_terminal_waiter_locked(record)
-                        or retention_released
+                        self._release_terminal_waiter_locked(record) or retention_released
                     )
                     continue
                 consumers = self._active_consumers.get(record.id, 1)
@@ -4201,10 +4139,7 @@ class BrowserTaskBridge:
             return await wait_for_terminal()
 
     def _release_terminal_waiter_locked(self, record: _TaskRecord) -> bool:
-        if (
-            record.submission.query.options.get(_LEDGER_TERMINAL_RETENTION_OPTION)
-            is not True
-        ):
+        if record.submission.query.options.get(_LEDGER_TERMINAL_RETENTION_OPTION) is not True:
             return False
         consumers = self._active_consumers.get(record.id, 0)
         if consumers == 0:
@@ -4328,27 +4263,37 @@ class BrowserTaskBridge:
             authorized_scope_keys=(
                 authorized_scope_keys
                 if authorized_scope_keys
-                else previous.authorized_scope_keys if previous is not None else ()
+                else previous.authorized_scope_keys
+                if previous is not None
+                else ()
             ),
             adapter_version=(
                 adapter_version
                 if adapter_version is not None
-                else previous.adapter_version if previous is not None else None
+                else previous.adapter_version
+                if previous is not None
+                else None
             ),
             contract_version=(
                 contract_version
                 if contract_version is not None
-                else previous.contract_version if previous is not None else None
+                else previous.contract_version
+                if previous is not None
+                else None
             ),
             build_identity=(
                 build_identity
                 if build_identity is not None
-                else previous.build_identity if previous is not None else None
+                else previous.build_identity
+                if previous is not None
+                else None
             ),
             runtime_instance_id=(
                 runtime_instance_id
                 if runtime_instance_id is not None
-                else previous.runtime_instance_id if previous is not None else None
+                else previous.runtime_instance_id
+                if previous is not None
+                else None
             ),
         )
 
@@ -4373,19 +4318,13 @@ class BrowserTaskBridge:
 
     @staticmethod
     def _validate_idempotency_key(value: str) -> None:
-        safe_characters = (
-            "abcdefghijklmnopqrstuvwxyz"
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            "0123456789._:-"
-        )
+        safe_characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
         if (
             len(value) < 8
             or len(value) > 128
             or any(character not in safe_characters for character in value)
         ):
-            raise ValueError(
-                "idempotency key must contain 8 to 128 safe ASCII characters"
-            )
+            raise ValueError("idempotency key must contain 8 to 128 safe ASCII characters")
 
     @staticmethod
     def _reload_request_fingerprint(
@@ -4404,8 +4343,7 @@ class BrowserTaskBridge:
         return tuple(
             record.id
             for record in self._records.values()
-            if record.state == BrowserTaskState.CLAIMED
-            and record.claimed_by == companion_id
+            if record.state == BrowserTaskState.CLAIMED and record.claimed_by == companion_id
         )
 
     def _reload_control_locked(
@@ -4419,8 +4357,7 @@ class BrowserTaskBridge:
                     self._reload_requests.values(),
                     key=lambda item: (item.requested_at, item.id),
                 )
-                if candidate.companion_id == companion_id
-                and not candidate.state.terminal
+                if candidate.companion_id == companion_id and not candidate.state.terminal
             ),
             None,
         )
@@ -4460,9 +4397,7 @@ class BrowserTaskBridge:
             return None, False
         receipt_token = secrets.token_urlsafe(32)
         record.delivery_generation += 1
-        record.receipt_token_sha256 = hashlib.sha256(
-            receipt_token.encode("utf-8")
-        ).hexdigest()
+        record.receipt_token_sha256 = hashlib.sha256(receipt_token.encode("utf-8")).hexdigest()
         record.state = BrowserCompanionControlState.DISPATCHED
         record.updated_at = now
         return (
@@ -4489,19 +4424,15 @@ class BrowserTaskBridge:
         if record.receipt_token_sha256 is None:
             raise BrowserCompanionControlError("reload request has no active receipt token")
         supplied_sha256 = hashlib.sha256(receipt.receipt_token.encode("utf-8")).hexdigest()
-        if (
-            receipt.delivery_generation != record.delivery_generation
-            or not hmac.compare_digest(record.receipt_token_sha256, supplied_sha256)
+        if receipt.delivery_generation != record.delivery_generation or not hmac.compare_digest(
+            record.receipt_token_sha256, supplied_sha256
         ):
             raise BrowserCompanionControlError(
                 "reload receipt token or delivery generation does not match"
             )
-        if (
-            receipt.previous_runtime_instance_id is not None
-            and not hmac.compare_digest(
-                receipt.previous_runtime_instance_id,
-                record.expected_runtime_instance_id,
-            )
+        if receipt.previous_runtime_instance_id is not None and not hmac.compare_digest(
+            receipt.previous_runtime_instance_id,
+            record.expected_runtime_instance_id,
         ):
             raise BrowserCompanionControlError(
                 "reload receipt previous runtime does not match the dispatched runtime"
@@ -4519,15 +4450,12 @@ class BrowserTaskBridge:
                 raise BrowserCompanionControlError(
                     "accepted receipt requires a dispatched reload request"
                 )
-            if (
-                not hmac.compare_digest(
-                    receipt.runtime_instance_id,
-                    record.expected_runtime_instance_id,
-                )
-                or not hmac.compare_digest(
-                    receipt.build_identity.build_sha256,
-                    record.request.expected_current_build_sha256,
-                )
+            if not hmac.compare_digest(
+                receipt.runtime_instance_id,
+                record.expected_runtime_instance_id,
+            ) or not hmac.compare_digest(
+                receipt.build_identity.build_sha256,
+                record.request.expected_current_build_sha256,
             ):
                 raise BrowserCompanionControlError(
                     "accepted receipt must come from the dispatched old runtime and build"
@@ -4634,11 +4562,7 @@ class BrowserTaskBridge:
         sealed_sha256 = details.get("inventory_receipt_sha256")
         declared_state = details.get("inventory_result_state")
         audited_states = {state.value for state in LodgingInventoryReceiptState}
-        if (
-            declared_state not in audited_states
-            and raw_receipt is None
-            and sealed_sha256 is None
-        ):
+        if declared_state not in audited_states and raw_receipt is None and sealed_sha256 is None:
             return
         if (
             declared_state not in audited_states
@@ -4671,8 +4595,7 @@ class BrowserTaskBridge:
                 "expected_package_area",
                 "segment",
             )
-            if isinstance((value := submission.query.options.get(key)), str)
-            and value
+            if isinstance((value := submission.query.options.get(key)), str) and value
         }
         confirmed = receipt.confirmed_query
         expected_confirmed_exhaustive = (
@@ -4683,8 +4606,7 @@ class BrowserTaskBridge:
             pending = receipt.provider_pending_evidence
             pending_duration_valid = bool(
                 pending is not None
-                and details.get("bounded_pending_observed_ms")
-                == pending.observed_duration_ms
+                and details.get("bounded_pending_observed_ms") == pending.observed_duration_ms
             )
         elif details.get("bounded_pending_observed_ms") is not None:
             pending_duration_valid = False
@@ -4699,8 +4621,7 @@ class BrowserTaskBridge:
             or receipt.provider != submission.provider
             or receipt.state.value != declared_state
             or failure.code not in expected_failure_codes[receipt.state]
-            or details.get("confirmed_exhaustive")
-            is not expected_confirmed_exhaustive
+            or details.get("confirmed_exhaustive") is not expected_confirmed_exhaustive
             or details.get("scanned_count") != receipt.scanned_count
             or confirmed.destination != submission.query.destination
             or confirmed.start_date != submission.query.start_date
@@ -4828,19 +4749,14 @@ class BrowserTaskBridge:
 
     def _terminal_record_has_pending_ledger_waiter(self, record: _TaskRecord) -> bool:
         return bool(
-            record.submission.query.options.get(_LEDGER_TERMINAL_RETENTION_OPTION)
-            is True
+            record.submission.query.options.get(_LEDGER_TERMINAL_RETENTION_OPTION) is True
             and self._active_consumers.get(record.id, 0) > 0
         )
 
     def _prune_terminal_reload_requests(self) -> bool:
         now = self._utc_now()
         terminal = sorted(
-            (
-                record
-                for record in self._reload_requests.values()
-                if record.state.terminal
-            ),
+            (record for record in self._reload_requests.values() if record.state.terminal),
             key=lambda record: (record.updated_at, record.id),
         )
         remove_ids = {
@@ -4907,9 +4823,7 @@ class BrowserTaskBridge:
                     record.state = BrowserTaskState.FAILED
                     record.failure = BrowserFailure(
                         code=BrowserFailureCode.TIMEOUT,
-                        message=(
-                            "browser bridge restarted after the final allowed task claim"
-                        ),
+                        message=("browser bridge restarted after the final allowed task claim"),
                         retryable=True,
                         captured_at=now,
                         details={"recovered_after_restart": True},
@@ -4928,25 +4842,19 @@ class BrowserTaskBridge:
                 companion_id=persisted_reload.companion_id,
                 idempotency_key=persisted_reload.idempotency_key,
                 request=persisted_reload.request,
-                request_fingerprint_sha256=(
-                    persisted_reload.request_fingerprint_sha256
-                ),
+                request_fingerprint_sha256=(persisted_reload.request_fingerprint_sha256),
                 state=persisted_reload.state,
                 requested_at=persisted_reload.requested_at,
                 updated_at=persisted_reload.updated_at,
                 expires_at=persisted_reload.expires_at,
                 drain_deadline_at=persisted_reload.drain_deadline_at,
-                expected_runtime_instance_id=(
-                    persisted_reload.expected_runtime_instance_id
-                ),
+                expected_runtime_instance_id=(persisted_reload.expected_runtime_instance_id),
                 delivery_generation=persisted_reload.delivery_generation,
                 receipt_token_sha256=persisted_reload.receipt_token_sha256,
                 accepted_at=persisted_reload.accepted_at,
                 applied_at=persisted_reload.applied_at,
                 observed_build_sha256=persisted_reload.observed_build_sha256,
-                observed_runtime_instance_id=(
-                    persisted_reload.observed_runtime_instance_id
-                ),
+                observed_runtime_instance_id=(persisted_reload.observed_runtime_instance_id),
                 failure_code=persisted_reload.failure_code,
             )
         self._housekeep()
@@ -5250,9 +5158,7 @@ def create_browser_bridge_app(
                     )
                 )
                 if any(item != checked_capability for item in attached):
-                    raise ValueError(
-                        "formal browser cancellation crosses execution capabilities"
-                    )
+                    raise ValueError("formal browser cancellation crosses execution capabilities")
                 tasks = await task_bridge.cancel_many(
                     payload.task_ids,
                     reason=payload.reason,
@@ -5289,9 +5195,7 @@ def create_browser_bridge_app(
                     )
                 )
                 if any(item != checked_capability for item in attached):
-                    raise ValueError(
-                        "formal browser snapshot crosses execution capabilities"
-                    )
+                    raise ValueError("formal browser snapshot crosses execution capabilities")
                 tasks = tuple(
                     await asyncio.gather(
                         *(task_bridge.get(task_id) for task_id in payload.task_ids)
@@ -5349,18 +5253,13 @@ def create_browser_bridge_app(
                 reload_receipt=payload.reload_receipt,
             )
             if source_authority is not None and response.leases:
-                scoped_leases: list[
-                    tuple[BrowserTaskLease, dict[str, object]]
-                ] = []
+                scoped_leases: list[tuple[BrowserTaskLease, dict[str, object]]] = []
                 for lease in response.leases:
-                    capability = await task_bridge.formal_execution_capability(
-                        lease.task_id
-                    )
+                    capability = await task_bridge.formal_execution_capability(lease.task_id)
                     if capability is not None:
                         scoped_leases.append((lease, capability))
                 for capability_id in dict.fromkeys(
-                    str(capability["capability_id"])
-                    for _lease, capability in scoped_leases
+                    str(capability["capability_id"]) for _lease, capability in scoped_leases
                 ):
                     group = [
                         lease
@@ -5379,16 +5278,12 @@ def create_browser_bridge_app(
                                 "formal browser claim has no acknowledged Companion heartbeat"
                             )
                         for lease in group:
-                            lease_payload = lease.model_dump(
-                                mode="json", exclude={"claim_token"}
-                            )
-                            lease_payload["formal_query"] = (
-                                source_authority.formal_browser_query(
-                                    task_id=lease.task_id,
-                                    provider=lease.provider.value,
-                                    kind=lease.kind.value,
-                                    query=lease.query.model_dump(mode="json"),
-                                )
+                            lease_payload = lease.model_dump(mode="json", exclude={"claim_token"})
+                            lease_payload["formal_query"] = source_authority.formal_browser_query(
+                                task_id=lease.task_id,
+                                provider=lease.provider.value,
+                                kind=lease.kind.value,
+                                query=lease.query.model_dump(mode="json"),
                             )
                             formal_leases.append(lease_payload)
                         source_authority.record_browser_http(
@@ -5410,9 +5305,7 @@ def create_browser_bridge_app(
             return response.model_copy(
                 update={
                     "formal_activation_request": (
-                        FormalBrowserActivationRequest.model_validate(
-                            pending_activation
-                        )
+                        FormalBrowserActivationRequest.model_validate(pending_activation)
                         if pending_activation is not None
                         else None
                     )
@@ -5486,8 +5379,7 @@ def create_browser_bridge_app(
                 )
             failpoint_event = (
                 formal_activation_failpoint_events.get(str(acknowledgment["job_id"]))
-                if formal_activation_failpoint_events is not None
-                and acknowledgment is not None
+                if formal_activation_failpoint_events is not None and acknowledgment is not None
                 else None
             )
             if failpoint_event is not None:
@@ -5612,6 +5504,21 @@ def create_browser_bridge_app(
         except BrowserTaskNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.get(
+        "/v1/tasks/{task_id}/lease-status",
+        response_model=BrowserTaskLeaseStatus,
+    )
+    async def get_task_lease_status(
+        task_id: str,
+        request: Request,
+        token: Annotated[str | None, Header(alias=BRIDGE_TOKEN_HEADER)] = None,
+    ) -> BrowserTaskLeaseStatus:
+        await authorize(request, token)
+        try:
+            return await task_bridge.get_lease_status(task_id)
+        except BrowserTaskNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.post("/v1/tasks/{task_id}/complete", response_model=BrowserTaskSnapshot)
     async def complete_task(
         task_id: str,
@@ -5655,8 +5562,6 @@ def create_browser_bridge_app_from_env() -> FastAPI:
     )
     return create_browser_bridge_app(
         bridge_token=token,
-        control_token=(
-            os.environ.get("TRIPCHORD_BROWSER_BRIDGE_CONTROL_TOKEN") or None
-        ),
+        control_token=(os.environ.get("TRIPCHORD_BROWSER_BRIDGE_CONTROL_TOKEN") or None),
         allowed_origin_regex=origin_regex,
     )

@@ -247,6 +247,42 @@ async def test_scripted_model_can_add_a_weighted_preference_but_not_hard_facts()
 
 
 @pytest.mark.asyncio
+async def test_complete_deterministic_request_can_skip_optional_model() -> None:
+    client = ScriptedModelClient(
+        (
+            ModelResponse(
+                text=json.dumps({"preferences": []}),
+                provider="placeholder",
+                model="placeholder",
+            ),
+        )
+    )
+    result = await HybridPackageRequirementAgent(
+        model_client=client,
+        now=lambda: datetime(2026, 8, 24, 8, tzinfo=UTC),
+        skip_model_when_deterministic_ready=True,
+    ).parse(
+        PackageRequirementRequest(
+            text=(
+                "我想从杭州出发去马尔代夫，2026年8月20日以后出发，"
+                "最晚2026年9月10日回到杭州，玩4到8天，2位成人，1间房。"
+                "住宿不要简陋或偏僻，兼顾品质和价格；比较机场附近过渡住宿"
+                "与位置体验更好的选择。请比较已连接平台并给出整趟总价更合适的"
+                "最终方案。早餐无要求，接受合理中转。"
+            ),
+            reference_date=date(2026, 8, 24),
+        )
+    )
+
+    assert result.state == PackageRequestState.READY
+    assert result.window is not None
+    assert result.window.earliest_departure == date(2026, 8, 24)
+    assert result.window.latest_arrival_date == date(2026, 9, 10)
+    assert result.model_proposal is None
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
 async def test_model_conflict_is_ignored_and_explicit_user_values_stay_locked() -> None:
     control = ScriptedModelClient(
         (
@@ -529,6 +565,35 @@ async def test_date_start_and_completion_boundary_form_a_flexible_window() -> No
     assert result.window.latest_return_date == date(2026, 9, 10)
     assert result.window.return_date_targets == (date(2026, 9, 9), date(2026, 9, 10))
     assert (result.window.min_nights, result.window.max_nights) == (3, 7)
+
+
+@pytest.mark.asyncio
+async def test_departure_lower_bound_keeps_remaining_future_window_and_preferences() -> None:
+    result = await HybridPackageRequirementAgent(
+        now=lambda: datetime(2026, 8, 24, 8, tzinfo=UTC)
+    ).parse(
+        PackageRequirementRequest(
+            text=(
+                "杭州出发去马尔代夫，2026年8月20日以后出发，"
+                "最晚2026年9月10日回到杭州，玩4到8天，2位成人，1间房。"
+                "住宿不要简陋或偏僻，兼顾品质和价格；比较机场附近过渡住宿与更好的选择。"
+            ),
+            reference_date=date(2026, 8, 24),
+        )
+    )
+
+    assert result.state == PackageRequestState.READY
+    assert result.window is not None
+    assert result.window.earliest_departure == date(2026, 8, 24)
+    assert result.window.latest_departure == date(2026, 9, 7)
+    assert result.window.latest_arrival_date == date(2026, 9, 10)
+    projected, _ = project_preferences_to_intent_template(
+        result.intent_template,
+        result.preferences,
+    )
+    assert projected.require_non_basic_lodging is True
+    assert projected.require_non_remote_lodging is True
+    assert result.preferences.effective("lodging_price") is not None
 
 
 @pytest.mark.asyncio

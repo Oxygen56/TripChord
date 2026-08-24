@@ -41,7 +41,9 @@ class _WaveBudgetProbeBridge(BrowserTaskBridge):
             self.positions[snapshot.id] = len(self.positions)
         for submission, snapshot in zip(submissions, snapshots, strict=True):
             self.lease_by_id[snapshot.id] = submission.timeout_seconds
-        if len(self.positions) == 11:
+        # Flight-first scheduling admits the three flight sources before any
+        # lodging source can become runnable.
+        if len(self.positions) == 3:
             self.all_submitted.set()
         return snapshots
 
@@ -56,8 +58,8 @@ class _WaveBudgetProbeBridge(BrowserTaskBridge):
         await asyncio.wait_for(self.all_submitted.wait(), timeout=2)
         task_id = ids[0]
         self.wait_budgets[task_id] = timeout_seconds
-        # Production waits for one leased task at a time.  Later scheduler
-        # waves do not extend the per-task wait budget.
+        # Production waits for one public task handle, but its acquisition may
+        # still be queued behind earlier graph sources before receiving a lease.
         minimum_budget = float(self.lease_by_id[task_id] + 1)
         if timeout_seconds < minimum_budget:
             raise TimeoutError(f"task requires {minimum_budget:g} seconds")
@@ -133,7 +135,7 @@ def test_source_offsets_remain_absolute_across_supervisor_waves(
 
 
 @pytest.mark.asyncio
-async def test_eleven_browser_sources_do_not_time_out_while_waiting_for_later_waves() -> None:
+async def test_admitted_flight_sources_keep_the_full_graph_queue_budget() -> None:
     bridge = _WaveBudgetProbeBridge()
     system = LivePackageAgentSystem(bridge, now=lambda: NOW)
 
@@ -144,14 +146,47 @@ async def test_eleven_browser_sources_do_not_time_out_while_waiting_for_later_wa
         timeout_seconds=15,
     )
 
-    assert len(bridge.wait_budgets) == 11
-    # Each browser task is waited independently after it receives a lease.
-    # The bridge timeout therefore covers one frozen 15s task lease plus the
-    # 1s handoff, rather than multiplying that timeout by later scheduler
-    # waves.  The C-98 lodging lease bump is removed: retry-with-tab-reuse
-    # handles the lodging budget split inside the frozen per-task lease.
-    assert set(bridge.wait_budgets.values()) == {16.0}
+    # Flight-first scheduling starts with the flight sources and may retry
+    # their bounded attempts before lodging becomes runnable.  Every admitted
+    # attempt keeps a caller wait that covers the complete source graph, while
+    # each claimed browser attempt retains its frozen 15s lease.
+    assert len(bridge.wait_budgets) >= 3
+    assert set(bridge.wait_budgets.values()) == {
+        _browser_wait_timeout_seconds(
+            15,
+            source_task_count=len(run.source_task_ids),
+        )
+    }
     assert all(
         all("TimeoutError" not in reason for reason in coverage.failure_reasons)
         for coverage in run.coverage
     )
+
+
+@pytest.mark.asyncio
+async def test_full_window_screen_submits_flights_without_ota_lodging() -> None:
+    bridge = _WaveBudgetProbeBridge()
+    system = LivePackageAgentSystem(bridge, now=lambda: NOW)
+    query = _query().model_copy(
+        update={
+            "options": {
+                "__tripchord_full_window_flight_screen": True,
+                "__tripchord_browser_wait_source_count": 90,
+            }
+        }
+    )
+
+    run = await system.run(
+        _intent(),
+        query,
+        mode=LiveCoverageMode.STRICT,
+        timeout_seconds=15,
+        model_agents_enabled=False,
+    )
+
+    assert len(run.source_task_ids) == 3
+    assert run.evidence_scope.value == "full_window_baseline_screen"
+    assert all(source_id.endswith("-flight") for source_id in run.source_task_ids)
+    assert set(bridge.wait_budgets.values()) == {
+        _browser_wait_timeout_seconds(15, source_task_count=90)
+    }

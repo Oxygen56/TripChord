@@ -41,11 +41,10 @@ _API_ORIGIN = f"https://{_API_HOST}"
 _OPERATOR = "iCom Tours"
 _MVT = timezone(timedelta(hours=5), name="MVT")
 _FORBIDDEN_PATH_WORDS = frozenset({"booking", "payment", "order"})
-_ECB_DAILY_REFERENCE_URL = (
-    "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
-)
+_ECB_DAILY_REFERENCE_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
 _ECB_MAX_RESPONSE_BYTES = 128_000
 _ECB_RATE_QUANTUM = Decimal("0.000001")
+_SHARED_PUBLIC_READ_TTL = timedelta(minutes=5)
 
 
 class _Endpoint(StrEnum):
@@ -138,9 +137,9 @@ class IComCnyReferenceEstimate(DomainModel):
         "tripchord-icom-cny-reference-estimate-v1"
     )
     source_name: Literal["European Central Bank"] = "European Central Bank"
-    source_url: Literal[
+    source_url: Literal["https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"] = (
         "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
-    ] = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+    )
     rate_date: date
     captured_at: AwareDatetime
     usd_per_eur: Decimal = Field(gt=0)
@@ -166,10 +165,9 @@ class IComCnyReferenceEstimate(DomainModel):
         if self.usd_to_cny_reference_rate != expected_rate:
             raise ValueError("USD/CNY reference rate does not reconcile with ECB cross rates")
         expected_cny_cents = int(
-            (
-                Decimal(self.source_usd_base_fare_cents)
-                * self.usd_to_cny_reference_rate
-            ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+            (Decimal(self.source_usd_base_fare_cents) * self.usd_to_cny_reference_rate).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
         )
         if self.estimated_cny_cents != expected_cny_cents:
             raise ValueError("iCom CNY estimate does not reconcile with source USD cents")
@@ -398,14 +396,6 @@ class _ScheduleRow(_PayloadModel):
     origin: _LocationRow
     destination: _LocationRow
 
-    @model_validator(mode="after")
-    def validate_capacity(self) -> _ScheduleRow:
-        if self.remaining_capacity > self.capacity:
-            raise ValueError("remainingCapacity exceeds capacity")
-        if self.vessel.total_capacity < self.capacity:
-            raise ValueError("trip capacity exceeds vessel totalCapacity")
-        return self
-
 
 class _SchedulesResponse(_PayloadModel):
     meta: _ApiMeta
@@ -524,11 +514,7 @@ async def fetch_icom_cny_reference_estimate(
                 "ECB reference-rate response was not valid XML",
             ) from exc
         day_node = next(
-            (
-                node
-                for node in root.iter()
-                if node.tag.endswith("Cube") and "time" in node.attrib
-            ),
+            (node for node in root.iter() if node.tag.endswith("Cube") and "time" in node.attrib),
             None,
         )
         if day_node is None:
@@ -542,9 +528,7 @@ async def fetch_icom_cny_reference_estimate(
             rates = {
                 node.attrib["currency"]: Decimal(node.attrib["rate"])
                 for node in day_node
-                if node.tag.endswith("Cube")
-                and "currency" in node.attrib
-                and "rate" in node.attrib
+                if node.tag.endswith("Cube") and "currency" in node.attrib and "rate" in node.attrib
             }
             usd_per_eur = rates["USD"]
             cny_per_eur = rates["CNY"]
@@ -610,6 +594,9 @@ class IComTransferProvider:
         self._owns_client = client is None
         self._now = now or (lambda: datetime.now(UTC))
         self._source_authority = source_authority
+        self._shared_fetch_lock = asyncio.Lock()
+        self._shared_fetches: dict[str, _FetchedPayload] = {}
+        self._inflight_fetches: dict[str, asyncio.Task[_FetchedPayload]] = {}
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -634,12 +621,12 @@ class IComTransferProvider:
         recorded_task_id = query_task_id or "non-formal-query"
         query_identity = query.model_dump(mode="json")
         requests = (
-            self._fetch(
+            self._fetch_shared(
                 _Endpoint.SCHEDULES,
                 params={"date": query.travel_date.isoformat()},
             ),
-            self._fetch(_Endpoint.BASE_FARE),
-            self._fetch(_Endpoint.POLICY),
+            self._fetch_shared(_Endpoint.BASE_FARE),
+            self._fetch_shared(_Endpoint.POLICY),
         )
         try:
             async with asyncio.timeout(self._config.timeout_seconds):
@@ -671,9 +658,7 @@ class IComTransferProvider:
         if formal_active and self._source_authority is not None:
             for endpoint in _ENDPOINTS:
                 fetched = fetched_by_endpoint[endpoint]
-                parsed_query = dict(
-                    httpx.QueryParams(httpx.URL(fetched.source_url).query)
-                )
+                parsed_query = dict(httpx.QueryParams(httpx.URL(fetched.source_url).query))
                 formal_call = self._source_authority.formal_icom_call(
                     source_task_id=recorded_task_id,
                     query_identity=query_identity,
@@ -687,9 +672,7 @@ class IComTransferProvider:
                         "source_task_id": formal_call["source_task_id"],
                         "query_task_id": formal_call["query_task_id"],
                         "call_id": formal_call["call_id"],
-                        "call_identity_sha256": formal_call[
-                            "call_identity_sha256"
-                        ],
+                        "call_identity_sha256": formal_call["call_identity_sha256"],
                         "query_identity": {
                             key: formal_call[key]
                             for key in (
@@ -705,9 +688,7 @@ class IComTransferProvider:
                                 "adults",
                             )
                         },
-                        "query_identity_sha256": formal_call[
-                            "query_identity_sha256"
-                        ],
+                        "query_identity_sha256": formal_call["query_identity_sha256"],
                         "url": fetched.source_url,
                         "path": endpoint.value,
                         "query": parsed_query,
@@ -746,6 +727,41 @@ class IComTransferProvider:
             options=options,
             source_urls=tuple(fetched_by_endpoint[endpoint].source_url for endpoint in _ENDPOINTS),
         )
+
+    async def _fetch_shared(
+        self,
+        endpoint: _Endpoint,
+        *,
+        params: dict[str, str] | None = None,
+    ) -> _FetchedPayload:
+        """Share identical public reads across a full-window planning run."""
+
+        cache_key = json.dumps(
+            {"endpoint": endpoint.value, "params": params or {}},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        async with self._shared_fetch_lock:
+            cached = self._shared_fetches.get(cache_key)
+            if cached is not None and self._now() - cached.captured_at <= _SHARED_PUBLIC_READ_TTL:
+                return cached
+            task = self._inflight_fetches.get(cache_key)
+            if task is None:
+                task = asyncio.create_task(self._fetch(endpoint, params=params))
+                self._inflight_fetches[cache_key] = task
+        try:
+            fetched = await asyncio.shield(task)
+        except BaseException:
+            if task.done():
+                async with self._shared_fetch_lock:
+                    if self._inflight_fetches.get(cache_key) is task:
+                        self._inflight_fetches.pop(cache_key, None)
+            raise
+        async with self._shared_fetch_lock:
+            self._shared_fetches[cache_key] = fetched
+            if self._inflight_fetches.get(cache_key) is task:
+                self._inflight_fetches.pop(cache_key, None)
+        return fetched
 
     async def _fetch(
         self,
@@ -1017,6 +1033,13 @@ class IComTransferProvider:
                 row.origin.name.casefold() != query.origin.value.casefold()
                 or row.destination.name.casefold() != query.destination.value.casefold()
             ):
+                continue
+            # iCom returns every route in one daily payload.  A capacity
+            # inconsistency on an unrelated route must not invalidate the
+            # requested Airport <-> Maafushi search.  For the requested route
+            # the inconsistent row is excluded because its availability is
+            # not safe to claim; other valid schedules remain usable.
+            if row.remaining_capacity > row.capacity or row.capacity > row.vessel.total_capacity:
                 continue
             departure_at, arrival_at = self._parse_mvt_times(row, query.travel_date)
             status = self._availability(row, query.adults)

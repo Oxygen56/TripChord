@@ -318,6 +318,56 @@ assert.equal(
   false,
 );
 {
+  const previousFetch = context.fetch;
+  const previousConnected = storage.tripchordConnected;
+  const previousToken = storage.tripchordBridgeToken;
+  let attempts = 0;
+  const leaseStatusUrls = [];
+  storage.tripchordConnected = true;
+  storage.tripchordBridgeToken = "t".repeat(32);
+  context.fetch = async (url, options = {}) => {
+    attempts += 1;
+    leaseStatusUrls.push(String(url));
+    if (attempts === 1) {
+      await new Promise((resolve) => {
+        options.signal.addEventListener("abort", resolve, { once: true });
+      });
+      throw new Error("signal is aborted without reason");
+    }
+    return {
+      ok: true,
+      async json() {
+        return {
+          state: "claimed",
+          claimed_by: "chrome-mv3-test-extension",
+        };
+      },
+    };
+  };
+  await hooks.assertLeaseActive({ task_id: "lease-timeout-retry" }, 5);
+  assert.equal(attempts, 2);
+  assert.equal(
+    leaseStatusUrls[0].endsWith(
+      "/v1/tasks/lease-timeout-retry/lease-status",
+    ),
+    true,
+  );
+
+  attempts = 0;
+  await assert.rejects(
+    hooks.assertLeaseActive(
+      { task_id: "lease-timeout-deadline" },
+      50,
+      Date.now() + 20,
+    ),
+    (error) => /timed out before completion/.test(String(error && error.message)),
+  );
+  assert.equal(attempts, 1);
+  context.fetch = previousFetch;
+  storage.tripchordConnected = previousConnected;
+  storage.tripchordBridgeToken = previousToken;
+}
+{
   const isolatedWindowId = 2;
   const isolatedTabId = 902;
   let cleanupAttempts = 0;
@@ -466,7 +516,7 @@ assert.equal(hooks.MAX_CTRIP_LODGING_PREVIEW_CANDIDATES, 12);
 assert.equal(hooks.MAX_CTRIP_LODGING_CAPTURE_CONTROLS, 6);
 assert.equal(hooks.CTRIP_LODGING_DETAIL_WORKFLOW_CAP_MS, 55000);
 assert.equal(hooks.INITIAL_LANDING_STAGE_CAP_MS, 40000);
-assert.equal(hooks.MAX_CONCURRENT_INITIAL_LANDINGS, 3);
+assert.equal(hooks.MAX_CONCURRENT_INITIAL_LANDINGS, 1);
 assert.equal(hooks.PREPARE_SEARCH_STAGE_CAP_MS, 35000);
 assert.equal(hooks.TRIGGER_SEARCH_STAGE_CAP_MS, 30000);
 assert.match(
@@ -763,20 +813,21 @@ assert.equal(
     ),
   );
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(runningLandings, 3);
-  assert.equal(landingReleases[3], undefined);
-  landingReleases[0]();
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(runningLandings, 3);
-  assert.equal(typeof landingReleases[3], "function");
-  landingReleases[1]();
-  landingReleases[2]();
+  assert.equal(runningLandings, 1);
+  assert.equal(typeof landingReleases[0], "function");
+  assert.equal(landingReleases[1], undefined);
+  for (let index = 0; index < 3; index += 1) {
+    landingReleases[index]();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(runningLandings, 1);
+    assert.equal(typeof landingReleases[index + 1], "function");
+  }
   landingReleases[3]();
   assert.deepEqual(
     Array.from(await Promise.all(landingRuns)),
     [0, 1, 2, 3],
   );
-  assert.equal(peakLandings, 3);
+  assert.equal(peakLandings, 1);
   assert.equal(
     traces.every((trace) => trace.length === 0),
     true,

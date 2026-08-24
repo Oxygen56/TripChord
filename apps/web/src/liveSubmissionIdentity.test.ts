@@ -78,7 +78,7 @@ describe("live submission identity", () => {
     expect(storage.getItem(identity.storageKey)).toContain(identity.tripId);
   });
 
-  it("uses bounded exponential polling backoff", () => {
+  it("uses bounded exponential reconnect backoff", () => {
     expect(retryDelayMs(1)).toBe(500);
     expect(retryDelayMs(2)).toBe(1000);
     expect(retryDelayMs(20)).toBe(8000);

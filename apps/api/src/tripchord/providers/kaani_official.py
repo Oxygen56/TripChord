@@ -35,8 +35,13 @@ KAANI_OFFICIAL_BOOKING_URL = "https://kaanihotels.com/stays/Beach-Hotel/book"
 KAANI_OFFICIAL_PROPERTY_URL = "https://kaanihotels.com/stays/Beach-Hotel"
 KAANI_SEAVIEW_ROOM_ID = "1861800000000000002"
 KAANI_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-KAANI_PARSER_CONTRACT = "kaani-official-ssr-v1"
-KAANI_RATE_CHUNK = "page-6bc33c7732fbd0d6.js"
+KAANI_PARSER_CONTRACT = "kaani-official-ssr-v2"
+KAANI_BOOKING_ROUTE_CHUNK_PATTERN = re.compile(
+    r"""src=["'](?P<src>/_next/static/chunks/[^"']*/stays/"""
+    r"""(?:%5Bslug%5D|\[(?:property|slug)\])/book/page-[0-9a-f]+\.js"""
+    r"""(?:\?[^"']*)?)["']""",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -82,11 +87,7 @@ class KaaniOfficialLodgingProvider:
     ) -> KaaniOfficialLodgingResult:
         if arrival_date is not None:
             query = query.model_copy(update={"start_date": arrival_date})
-        if (
-            query.start_date is None
-            or query.end_date is None
-            or query.destination_code != "MLE"
-        ):
+        if query.start_date is None or query.end_date is None or query.destination_code != "MLE":
             raise ValueError("Kaani official source requires an MLE lodging query")
         if query.adults != 2 or query.rooms != 1 or query.children != 0:
             raise ValueError("Kaani official source only supports the audited party shape")
@@ -118,7 +119,7 @@ class KaaniOfficialLodgingProvider:
         property_raw = property_response.content
         booking_text = _text(booking_raw)
         property_text = _text(property_raw)
-        self._validate_booking_page(
+        booking_route_chunk = self._validate_booking_page(
             booking_raw=booking_raw,
             booking_text=booking_text,
             query=query,
@@ -137,7 +138,7 @@ class KaaniOfficialLodgingProvider:
         total_usd = Decimal(rate_match.group(2))
         if qty < query.rooms or not total_usd.is_finite() or total_usd <= 0:
             raise ValueError("Kaani official seaview rate is not currently available")
-        rate_chunk_ref = f"kaani-official-rate-chunk:{KAANI_RATE_CHUNK}"
+        rate_chunk_ref = f"kaani-official-booking-route-chunk:{booking_route_chunk}"
         captured_at = self._now().astimezone(UTC)
         booking_sha = hashlib.sha256(booking_raw).hexdigest()
         property_sha = hashlib.sha256(property_raw).hexdigest()
@@ -197,9 +198,7 @@ class KaaniOfficialLodgingProvider:
             rooms=1,
             room_name="Deluxe Double Room Seaview + Balcony",
             breakfast_included=True,
-            cancellation_policy=(
-                None
-            ),
+            cancellation_policy=(None),
             provider_property_id="Beach-Hotel",
             provider_room_id=KAANI_SEAVIEW_ROOM_ID,
             provider_rate_plan_id=None,
@@ -235,7 +234,7 @@ class KaaniOfficialLodgingProvider:
     @staticmethod
     def _validate_booking_page(
         *, booking_raw: bytes, booking_text: str, query: BrowserSearchQuery, nights: int
-    ) -> None:
+    ) -> str:
         if query.start_date is None or query.end_date is None:
             raise ValueError("Kaani official booking validation requires stay dates")
         _require(
@@ -265,7 +264,10 @@ class KaaniOfficialLodgingProvider:
         room_window = decoded[max(0, room_match.start() - 900) : room_match.end() + 300]
         _require(room_window, r"Deluxe Double Room Seaview \+ Balcony", "room title")
         _require(room_window, r"(?:adults|capacity).{0,20}[2-9]", "room capacity")
-        _require(booking_raw.decode("utf-8"), re.escape(KAANI_RATE_CHUNK), "rate semantics chunk")
+        route_chunk = KAANI_BOOKING_ROUTE_CHUNK_PATTERN.search(booking_raw.decode("utf-8"))
+        if route_chunk is None:
+            raise ValueError("Kaani official page missing booking route chunk")
+        return route_chunk.group("src")
 
     @staticmethod
     def _validate_property_page(property_raw: bytes, property_text: str) -> None:

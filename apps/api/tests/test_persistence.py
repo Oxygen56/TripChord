@@ -94,3 +94,16 @@ async def test_event_recording_is_idempotent() -> None:
         assert len(first.events) == 1
         assert repeated.events == first.events
     await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_file_sqlite_uses_wal_and_waits_for_concurrent_writers(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'tripchord.db'}")
+    await database.create_schema()
+    async with database.engine.connect() as connection:
+        journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode")
+        busy_timeout = await connection.exec_driver_sql("PRAGMA busy_timeout")
+
+        assert journal_mode.scalar_one().lower() == "wal"
+        assert busy_timeout.scalar_one() == 30_000
+    await database.dispose()

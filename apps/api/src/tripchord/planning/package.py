@@ -163,9 +163,7 @@ class NormalizedQuote(DomainModel):
     reference_rate_source: str | None = Field(default=None, min_length=1)
     reference_rate_date: date | None = None
     reference_usd_to_cny: Decimal | None = Field(default=None, gt=0)
-    reference_rate_response_sha256: str | None = Field(
-        default=None, pattern="^[0-9a-f]{64}$"
-    )
+    reference_rate_response_sha256: str | None = Field(default=None, pattern="^[0-9a-f]{64}$")
     reference_rate_captured_at: datetime | None = None
 
     @field_validator("currency")
@@ -410,8 +408,7 @@ class NormalizedFlightQuote(NormalizedQuote):
                     transfer = matching_transfers[0]
                     if (
                         not transfer.through_ticket_protected
-                        or transfer.actual_buffer_minutes
-                        < transfer.minimum_buffer_minutes
+                        or transfer.actual_buffer_minutes < transfer.minimum_buffer_minutes
                         or transfer.actual_buffer_minutes
                         != int((current.departure_at - previous.arrival_at).total_seconds() // 60)
                     ):
@@ -528,8 +525,7 @@ def lodging_non_remote_evidence_confirmed(
     if address is None or not _EXPLICIT_LODGING_ADDRESS_PATTERN.search(address):
         return False
     return any(
-        _NEARBY_PROXIMITY_PATTERN.search(item)
-        and _NEARBY_SERVICE_PATTERN.search(item)
+        _NEARBY_PROXIMITY_PATTERN.search(item) and _NEARBY_SERVICE_PATTERN.search(item)
         for item in nearby_evidence
     )
 
@@ -538,9 +534,7 @@ def lodging_basic_markers(lodging: NormalizedLodgingQuote) -> tuple[str, ...]:
     """Return generic room-quality markers; provider names are never special-cased."""
 
     searchable = " ".join(
-        value.strip()
-        for value in (lodging.property_name, lodging.room_name or "")
-        if value.strip()
+        value.strip() for value in (lodging.property_name, lodging.room_name or "") if value.strip()
     )
     return tuple(name for name, pattern in _BASIC_LODGING_PATTERNS if pattern.search(searchable))
 
@@ -554,8 +548,7 @@ def lodging_quality_tier(lodging: NormalizedLodgingQuote) -> LodgingQualityTier:
     if any(term in searchable for term in ("阳台", "balcony")):
         return LodgingQualityTier.BALCONY
     if any(
-        term in searchable
-        for term in ("超级豪华", "豪华", "高级", "deluxe", "superior", "premium")
+        term in searchable for term in ("超级豪华", "豪华", "高级", "deluxe", "superior", "premium")
     ):
         return LodgingQualityTier.DELUXE
     return LodgingQualityTier.STANDARD
@@ -984,15 +977,11 @@ def lodging_is_comparison_eligible(
             intent.require_breakfast is None
             or lodging.breakfast_included is intent.require_breakfast
         )
-        and (
-            not intent.require_non_basic_lodging
-            or not lodging_basic_markers(lodging)
-        )
+        and (not intent.require_non_basic_lodging or not lodging_basic_markers(lodging))
         and (
             not intent.require_non_remote_lodging
             or (
-                lodging.location_convenience
-                == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+                lodging.location_convenience == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
                 and lodging_non_remote_evidence_confirmed(
                     lodging.location_address,
                     lodging.nearby_location_evidence,
@@ -1018,11 +1007,7 @@ def lodging_is_segment_comparison_eligible(
         lodging, intent, allow_reference_currency=allow_reference_currency
     ):
         return False
-    if (
-        lodging.area != area
-        or lodging.check_in != check_in
-        or lodging.check_out != check_out
-    ):
+    if lodging.area != area or lodging.check_in != check_in or lodging.check_out != check_out:
         return False
     if exact_place_key is not None:
         return lodging.place_key == exact_place_key
@@ -1108,9 +1093,10 @@ class PackageCandidateGenerationAudit(DomainModel):
     @model_validator(mode="after")
     def forbid_full_enumeration_claim(self) -> Self:
         expected_inventory_keys = {"flights", "lodgings", "transfers"}
-        if set(self.raw_inventory_counts) != expected_inventory_keys or set(
-            self.prescreened_inventory_counts
-        ) != expected_inventory_keys:
+        if (
+            set(self.raw_inventory_counts) != expected_inventory_keys
+            or set(self.prescreened_inventory_counts) != expected_inventory_keys
+        ):
             raise ValueError("candidate generation inventory counts require exact typed keys")
         if any(value < 0 for value in self.raw_inventory_counts.values()) or any(
             value < 0 for value in self.prescreened_inventory_counts.values()
@@ -1213,13 +1199,9 @@ class TravelPackageCandidate(DomainModel):
         start_date = self.flight.outbound_arrive_at.date()
         end_date = self.flight.return_depart_at.date()
         if self.kind == PackageCandidateKind.CONTINUOUS_ISLAND:
-            expected_lodgings = Counter(
-                {(PackageArea.DESTINATION_ISLAND, start_date, end_date): 1}
-            )
+            expected_lodgings = Counter({(PackageArea.DESTINATION_ISLAND, start_date, end_date): 1})
         elif self.kind == PackageCandidateKind.CONTINUOUS_AIRPORT_ISLAND:
-            expected_lodgings = Counter(
-                {(PackageArea.AIRPORT_ISLAND, start_date, end_date): 1}
-            )
+            expected_lodgings = Counter({(PackageArea.AIRPORT_ISLAND, start_date, end_date): 1})
         else:
             first_checkout = start_date + timedelta(days=1)
             last_checkin = end_date - timedelta(days=1)
@@ -1235,8 +1217,7 @@ class TravelPackageCandidate(DomainModel):
                 }
             )
         actual_lodgings = Counter(
-            (lodging.area, lodging.check_in, lodging.check_out)
-            for lodging in self.lodgings
+            (lodging.area, lodging.check_in, lodging.check_out) for lodging in self.lodgings
         )
         if actual_lodgings != expected_lodgings:
             raise ValueError("package lodging segments do not match candidate kind")
@@ -1262,8 +1243,7 @@ class TravelPackageCandidate(DomainModel):
             if len(group) == 1:
                 continue
             if len(group) != 2 or any(
-                transfer.price_scope != TransferPriceScope.ROUND_TRIP
-                for transfer in group
+                transfer.price_scope != TransferPriceScope.ROUND_TRIP for transfer in group
             ):
                 raise ValueError(
                     "a shared round-trip transfer contract must cover exactly two legs"
@@ -1275,9 +1255,7 @@ class TravelPackageCandidate(DomainModel):
                 or first.origin_place_key != returning.destination_place_key
                 or first.destination_place_key != returning.origin_place_key
             ):
-                raise ValueError(
-                    "shared round-trip transfer contracts require reciprocal legs"
-                )
+                raise ValueError("shared round-trip transfer contracts require reciprocal legs")
         return self
 
     @property
@@ -1295,13 +1273,17 @@ class TravelPackageCandidate(DomainModel):
             if self.flight.party_total_known and self.flight.total_for_party_cents is not None
             else 0
         )
-        return flight_total + sum(
-            lodging.total_for_party_cents
-            for lodging in self.lodgings
-            if lodging.currency == self.currency
-        ) + transfer_contract_total_cents(
-            self.transfers,
-            currency=self.currency,
+        return (
+            flight_total
+            + sum(
+                lodging.total_for_party_cents
+                for lodging in self.lodgings
+                if lodging.currency == self.currency
+            )
+            + transfer_contract_total_cents(
+                self.transfers,
+                currency=self.currency,
+            )
         )
 
     @property
@@ -1416,8 +1398,7 @@ class DecisionOnlyCandidateSet(DomainModel):
         if len(providers) != len(set(providers)):
             raise ValueError("decision-only candidates must use unique lodging providers")
         transfer_fingerprints = {
-            tuple(transfer.id for transfer in item.candidate.transfers)
-            for item in self.candidates
+            tuple(transfer.id for transfer in item.candidate.transfers) for item in self.candidates
         }
         if len(transfer_fingerprints) != 1:
             raise ValueError("decision-only candidates must share transfers")
@@ -1449,9 +1430,7 @@ def package_date_violations(
     """Apply the one authoritative date contract to every candidate class."""
 
     departure_matches = candidate.flight.outbound_depart_at.date() == intent.start_date
-    return_departure_matches = (
-        candidate.flight.return_depart_at.date() == intent.end_date
-    )
+    return_departure_matches = candidate.flight.return_depart_at.date() == intent.end_date
     if departure_matches and return_departure_matches:
         if (
             intent.latest_arrival_date is None
@@ -1488,9 +1467,7 @@ class PackageDiff(DomainModel):
     @property
     def changed(self) -> bool:
         return bool(
-            self.removed_component_ids
-            or self.added_component_ids
-            or self.changed_component_ids
+            self.removed_component_ids or self.added_component_ids or self.changed_component_ids
         )
 
 
@@ -1857,10 +1834,15 @@ def package_budget(candidate: TravelPackageCandidate) -> PackageBudgetBreakdown:
         )
         for currency, items in sorted(foreign_groups.items())
     )
-    all_in_total = flight_known and not supplemental and all(
-        quote.currency == candidate.currency and quote.taxes_and_fees_included is True
-        for quote in (candidate.flight, *candidate.lodgings, *candidate.transfers)
-    ) and not foreign_subtotals
+    all_in_total = (
+        flight_known
+        and not supplemental
+        and all(
+            quote.currency == candidate.currency and quote.taxes_and_fees_included is True
+            for quote in (candidate.flight, *candidate.lodgings, *candidate.transfers)
+        )
+        and not foreign_subtotals
+    )
     if flight_known:
         formula = (
             f"航班 {_money(candidate.currency, flight)} + "
@@ -1940,9 +1922,7 @@ def diff_packages(
     before_quotes = {
         quote.id: quote for quote in (before.flight, *before.lodgings, *before.transfers)
     }
-    after_quotes = {
-        quote.id: quote for quote in (after.flight, *after.lodgings, *after.transfers)
-    }
+    after_quotes = {quote.id: quote for quote in (after.flight, *after.lodgings, *after.transfers)}
     changed = tuple(
         item_id
         for item_id in before.component_ids
@@ -2230,7 +2210,10 @@ class PackagePlanner:
         """Build all bounded lodging variants for decision-only comparison."""
         variants = tuple(
             candidate
-            for candidate in self._continuous_candidates(intent, flight, inventory)
+            for candidate in (
+                *self._continuous_candidates(intent, flight, inventory),
+                *self._split_candidates(intent, flight, inventory),
+            )
             if not package_date_violations(intent, candidate)
             and candidate.transfers
             and all(item.provider == transfer_provider for item in candidate.transfers)
@@ -2319,9 +2302,7 @@ class PackagePlanner:
             "prescreened_structural_candidate_upper_bound": prescreened_upper,
             "generation_candidate_cap": candidate_cap,
             "transfer_beam_width": self.LIVE_TRANSFER_BEAM_WIDTH,
-            "transfer_limit_per_contract_bucket": (
-                self.LIVE_TRANSFER_LIMIT_PER_CONTRACT_BUCKET
-            ),
+            "transfer_limit_per_contract_bucket": (self.LIVE_TRANSFER_LIMIT_PER_CONTRACT_BUCKET),
             "structurally_joined_candidate_count": len(ranked_joined),
             "generated_candidate_ids": [item.id for item in generated],
             "rejection_reasons": list(rejection_reasons),
@@ -2349,9 +2330,7 @@ class PackagePlanner:
             prescreened_structural_candidate_upper_bound=prescreened_upper,
             generation_candidate_cap=candidate_cap,
             transfer_beam_width=self.LIVE_TRANSFER_BEAM_WIDTH,
-            transfer_limit_per_contract_bucket=(
-                self.LIVE_TRANSFER_LIMIT_PER_CONTRACT_BUCKET
-            ),
+            transfer_limit_per_contract_bucket=(self.LIVE_TRANSFER_LIMIT_PER_CONTRACT_BUCKET),
             structurally_joined_candidate_count=len(ranked_joined),
             generated_candidate_count=len(generated),
             generated_candidate_ids=tuple(item.id for item in generated),
@@ -2438,12 +2417,10 @@ class PackagePlanner:
                 and transfer.infants == intent.infants
                 and (
                     (
-                        transfer.price_guarantee
-                        == TransferPriceGuarantee.ALL_IN_CONFIRMED
+                        transfer.price_guarantee == TransferPriceGuarantee.ALL_IN_CONFIRMED
                         and transfer.currency == intent.currency
                     )
-                    or transfer.price_guarantee
-                    == TransferPriceGuarantee.PUBLISHED_BASE_FARE
+                    or transfer.price_guarantee == TransferPriceGuarantee.PUBLISHED_BASE_FARE
                 )
                 for transfer in inventory.transfers
             )
@@ -2467,9 +2444,7 @@ class PackagePlanner:
                         f"{service_date.isoformat()}:no_compatible_hard_contract"
                     )
             if len(reasons) == branch_reasons_before and flights:
-                reasons.append(
-                    f"{kind.value}:no_candidate_after_lodging_transfer_binding_join"
-                )
+                reasons.append(f"{kind.value}:no_candidate_after_lodging_transfer_binding_join")
 
         continuous_branches: tuple[tuple[PackageArea, PackageCandidateKind], ...]
         if intent.destination_place_key == PackagePlaceKey.MAAFUSHI:
@@ -2658,15 +2633,11 @@ class PackagePlanner:
             # silently disappearing from the candidate audit.
             if intent.require_non_basic_lodging and lodging_basic_markers(lodging):
                 continue
-            if (
-                intent.require_non_remote_lodging
-                and (
-                    lodging.location_convenience
-                    != LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
-                    or not lodging_non_remote_evidence_confirmed(
-                        lodging.location_address,
-                        lodging.nearby_location_evidence,
-                    )
+            if intent.require_non_remote_lodging and (
+                lodging.location_convenience != LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+                or not lodging_non_remote_evidence_confirmed(
+                    lodging.location_address,
+                    lodging.nearby_location_evidence,
                 )
             ):
                 continue
@@ -2812,9 +2783,7 @@ class PackagePlanner:
         flights: tuple[NormalizedFlightQuote, ...],
         limit: int,
     ) -> tuple[NormalizedFlightQuote, ...]:
-        ordered = tuple(
-            sorted(flights, key=lambda item: (item.total_for_party_cents, item.id))
-        )
+        ordered = tuple(sorted(flights, key=lambda item: (item.total_for_party_cents, item.id)))
         selected: dict[str, NormalizedFlightQuote] = {}
         feature_seen: set[tuple[str, str]] = set()
         for flight in ordered:
@@ -2845,9 +2814,7 @@ class PackagePlanner:
         lodgings: tuple[NormalizedLodgingQuote, ...],
         limit: int,
     ) -> tuple[NormalizedLodgingQuote, ...]:
-        ordered = tuple(
-            sorted(lodgings, key=lambda item: (item.total_for_party_cents, item.id))
-        )
+        ordered = tuple(sorted(lodgings, key=lambda item: (item.total_for_party_cents, item.id)))
         selected: dict[str, NormalizedLodgingQuote] = {}
         feature_seen: set[tuple[str, str]] = set()
         for lodging in ordered:
@@ -2963,9 +2930,7 @@ class PackagePlanner:
         for flight in flights:
             stay_start = flight.outbound_arrive_at.date()
             stay_end = flight.return_depart_at.date()
-            continuous = sum(
-                count(area, stay_start, stay_end) for area in continuous_areas
-            )
+            continuous = sum(count(area, stay_start, stay_end) for area in continuous_areas)
             split = 0
             if (stay_end - stay_start).days >= 3:
                 split = (
@@ -3301,15 +3266,11 @@ class PackagePlanner:
             and lodging.children == intent.children
             and lodging.infants == intent.infants
             and lodging.rooms == intent.rooms
-            and (
-                not intent.require_non_basic_lodging
-                or not lodging_basic_markers(lodging)
-            )
+            and (not intent.require_non_basic_lodging or not lodging_basic_markers(lodging))
             and (
                 not intent.require_non_remote_lodging
                 or (
-                    lodging.location_convenience
-                    == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+                    lodging.location_convenience == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
                     and lodging_non_remote_evidence_confirmed(
                         lodging.location_address,
                         lodging.nearby_location_evidence,
@@ -3360,10 +3321,7 @@ class PackagePlanner:
                 and transfer.adults == intent.adults
                 and transfer.children == intent.children
                 and transfer.infants == intent.infants
-                and (
-                    required_provider is None
-                    or transfer.provider == required_provider
-                )
+                and (required_provider is None or transfer.provider == required_provider)
                 and (
                     (
                         transfer.price_guarantee == TransferPriceGuarantee.ALL_IN_CONFIRMED
@@ -3488,13 +3446,15 @@ class PackagePlanner:
             if flight.party_total_known and flight.total_for_party_cents is not None
             else 0
         )
-        total = flight_total + sum(
-            item.total_for_party_cents
-            for item in lodgings
-            if item.currency == intent.currency
-        ) + transfer_contract_total_cents(
-            transfers,
-            currency=intent.currency,
+        total = (
+            flight_total
+            + sum(
+                item.total_for_party_cents for item in lodgings if item.currency == intent.currency
+            )
+            + transfer_contract_total_cents(
+                transfers,
+                currency=intent.currency,
+            )
         )
         return TravelPackageCandidate(
             id=f"{intent.trip_id}:package:{kind.value}:{digest}:v1",
@@ -3624,9 +3584,7 @@ class PackageVerifier:
         candidate: TravelPackageCandidate,
     ) -> list[PackageViolation]:
         hard_mismatches = [
-            quote.id
-            for quote in (candidate.flight,)
-            if quote.currency != intent.currency
+            quote.id for quote in (candidate.flight,) if quote.currency != intent.currency
         ]
         hard_mismatches.extend(
             transfer.id
@@ -3639,9 +3597,7 @@ class PackageVerifier:
         if candidate.currency != intent.currency:
             hard_mismatches.append(candidate.id)
         foreign_lodgings = tuple(
-            lodging.id
-            for lodging in candidate.lodgings
-            if lodging.currency != intent.currency
+            lodging.id for lodging in candidate.lodgings if lodging.currency != intent.currency
         )
         if hard_mismatches:
             return [
@@ -3856,8 +3812,7 @@ class PackageVerifier:
         stay_start = candidate.flight.outbound_arrive_at.date()
         stay_end = candidate.flight.return_depart_at.date()
         expected = {
-            stay_start + timedelta(days=offset): 0
-            for offset in range((stay_end - stay_start).days)
+            stay_start + timedelta(days=offset): 0 for offset in range((stay_end - stay_start).days)
         }
         outside = False
         for lodging in candidate.lodgings:
@@ -3889,13 +3844,9 @@ class PackageVerifier:
         stay_start = candidate.flight.outbound_arrive_at.date()
         stay_end = candidate.flight.return_depart_at.date()
         if candidate.kind == PackageCandidateKind.CONTINUOUS_ISLAND:
-            expected = Counter(
-                {(PackageArea.DESTINATION_ISLAND, stay_start, stay_end): 1}
-            )
+            expected = Counter({(PackageArea.DESTINATION_ISLAND, stay_start, stay_end): 1})
         elif candidate.kind == PackageCandidateKind.CONTINUOUS_AIRPORT_ISLAND:
-            expected = Counter(
-                {(PackageArea.AIRPORT_ISLAND, stay_start, stay_end): 1}
-            )
+            expected = Counter({(PackageArea.AIRPORT_ISLAND, stay_start, stay_end): 1})
         else:
             first_checkout = stay_start + timedelta(days=1)
             last_checkin = stay_end - timedelta(days=1)
@@ -3911,8 +3862,7 @@ class PackageVerifier:
                 }
             )
         actual = Counter(
-            (lodging.area, lodging.check_in, lodging.check_out)
-            for lodging in candidate.lodgings
+            (lodging.area, lodging.check_in, lodging.check_out) for lodging in candidate.lodgings
         )
         place_mismatch = tuple(
             lodging.id
@@ -3971,10 +3921,7 @@ class PackageVerifier:
                 continue
             reciprocal = bool(
                 len(group) == 2
-                and all(
-                    transfer.price_scope == TransferPriceScope.ROUND_TRIP
-                    for transfer in group
-                )
+                and all(transfer.price_scope == TransferPriceScope.ROUND_TRIP for transfer in group)
                 and group[0].origin_area == group[1].destination_area
                 and group[0].destination_area == group[1].origin_area
                 and group[0].origin_place_key == group[1].destination_place_key
@@ -4306,8 +4253,7 @@ class PackageVerifier:
                 item
                 for item in candidate.lodgings
                 if (
-                    item.location_convenience
-                    != LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+                    item.location_convenience != LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
                     or not lodging_non_remote_evidence_confirmed(
                         item.location_address,
                         item.nearby_location_evidence,
@@ -4343,8 +4289,7 @@ class PackageVerifier:
                 transfer.price_contract_id: transfer
                 for transfer in candidate.transfers
                 if (
-                    transfer.price_guarantee
-                    == TransferPriceGuarantee.PUBLISHED_BASE_FARE
+                    transfer.price_guarantee == TransferPriceGuarantee.PUBLISHED_BASE_FARE
                     and transfer.currency == candidate.currency
                 )
             }.values()
@@ -4354,10 +4299,7 @@ class PackageVerifier:
         )
         if not candidate.flight.party_total_known:
             return []
-        if (
-            intent.budget_cents is None
-            or minimum_known_total_cents <= intent.budget_cents
-        ):
+        if intent.budget_cents is None or minimum_known_total_cents <= intent.budget_cents:
             return []
         return [
             PackageViolation(
@@ -4367,9 +4309,7 @@ class PackageVerifier:
                 component_ids=candidate.component_ids,
                 details={
                     "total_cents": candidate.computed_total_cents,
-                    "known_same_currency_base_fare_cents": (
-                        known_same_currency_base_fare_cents
-                    ),
+                    "known_same_currency_base_fare_cents": (known_same_currency_base_fare_cents),
                     "minimum_known_total_cents": minimum_known_total_cents,
                     "budget_cents": intent.budget_cents,
                 },
@@ -4651,13 +4591,17 @@ class PackageRepairer:
             if flight.party_total_known and flight.total_for_party_cents is not None
             else 0
         )
-        total = flight_total + sum(
-            item.total_for_party_cents
-            for item in lodgings
-            if item.currency == candidate.currency
-        ) + transfer_contract_total_cents(
-            transfers,
-            currency=candidate.currency,
+        total = (
+            flight_total
+            + sum(
+                item.total_for_party_cents
+                for item in lodgings
+                if item.currency == candidate.currency
+            )
+            + transfer_contract_total_cents(
+                transfers,
+                currency=candidate.currency,
+            )
         )
         version = candidate.version + 1
         repaired = candidate.model_copy(

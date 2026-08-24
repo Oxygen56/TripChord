@@ -54,6 +54,7 @@ from tripchord.agents.live_system import (
     LivePackageAgentSystem,
     LiveRunPurpose,
     SourceExecutionCompleteness,
+    _browser_wait_timeout_seconds,
 )
 from tripchord.agents.memory import MemoryAccessContext, MemoryStore
 from tripchord.agents.model_gateway import ModelRouter
@@ -76,6 +77,7 @@ from tripchord.planning.flexible_dates import (
     AuditableDatePair,
     DateExplorationResult,
     DateOptimalityStatus,
+    FareDateHint,
     FlexibleDateExplorer,
     FlexibleQueryPlan,
     FlexibleQueryPlanBuilder,
@@ -103,6 +105,7 @@ from tripchord.planning.package import (
     PackageIntent,
     PackagePlaceKey,
     TransferOption,
+    lodging_reference_cny_if_comparable,
 )
 from tripchord.planning.stay_plans import (
     StayPlanCandidateSet,
@@ -111,11 +114,18 @@ from tripchord.planning.stay_plans import (
 )
 from tripchord.platform.terminal import SearchRun
 from tripchord.providers.browser_bridge import (
+    BrowserDateRangeQuery,
     BrowserProvider,
+    BrowserRangeCapabilityStatus,
+    BrowserRangeParty,
+    BrowserRangePriceBasis,
+    BrowserRangePriceFinality,
     BrowserSearchQuery,
     BrowserTaskSnapshot,
     BrowserTaskState,
     BrowserTaskSubmission,
+    BrowserVertical,
+    ctrip_trusted_flight_search_url,
 )
 
 _KIND_SUFFIX = {
@@ -147,8 +157,42 @@ _PUBLICATION_REFRESH_MODEL_AGENT_COUNT = 8
 _MAX_SOURCE_START_DELAY_MS = 900_000
 _FULL_WINDOW_FINALIZATION_BUFFER_SECONDS = 60
 INTERNAL_BENCHMARK_TOTAL_TIMEOUT_SECONDS = 530
+_FULL_WINDOW_PAIR_WORKERS = 30
+_FULL_WINDOW_FLIGHT_SCREEN_TIMEOUT_SECONDS = 60
+_FULL_WINDOW_ENRICHMENT_RESERVE_SECONDS = 150
+_FULL_WINDOW_RANGE_EXACT_PAIR_LIMIT = 3
+_CTRIP_RANGE_MAX_VISIBLE_PAIRS = 7
+_CTRIP_RANGE_TASK_TIMEOUT_SECONDS = 180
 
 PairCheckpointReporter = Callable[[LivePlanningPairCheckpoint], Awaitable[None]]
+
+
+def _provider_flight_failure_class(
+    run: LivePackageAgentRun,
+    provider: BrowserProvider,
+) -> str | None:
+    """Return only platform-wide user gates that are safe to stop repeating by date.
+
+    A missing exact quote, timeout, or parser failure can be specific to one
+    itinerary.  It must never suppress later date pairs.  Login and CAPTCHA
+    gates are different: the user explicitly asked this run to skip that whole
+    platform instead of waiting for human action.
+    """
+
+    coverage = next((item for item in run.coverage if item.provider == provider), None)
+    if coverage is None:
+        return None
+    if BrowserVertical.FLIGHT not in coverage.failed_verticals:
+        return None
+    prefix = f"source-{provider.value}-flight:"
+    reasons = tuple(
+        reason.lower() for reason in coverage.failure_reasons if reason.lower().startswith(prefix)
+    )
+    if any("login_required" in reason for reason in reasons):
+        return "login_required"
+    if any("captcha" in reason or "verification" in reason for reason in reasons):
+        return "captcha_required"
+    return None
 
 
 @dataclass
@@ -246,15 +290,13 @@ class _FlexibleAcquisitionLedger:
                 snapshot.attempt_count for snapshot in publication_snapshots
             ),
             "recent_quote_reuse_count": sum(
-                snapshot.reused_from_task_id is not None
-                for snapshot in exploration_snapshots
+                snapshot.reused_from_task_id is not None for snapshot in exploration_snapshots
             ),
             "inflight_coalesced_count": sum(
                 snapshot.inflight_coalesced for snapshot in exploration_snapshots
             ),
             "unclaimed_cancelled_count": sum(
-                snapshot.state == BrowserTaskState.CANCELLED
-                and snapshot.attempt_count == 0
+                snapshot.state == BrowserTaskState.CANCELLED and snapshot.attempt_count == 0
                 for snapshot in exploration_snapshots
             ),
         }
@@ -264,15 +306,18 @@ class _FlexibleAcquisitionLedger:
         payload = submission.query.model_dump(mode="json")
         options = dict(payload.get("options") or {})
         payload["options"] = {
-            key: value
-            for key, value in options.items()
-            if not key.startswith("__tripchord_")
+            key: value for key, value in options.items() if not key.startswith("__tripchord_")
         }
         canonical = {
             "provider": submission.provider.value,
             "kind": submission.kind.value,
             "partition": submission.reuse_partition_sha256,
             "query": payload,
+            "range_query": (
+                submission.range_query.model_dump(mode="json")
+                if submission.range_query is not None
+                else None
+            ),
         }
         return hashlib.sha256(
             json.dumps(
@@ -308,10 +353,7 @@ class _FlexibleAcquisitionLedger:
                 # must bypass the exploration ledger as well. They are a new
                 # exact evidence acquisition even when the query fingerprint
                 # matches an earlier exploration task.
-                if (
-                    submission.query.options.get("__tripchord_allow_recent_quote_reuse")
-                    is False
-                ):
+                if submission.query.options.get("__tripchord_allow_recent_quote_reuse") is False:
                     (snapshot,) = await self._delegate.submit_many((submission,))
                     metrics["publication_refresh_delegated_acquisitions"] += 1
                     publication_task_ids.add(snapshot.id)
@@ -342,8 +384,26 @@ class _FlexibleAcquisitionLedger:
                     entry = _FlexibleAcquisitionEntry(snapshot.id, snapshot, outcome)
                     entries_by_key[key] = entry
                     entries_by_task_id[snapshot.id] = entry
+                    raw_wait_source_count = submission.query.options.get(
+                        "__tripchord_browser_wait_source_count",
+                        1,
+                    )
+                    if (
+                        not isinstance(raw_wait_source_count, int)
+                        or isinstance(raw_wait_source_count, bool)
+                        or not 1 <= raw_wait_source_count <= 1_000
+                    ):
+                        raise ValueError(
+                            "browser wait source count must be an integer from 1 to 1000"
+                        )
                     entry.watcher_task = asyncio.create_task(
-                        self._collect_outcome(entry, submission.timeout_seconds)
+                        self._collect_outcome(
+                            entry,
+                            _browser_wait_timeout_seconds(
+                                submission.timeout_seconds,
+                                source_task_count=raw_wait_source_count,
+                            ),
+                        )
                     )
                     snapshots.append(snapshot)
                     continue
@@ -352,7 +412,7 @@ class _FlexibleAcquisitionLedger:
                 snapshots.append(entry.initial_snapshot)
             return tuple(snapshots)
 
-    async def _collect_outcome(self, entry: _FlexibleAcquisitionEntry, timeout: int) -> None:
+    async def _collect_outcome(self, entry: _FlexibleAcquisitionEntry, timeout: float) -> None:
         try:
             (snapshot,) = await self._delegate.wait_many(
                 (entry.task_id,),
@@ -685,7 +745,7 @@ class PublicationRefreshAudit(DomainModel):
 
 class FlexiblePairExecution(DomainModel):
     date_pair: AuditableDatePair
-    query_tasks: tuple[FlexibleQueryTask, ...] = Field(min_length=11, max_length=18)
+    query_tasks: tuple[FlexibleQueryTask, ...] = Field(min_length=3, max_length=18)
     source_start_delays_ms: dict[str, int]
     state: FlexiblePairState
     run: LivePackageAgentRun | None = None
@@ -724,6 +784,15 @@ class FlexiblePairExecution(DomainModel):
                 or self.run.finalization_state != LiveFinalizationState.FINAL_PUBLISHED
             ):
                 raise ValueError("publication refresh must expose a final publication run")
+        if len(self.query_tasks) < 11 and (
+            self.run is None
+            or self.run.evidence_scope != LiveEvidenceScope.FULL_WINDOW_BASELINE_SCREEN
+            or any(task.kind != QueryTaskKind.FLIGHT for task in self.query_tasks)
+            or len(self.query_tasks) != len(LIVE_V5_PLATFORMS)
+        ):
+            raise ValueError(
+                "a reduced pair query is valid only for the full-window flight baseline screen"
+            )
         refresh_failure = self.publication_refresh_failure_class is not None
         if refresh_failure != (self.publication_refresh_failure_message is not None):
             raise ValueError("publication refresh failure requires class and message")
@@ -761,9 +830,7 @@ class FlexiblePerformanceReport(DomainModel):
     model_call_count: int = Field(ge=0)
     model_cost_usd: float = Field(ge=0)
     publication_refresh_delegated_acquisition_count: int | None = Field(default=None, ge=0)
-    publication_refresh_platform_acquisition_attempt_count: int | None = Field(
-        default=None, ge=0
-    )
+    publication_refresh_platform_acquisition_attempt_count: int | None = Field(default=None, ge=0)
     recent_quote_reuse_count: int | None = Field(default=None, ge=0)
     inflight_coalesced_count: int | None = Field(default=None, ge=0)
     unclaimed_cancelled_count: int | None = Field(default=None, ge=0)
@@ -824,6 +891,35 @@ class FlexiblePerformanceReport(DomainModel):
             and self.delegated_acquisition_count > self.planned_unique_acquisition_count
         ):
             raise ValueError("delegated acquisitions exceed the unique-acquisition plan")
+        return self
+
+
+class DateRangeScreeningReport(DomainModel):
+    """Observed batch-date screen used to choose a small exact-search frontier."""
+
+    provider: TravelPlatform
+    requested_pair_count: int = Field(ge=1)
+    observed_pair_count: int = Field(ge=0)
+    priced_pair_count: int = Field(ge=0)
+    task_count: int = Field(ge=1)
+    complete_visible_coverage: bool
+    selected_pair_ids: tuple[str, ...] = ()
+    receipt_sha256: tuple[str, ...] = ()
+    captured_at: datetime
+    warnings: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> DateRangeScreeningReport:
+        if self.captured_at.tzinfo is None:
+            raise ValueError("date-range screening timestamp must be timezone-aware")
+        if self.priced_pair_count > self.observed_pair_count:
+            raise ValueError("priced batch-date cells cannot exceed observed cells")
+        if self.observed_pair_count > self.requested_pair_count:
+            raise ValueError("observed batch-date cells cannot exceed requested cells")
+        if self.complete_visible_coverage != (
+            self.observed_pair_count == self.requested_pair_count
+        ):
+            raise ValueError("batch-date coverage flag must match observed cells")
         return self
 
 
@@ -910,6 +1006,7 @@ class FlexibleLiveAgentRun(DomainModel):
     admissible_bounds: tuple[AdmissibleCostBound, ...] = ()
     claim_boundary: str = Field(min_length=1)
     performance_report: FlexiblePerformanceReport | None = None
+    date_range_screening: DateRangeScreeningReport | None = None
 
     @model_validator(mode="after")
     def validate_adaptive_control_audit(self) -> FlexibleLiveAgentRun:
@@ -960,12 +1057,9 @@ class FlexibleLiveAgentRun(DomainModel):
         ):
             raise ValueError("HUMAN_BLOCK runs cannot claim proven optimality")
         if self.optimality_status == DateOptimalityStatus.OPTIMALITY_PROVEN and (
-            not self.admissible_bounds
-            or not all(bound.proven for bound in self.admissible_bounds)
+            not self.admissible_bounds or not all(bound.proven for bound in self.admissible_bounds)
         ):
-                raise ValueError(
-                    "optimality_proven requires non-empty proven admissible bounds"
-                )
+            raise ValueError("optimality_proven requires non-empty proven admissible bounds")
         return self
 
     @staticmethod
@@ -1024,9 +1118,7 @@ class FlexibleLiveAgentRun(DomainModel):
                 None,
             )
             if selected is None or not selected.complete_cny_party_total:
-                raise ValueError(
-                    "the final recommendation must be a complete CNY party total"
-                )
+                raise ValueError("the final recommendation must be a complete CNY party total")
         unsafe = tuple(
             option.option_id
             for option in self.ranked_options
@@ -1190,9 +1282,7 @@ class FlexibleLiveAgentSystem:
                     live_run.intent.trip_id,
                     live_run.run_purpose,
                     live_run.evidence_scope,
-                    source_task_ids
-                    if source_task_ids
-                    else live_run.intent.trip_id,
+                    source_task_ids if source_task_ids else live_run.intent.trip_id,
                 )
                 if run_key in seen:
                     continue
@@ -1200,6 +1290,204 @@ class FlexibleLiveAgentSystem:
                 model_calls += live_run.agentic.logical_request_count
                 model_cost += live_run.agentic.total_estimated_cost_usd
         return model_calls, model_cost
+
+    async def _screen_full_window_with_ctrip(
+        self,
+        window: FlexibleTravelWindow,
+        exploration: DateExplorationResult,
+        *,
+        memory_access: MemoryAccessContext | None,
+    ) -> tuple[PlatformFareCalendar | None, DateRangeScreeningReport | None]:
+        """Read Ctrip's visible same-duration strip before exact OTA fan-out."""
+
+        if (
+            self._acquisition_ledger is None
+            or not isinstance(self._live, LivePackageAgentSystem)
+            or window.origin_code is None
+            or window.destination_code is None
+            or window.adults > 9
+            or window.children
+            or window.infants
+        ):
+            return None, None
+        groups: dict[int, list[AuditableDatePair]] = {}
+        for pair in exploration.candidates:
+            groups.setdefault(pair.night_count, []).append(pair)
+        chunks = tuple(
+            tuple(ordered[offset : offset + _CTRIP_RANGE_MAX_VISIBLE_PAIRS])
+            for night_count in sorted(groups)
+            for ordered in (
+                sorted(
+                    groups[night_count],
+                    key=lambda item: (item.departure_date, item.return_date),
+                ),
+            )
+            for offset in range(0, len(ordered), _CTRIP_RANGE_MAX_VISIBLE_PAIRS)
+        )
+        if not chunks:
+            return None, None
+        principal = (
+            f"{memory_access.tenant_id}\0{memory_access.user_id or '<tenant-scope>'}"
+            if memory_access is not None
+            else "anonymous-flexible-range"
+        )
+        tenant_partition_sha256 = hashlib.sha256(principal.encode()).hexdigest()
+        submissions: list[BrowserTaskSubmission] = []
+        for chunk in chunks:
+            anchor = chunk[(len(chunk) - 1) // 2]
+            query = BrowserSearchQuery(
+                origin=window.origin,
+                destination=window.destination,
+                origin_code=window.origin_code,
+                destination_code=window.destination_code,
+                start_date=anchor.departure_date,
+                end_date=anchor.return_date,
+                adults=window.adults,
+                children=window.children,
+                children_ages=window.children_ages,
+                infants=window.infants,
+                rooms=window.rooms,
+                currency=window.currency,
+                options={
+                    "__tripchord_browser_wait_source_count": len(chunks),
+                },
+            )
+            query = query.model_copy(update={"search_url": ctrip_trusted_flight_search_url(query)})
+            submissions.append(
+                BrowserTaskSubmission(
+                    provider=BrowserProvider.CTRIP,
+                    kind=BrowserVertical.FLIGHT,
+                    query=query,
+                    range_query=BrowserDateRangeQuery(
+                        provider=BrowserProvider.CTRIP,
+                        kind=BrowserVertical.FLIGHT,
+                        origin=window.origin,
+                        destination=window.destination,
+                        origin_code=window.origin_code,
+                        destination_code=window.destination_code,
+                        requested_pairs=tuple(
+                            (pair.departure_date, pair.return_date) for pair in chunk
+                        ),
+                        party=BrowserRangeParty(
+                            adults=window.adults,
+                            children=window.children,
+                            children_ages=window.children_ages,
+                            infants=window.infants,
+                            rooms=window.rooms,
+                        ),
+                        currency=window.currency,
+                        tenant_partition_sha256=tenant_partition_sha256,
+                        contract_version="tripchord-browser-range-v1",
+                        parser_version="ctrip-visible-date-strip-v1",
+                    ),
+                    timeout_seconds=_CTRIP_RANGE_TASK_TIMEOUT_SECONDS,
+                    max_attempts=1,
+                    reuse_partition_sha256=(
+                        tenant_partition_sha256 if memory_access is not None else None
+                    ),
+                )
+            )
+        snapshots = await self._acquisition_ledger.submit_many(submissions)
+        try:
+            terminal = await self._acquisition_ledger.wait_many(
+                (snapshot.id for snapshot in snapshots),
+                timeout_seconds=_CTRIP_RANGE_TASK_TIMEOUT_SECONDS + 30,
+            )
+        except TimeoutError:
+            await self._acquisition_ledger.cancel_many(
+                (snapshot.id for snapshot in snapshots),
+                reason="ctrip range screening exceeded its bounded wait",
+            )
+            return None, DateRangeScreeningReport(
+                provider=TravelPlatform.CTRIP,
+                requested_pair_count=exploration.universe_size,
+                observed_pair_count=0,
+                priced_pair_count=0,
+                task_count=len(submissions),
+                complete_visible_coverage=False,
+                captured_at=self._utc_now(),
+                warnings=("携程批量日期栏在限定时间内未完成，未用于缩小精确查询范围",),
+            )
+        cells_by_pair: dict[tuple[date, date], Any] = {}
+        receipts: list[str] = []
+        captured_at = self._utc_now()
+        for snapshot in terminal:
+            receipt = snapshot.range_completion
+            if (
+                snapshot.state != BrowserTaskState.SUCCEEDED
+                or receipt is None
+                or receipt.capability.status != BrowserRangeCapabilityStatus.CONFIRMED
+            ):
+                continue
+            receipts.append(receipt.receipt_sha256)
+            captured_at = max(captured_at, receipt.capability.captured_at)
+            for cell in receipt.cells:
+                cells_by_pair.setdefault((cell.start_date, cell.end_date), cell)
+        requested_pairs = {
+            (pair.departure_date, pair.return_date) for pair in exploration.candidates
+        }
+        priced: list[tuple[int, tuple[date, date], str]] = []
+        hints: list[FareDateHint] = []
+        pair_id_by_dates = {
+            (pair.departure_date, pair.return_date): pair.id for pair in exploration.candidates
+        }
+        for pair_dates, cell in cells_by_pair.items():
+            if (
+                pair_dates not in requested_pairs
+                or cell.amount is None
+                or cell.price_finality != BrowserRangePriceFinality.STARTING
+                or cell.price_basis != BrowserRangePriceBasis.PER_PERSON
+            ):
+                continue
+            total_for_party_cents = int(cell.amount * window.adults * Decimal(100))
+            evidence_ref = f"browser-range:{cell.evidence_sha256}"
+            hints.append(
+                FareDateHint(
+                    departure_date=pair_dates[0],
+                    return_date=pair_dates[1],
+                    total_for_party_cents=total_for_party_cents,
+                    currency=cell.currency,
+                    evidence_ref=evidence_ref,
+                )
+            )
+            priced.append((total_for_party_cents, pair_dates, pair_id_by_dates[pair_dates]))
+        priced.sort(key=lambda item: (item[0], item[1][0], item[1][1]))
+        selected_pair_ids = tuple(item[2] for item in priced[:_FULL_WINDOW_RANGE_EXACT_PAIR_LIMIT])
+        observed_pair_count = len(requested_pairs & set(cells_by_pair))
+        report = DateRangeScreeningReport(
+            provider=TravelPlatform.CTRIP,
+            requested_pair_count=len(requested_pairs),
+            observed_pair_count=observed_pair_count,
+            priced_pair_count=len(hints),
+            task_count=len(submissions),
+            complete_visible_coverage=observed_pair_count == len(requested_pairs),
+            selected_pair_ids=selected_pair_ids,
+            receipt_sha256=tuple(receipts),
+            captured_at=captured_at,
+            warnings=(
+                (
+                    "携程批量日期栏只提供起价，已按当前人数换算为筛选参考；"
+                    "最终候选仍需重新核对完整往返总价"
+                ),
+                *(
+                    ()
+                    if observed_pair_count == len(requested_pairs)
+                    else ("批量日期栏未覆盖全部组合，最终结果不得声称全窗口最低价",)
+                ),
+            ),
+        )
+        if not hints:
+            return None, report
+        return (
+            PlatformFareCalendar(
+                platform=TravelPlatform.CTRIP,
+                hints=tuple(hints),
+                complete_for_window=(len(hints) == len(requested_pairs)),
+                captured_at=captured_at,
+                expires_at=captured_at + timedelta(minutes=5),
+            ),
+            report,
+        )
 
     @request_agent_budgeted
     async def run(
@@ -1321,6 +1609,35 @@ class FlexibleLiveAgentSystem:
                     )
                 }
             )
+        full_window_requested = exact_pair_budget == exploration.universe_size
+        date_range_screening: DateRangeScreeningReport | None = None
+        range_screened_frontier = False
+        if full_window_requested:
+            range_calendar, date_range_screening = await self._screen_full_window_with_ctrip(
+                effective_window,
+                exploration,
+                memory_access=memory_access,
+            )
+            if range_calendar is not None:
+                calendars = (*calendars, range_calendar)
+                exploration = self._explorer.explore(
+                    effective_window,
+                    calendars,
+                    now=self._utc_now(),
+                )
+                exact_pair_budget = min(
+                    _FULL_WINDOW_RANGE_EXACT_PAIR_LIMIT,
+                    exploration.universe_size,
+                )
+                range_screened_frontier = True
+                exploration = exploration.model_copy(
+                    update={
+                        "warnings": (
+                            *exploration.warnings,
+                            "已先读取携程可见批量日期栏，再对排名靠前的日期执行精确跨平台查询",
+                        )
+                    }
+                )
         scale_directive = self._adaptive_scale_directive(
             exploration,
             mode=mode,
@@ -1364,7 +1681,7 @@ class FlexibleLiveAgentSystem:
             exact_pair_budget,
             stay_plan_candidate_set=stay_plan_candidate_set,
         )
-        if exact_pair_budget == exploration.universe_size:
+        if full_window_requested and not range_screened_frontier:
             deterministic_query_plan = self._query_planner.build(
                 effective_window,
                 exploration,
@@ -1377,7 +1694,7 @@ class FlexibleLiveAgentSystem:
                 timeout_seconds=timeout_seconds,
                 total_timeout_seconds=total_timeout_seconds,
             )
-        if exact_pair_budget == exploration.universe_size:
+        if full_window_requested:
             # Once the server has admitted the complete deterministic universe,
             # a model cannot improve coverage by selecting a frontier.  Keep the
             # explorer's stable order and spend zero model budget on date
@@ -1389,7 +1706,12 @@ class FlexibleLiveAgentSystem:
                 update={
                     "warnings": (
                         *exploration.warnings,
-                        "完整日期全集按服务器确定性顺序执行；未调用 Query Strategist 模型",
+                        (
+                            "批量日期栏按服务器确定性价格顺序生成精查候选；"
+                            "未调用 Query Strategist 模型"
+                            if range_screened_frontier
+                            else "完整日期全集按服务器确定性顺序执行；未调用 Query Strategist 模型"
+                        ),
                     )
                 }
             )
@@ -1407,7 +1729,7 @@ class FlexibleLiveAgentSystem:
         effective_exact_pair_budget = exact_pair_budget
         effective_policy = (
             deterministic_policy
-            if exact_pair_budget == exploration.universe_size
+            if full_window_requested
             else self._execution_query_policy(
                 effective_window,
                 exploration,
@@ -1425,7 +1747,11 @@ class FlexibleLiveAgentSystem:
         # The final merge can otherwise re-promote the unsafe 2026-09-10
         # departure target after the bounded strategy pass.  Re-apply the
         # actual-arrival boundary at the last server-owned selection point.
-        if effective_window.return_date_targets and effective_window.latest_arrival_date:
+        if (
+            not range_screened_frontier
+            and effective_window.return_date_targets
+            and effective_window.latest_arrival_date
+        ):
             safe_return = max(effective_window.return_date_targets)
             if safe_return == effective_window.latest_arrival_date:
                 safe_return -= timedelta(days=1)
@@ -1434,7 +1760,8 @@ class FlexibleLiveAgentSystem:
                     item
                     for item in exploration.candidates
                     if item.return_date == safe_return
-                    and item.night_count == max(
+                    and item.night_count
+                    == max(
                         effective_window.min_nights,
                         effective_window.max_nights - 1,
                     )
@@ -1444,11 +1771,7 @@ class FlexibleLiveAgentSystem:
             if safe_pair is not None and safe_pair.id not in query_plan.selected_pair_ids:
                 selected_ids = (
                     safe_pair.id,
-                    *(
-                        item
-                        for item in query_plan.selected_pair_ids
-                        if item != safe_pair.id
-                    ),
+                    *(item for item in query_plan.selected_pair_ids if item != safe_pair.id),
                 )[:effective_exact_pair_budget]
                 query_plan = query_plan.model_copy(update={"selected_pair_ids": selected_ids})
         pairs = {item.id: item for item in exploration.candidates}
@@ -1465,30 +1788,25 @@ class FlexibleLiveAgentSystem:
                     "frozen stay-plan gateway must exactly match the interpreted destination"
                 )
         schedule_started = self._monotonic()
-        # The browser companion exposes six global read-only leases. Each pair
-        # already saturates them with eleven (v3) or thirteen (v4) tool-bound Source workers.
-        # Admitting three pairs together makes early flight receipts wait behind
-        # unrelated lodging work until their ten-minute quote TTL expires. Keep
-        # source Agents maximally concurrent inside a pair, but admit date pairs
-        # one at a time so Verifier always sees a coherent fresh evidence window.
-        # Three domain/date workers may overlap; the browser bridge and each
-        # provider still enforce their own bounded leases and rate lanes.
-        pair_worker_count = pair_worker_count_override or 3
-        worker_pool_enabled = (
-            scale_directive is not None
-            and effective_exact_pair_budget > DIRECT_DATE_PAIR_LIMIT
-        )
         # A large concrete live run is an exploration pass, not 66 independent
         # model-agent runs.  It uses the deterministic live DAG and reserves
         # the model budget for the single publication refresh below.
-        bulk_exploration = (
-            isinstance(self._live, LivePackageAgentSystem)
-            and effective_exact_pair_budget == exploration.universe_size
+        bulk_exploration = isinstance(self._live, LivePackageAgentSystem) and full_window_requested
+        # Full-window exploration admits all dates together but only submits
+        # their flight sources.  The caller wait covers the global queue while
+        # Chrome keeps its own six-lease cap, so dates do not time out merely
+        # because they are waiting behind an earlier wave.  OTA lodging is
+        # added only for the best same-baseline date after the screen settles.
+        pair_worker_count = pair_worker_count_override or (
+            min(_FULL_WINDOW_PAIR_WORKERS, effective_exact_pair_budget) if bulk_exploration else 3
         )
+        worker_pool_enabled = (
+            scale_directive is not None and effective_exact_pair_budget > DIRECT_DATE_PAIR_LIMIT
+        )
+        provider_failure_lock = asyncio.Lock()
+        suppressed_flight_providers: set[BrowserProvider] = set()
         provider_lane_lock = asyncio.Lock()
-        provider_next_available_ms = {
-            item.platform: 0 for item in effective_policy.platform_rates
-        }
+        provider_next_available_ms = {item.platform: 0 for item in effective_policy.platform_rates}
         # One absolute lane reservation per provider acquisition, not per
         # date-pair label.  The browser bridge's singleflight/recent-quote
         # reuse then sees the same identity and duplicate pairs inherit the
@@ -1499,6 +1817,7 @@ class FlexibleLiveAgentSystem:
             pair: AuditableDatePair,
             *,
             worker_index: int | None = None,
+            flight_screen_only: bool = False,
         ) -> FlexiblePairExecution:
             # Build only the selected pair's source tasks.  This is the dynamic
             # expansion point. The default consumes Query Strategist's audited
@@ -1516,6 +1835,11 @@ class FlexibleLiveAgentSystem:
                 pair_policy,
                 stay_plan_candidate_set=stay_plan_candidate_set,
             )
+            pair_tasks = (
+                tuple(task for task in pair_plan.tasks if task.kind == QueryTaskKind.FLIGHT)
+                if flight_screen_only
+                else pair_plan.tasks
+            )
             rate_by_platform = {
                 item.platform: effective_platform_interval_ms(
                     item,
@@ -1526,9 +1850,7 @@ class FlexibleLiveAgentSystem:
             absolute_offsets: dict[str, int] = {}
             async with provider_lane_lock:
                 for platform, interval_ms in rate_by_platform.items():
-                    platform_tasks = tuple(
-                        task for task in pair_plan.tasks if task.platform == platform
-                    )
+                    platform_tasks = tuple(task for task in pair_tasks if task.platform == platform)
                     if not platform_tasks:
                         continue
                     for task in platform_tasks:
@@ -1548,7 +1870,7 @@ class FlexibleLiveAgentSystem:
                         provider_next_available_ms[platform] = absolute_offset + interval_ms
             tasks = tuple(
                 task.model_copy(update={"scheduled_offset_ms": absolute_offsets[task.id]})
-                for task in pair_plan.tasks
+                for task in pair_tasks
             )
             pair_intent = self._intent(
                 effective_window,
@@ -1563,6 +1885,41 @@ class FlexibleLiveAgentSystem:
                 stay_area_search_profile=stay_area_search_profile,
                 stay_plan_candidate_set=stay_plan_candidate_set,
             )
+            pair_query = pair_query.model_copy(
+                update={
+                    "options": {
+                        **pair_query.options,
+                        "__tripchord_browser_wait_source_count": (
+                            effective_exact_pair_budget * len(LIVE_V5_PLATFORMS)
+                            if flight_screen_only
+                            else len(tasks)
+                        ),
+                    }
+                }
+            )
+            if flight_screen_only:
+                pair_query = pair_query.model_copy(
+                    update={
+                        "options": {
+                            **pair_query.options,
+                            "__tripchord_full_window_flight_screen": True,
+                        }
+                    }
+                )
+            if bulk_exploration and mode == LiveCoverageMode.DEGRADED:
+                async with provider_failure_lock:
+                    suppressed_for_pair = sorted(
+                        provider.value for provider in suppressed_flight_providers
+                    )
+                if suppressed_for_pair:
+                    pair_query = pair_query.model_copy(
+                        update={
+                            "options": {
+                                **pair_query.options,
+                                "__tripchord_skip_flight_providers": suppressed_for_pair,
+                            }
+                        }
+                    )
             elapsed_ms = max(
                 0,
                 int((self._monotonic() - schedule_started) * 1000),
@@ -1576,13 +1933,27 @@ class FlexibleLiveAgentSystem:
                     pair_intent,
                     pair_query,
                     mode=mode,
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=(
+                        min(timeout_seconds, _FULL_WINDOW_FLIGHT_SCREEN_TIMEOUT_SECONDS)
+                        if flight_screen_only
+                        else timeout_seconds
+                    ),
                     source_start_delays_ms=delays,
                     memory_access=memory_access,
                     publication_refresh_minimum_options=publication_refresh_minimum_options,
                     model_agents_enabled=not bulk_exploration,
                     exploration_only=bulk_exploration,
                 )
+                if bulk_exploration and mode == LiveCoverageMode.DEGRADED:
+                    async with provider_failure_lock:
+                        for provider in BrowserProvider:
+                            failure_class = _provider_flight_failure_class(
+                                live_run,
+                                provider,
+                            )
+                            if failure_class is None:
+                                continue
+                            suppressed_flight_providers.add(provider)
             # A date-specific external/provider failure is isolatable.  Do
             # not turn programming errors (AssertionError/TypeError/etc.) or
             # required-model contract failures (ValueError) into an innocent
@@ -1631,6 +2002,7 @@ class FlexibleLiveAgentSystem:
 
         execution_by_pair: dict[str, FlexiblePairExecution] = {}
         execution_order: list[str] = []
+        full_window_enriched_pair_id: str | None = None
         exact_observations: list[ExactDatePairObservation] = []
         refinement_trace: list[AdaptiveRefinementDecision] = []
         planned_ids = set(query_plan.selected_pair_ids)
@@ -1647,7 +2019,8 @@ class FlexibleLiveAgentSystem:
                     item
                     for item in exploration.candidates
                     if item.return_date == safe_return
-                    and item.night_count == max(
+                    and item.night_count
+                    == max(
                         effective_window.min_nights,
                         effective_window.max_nights - 1,
                     )
@@ -1714,8 +2087,7 @@ class FlexibleLiveAgentSystem:
                             or (
                                 live_run.exact_quote_comparison_coverage is not None
                                 and (
-                                    live_run.exact_quote_comparison_coverage
-                                    .single_source_publishable
+                                    live_run.exact_quote_comparison_coverage.single_source_publishable
                                 )
                             )
                         )
@@ -1726,8 +2098,7 @@ class FlexibleLiveAgentSystem:
                                 and (
                                     live_run.exact_quote_comparison_coverage.complete
                                     or (
-                                        live_run.exact_quote_comparison_coverage
-                                        .single_source_publishable
+                                        live_run.exact_quote_comparison_coverage.single_source_publishable
                                     )
                                 )
                             )
@@ -1743,6 +2114,28 @@ class FlexibleLiveAgentSystem:
         if effective_exact_pair_budget > 1 and isinstance(
             self._date_refiner, RankedTopKDateRefiner
         ):
+            # Probe one complete date before admitting the full flight
+            # frontier.  Login/CAPTCHA is session-wide, so this prevents a
+            # blocked provider from occupying dozens of queued leases before
+            # the shared degraded-mode gate can observe it.  Ordinary missing
+            # quotes, timeouts and extraction failures remain date-local and
+            # never suppress the remaining dates.
+            if bulk_exploration and mode == LiveCoverageMode.DEGRADED:
+                canary_pair = next(
+                    (
+                        pair
+                        for pair in planned_pairs[:effective_exact_pair_budget]
+                        if pair.id not in execution_by_pair
+                    ),
+                    None,
+                )
+                if canary_pair is not None:
+                    canary_execution = await execute_pair(
+                        canary_pair,
+                        worker_index=0 if worker_pool_enabled else None,
+                        flight_screen_only=True,
+                    )
+                    await record_execution(canary_pair, canary_execution)
             batch = tuple(
                 pair
                 for pair in planned_pairs[:effective_exact_pair_budget]
@@ -1764,6 +2157,7 @@ class FlexibleLiveAgentSystem:
                         execution = await execute_pair(
                             pair,
                             worker_index=worker_index if worker_pool_enabled else None,
+                            flight_screen_only=bulk_exploration,
                         )
                         await record_execution(pair, execution)
                     finally:
@@ -1772,6 +2166,55 @@ class FlexibleLiveAgentSystem:
             async with asyncio.TaskGroup() as task_group:
                 for worker_index in range(pair_worker_count):
                     task_group.create_task(worker(worker_index))
+            if bulk_exploration:
+
+                def decision_total(execution: FlexiblePairExecution) -> tuple[int, str]:
+                    live_run = execution.run or execution.exploration_run
+                    decision = live_run.decision_only_candidate if live_run is not None else None
+                    if decision is None or live_run is None:
+                        return (10**18, execution.date_pair.id)
+                    foreign_lodging_cents = sum(
+                        lodging_reference_cny_if_comparable(
+                            lodging,
+                            decision.candidate.currency,
+                        )
+                        or 10**18
+                        for lodging in decision.candidate.lodgings
+                        if lodging.currency != decision.candidate.currency
+                    )
+                    transfer_cents = (
+                        live_run.icom_cny_reference_estimate.estimated_cny_cents
+                        if live_run.icom_cny_reference_estimate is not None
+                        else 10**18
+                    )
+                    return (
+                        decision.budget.confirmed_subtotal_cents
+                        + foreign_lodging_cents
+                        + transfer_cents,
+                        execution.date_pair.id,
+                    )
+
+                enrichment_target = min(
+                    execution_by_pair.values(),
+                    key=decision_total,
+                    default=None,
+                )
+                elapsed_seconds = self._monotonic() - schedule_started
+                if (
+                    enrichment_target is not None
+                    and decision_total(enrichment_target)[0] < 10**18
+                    and total_timeout_seconds - elapsed_seconds
+                    >= _FULL_WINDOW_ENRICHMENT_RESERVE_SECONDS
+                ):
+                    enriched = await execute_pair(
+                        enrichment_target.date_pair,
+                        worker_index=0 if worker_pool_enabled else None,
+                    )
+                    if enriched.state == FlexiblePairState.COMPLETED and enriched.run is not None:
+                        execution_by_pair[enrichment_target.date_pair.id] = enriched
+                        full_window_enriched_pair_id = enrichment_target.date_pair.id
+                        if search_run_recorder is not None:
+                            await search_run_recorder(enriched.run)
         while len(execution_by_pair) < effective_exact_pair_budget:
             refinement = self._date_refiner.next_pair(
                 planned_pairs,
@@ -1788,9 +2231,7 @@ class FlexibleLiveAgentSystem:
             )
             await record_execution(pair, execution)
         executions = tuple(
-            execution_by_pair[pair.id]
-            for pair in planned_pairs
-            if pair.id in execution_by_pair
+            execution_by_pair[pair.id] for pair in planned_pairs if pair.id in execution_by_pair
         )
         if not executions:
             raise RuntimeError("bounded exact-date acquisition produced no pair execution")
@@ -1822,6 +2263,65 @@ class FlexibleLiveAgentSystem:
             ),
             stay_plan_candidate_set=stay_plan_candidate_set,
         )
+        if bulk_exploration:
+            logical_tasks = tuple(
+                task for execution in executions for task in execution.query_tasks
+            )
+            unique_tasks: dict[str, FlexibleQueryTask] = {}
+            for task in logical_tasks:
+                unique_tasks.setdefault(canonical_acquisition_fingerprint(task), task)
+            actual_tasks = tuple(unique_tasks.values())
+            actual_counts = {
+                platform.value: sum(task.platform == platform for task in actual_tasks)
+                for platform in LIVE_V5_PLATFORMS
+            }
+            actual_query_hash = hashlib.sha256(
+                json.dumps(
+                    {
+                        "execution_mode": (
+                            "ctrip_range_screen_then_exact_frontier_then_best_date_enrichment"
+                            if range_screened_frontier
+                            else "full_window_flight_screen_then_best_date_enrichment"
+                        ),
+                        "tasks": [task.model_dump(mode="json") for task in actual_tasks],
+                        "selected_pair_ids": [execution.date_pair.id for execution in executions],
+                        "enriched_pair_id": full_window_enriched_pair_id,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()
+            enrichment_warning = (
+                "已对当前基线最优日期补查 OTA 住宿；不声明其他日期已完成 OTA 住宿比价"
+                if full_window_enriched_pair_id is not None
+                else "本次未完成 OTA 住宿补查，住宿仅使用酒店官方来源比较"
+            )
+            query_plan = query_plan.model_copy(
+                update={
+                    "tasks": actual_tasks,
+                    "selected_pair_ids": tuple(execution.date_pair.id for execution in executions),
+                    "omitted_pair_ids": (
+                        query_plan.omitted_pair_ids if range_screened_frontier else ()
+                    ),
+                    "total_task_count": len(actual_tasks),
+                    "logical_task_count": len(logical_tasks),
+                    "unique_acquisition_count": len(actual_tasks),
+                    "deduplicated_task_count": len(logical_tasks) - len(actual_tasks),
+                    "task_count_by_platform": actual_counts,
+                    "query_hash": actual_query_hash,
+                    "warnings": (
+                        *query_plan.warnings,
+                        (
+                            "完整日期窗口先读取携程可见批量日期起价，"
+                            "再对候选日期执行跨平台精确航班筛选；"
+                            if range_screened_frontier
+                            else "完整日期窗口先执行同口径航班筛选并结合酒店官方来源与公开接驳；"
+                        )
+                        + enrichment_warning,
+                    ),
+                }
+            )
         ranked = self._rank(
             executions,
             mode,
@@ -2063,7 +2563,33 @@ class FlexibleLiveAgentSystem:
             stay_area_search_profile=stay_area_search_profile,
             stay_plan_candidate_set=stay_plan_candidate_set,
             date_acquisition_policy=self._date_acquisition_policy,
+            range_screened_frontier=range_screened_frontier,
         )
+        if bulk_exploration:
+            claim_boundary += (
+                (
+                    f"本轮先从携程可见批量日期栏读取 "
+                    f"{date_range_screening.observed_pair_count}/"
+                    f"{date_range_screening.requested_pair_count} 个日期组合，"
+                    f"其中 {date_range_screening.priced_pair_count} 个显示人民币起价；"
+                    f"随后只对排名靠前的 {len(executions)} 个日期执行跨平台精确查询。"
+                    if range_screened_frontier and date_range_screening is not None
+                    else "本轮日期排序只比较各日期实际形成的同口径基线："
+                    "实时航班结果、Kaani/Arena 酒店官方来源与 iCom 公开接驳；"
+                )
+                + (
+                    f"仅对基线最优日期 {full_window_enriched_pair_id} 补查 OTA 住宿。"
+                    if full_window_enriched_pair_id is not None
+                    else "本轮剩余时间不足，未补查任何日期的 OTA 住宿。"
+                )
+                + (
+                    "批量栏起价只用于选候选，最终方案使用候选日期的精确结果；"
+                    "不能声明所有平台逐日精确穷举后的全局最低价。"
+                    if range_screened_frontier
+                    else "因此只能声明该同口径基线下的当前最优，"
+                    "不能声明所有日期均完成 OTA 住宿比价。"
+                )
+            )
         if scale_directive is not None and agent_template_plan is not None:
             budget_audit = budget_ledger.audit()
             planning_admitted_count = (
@@ -2161,12 +2687,11 @@ class FlexibleLiveAgentSystem:
             executions,
         )
         source_delays = tuple(
-            delay
-            for execution in executions
-            for delay in execution.source_start_delays_ms.values()
+            delay for execution in executions for delay in execution.source_start_delays_ms.values()
         )
-        planned_logical_query_count = query_plan.logical_task_count
-        planned_unique_acquisition_count = query_plan.unique_acquisition_count
+        range_task_count = date_range_screening.task_count if date_range_screening else 0
+        planned_logical_query_count = query_plan.logical_task_count + range_task_count
+        planned_unique_acquisition_count = query_plan.unique_acquisition_count + range_task_count
         acquisition_metrics = (
             self._acquisition_ledger.detailed_metrics()
             if self._acquisition_ledger is not None
@@ -2189,14 +2714,10 @@ class FlexibleLiveAgentSystem:
             )
         deduplicated_query_count = logical_query_count - delegated_acquisition_count
         platform_acquisition_attempt_count = (
-            acquisition_metrics.get("platform_acquisition_attempt_count")
-            if observed
-            else None
+            acquisition_metrics.get("platform_acquisition_attempt_count") if observed else None
         )
         publication_refresh_platform_acquisition_attempt_count = (
-            acquisition_metrics.get(
-                "publication_refresh_platform_acquisition_attempt_count"
-            )
+            acquisition_metrics.get("publication_refresh_platform_acquisition_attempt_count")
             if observed
             else None
         )
@@ -2216,9 +2737,7 @@ class FlexibleLiveAgentSystem:
                 acquisition_metrics.get("delegate_submit_call_count") if observed else None
             ),
             delegated_acquisition_count=delegated_acquisition_count if observed else None,
-            executed_deduplicated_query_count=(
-                deduplicated_query_count if observed else None
-            ),
+            executed_deduplicated_query_count=(deduplicated_query_count if observed else None),
             ledger_shared_return_count=(
                 acquisition_metrics.get("ledger_shared_return_count") if observed else None
             ),
@@ -2251,8 +2770,7 @@ class FlexibleLiveAgentSystem:
         )
         if (
             internal_benchmark
-            and performance_report.wall_time_seconds
-            > INTERNAL_BENCHMARK_TOTAL_TIMEOUT_SECONDS
+            and performance_report.wall_time_seconds > INTERNAL_BENCHMARK_TOTAL_TIMEOUT_SECONDS
         ):
             raise TimeoutError(
                 "internal flexible benchmark exceeded its 530s wall-clock budget: "
@@ -2287,6 +2805,7 @@ class FlexibleLiveAgentSystem:
             admissible_bounds=admissible_bounds,
             claim_boundary=claim_boundary,
             performance_report=performance_report,
+            date_range_screening=date_range_screening,
         )
 
     async def _refresh_execution_for_publication(
@@ -2884,9 +3403,9 @@ class FlexibleLiveAgentSystem:
                 "selection_reasons、stop_condition、query_budget_pairs；其中 stop_condition"
                 "必须是非空字符串，query_budget_pairs 必须是整数且等于 exact_pair_budget。"
                 "即使没有额外理由，也要输出 selection_reasons 数组（可为空）。输出形状示例："
-                "{\"summary\":\"...\",\"selected_pair_ids\":[\"id\"],"
-                "\"selection_reasons\":[],\"stop_condition\":\"达到固定精查预算\","
-                "\"query_budget_pairs\":1,\"uncertainty_flags\":[]}。"
+                '{"summary":"...","selected_pair_ids":["id"],'
+                '"selection_reasons":[],"stop_condition":"达到固定精查预算",'
+                '"query_budget_pairs":1,"uncertainty_flags":[]}。'
             ),
             output_model=QueryStrategyProposal,
             required=self._model_agents_required,
@@ -2965,9 +3484,7 @@ class FlexibleLiveAgentSystem:
         # boundary is actual arrival home.  For the MLE→HGH overnight route,
         # reserve one day for that arrival so a bounded run cannot publish a
         # flight departing on 2026-09-10 and arriving after the deadline.
-        safe_return_target = (
-            max(window.return_date_targets) if window.return_date_targets else None
-        )
+        safe_return_target = max(window.return_date_targets) if window.return_date_targets else None
         target_nights = window.max_nights
         if (
             safe_return_target is not None
@@ -3348,9 +3865,16 @@ class FlexibleLiveAgentSystem:
         tasks: tuple[FlexibleQueryTask, ...],
         elapsed_ms: int,
     ) -> dict[str, int]:
-        if len(tasks) not in {11, 13, 15, 18}:
+        if len(tasks) not in {3, 11, 13, 15, 18}:
             raise ValueError(
                 "each flexible date pair must match an audited provider capability profile"
+            )
+        if len(tasks) == 3 and (
+            any(task.kind != QueryTaskKind.FLIGHT for task in tasks)
+            or {task.platform for task in tasks} != set(LIVE_V5_PLATFORMS)
+        ):
+            raise ValueError(
+                "the full-window baseline screen requires one flight query per live platform"
             )
         delays: dict[str, int] = {}
         if len(tasks) in {13, 18}:
@@ -3390,10 +3914,7 @@ class FlexibleLiveAgentSystem:
         conservative_execution_budget_ms = (
             max(timeout_seconds, 120) + _FULL_WINDOW_FINALIZATION_BUFFER_SECONDS
         ) * 1000
-        if (
-            last_source_offset_ms + conservative_execution_budget_ms
-            > total_timeout_seconds * 1000
-        ):
+        if last_source_offset_ms + conservative_execution_budget_ms > total_timeout_seconds * 1000:
             raise FullWindowDeadlineInfeasible(
                 pair_count=pair_count,
                 last_source_offset_ms=last_source_offset_ms,
@@ -3485,7 +4006,11 @@ class FlexibleLiveAgentSystem:
     @staticmethod
     def _is_sealed_exploration(live_run: LivePackageAgentRun) -> bool:
         return (
-            live_run.evidence_scope == LiveEvidenceScope.FULL_SEARCH
+            live_run.evidence_scope
+            in {
+                LiveEvidenceScope.FULL_SEARCH,
+                LiveEvidenceScope.FULL_WINDOW_BASELINE_SCREEN,
+            }
             and live_run.run_purpose == LiveRunPurpose.EXPLORATION_SELECTION
             and live_run.finalization_state == LiveFinalizationState.EXPLORATION_SEALED
             and live_run.exploration_seal_passed
@@ -3670,8 +4195,7 @@ class FlexibleLiveAgentSystem:
                 key=lambda item: (
                     0 if item.option_id in complete_cny_ids else 1,
                     item.total_budget_cents
-                    if item.option_id in complete_cny_ids
-                    and item.total_budget_cents is not None
+                    if item.option_id in complete_cny_ids and item.total_budget_cents is not None
                     else 10**18,
                     item.rank,
                     item.option_id,
@@ -3679,8 +4203,7 @@ class FlexibleLiveAgentSystem:
             )
         )
         return tuple(
-            item.model_copy(update={"rank": rank})
-            for rank, item in enumerate(ordered, start=1)
+            item.model_copy(update={"rank": rank}) for rank, item in enumerate(ordered, start=1)
         )
 
     def _objective_values(
@@ -3779,9 +4302,12 @@ class FlexibleLiveAgentSystem:
         stay_area_search_profile: StayAreaSearchProfile | None,
         stay_plan_candidate_set: StayPlanCandidateSet | None,
         date_acquisition_policy: str,
+        range_screened_frontier: bool = False,
     ) -> str:
         if not sampled:
             qualifier = "全量日期对精确查询"
+        elif range_screened_frontier:
+            qualifier = "携程可见批量日期起价排序后的 Top-K 精确查询"
         elif date_acquisition_policy == RankedTopKDateRefiner.policy_id:
             qualifier = "Query Strategist 排序后的 bounded Top-K 精确查询"
         elif date_acquisition_policy.startswith("adaptive_experimental"):
@@ -3800,7 +4326,10 @@ class FlexibleLiveAgentSystem:
             + "排序只在这些日期对及其当次可见报价内有效，不得声称全月最低价、"
             + "全网最低价、库存锁定或可订承诺。"
         )
-        if date_acquisition_policy == RankedTopKDateRefiner.policy_id:
+        if (
+            date_acquisition_policy == RankedTopKDateRefiner.policy_id
+            and not range_screened_frontier
+        ):
             boundary = (
                 f"{boundary}默认 Top-K 是当前冻结 synthetic 基线下的保守 fallback；"
                 "Query Strategist 仍可在硬预算内真实重排，且该选择不证明真实 OTA 上"

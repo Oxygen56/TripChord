@@ -181,6 +181,30 @@ async def test_deadline_includes_queue_wait_and_never_starts_expired_operation()
 
 
 @pytest.mark.asyncio
+async def test_self_cancelled_operation_becomes_terminal_failure() -> None:
+    registry = LivePlanningJobRegistry(capacity=2, max_running=1)
+
+    async def self_cancel(_: Any) -> dict[str, Any]:
+        raise asyncio.CancelledError
+
+    job = await registry.start(tenant_id="tenant-a", operation=self_cancel)
+    await _wait_for_state(
+        registry,
+        job.id,
+        "tenant-a",
+        LivePlanningJobState.FAILED,
+    )
+    failed = await registry.get(job.id, "tenant-a")
+    assert failed is not None
+    assert failed.stage == "failed"
+    assert failed.error == "RuntimeError: live planning execution failed"
+    assert failed.safe_failure_code == "execution_exception"
+    assert failed.safe_failure_details is not None
+    assert failed.safe_failure_details.exception_class == "RuntimeError"
+    await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_stubborn_cancel_is_terminal_releases_slot_and_fences_late_mutations() -> None:
     registry = LivePlanningJobRegistry(
         capacity=2,

@@ -133,6 +133,21 @@ class ImmediateWaitTimeoutBrowserTaskBridge(BrowserTaskBridge):
         return await super().wait_many(task_ids, timeout_seconds=0.001)
 
 
+class RecordingWaitTimeoutBrowserTaskBridge(ImmediateWaitTimeoutBrowserTaskBridge):
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.wait_timeouts: list[float] = []
+
+    async def wait_many(
+        self,
+        task_ids: Iterable[str],
+        *,
+        timeout_seconds: float,
+    ) -> tuple[BrowserTaskSnapshot, ...]:
+        self.wait_timeouts.append(timeout_seconds)
+        return await super().wait_many(task_ids, timeout_seconds=timeout_seconds)
+
+
 def window() -> FlexibleTravelWindow:
     return FlexibleTravelWindow(
         origin="HGH",
@@ -654,9 +669,7 @@ class FakeLiveRunner:
             mode,
             total_cents=variable_flight_total,
             complete=self.complete,
-            exact_quote_comparison_complete=(
-                self.exact_quote_comparison_complete
-            ),
+            exact_quote_comparison_complete=(self.exact_quote_comparison_complete),
         )
 
 
@@ -874,6 +887,35 @@ async def test_publication_refresh_bypasses_run_acquisition_ledger() -> None:
     detailed = ledger.detailed_metrics()
     assert detailed["platform_acquisition_attempt_count"] == 1
     assert detailed["publication_refresh_platform_acquisition_attempt_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_acquisition_ledger_preserves_full_window_queue_wait_budget() -> None:
+    from tripchord.agents.flexible_live_system import _FlexibleAcquisitionLedger
+    from tripchord.agents.live_system import _browser_wait_timeout_seconds
+
+    bridge = RecordingWaitTimeoutBrowserTaskBridge(now=lambda: NOW)
+    ledger = _FlexibleAcquisitionLedger(bridge)
+    ledger.reset()
+    query = BrowserSearchQuery(
+        origin="HGH",
+        destination="MLE",
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 8),
+        options={"__tripchord_browser_wait_source_count": 90},
+    )
+    submission = BrowserTaskSubmission(
+        provider=BrowserProvider.CTRIP,
+        kind=BrowserVertical.FLIGHT,
+        query=query,
+        timeout_seconds=15,
+    )
+
+    (snapshot,) = await ledger.submit_many((submission,))
+    await asyncio.sleep(0.01)
+
+    assert bridge.wait_timeouts == [_browser_wait_timeout_seconds(15, source_task_count=90)]
+    await ledger.cancel_many((snapshot.id,), reason="queue-wait budget regression cleanup")
 
 
 def test_acquisition_ledger_attempt_metrics_distinguish_reuse_cancel_and_claim() -> None:
@@ -1306,27 +1348,24 @@ async def test_three_date_pairs_share_fixed_concurrency_and_provider_lanes() -> 
 
     expected_pair_ids = result.query_plan.selected_pair_ids
     assert fake.max_active == 3
-    assert set(fake.completed_dates) == {
-        item.date_pair.departure_date for item in result.pair_runs
-    }
+    assert set(fake.completed_dates) == {item.date_pair.departure_date for item in result.pair_runs}
     assert tuple(item.date_pair.id for item in result.pair_runs) == expected_pair_ids
     assert {item.date_pair_id for item in result.ranked_options} == set(expected_pair_ids)
     assert result.ranked_options[1].departure_date == date(2026, 8, 3)
     assert result.ranked_options[1].diversity_tags != result.ranked_options[0].diversity_tags
     assert all(item.pareto_front == 1 for item in result.ranked_options)
     assert result.query_plan.total_task_count == 33
+    assert [item.source_start_delays_ms["source-ctrip-flight"] for item in result.pair_runs] == [
+        0,
+        5_000,
+        10_000,
+    ]
     assert [
-        item.source_start_delays_ms["source-ctrip-flight"] for item in result.pair_runs
-    ] == [0, 5_000, 10_000]
-    assert [
-        item.source_start_delays_ms["source-qunar-lodging-last"]
-        for item in result.pair_runs
+        item.source_start_delays_ms["source-qunar-lodging-last"] for item in result.pair_runs
     ] == [4_000, 9_000, 14_000]
     assert tuple(item.sequence for item in checkpoints) == (1, 2, 3)
     assert {item.date_pair_id for item in checkpoints} == set(expected_pair_ids)
-    assert all(
-        item.state == LivePlanningPairCheckpointState.COMPLETED for item in checkpoints
-    )
+    assert all(item.state == LivePlanningPairCheckpointState.COMPLETED for item in checkpoints)
     assert all(item.state == LivePlanningPairCheckpointState.COMPLETED for item in checkpoints)
     assert all(len(item.query_task_ids) == 11 for item in checkpoints)
     assert all(item.run_summary_sha256 != item.checkpoint_sha256 for item in checkpoints)
@@ -1434,28 +1473,20 @@ async def test_v4_admission_completes_one_pair_with_six_global_leases() -> None:
     assert len(result.pair_runs) == 1
     for execution in result.pair_runs:
         planned_pair_tasks = tuple(
-            task
-            for task in result.query_plan.tasks
-            if task.date_pair_id == execution.date_pair.id
+            task for task in result.query_plan.tasks if task.date_pair_id == execution.date_pair.id
         )
         assert tuple(item.id for item in execution.query_tasks) == tuple(
             item.id for item in planned_pair_tasks
         )
         assert execution.source_start_delays_ms["source-ctrip-flight"] == 0
         assert execution.source_start_delays_ms["source-tongcheng-flight"] == 0
-        assert (
-            execution.source_start_delays_ms["source-qunar-lodging-hulhumale-full"]
-            == 5_000
-        )
+        assert execution.source_start_delays_ms["source-qunar-lodging-hulhumale-full"] == 5_000
     assert [item["source-ctrip-flight"] for item in fake.source_delay_history] == [0]
     assert [item["source-tongcheng-flight"] for item in fake.source_delay_history] == [0]
-    assert [
-        item["source-qunar-lodging-hulhumale-full"] for item in fake.source_delay_history
-    ] == [5_000]
-    assert [
-        execution.query_tasks[0].scheduled_offset_ms
-        for execution in result.pair_runs
-    ] == [0]
+    assert [item["source-qunar-lodging-hulhumale-full"] for item in fake.source_delay_history] == [
+        5_000
+    ]
+    assert [execution.query_tasks[0].scheduled_offset_ms for execution in result.pair_runs] == [0]
     assert [
         next(
             task.scheduled_offset_ms
@@ -1566,13 +1597,16 @@ async def test_one_date_failure_is_isolated_and_other_repaired_options_are_ranke
     if result.refinement_trace:
         assert result.refinement_trace[0].selected_pair_id == result.query_plan.selected_pair_ids[0]
     if result.refinement_trace:
-        assert len(
-            {
-                item.selected_pair_id
-                for item in result.refinement_trace
-                if item.selected_pair_id is not None
-            }
-        ) == 3
+        assert (
+            len(
+                {
+                    item.selected_pair_id
+                    for item in result.refinement_trace
+                    if item.selected_pair_id is not None
+                }
+            )
+            == 3
+        )
     if len(result.refinement_trace) > 1:
         assert "Query Strategist" in result.refinement_trace[1].reason
     assert "保守 fallback" in result.claim_boundary
@@ -1620,9 +1654,7 @@ async def test_complete_cny_total_beats_more_comfortable_expensive_date() -> Non
                 candidate = run.package.final_candidate
                 poor_schedule_flight = candidate.flight.model_copy(
                     update={
-                        "outbound_depart_at": candidate.flight.outbound_depart_at.replace(
-                            hour=1
-                        ),
+                        "outbound_depart_at": candidate.flight.outbound_depart_at.replace(hour=1),
                         "return_depart_at": candidate.flight.return_depart_at.replace(hour=1),
                     }
                 )
@@ -1667,8 +1699,9 @@ async def test_complete_cny_total_beats_more_comfortable_expensive_date() -> Non
 
 
 @pytest.mark.asyncio
-async def test_publication_refresh_fails_closed_when_exploration_has_fewer_than_two_options(
-) -> None:
+async def test_publication_refresh_fails_closed_when_exploration_has_fewer_than_two_options() -> (
+    None
+):
     constrained_window = window().model_copy(
         update={"latest_departure": date(2026, 8, 2), "max_pairs": 2}
     )
@@ -1714,12 +1747,8 @@ def test_two_publication_options_cannot_share_a_browser_task_id() -> None:
         )
         return SimpleNamespace(
             publication_refresh_minimum_options=2,
-            pair_runs=tuple(
-                SimpleNamespace(publication_refresh_audit=audit) for audit in audits
-            ),
-            ranked_options=tuple(
-                SimpleNamespace(option_id=option_id) for option_id in option_ids
-            ),
+            pair_runs=tuple(SimpleNamespace(publication_refresh_audit=audit) for audit in audits),
+            ranked_options=tuple(SimpleNamespace(option_id=option_id) for option_id in option_ids),
             publication_refreshed_option_ids=option_ids,
             recommended_option_ids=option_ids,
             final_decision=SimpleNamespace(state=PackageDecisionState.ACCEPT),
@@ -1815,9 +1844,7 @@ async def test_one_pair_timeout_is_isolated_without_cancelling_other_pairs() -> 
     )
 
     timed_out = next(
-        item
-        for item in result.pair_runs
-        if item.date_pair.departure_date == date(2026, 8, 2)
+        item for item in result.pair_runs if item.date_pair.departure_date == date(2026, 8, 2)
     )
     assert timed_out.state == FlexiblePairState.FAILED
     assert timed_out.failure_class == "TimeoutError"
@@ -1878,7 +1905,7 @@ async def test_other_destination_keeps_query_and_has_no_golden_stay_profile() ->
     assert len(fake.queries) == 1
     assert fake.queries[0].destination == "Tokyo"
     assert fake.queries[0].destination_code is None
-    assert fake.queries[0].options == {}
+    assert fake.queries[0].options == {"__tripchord_browser_wait_source_count": 11}
     assert fake.calls[0][0].destination_place_key is None
 
 
@@ -1897,9 +1924,7 @@ def test_golden_profile_recognizes_supported_male_gateway_aliases(
 @pytest.mark.asyncio
 async def test_male_default_normalizes_missing_iata_code_before_real_source_planning() -> None:
     fake = FakeLiveRunner()
-    male_window = window().model_copy(
-        update={"destination": "MLE", "destination_code": None}
-    )
+    male_window = window().model_copy(update={"destination": "MLE", "destination_code": None})
 
     result = await FlexibleLiveAgentSystem(
         fake,
@@ -1922,9 +1947,7 @@ async def test_male_default_normalizes_missing_iata_code_before_real_source_plan
 @pytest.mark.asyncio
 async def test_male_explicit_candidate_set_also_normalizes_missing_iata_code() -> None:
     fake = FakeLiveRunner()
-    male_window = window().model_copy(
-        update={"destination": "MLE", "destination_code": None}
-    )
+    male_window = window().model_copy(update={"destination": "MLE", "destination_code": None})
 
     await FlexibleLiveAgentSystem(
         fake,
@@ -1942,8 +1965,9 @@ async def test_male_explicit_candidate_set_also_normalizes_missing_iata_code() -
 
 
 @pytest.mark.asyncio
-async def test_strict_mode_can_publish_exact_single_source_when_other_platform_is_incomplete(
-) -> None:
+async def test_strict_mode_can_publish_exact_single_source_when_other_platform_is_incomplete() -> (
+    None
+):
     fake = FakeLiveRunner(complete=False)
     result = await FlexibleLiveAgentSystem(
         fake,
@@ -1968,8 +1992,7 @@ async def test_strict_mode_can_publish_exact_single_source_when_other_platform_i
 
 
 @pytest.mark.asyncio
-async def test_single_source_package_remains_blocked_when_only_quote_is_not_complete(
-) -> None:
+async def test_single_source_package_remains_blocked_when_only_quote_is_not_complete() -> None:
     result = await FlexibleLiveAgentSystem(
         FakeLiveRunner(exact_quote_comparison_complete=False),
         now=lambda: NOW,

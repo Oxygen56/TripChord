@@ -371,6 +371,7 @@ class LiveDataProvider(StrEnum):
 
 class LiveEvidenceScope(StrEnum):
     FULL_SEARCH = "full_search"
+    FULL_WINDOW_BASELINE_SCREEN = "full_window_baseline_screen"
     PUBLICATION_COMPONENT_REFRESH = "publication_component_refresh"
 
 
@@ -418,6 +419,7 @@ _EXPLORATION_MODEL_STAGE_IDS = (
 )
 
 _DETERMINISTIC_DOMINANCE_SKIP = "deterministic_dominance_skip"
+_NO_CANDIDATE_MODEL_SKIP = "no_candidate_model_skip"
 _DETERMINISTIC_DOMINANCE_POLICY_BOUNDARY = (
     "只比较已通过全部硬约束的候选；同行可比人民币总价必须严格更低，且航班、"
     "接驳、早餐、取消、位置与用户已声明的房型品质权益不得变差。用户只要求"
@@ -695,11 +697,7 @@ class LodgingProviderQuoteEvidence(DomainModel):
     @model_validator(mode="before")
     @classmethod
     def backfill_legacy_eligible_quote_ids(cls, value: object) -> object:
-        if (
-            isinstance(value, dict)
-            and "eligible_quote_ids" not in value
-            and value.get("quote_ids")
-        ):
+        if isinstance(value, dict) and "eligible_quote_ids" not in value and value.get("quote_ids"):
             return {**value, "eligible_quote_ids": value["quote_ids"]}
         return value
 
@@ -1168,8 +1166,7 @@ class LivePackageAgentRun(DomainModel):
                 (
                     item
                     for item in self.decision_only_candidate_set.candidates
-                    if item.candidate.id
-                    == self.decision_only_candidate_set.selected_candidate_id
+                    if item.candidate.id == self.decision_only_candidate_set.selected_candidate_id
                 ),
                 None,
             )
@@ -1189,15 +1186,12 @@ class LivePackageAgentRun(DomainModel):
                     "iCom CNY estimate requires an accepted package",
                 )
             supplemental = tuple(
-                item
-                for item in budget.supplemental_published_base_fares
-                if item.currency == "USD"
+                item for item in budget.supplemental_published_base_fares if item.currency == "USD"
             )
             estimate = self.icom_cny_reference_estimate
             if (
                 len(supplemental) != 1
-                or supplemental[0].total_for_party_cents
-                != estimate.source_usd_base_fare_cents
+                or supplemental[0].total_for_party_cents != estimate.source_usd_base_fare_cents
                 or supplemental[0].price_contract_ids != estimate.price_contract_ids
                 or supplemental[0].transfer_ids != estimate.transfer_ids
             ):
@@ -1290,10 +1284,14 @@ class LivePackageAgentRun(DomainModel):
             )
         final_tail = set(_DEFERRED_EXPLORATION_STAGE_IDS)
         if self.run_purpose == LiveRunPurpose.EXPLORATION_SELECTION:
-            if self.evidence_scope != LiveEvidenceScope.FULL_SEARCH:
+            if self.evidence_scope not in {
+                LiveEvidenceScope.FULL_SEARCH,
+                LiveEvidenceScope.FULL_WINDOW_BASELINE_SCREEN,
+            }:
                 raise PydanticCustomError(
                     "live_run_exploration_evidence_scope_invalid",
-                    "exploration selection requires full-search evidence scope",
+                    "exploration selection requires full-search or full-window "
+                    "baseline-screen evidence scope",
                 )
             if self.finalization_state != LiveFinalizationState.EXPLORATION_SEALED:
                 raise PydanticCustomError(
@@ -1602,6 +1600,10 @@ class _ApprovedExplanationClaim:
 @dataclass
 class _RunState:
     source_task_ids: tuple[str, ...]
+    flight_source_task_ids: tuple[str, ...] = ()
+    flight_source_completed_task_ids: set[str] = field(default_factory=set)
+    lodging_source_task_ids: tuple[str, ...] = ()
+    no_usable_flight_short_circuit: bool = False
     source_timeout_seconds: int = 120
     intent: PackageIntent | None = None
     mode: LiveCoverageMode = LiveCoverageMode.STRICT
@@ -1620,19 +1622,15 @@ class _RunState:
     browser_task_ids_by_source: dict[str, tuple[str, ...]] = field(default_factory=dict)
     browser_task_scope_by_source: dict[str, str] = field(default_factory=dict)
     browser_task_circuit_key_by_source: dict[str, str] = field(default_factory=dict)
-    provider_vertical_circuits: dict[str, dict[str, JsonValue]] = field(
-        default_factory=dict
-    )
+    provider_vertical_circuits: dict[str, dict[str, JsonValue]] = field(default_factory=dict)
     provider_vertical_circuit_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock,
         repr=False,
     )
-    party_price_validation_snapshots: dict[str, BrowserTaskSnapshot] = field(
+    party_price_validation_snapshots: dict[str, BrowserTaskSnapshot] = field(default_factory=dict)
+    party_price_comparison_receipts: dict[str, tuple[FlightPartyComparisonReceipt, ...]] = field(
         default_factory=dict
     )
-    party_price_comparison_receipts: dict[
-        str, tuple[FlightPartyComparisonReceipt, ...]
-    ] = field(default_factory=dict)
     party_price_validation_errors: dict[str, str] = field(default_factory=dict)
     lodging_window_alignment: dict[str, JsonValue] | None = None
     lodging_window_results: tuple[NormalizedBrowserQuoteResult, ...] = ()
@@ -1887,9 +1885,7 @@ def _settled_browser_source_events(
                 ),
                 "occurred_at": terminal_at.isoformat(),
                 "detail": (
-                    "not_attempted_due_same_run_lodging_circuit"
-                    if circuit_suppressed
-                    else None
+                    "not_attempted_due_same_run_lodging_circuit" if circuit_suppressed else None
                 ),
             }
         )
@@ -1979,6 +1975,31 @@ class LivePackageAgentSystem:
                 reuse_partition_sha256=reuse_partition_sha256,
             )
         )
+        raw_full_window_flight_screen = query.options.get(
+            "__tripchord_full_window_flight_screen",
+            False,
+        )
+        if not isinstance(raw_full_window_flight_screen, bool):
+            raise ValueError("full-window flight screen flag must be boolean")
+        if raw_full_window_flight_screen:
+            browser_source_tasks = tuple(
+                task
+                for task in browser_source_tasks
+                if BrowserTaskSubmission.model_validate(task.input["submission"]).kind
+                is BrowserVertical.FLIGHT
+            )
+        raw_browser_wait_source_count = query.options.get(
+            "__tripchord_browser_wait_source_count",
+            len(browser_source_tasks),
+        )
+        if (
+            not isinstance(raw_browser_wait_source_count, int)
+            or isinstance(raw_browser_wait_source_count, bool)
+            or raw_browser_wait_source_count < len(browser_source_tasks)
+            or raw_browser_wait_source_count > 1_000
+        ):
+            raise ValueError("browser wait source count must cover this graph and be at most 1000")
+        browser_wait_source_count = raw_browser_wait_source_count
         delays = source_start_delays_ms or {}
         known_source_ids = {task.id for task in browser_source_tasks}
         if unknown := set(delays) - known_source_ids:
@@ -2039,6 +2060,18 @@ class LivePackageAgentSystem:
         all_source_ids = (*source_ids, *public_transfer_ids)
         state = _RunState(
             source_task_ids=source_ids,
+            flight_source_task_ids=tuple(
+                task.id
+                for task in browser_source_tasks
+                if BrowserTaskSubmission.model_validate(task.input["submission"]).kind
+                is BrowserVertical.FLIGHT
+            ),
+            lodging_source_task_ids=tuple(
+                task.id
+                for task in browser_source_tasks
+                if BrowserTaskSubmission.model_validate(task.input["submission"]).kind
+                is BrowserVertical.LODGING
+            ),
             source_timeout_seconds=timeout_seconds,
             intent=intent,
             mode=mode,
@@ -2112,6 +2145,59 @@ class LivePackageAgentSystem:
             search_schedule,
             supervisor_task_id=search_supervisor_task.id,
         )
+        raw_suppressed_flight_providers = query.options.get(
+            "__tripchord_skip_flight_providers",
+            (),
+        )
+        if not isinstance(raw_suppressed_flight_providers, (list, tuple)) or any(
+            not isinstance(provider, str)
+            or provider not in {item.value for item in self._providers}
+            for provider in raw_suppressed_flight_providers
+        ):
+            raise ValueError("suppressed flight providers must be configured providers")
+        suppressed_flight_providers = frozenset(raw_suppressed_flight_providers)
+        if suppressed_flight_providers:
+            scheduled_source_tasks = tuple(
+                task.model_copy(
+                    update={
+                        "input": {
+                            **task.input,
+                            "provider_failure_circuit_skipped": True,
+                            "provider_failure_circuit_skip_reason": (
+                                "same flexible run observed a login or CAPTCHA gate "
+                                "on an earlier date and was instructed to skip the platform"
+                            ),
+                        }
+                    }
+                )
+                if task.id in state.flight_source_task_ids
+                and BrowserTaskSubmission.model_validate(task.input["submission"]).provider.value
+                in suppressed_flight_providers
+                else task
+                for task in scheduled_source_tasks
+            )
+        if not model_agents_enabled and state.flight_source_task_ids:
+            # Full-window exploration cannot form a package without a usable
+            # flight.  Gate the much larger lodging fan-out behind the complete
+            # flight frontier.  When every flight source ends without a
+            # publishable quote, ``_short_circuit_lodging_without_usable_flight``
+            # records the cancellation tombstones before these tasks become
+            # runnable, so they settle without opening browser tabs.  A date
+            # pair with a usable flight still runs every admitted lodging task.
+            flight_dependencies = state.flight_source_task_ids
+            lodging_ids = frozenset(state.lodging_source_task_ids)
+            scheduled_source_tasks = tuple(
+                task.model_copy(
+                    update={
+                        "dependencies": tuple(
+                            dict.fromkeys((*task.dependencies, *flight_dependencies))
+                        )
+                    }
+                )
+                if task.id in lodging_ids
+                else task
+                for task in scheduled_source_tasks
+            )
         finalization_tasks = self._run_finalization_tasks(purpose)
         graph = TaskGraph(
             tasks=(
@@ -2306,7 +2392,7 @@ class LivePackageAgentSystem:
                 ContextEngine(EvidenceBlackboard()),
                 self._tool_registry(
                     state,
-                    source_task_count=len(browser_source_tasks),
+                    source_task_count=browser_wait_source_count,
                 ),
             )
         except BaseException:
@@ -2330,7 +2416,21 @@ class LivePackageAgentSystem:
                     f"{type(exc).__name__}: {exc}"
                 )
         if state.decision is None:
-            raise RuntimeError("orchestrator did not produce a final decision")
+            completed_ids = {result.task_id for result in scheduler.results}
+            missing_ids = tuple(
+                task.id for task in scheduler.graph.tasks if task.id not in completed_ids
+            )
+            failed_ids = tuple(result.task_id for result in scheduler.results if not result.success)
+            failed_diagnostics = tuple(
+                (result.task_id, result.failure_class, result.summary)
+                for result in scheduler.results
+                if not result.success
+            )
+            raise RuntimeError(
+                "orchestrator did not produce a final decision; "
+                f"failed_tasks={failed_ids}, missing_tasks={missing_ids}, "
+                f"failed_diagnostics={failed_diagnostics}"
+            )
         if purpose == LiveRunPurpose.EXPLORATION_SELECTION:
             if not state.exploration_seal_passed:
                 raise RuntimeError(
@@ -2346,6 +2446,12 @@ class LivePackageAgentSystem:
             )
         elif not state.publication_gate_passed:
             raise RuntimeError("deterministic publication gate did not complete")
+        if raw_full_window_flight_screen:
+            state.claim_boundary += (
+                "该日期运行属于完整窗口的同口径基线筛选：浏览器仅查询航班，"
+                "住宿只采用当次可用的官方来源，接驳只采用 iCom 公开来源；"
+                "不代表该日期已完成 OTA 住宿比价。"
+            )
         state.claim_boundary += self._model_participation_claim(state, scheduler)
         state.decision_only_candidate_set = self._build_decision_only_candidate_set(state)
         state.decision_only_candidate = (
@@ -2353,8 +2459,7 @@ class LivePackageAgentSystem:
                 (
                     item
                     for item in state.decision_only_candidate_set.candidates
-                    if item.candidate.id
-                    == state.decision_only_candidate_set.selected_candidate_id
+                    if item.candidate.id == state.decision_only_candidate_set.selected_candidate_id
                 ),
                 None,
             )
@@ -2379,9 +2484,7 @@ class LivePackageAgentSystem:
                     },
                 }
             )
-        deterministic_candidate_id = (
-            state.candidates[0].id if state.candidates else None
-        )
+        deterministic_candidate_id = state.candidates[0].id if state.candidates else None
         if (
             state.candidate_proposal is not None
             and state.planner_handoff is not None
@@ -2398,6 +2501,11 @@ class LivePackageAgentSystem:
                 }
             )
         return LivePackageAgentRun(
+            evidence_scope=(
+                LiveEvidenceScope.FULL_WINDOW_BASELINE_SCREEN
+                if raw_full_window_flight_screen
+                else LiveEvidenceScope.FULL_SEARCH
+            ),
             run_purpose=purpose,
             finalization_state=(
                 LiveFinalizationState.EXPLORATION_SEALED
@@ -2476,8 +2584,8 @@ class LivePackageAgentSystem:
         intent = state.intent
         if intent is None:
             return None
-        comparison_flights = tuple(
-            result.quote
+        comparison_flights_by_id = {
+            result.quote.id: result.quote
             for result in state.normalization_results
             if result.usable
             and isinstance(result.quote, NormalizedFlightQuote)
@@ -2493,7 +2601,8 @@ class LivePackageAgentSystem:
                 reference.startswith("flight-party-comparison:sha256:")
                 for reference in result.quote.evidence_refs
             )
-        )
+        }
+        comparison_flights = tuple(comparison_flights_by_id.values())
         if not comparison_flights:
             return None
         inventory = PackageInventory(
@@ -2561,11 +2670,12 @@ class LivePackageAgentSystem:
                 transfer_provider="icom-public-transfer",
             )
         )
-        if len(candidates) < 2:
-            return None
-        selected = min(
-            candidates,
-            key=lambda item: (
+        candidates_by_flight: dict[str, list[DecisionOnlyPackageCandidate]] = {}
+        for candidate in candidates:
+            candidates_by_flight.setdefault(candidate.candidate.flight.id, []).append(candidate)
+
+        def candidate_score(item: DecisionOnlyPackageCandidate) -> tuple[int, str]:
+            return (
                 item.budget.confirmed_subtotal_cents
                 + sum(
                     lodging_reference_cny_if_comparable(lodging, intent.currency) or 10**18
@@ -2573,8 +2683,20 @@ class LivePackageAgentSystem:
                     if lodging.currency != item.candidate.currency
                 ),
                 item.candidate.id,
-            ),
+            )
+
+        comparable_groups = tuple(
+            tuple(sorted(group, key=candidate_score))
+            for group in candidates_by_flight.values()
+            if len(group) >= 2
         )
+        if not comparable_groups:
+            return None
+        candidates = min(
+            comparable_groups,
+            key=lambda group: candidate_score(group[0]),
+        )
+        selected = candidates[0]
         return DecisionOnlyCandidateSet(
             candidates=candidates,
             selected_candidate_id=selected.candidate.id,
@@ -2789,7 +2911,9 @@ class LivePackageAgentSystem:
                     actions.append(activity[0])
                     evidence_refs.append(activity[1])
                     evidence_refs.append(activity[2])
-                    actions.append("备选：若当天无位、天气或海况不适，保留为岛上自由活动；不宣称已预约。")
+                    actions.append(
+                        "备选：若当天无位、天气或海况不适，保留为岛上自由活动；不宣称已预约。"
+                    )
             if current == flight.return_depart_at.date():
                 actions.append(
                     f"{flight.return_depart_at.strftime('%H:%M')} 从{flight.destination}返程。"
@@ -2868,8 +2992,7 @@ class LivePackageAgentSystem:
             except ValueError:
                 continue
             label = (
-                f"{_MODEL_ROLE_CLAIM_LABELS.get(trace.role, trace.role.value)}"
-                f"（{trace.task_id}）"
+                f"{_MODEL_ROLE_CLAIM_LABELS.get(trace.role, trace.role.value)}（{trace.task_id}）"
             )
             if trace.execution_mode == "deterministic_skip":
                 deterministic_skips.append(label)
@@ -3685,8 +3808,7 @@ class LivePackageAgentSystem:
                     verifier_passed=(
                         global_run.decision.state == PackageDecisionState.ACCEPT
                         and global_run.package is not None
-                        and global_run.package.final_decision.state
-                        == PackageDecisionState.ACCEPT
+                        and global_run.package.final_decision.state == PackageDecisionState.ACCEPT
                     ),
                     reverifier_passed=(
                         global_run.package_reverification_audit.passed
@@ -3713,9 +3835,7 @@ class LivePackageAgentSystem:
                     if global_run.package is not None
                     else None
                 ),
-                verifier_passed=(
-                    global_run.decision.state == PackageDecisionState.ACCEPT
-                ),
+                verifier_passed=(global_run.decision.state == PackageDecisionState.ACCEPT),
                 reverifier_passed=(
                     global_run.package_reverification_audit.passed
                     if global_run.package_reverification_audit is not None
@@ -3836,9 +3956,7 @@ class LivePackageAgentSystem:
         }
         source_outcomes = tuple(
             outcome.model_copy(
-                update={
-                    "eligible_quote_count": eligible_by_provider.get(outcome.provider, 0)
-                }
+                update={"eligible_quote_count": eligible_by_provider.get(outcome.provider, 0)}
             )
             for outcome in source_outcomes
         )
@@ -3879,9 +3997,7 @@ class LivePackageAgentSystem:
         verified_at = verification_now or self._utc_now()
         violations = self._verifier.verify(patched_intent, repaired, now=verified_at)
         errors = tuple(
-            item
-            for item in violations
-            if item.severity == PackageViolationSeverity.ERROR
+            item for item in violations if item.severity == PackageViolationSeverity.ERROR
         )
         try:
             independent_audit = self._package_reverifier.audit(
@@ -3920,9 +4036,7 @@ class LivePackageAgentSystem:
             )
 
         warnings = tuple(
-            item
-            for item in violations
-            if item.severity == PackageViolationSeverity.WARNING
+            item for item in violations if item.severity == PackageViolationSeverity.WARNING
         )
         decision = PackageDecision(
             state=PackageDecisionState.ACCEPT,
@@ -3975,9 +4089,9 @@ class LivePackageAgentSystem:
         eligible_provider_count = sum(
             outcome.eligible_quote_count > 0 for outcome in source_outcomes
         )
-        source_summary = "、".join(
-            f"{item.provider}:{item.state}" for item in source_outcomes
-        ) or "无来源结果"
+        source_summary = (
+            "、".join(f"{item.provider}:{item.state}" for item in source_outcomes) or "无来源结果"
+        )
         updated = previous.model_copy(
             update={
                 "intent": patched_intent,
@@ -4048,9 +4162,7 @@ class LivePackageAgentSystem:
             update={"start_date": target.check_in, "end_date": target.check_out}
         )
         assert previous.package is not None
-        segment = self._modification_lodging_segment(
-            previous.package.final_candidate.kind
-        )
+        segment = self._modification_lodging_segment(previous.package.final_candidate.kind)
         browser_tasks = tuple(
             self._source_task(
                 provider,
@@ -4360,25 +4472,20 @@ class LivePackageAgentSystem:
         replacement: NormalizedLodgingQuote,
         instruction: str,
     ) -> TravelPackageCandidate:
-        lodgings = tuple(
-            replacement if item.id == target.id else item for item in current.lodgings
-        )
+        lodgings = tuple(replacement if item.id == target.id else item for item in current.lodgings)
         version = current.version + 1
         identity = hashlib.sha256(
             f"{current.id}|{replacement.id}|{instruction}".encode()
         ).hexdigest()[:12]
         flight_total = (
             current.flight.total_for_party_cents
-            if current.flight.party_total_known
-            and current.flight.total_for_party_cents is not None
+            if current.flight.party_total_known and current.flight.total_for_party_cents is not None
             else 0
         )
         total = (
             flight_total
             + sum(
-                item.total_for_party_cents
-                for item in lodgings
-                if item.currency == current.currency
+                item.total_for_party_cents for item in lodgings if item.currency == current.currency
             )
             + transfer_contract_total_cents(
                 current.transfers,
@@ -4727,6 +4834,7 @@ class LivePackageAgentSystem:
             and event.controlled_price_delta_cents is not None
         ):
             delta = event.controlled_price_delta_cents
+
             def apply_controlled_price_change(item: TransferOption) -> TransferOption:
                 if not self._same_transfer_service(item, target):
                     return item
@@ -4880,6 +4988,7 @@ class LivePackageAgentSystem:
                 or not self._same_transfer_service(item, target)
             )
         )
+
         def replacement_order(item: TransferOption) -> tuple[object, ...]:
             # Resolve connection feasibility before choosing among otherwise
             # equivalent same-day offers.  The old id-first tie-break could
@@ -5129,10 +5238,7 @@ class LivePackageAgentSystem:
             return draft
         blocking = PackageDecision(
             state=PackageDecisionState.HUMAN_BLOCK,
-            summary=(
-                "事件重规划不得绕过已预订保护："
-                f"{impact.blocked_reason}"
-            ),
+            summary=(f"事件重规划不得绕过已预订保护：{impact.blocked_reason}"),
             evidence_refs=package.final_candidate.evidence_refs,
         )
         return draft.model_copy(
@@ -5309,9 +5415,7 @@ class LivePackageAgentSystem:
     def _normalized_cancellation_contract(policy: str | None) -> str | None:
         if policy is None:
             return None
-        normalized = " ".join(
-            unicodedata.normalize("NFKC", policy).casefold().split()
-        )
+        normalized = " ".join(unicodedata.normalize("NFKC", policy).casefold().split())
         return normalized or None
 
     @staticmethod
@@ -5381,22 +5485,21 @@ class LivePackageAgentSystem:
                 "standard": 1,
                 "basic": 0,
             }
-            if quality_order[lodging_quality_tier(preferred).value] < quality_order[
-                lodging_quality_tier(alternative).value
-            ]:
+            if (
+                quality_order[lodging_quality_tier(preferred).value]
+                < quality_order[lodging_quality_tier(alternative).value]
+            ):
                 return False
 
         preferred_not_remote = (
-            preferred.location_convenience
-            == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+            preferred.location_convenience == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
             and lodging_non_remote_evidence_confirmed(
                 preferred.location_address,
                 preferred.nearby_location_evidence,
             )
         )
         alternative_not_remote = (
-            alternative.location_convenience
-            == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+            alternative.location_convenience == LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
             and lodging_non_remote_evidence_confirmed(
                 alternative.location_address,
                 alternative.nearby_location_evidence,
@@ -5490,9 +5593,7 @@ class LivePackageAgentSystem:
                 inventory=state.inventory,
                 inventory_outcomes=state.stay_plan_inventory_outcomes,
             )
-            state.selected_stay_plan_id = (
-                state.stay_plan_planner_handoff.selected_stay_plan_id
-            )
+            state.selected_stay_plan_id = state.stay_plan_planner_handoff.selected_stay_plan_id
 
     def _candidate_curation_policy(
         self,
@@ -5682,8 +5783,7 @@ class LivePackageAgentSystem:
                     or (
                         quote.adults == intent.adults
                         and quote.rooms == intent.rooms
-                        and intent.start_date <= quote.check_in < quote.check_out
-                        <= intent.end_date
+                        and intent.start_date <= quote.check_in < quote.check_out <= intent.end_date
                     )
                 )
             )
@@ -5736,12 +5836,9 @@ class LivePackageAgentSystem:
                         f"confirmed subtotal: {wrongly_excluded}"
                     )
                 comparable = set(proposal.comparable_quote_ids)
-                missing_comparable = sorted(
-                    set(must_be_comparable_ids) - comparable
-                )
+                missing_comparable = sorted(set(must_be_comparable_ids) - comparable)
                 wrongly_non_comparable = sorted(
-                    set(must_be_comparable_ids)
-                    & set(proposal.excluded_quote_ids)
+                    set(must_be_comparable_ids) & set(proposal.excluded_quote_ids)
                 )
                 if missing_comparable or wrongly_non_comparable:
                     return (
@@ -6178,6 +6275,25 @@ class LivePackageAgentSystem:
                 role == AgentRole.CANDIDATE_CURATOR
                 and apply_proposal
                 and task.id == "curate-travel-candidates"
+                and not self._model_agents_required
+                and not state.candidates
+            ):
+                result = agent.skipped_result(
+                    task,
+                    _NO_CANDIDATE_MODEL_SKIP,
+                    summary="没有可选整包候选，已跳过 Candidate Curator 模型请求",
+                    output={
+                        "candidate_curation_mode": _NO_CANDIDATE_MODEL_SKIP,
+                        "selected_candidate_id": None,
+                        "hard_eligible_candidate_count": 0,
+                    },
+                )
+                state.agentic_results[task.id] = result
+                return result
+            if (
+                role == AgentRole.CANDIDATE_CURATOR
+                and apply_proposal
+                and task.id == "curate-travel-candidates"
                 and (
                     dominance := self._deterministic_dominance_winner(
                         state,
@@ -6192,17 +6308,13 @@ class LivePackageAgentSystem:
                 result = agent.skipped_result(
                     task,
                     _DETERMINISTIC_DOMINANCE_SKIP,
-                    summary=(
-                        "候选存在唯一确定性支配赢家，已跳过 Candidate Curator 模型请求"
-                    ),
+                    summary=("候选存在唯一确定性支配赢家，已跳过 Candidate Curator 模型请求"),
                     output={
                         "candidate_curation_mode": _DETERMINISTIC_DOMINANCE_SKIP,
                         "selected_candidate_id": winner.id,
                         "hard_eligible_candidate_count": eligible_count,
                         "selected_total_for_party_cents": winner.computed_total_cents,
-                        "dominance_policy_boundary": (
-                            _DETERMINISTIC_DOMINANCE_POLICY_BOUNDARY
-                        ),
+                        "dominance_policy_boundary": (_DETERMINISTIC_DOMINANCE_POLICY_BOUNDARY),
                     },
                 )
                 state.agentic_results[task.id] = result
@@ -6236,10 +6348,7 @@ class LivePackageAgentSystem:
             if (
                 self._context_builder is not None
                 and state.memory_access is not None
-                and not (
-                    formal_model_role == role.value
-                    and role == AgentRole.CANDIDATE_CURATOR
-                )
+                and not (formal_model_role == role.value and role == AgentRole.CANDIDATE_CURATOR)
             ):
                 current_pack = context_engine.build_pack(task)
                 purpose = {
@@ -7259,11 +7368,7 @@ class LivePackageAgentSystem:
             "external_tool_called": False,
         }
         summary = f"{task.id} suppressed by scope cancellation tombstone"
-        topic = (
-            "public_transfer_result"
-            if "icom_query" in task.input
-            else "browser_result"
-        )
+        topic = "public_transfer_result" if "icom_query" in task.input else "browser_result"
         return AgentTaskResult(
             task_id=task.id,
             agent_role=task.role,
@@ -7300,17 +7405,9 @@ class LivePackageAgentSystem:
             return None
         failure = snapshot.failure
         if failure.code is BrowserFailureCode.CAPTCHA_REQUIRED:
-            return (
-                "captcha_required"
-                if snapshot.state is BrowserTaskState.BLOCKED
-                else None
-            )
+            return "captcha_required" if snapshot.state is BrowserTaskState.BLOCKED else None
         if failure.code is BrowserFailureCode.LOGIN_REQUIRED:
-            return (
-                "login_required"
-                if snapshot.state is BrowserTaskState.BLOCKED
-                else None
-            )
+            return "login_required" if snapshot.state is BrowserTaskState.BLOCKED else None
         if snapshot.state is not BrowserTaskState.FAILED:
             return None
         if failure.code is BrowserFailureCode.DOM_DRIFT:
@@ -7384,10 +7481,7 @@ class LivePackageAgentSystem:
         if scope.key in state.provider_vertical_circuits:
             return scope.key
         cohort_key = task.input.get("provider_lodging_cohort_key")
-        if (
-            isinstance(cohort_key, str)
-            and cohort_key in state.provider_vertical_circuits
-        ):
+        if isinstance(cohort_key, str) and cohort_key in state.provider_vertical_circuits:
             return cohort_key
         return None
 
@@ -7461,9 +7555,7 @@ class LivePackageAgentSystem:
                         ),
                     )
                     receipt["cancelled_sibling_browser_task_ids"] = [
-                        item.id
-                        for item in cancelled
-                        if item.state is BrowserTaskState.CANCELLED
+                        item.id for item in cancelled if item.state is BrowserTaskState.CANCELLED
                     ]
                 except Exception as exc:
                     receipt["cancellation_error"] = type(exc).__name__
@@ -7518,8 +7610,7 @@ class LivePackageAgentSystem:
         for raw_quote in snapshot.quotes:
             price_basis_source = raw_quote.details.get("price_basis_source")
             if not (
-                isinstance(price_basis_source, str)
-                and "unverified_party" in price_basis_source
+                isinstance(price_basis_source, str) and "unverified_party" in price_basis_source
             ):
                 continue
             normalized = self._normalizer.normalize(raw_quote, query)
@@ -7580,20 +7671,41 @@ class LivePackageAgentSystem:
             _: ContextEngine,
             tools: ToolRegistry,
         ) -> AgentTaskResult:
-            if task.input.get("search_supervisor_skipped") is True:
+            search_supervisor_skipped = task.input.get("search_supervisor_skipped") is True
+            provider_failure_circuit_skipped = (
+                task.input.get("provider_failure_circuit_skipped") is True
+            )
+            if search_supervisor_skipped or provider_failure_circuit_skipped:
                 reason = str(
                     task.input.get(
-                        "search_supervisor_skip_reason",
-                        "explicit degraded-mode optional-task omission",
+                        (
+                            "provider_failure_circuit_skip_reason"
+                            if provider_failure_circuit_skipped
+                            else "search_supervisor_skip_reason"
+                        ),
+                        (
+                            "same-run provider failure circuit"
+                            if provider_failure_circuit_skipped
+                            else "explicit degraded-mode optional-task omission"
+                        ),
                     )
                 )
-                state.source_errors[task.id] = f"SearchSupervisorSkipped: {reason}"
+                skip_class = (
+                    "ProviderFailureCircuitSkipped"
+                    if provider_failure_circuit_skipped
+                    else "SearchSupervisorSkipped"
+                )
+                state.source_errors[task.id] = f"{skip_class}: {reason}"
                 output: dict[str, JsonValue] = {
-                    "search_supervisor_skipped": True,
+                    "search_supervisor_skipped": search_supervisor_skipped,
+                    "provider_failure_circuit_skipped": (provider_failure_circuit_skipped),
                     "skip_reason": reason,
                     "external_tool_called": False,
                 }
                 topic = "public_transfer_result" if "icom_query" in task.input else "browser_result"
+                if task.id in state.flight_source_task_ids:
+                    state.flight_source_completed_task_ids.add(task.id)
+                    await self._short_circuit_lodging_without_usable_flight(state)
                 return AgentTaskResult(
                     task_id=task.id,
                     agent_role=task.role,
@@ -7669,9 +7781,8 @@ class LivePackageAgentSystem:
                     task,
                     open_circuit_key,
                 )
-            if (
-                scope is not None
-                and state.cancellation_tombstones.rejects(scope, attempt_generation)
+            if scope is not None and state.cancellation_tombstones.rejects(
+                scope, attempt_generation
             ):
                 # A scope was cancelled earlier in this run (or carried over
                 # from a previous generation).  This attempt is late: it must
@@ -7721,9 +7832,8 @@ class LivePackageAgentSystem:
                         task,
                         open_circuit_key,
                     )
-                if (
-                    scope is not None
-                    and state.cancellation_tombstones.rejects(scope, attempt_generation)
+                if scope is not None and state.cancellation_tombstones.rejects(
+                    scope, attempt_generation
                 ):
                     return self._scope_cancellation_suppressed_result(
                         task,
@@ -7779,12 +7889,9 @@ class LivePackageAgentSystem:
                     validation_snapshot: BrowserTaskSnapshot | None = None
                     validation_error: str | None = None
                     if self._needs_one_adult_price_validation(snapshot):
-                        if (
-                            scope is not None
-                            and state.cancellation_tombstones.rejects(
-                                scope,
-                                attempt_generation,
-                            )
+                        if scope is not None and state.cancellation_tombstones.rejects(
+                            scope,
+                            attempt_generation,
                         ):
                             validation_error = (
                                 "one-adult validation suppressed by scope cancellation tombstone"
@@ -7794,10 +7901,8 @@ class LivePackageAgentSystem:
                                 source_submission = BrowserTaskSubmission.model_validate(
                                     task.input["submission"]
                                 )
-                                validation_submission = (
-                                    self._one_adult_price_validation_submission(
-                                        source_submission
-                                    )
+                                validation_submission = self._one_adult_price_validation_submission(
+                                    source_submission
                                 )
                                 validation_call = ToolCall(
                                     id=f"call:{task.id}:adult-1-price-validation",
@@ -7912,6 +8017,14 @@ class LivePackageAgentSystem:
                     }
                     topic = "browser_result"
                 subject = task.id
+            if task.id in state.flight_source_task_ids:
+                # A snapshot is written before an optional 1-adult price
+                # validation finishes.  Mark the source complete only here,
+                # after that validation (or its terminal failure), so another
+                # fast flight source cannot cancel lodging while a publishable
+                # party total is still being established.
+                state.flight_source_completed_task_ids.add(task.id)
+                await self._short_circuit_lodging_without_usable_flight(state)
             return AgentTaskResult(
                 task_id=task.id,
                 agent_role=task.role,
@@ -7930,6 +8043,126 @@ class LivePackageAgentSystem:
 
         return execute
 
+    def _has_usable_flight_source_result(
+        self,
+        state: _RunState,
+        task_id: str,
+    ) -> bool:
+        snapshot = state.snapshots.get(task_id)
+        if snapshot is None:
+            return False
+        validation_snapshot = state.party_price_validation_snapshots.get(task_id)
+        party_price_comparisons: tuple[FlightPartyComparisonReceipt, ...] = ()
+        if validation_snapshot is not None:
+            if snapshot.state is BrowserTaskState.SUCCEEDED:
+                party_price_comparisons = self._normalizer.derive_flight_party_comparison_receipts(
+                    snapshot,
+                    validation_snapshot,
+                )
+            else:
+                party_price_comparisons = self._derive_sealed_receipt_party_comparisons(
+                    snapshot,
+                    validation_snapshot,
+                )
+        if snapshot.state is BrowserTaskState.SUCCEEDED:
+            normalized = self._normalizer.normalize_many(
+                snapshot.quotes,
+                snapshot.query,
+                party_price_comparisons=party_price_comparisons,
+            )
+        elif state.intent is not None:
+            normalized = self._normalize_comparison_flight_receipt(
+                snapshot,
+                state.intent,
+                party_price_comparisons=party_price_comparisons,
+            )
+        else:
+            normalized = ()
+        for result in normalized:
+            quote = result.quote
+            if not result.usable or not isinstance(quote, NormalizedFlightQuote):
+                continue
+            if quote.has_publishable_execution_contract:
+                return True
+            # Qunar currently exposes a complete round-trip card and a stable
+            # tax-inclusive display amount, but not a separate party-inventory
+            # control.  An exact 1-adult/N-adult comparison can still prove the
+            # arithmetic used for a decision-only package.  That is enough to
+            # continue searching matching hotels, while the final result keeps
+            # availability and settlement explicitly unconfirmed.
+            if (
+                quote.provider == BrowserProvider.QUNAR.value
+                and quote.party_total_known
+                and quote.total_for_party_cents is not None
+                and quote.total_for_party_cents > 0
+                and quote.price_basis == "comparison_only"
+                and quote.availability == QuoteAvailability.COMPARISON_ONLY
+                and not quote.party_availability_confirmed
+                and any(
+                    reference.startswith("flight-party-comparison:sha256:")
+                    for reference in quote.evidence_refs
+                )
+            ):
+                return True
+        return False
+
+    async def _short_circuit_lodging_without_usable_flight(
+        self,
+        state: _RunState,
+    ) -> None:
+        """Stop lodging work once every flight source has definitively failed.
+
+        A package cannot be formed without an exact usable flight.  Lodging is
+        still started in parallel for the successful case, but once the whole
+        flight frontier is terminal and empty, keeping dynamic hotel pages and
+        their retries alive only burns the user's deadline.
+        """
+
+        if state.no_usable_flight_short_circuit or not state.flight_source_task_ids:
+            return
+        if not all(
+            task_id in state.flight_source_completed_task_ids
+            for task_id in state.flight_source_task_ids
+        ):
+            return
+        if any(
+            self._has_usable_flight_source_result(state, task_id)
+            for task_id in state.flight_source_task_ids
+        ):
+            return
+        async with state.provider_vertical_circuit_lock:
+            if state.no_usable_flight_short_circuit:
+                return
+            state.no_usable_flight_short_circuit = True
+            reason = "all selected flight sources ended without an exact usable quote"
+            for source_task_id in state.lodging_source_task_ids:
+                snapshot = state.snapshots.get(source_task_id)
+                provider, _ = _browser_source_identity(source_task_id, snapshot)
+                _record_scope_cancellation(
+                    state,
+                    ProviderScopeKey(
+                        provider=provider,
+                        vertical=ProviderVertical.LODGING,
+                    ),
+                    generation=0,
+                    reason=reason,
+                )
+            browser_task_ids = tuple(
+                dict.fromkeys(
+                    browser_task_id
+                    for source_task_id in state.lodging_source_task_ids
+                    for browser_task_id in state.browser_task_ids_by_source.get(
+                        source_task_id,
+                        (),
+                    )
+                )
+            )
+            if browser_task_ids:
+                try:
+                    await self._bridge.cancel_many(browser_task_ids, reason=reason)
+                except Exception as exc:
+                    state.source_errors["lodging-short-circuit"] = f"{type(exc).__name__}: {exc}"
+
     def _settle_executor(
         self,
         state: _RunState,
@@ -7941,9 +8174,7 @@ class LivePackageAgentSystem:
         ) -> AgentTaskResult:
             now = self._utc_now()
             state.barrier_released_at = now
-            terminal_source_ids = tuple(
-                task_id for task_id in state.source_task_ids
-            )
+            terminal_source_ids = tuple(task_id for task_id in state.source_task_ids)
             # Record a tombstone for every source that reached a typed
             # ``cancelled`` terminal state.  Later retry / publication refresh /
             # failover / delayed wake-up / event replan attempts for that scope
@@ -7977,19 +8208,13 @@ class LivePackageAgentSystem:
                     reason=f"source task {task_id} reached a cancelled terminal state",
                 )
             if self._source_terminal_reporter is not None:
-                await self._source_terminal_reporter(
-                    _settled_browser_source_events(state, now)
-                )
+                await self._source_terminal_reporter(_settled_browser_source_events(state, now))
             output: dict[str, JsonValue] = {
                 "barrier": "released",
                 "terminal_source_ids": list(terminal_source_ids),
                 "source_error_count": len(state.source_errors),
-                "cancelled_scope_count": len(
-                    state.cancellation_tombstones.tombstones
-                ),
-                "provider_vertical_circuit_count": len(
-                    state.provider_vertical_circuits
-                ),
+                "cancelled_scope_count": len(state.cancellation_tombstones.tombstones),
+                "provider_vertical_circuit_count": len(state.provider_vertical_circuits),
             }
             summary = (
                 f"全部 {len(terminal_source_ids)} 个已选 Source 已进入类型化终态；"
@@ -8022,24 +8247,22 @@ class LivePackageAgentSystem:
             context: ContextEngine,
             tools: ToolRegistry,
         ) -> AgentTaskResult:
-            if (
-                task.id == "normalize-browser-quotes"
-                and state.publication_target_candidate is None
-            ):
-                state.lodging_window_alignment = (
-                    await self._align_lodging_windows_to_flight(
-                        state,
-                        context,
-                        tools,
-                    )
+            if task.id == "normalize-browser-quotes" and state.publication_target_candidate is None:
+                state.lodging_window_alignment = await self._align_lodging_windows_to_flight(
+                    state,
+                    context,
+                    tools,
                 )
             browser_results = self._normalize_browser_state(state)
             if state.lodging_window_results:
-                browser_results = tuple(
-                    result
-                    for result in browser_results
-                    if not isinstance(result.quote, NormalizedLodgingQuote)
-                ) + state.lodging_window_results
+                browser_results = (
+                    tuple(
+                        result
+                        for result in browser_results
+                        if not isinstance(result.quote, NormalizedLodgingQuote)
+                    )
+                    + state.lodging_window_results
+                )
             flight_snapshot = next(
                 (
                     snapshot
@@ -8062,33 +8285,42 @@ class LivePackageAgentSystem:
                 # browser wave and bounded lodging-window alignment have
                 # produced normalized flight facts; never assume departure+1.
                 windows = (state.lodging_window_alignment or {}).get("windows")
-                arrival_dates = tuple(
-                    date.fromisoformat(cast(str, item["stay_start"]))
-                    for item in windows
-                    if isinstance(item, dict) and isinstance(item.get("stay_start"), str)
-                ) if isinstance(windows, list) else ()
+                arrival_dates = (
+                    tuple(
+                        date.fromisoformat(cast(str, item["stay_start"]))
+                        for item in windows
+                        if isinstance(item, dict) and isinstance(item.get("stay_start"), str)
+                    )
+                    if isinstance(windows, list)
+                    else ()
+                )
                 if not arrival_dates:
                     arrival_dates = tuple(
-                        sorted({
-                            result.quote.outbound_arrive_at.date()
-                            for result in browser_results
-                            if result.usable and isinstance(result.quote, NormalizedFlightQuote)
-                        })
+                        sorted(
+                            {
+                                result.quote.outbound_arrive_at.date()
+                                for result in browser_results
+                                if result.usable and isinstance(result.quote, NormalizedFlightQuote)
+                            }
+                        )
                     ) or (state.intent.start_date,)
-                official_tasks = tuple(asyncio.create_task(
-                    self._official_lodging_provider.search(
-                        flight_snapshot.query, state.intent,
-                        state.stay_plan_candidate_set, arrival_date=arrival_date,
+                official_tasks = tuple(
+                    asyncio.create_task(
+                        self._official_lodging_provider.search(
+                            flight_snapshot.query,
+                            state.intent,
+                            state.stay_plan_candidate_set,
+                            arrival_date=arrival_date,
+                        )
                     )
-                ) for arrival_date in arrival_dates)
+                    for arrival_date in arrival_dates
+                )
                 try:
                     official_attempts = await asyncio.gather(
                         *official_tasks, return_exceptions=True
                     )
                     successful_official: list[ArenaOfficialLodgingResult] = []
-                    for arrival_date, attempt in zip(
-                        arrival_dates, official_attempts, strict=True
-                    ):
+                    for arrival_date, attempt in zip(arrival_dates, official_attempts, strict=True):
                         window_key = arrival_date.isoformat()
                         if isinstance(attempt, BaseException):
                             state.official_lodging_window_errors[window_key] = (
@@ -8116,17 +8348,16 @@ class LivePackageAgentSystem:
                         {
                             result.quote.outbound_arrive_at.date()
                             for result in browser_results
-                            if result.usable
-                            and isinstance(result.quote, NormalizedFlightQuote)
+                            if result.usable and isinstance(result.quote, NormalizedFlightQuote)
                         }
                     )
                 ) or ((state.intent.start_date,) if state.intent is not None else ())
             official_results = tuple(item.result for item in state.official_lodging_results)
-            assert flight_snapshot is not None
             if (
                 self._kaani_lodging_provider is not None
                 and state.intent is not None
                 and arrival_dates
+                and flight_snapshot is not None
             ):
                 kaani_attempts = await asyncio.gather(
                     *(
@@ -8257,9 +8488,7 @@ class LivePackageAgentSystem:
                     [
                         {
                             **receipt.model_dump(mode="json", by_alias=True),
-                            "receipt_sha256": (
-                                flight_party_comparison_receipt_sha256(receipt)
-                            ),
+                            "receipt_sha256": (flight_party_comparison_receipt_sha256(receipt)),
                         }
                         for task_id in sorted(state.party_price_comparison_receipts)
                         for receipt in state.party_price_comparison_receipts[task_id]
@@ -8268,9 +8497,7 @@ class LivePackageAgentSystem:
                 "party_price_validation_errors": _json_value(
                     dict(sorted(state.party_price_validation_errors.items()))
                 ),
-                "lodging_window_alignment": _json_value(
-                    state.lodging_window_alignment
-                ),
+                "lodging_window_alignment": _json_value(state.lodging_window_alignment),
                 "official_lodging_window_errors": _json_value(
                     dict(sorted(state.official_lodging_window_errors.items()))
                 ),
@@ -8313,8 +8540,7 @@ class LivePackageAgentSystem:
         alignment_flights = tuple(
             flight
             for result in initial_results
-            if result.usable
-            and isinstance(result.quote, NormalizedFlightQuote)
+            if result.usable and isinstance(result.quote, NormalizedFlightQuote)
             for flight in (result.quote,)
             if flight.is_fresh(now)
             and flight.origin == intent.origin
@@ -8371,8 +8597,11 @@ class LivePackageAgentSystem:
             original_snapshots: dict[str, BrowserTaskSnapshot] = {}
             for provider in sorted(lodging_providers, key=lambda value: value.value):
                 for source_task in self._provider_source_tasks(
-                    provider, base_query, state.source_timeout_seconds,
-                    allow_recent_quote_reuse=False, reuse_partition_sha256=None,
+                    provider,
+                    base_query,
+                    state.source_timeout_seconds,
+                    allow_recent_quote_reuse=False,
+                    reuse_partition_sha256=None,
                 ):
                     submission = BrowserTaskSubmission.model_validate(
                         source_task.input["submission"]
@@ -8392,72 +8621,95 @@ class LivePackageAgentSystem:
                     ):
                         continue
                     original_snapshots[source_task.id] = previous
-                    replacement_tasks.append(source_task.model_copy(update={"input": {
-                        **source_task.input,
-                        "lodging_window_alignment": {
-                            "flight_id": selected_flight.id,
-                            "stay_start": stay_start.isoformat(),
-                            "stay_end": stay_end.isoformat(),
-                        },
-                    }}))
+                    replacement_tasks.append(
+                        source_task.model_copy(
+                            update={
+                                "input": {
+                                    **source_task.input,
+                                    "lodging_window_alignment": {
+                                        "flight_id": selected_flight.id,
+                                        "stay_start": stay_start.isoformat(),
+                                        "stay_end": stay_end.isoformat(),
+                                    },
+                                }
+                            }
+                        )
+                    )
             replacements: list[dict[str, JsonValue]] = []
             if replacement_tasks:
-                task_results = await asyncio.gather(*(
-                    source_executor(source_task, context, tools)
-                    for source_task in replacement_tasks
-                ))
+                task_results = await asyncio.gather(
+                    *(
+                        source_executor(source_task, context, tools)
+                        for source_task in replacement_tasks
+                    )
+                )
                 for source_task, source_result in zip(replacement_tasks, task_results, strict=True):
                     previous = original_snapshots[source_task.id]
                     current = state.snapshots.get(source_task.id)
-                    replacements.append({
-                        "source_task_id": source_task.id,
-                        "previous_browser_task_id": previous.id,
-                        "previous_start_date": previous.query.start_date.isoformat(),
-                        "previous_end_date": (
-                            previous.query.end_date.isoformat()
-                            if previous.query.end_date
-                            else None
-                        ),
-                        "replacement_browser_task_id": current.id if current is not None else None,
-                        "replacement_state": (
-                            current.state.value if current is not None else "missing"
-                        ),
-                        "replacement_start_date": (
-                            current.query.start_date.isoformat()
+                    replacements.append(
+                        {
+                            "source_task_id": source_task.id,
+                            "previous_browser_task_id": previous.id,
+                            "previous_start_date": previous.query.start_date.isoformat(),
+                            "previous_end_date": (
+                                previous.query.end_date.isoformat()
+                                if previous.query.end_date
+                                else None
+                            ),
+                            "replacement_browser_task_id": current.id
                             if current is not None
-                            else None
-                        ),
-                        "replacement_end_date": (
-                            current.query.end_date.isoformat()
-                            if current is not None and current.query.end_date
-                            else None
-                        ),
-                        "source_result_success": source_result.success,
-                    })
+                            else None,
+                            "replacement_state": (
+                                current.state.value if current is not None else "missing"
+                            ),
+                            "replacement_start_date": (
+                                current.query.start_date.isoformat()
+                                if current is not None
+                                else None
+                            ),
+                            "replacement_end_date": (
+                                current.query.end_date.isoformat()
+                                if current is not None and current.query.end_date
+                                else None
+                            ),
+                            "source_result_success": source_result.success,
+                        }
+                    )
                     if current is not None and current.state == BrowserTaskState.SUCCEEDED:
-                        window_results.extend(self._normalizer.normalize_many(
-                            current.quotes, current.query,
-                        ))
+                        window_results.extend(
+                            self._normalizer.normalize_many(
+                                current.quotes,
+                                current.query,
+                            )
+                        )
             else:
                 # Preserve already matching quotes for this window while
                 # keeping them explicitly tied to the same flight window.
                 for provider in sorted(lodging_providers, key=lambda value: value.value):
                     for source_task in self._provider_source_tasks(
-                        provider, base_query, state.source_timeout_seconds,
-                        allow_recent_quote_reuse=False, reuse_partition_sha256=None,
+                        provider,
+                        base_query,
+                        state.source_timeout_seconds,
+                        allow_recent_quote_reuse=False,
+                        reuse_partition_sha256=None,
                     ):
                         snapshot = state.snapshots.get(source_task.id)
                         if snapshot is not None and snapshot.state == BrowserTaskState.SUCCEEDED:
-                            window_results.extend(self._normalizer.normalize_many(
-                                snapshot.quotes, snapshot.query,
-                            ))
-            window_reports.append({
-                "flight_id": selected_flight.id,
-                "stay_start": stay_start.isoformat(),
-                "stay_end": stay_end.isoformat(),
-                "replacement_count": len(replacements),
-                "replacements": _json_value(replacements),
-            })
+                            window_results.extend(
+                                self._normalizer.normalize_many(
+                                    snapshot.quotes,
+                                    snapshot.query,
+                                )
+                            )
+            window_reports.append(
+                {
+                    "flight_id": selected_flight.id,
+                    "stay_start": stay_start.isoformat(),
+                    "stay_end": stay_end.isoformat(),
+                    "replacement_count": len(replacements),
+                    "replacements": _json_value(replacements),
+                }
+            )
         state.lodging_window_results = tuple(window_results)
         if not window_reports:
             return {"state": "not_applied", "reason": "no_flight_snapshot_for_window"}
@@ -8499,9 +8751,7 @@ class LivePackageAgentSystem:
                 state.normalization_by_task[task_id] = comparison_results
                 results.extend(comparison_results)
                 continue
-            successful_party_price_comparisons: tuple[
-                FlightPartyComparisonReceipt, ...
-            ] = ()
+            successful_party_price_comparisons: tuple[FlightPartyComparisonReceipt, ...] = ()
             validation_snapshot = state.party_price_validation_snapshots.get(task_id)
             if validation_snapshot is not None:
                 successful_party_price_comparisons = (
@@ -8510,9 +8760,7 @@ class LivePackageAgentSystem:
                         validation_snapshot,
                     )
                 )
-                state.party_price_comparison_receipts[task_id] = (
-                    successful_party_price_comparisons
-                )
+                state.party_price_comparison_receipts[task_id] = successful_party_price_comparisons
             task_results = self._normalizer.normalize_many(
                 snapshot.quotes,
                 snapshot.query,
@@ -8575,7 +8823,8 @@ class LivePackageAgentSystem:
         )
         for candidate in receipt.candidate_summaries:
             if (
-                candidate.price_classification not in {
+                candidate.price_classification
+                not in {
                     "comparison_only",
                     "starting_or_estimated",
                 }
@@ -8590,8 +8839,7 @@ class LivePackageAgentSystem:
                 continue
             try:
                 outbound_depart, outbound_arrive, return_depart, return_arrive = tuple(
-                    datetime.fromisoformat(value.replace("Z", "+00:00"))
-                    for value in timestamps
+                    datetime.fromisoformat(value.replace("Z", "+00:00")) for value in timestamps
                 )
                 amount = int((Decimal(str(candidate.amount)) * Decimal(100)).to_integral_exact())
                 outbound_segments = tuple(
@@ -8705,9 +8953,7 @@ class LivePackageAgentSystem:
         """Fingerprint only identity proven by a sealed visible candidate."""
 
         payload = {
-            "outbound_flight_numbers": tuple(
-                getattr(candidate, "outbound_flight_numbers", ())
-            ),
+            "outbound_flight_numbers": tuple(getattr(candidate, "outbound_flight_numbers", ())),
             "return_flight_numbers": tuple(getattr(candidate, "return_flight_numbers", ())),
             "outbound_times": (outbound_depart.isoformat(), outbound_arrive.isoformat()),
             "return_times": (return_depart.isoformat(), return_arrive.isoformat()),
@@ -8791,30 +9037,39 @@ class LivePackageAgentSystem:
                 tuple[FlightSearchCandidateSummary, int, tuple[datetime, ...]],
             ] = {}
             for candidate in receipt.candidate_summaries:
+                explicit_per_person = bool(
+                    candidate.price_evidence
+                    and candidate.price_basis == QuotePriceBasis.PER_PERSON
+                    and re.search(
+                        r"(?:人均|每\s*人|每\s*(?:名|位)\s*成人|/\s*人|"
+                        r"\bper\s+person\b)",
+                        candidate.price_evidence,
+                        flags=re.IGNORECASE,
+                    )
+                )
+                qunar_tax_total_comparison = bool(
+                    receipt.provider == BrowserProvider.QUNAR
+                    and candidate.price_evidence
+                    and "含税总价" in candidate.price_evidence
+                    and candidate.price_basis
+                    in {QuotePriceBasis.PER_PERSON, QuotePriceBasis.TOTAL_PARTY}
+                )
                 if (
                     candidate.price_classification.value != "comparison_only"
                     or candidate.amount is None
                     or candidate.currency != requested_snapshot.query.currency
                     or candidate.price_evidence is None
                     or "含税" not in candidate.price_evidence
-                    # A sealed comparison receipt currently carries the
-                    # itinerary identity, not a stable fare-product identity
-                    # (cabin/fare family/rules/selection id).  Equal amounts
-                    # from separate 1-adult and N-adult searches can therefore
-                    # be an accidental fare refresh.  Only an explicit visible
-                    # per-adult label makes multiplication safe on this
-                    # reduced receipt surface.
-                    or candidate.price_basis != QuotePriceBasis.PER_PERSON
-                    or not re.search(
-                        r"(?:人均|每\s*人|每\s*(?:名|位)\s*成人|/\s*人|"
-                        r"\bper\s+person\b)",
-                        candidate.price_evidence,
-                        flags=re.IGNORECASE,
-                    )
+                    or not (explicit_per_person or qunar_tax_total_comparison)
                     or not candidate.outbound_flight_numbers
                     or not candidate.return_flight_numbers
-                    or not candidate.outbound_segments
-                    or not candidate.return_segments
+                    or candidate.origin_airport_code != query.origin_code
+                    or candidate.destination_airport_code != query.destination_code
+                    or (
+                        receipt.provider != BrowserProvider.QUNAR
+                        and (not candidate.outbound_segments or not candidate.return_segments)
+                    )
+                    or bool(candidate.outbound_segments) != bool(candidate.return_segments)
                 ):
                     continue
                 try:
@@ -8825,8 +9080,7 @@ class LivePackageAgentSystem:
                     if len(timestamps) != 4:
                         continue
                     times = tuple(
-                        datetime.fromisoformat(value.replace("Z", "+00:00"))
-                        for value in timestamps
+                        datetime.fromisoformat(value.replace("Z", "+00:00")) for value in timestamps
                     )
                     out_segments = tuple(
                         NormalizedFlightSegment.model_validate(item)
@@ -8840,9 +9094,12 @@ class LivePackageAgentSystem:
                     continue
                 fingerprint = self._sealed_candidate_fingerprint(
                     candidate,
-                    outbound_depart=times[0], outbound_arrive=times[1],
-                    return_depart=times[2], return_arrive=times[3],
-                    outbound_segments=out_segments, return_segments=ret_segments,
+                    outbound_depart=times[0],
+                    outbound_arrive=times[1],
+                    return_depart=times[2],
+                    return_arrive=times[3],
+                    outbound_segments=out_segments,
+                    return_segments=ret_segments,
                 )
                 output.setdefault(
                     fingerprint,
@@ -8888,16 +9145,24 @@ class LivePackageAgentSystem:
                     validity_overlap_end=overlap_end,
                     one_adult=FlightPartyPriceObservation(
                         task_id=one_adult_snapshot.id,
-                        evidence_sha256=flight_search_receipt_sha256(one_adult.model_dump(mode="json")),
-                        adults=1, amount_cents=one_row[1], captured_at=one_adult.captured_at,
+                        evidence_sha256=flight_search_receipt_sha256(
+                            one_adult.model_dump(mode="json")
+                        ),
+                        adults=1,
+                        amount_cents=one_row[1],
+                        captured_at=one_adult.captured_at,
                         expires_at=one_adult.captured_at + timedelta(minutes=10),
                         same_product_fingerprint=fingerprint,
                         available_for_requested_adults=False,
                     ),
                     requested_party=FlightPartyPriceObservation(
                         task_id=requested_snapshot.id,
-                        evidence_sha256=flight_search_receipt_sha256(requested.model_dump(mode="json")),
-                        adults=query.adults, amount_cents=amount, captured_at=requested.captured_at,
+                        evidence_sha256=flight_search_receipt_sha256(
+                            requested.model_dump(mode="json")
+                        ),
+                        adults=query.adults,
+                        amount_cents=amount,
+                        captured_at=requested.captured_at,
                         expires_at=requested.captured_at + timedelta(minutes=10),
                         same_product_fingerprint=fingerprint,
                         available_for_requested_adults=False,
@@ -9141,9 +9406,7 @@ class LivePackageAgentSystem:
                         "candidate_shard_merge_audit": None,
                         "hard_eligible_candidate_count": eligible_count,
                         "selected_total_for_party_cents": winner.computed_total_cents,
-                        "dominance_policy_boundary": (
-                            _DETERMINISTIC_DOMINANCE_POLICY_BOUNDARY
-                        ),
+                        "dominance_policy_boundary": (_DETERMINISTIC_DOMINANCE_POLICY_BOUNDARY),
                     }
                 )
                 return self._stage_result(
@@ -9779,14 +10042,9 @@ class LivePackageAgentSystem:
                     state.publication_target_candidate,
                 )
                 if publication_stay_plan_id is None:
-                    raise ValueError(
-                        "publication target is outside the frozen stay-plan set"
-                    )
+                    raise ValueError("publication target is outside the frozen stay-plan set")
                 state.selected_stay_plan_id = publication_stay_plan_id
-            if (
-                state.stay_plan_candidate_set is not None
-                and state.package is not None
-            ):
+            if state.stay_plan_candidate_set is not None and state.package is not None:
                 terminal_stay_plan_id = stay_plan_for_candidate(
                     state.stay_plan_candidate_set,
                     intent,
@@ -9855,9 +10113,7 @@ class LivePackageAgentSystem:
                 and self._official_single_source_matches_candidate(
                     state,
                     intent,
-                    state.package.final_candidate.lodgings
-                    if state.package is not None
-                    else (),
+                    state.package.final_candidate.lodgings if state.package is not None else (),
                 )
             )
             selected_stay_comparison_complete = bool(
@@ -9910,14 +10166,11 @@ class LivePackageAgentSystem:
             )
             if state.package is not None and state.package_reverification_audit is None:
                 repair_outcome = (
-                    state.repair_handoff.outcome
-                    if state.repair_handoff is not None
-                    else None
+                    state.repair_handoff.outcome if state.repair_handoff is not None else None
                 )
                 if repair_outcome is not None and repair_outcome.candidate is None:
                     agent_block_reason = (
-                        "当前报价没有可安全修复的候选，正式结果保持阻断："
-                        f"{repair_outcome.message}"
+                        f"当前报价没有可安全修复的候选，正式结果保持阻断：{repair_outcome.message}"
                     )
                 else:
                     agent_block_reason = (
@@ -10277,18 +10530,15 @@ class LivePackageAgentSystem:
                         and result.output.get("candidate_curation_mode")
                         == _DETERMINISTIC_DOMINANCE_SKIP
                     )
-                    if (
-                        not authorized_deterministic_skip
-                        and (
-                            result.output.get("agent_required_failed") is True
-                            or proposal_required_failure
-                            or not isinstance(trace, dict)
-                            or trace.get("model_called") is not True
-                            or not isinstance(logical_request_count, int)
-                            or isinstance(logical_request_count, bool)
-                            or logical_request_count < 1
-                            or trace.get("failure") not in (None, "")
-                        )
+                    if not authorized_deterministic_skip and (
+                        result.output.get("agent_required_failed") is True
+                        or proposal_required_failure
+                        or not isinstance(trace, dict)
+                        or trace.get("model_called") is not True
+                        or not isinstance(logical_request_count, int)
+                        or isinstance(logical_request_count, bool)
+                        or logical_request_count < 1
+                        or trace.get("failure") not in (None, "")
                     ):
                         required_model_failures.append(task_id)
             state.exploration_required_model_failures = tuple(required_model_failures)
@@ -10360,16 +10610,10 @@ class LivePackageAgentSystem:
                                     for issue in result.issues
                                 }
                             ),
-                            "normalization_result_count": len(
-                                state.normalization_results
-                            ),
+                            "normalization_result_count": len(state.normalization_results),
                             "candidate_shortlist": len(state.candidate_shortlist),
-                            "candidate_decision_frontier": len(
-                                state.candidate_decision_frontier
-                            ),
-                            "comparison_ready": len(
-                                state.comparison_ready_candidate_ids
-                            ),
+                            "candidate_decision_frontier": len(state.candidate_decision_frontier),
+                            "comparison_ready": len(state.comparison_ready_candidate_ids),
                             "evidence_comparable": len(
                                 state.evidence_proposal.comparable_quote_ids
                                 if state.evidence_proposal is not None
@@ -10380,9 +10624,7 @@ class LivePackageAgentSystem:
                                 if state.evidence_proposal is not None
                                 else ()
                             ),
-                            "initial_candidate_present": (
-                                state.initial_candidate is not None
-                            ),
+                            "initial_candidate_present": (state.initial_candidate is not None),
                         },
                         ensure_ascii=False,
                         sort_keys=True,
@@ -10525,9 +10767,7 @@ class LivePackageAgentSystem:
             submission_raw = call.arguments.get("submission")
             submission = BrowserTaskSubmission.model_validate(submission_raw)
             raw_generation = call.arguments.get("__tripchord_attempt_generation", 0)
-            attempt_generation = (
-                raw_generation if isinstance(raw_generation, int) else 0
-            )
+            attempt_generation = raw_generation if isinstance(raw_generation, int) else 0
             retry_scope = _browser_submission_scope(submission)
             submitted_ids: list[str] = []
             attempts: list[BrowserTaskSnapshot] = []
@@ -10557,12 +10797,13 @@ class LivePackageAgentSystem:
                         (submitted.id,),
                         timeout_seconds=_browser_wait_timeout_seconds(
                             retry_submission.timeout_seconds,
-                            # This call waits for exactly one leased browser
-                            # task.  Using the whole graph size here multiplies
-                            # every provider timeout by the number of parallel
-                            # tasks and can keep one dead page alive for many
-                            # minutes instead of producing its typed timeout.
-                            source_task_count=1,
+                            # The task may wait behind earlier sources before
+                            # Chrome claims it.  This budget covers those queue
+                            # waves; the acquisition's own attempt deadline is
+                            # still started at claim time and remains bounded by
+                            # ``timeout_seconds``, so a dead page is not kept
+                            # alive by the longer caller wait.
+                            source_task_count=source_task_count,
                         ),
                     )
                     attempts.append(terminal)
@@ -10612,12 +10853,9 @@ class LivePackageAgentSystem:
                     # the retry and return attempt 0's terminal so the caller
                     # sees the suppressed flag and never treats it as a live
                     # result.
-                    if (
-                        retry_scope is not None
-                        and state.cancellation_tombstones.rejects(
-                            retry_scope,
-                            attempt_generation,
-                        )
+                    if retry_scope is not None and state.cancellation_tombstones.rejects(
+                        retry_scope,
+                        attempt_generation,
                     ):
                         return {
                             "snapshot": _json_value(terminal.model_dump(mode="json")),
@@ -11384,9 +11622,7 @@ class LivePackageAgentSystem:
         # separately to the broader provider+lodging circuit.
         tasks_by_segment = {
             segment: next(
-                task
-                for task in base
-                if task.id == f"source-{provider.value}-lodging-{segment}"
+                task for task in base if task.id == f"source-{provider.value}-lodging-{segment}"
             )
             for segment in segment_queries
         }
@@ -11420,14 +11656,10 @@ class LivePackageAgentSystem:
             for follower_segment in follower_segments:
                 follower = tasks_by_segment[follower_segment]
                 if exact_place_cohort_key(follower) != cohort_key:
-                    raise ValueError(
-                        "lodging canary and follower must bind the same exact place"
-                    )
+                    raise ValueError("lodging canary and follower must bind the same exact place")
                 rewritten_by_id[follower.id] = follower.model_copy(
                     update={
-                        "dependencies": tuple(
-                            dict.fromkeys((*follower.dependencies, canary.id))
-                        ),
+                        "dependencies": tuple(dict.fromkeys((*follower.dependencies, canary.id))),
                         "input": {
                             **follower.input,
                             "provider_vertical_canary_source_id": canary.id,
@@ -11667,8 +11899,7 @@ class LivePackageAgentSystem:
                         evidence_ref
                         for evidence_ref in quote.evidence_refs
                         if evidence_ref.startswith(f"browser:{provider.value}:sha256:")
-                        and evidence_ref.rsplit(":", maxsplit=1)[-1]
-                        in primary_raw_by_sha
+                        and evidence_ref.rsplit(":", maxsplit=1)[-1] in primary_raw_by_sha
                     )
                     if len(primary_raw_refs) != 1:
                         continue
@@ -12006,9 +12237,7 @@ class LivePackageAgentSystem:
                 )
             )
         official_results = state.official_lodging_results or (
-            (state.official_lodging_result,)
-            if state.official_lodging_result is not None
-            else ()
+            (state.official_lodging_result,) if state.official_lodging_result is not None else ()
         )
         official = next(
             (
@@ -12024,10 +12253,7 @@ class LivePackageAgentSystem:
             ),
             None,
         )
-        if (
-            official is not None
-            and isinstance(official.result.quote, NormalizedLodgingQuote)
-        ):
+        if official is not None and isinstance(official.result.quote, NormalizedLodgingQuote):
             quote = official.result.quote
             if quote.place_key == exact_place_key and quote.area == area:
                 eligible_quote_ids = (
@@ -12126,9 +12352,7 @@ class LivePackageAgentSystem:
         lodgings: tuple[NormalizedLodgingQuote, ...],
     ) -> bool:
         official_results = state.official_lodging_results or (
-            (state.official_lodging_result,)
-            if state.official_lodging_result is not None
-            else ()
+            (state.official_lodging_result,) if state.official_lodging_result is not None else ()
         )
         return bool(
             official_results
@@ -12281,9 +12505,7 @@ class LivePackageAgentSystem:
                 )
             )
         official_results = state.official_lodging_results or (
-            (state.official_lodging_result,)
-            if state.official_lodging_result is not None
-            else ()
+            (state.official_lodging_result,) if state.official_lodging_result is not None else ()
         )
         official = next(
             (
@@ -12299,10 +12521,7 @@ class LivePackageAgentSystem:
             ),
             None,
         )
-        if (
-            official is not None
-            and isinstance(official.result.quote, NormalizedLodgingQuote)
-        ):
+        if official is not None and isinstance(official.result.quote, NormalizedLodgingQuote):
             quote = official.result.quote
             if quote.place_key == lodging.place_key and quote.area == lodging.area:
                 eligible_quote_ids = (
@@ -12437,28 +12656,22 @@ class LivePackageAgentSystem:
                         and inventory_outcomes[0].state == StayInventoryResultState.QUOTE_FOUND
                     )
                 source_completed = (
-                    (
-                        state.source_errors.get(task_id, "").startswith(
-                            "ProviderVerticalCircuitOpen:"
+                    state.source_errors.get(task_id, "").startswith("ProviderVerticalCircuitOpen:")
+                    and "reason=bounded_provider_pending;" in state.source_errors.get(task_id, "")
+                ) or (
+                    snapshot is not None
+                    and outcome_found
+                    and (
+                        snapshot.state == BrowserTaskState.SUCCEEDED
+                        or (
+                            vertical == BrowserVertical.FLIGHT
+                            and flight_outcome is not None
+                            and snapshot.failure is not None
                         )
-                        and "reason=bounded_provider_pending;"
-                        in state.source_errors.get(task_id, "")
-                    )
-                    or (
-                        snapshot is not None
-                        and outcome_found
-                        and (
-                            snapshot.state == BrowserTaskState.SUCCEEDED
-                            or (
-                                vertical == BrowserVertical.FLIGHT
-                                and flight_outcome is not None
-                                and snapshot.failure is not None
-                            )
-                            or (
-                                vertical == BrowserVertical.LODGING
-                                and outcome_found
-                                and snapshot.failure is not None
-                            )
+                        or (
+                            vertical == BrowserVertical.LODGING
+                            and outcome_found
+                            and snapshot.failure is not None
                         )
                     )
                 )
@@ -13864,9 +14077,7 @@ class LivePackageAgentSystem:
             common["party_total_known"] = quote.party_total_known
             common["price_basis"] = quote.price_basis
             common["display_amount_cents"] = (
-                quote.display_amount_cents
-                if not quote.party_total_known
-                else None
+                quote.display_amount_cents if not quote.party_total_known else None
             )
             common.update(
                 {
@@ -14055,22 +14266,17 @@ class LivePackageAgentSystem:
             ),
             "provider": quote.provider,
             "currency": quote.currency,
-                    "total_for_party_cents": (
-                        quote.total_for_party_cents
-                        if not isinstance(quote, NormalizedFlightQuote)
-                        or quote.party_total_known
-                        else None
-                    ),
-                    "party_total_known": (
-                        quote.party_total_known
-                        if isinstance(quote, NormalizedFlightQuote)
-                        else True
-                    ),
-                    "price_basis": (
-                        quote.price_basis
-                        if isinstance(quote, NormalizedFlightQuote)
-                        else "total_party"
-                    ),
+            "total_for_party_cents": (
+                quote.total_for_party_cents
+                if not isinstance(quote, NormalizedFlightQuote) or quote.party_total_known
+                else None
+            ),
+            "party_total_known": (
+                quote.party_total_known if isinstance(quote, NormalizedFlightQuote) else True
+            ),
+            "price_basis": (
+                quote.price_basis if isinstance(quote, NormalizedFlightQuote) else "total_party"
+            ),
             "taxes_and_fees_included": quote.taxes_and_fees_included,
             "availability": quote.availability.value,
             "expires_at": quote.expires_at.isoformat(),
@@ -14473,8 +14679,7 @@ class LivePackageAgentSystem:
                     f"{flight.adults} 名成人总价为 "
                     f"{amount(flight.currency, flight.total_for_party_cents or 0)}。"
                     + (
-                        "该金额由同一产品的 1 成人/N 成人展示价对照派生，"
-                        "只用于比较，不是结算锁价。"
+                        "该金额由同一产品的 1 成人/N 成人展示价对照派生，只用于比较，不是结算锁价。"
                         if any(
                             reference.startswith("flight-party-comparison:sha256:")
                             for reference in flight.evidence_refs
@@ -14840,11 +15045,7 @@ class LivePackageAgentSystem:
                 f"{trusted_url_boundary}"
             )
         if comparison_complete is False and single_source_publishable:
-            mode_prefix = (
-                "降级模式下基于成功来源，"
-                if mode != LiveCoverageMode.STRICT
-                else ""
-            )
+            mode_prefix = "降级模式下基于成功来源，" if mode != LiveCoverageMode.STRICT else ""
             return (
                 f"{mode_prefix}本次选中住宿的每个分段都有一份新鲜精确官方或 OTA 来源，"
                 "因此发布为单来源建议；跨平台比价尚未完成，不声明最低价，"

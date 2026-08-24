@@ -110,9 +110,7 @@ class DurableBrowserTaskStore:
         payload = submission.query.model_dump(mode="json")
         options = dict(payload.get("options") or {})
         payload["options"] = {
-            key: value
-            for key, value in options.items()
-            if not key.startswith("__tripchord_")
+            key: value for key, value in options.items() if not key.startswith("__tripchord_")
         }
         return cls._digest(
             {
@@ -149,20 +147,14 @@ class DurableBrowserTaskStore:
             claimed_at=_aware(row.claimed_at) if row.claimed_at else None,
             quotes=tuple(BrowserQuote.model_validate(x) for x in (row.quotes or [])),
             range_completion=(
-                retained_completion.range_completion
-                if retained_completion is not None
-                else None
+                retained_completion.range_completion if retained_completion is not None else None
             ),
             failure=BrowserFailure.model_validate(row.failure) if row.failure else None,
             reused_from_task_id=(
-                consumer.reused_from_task_id
-                if consumer is not None
-                else row.reused_from_task_id
+                consumer.reused_from_task_id if consumer is not None else row.reused_from_task_id
             ),
             reuse_age_seconds=(
-                consumer.reuse_age_seconds
-                if consumer is not None
-                else row.reuse_age_seconds
+                consumer.reuse_age_seconds if consumer is not None else row.reuse_age_seconds
             ),
             inflight_coalesced=row.inflight_coalesced_count > 0,
         )
@@ -176,8 +168,7 @@ class DurableBrowserTaskStore:
         # primary task the Companion actually owns.
         public_id = consumer.id
         terminal_reuse = (
-            acquisition.state == "succeeded"
-            and consumer.reused_from_task_id is not None
+            acquisition.state == "succeeded" and consumer.reused_from_task_id is not None
         )
         if acquisition.public_task_id and not terminal_reuse:
             public_id = acquisition.public_task_id
@@ -197,9 +188,7 @@ class DurableBrowserTaskStore:
             public_id,
             acquisition.id,
             consumer.state,
-            BrowserTaskState(
-                "claimed" if acquisition.state == "completing" else acquisition.state
-            ),
+            BrowserTaskState("claimed" if acquisition.state == "completing" else acquisition.state),
             self._snapshot(acquisition, public_id, consumer),
             acquisition.source_receipt,
             consumer.binding_receipt,
@@ -274,8 +263,10 @@ class DurableBrowserTaskStore:
                 s.add(row)
             else:
                 if (
-                    (runtime_instance_id is not None
-                     and row.runtime_instance_id != runtime_instance_id)
+                    (
+                        runtime_instance_id is not None
+                        and row.runtime_instance_id != runtime_instance_id
+                    )
                     or (build_identity is not None and row.build_identity != build_identity)
                     or (adapter_version is not None and row.adapter_version != adapter_version)
                     or (contract_version is not None and row.contract_version != contract_version)
@@ -329,10 +320,7 @@ class DurableBrowserTaskStore:
             and (
                 capability is not None
                 or (
-                    submission.query.options.get(
-                        "__tripchord_allow_recent_quote_reuse"
-                    )
-                    is True
+                    submission.query.options.get("__tripchord_allow_recent_quote_reuse") is True
                     and submission.reuse_partition_sha256 is not None
                 )
             )
@@ -366,8 +354,7 @@ class DurableBrowserTaskStore:
                 select(BrowserTaskConsumerRow).where(
                     BrowserTaskConsumerRow.id == consumer_id,
                     BrowserTaskConsumerRow.tenant_id == tenant_id,
-                    BrowserTaskConsumerRow.authority_partition_sha256
-                    == self._authority_partition,
+                    BrowserTaskConsumerRow.authority_partition_sha256 == self._authority_partition,
                 )
             )
             if old:
@@ -422,9 +409,7 @@ class DurableBrowserTaskStore:
             elif row is not None and row.state == "succeeded":
                 fresh = bool(row.quotes) and all(
                     0
-                    <= (
-                        now - _aware(BrowserQuote.model_validate(q).captured_at)
-                    ).total_seconds()
+                    <= (now - _aware(BrowserQuote.model_validate(q).captured_at)).total_seconds()
                     < 600
                     for q in row.quotes
                 )
@@ -432,10 +417,7 @@ class DurableBrowserTaskStore:
                     row = None
                 else:
                     ages = tuple(
-                        (
-                            now
-                            - _aware(BrowserQuote.model_validate(q).captured_at)
-                        ).total_seconds()
+                        (now - _aware(BrowserQuote.model_validate(q).captured_at)).total_seconds()
                         for q in row.quotes
                     )
                     reuse_age_seconds = max(0.0, max(ages, default=0.0))
@@ -453,11 +435,7 @@ class DurableBrowserTaskStore:
                     tenant_id=tenant_id,
                     authority_partition_sha256=self._authority_partition,
                     tenant_partition=partition,
-                    active_singleflight_key=(
-                        None
-                        if not reuse_enabled
-                        else active_key
-                    ),
+                    active_singleflight_key=(None if not reuse_enabled else active_key),
                     public_task_id=consumer_id,
                     reference_count=1,
                     fingerprint_sha256=fingerprint,
@@ -478,12 +456,14 @@ class DurableBrowserTaskStore:
                     # active-key race. Re-read its acquisition and bind to it.
                     await s.rollback()
                     row = await s.scalar(
-                        select(BrowserAcquisitionRow).where(
+                        select(BrowserAcquisitionRow)
+                        .where(
                             BrowserAcquisitionRow.active_singleflight_key == active_key,
                             BrowserAcquisitionRow.authority_partition_sha256
                             == self._authority_partition,
                             BrowserAcquisitionRow.state.in_(("queued", "claimed")),
-                        ).with_for_update()
+                        )
+                        .with_for_update()
                     )
                     if row is None:
                         row = BrowserAcquisitionRow(
@@ -564,7 +544,8 @@ class DurableBrowserTaskStore:
             if c is None:
                 return None
             a = await s.scalar(
-                select(BrowserAcquisitionRow).where(
+                select(BrowserAcquisitionRow)
+                .where(
                     BrowserAcquisitionRow.id == c.acquisition_id,
                     BrowserAcquisitionRow.tenant_id == tenant_id,
                     BrowserAcquisitionRow.authority_partition_sha256 == self._authority_partition,
@@ -604,6 +585,54 @@ class DurableBrowserTaskStore:
                 await s.commit()
             return await self._projection(s, c, a)
 
+    async def get_consumer_lease_status(
+        self,
+        consumer_id: str,
+        *,
+        tenant_id: str,
+    ) -> tuple[str, str | None, datetime] | None:
+        """Read the active-lease projection without materializing task JSON.
+
+        This path is called between browser stages.  Keep it side-effect free
+        and limited to indexed identity/state columns so a large flexible-date
+        run cannot make its own lease checks time out.
+        """
+
+        async with self._database.sessions() as s:
+            result = await s.execute(
+                select(
+                    BrowserTaskConsumerRow.state,
+                    BrowserAcquisitionRow.state,
+                    BrowserAcquisitionRow.lease_owner,
+                    BrowserAcquisitionRow.lease_expires_at,
+                    BrowserAcquisitionRow.updated_at,
+                )
+                .join(
+                    BrowserAcquisitionRow,
+                    BrowserAcquisitionRow.id == BrowserTaskConsumerRow.acquisition_id,
+                )
+                .where(
+                    BrowserTaskConsumerRow.id == consumer_id,
+                    BrowserTaskConsumerRow.tenant_id == tenant_id,
+                    BrowserTaskConsumerRow.authority_partition_sha256 == self._authority_partition,
+                    BrowserAcquisitionRow.tenant_id == tenant_id,
+                    BrowserAcquisitionRow.authority_partition_sha256 == self._authority_partition,
+                )
+            )
+            row = result.one_or_none()
+            if row is None:
+                return None
+            consumer_state, acquisition_state, lease_owner, lease_expires_at, updated_at = row
+            if consumer_state != "active":
+                return BrowserTaskState.CANCELLED.value, None, _aware(updated_at)
+            if acquisition_state == "completing":
+                acquisition_state = BrowserTaskState.CLAIMED.value
+            if acquisition_state == BrowserTaskState.CLAIMED.value and (
+                lease_expires_at is None or _aware(lease_expires_at) <= utc_now()
+            ):
+                return BrowserTaskState.QUEUED.value, None, _aware(updated_at)
+            return str(acquisition_state), lease_owner, _aware(updated_at)
+
     async def get_consumer_capability(
         self, consumer_id: str, *, tenant_id: str
     ) -> dict[str, Any] | None:
@@ -612,8 +641,7 @@ class DurableBrowserTaskStore:
                 select(BrowserTaskConsumerRow.capability).where(
                     BrowserTaskConsumerRow.id == consumer_id,
                     BrowserTaskConsumerRow.tenant_id == tenant_id,
-                    BrowserTaskConsumerRow.authority_partition_sha256
-                    == self._authority_partition,
+                    BrowserTaskConsumerRow.authority_partition_sha256 == self._authority_partition,
                 )
             )
             return dict(capability) if capability is not None else None
@@ -632,8 +660,7 @@ class DurableBrowserTaskStore:
                 select(BrowserAcquisitionRow).where(
                     BrowserAcquisitionRow.public_task_id == public_task_id,
                     BrowserAcquisitionRow.tenant_id == tenant_id,
-                    BrowserAcquisitionRow.authority_partition_sha256
-                    == self._authority_partition,
+                    BrowserAcquisitionRow.authority_partition_sha256 == self._authority_partition,
                     BrowserAcquisitionRow.state.in_(("claimed", "completing")),
                 )
             )
@@ -659,8 +686,7 @@ class DurableBrowserTaskStore:
             session = await s.scalar(
                 select(CompanionSessionRow).where(
                     CompanionSessionRow.id == row.session_id,
-                    CompanionSessionRow.authority_partition_sha256
-                    == self._authority_partition,
+                    CompanionSessionRow.authority_partition_sha256 == self._authority_partition,
                 )
             )
             if row.state != "completing" and (
@@ -675,8 +701,7 @@ class DurableBrowserTaskStore:
                 select(BrowserTaskConsumerRow).where(
                     BrowserTaskConsumerRow.id == row.claim_consumer_id,
                     BrowserTaskConsumerRow.acquisition_id == row.id,
-                    BrowserTaskConsumerRow.authority_partition_sha256
-                    == self._authority_partition,
+                    BrowserTaskConsumerRow.authority_partition_sha256 == self._authority_partition,
                 )
             )
             if consumer is None:
@@ -703,8 +728,7 @@ class DurableBrowserTaskStore:
             value = await s.scalar(
                 select(func.count(BrowserAcquisitionRow.id)).where(
                     BrowserAcquisitionRow.tenant_id == tenant_id,
-                    BrowserAcquisitionRow.authority_partition_sha256
-                    == self._authority_partition,
+                    BrowserAcquisitionRow.authority_partition_sha256 == self._authority_partition,
                     BrowserAcquisitionRow.state.in_(("queued", "claimed")),
                 )
             )
@@ -716,25 +740,21 @@ class DurableBrowserTaskStore:
                 await s.scalars(
                     select(CompanionSessionRow)
                     .where(
-                        CompanionSessionRow.authority_partition_sha256
-                        == self._authority_partition
+                        CompanionSessionRow.authority_partition_sha256 == self._authority_partition
                     )
                     .order_by(CompanionSessionRow.last_seen_at.desc())
                 )
             ).all()
             return tuple(rows)
 
-    async def get_companion_session(
-        self, session_id: str
-    ) -> CompanionSessionRow | None:
+    async def get_companion_session(self, session_id: str) -> CompanionSessionRow | None:
         async with self._database.sessions() as s:
             return cast(
                 CompanionSessionRow | None,
                 await s.scalar(
                     select(CompanionSessionRow).where(
                         CompanionSessionRow.id == session_id,
-                        CompanionSessionRow.authority_partition_sha256
-                        == self._authority_partition,
+                        CompanionSessionRow.authority_partition_sha256 == self._authority_partition,
                     )
                 ),
             )
@@ -858,8 +878,7 @@ class DurableBrowserTaskStore:
                 if ":" in scope
             ]
             claim_filters = [
-                BrowserAcquisitionRow.authority_partition_sha256
-                == self._authority_partition,
+                BrowserAcquisitionRow.authority_partition_sha256 == self._authority_partition,
                 BrowserAcquisitionRow.provider.in_(allowed_providers),
                 or_(
                     BrowserAcquisitionRow.state == "queued",
@@ -882,12 +901,9 @@ class DurableBrowserTaskStore:
             ).all()
             eligible_by_provider: dict[str, list[BrowserAcquisitionRow]] = {}
             for candidate in rows:
-                if (
-                    candidate.provider not in allowed_providers
-                    or (
-                        allowed_scopes
-                        and f"{candidate.provider}:{candidate.kind}" not in allowed_scopes
-                    )
+                if candidate.provider not in allowed_providers or (
+                    allowed_scopes
+                    and f"{candidate.provider}:{candidate.kind}" not in allowed_scopes
                 ):
                     continue
                 eligible_by_provider.setdefault(candidate.provider, []).append(candidate)
@@ -915,12 +931,8 @@ class DurableBrowserTaskStore:
                     break
             result: list[DurableBrowserAcquisitionLease] = []
             for row in fair_rows:
-                if (
-                    row.provider not in allowed_providers
-                    or (
-                        allowed_scopes
-                        and f"{row.provider}:{row.kind}" not in allowed_scopes
-                    )
+                if row.provider not in allowed_providers or (
+                    allowed_scopes and f"{row.provider}:{row.kind}" not in allowed_scopes
                 ):
                     continue
                 if (
@@ -1097,9 +1109,7 @@ class DurableBrowserTaskStore:
                 await s.rollback()
                 return False
             row.heartbeat_at = now
-            row.lease_expires_at = min(
-                now + timedelta(seconds=30), _aware(row.attempt_deadline_at)
-            )
+            row.lease_expires_at = min(now + timedelta(seconds=30), _aware(row.attempt_deadline_at))
             row.updated_at = now
             await s.commit()
             return True
@@ -1183,8 +1193,7 @@ class DurableBrowserTaskStore:
             ):
                 raise DurableBrowserTaskConflict("stale acquisition lease")
             if source_receipt is not None and (
-                row.public_task_id is None
-                or source_receipt.task_id != row.public_task_id
+                row.public_task_id is None or source_receipt.task_id != row.public_task_id
             ):
                 raise DurableBrowserTaskConflict("receipt is bound to another acquisition")
             row.state = completion.state.value
@@ -1236,8 +1245,7 @@ class DurableBrowserTaskStore:
                 .where(
                     BrowserAcquisitionRow.id == acquisition_id,
                     BrowserAcquisitionRow.tenant_id == tenant_id,
-                    BrowserAcquisitionRow.authority_partition_sha256
-                    == self._authority_partition,
+                    BrowserAcquisitionRow.authority_partition_sha256 == self._authority_partition,
                 )
                 .with_for_update()
             )
@@ -1302,19 +1310,21 @@ class DurableBrowserTaskStore:
 
     async def get_pending_completion(
         self, acquisition_id: str, *, tenant_id: str
-    ) -> tuple[
-        BrowserTaskCompletion,
-        BrowserTaskSnapshot,
-        BrowserSourceExecutionReceipt | None,
-        str,
-    ] | None:
+    ) -> (
+        tuple[
+            BrowserTaskCompletion,
+            BrowserTaskSnapshot,
+            BrowserSourceExecutionReceipt | None,
+            str,
+        ]
+        | None
+    ):
         async with self._database.sessions() as s:
             row = await s.scalar(
                 select(BrowserAcquisitionRow).where(
                     BrowserAcquisitionRow.id == acquisition_id,
                     BrowserAcquisitionRow.tenant_id == tenant_id,
-                    BrowserAcquisitionRow.authority_partition_sha256
-                    == self._authority_partition,
+                    BrowserAcquisitionRow.authority_partition_sha256 == self._authority_partition,
                     BrowserAcquisitionRow.state == "completing",
                 )
             )
@@ -1342,8 +1352,7 @@ class DurableBrowserTaskStore:
                 select(BrowserAcquisitionRow.completion_event_details).where(
                     BrowserAcquisitionRow.id == acquisition_id,
                     BrowserAcquisitionRow.tenant_id == tenant_id,
-                    BrowserAcquisitionRow.authority_partition_sha256
-                    == self._authority_partition,
+                    BrowserAcquisitionRow.authority_partition_sha256 == self._authority_partition,
                     BrowserAcquisitionRow.state == "completing",
                 )
             )
@@ -1445,8 +1454,7 @@ class DurableBrowserTaskStore:
                 .where(
                     BrowserAcquisitionRow.id == acquisition_id,
                     BrowserAcquisitionRow.tenant_id == tenant_id,
-                    BrowserAcquisitionRow.authority_partition_sha256
-                    == self._authority_partition,
+                    BrowserAcquisitionRow.authority_partition_sha256 == self._authority_partition,
                 )
                 .with_for_update()
             )
@@ -1499,12 +1507,12 @@ class DurableBrowserTaskStore:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while True:
             value = await self.get_consumer(consumer_id, tenant_id=tenant_id)
-            if (
-                value is None
-                or value.acquisition_state.terminal
-                or asyncio.get_running_loop().time() >= deadline
-            ):
+            if value is None or value.acquisition_state.terminal:
                 return value
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(
+                    "browser acquisition did not reach a terminal state before timeout"
+                )
             await asyncio.sleep(0.1)
 
     async def cancel_consumer(
