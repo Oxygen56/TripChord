@@ -772,6 +772,29 @@ function PlanActionLink({
   );
 }
 
+function PlanInlineActionLink({
+  url,
+  label,
+}: {
+  url: string | null | undefined;
+  label: string;
+}) {
+  if (!url) return <span className="trip-inline-link unavailable">入口待确认</span>;
+  return (
+    <a className="trip-inline-link" href={url} target="_blank" rel="noreferrer">
+      {label} <span aria-hidden="true">↗</span>
+    </a>
+  );
+}
+
+export function selectPlanForCard(response: LiveFlexibleFromTextResponse) {
+  const plan = response.final_plan ?? response.best_available_plan ?? null;
+  return {
+    plan,
+    isBestAvailable: !response.final_plan && Boolean(response.best_available_plan),
+  };
+}
+
 function FlightLeg({
   direction,
   flightNumbers,
@@ -871,6 +894,79 @@ function FinalTripCard({
   const destinationLabel = flight
     ? airportLabel(flight.destination_airport_code ?? null, flight.destination)
     : "目的地";
+  const lodgingPrices = plan.lodgings.map((lodging) => {
+    const sourceComparison = (plan.lodging_source_comparisons ?? []).find(
+      (item) =>
+        item.provider === lodging.provider &&
+        item.property_name === lodging.property_name &&
+        item.room_name === lodging.room_name &&
+        item.check_in === lodging.check_in &&
+        item.check_out === lodging.check_out,
+    );
+    return lodging.reference_cny_cents ??
+      (sourceComparison?.reference_currency === "CNY"
+        ? sourceComparison.reference_total_cents
+        : null);
+  });
+  const lodgingTotalCents = lodgingPrices.every((value) => typeof value === "number")
+    ? lodgingPrices.reduce((sum, value) => sum + (value ?? 0), 0)
+    : null;
+  const transferPrices = plan.transfers.map((transfer) => transfer.reference_cny_cents);
+  const transferTotalCents = transferPrices.length > 0 &&
+    transferPrices.every((value) => typeof value === "number")
+    ? transferPrices.reduce<number>((sum, value) => sum + (value ?? 0), 0)
+    : null;
+  const flightTotalCents = flight?.currency === "CNY"
+    ? flight.total_for_party_cents
+    : null;
+  const knownCostTotal =
+    (flightTotalCents ?? 0) + (lodgingTotalCents ?? 0) + (transferTotalCents ?? 0);
+  const costSegments = [
+    { label: "机票", value: flightTotalCents, className: "flight" },
+    { label: "住宿", value: lodgingTotalCents, className: "stay" },
+    { label: "接驳", value: transferTotalCents, className: "transfer" },
+  ];
+  const timelineEvents = [
+    ...(plan.transfers ?? []).map((transfer, index) => ({
+      kind: "transfer" as const,
+      sortAt: transfer.depart_at ?? `${transfer.service_date}T12:00:00`,
+      eyebrow: `第 ${index + 1} 段接驳`,
+      title: `${placeLabel(transfer.origin_place_key ?? null, transfer.origin_area)} → ${placeLabel(transfer.destination_place_key ?? null, transfer.destination_area)}`,
+      detail: transfer.depart_at
+        ? `${formatTravelLocalDateTime(transfer.depart_at)}${transfer.arrive_at ? ` → ${formatTravelLocalDateTime(transfer.arrive_at)}` : ""}`
+        : formatTravelDate(transfer.service_date),
+      price: transfer.reference_cny_cents,
+      provider: providerLabel(transfer.provider),
+      url: transfer.official_view_url,
+    })),
+    ...(plan.lodgings ?? []).map((lodging, index) => ({
+      kind: "lodging" as const,
+      sortAt: `${lodging.check_in}T23:59:00`,
+      eyebrow: "住宿",
+      title: lodging.property_name,
+      detail: `${formatTravelDate(lodging.check_in)} 入住 · ${formatTravelDate(lodging.check_out)} 退房 · ${roomNameLabel(lodging.room_name)}`,
+      price: lodgingPrices[index],
+      provider: providerLabel(lodging.provider),
+      url: lodging.official_view_url,
+    })),
+  ].sort((left, right) => left.sortAt.localeCompare(right.sortAt));
+  const selectedLodging = plan.lodgings[0] ?? null;
+  const tripDestinationLabel = selectedLodging
+    ? placeLabel(selectedLodging.place_key ?? null, selectedLodging.area)
+    : destinationLabel;
+  const comparableLodgings = (plan.lodging_source_comparisons ?? []).filter(
+    (comparison) =>
+      !selectedLodging ||
+      (comparison.check_in === selectedLodging.check_in &&
+        comparison.check_out === selectedLodging.check_out),
+  );
+  const transferPurchaseLinks = plan.transfers.filter(
+    (transfer, index, transfers) =>
+      Boolean(transfer.official_view_url) &&
+      transfers.findIndex(
+        (candidate) => candidate.official_view_url === transfer.official_view_url,
+      ) === index,
+  );
 
   return (
     <section
@@ -910,6 +1006,146 @@ function FinalTripCard({
         </p>
       </div>
 
+      <div className="trip-route-hero">
+        <div className="trip-route-endpoint">
+          <span>出发</span>
+          <strong>{originLabel}</strong>
+          <small>{flight ? formatTravelLocalDateTime(flight.outbound_depart_at) : "时间待确认"}</small>
+        </div>
+        <div className="trip-route-line" aria-hidden="true"><i />✈<i /></div>
+        <div className="trip-route-endpoint destination">
+          <span>目的地</span>
+          <strong>{tripDestinationLabel}</strong>
+          <small>{flight ? `经 ${destinationLabel} · ${formatTravelLocalDateTime(flight.outbound_arrive_at)} 落地` : "时间待确认"}</small>
+        </div>
+        <div className="trip-route-return">
+          <span>返航</span>
+          <strong>{flight ? formatTravelLocalDateTime(flight.return_depart_at) : "时间待确认"}</strong>
+          <small>{flight ? `抵达 ${originLabel} · ${formatTravelLocalDateTime(flight.return_arrive_at)}` : "返程时间待确认"}</small>
+        </div>
+      </div>
+
+      <div className="trip-cost-strip" aria-label="费用组成">
+        {costSegments.map((segment) => (
+          <div className="trip-cost-segment" key={segment.label}>
+            <div className="trip-cost-bar"><i className={segment.className} style={{ width: `${knownCostTotal && segment.value ? Math.max(4, (segment.value / knownCostTotal) * 100) : 0}%` }} /></div>
+            <span>{segment.label}</span>
+            <strong>{segment.value ? formatCents(segment.value) : "待确认"}</strong>
+          </div>
+        ))}
+      </div>
+
+      <div className="trip-card-main-grid">
+        <section className="trip-timeline-panel" aria-label="完整行程时间轴">
+          <div className="trip-section-title"><div><span className="eyebrow">按时间顺序</span><h3>完整行程</h3></div><small>{plan.departure_date} 起</small></div>
+          <ol className="trip-timeline">
+            {flight && (
+              <li className="trip-timeline-event flight-event">
+                <div className="trip-timeline-dot">✈</div>
+                <div className="trip-timeline-content">
+                  <span className="timeline-eyebrow">去程航班 · {flight.outbound_flight_numbers.join(" + ") || "航班号待确认"}</span>
+                  <strong>{originLabel} → {destinationLabel}</strong>
+                  <small>{formatTravelLocalDateTime(flight.outbound_depart_at)} 出发 · {formatTravelLocalDateTime(flight.outbound_arrive_at)} 抵达</small>
+                  <PlanInlineActionLink url={flight.official_view_url} label={`${providerLabel(flight.provider)} · 往返 ${flightTotalCents ? formatCents(flightTotalCents) : "价格待确认"}`} />
+                </div>
+              </li>
+            )}
+            {timelineEvents.map((event, index) => (
+              <li className={`trip-timeline-event ${event.kind}-event`} key={`${event.kind}-${event.sortAt}-${index}`}>
+                <div className="trip-timeline-dot">{event.kind === "lodging" ? "⌂" : "↔"}</div>
+                <div className="trip-timeline-content">
+                  <span className="timeline-eyebrow">{event.eyebrow}</span>
+                  <strong>{event.title}</strong>
+                  <small>{event.detail}</small>
+                  <PlanInlineActionLink url={event.url} label={`${event.provider} · ${event.price ? formatCents(event.price) : "价格待确认"}`} />
+                </div>
+              </li>
+            ))}
+            {flight && (
+              <li className="trip-timeline-event return-event">
+                <div className="trip-timeline-dot">↩</div>
+                <div className="trip-timeline-content">
+                  <span className="timeline-eyebrow">返程航班 · {flight.return_flight_numbers.join(" + ") || "航班号待确认"}</span>
+                  <strong>{destinationLabel} → {originLabel}</strong>
+                  <small>{formatTravelLocalDateTime(flight.return_depart_at)} 起飞 · {formatTravelLocalDateTime(flight.return_arrive_at)} 抵达</small>
+                  <PlanInlineActionLink url={flight.official_view_url} label={`${providerLabel(flight.provider)} · 已计入往返价`} />
+                </div>
+              </li>
+            )}
+          </ol>
+        </section>
+
+        <aside className="trip-card-sidebar" aria-label="住宿比较和重新核价入口">
+          <div className="trip-sidebar-block selected-stay">
+            <span className="eyebrow">{plan.lodgings.length > 1 ? "已选住宿组合" : "已选住宿"}</span>
+            {plan.lodgings.length > 0 ? plan.lodgings.map((lodging, index) => (
+              <article
+                className="selected-stay-item"
+                key={`${lodging.provider}:${lodging.property_name}:${lodging.check_in}`}
+              >
+                <h3>{lodging.property_name}</h3>
+                <p>{formatTravelDate(lodging.check_in)} – {formatTravelDate(lodging.check_out)} · {roomNameLabel(lodging.room_name)}</p>
+                <PlanInlineActionLink url={lodging.official_view_url} label={`${providerLabel(lodging.provider)} · ${lodgingPrices[index] ? formatCents(lodgingPrices[index]) : "价格待确认"}`} />
+              </article>
+            )) : <p>暂无已选住宿</p>}
+          </div>
+          {comparableLodgings.length > 0 && (
+            <div className="trip-sidebar-block">
+              <span className="eyebrow">同日期价格比较</span>
+              <div className="stay-comparison-list">
+                {comparableLodgings.slice(0, 3).map((comparison, index) => {
+                  const isSelected = Boolean(
+                    selectedLodging &&
+                    comparison.provider === selectedLodging.provider &&
+                    comparison.property_name === selectedLodging.property_name &&
+                    comparison.room_name === selectedLodging.room_name,
+                  );
+                  return (
+                  <div className="stay-comparison-row" key={`${comparison.provider}-${comparison.property_name}-${index}`}>
+                    <span>
+                      {providerLabel(comparison.provider)}
+                      <small>{comparison.property_name}</small>
+                      <em>{isSelected ? "已选" : comparison.eligible ? "可比较" : "未满足住宿要求"}</em>
+                    </span>
+                    <strong>{comparison.reference_currency === "CNY" && comparison.reference_total_cents ? formatCents(comparison.reference_total_cents) : "待确认"}</strong>
+                  </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+          <div className="trip-sidebar-block reprice-block">
+            <span className="eyebrow">准备购买前</span>
+            <strong>重新核对最新价格与余位</strong>
+            <p>打开入口后核对同行人数、税费、房型和取消规则。</p>
+            <nav className="reprice-actions" aria-label="分项重新核价入口">
+              {flight && (
+                <PlanActionLink
+                  url={flight.official_view_url}
+                  label={`机票 · ${providerLabel(flight.provider)}`}
+                />
+              )}
+              {plan.lodgings.map((lodging) => (
+                <PlanActionLink
+                  key={`${lodging.provider}:${lodging.property_name}:${lodging.check_in}`}
+                  url={lodging.official_view_url}
+                  label={`住宿 · ${lodging.property_name}`}
+                />
+              ))}
+              {transferPurchaseLinks.map((transfer) => (
+                <PlanActionLink
+                  key={`${transfer.provider}:${transfer.official_view_url}`}
+                  url={transfer.official_view_url}
+                  label={`接驳 · ${providerLabel(transfer.provider)}`}
+                />
+              ))}
+            </nav>
+          </div>
+        </aside>
+      </div>
+
+      <details className="final-trip-details">
+        <summary>查看航班、房型和接驳完整信息</summary>
       {flight && (
         <section className="trip-component-card flight-component" aria-label="往返航班详情">
           <div className="trip-component-heading">
@@ -979,6 +1215,7 @@ function FinalTripCard({
           (item) =>
             item.provider === lodging.provider &&
             item.property_name === lodging.property_name &&
+            item.room_name === lodging.room_name &&
             item.check_in === lodging.check_in &&
             item.check_out === lodging.check_out,
         );
@@ -1060,9 +1297,9 @@ function FinalTripCard({
       })}
 
       {plan.transfers.length > 0 && (
-        <section className="trip-component-card" aria-label="机场与岛屿接驳详情">
+        <section className="trip-component-card" aria-label="行程接驳详情">
           <div className="trip-component-heading">
-            <div><span>接驳</span><h3>机场 ↔ 岛屿</h3></div>
+            <div><span>接驳</span><h3>全部行程接驳</h3></div>
             <div className="component-price">
               <strong>
                 {typeof plan.estimated_icom_transfer_cny_cents === "number"
@@ -1078,7 +1315,7 @@ function FinalTripCard({
               return (
                 <article key={`${transfer.provider}:${transfer.service_date}:${index}`}>
                   <div>
-                    <span>{index === 0 ? "去岛" : "返程"}</span>
+                    <span>第 {index + 1} 段</span>
                     <strong>
                       {placeLabel(transfer.origin_place_key ?? null, transfer.origin_area)} →
                       {" "}{placeLabel(transfer.destination_place_key ?? null, transfer.destination_area)}
@@ -1117,11 +1354,12 @@ function FinalTripCard({
             )}
             <PlanActionLink
               url={plan.transfers[0].official_view_url}
-              label="打开 iCom 官网确认并购买"
+              label={`打开${providerLabel(plan.transfers[0].provider)}确认并购买`}
             />
           </div>
         </section>
       )}
+      </details>
 
       <div className="journey-date-grid">
         <article><span>出发</span><strong>{formatTravelDate(plan.departure_date)}</strong></article>
@@ -1176,8 +1414,7 @@ function FlexiblePlanningSummary({
   const interpretation = response.interpretation;
   const window = interpretation.window;
   const run = response.run;
-  const isBestAvailable = !response.final_plan && Boolean(response.best_available_plan);
-  const finalPlan = response.final_plan ?? response.best_available_plan;
+  const { plan: finalPlan, isBestAvailable } = selectPlanForCard(response);
   const breakfastApplication = getBreakfastPreferenceApplication(response);
   const modelParticipation = modelParticipationLabel(response);
   const pairById = new Map(

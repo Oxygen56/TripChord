@@ -4,6 +4,7 @@ import {
   formatTravelLocalDateTime,
   livePlanModificationHeading,
   modelParticipationLabel,
+  selectPlanForCard,
 } from "./App";
 
 describe("travel local date and time", () => {
@@ -42,5 +43,19 @@ describe("live plan modification result heading", () => {
     expect(livePlanModificationHeading("blocked", "lodging")).toBe(
       "没有安全替代项",
     );
+  });
+});
+
+describe("final result card selection", () => {
+  it("uses the same card contract for a final plan and a best available plan", () => {
+    const finalPlan = { departure_date: "2026-09-03" } as never;
+    const bestPlan = { departure_date: "2026-09-04" } as never;
+    const finalResult = selectPlanForCard({ final_plan: finalPlan, best_available_plan: bestPlan } as never);
+    const bestResult = selectPlanForCard({ final_plan: null, best_available_plan: bestPlan } as never);
+
+    expect(finalResult.plan).toBe(finalPlan);
+    expect(finalResult.isBestAvailable).toBe(false);
+    expect(bestResult.plan).toBe(bestPlan);
+    expect(bestResult.isBestAvailable).toBe(true);
   });
 });
