@@ -4,14 +4,16 @@
 
 ## 简历可直接使用的版本
 
-### TripChord（旅弦）——确定性内核与多角色协作的自由行决策 Agent
+### TripChord（旅弦）——LLM 与确定性系统协作的 Multi-Agent 旅行决策系统
 
-**技术栈：** Python、FastAPI、Pydantic、SQLAlchemy/PostgreSQL、React/TypeScript、Chrome Extension、OpenAI-compatible Model Gateway
+**Agent 技术栈：** 自研 Typed Multi-Agent Runtime / DAG、Context Engineering、Tool Calling、角色级工具白名单、Structured Output、Typed Handoff、Model Routing & Tracing、BM25 Preference RAG、Agent Evaluation、Deterministic Verifier / Publication Gate
 
-- 从 0 设计交通、住宿与接驳一体化的旅行决策系统，将自然语言需求转成合法日期空间，统一不同平台的产品身份、同行人数和费用口径，再生成包含完整日期、衔接关系、人民币总费用及来源链接的行程方案。
-- 设计确定性探索与多角色 Agent 分层的架构：各角色使用专属 Context Pack、工具白名单、结构化输出和类型化交接；LLM 只处理需求语义、偏好权衡和软风险，确定性内核负责日期、人数、金额、产品身份、行程衔接和发布判定；全窗口探索可延后模型阶段，只有候选进入相应决策路径时才承担模型成本。
-- 实现固定工作池、跨日期查询指纹、single-flight 复用和异步任务，避免逐日期串行查询及相同请求重复执行。一次真实只读运行约 100 秒覆盖 30/30 个可行日期组合的批量价格线索、详查 Top 3，并组合出含航班、酒店、接驳、总价和官方入口的当前最佳候选。
-- 将长期偏好设计为可确认、可撤销、可过期的数据；实时价格、库存和班次禁止进入长期记忆。对同任务、同工具、同预算的 12 组脚本化 A/B 评测中，单 Agent 与 Multi-Agent 的有效方案率均为 100%，而 Multi-Agent 成本更高，因此不把固定执行全部角色当作最终方向，并保留按问题复杂度继续收窄触发范围的演进路径。
+**工程实现：** Python、FastAPI、Pydantic、SQLAlchemy/PostgreSQL、React/TypeScript、Chrome Extension
+
+- 自研 Typed Multi-Agent Runtime / DAG，以角色级 Context Pack、工具白名单、Structured Output、Typed Handoff 和类型化失败语义，编排证据仲裁、候选选择、独立审查与修复；模型网关统一 Tool Calling、路由与追踪，BM25 RAG 检索经审计的非实时记忆，其中用户偏好须确认后写入且可撤销、可过期，实时价格、库存和班次禁止进入。
+- 划分 LLM 与确定性系统的决策权：LLM 只处理语言歧义、偏好权衡、软风险与有界修复建议；程序负责日期空间、同行人数、价格计算、产品身份、行程衔接、修改执行和最终发布。涉及报价和方案的模型结论必须绑定本轮工具结果，并经过独立 Verifier 复算；任务执行成功不等于业务方案可以发布。
+- 构建单 Agent / Multi-Agent 公平评测框架，固定任务、工具、模型标识与总预算，并独立审计发布结果；12 类离线 scripted 任务中两组有效方案率均为 100%，平均模型接口调用为 4.25 / 10.25。该结果只验证编排成本与门控，不证明 Multi-Agent 更准确。
+- 将浏览器长任务封装为支持幂等提交、进度查询、取消和检查点恢复的异步 Job，并以固定工作池、跨日期指纹和 single-flight 控制并发与去重；一次约 100 秒的真实只读运行取得 30/30 日期批量线索并详查 Top 3，但模型阶段被延后（0 次调用）且关键偏好尚未落实，因此只返回带缺口的当前候选，未发布最终方案。
 
 项目地址：[github.com/Oxygen56/TripChord](https://github.com/Oxygen56/TripChord)
 
