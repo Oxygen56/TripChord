@@ -188,11 +188,7 @@ def _final_publication_scheduler() -> SchedulerOutcome:
             agent_role=task.role,
             success=True,
             summary="fixture stage completed",
-            output=(
-                {"publication_gate_passed": True}
-                if task.id == "publish-live-run"
-                else {}
-            ),
+            output=({"publication_gate_passed": True} if task.id == "publish-live-run" else {}),
         )
         for task in tasks
     )
@@ -339,9 +335,7 @@ def test_live_final_projection_separates_confirmed_subtotal_from_icom_estimate()
         captured_at=captured_at,
         expires_at=captured_at + timedelta(minutes=10),
         availability=QuoteAvailability.AVAILABLE,
-        evidence_refs=(
-            "https://hotels.ctrip.com/hotels/detail/?hotelId=2192724",
-        ),
+        evidence_refs=("https://hotels.ctrip.com/hotels/detail/?hotelId=2192724",),
         property_name="Kaani Beach Hotel",
         area=PackageArea.DESTINATION_ISLAND,
         check_in=date(2026, 9, 4),
@@ -352,9 +346,7 @@ def test_live_final_projection_separates_confirmed_subtotal_from_icom_estimate()
         breakfast_included=True,
         cancellation_policy="免费取消",
         location_address="Aabaadhee Hingun Road, 马富施, 马尔代夫",
-        nearby_location_evidence=(
-            "近Sinai Dive Club Maldives · Maafushi Dive & Water Sports.",
-        ),
+        nearby_location_evidence=("近Sinai Dive Club Maldives · Maafushi Dive & Water Sports.",),
         location_convenience=LodgingLocationConvenience.CONFIRMED_NOT_REMOTE,
     )
     transfer = SimpleNamespace(
@@ -429,9 +421,7 @@ def test_live_final_projection_separates_confirmed_subtotal_from_icom_estimate()
 
 def test_live_agent_response_schema_strongly_types_final_plan() -> None:
     schema = LiveAgentPlanningResponse.model_json_schema()
-    assert schema["properties"]["final_plan"]["anyOf"][0]["$ref"].endswith(
-        "/FinalPlanProjection"
-    )
+    assert schema["properties"]["final_plan"]["anyOf"][0]["$ref"].endswith("/FinalPlanProjection")
     with pytest.raises(ValidationError):
         LiveAgentPlanningResponse.model_validate(
             {
@@ -559,9 +549,7 @@ def test_best_available_plan_keeps_display_fare_separate_from_lodging_total() ->
 
     # A quote covering the departure date must not be used when the flight
     # reaches the destination on the following calendar day.
-    misaligned_lodging = lodging.model_copy(
-        update={"check_in": date(2026, 9, 3)}
-    )
+    misaligned_lodging = lodging.model_copy(update={"check_in": date(2026, 9, 3)})
     misaligned_run = live_run.model_copy(
         update={
             "normalization_results": (
@@ -606,9 +594,7 @@ def test_best_available_plan_does_not_add_unknown_flight_fare_to_lodging() -> No
             destination="马累",
             adults=2,
             party_availability_confirmed=False,
-            outbound_depart_at=datetime.combine(
-                departure_date, time(21, 45), tzinfo=UTC
-            ),
+            outbound_depart_at=datetime.combine(departure_date, time(21, 45), tzinfo=UTC),
             outbound_arrive_at=datetime.combine(
                 departure_date + timedelta(days=1), time(12, 20), tzinfo=UTC
             ),
@@ -1306,24 +1292,16 @@ async def test_live_monitor_api_is_opt_in_bounded_and_cancellable(
             assert current.json()["run_id"] == run_id
             assert current.json()["run"]["decision"]["state"] == "accept"
 
-            checked = await client.post(
-                f"/api/v1/agents/live-monitors/{monitor_id}/check-now"
-            )
+            checked = await client.post(f"/api/v1/agents/live-monitors/{monitor_id}/check-now")
             assert checked.status_code == 200
             assert checked.json()["monitor"]["check_count"] == 1
-            assert checked.json()["monitor"]["last_check"]["event_id"] == (
-                "monitor-event-fixture"
-            )
+            assert checked.json()["monitor"]["last_check"]["event_id"] == ("monitor-event-fixture")
 
-            fetched = await client.get(
-                f"/api/v1/agents/live-monitors/{monitor_id}"
-            )
+            fetched = await client.get(f"/api/v1/agents/live-monitors/{monitor_id}")
             assert fetched.status_code == 200
             assert fetched.json()["monitor"]["state"] == "active"
 
-            stopped = await client.delete(
-                f"/api/v1/agents/live-monitors/{monitor_id}"
-            )
+            stopped = await client.delete(f"/api/v1/agents/live-monitors/{monitor_id}")
             assert stopped.status_code == 200
             assert stopped.json()["monitor"]["state"] == "stopped"
     finally:
@@ -1820,12 +1798,16 @@ def test_decision_only_response_projection_contract_fixture() -> None:
         update={
             "normalization_results": (
                 NormalizedBrowserQuoteResult(
-                    provider="ctrip", kind=BrowserVertical.LODGING,
-                    status=QuoteNormalizationStatus.USABLE, quote=ctrip,
+                    provider="ctrip",
+                    kind=BrowserVertical.LODGING,
+                    status=QuoteNormalizationStatus.USABLE,
+                    quote=ctrip,
                 ),
                 NormalizedBrowserQuoteResult(
-                    provider="arena_official", kind=BrowserVertical.LODGING,
-                    status=QuoteNormalizationStatus.USABLE, quote=arena,
+                    provider="arena_official",
+                    kind=BrowserVertical.LODGING,
+                    status=QuoteNormalizationStatus.USABLE,
+                    quote=arena,
                 ),
             ),
             "decision_only_candidate": decision_only,
@@ -1851,8 +1833,15 @@ def test_decision_only_response_projection_contract_fixture() -> None:
     assert response.flight.provider == "qunar"
     assert response.flight.price_basis == "comparison_only"
     assert response.flight.has_publishable_execution_contract is False
+    assert response.flight.official_view_url is not None
+    assert response.flight.official_view_url.startswith("https://flight.qunar.com/")
     assert len(response.transfers) == 2
     assert all(item.provider == "icom-public-transfer" for item in response.transfers)
+    assert sum(item.reference_cny_cents or 0 for item in response.transfers) == 80_647
+    assert all(
+        item.official_view_url == "https://www.icomtours.com/" for item in response.transfers
+    )
+    assert response.lodgings[0].official_view_url is None
     assert response.confirmed_cny_subtotal_cents == 1_106_500
     assert response.estimated_icom_transfer_cny_cents == 80_647
     assert response.estimated_total_cny_cents == 1_187_147

@@ -19,6 +19,7 @@ from tripchord.agents.live_jobs import (
     NON_DURABLE_LIVE_PLANNING_BOUNDARY,
     LivePlanningJobInactiveError,
     LivePlanningJobRegistry,
+    LivePlanningJobSnapshot,
     LivePlanningPairCheckpoint,
     LivePlanningPairCheckpointState,
     LiveSourceTerminalEvent,
@@ -59,6 +60,61 @@ def test_live_planning_boundary_helper_is_fail_closed_by_registry_mode() -> None
     )
 
 NOW = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
+
+
+def test_legacy_selected_plan_is_reprojected_without_mutating_saved_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy_result: dict[str, Any] = {
+        "final_plan": None,
+        "best_available_plan": {"option_id": "option-kept"},
+    }
+    job = LivePlanningJobSnapshot(
+        id="legacy-job",
+        state="succeeded",
+        stage="completed",
+        progress=100,
+        revision=1,
+        result=legacy_result,
+        created_at=NOW,
+        updated_at=NOW,
+        deadline_at=NOW.replace(hour=10),
+    )
+
+    class ReprojectedPlan:
+        option_id = "option-kept"
+
+        @staticmethod
+        def model_dump(*, mode: str) -> dict[str, str]:
+            assert mode == "json"
+            return {
+                "projection_schema_version": "final-plan-projection-v2",
+                "option_id": "option-kept",
+            }
+
+    monkeypatch.setattr(
+        main_module.LiveFlexibleFromTextPlanningResponse,
+        "model_validate",
+        staticmethod(lambda payload: SimpleNamespace(run=object())),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "build_best_available_plan_projection",
+        lambda run: ReprojectedPlan(),
+    )
+
+    upgraded = main_module._with_current_final_plan_projection(job)
+
+    assert upgraded.result is not None
+    assert upgraded.result["best_available_plan"] == {
+        "projection_schema_version": "final-plan-projection-v2",
+        "option_id": "option-kept",
+    }
+    assert "projection_schema_version" not in legacy_result["best_available_plan"]
+    assert job.result == legacy_result
+
+    ReprojectedPlan.option_id = "different-option"
+    assert main_module._with_current_final_plan_projection(job) is job
 
 
 def _payload(*, ready: bool) -> dict[str, object]:

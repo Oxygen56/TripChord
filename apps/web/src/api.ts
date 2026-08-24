@@ -696,11 +696,26 @@ export type LiveFlexiblePairRunHandle = {
 };
 
 export type FinalPlanProjection = {
+  projection_schema_version?: "final-plan-projection-v2";
   option_id: string;
   date_pair_id: string;
   departure_date: string;
   return_date: string;
   total_budget_cents: number | null;
+  confirmed_cny_subtotal_cents?: number | null;
+  estimated_icom_transfer_cny_cents?: number | null;
+  estimated_total_cny_cents?: number | null;
+  icom_cny_reference_estimate?: {
+    source_name: string;
+    source_url: string;
+    rate_date: string;
+    captured_at: string;
+    usd_to_cny_reference_rate: string;
+    source_usd_base_fare_cents: number;
+    estimated_cny_cents: number;
+    taxes_and_fees_included: boolean | null;
+    boundary: string;
+  } | null;
   optimality_status: string;
   claim_boundary: string;
   flight_component_id: string | null;
@@ -710,17 +725,66 @@ export type FinalPlanProjection = {
     provider: string;
     origin: string;
     destination: string;
+    origin_airport_code: string | null;
+    destination_airport_code: string | null;
     outbound_flight_numbers: string[];
     outbound_depart_at: string;
     outbound_arrive_at: string;
     return_flight_numbers: string[];
     return_depart_at: string;
     return_arrive_at: string;
+    outbound_segments: Array<{
+      flight_number: string;
+      departure_airport_code: string;
+      arrival_airport_code: string;
+      departure_at: string;
+      arrival_at: string;
+    }>;
+    return_segments: Array<{
+      flight_number: string;
+      departure_airport_code: string;
+      arrival_airport_code: string;
+      departure_at: string;
+      arrival_at: string;
+    }>;
+    outbound_ground_transfers: Array<{
+      from_airport_code: string;
+      to_airport_code: string;
+      mode: string;
+      minimum_buffer_minutes: number;
+      actual_buffer_minutes: number;
+      baggage_recheck_required: boolean;
+      through_ticket_protected: boolean;
+    }>;
+    return_ground_transfers: Array<{
+      from_airport_code: string;
+      to_airport_code: string;
+      mode: string;
+      minimum_buffer_minutes: number;
+      actual_buffer_minutes: number;
+      baggage_recheck_required: boolean;
+      through_ticket_protected: boolean;
+    }>;
+    carrier_summary: string | null;
+    cabin_class: string | null;
+    currency: string;
+    total_for_party_cents: number | null;
+    display_amount_cents: number | null;
+    taxes_and_fees_included: boolean | null;
+    party_total_known: boolean;
+    price_basis: string;
+    availability: string;
+    party_availability_confirmed: boolean;
+    has_publishable_execution_contract: boolean;
+    captured_at: string | null;
+    expires_at: string | null;
+    official_view_url: string | null;
   } | null;
   lodgings: Array<{
     provider: string;
     property_name: string;
     area: string;
+    place_key: string | null;
     check_in: string;
     check_out: string;
     rooms: number;
@@ -731,15 +795,51 @@ export type FinalPlanProjection = {
     location_address: string | null;
     nearby_location_evidence: string[];
     location_evidence_summary: string | null;
+    currency: string;
+    total_for_party_cents: number | null;
+    display_total_cents: number | null;
+    reference_cny_cents: number | null;
+    taxes_and_fees_included: boolean | null;
+    availability: string;
+    captured_at: string | null;
+    expires_at: string | null;
+    official_view_url: string | null;
   }>;
   transfers: Array<{
     provider: string;
     origin_area: string;
     destination_area: string;
+    origin_place_key: string | null;
+    destination_place_key: string | null;
     service_date: string;
     schedule_mode: string;
     depart_at: string | null;
     arrive_at: string | null;
+    currency: string | null;
+    total_for_party_cents: number | null;
+    reference_cny_cents: number | null;
+    taxes_and_fees_included: boolean | null;
+    price_guarantee: string | null;
+    availability: string;
+    captured_at: string | null;
+    expires_at: string | null;
+    official_view_url: string | null;
+  }>;
+  lodging_source_comparisons?: Array<{
+    provider: string;
+    source_type: "ota" | "hotel_official";
+    property_name: string;
+    room_name: string | null;
+    currency: string;
+    total_for_party_cents: number | null;
+    reference_total_cents: number | null;
+    reference_currency: string | null;
+    taxes_and_fees_included: boolean | null;
+    captured_at: string;
+    check_in: string;
+    check_out: string;
+    eligible: boolean;
+    reason: string;
   }>;
   party: Record<string, number>;
   covered_source_ids: string[];
@@ -762,6 +862,9 @@ export type LiveFlexibleFromTextResponse = {
   best_available_plan?: BestAvailablePlanProjection | null;
   cached_pair_runs: LiveFlexiblePairRunHandle[];
   model_enhancement_enabled: boolean;
+  model_trace_count?: number;
+  model_trace_success_count?: number;
+  model_trace_failure_count?: number;
   execution_boundary: string;
 };
 

@@ -191,12 +191,62 @@ const providerLabels: Record<LiveProvider, string> = {
   "icom-public-transfer": "iCom 官方快艇",
 };
 
+const extendedProviderLabels: Record<string, string> = {
+  ...providerLabels,
+  kaani_official: "Kaani 酒店官网",
+  arena_official: "Arena 酒店官网",
+};
+
+const airportLabels: Record<string, string> = {
+  HGH: "杭州萧山国际机场",
+  MLE: "维拉纳国际机场",
+  PEK: "北京首都国际机场",
+  PKX: "北京大兴国际机场",
+  PVG: "上海浦东国际机场",
+  SIN: "新加坡樟宜机场",
+};
+
+const placeLabels: Record<string, string> = {
+  velana_airport: "维拉纳国际机场（MLE）",
+  maafushi: "马富施岛",
+  hulhumale: "胡鲁马累",
+  airport: "机场",
+  destination_island: "目的地岛",
+  airport_island: "机场岛",
+};
+
 function isLiveProvider(value: string): value is LiveProvider {
   return value in providerLabels;
 }
 
 function providerLabel(value: string): string {
-  return isLiveProvider(value) ? providerLabels[value] : value;
+  return extendedProviderLabels[value] ?? (isLiveProvider(value) ? providerLabels[value] : value);
+}
+
+function airportLabel(code: string | null, fallback: string): string {
+  if (!code) return fallback;
+  return `${airportLabels[code] ?? fallback}（${code}）`;
+}
+
+function placeLabel(placeKey: string | null, area: string): string {
+  return (placeKey && placeLabels[placeKey]) || placeLabels[area] || area;
+}
+
+function roomNameLabel(value: string | null): string {
+  if (!value) return "房型待确认";
+  if (value === "Deluxe Double Room Seaview + Balcony") {
+    return "豪华海景阳台大床房（Deluxe Double Room Seaview + Balcony）";
+  }
+  return value;
+}
+
+function locationEvidenceLabel(value: string): string {
+  return value
+    .replace(
+      "near Maafushi's main ferry jetty; official page states: steps from Maafushi's main ferry jetty",
+      "靠近 Maafushi 主渡轮码头（官网描述为步行可达）",
+    )
+    .replace(/\bbeachfront\b/gi, "海滨位置");
 }
 
 const verticalLabels = {
@@ -246,7 +296,7 @@ function formatMoney(amount: string, currency = "CNY"): string {
   return new Intl.NumberFormat("zh-CN", {
     style: "currency",
     currency,
-    maximumFractionDigits: 0,
+    maximumFractionDigits: 2,
   }).format(Number(amount));
 }
 
@@ -258,12 +308,49 @@ function formatDateTime(value: string): string {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.valueOf())) return value;
   return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
   }).format(parsed);
+}
+
+export function formatTravelLocalDateTime(value: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.exec(
+    value,
+  );
+  if (!match) return value;
+  const [, year, month, day, hour, minute, offset] = match;
+  const timezone = offset === "Z" ? "UTC" : `UTC${offset}`;
+  return `${year}年${Number(month)}月${Number(day)}日 ${hour}:${minute}（${timezone}）`;
+}
+
+export function modelParticipationLabel(
+  response: Pick<
+    LiveFlexibleFromTextResponse,
+    "model_enhancement_enabled" | "model_trace_count"
+  >,
+): string {
+  if (response.model_trace_count === 0) return "本次未调用模型";
+  if (typeof response.model_trace_count === "number") {
+    return `本次调用模型 ${response.model_trace_count} 次`;
+  }
+  return response.model_enhancement_enabled ? "模型能力可用" : "确定性路径";
+}
+
+function formatTravelDate(value: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return value;
+  return `${match[1]}年${Number(match[2])}月${Number(match[3])}日`;
+}
+
+function travelNightCount(checkIn: string, checkOut: string): number | null {
+  const start = Date.parse(`${checkIn}T00:00:00Z`);
+  const end = Date.parse(`${checkOut}T00:00:00Z`);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+  return Math.round((end - start) / 86_400_000);
 }
 
 function asObject(value: JsonValue | undefined): Record<string, JsonValue> | null {
@@ -647,6 +734,440 @@ function factValueLabel(field: string, value: JsonValue): string {
   return String(value);
 }
 
+function unresolvedItemLabel(value: string): string {
+  if (value.startsWith("部分住宿来源未形成合格报价：")) {
+    return "部分平台本次没有返回可公平比较的住宿报价。";
+  }
+  if (value.startsWith("部分已连接来源未返回可用结果：")) {
+    return "部分已连接平台本次没有返回可用结果。";
+  }
+  return value;
+}
+
+function priceBasisLabel(
+  basis: string,
+  partyTotalKnown: boolean,
+  partyCount: number,
+): string {
+  if (!partyTotalKnown) return "页面展示金额，完整同行总价待平台确认";
+  if (basis === "comparison_only") {
+    return `${partyCount} 人当前页面比较金额，余位与成交价待平台确认`;
+  }
+  if (basis === "per_person") return "每人价格";
+  return `${partyCount} 人合计`;
+}
+
+function PlanActionLink({
+  url,
+  label,
+}: {
+  url: string | null | undefined;
+  label: string;
+}) {
+  if (!url) return <small className="component-link-missing">平台未提供可用入口</small>;
+  return (
+    <a className="component-action-link" href={url} target="_blank" rel="noreferrer">
+      {label} <span aria-hidden="true">↗</span>
+    </a>
+  );
+}
+
+function FlightLeg({
+  direction,
+  flightNumbers,
+  departAt,
+  arriveAt,
+  from,
+  to,
+  segments,
+  groundTransfers,
+}: {
+  direction: "去程" | "返程";
+  flightNumbers: string[];
+  departAt: string;
+  arriveAt: string;
+  from: string;
+  to: string;
+  segments: NonNullable<FinalPlanProjection["flight"]>["outbound_segments"];
+  groundTransfers: NonNullable<FinalPlanProjection["flight"]>["outbound_ground_transfers"];
+}) {
+  return (
+    <div className="flight-leg-card">
+      <div className="flight-leg-title">
+        <div>
+          <span>{direction}</span>
+          <strong>{flightNumbers.join(" + ") || "航班号待确认"}</strong>
+        </div>
+        <small>{from} → {to}</small>
+      </div>
+      {segments.length > 0 ? (
+        <div className="flight-segments">
+          {segments.map((segment, index) => (
+            <div className="flight-segment" key={`${direction}-${segment.flight_number}-${index}`}>
+              <strong>{segment.flight_number}</strong>
+              <span>
+                {airportLabel(segment.departure_airport_code, segment.departure_airport_code)}
+                {" "}{formatTravelLocalDateTime(segment.departure_at)}
+              </span>
+              <span>
+                → {airportLabel(segment.arrival_airport_code, segment.arrival_airport_code)}
+                {" "}{formatTravelLocalDateTime(segment.arrival_at)}
+              </span>
+            </div>
+          ))}
+          {groundTransfers.map((transfer, index) => (
+            <div className="ground-transfer-warning" key={`${direction}-ground-${index}`}>
+              <strong>需要换机场</strong>
+              <span>
+                {airportLabel(transfer.from_airport_code, transfer.from_airport_code)} →
+                {" "}{airportLabel(transfer.to_airport_code, transfer.to_airport_code)} ·
+                {" "}{transfer.mode} · 预留 {transfer.actual_buffer_minutes} 分钟
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="flight-summary-route">
+          <span>{from}</span>
+          <strong>{formatTravelLocalDateTime(departAt)}</strong>
+          <span aria-hidden="true">→</span>
+          <span>{to}</span>
+          <strong>{formatTravelLocalDateTime(arriveAt)}</strong>
+          {flightNumbers.length > 1 && (
+            <p>
+              本次来源没有可靠返回每段中转机场和分段时间。购买前请在平台页核对中转地点、
+              是否换机场、行李直挂和衔接时间。
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FinalTripCard({
+  response,
+  plan,
+  isBestAvailable,
+}: {
+  response: LiveFlexibleFromTextResponse;
+  plan: FinalPlanProjection;
+  isBestAvailable: boolean;
+}) {
+  const flight = plan.flight;
+  const partyCount =
+    (plan.party.adults ?? 0) +
+    (plan.party.children ?? 0) +
+    (plan.party.infants ?? 0);
+  const estimatedTotal =
+    plan.estimated_total_cny_cents ??
+    response.best_available_plan?.estimated_total_cny_cents ??
+    null;
+  const totalCents = plan.total_budget_cents ?? estimatedTotal;
+  const totalIsEstimate = plan.total_budget_cents === null;
+  const originLabel = flight
+    ? airportLabel(flight.origin_airport_code ?? null, flight.origin)
+    : "出发地";
+  const destinationLabel = flight
+    ? airportLabel(flight.destination_airport_code ?? null, flight.destination)
+    : "目的地";
+
+  return (
+    <section
+      className="final-plan-card"
+      aria-label={isBestAvailable ? "当前最佳行程候选" : "最终最佳行程"}
+    >
+      <div className="final-plan-heading">
+        <div>
+          <p className="eyebrow">TRIPCHORD 行程决策卡</p>
+          <h2>{isBestAvailable ? "当前最佳行程候选" : "最终最佳行程"}</h2>
+          <p className="final-plan-subtitle">
+            交通、住宿和接驳已放在同一张卡里；点击各项入口后由你确认并购买。
+          </p>
+        </div>
+        <strong>
+          {isBestAvailable
+            ? "航班余位待确认"
+            : plan.optimality_status === "optimality_proven"
+              ? "本次覆盖范围内总价最优"
+              : "当前已验证最优"}
+        </strong>
+      </div>
+
+      <div className="final-price-hero">
+        <div>
+          <span>{totalIsEstimate ? "这次同行预计总费用" : "这次同行总费用"}</span>
+          <strong>{totalCents === null ? "总价待确认" : formatCents(totalCents)}</strong>
+          <small>
+            {plan.party.adults ?? 0} 位成人 · {plan.party.children ?? 0} 位儿童 ·
+            {" "}{plan.party.infants ?? 0} 位婴儿 · {plan.party.rooms ?? 0} 间房
+          </small>
+        </div>
+        <p>
+          {totalIsEstimate
+            ? "含当前航班比较金额、住宿人民币参考金额与接驳人民币参考金额；不是锁价。"
+            : "按本次来源确认的同币种同行价格汇总。"}
+        </p>
+      </div>
+
+      {flight && (
+        <section className="trip-component-card flight-component" aria-label="往返航班详情">
+          <div className="trip-component-heading">
+            <div>
+              <span>往返航班</span>
+              <h3>{providerLabel(flight.provider)}</h3>
+            </div>
+            <div className="component-price">
+              <strong>
+                {typeof flight.total_for_party_cents === "number"
+                  ? formatCents(flight.total_for_party_cents, flight.currency ?? "CNY")
+                  : typeof flight.display_amount_cents === "number"
+                    ? formatCents(flight.display_amount_cents, flight.currency ?? "CNY")
+                    : "价格待确认"}
+              </strong>
+              <small>
+                {priceBasisLabel(
+                  flight.price_basis ?? "comparison_only",
+                  flight.party_total_known ?? false,
+                  partyCount,
+                )}
+              </small>
+            </div>
+          </div>
+          <div className="flight-leg-grid">
+            <FlightLeg
+              direction="去程"
+              flightNumbers={flight.outbound_flight_numbers}
+              departAt={flight.outbound_depart_at}
+              arriveAt={flight.outbound_arrive_at}
+              from={originLabel}
+              to={destinationLabel}
+              segments={flight.outbound_segments ?? []}
+              groundTransfers={flight.outbound_ground_transfers ?? []}
+            />
+            <FlightLeg
+              direction="返程"
+              flightNumbers={flight.return_flight_numbers}
+              departAt={flight.return_depart_at}
+              arriveAt={flight.return_arrive_at}
+              from={destinationLabel}
+              to={originLabel}
+              segments={flight.return_segments ?? []}
+              groundTransfers={flight.return_ground_transfers ?? []}
+            />
+          </div>
+          <div className="component-meta-row">
+            <span>
+              {flight.taxes_and_fees_included === true ? "页面标注含税" : "税费待平台确认"}
+            </span>
+            <span>
+              {flight.party_availability_confirmed
+                ? "查询时同行余位已确认，未锁库存"
+                : "同行余位尚未确认，未锁库存"}
+            </span>
+            {flight.captured_at && <span>采集于 {formatDateTime(flight.captured_at)}</span>}
+            <PlanActionLink
+              url={flight.official_view_url}
+              label={`打开${providerLabel(flight.provider)}确认并购买`}
+            />
+          </div>
+        </section>
+      )}
+
+      {plan.lodgings.map((lodging) => {
+        const sourceComparison = (plan.lodging_source_comparisons ?? []).find(
+          (item) =>
+            item.provider === lodging.provider &&
+            item.property_name === lodging.property_name &&
+            item.check_in === lodging.check_in &&
+            item.check_out === lodging.check_out,
+        );
+        const nights = travelNightCount(lodging.check_in, lodging.check_out);
+        const cnyPrice =
+          lodging.reference_cny_cents ??
+          (sourceComparison?.reference_currency === "CNY"
+            ? sourceComparison.reference_total_cents
+            : null);
+        const originalPrice =
+          lodging.total_for_party_cents ??
+          lodging.display_total_cents ??
+          sourceComparison?.total_for_party_cents;
+        const originalCurrency = lodging.currency ?? sourceComparison?.currency ?? "CNY";
+        const taxesIncluded =
+          lodging.taxes_and_fees_included ?? sourceComparison?.taxes_and_fees_included;
+        const capturedAt = lodging.captured_at ?? sourceComparison?.captured_at;
+        return (
+          <section
+            className="trip-component-card"
+            aria-label={`住宿 ${lodging.property_name}`}
+            key={`${lodging.provider}:${lodging.property_name}:${lodging.check_in}`}
+          >
+            <div className="trip-component-heading">
+              <div>
+                <span>住宿 · {placeLabel(lodging.place_key ?? null, lodging.area)}</span>
+                <h3>{lodging.property_name}</h3>
+                <small>{providerLabel(lodging.provider)}</small>
+              </div>
+              <div className="component-price">
+                <strong>
+                  {typeof cnyPrice === "number"
+                    ? `${originalCurrency === "CNY" ? "" : "约 "}${formatCents(cnyPrice)}`
+                    : typeof originalPrice === "number"
+                      ? formatCents(originalPrice, originalCurrency)
+                      : "价格待确认"}
+                </strong>
+                <small>
+                  {nights === null ? "住宿价格" : `${nights} 晚 · ${lodging.rooms} 间房合计`}
+                  {taxesIncluded === true ? " · 含税费" : " · 税费待确认"}
+                </small>
+              </div>
+            </div>
+            <div className="lodging-detail-grid">
+              <div><span>入住</span><strong>{formatTravelDate(lodging.check_in)}</strong></div>
+              <div><span>退房</span><strong>{formatTravelDate(lodging.check_out)}</strong></div>
+              <div><span>房型</span><strong>{roomNameLabel(lodging.room_name)}</strong></div>
+              <div>
+                <span>餐食与取消</span>
+                <strong>
+                  {lodging.breakfast_included === true ? "含早餐" : "早餐待确认"} ·
+                  {" "}{lodging.cancellation_policy ?? "取消规则待确认"}
+                </strong>
+              </div>
+            </div>
+            {lodging.location_address && (
+              <p className="component-location">地址：{lodging.location_address}</p>
+            )}
+            {lodging.location_evidence_summary && (
+              <p className="component-location">
+                位置：{locationEvidenceLabel(lodging.location_evidence_summary)}
+              </p>
+            )}
+            <div className="component-meta-row">
+              <span>查询时可用，未锁房</span>
+              {originalCurrency !== "CNY" && typeof originalPrice === "number" && (
+                <span>
+                  官网原价 {formatCents(originalPrice, originalCurrency)}，人民币为参考折算
+                </span>
+              )}
+              {capturedAt && <span>采集于 {formatDateTime(capturedAt)}</span>}
+              <PlanActionLink
+                url={lodging.official_view_url}
+                label={`打开${providerLabel(lodging.provider)}确认并购买`}
+              />
+            </div>
+          </section>
+        );
+      })}
+
+      {plan.transfers.length > 0 && (
+        <section className="trip-component-card" aria-label="机场与岛屿接驳详情">
+          <div className="trip-component-heading">
+            <div><span>接驳</span><h3>机场 ↔ 岛屿</h3></div>
+            <div className="component-price">
+              <strong>
+                {typeof plan.estimated_icom_transfer_cny_cents === "number"
+                  ? `往返约 ${formatCents(plan.estimated_icom_transfer_cny_cents)}`
+                  : providerLabel(plan.transfers[0].provider)}
+              </strong>
+              <small>{partyCount} 人全部接驳</small>
+            </div>
+          </div>
+          <div className="transfer-list">
+            {plan.transfers.map((transfer, index) => {
+              const originalPrice = transfer.total_for_party_cents;
+              return (
+                <article key={`${transfer.provider}:${transfer.service_date}:${index}`}>
+                  <div>
+                    <span>{index === 0 ? "去岛" : "返程"}</span>
+                    <strong>
+                      {placeLabel(transfer.origin_place_key ?? null, transfer.origin_area)} →
+                      {" "}{placeLabel(transfer.destination_place_key ?? null, transfer.destination_area)}
+                    </strong>
+                    <small>
+                      {transfer.depart_at
+                        ? formatTravelLocalDateTime(transfer.depart_at)
+                        : formatTravelDate(transfer.service_date)}
+                      {transfer.arrive_at
+                        ? ` → ${formatTravelLocalDateTime(transfer.arrive_at)}`
+                        : " · 到达时间待确认"}
+                    </small>
+                  </div>
+                  <div className="component-price">
+                    <strong>
+                      {typeof transfer.reference_cny_cents === "number"
+                        ? `约 ${formatCents(transfer.reference_cny_cents)}`
+                        : typeof originalPrice === "number" && transfer.currency
+                          ? formatCents(originalPrice, transfer.currency)
+                          : "价格待确认"}
+                    </strong>
+                    <small>
+                      {partyCount} 人单程基础价
+                      {transfer.taxes_and_fees_included === true ? " · 含税" : " · 税费待确认"}
+                    </small>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+          <div className="component-meta-row">
+            <span>查询时班次可用，未锁座</span>
+            <span>人民币金额按本次参考汇率换算</span>
+            {plan.transfers[0].captured_at && (
+              <span>采集于 {formatDateTime(plan.transfers[0].captured_at)}</span>
+            )}
+            <PlanActionLink
+              url={plan.transfers[0].official_view_url}
+              label="打开 iCom 官网确认并购买"
+            />
+          </div>
+        </section>
+      )}
+
+      <div className="journey-date-grid">
+        <article><span>出发</span><strong>{formatTravelDate(plan.departure_date)}</strong></article>
+        {flight && (
+          <>
+            <article>
+              <span>抵达目的地</span>
+              <strong>{formatTravelLocalDateTime(flight.outbound_arrive_at)}</strong>
+            </article>
+            <article>
+              <span>返程起飞</span>
+              <strong>{formatTravelLocalDateTime(flight.return_depart_at)}</strong>
+            </article>
+            <article>
+              <span>回到 {flight.origin}</span>
+              <strong>{formatTravelLocalDateTime(flight.return_arrive_at)}</strong>
+            </article>
+          </>
+        )}
+      </div>
+
+      {plan.unresolved_items.length > 0 && (
+        <div className="final-plan-unresolved">
+          <strong>购买前必须确认</strong>
+          <ul>
+            {Array.from(new Set(plan.unresolved_items.map(unresolvedItemLabel))).map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <p className="final-purchase-boundary">
+        价格和余位会变化。打开入口后请再次核对日期、同行人数、航班、房型、税费和取消规则；
+        TripChord 只查询、比较和建议，不会替你下单或付款。
+      </p>
+      <details className="result-boundary-details">
+        <summary>查看这份结果的覆盖范围</summary>
+        {isBestAvailable && response.best_available_plan && (
+          <p>{response.best_available_plan.advisory_note}</p>
+        )}
+        <p>{plan.claim_boundary}</p>
+      </details>
+    </section>
+  );
+}
+
 function FlexiblePlanningSummary({
   response,
 }: {
@@ -658,6 +1179,7 @@ function FlexiblePlanningSummary({
   const isBestAvailable = !response.final_plan && Boolean(response.best_available_plan);
   const finalPlan = response.final_plan ?? response.best_available_plan;
   const breakfastApplication = getBreakfastPreferenceApplication(response);
+  const modelParticipation = modelParticipationLabel(response);
   const pairById = new Map(
     run?.pair_runs.map((pair) => [pair.date_pair.id, pair]) ?? [],
   );
@@ -670,16 +1192,14 @@ function FlexiblePlanningSummary({
       >
         <div className="interpretation-head">
           <div>
-            <p className="eyebrow">DETERMINISTIC-FIRST CONTEXT ENGINE</p>
+            <p className="eyebrow">需求解析与约束确认</p>
             <h2>
               {interpretation.state === "ready"
                 ? "需求已转成可执行约束"
                 : "需要补充关键信息"}
             </h2>
           </div>
-          <strong>
-            {response.model_enhancement_enabled ? "模型增强已启用" : "模型增强未启用"}
-          </strong>
+          <strong>{modelParticipation}</strong>
         </div>
         {window && (
           <div className="window-summary">
@@ -771,138 +1291,11 @@ function FlexiblePlanningSummary({
       </section>
 
       {finalPlan ? (
-        <section
-          className="final-plan-card"
-          aria-label={isBestAvailable ? "当前最优方案" : "最终最佳方案"}
-        >
-          <div className="final-plan-heading">
-            <div>
-              <p className="eyebrow">{isBestAvailable ? "当前最优方案" : "最终方案"}</p>
-              <h2>
-                {isBestAvailable
-                  ? "当前能组成完整行程的最优选择"
-                  : "这趟行程的最佳可执行方案"}
-              </h2>
-            </div>
-            <strong>
-              {isBestAvailable
-                ? "下单前确认航班余位"
-                : finalPlan.optimality_status === "optimality_proven"
-                ? "覆盖范围内总价最优"
-                : "当前已验证最优"}
-            </strong>
-          </div>
-          {finalPlan.flight && (
-            <div className="final-plan-itinerary">
-              <h3>往返航班</h3>
-              <article>
-                <strong>去程 {finalPlan.flight.outbound_flight_numbers.join(" + ")}</strong>
-                <span>
-                  {finalPlan.flight.origin} {formatDateTime(finalPlan.flight.outbound_depart_at)}
-                  {" → "}
-                  {finalPlan.flight.destination} {formatDateTime(finalPlan.flight.outbound_arrive_at)}
-                </span>
-              </article>
-              <article>
-                <strong>返程 {finalPlan.flight.return_flight_numbers.join(" + ")}</strong>
-                <span>
-                  {finalPlan.flight.destination} {formatDateTime(finalPlan.flight.return_depart_at)}
-                  {" → "}
-                  {finalPlan.flight.origin} {formatDateTime(finalPlan.flight.return_arrive_at)}
-                </span>
-              </article>
-            </div>
-          )}
-          {finalPlan.lodgings.length > 0 && (
-            <div className="final-plan-itinerary">
-              <h3>住宿</h3>
-              {finalPlan.lodgings.map((lodging) => (
-                <article key={`${lodging.provider}:${lodging.property_name}:${lodging.check_in}`}>
-                  <strong>{lodging.property_name}</strong>
-                  <span>{lodging.check_in} 至 {lodging.check_out} · {lodging.rooms} 间</span>
-                  <small>
-                    {lodging.room_name ?? "房型待确认"} ·
-                    {lodging.breakfast_included === true ? " 含早餐" : " 早餐待确认"}
-                  </small>
-                  {lodging.location_evidence_summary && (
-                    <small>位置依据：{lodging.location_evidence_summary}</small>
-                  )}
-                </article>
-              ))}
-            </div>
-          )}
-          {finalPlan.transfers.length > 0 && (
-            <div className="final-plan-itinerary">
-              <h3>接驳</h3>
-              {finalPlan.transfers.map((transfer, index) => (
-                <article key={`${transfer.provider}:${transfer.service_date}:${index}`}>
-                  <strong>{transfer.origin_area} → {transfer.destination_area}</strong>
-                  <span>
-                    {transfer.service_date}
-                    {transfer.depart_at ? ` · ${formatDateTime(transfer.depart_at)}` : " · 时刻待确认"}
-                    {transfer.arrive_at ? ` → ${formatDateTime(transfer.arrive_at)}` : ""}
-                  </span>
-                </article>
-              ))}
-            </div>
-          )}
-          <div className="final-plan-route">
-            <div><span>出发</span><strong>{finalPlan.departure_date}</strong></div>
-            <div className="route-arrow" aria-hidden="true">→</div>
-            <div>
-              <span>返程起飞</span>
-              <strong>{finalPlan.return_date}</strong>
-              {finalPlan.flight && (
-                <small>抵达杭州 {formatDateTime(finalPlan.flight.return_arrive_at)}</small>
-              )}
-            </div>
-          </div>
-          <div className="final-plan-facts">
-            <article>
-              <span>{isBestAvailable ? "预计人民币总价" : "人民币总价"}</span>
-              <strong>
-                {isBestAvailable && response.best_available_plan?.estimated_total_cny_cents !== null
-                  ? formatCents(
-                      response.best_available_plan?.estimated_total_cny_cents ?? 0,
-                      "CNY",
-                    )
-                  : finalPlan.price_comparability === "complete_cny" &&
-                    finalPlan.total_budget_cents !== null
-                  ? formatCents(finalPlan.total_budget_cents, "CNY")
-                  : "总价待确认"}
-              </strong>
-              {isBestAvailable ? (
-                <small>航班比较价、住宿参考折算与接驳公开基础价合计</small>
-              ) : finalPlan.price_comparability !== "complete_cny" ? (
-                <small>报价条件尚不能完整比较</small>
-              ) : null}
-            </article>
-            <article>
-              <span>出行人数</span>
-              <strong>{finalPlan.party.adults ?? 0} 位成人</strong>
-              <small>
-                {finalPlan.party.children ?? 0} 位儿童 · {finalPlan.party.infants ?? 0} 位婴儿
-              </small>
-            </article>
-            <article>
-              <span>房间</span>
-              <strong>{finalPlan.party.rooms ?? 0} 间</strong>
-              <small>按本次需求确认</small>
-            </article>
-          </div>
-          {finalPlan.unresolved_items.length > 0 && (
-            <div className="final-plan-unresolved">
-              <strong>仍待确认</strong>
-              <ul>
-                {finalPlan.unresolved_items.map((item) => <li key={item}>{item}</li>)}
-              </ul>
-            </div>
-          )}
-          {isBestAvailable && response.best_available_plan && (
-            <p className="claim-boundary">{response.best_available_plan.advisory_note}</p>
-          )}
-          <p className="claim-boundary">{finalPlan.claim_boundary}</p>
-        </section>
+        <FinalTripCard
+          response={response}
+          plan={finalPlan}
+          isBestAvailable={isBestAvailable}
+        />
       ) : (
         <section className="issue-box final-plan-missing" aria-label="最终方案不可用">
           <strong>暂未形成唯一最终方案</strong>

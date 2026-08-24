@@ -19,6 +19,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -3566,6 +3567,47 @@ async def start_live_flexible_from_text_job_endpoint(
     )
 
 
+def _with_current_final_plan_projection(
+    job: LivePlanningJobSnapshot,
+) -> LivePlanningJobSnapshot:
+    """Upgrade only an already-selected legacy plan for the response view.
+
+    The saved run remains the source of truth and the persisted snapshot is not
+    mutated.  Reprojection is accepted only when it selects the exact same
+    option, so a display-schema upgrade cannot silently change the itinerary.
+    """
+
+    payload = job.result
+    if payload is None:
+        return job
+    final_payload = payload.get("final_plan")
+    best_payload = payload.get("best_available_plan")
+    legacy_plan = final_payload if isinstance(final_payload, dict) else best_payload
+    if not isinstance(legacy_plan, dict):
+        return job
+    if legacy_plan.get("projection_schema_version") == "final-plan-projection-v2":
+        return job
+    try:
+        response = LiveFlexibleFromTextPlanningResponse.model_validate(payload)
+    except ValidationError:
+        return job
+    if response.run is None:
+        return job
+
+    target_field = "final_plan" if isinstance(final_payload, dict) else "best_available_plan"
+    rebuilt = (
+        build_final_plan_projection(response.run)
+        if target_field == "final_plan"
+        else build_best_available_plan_projection(response.run)
+    )
+    if rebuilt is None or rebuilt.option_id != legacy_plan.get("option_id"):
+        return job
+
+    upgraded_payload = dict(payload)
+    upgraded_payload[target_field] = rebuilt.model_dump(mode="json")
+    return job.model_copy(update={"result": upgraded_payload})
+
+
 @app.get(
     "/api/v1/agents/live-flexible-plan-from-text/jobs/{job_id}",
     response_model=LivePlanningJobSnapshot,
@@ -3579,7 +3621,7 @@ async def get_live_flexible_from_text_job_endpoint(
     job = await registry.get(job_id, principal.tenant_id)
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="live job not found")
-    return job
+    return _with_current_final_plan_projection(job)
 
 
 @app.get("/api/v1/agents/live-flexible-plan-from-text/jobs/{job_id}/events")
@@ -3626,7 +3668,10 @@ async def stream_live_flexible_from_text_job_endpoint(
                 job.state in TERMINAL_LIVE_PLANNING_JOB_STATES
                 and job.barrier_released_at is not None
             ):
-                payload = json.dumps(job.model_dump(mode="json"), ensure_ascii=False)
+                payload = json.dumps(
+                    _with_current_final_plan_projection(job).model_dump(mode="json"),
+                    ensure_ascii=False,
+                )
                 yield f"event: result\ndata: {payload}\n\n"
                 return
             payload = json.dumps(

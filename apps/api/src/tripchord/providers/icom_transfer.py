@@ -39,6 +39,7 @@ from tripchord.providers.base import ProviderError
 _API_HOST = "sfs-api.icomtours.com"
 _API_ORIGIN = f"https://{_API_HOST}"
 _OPERATOR = "iCom Tours"
+ICOM_OFFICIAL_BOOKING_URL = "https://www.icomtours.com/"
 _MVT = timezone(timedelta(hours=5), name="MVT")
 _FORBIDDEN_PATH_WORDS = frozenset({"booking", "payment", "order"})
 _ECB_DAILY_REFERENCE_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"

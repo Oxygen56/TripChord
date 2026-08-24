@@ -798,9 +798,183 @@ h1 { font-family: "Noto Sans SC", sans-serif; margin: 0; font-size: clamp(40px, 
 /* aria-live 结果容器基线 */
 .handoff-status { display: grid; gap: 6px; }
 
+/* 自包含中文行程决策卡 */
+.final-plan-subtitle {
+  max-width: 620px;
+  margin: 7px 0 0;
+  color: #667b70;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.final-price-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, .75fr);
+  gap: 18px;
+  align-items: center;
+  margin: 20px 0 14px;
+  padding: 20px;
+  border-radius: 17px;
+  background: linear-gradient(135deg, #173f34, #2b5c4b);
+  color: white;
+}
+.final-price-hero > div { display: grid; gap: 5px; }
+.final-price-hero span { color: #c6ddd2; font-size: 13px; }
+.final-price-hero strong { color: #f5d58d; font-size: 32px; line-height: 1.15; }
+.final-price-hero small { color: #c5d7cf; font-size: 12px; }
+.final-price-hero p {
+  margin: 0;
+  padding-left: 18px;
+  border-left: 1px solid rgba(255,255,255,.2);
+  color: #d8e5df;
+  font-size: 12px;
+  line-height: 1.65;
+}
+.trip-component-card {
+  display: grid;
+  gap: 14px;
+  margin-top: 12px;
+  padding: 18px;
+  border: 1px solid #d7e3d9;
+  border-radius: 17px;
+  background: rgba(255,255,255,.88);
+}
+.trip-component-card.flight-component { border-color: #c9d9ec; }
+.trip-component-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 18px;
+}
+.trip-component-heading > div:first-child { display: grid; gap: 4px; }
+.trip-component-heading span { color: #71847a; font-size: 12px; font-weight: 700; }
+.trip-component-heading h3 { margin: 0; color: #21483a; font-size: 19px; }
+.trip-component-heading small { color: #78877f; font-size: 12px; }
+.component-price { display: grid; gap: 4px; text-align: right; }
+.component-price strong { color: #9a641f; font-size: 20px; white-space: nowrap; }
+.component-price small { max-width: 260px; color: #806e55; font-size: 12px; line-height: 1.45; }
+.flight-leg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.flight-leg-card {
+  min-width: 0;
+  padding: 14px;
+  border-radius: 13px;
+  background: #f5f8fb;
+}
+.flight-leg-title { display: flex; justify-content: space-between; gap: 12px; }
+.flight-leg-title > div { display: grid; gap: 4px; }
+.flight-leg-title span { color: #61768c; font-size: 12px; font-weight: 700; }
+.flight-leg-title strong { color: #284969; font-size: 14px; }
+.flight-leg-title small { color: #708296; font-size: 12px; text-align: right; line-height: 1.45; }
+.flight-summary-route {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 4px;
+  margin-top: 12px;
+  color: #66798b;
+  font-size: 12px;
+}
+.flight-summary-route strong { color: #294a67; font-size: 12px; }
+.flight-summary-route > span[aria-hidden] { color: #a98a54; }
+.flight-summary-route p,
+.ground-transfer-warning {
+  margin: 8px 0 0;
+  padding: 9px 10px;
+  border: 1px solid #e7c9aa;
+  border-radius: 9px;
+  background: #fff7ea;
+  color: #825c28;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.flight-segments { display: grid; gap: 7px; margin-top: 12px; }
+.flight-segment { display: grid; gap: 3px; padding: 9px; border-radius: 9px; background: white; }
+.flight-segment strong { color: #284969; font-size: 12px; }
+.flight-segment span { color: #6c7e8e; font-size: 12px; line-height: 1.45; }
+.ground-transfer-warning { display: grid; gap: 3px; }
+.component-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  padding-top: 12px;
+  border-top: 1px dashed #d8e1da;
+}
+.component-meta-row > span,
+.component-link-missing {
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: #f2f5f1;
+  color: #6b7c73;
+  font-size: 12px;
+}
+.component-action-link {
+  margin-left: auto;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: #245a47;
+  color: white;
+  font-size: 12px;
+  font-weight: 800;
+  text-decoration: none;
+}
+.component-action-link:hover { background: #173f34; }
+.lodging-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.lodging-detail-grid > div { display: grid; gap: 4px; padding: 10px; border-radius: 10px; background: #f6f8f5; }
+.lodging-detail-grid span { color: #7a8981; font-size: 12px; }
+.lodging-detail-grid strong { color: #315446; font-size: 12px; line-height: 1.5; }
+.component-location { margin: -4px 0 0; color: #667970; font-size: 12px; line-height: 1.55; }
+.transfer-list { display: grid; gap: 8px; }
+.transfer-list article {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 12px;
+  border-radius: 12px;
+  background: #f5f8f5;
+}
+.transfer-list article > div:first-child { display: grid; gap: 4px; }
+.transfer-list article span { color: #75867e; font-size: 12px; }
+.transfer-list article strong { color: #315446; font-size: 13px; }
+.transfer-list article small { color: #708079; font-size: 12px; line-height: 1.45; }
+.journey-date-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+}
+.journey-date-grid article { display: grid; gap: 5px; padding: 12px; border-radius: 12px; background: #edf5ef; }
+.journey-date-grid span { color: #74867b; font-size: 12px; }
+.journey-date-grid strong { color: #2b5444; font-size: 12px; line-height: 1.45; }
+.final-purchase-boundary {
+  margin: 12px 0 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #f5f2e9;
+  color: #735f3e;
+  font-size: 12px;
+  line-height: 1.65;
+}
+.result-boundary-details { margin-top: 10px; color: #6d7c74; font-size: 12px; }
+.result-boundary-details summary { cursor: pointer; color: #3e6958; font-weight: 800; }
+.result-boundary-details p { line-height: 1.65; overflow-wrap: anywhere; }
+
 @media (max-width: 1000px) {
   .workflow-steps { grid-template-columns: repeat(2, 1fr); }
+  .journey-date-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 640px) {
   .workflow-steps { grid-template-columns: 1fr; padding: 0 16px; }
+  .final-price-hero,
+  .flight-leg-grid,
+  .lodging-detail-grid,
+  .journey-date-grid { grid-template-columns: 1fr; }
+  .final-price-hero p { padding: 12px 0 0; border-top: 1px solid rgba(255,255,255,.2); border-left: 0; }
+  .trip-component-heading,
+  .transfer-list article { align-items: stretch; flex-direction: column; }
+  .component-price { text-align: left; }
+  .component-action-link { width: 100%; margin-left: 0; text-align: center; }
 }

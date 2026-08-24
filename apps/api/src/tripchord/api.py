@@ -1,7 +1,8 @@
 import json
 from collections.abc import Callable
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlencode, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_serializer, model_validator
 
@@ -66,8 +67,14 @@ from tripchord.providers.browser_bridge import (
     BrowserProvider,
     BrowserSearchQuery,
     _is_allowed_provider_url,
+    ctrip_trusted_flight_search_url,
+    qunar_trusted_flight_search_url,
+    tongcheng_trusted_flight_search_url,
 )
-from tripchord.providers.icom_transfer import IComCnyReferenceEstimate
+from tripchord.providers.icom_transfer import (
+    ICOM_OFFICIAL_BOOKING_URL,
+    IComCnyReferenceEstimate,
+)
 from tripchord.providers.user_snapshot import UserQuoteInput, import_user_quote
 
 
@@ -355,23 +362,53 @@ class LiveFlexiblePairRunHandle(ApiModel):
     expires_at: datetime
 
 
+class FinalFlightSegmentProjection(ApiModel):
+    flight_number: str
+    departure_airport_code: str
+    arrival_airport_code: str
+    departure_at: datetime
+    arrival_at: datetime
+
+
+class FinalFlightGroundTransferProjection(ApiModel):
+    from_airport_code: str
+    to_airport_code: str
+    mode: str
+    minimum_buffer_minutes: int
+    actual_buffer_minutes: int
+    baggage_recheck_required: bool
+    through_ticket_protected: bool
+
+
 class FinalFlightProjection(ApiModel):
     provider: str
     origin: str
     destination: str
+    origin_airport_code: str | None = None
+    destination_airport_code: str | None = None
     outbound_flight_numbers: tuple[str, ...] = ()
     outbound_depart_at: datetime
     outbound_arrive_at: datetime
     return_flight_numbers: tuple[str, ...] = ()
     return_depart_at: datetime
     return_arrive_at: datetime
+    outbound_segments: tuple[FinalFlightSegmentProjection, ...] = ()
+    return_segments: tuple[FinalFlightSegmentProjection, ...] = ()
+    outbound_ground_transfers: tuple[FinalFlightGroundTransferProjection, ...] = ()
+    return_ground_transfers: tuple[FinalFlightGroundTransferProjection, ...] = ()
+    carrier_summary: str | None = None
+    cabin_class: str | None = None
+    currency: str = "CNY"
     total_for_party_cents: int | None = None
     display_amount_cents: int | None = None
+    taxes_and_fees_included: bool | None = None
     party_total_known: bool = True
     price_basis: str = "total_party"
     availability: str = "available"
     party_availability_confirmed: bool = True
     has_publishable_execution_contract: bool = True
+    captured_at: datetime | None = None
+    expires_at: datetime | None = None
     official_view_url: str | None = None
 
 
@@ -379,6 +416,7 @@ class FinalLodgingProjection(ApiModel):
     provider: str
     property_name: str
     area: str
+    place_key: str | None = None
     check_in: date
     check_out: date
     rooms: int
@@ -389,7 +427,14 @@ class FinalLodgingProjection(ApiModel):
     location_address: str | None = None
     nearby_location_evidence: tuple[str, ...] = ()
     location_evidence_summary: str | None = None
+    currency: str = "CNY"
+    total_for_party_cents: int | None = None
     display_total_cents: int | None = None
+    reference_cny_cents: int | None = None
+    taxes_and_fees_included: bool | None = None
+    availability: str = "available"
+    captured_at: datetime | None = None
+    expires_at: datetime | None = None
     official_view_url: str | None = None
 
 
@@ -397,14 +442,21 @@ class FinalTransferProjection(ApiModel):
     provider: str
     origin_area: str
     destination_area: str
+    origin_place_key: str | None = None
+    destination_place_key: str | None = None
     service_date: date
     schedule_mode: str
     depart_at: datetime | None = None
     arrive_at: datetime | None = None
     currency: str | None = None
     total_for_party_cents: int | None = None
+    reference_cny_cents: int | None = None
     taxes_and_fees_included: bool | None = None
     price_guarantee: str | None = None
+    availability: str = "available"
+    captured_at: datetime | None = None
+    expires_at: datetime | None = None
+    official_view_url: str | None = None
 
 
 class LodgingSourceComparisonProjection(ApiModel):
@@ -432,6 +484,9 @@ class FinalPlanProjection(ApiModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    projection_schema_version: Literal["final-plan-projection-v2"] = (
+        "final-plan-projection-v2"
+    )
     option_id: str
     date_pair_id: str
     departure_date: date
@@ -603,6 +658,9 @@ def build_live_final_plan_projection(run: LivePackageAgentRun) -> FinalPlanProje
         and estimated_icom_transfer_cny_cents is not None
         else None
     )
+    transfer_reference_cny = _transfer_reference_cny_allocations(
+        candidate.transfers, reference_estimate
+    )
     covered = tuple(source_id for item in run.coverage for source_id in item.successful_source_ids)
     failed = tuple(source_id for item in run.coverage for source_id in item.failed_source_ids)
     unresolved: list[str] = []
@@ -634,62 +692,15 @@ def build_live_final_plan_projection(run: LivePackageAgentRun) -> FinalPlanProje
         lodging_component_ids=tuple(item.id for item in candidate.lodgings),
         transfer_component_ids=tuple(item.id for item in candidate.transfers),
         flight=(
-            FinalFlightProjection(
-                provider=candidate.flight.provider,
-                origin=candidate.flight.origin,
-                destination=candidate.flight.destination,
-                outbound_flight_numbers=candidate.flight.outbound_flight_numbers,
-                outbound_depart_at=candidate.flight.outbound_depart_at,
-                outbound_arrive_at=candidate.flight.outbound_arrive_at,
-                return_flight_numbers=candidate.flight.return_flight_numbers,
-                return_depart_at=candidate.flight.return_depart_at,
-                return_arrive_at=candidate.flight.return_arrive_at,
-                total_for_party_cents=(
-                    candidate.flight.total_for_party_cents
-                    if candidate.flight.party_total_known
-                    else None
-                ),
-                display_amount_cents=candidate.flight.display_amount_cents,
-                party_total_known=candidate.flight.party_total_known,
-                price_basis=candidate.flight.price_basis,
-                official_view_url=_trusted_quote_view_url(candidate.flight),
-            )
+            _final_flight_projection(candidate.flight, getattr(run, "search_query", None))
             if candidate.flight
             else None
         ),
-        lodgings=tuple(
-            FinalLodgingProjection(
-                provider=item.provider,
-                property_name=item.property_name,
-                area=item.area.value,
-                check_in=item.check_in,
-                check_out=item.check_out,
-                rooms=item.rooms,
-                room_name=item.room_name,
-                breakfast_included=item.breakfast_included,
-                cancellation_policy=item.cancellation_policy,
-                location_convenience=item.location_convenience.value,
-                location_address=item.location_address,
-                nearby_location_evidence=item.nearby_location_evidence,
-                location_evidence_summary=_lodging_location_evidence_summary(item),
-                display_total_cents=item.total_for_party_cents,
-                official_view_url=_trusted_quote_view_url(item),
-            )
-            for item in candidate.lodgings
-        ),
+        lodgings=tuple(_final_lodging_projection(item) for item in candidate.lodgings),
         transfers=tuple(
-            FinalTransferProjection(
-                provider=item.provider,
-                origin_area=item.origin_area.value,
-                destination_area=item.destination_area.value,
-                service_date=item.service_date,
-                schedule_mode=item.schedule_mode.value,
-                depart_at=item.depart_at,
-                arrive_at=item.arrive_at,
-                currency=item.currency,
-                total_for_party_cents=item.total_for_party_cents,
-                taxes_and_fees_included=item.taxes_and_fees_included,
-                price_guarantee=item.price_guarantee.value,
+            _final_transfer_projection(
+                item,
+                reference_cny_cents=transfer_reference_cny.get(item.id),
             )
             for item in candidate.transfers
         ),
@@ -731,6 +742,13 @@ def build_final_plan_projection(
     )
     package_run = execution.run.package if execution and execution.run else None
     candidate = package_run.final_candidate if package_run else None
+    reference_estimate = (
+        execution.run.icom_cny_reference_estimate if execution and execution.run else None
+    )
+    transfer_reference_cny = _transfer_reference_cny_allocations(
+        candidate.transfers if candidate is not None else (),
+        reference_estimate,
+    )
     covered_source_ids = tuple(
         source_id
         for coverage in (execution.run.coverage if execution and execution.run else ())
@@ -774,58 +792,23 @@ def build_final_plan_projection(
         lodging_component_ids=tuple(item.id for item in candidate.lodgings) if candidate else (),
         transfer_component_ids=tuple(item.id for item in candidate.transfers) if candidate else (),
         flight=(
-            FinalFlightProjection(
-                provider=candidate.flight.provider,
-                origin=candidate.flight.origin,
-                destination=candidate.flight.destination,
-                outbound_flight_numbers=candidate.flight.outbound_flight_numbers,
-                outbound_depart_at=candidate.flight.outbound_depart_at,
-                outbound_arrive_at=candidate.flight.outbound_arrive_at,
-                return_flight_numbers=candidate.flight.return_flight_numbers,
-                return_depart_at=candidate.flight.return_depart_at,
-                return_arrive_at=candidate.flight.return_arrive_at,
-                display_amount_cents=candidate.flight.display_amount_cents,
-                party_total_known=candidate.flight.party_total_known,
-                price_basis=candidate.flight.price_basis,
-                official_view_url=_trusted_quote_view_url(candidate.flight),
+            _final_flight_projection(
+                candidate.flight,
+                getattr(execution.run, "search_query", None),
             )
-            if candidate
+            if candidate and execution and execution.run
             else None
         ),
         lodgings=(
-            tuple(
-                FinalLodgingProjection(
-                    provider=item.provider,
-                    property_name=item.property_name,
-                    area=item.area.value,
-                    check_in=item.check_in,
-                    check_out=item.check_out,
-                    rooms=item.rooms,
-                    room_name=item.room_name,
-                    breakfast_included=item.breakfast_included,
-                    cancellation_policy=item.cancellation_policy,
-                    location_convenience=item.location_convenience.value,
-                    location_address=item.location_address,
-                    nearby_location_evidence=item.nearby_location_evidence,
-                    location_evidence_summary=_lodging_location_evidence_summary(item),
-                    display_total_cents=item.total_for_party_cents,
-                    official_view_url=_trusted_quote_view_url(item),
-                )
-                for item in candidate.lodgings
-            )
+            tuple(_final_lodging_projection(item) for item in candidate.lodgings)
             if candidate
             else ()
         ),
         transfers=(
             tuple(
-                FinalTransferProjection(
-                    provider=item.provider,
-                    origin_area=item.origin_area.value,
-                    destination_area=item.destination_area.value,
-                    service_date=item.service_date,
-                    schedule_mode=item.schedule_mode.value,
-                    depart_at=item.depart_at,
-                    arrive_at=item.arrive_at,
+                _final_transfer_projection(
+                    item,
+                    reference_cny_cents=transfer_reference_cny.get(item.id),
                 )
                 for item in candidate.transfers
             )
@@ -849,21 +832,265 @@ def build_final_plan_projection(
     )
 
 
-def _trusted_quote_view_url(quote: Any) -> str | None:
-    """Expose only provider URLs already carried by the captured evidence."""
+_OFFICIAL_PROVIDER_VIEW_HOSTS: dict[str, frozenset[str]] = {
+    "kaani_official": frozenset({"kaanihotels.com", "www.kaanihotels.com"}),
+    "arena_official": frozenset(
+        {
+            "arenabeachmaldives.com",
+            "www.arenabeachmaldives.com",
+            "letsbook.me",
+            "live.ipms247.com",
+        }
+    ),
+}
+_OFFICIAL_PROVIDER_FALLBACK_URLS: dict[str, str] = {
+    "kaani_official": "https://kaanihotels.com/stays/Beach-Hotel/book",
+    "arena_official": "https://arenabeachmaldives.com/booking/",
+}
 
+
+def _embedded_https_url(reference: str) -> str | None:
+    marker = reference.find("https://")
+    if marker < 0:
+        return None
+    candidate = reference[marker:]
+    parsed = urlsplit(candidate)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    return candidate
+
+
+def _trusted_quote_view_url(quote: Any) -> str | None:
+    """Expose a read-only provider page, including typed official-source refs."""
+
+    provider_name = str(quote.provider)
+    browser_provider: BrowserProvider | None
     try:
-        provider = BrowserProvider(quote.provider)
+        browser_provider = BrowserProvider(provider_name)
+    except ValueError:
+        browser_provider = None
+    allowed_official_hosts = _OFFICIAL_PROVIDER_VIEW_HOSTS.get(provider_name, frozenset())
+    for reference in quote.evidence_refs:
+        if not isinstance(reference, str):
+            continue
+        candidate = _embedded_https_url(reference)
+        if candidate is None:
+            continue
+        if browser_provider is not None and _is_allowed_provider_url(browser_provider, candidate):
+            return candidate
+        if urlsplit(candidate).hostname in allowed_official_hosts:
+            return candidate
+    return _OFFICIAL_PROVIDER_FALLBACK_URLS.get(provider_name)
+
+
+def _trusted_flight_view_url(
+    quote: NormalizedFlightQuote,
+    query: BrowserSearchQuery | None,
+) -> str | None:
+    captured = _trusted_quote_view_url(quote)
+    if captured is not None:
+        return captured
+    if query is None:
+        return None
+    builders = {
+        BrowserProvider.CTRIP.value: ctrip_trusted_flight_search_url,
+        BrowserProvider.QUNAR.value: qunar_trusted_flight_search_url,
+        BrowserProvider.TONGCHENG.value: tongcheng_trusted_flight_search_url,
+    }
+    builder = builders.get(quote.provider)
+    if builder is None:
+        return None
+    try:
+        return builder(query.model_copy(update={"search_url": None}))
     except ValueError:
         return None
-    for reference in quote.evidence_refs:
-        if (
-            isinstance(reference, str)
-            and reference.startswith("https://")
-            and _is_allowed_provider_url(provider, reference)
-        ):
-            return reference
+
+
+def _trusted_lodging_view_url(quote: NormalizedLodgingQuote) -> str | None:
+    base = _trusted_quote_view_url(quote)
+    if base is None or quote.provider != "kaani_official":
+        return base
+    query = urlencode(
+        {
+            "from": quote.check_in.isoformat(),
+            "to": quote.check_out.isoformat(),
+            "adults": quote.adults,
+            "rooms": quote.rooms,
+            "children": quote.children,
+        }
+    )
+    return f"{base.split('?', 1)[0]}?{query}"
+
+
+def _lodging_reference_cny_cents(quote: NormalizedLodgingQuote) -> int | None:
+    if quote.currency == "CNY":
+        return quote.total_for_party_cents
+    if quote.reference_currency == "CNY":
+        return quote.reference_total_cents
     return None
+
+
+def _transfer_reference_cny_allocations(
+    transfers: tuple[Any, ...],
+    estimate: IComCnyReferenceEstimate | None,
+) -> dict[str, int]:
+    allocations = {
+        item.id: item.total_for_party_cents for item in transfers if item.currency == "CNY"
+    }
+    if estimate is None:
+        return allocations
+    eligible = tuple(
+        item
+        for item in transfers
+        if item.id in estimate.transfer_ids
+        and item.currency == "USD"
+        and item.total_for_party_cents > 0
+    )
+    source_total = estimate.source_usd_base_fare_cents
+    if source_total <= 0:
+        return allocations
+    assigned = 0
+    covers_full_estimate = sum(item.total_for_party_cents for item in eligible) == source_total
+    for index, item in enumerate(eligible):
+        if covers_full_estimate and index == len(eligible) - 1:
+            value = estimate.estimated_cny_cents - assigned
+        else:
+            value = estimate.estimated_cny_cents * item.total_for_party_cents // source_total
+            assigned += value
+        allocations[item.id] = value
+    return allocations
+
+
+def _final_flight_projection(
+    quote: NormalizedFlightQuote,
+    query: BrowserSearchQuery | None,
+) -> FinalFlightProjection:
+    return FinalFlightProjection(
+        provider=quote.provider,
+        origin=quote.origin,
+        destination=quote.destination,
+        origin_airport_code=quote.origin_airport_code,
+        destination_airport_code=quote.destination_airport_code,
+        outbound_flight_numbers=quote.outbound_flight_numbers,
+        outbound_depart_at=quote.outbound_depart_at,
+        outbound_arrive_at=quote.outbound_arrive_at,
+        return_flight_numbers=quote.return_flight_numbers,
+        return_depart_at=quote.return_depart_at,
+        return_arrive_at=quote.return_arrive_at,
+        outbound_segments=tuple(
+            FinalFlightSegmentProjection(**item.model_dump()) for item in quote.outbound_segments
+        ),
+        return_segments=tuple(
+            FinalFlightSegmentProjection(**item.model_dump()) for item in quote.return_segments
+        ),
+        outbound_ground_transfers=tuple(
+            FinalFlightGroundTransferProjection(
+                from_airport_code=item.from_airport_code,
+                to_airport_code=item.to_airport_code,
+                mode=item.mode,
+                minimum_buffer_minutes=item.minimum_buffer_minutes,
+                actual_buffer_minutes=item.actual_buffer_minutes,
+                baggage_recheck_required=item.baggage_recheck_required,
+                through_ticket_protected=item.through_ticket_protected,
+            )
+            for item in quote.outbound_ground_transfers
+        ),
+        return_ground_transfers=tuple(
+            FinalFlightGroundTransferProjection(
+                from_airport_code=item.from_airport_code,
+                to_airport_code=item.to_airport_code,
+                mode=item.mode,
+                minimum_buffer_minutes=item.minimum_buffer_minutes,
+                actual_buffer_minutes=item.actual_buffer_minutes,
+                baggage_recheck_required=item.baggage_recheck_required,
+                through_ticket_protected=item.through_ticket_protected,
+            )
+            for item in quote.return_ground_transfers
+        ),
+        carrier_summary=quote.carrier_summary,
+        cabin_class=quote.cabin_class,
+        currency=quote.currency,
+        total_for_party_cents=quote.total_for_party_cents,
+        display_amount_cents=quote.display_amount_cents,
+        taxes_and_fees_included=quote.taxes_and_fees_included,
+        party_total_known=quote.party_total_known,
+        price_basis=quote.price_basis,
+        availability=quote.availability.value,
+        party_availability_confirmed=quote.party_availability_confirmed,
+        has_publishable_execution_contract=quote.has_publishable_execution_contract,
+        captured_at=quote.captured_at,
+        expires_at=quote.expires_at,
+        official_view_url=_trusted_flight_view_url(quote, query),
+    )
+
+
+def _final_lodging_projection(quote: NormalizedLodgingQuote) -> FinalLodgingProjection:
+    return FinalLodgingProjection(
+        provider=quote.provider,
+        property_name=quote.property_name,
+        area=quote.area.value,
+        place_key=quote.place_key.value if quote.place_key is not None else None,
+        check_in=quote.check_in,
+        check_out=quote.check_out,
+        rooms=quote.rooms,
+        room_name=quote.room_name,
+        breakfast_included=quote.breakfast_included,
+        cancellation_policy=quote.cancellation_policy,
+        location_convenience=quote.location_convenience.value,
+        location_address=quote.location_address,
+        nearby_location_evidence=quote.nearby_location_evidence,
+        location_evidence_summary=_lodging_location_evidence_summary(quote),
+        currency=quote.currency,
+        total_for_party_cents=quote.total_for_party_cents,
+        display_total_cents=quote.total_for_party_cents,
+        reference_cny_cents=_lodging_reference_cny_cents(quote),
+        taxes_and_fees_included=quote.taxes_and_fees_included,
+        availability=quote.availability.value,
+        captured_at=quote.captured_at,
+        expires_at=quote.expires_at,
+        official_view_url=_trusted_lodging_view_url(quote),
+    )
+
+
+def _final_transfer_projection(
+    quote: Any,
+    *,
+    reference_cny_cents: int | None,
+) -> FinalTransferProjection:
+    origin_place_key = getattr(quote, "origin_place_key", None)
+    destination_place_key = getattr(quote, "destination_place_key", None)
+    availability = getattr(quote, "availability", None)
+    return FinalTransferProjection(
+        provider=quote.provider,
+        origin_area=quote.origin_area.value,
+        destination_area=quote.destination_area.value,
+        origin_place_key=(origin_place_key.value if origin_place_key is not None else None),
+        destination_place_key=(
+            destination_place_key.value if destination_place_key is not None else None
+        ),
+        service_date=quote.service_date,
+        schedule_mode=quote.schedule_mode.value,
+        depart_at=quote.depart_at,
+        arrive_at=quote.arrive_at,
+        currency=quote.currency,
+        total_for_party_cents=quote.total_for_party_cents,
+        reference_cny_cents=reference_cny_cents,
+        taxes_and_fees_included=quote.taxes_and_fees_included,
+        price_guarantee=quote.price_guarantee.value,
+        availability=availability.value if availability is not None else "available",
+        captured_at=getattr(quote, "captured_at", None),
+        expires_at=getattr(quote, "expires_at", None),
+        official_view_url=(
+            ICOM_OFFICIAL_BOOKING_URL
+            if quote.provider == "icom-public-transfer"
+            else getattr(quote, "detail_url", None)
+        ),
+    )
 
 
 def _decision_candidate_projections(
@@ -1002,29 +1229,29 @@ def build_best_available_plan_projection(
                 )
         if candidate_set is None:
             for result in live_run.normalization_results:
-                quote = result.quote
+                normalized_quote = result.quote
                 if (
-                    not isinstance(quote, NormalizedLodgingQuote)
-                    or quote.provider != "arena_official"
+                    not isinstance(normalized_quote, NormalizedLodgingQuote)
+                    or normalized_quote.provider != "arena_official"
                 ):
                     continue
                 source_comparisons.append(
                     LodgingSourceComparisonProjection(
-                        provider=quote.provider,
+                        provider=normalized_quote.provider,
                         source_type="hotel_official",
-                        property_name=quote.property_name,
-                        room_name=quote.room_name,
-                        currency=quote.currency,
-                        total_for_party_cents=quote.total_for_party_cents,
-                        reference_total_cents=quote.reference_total_cents,
-                        reference_currency=quote.reference_currency,
-                        reference_rate_source=quote.reference_rate_source,
-                        reference_rate_date=quote.reference_rate_date,
-                        taxes_and_fees_included=quote.taxes_and_fees_included,
-                        captured_at=quote.captured_at,
-                        evidence_refs=quote.evidence_refs,
-                        check_in=quote.check_in,
-                        check_out=quote.check_out,
+                        property_name=normalized_quote.property_name,
+                        room_name=normalized_quote.room_name,
+                        currency=normalized_quote.currency,
+                        total_for_party_cents=normalized_quote.total_for_party_cents,
+                        reference_total_cents=normalized_quote.reference_total_cents,
+                        reference_currency=normalized_quote.reference_currency,
+                        reference_rate_source=normalized_quote.reference_rate_source,
+                        reference_rate_date=normalized_quote.reference_rate_date,
+                        taxes_and_fees_included=normalized_quote.taxes_and_fees_included,
+                        captured_at=normalized_quote.captured_at,
+                        evidence_refs=normalized_quote.evidence_refs,
+                        check_in=normalized_quote.check_in,
+                        check_out=normalized_quote.check_out,
                         eligible=False,
                         reason="位置依据不足，Arena 官方报价不能计作第二个合格完整方案",
                     )
@@ -1048,6 +1275,7 @@ def build_best_available_plan_projection(
         ]
         if lodging_failures:
             unresolved_items.append("部分住宿来源未形成合格报价：" + "、".join(lodging_failures))
+        transfer_reference_cny = _transfer_reference_cny_allocations(candidate.transfers, estimate)
         return BestAvailablePlanProjection(
             option_id=f"best-available:decision-only:{execution.date_pair.id}",
             date_pair_id=execution.date_pair.id,
@@ -1061,62 +1289,21 @@ def build_best_available_plan_projection(
             estimated_total_cny_cents=_decision_estimated_total_cents(live_run, decision_only),
             icom_cny_reference_estimate=estimate,
             optimality_status="best_available_not_final",
-            claim_boundary=f"{decision_only.decision_boundary}{run.claim_boundary}",
+            claim_boundary=(
+                f"{decision_only.decision_boundary}{getattr(run, 'claim_boundary', '')}"
+            ),
             flight_component_id=flight.id,
             lodging_component_ids=tuple(item.id for item in candidate.lodgings),
             transfer_component_ids=tuple(item.id for item in candidate.transfers),
-            flight=FinalFlightProjection(
-                provider=flight.provider,
-                origin=flight.origin,
-                destination=flight.destination,
-                outbound_flight_numbers=flight.outbound_flight_numbers,
-                outbound_depart_at=flight.outbound_depart_at,
-                outbound_arrive_at=flight.outbound_arrive_at,
-                return_flight_numbers=flight.return_flight_numbers,
-                return_depart_at=flight.return_depart_at,
-                return_arrive_at=flight.return_arrive_at,
-                total_for_party_cents=flight.total_for_party_cents,
-                display_amount_cents=flight.display_amount_cents,
-                party_total_known=True,
-                price_basis="comparison_only",
-                availability=flight.availability.value,
-                party_availability_confirmed=False,
-                has_publishable_execution_contract=False,
-                official_view_url=_trusted_quote_view_url(flight),
+            flight=_final_flight_projection(
+                flight,
+                getattr(live_run, "search_query", None),
             ),
-            lodgings=tuple(
-                FinalLodgingProjection(
-                    provider=item.provider,
-                    property_name=item.property_name,
-                    area=item.area.value,
-                    check_in=item.check_in,
-                    check_out=item.check_out,
-                    rooms=item.rooms,
-                    room_name=item.room_name,
-                    breakfast_included=item.breakfast_included,
-                    cancellation_policy=item.cancellation_policy,
-                    location_convenience=item.location_convenience.value,
-                    location_address=item.location_address,
-                    nearby_location_evidence=item.nearby_location_evidence,
-                    location_evidence_summary=_lodging_location_evidence_summary(item),
-                    display_total_cents=item.total_for_party_cents,
-                    official_view_url=_trusted_quote_view_url(item),
-                )
-                for item in candidate.lodgings
-            ),
+            lodgings=tuple(_final_lodging_projection(item) for item in candidate.lodgings),
             transfers=tuple(
-                FinalTransferProjection(
-                    provider=item.provider,
-                    origin_area=item.origin_area.value,
-                    destination_area=item.destination_area.value,
-                    service_date=item.service_date,
-                    schedule_mode=item.schedule_mode.value,
-                    depart_at=item.depart_at,
-                    arrive_at=item.arrive_at,
-                    currency=item.currency,
-                    total_for_party_cents=item.total_for_party_cents,
-                    taxes_and_fees_included=item.taxes_and_fees_included,
-                    price_guarantee=item.price_guarantee.value,
+                _final_transfer_projection(
+                    item,
+                    reference_cny_cents=transfer_reference_cny.get(item.id),
                 )
                 for item in candidate.transfers
             ),
@@ -1154,31 +1341,34 @@ def build_best_available_plan_projection(
         flights: list[NormalizedFlightQuote] = []
         lodgings: list[NormalizedLodgingQuote] = []
         for result in live_run.normalization_results:
-            quote = result.quote
-            if not result.usable or quote is None:
+            normalized_quote = result.quote
+            if not result.usable or normalized_quote is None:
                 continue
-            if isinstance(quote, NormalizedFlightQuote):
+            if isinstance(normalized_quote, NormalizedFlightQuote):
                 amount = (
-                    quote.total_for_party_cents
-                    if quote.party_total_known
-                    else quote.display_amount_cents
+                    normalized_quote.total_for_party_cents
+                    if normalized_quote.party_total_known
+                    else normalized_quote.display_amount_cents
                 )
                 if (
-                    quote.currency == "CNY"
-                    and quote.availability.value == "available"
-                    and quote.outbound_depart_at.date() == execution.date_pair.departure_date
-                    and quote.return_depart_at.date() == execution.date_pair.return_date
+                    normalized_quote.currency == "CNY"
+                    and normalized_quote.availability.value == "available"
+                    and normalized_quote.outbound_depart_at.date()
+                    == execution.date_pair.departure_date
+                    and normalized_quote.return_depart_at.date() == execution.date_pair.return_date
                     and amount is not None
                     and amount > 0
                 ):
-                    flights.append(quote)
-            elif isinstance(quote, NormalizedLodgingQuote):
-                searchable_text = f"{quote.property_name} {quote.room_name or ''}".lower()
-                cancellation = quote.cancellation_policy or ""
+                    flights.append(normalized_quote)
+            elif isinstance(normalized_quote, NormalizedLodgingQuote):
+                searchable_text = (
+                    f"{normalized_quote.property_name} {normalized_quote.room_name or ''}"
+                ).lower()
+                cancellation = normalized_quote.cancellation_policy or ""
                 if (
-                    quote.currency == "CNY"
-                    and quote.availability.value == "available"
-                    and quote.breakfast_included is True
+                    normalized_quote.currency == "CNY"
+                    and normalized_quote.availability.value == "available"
+                    and normalized_quote.breakfast_included is True
                     and "免费取消" in cancellation
                     and "不可取消" not in cancellation
                     and "基础" not in searchable_text
@@ -1186,7 +1376,7 @@ def build_best_available_plan_projection(
                     and "无窗" not in searchable_text
                     and "标准房" not in searchable_text
                 ):
-                    lodgings.append(quote)
+                    lodgings.append(normalized_quote)
         if not flights or not lodgings:
             continue
         flight = min(
@@ -1331,43 +1521,11 @@ def build_best_available_plan_projection(
         ),
         flight_component_id=flight.id,
         lodging_component_ids=tuple(item.id for item in chosen_lodgings),
-        flight=FinalFlightProjection(
-            provider=flight.provider,
-            origin=flight.origin,
-            destination=flight.destination,
-            outbound_flight_numbers=flight.outbound_flight_numbers,
-            outbound_depart_at=flight.outbound_depart_at,
-            outbound_arrive_at=flight.outbound_arrive_at,
-            return_flight_numbers=flight.return_flight_numbers,
-            return_depart_at=flight.return_depart_at,
-            return_arrive_at=flight.return_arrive_at,
-            display_amount_cents=(
-                None if flight.party_total_known else flight.display_amount_cents
-            ),
-            party_total_known=flight.party_total_known,
-            price_basis=flight.price_basis,
-            official_view_url=_trusted_quote_view_url(flight),
+        flight=_final_flight_projection(
+            flight,
+            getattr(live_run, "search_query", None),
         ),
-        lodgings=tuple(
-            FinalLodgingProjection(
-                provider=item.provider,
-                property_name=item.property_name,
-                area=item.area.value,
-                check_in=item.check_in,
-                check_out=item.check_out,
-                rooms=item.rooms,
-                room_name=item.room_name,
-                breakfast_included=item.breakfast_included,
-                cancellation_policy=item.cancellation_policy,
-                location_convenience=item.location_convenience.value,
-                location_address=item.location_address,
-                nearby_location_evidence=item.nearby_location_evidence,
-                location_evidence_summary=_lodging_location_evidence_summary(item),
-                display_total_cents=item.total_for_party_cents,
-                official_view_url=_trusted_quote_view_url(item),
-            )
-            for item in chosen_lodgings
-        ),
+        lodgings=tuple(_final_lodging_projection(item) for item in chosen_lodgings),
         party={
             "adults": live_run.intent.adults,
             "children": live_run.intent.children,
