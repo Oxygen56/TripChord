@@ -1,0 +1,93 @@
+{
+  "scenario": "current_multicity_group_mcp_create_resume_modify",
+  "captured_at": "2026-08-26T06:49:35Z",
+  "host": {
+    "name": "Claude Code",
+    "version": "2.1.245",
+    "transport": "stdio",
+    "role": "dialogue and display only",
+    "deepseek_harness": {
+      "installed_version": "0.3.5",
+      "validated": false,
+      "boundary": "GUI-only in this environment; no headless host run is claimed"
+    }
+  },
+  "standard_client": {
+    "name": "official Python MCP SDK ClientSession",
+    "version": "1.29.1",
+    "transport": "stdio",
+    "listed_tools": [
+      "create_plan",
+      "get_plan_status",
+      "get_plan",
+      "modify_plan"
+    ],
+    "same_run_read": true
+  },
+  "tripchord": {
+    "api": "http://127.0.0.1:8017",
+    "database": ".runtime/i7-current.db",
+    "browser_bridge_enabled": false,
+    "sources": ["12306 official current rail", "Trip.com current public SSR hotel list"],
+    "run_id": "live-job-92158a6d-f8a5-4439-9684-6039a4d0b63e",
+    "requirement": "旅行者甲从杭州、旅行者乙从南京分别于2026-08-30出发到上海汇合，共住一间房；甲参加2026-08-31 19:00-21:00在上海的已持有活动，乙不参加；乙2026-09-02从上海返回南京，甲2026-09-04从上海返回杭州。两人均为成人，交通和酒店总价尽量低，活动费用未提供。",
+    "create": {
+      "host_calls": 1,
+      "request_id": "i7-host-group-8017",
+      "idempotency_mode": "explicit request_id (default canonical-key path separately regression-tested)",
+      "initial_external_query_count": 6,
+      "initial_planning_elapsed_ms": 10971,
+      "version_id": "live-job-92158a6d-f8a5-4439-9684-6039a4d0b63e:plan:v1",
+      "status": "final",
+      "total_cny_cents": 136000,
+      "selected_component_count": 6
+    },
+    "disconnect_resume": {
+      "host_processes": 2,
+      "same_run_id": true,
+      "same_active_version_before_modify": true,
+      "resume_operations": ["get_plan_status", "get_plan"],
+      "new_create_calls": 0,
+      "new_external_query_count": 0
+    },
+    "modify": {
+      "instruction": "保留所有车次，只把2026-08-30至2026-09-02的共享酒店换成另一家当前可用且价格最低的酒店。",
+      "status": "applied",
+      "version_id": "live-job-92158a6d-f8a5-4439-9684-6039a4d0b63e:plan:v2",
+      "external_query_count": 1,
+      "elapsed_ms": 1778,
+      "before_total_cny_cents": 136000,
+      "after_total_cny_cents": 186000,
+      "delta_cny_cents": 50000,
+      "kept_component_count": 5,
+      "replaced_component_count": 1,
+      "component_count_after": 6,
+      "query_scope": [
+        "trip.com:hotel:2:2026-08-30:2026-09-02:2a:1r:traveler:甲,traveler:乙"
+      ],
+      "direct_component_ids": ["stay:上海:0"],
+      "affected_component_ids": ["anchor:上海:2026-08-31T19:00:00", "stay:上海:0"],
+      "unaffected_component_count": 5,
+      "traversed_dependency_kinds": ["lodging"]
+    },
+    "active_plan_after_modify": {
+      "status": "final",
+      "total_cny_cents": 186000,
+      "components": [
+        {"kind": "transport", "provider": "12306", "traveler_ids": ["traveler:甲"], "price_cny_cents": 5300},
+        {"kind": "transport", "provider": "12306", "traveler_ids": ["traveler:乙"], "price_cny_cents": 12200},
+        {"kind": "transport", "provider": "12306", "traveler_ids": ["traveler:甲"], "price_cny_cents": 7100},
+        {"kind": "transport", "provider": "12306", "traveler_ids": ["traveler:乙"], "price_cny_cents": 9800},
+        {"kind": "stay", "provider": "trip.com", "traveler_ids": ["traveler:甲", "traveler:乙"], "price_cny_cents": 118400},
+        {"kind": "stay", "provider": "trip.com", "traveler_ids": ["traveler:甲"], "price_cny_cents": 33200}
+      ],
+      "fixed_activity": "2026-08-31 19:00-21:00 上海；用户已持有，活动费用未提供且未计入"
+    }
+  },
+  "boundary": [
+    "仅证明当前有界的12306+Trip.com来源，不是全网最低价或锁价",
+    "只读查询；没有下单、付款、接受条款或修改预订",
+    "本次把‘保留所有车次’作为当前铁路来源下的等价交通锁定；未声称航空航班修改",
+    "DeepSeek Harness GUI、Oh My Pi 未作为本次真实宿主通过"
+  ]
+}

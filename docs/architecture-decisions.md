@@ -174,7 +174,7 @@ API 查询、日期枚举、并发调度、报价归一、组合优化、硬校�
 
 ## D004：让其他 AI 应用调用 TripChord
 
-**状态：已确认；接口尚未实现。决定日期：2026-08-23。**
+**状态：已实现并完成范围受控验证；TripChord 2.0 总声明仍待七轮总验收。决定日期：2026-08-26。**
 
 ### 决定
 
@@ -185,7 +185,8 @@ TripChord 可以作为一项完整的旅行规划服务，被聊天助手、桌�
 推荐的公共操作保持粗粒度：
 
 - `create_plan`：创建规划任务并返回任务编号；
-- `get_plan`：查询进度或取得最终结构化方案；
+- `get_plan_status`：查询进度，不重新规划；
+- `get_plan`：取得同一个 TripRun 的当前结构化方案；
 - `modify_plan`：按新要求生成新版本和变化说明。
 
 真实平台规划可能持续数分钟，因此创建任务和取得结果需要分开。MCP 只是现有异步任务接口的一层通用包装，不会另外创建一套任务或价格数据。
@@ -204,13 +205,15 @@ TripChord 可以作为一项完整的旅行规划服务，被聊天助手、桌�
 
 外部应用可以附带一份简短使用说明，告诉模型何时调用 TripChord、怎样提交旅行需求以及怎样展示结果。这份说明不能负责价格计算、行程检查或最终选择。
 
-已经确认具备这种接入基础的例子包括 [Oh My Pi](https://github.com/can1357/oh-my-pi/blob/main/docs/mcp-config.md) 和 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/mcp/mcp-client)：它们都能够作为 MCP 客户端调用外部能力。它们只是可选入口，不是运行 TripChord 的前提。
+本轮用 **Claude Code 2.1.245** 作为真实外部宿主，通过 stdio 完成创建、断开后恢复和酒店局部修改；再用官方 Python MCP SDK **1.29.1** 独立读取同一个 `run_id`。OpenCode 1.18.21 已确认可脚本化但未作为本次证据宿主；DeepSeek Harness 0.3.5 仅验证本机 GUI 安装，未声称已完成无头接入；Oh My Pi 未作为本轮宿主。机器可读证据见 [`i7-mcp-current-2026-08-26.json`](../benchmarks/results/i7-mcp-current-2026-08-26.json)。
 
 TripChord 不把内部每个 Agent 暴露成单独工具。否则外部应用需要自己拼接搜索、价格和最终方案，反而破坏 TripChord 统一负责结果的产品边界。
 
 ### 验证要求
 
 同一个任务通过 TripChord 原生入口和 MCP 入口运行时，应产生相同任务身份、相同最终方案和相同修改差异；MCP 入口不得增加一次完整重复搜索。
+
+本轮范围受控结果：同一任务首次查询 6 个当前来源任务，外部宿主断开后只用 `get_plan_status`/`get_plan` 恢复，没有新增查询；“保留所有车次，只换共享酒店”只查询该住宿段 1 次，生成 v2 和差异。结果仍仅限 12306 + Trip.com 当前可见范围，不代表全网最低、锁价或自动预订。
 
 ## D005：Agent 运行框架选型
 
@@ -344,7 +347,7 @@ inspect_requirements → inspect_candidate → verify_candidate → Proposal
 采用“稳定领域内核 + 可替换模型端口 + 单一耐久状态 + MCP 外观”的分层 Hybrid，但当前每层仍由已有实现承担：
 
 ```text
-原生 UI / Oh My Pi / DeepSeek Harness / 其他宿主
+原生 UI / Claude Code / 标准 MCP 客户端 / 其他宿主（需单独验证）
                         │
                  Typed API / MCP
                         │

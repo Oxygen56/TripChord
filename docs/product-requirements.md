@@ -411,6 +411,8 @@ Debate、投票、BFT 共识、固定完整团队、新 Agent Runtime 或大量�
 
 ### 迭代 7：外部 Agent 接入与 TripChord 2.0
 
+**当前证据状态（2026-08-26）**：已用 Claude Code 2.1.245 作为真实宿主、官方 Python MCP SDK 1.29.1 作为独立客户端完成范围受控当前来源验证；证据见 [`benchmarks/results/i7-mcp-current-2026-08-26.json`](../benchmarks/results/i7-mcp-current-2026-08-26.json)。本条只更新 I7 的实现状态，不单独宣布七轮总验收或所有宿主覆盖。
+
 **用户结果**
 
 用户能够从其他聊天助手、桌面应用或 Agent Harness 创建 TripChord 任务，断开后继续查询进度、读取同一行程，并用自然语言修改它。

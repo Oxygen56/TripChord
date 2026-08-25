@@ -62,7 +62,7 @@ Round 17 又记录 job-bound 47/47 成功模型调用和三个 checkpoint，但 
 | 解释 Agent 会不会编造“含早/免费取消”？ | 选择理由、权衡和权益陈述必须逐条绑定最终组件 ID 与 evidence_ref；运行时还会对早餐、行李、免费取消和含税等结构化权益做确定性对账。 | 已实现/未知组件与虚假含早反例测试 |
 | 多 Agent 一定比单 Agent 好吗？ | 没有这个结论。当前公平 scripted 对照不能证明架构质量优势；可证价值是权限隔离、并发等待重叠、阶段化复核和可审计 handoff。同一 Router/进程仍有 common-mode failure。 | 声明边界；`docs/benchmark-agent-architectures.md` |
 | 用的是 LangGraph 吗？ | 没有依赖 LangGraph。项目实现的是 typed Dynamic DAG runtime，因此简历只能写 “LangGraph-style”，不能写“基于 LangGraph”。 | 已实现自研 runtime；`agents/runtime.py` |
-| 用了 MCP 吗？ | 当前 live 工具走内部 JSON Schema `ToolRegistry` 与最小权限 allowlist，不是 MCP。浏览器桥是本地租约协议，也不能包装成 MCP。 | 尚未声称 MCP |
+| 用了 MCP 吗？ | 已实现一个只暴露四个粗粒度能力的 stdio MCP 适配器：`create_plan`、`get_plan_status`、`get_plan`、`modify_plan`。Claude Code 2.1.245 已完成创建、断开恢复和局部修改，官方 Python MCP SDK 1.29.1 也读取了同一 `TripRun`；TripChord 的 REST/求解/最终校验仍是唯一事实源。 | 范围受控当前来源证据；DeepSeek Harness GUI 与 Oh My Pi 未声称已接通 |
 | LLM 如何调用工具？ | 模型先返回受 schema 约束的 tool call；runtime 校验 Agent role、工具 allowlist、权限级别、参数和调用上限，执行后把回执作为不可信数据放回同一 Context 预算，再进行下一轮模型请求。 | 已实现；`agents/model_agent.py`、`agents/tools.py` |
 | 动态 Agent 是不是让 LLM 自己无限 spawn？ | 不是。确定性 `ScaleDirective` 按工作量计算实例与并发 ceiling，`AgentTemplatePlan` 只分配白名单模板，运行时 ledger 在模型阶段前再次准入；ReAct Agent 只在获准分片内选合法 ID。 | 已实现控制器、模板与日期分片；不声称自由 Meta-Agent 自我复制 |
 | 96 个 Agent 是性能最优解吗？ | 不是。96 是防请求自放大的 hard guardrail；最大 synthetic 输入提出 143 时被截断或提前拒绝。真实 SLA/成本调优尚无数据。 | 已实现硬门；`adaptive_control.py`、冻结预算基准 |

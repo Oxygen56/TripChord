@@ -27,12 +27,16 @@ dependencies = [
   "sqlalchemy[asyncio]>=2.0.40",
   "uvicorn[standard]>=0.34.0",
   "cryptography>=44.0",
+  "mcp>=1.29.0,<2",
 ]
 
 [project.urls]
 Homepage = "https://github.com/Oxygen56/TripChord"
 Repository = "https://github.com/Oxygen56/TripChord"
 Issues = "https://github.com/Oxygen56/TripChord/issues"
+
+[project.scripts]
+tripchord-mcp = "tripchord.mcp_server:main"
 
 
 [project.optional-dependencies]

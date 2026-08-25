@@ -24,6 +24,8 @@ TripChord 是一个主要在用户自己电脑上运行的旅行决策 Agent。�
 
 从当前 1.0 到目标形态共拆为七次用户可见迭代；完整需求、每轮交付和端到端完成标准见 [TripChord 2.0 产品需求文档](docs/product-requirements.md)。
 
+外部 Agent 接入已经有一条范围受控的 MCP 证据链：Claude Code 2.1.245 可创建、断开后恢复并修改同一个 TripRun，官方 Python MCP SDK 1.29.1 可独立读取相同状态。详见 [I7 MCP 当前来源证据](benchmarks/results/i7-mcp-current-2026-08-26.json)；这不等于已经覆盖所有宿主或完成全网旅行能力。
+
 ## 为什么叫 TripChord
 
 `Trip` 是旅行，`Chord` 是和弦。单独的航班、酒店和接驳像不同音符；TripChord 要做的是让它们在日期、衔接、预算和个人偏好上彼此协调，组成一份真正能走的完整行程。中文名“旅弦”保留了这个含义。完整的命名考虑见[项目命名说明](docs/naming.md)。

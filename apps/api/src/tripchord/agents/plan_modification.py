@@ -209,7 +209,11 @@ def parse_live_plan_modification(
         (LodgingRoomFeature.SEA_VIEW,) if re.search(r"海景|sea\s*view", text, re.I) else ()
     )
     exclude_current_property = bool(
-        re.search(r"换(?:成)?(?:另|别|其他)?一(?:家|间)酒店|换一家|另一家酒店", text)
+        re.search(
+            r"换(?:成)?(?:另|别|其他)?一(?:家|间)(?:[^，。；,]{0,24})?酒店"
+            r"|换一家|另一家酒店",
+            text,
+        )
     )
 
     require_breakfast: bool | None = None
