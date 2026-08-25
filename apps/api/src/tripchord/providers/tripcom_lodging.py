@@ -67,6 +67,8 @@ class _StaySpec:
     check_in: date
     check_out: date
     adults: int
+    rooms: int = 1
+    participant_ids: tuple[str, ...] = ()
 
     @property
     def nights(self) -> int:
@@ -80,7 +82,7 @@ class _StaySpec:
             ("checkout", self.check_out.isoformat()),
             ("adult", str(self.adults)),
             ("children", "0"),
-            ("crn", "1"),
+            ("crn", str(self.rooms)),
             ("curr", "CNY"),
         )
 
@@ -90,9 +92,16 @@ class _StaySpec:
 
     @property
     def query_task_id(self) -> str:
-        return (
+        base = (
             f"trip.com:hotel:{self.city.city_id}:"
-            f"{self.check_in.isoformat()}:{self.check_out.isoformat()}:{self.adults}a"
+            f"{self.check_in.isoformat()}:{self.check_out.isoformat()}:"
+            f"{self.adults}a"
+        )
+        participant_scope = ",".join(self.participant_ids)
+        return (
+            f"{base}:{self.rooms}r:{participant_scope}"
+            if participant_scope
+            else base
         )
 
 
@@ -328,6 +337,29 @@ class TripComCurrentLodgingSource:
     def _prepare(self, intent: TravelIntent) -> tuple[_StaySpec, ...] | str:
         if not 1 <= intent.travelers <= _MAX_TRAVELERS:
             return "Trip.com当前住宿查询只支持1至8名成人、1间房"
+        if intent.stay_requirements:
+            scoped_specs: list[_StaySpec] = []
+            for requirement in intent.stay_requirements:
+                city = _city_identity(requirement.place_id)
+                if city is None:
+                    return "Trip.com当前住宿查询尚未支持某个停留城市"
+                if requirement.check_out <= requirement.check_in:
+                    return "Trip.com当前住宿查询的退房日期必须晚于入住日期"
+                adults = len(requirement.participant_ids)
+                if not 1 <= adults <= _MAX_TRAVELERS or requirement.room_count != 1:
+                    return "Trip.com当前住宿查询只支持1至8名成人、1间房"
+                scoped_specs.append(
+                    _StaySpec(
+                        place_id=requirement.place_id,
+                        city=city,
+                        check_in=requirement.check_in,
+                        check_out=requirement.check_out,
+                        adults=adults,
+                        rooms=requirement.room_count,
+                        participant_ids=requirement.participant_ids,
+                    )
+                )
+            return tuple(scoped_specs)
         if len(intent.route_legs) < 2:
             return "Trip.com多城市住宿查询需要至少两段连续行程"
 
@@ -354,7 +386,7 @@ class TripComCurrentLodgingSource:
                     city=city,
                     check_in=check_in,
                     check_out=check_out,
-                    adults=intent.travelers,
+                        adults=intent.travelers,
                 )
             )
         return tuple(specs)
@@ -391,6 +423,7 @@ class TripComCurrentLodgingSource:
                     (
                         f"{spec.place_id}|{spec.check_in.isoformat()}|"
                         f"{spec.check_out.isoformat()}|{spec.adults}|{card.hotel_id}|"
+                        f"{spec.rooms}|{','.join(sorted(spec.participant_ids))}|"
                         f"{card.hotel_name}|{card.room_name}|{total_cents}"
                     ).encode()
                 ).hexdigest()[:20]
@@ -408,6 +441,7 @@ class TripComCurrentLodgingSource:
                         label=f"{card.hotel_name}｜{card.room_name}",
                         confirmed_traveler_count=spec.adults,
                         confirmed_room_count=1,
+                        participant_ids=spec.participant_ids,
                     )
                 )
                 contracts.append(
@@ -416,7 +450,9 @@ class TripComCurrentLodgingSource:
                         currency="CNY",
                         total_for_party_cents=total_cents,
                         component_ids=(offer_id,),
+                        covered_traveler_ids=spec.participant_ids,
                         shared=False,
+                        shared_between_travelers=len(spec.participant_ids) > 1,
                         taxes_and_fees_included=True,
                         source=(
                             "current:trip.com:public-ssr-list:"
@@ -436,7 +472,7 @@ class TripComCurrentLodgingSource:
                 tuple(offers),
                 tuple(contracts),
                 SourceStatus(
-                    source_id=f"trip.com:hotel:{spec.place_id}",
+                    source_id=spec.query_task_id,
                     provider="trip.com",
                     state=state,
                     detail=detail,
@@ -449,7 +485,7 @@ class TripComCurrentLodgingSource:
                 (),
                 (),
                 SourceStatus(
-                    source_id=f"trip.com:hotel:{spec.place_id}",
+                    source_id=spec.query_task_id,
                     provider="trip.com",
                     state=SourceState.FAILED,
                     detail=f"Trip.com当前住宿查询失败:{type(exc).__name__}",
@@ -483,7 +519,10 @@ class TripComCurrentLodgingSource:
                 f'"checkOut":"{spec.check_out.isoformat()}",'
                 f'"nights":{spec.nights},'
             ),
-            (f'"guestInfo":{{"roomsNum":1,"adultsNum":{spec.adults},"childNum":0,'),
+            (
+                f'"guestInfo":{{"roomsNum":{spec.rooms},'
+                f'"adultsNum":{spec.adults},"childNum":0,'
+            ),
             '"cargo":{"locale":"en-XX","currency":"CNY",',
         )
         if not all(fragment in readback for fragment in required_fragments):

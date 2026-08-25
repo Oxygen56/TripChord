@@ -869,12 +869,30 @@ export type TripCardProjection = {
   query_captured_at: string;
   source_statuses: SourceStatus[];
   fixed_activities: TripCardComponent[];
+  travelers: Traveler[];
+  shared_components: TripCardComponent[];
+  traveler_itineraries: Array<{
+    traveler_id: string;
+    traveler_name: string;
+    origin: PlaceRef;
+    components: TripCardComponent[];
+  }>;
+  traveler_costs: Array<{
+    traveler_id: string;
+    traveler_name: string;
+    direct_cny_cents: number;
+    allocated_shared_cny_cents: number;
+    attributable_total_cny_cents: number;
+  }>;
+  shared_cost_cny_cents: number;
   price_contracts: Array<{
     id: string;
     currency: string;
     total_for_party_cents: number;
     component_ids: string[];
+    covered_traveler_ids: string[];
     shared: boolean;
+    shared_between_travelers: boolean;
     taxes_and_fees_included: boolean;
     source: string;
   }>;
@@ -894,6 +912,7 @@ export type TripCardComponent = {
   detail_url: string;
   price_cny_cents: number | null;
   shared_price_contract: boolean;
+  participant_ids: string[];
 };
 
 export type SourceStatus = {
@@ -906,10 +925,10 @@ export type SourceStatus = {
 };
 
 export type TravelIntent = {
-  topology: "single_destination" | "multi_city";
+  topology: "single_destination" | "multi_city" | "group_multi_origin";
   travelers: number;
-  origin: { id: string; name: string; city: string };
-  places: Array<{ id: string; name: string; city: string }>;
+  origin: PlaceRef;
+  places: PlaceRef[];
   window: { start: string; end: string };
   route_legs: Array<{
     origin_place_id: string;
@@ -917,7 +936,38 @@ export type TravelIntent = {
     departure_date: string | null;
     earliest_departure_date: string | null;
     latest_departure_date: string | null;
+    participant_ids: string[];
   }>;
+  traveler_profiles: Traveler[];
+  traveler_groups: Array<{
+    id: string;
+    name: string;
+    traveler_ids: string[];
+    purpose: string;
+  }>;
+  stay_requirements: Array<{
+    id: string;
+    place_id: string;
+    check_in: string;
+    check_out: string;
+    participant_ids: string[];
+    room_count: number;
+  }>;
+};
+
+export type PlaceRef = {
+  id: string;
+  name: string;
+  city: string;
+  kind?: string;
+};
+
+export type Traveler = {
+  id: string;
+  name: string;
+  origin: PlaceRef;
+  available_window: { start: string; end: string };
+  age_category: string;
 };
 
 export type LiveFlexibleFromTextResponse = {

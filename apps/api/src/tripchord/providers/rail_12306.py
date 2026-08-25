@@ -64,6 +64,13 @@ _RAIL_STATIONS = (
         station_name="上海虹桥",
         aliases=frozenset({"上海", "shanghai", "aoh"}),
     ),
+    RailStationIdentity(
+        city_id="北京",
+        city_name="北京",
+        station_code="VNP",
+        station_name="北京南",
+        aliases=frozenset({"北京", "beijing", "vnp"}),
+    ),
 )
 
 
@@ -76,10 +83,12 @@ class _RailLegSpec:
 
     @property
     def query_task_id(self) -> str:
-        return (
+        base = (
             f"12306:{self.travel_date.isoformat()}:"
             f"{self.origin.station_code}-{self.destination.station_code}"
         )
+        participant_scope = ",".join(self.requirement.participant_ids)
+        return f"{base}:{participant_scope}" if participant_scope else base
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,7 +197,14 @@ class Rail12306CurrentCatalogSource:
             init_response = await client.get(_LEFT_TICKET_INIT_URL, headers=headers)
             init_response.raise_for_status()
             results = await asyncio.gather(
-                *(self._fetch_leg(client, spec, intent.travelers) for spec in prepared)
+                *(
+                    self._fetch_leg(
+                        client,
+                        spec,
+                        len(spec.requirement.participant_ids) or intent.travelers,
+                    )
+                    for spec in prepared
+                )
             )
         except (httpx.HTTPError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             captured_at = datetime.now(UTC)
@@ -497,6 +513,7 @@ class Rail12306CurrentCatalogSource:
                 f"¥{Decimal(party_total_cents) / Decimal(100):,.2f}｜"
                 f"查询时二等座余{candidate.second_class_availability}张"
             ),
+            participant_ids=spec.requirement.participant_ids,
             party_capacity_confirmed=True,
             available_units=int(candidate.second_class_availability),
         )
@@ -504,7 +521,9 @@ class Rail12306CurrentCatalogSource:
             id=contract_id,
             total_for_party_cents=party_total_cents,
             component_ids=(offer_id,),
+            covered_traveler_ids=spec.requirement.participant_ids,
             shared=False,
+            shared_between_travelers=False,
             taxes_and_fees_included=True,
             source=(
                 "current:12306:official-left-ticket+ticket-price:"

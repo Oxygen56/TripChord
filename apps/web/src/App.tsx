@@ -1712,14 +1712,20 @@ function FlexiblePlanningSummary({
 export function UnifiedTripCard({ card }: { card: NonNullable<LiveFlexibleFromTextResponse["trip_card"]> }) {
   const money = (value: number) =>
     `¥${(value / 100).toLocaleString("zh-CN", { minimumFractionDigits: 2 })}`;
+  const travelerNames = new Map(card.travelers.map((item) => [item.id, item.name]));
+  const participantLabel = (participantIds: string[]) =>
+    participantIds.map((item) => travelerNames.get(item) || item).join("、");
   return (
     <section className="final-trip-card" aria-label="统一旅行方案卡">
       <div className="interpretation-head"><div><p className="eyebrow">TripChord 方案</p><h2>{card.title}</h2></div><strong>{card.status === "final" ? "最终方案" : card.status === "candidate" ? "当前候选" : card.status === "no_solution" ? "暂无可行方案" : "等待来源"}</strong></div>
       <div className="window-summary"><strong>{card.total_cny_cents === null ? "当前没有可用总价" : money(card.total_cny_cents)}</strong><span>{card.start_date} 至 {card.end_date} · {card.city_order.join(" → ")} · {card.traveler_count} 人</span></div>
       <div className="complex-trip-components">
-        {card.components.map((item) => <article key={item.offer_id}><strong>{item.label}</strong><span>{item.place_from || ""}{item.place_to ? ` → ${item.place_to}` : ""} · {item.start} → {item.end}</span><small>{item.provider} · {item.price_cny_cents !== null ? money(item.price_cny_cents) : item.shared_price_contract ? "费用包含在共享组合价中" : "费用未提供"}</small>{item.detail_url && <PlanInlineActionLink url={item.detail_url} label="查看来源" />}</article>)}
+        {card.components.map((item) => <article key={item.offer_id}><strong>{item.label}</strong><span>{item.place_from || ""}{item.place_to ? ` → ${item.place_to}` : ""} · {item.start} → {item.end}</span>{item.participant_ids.length > 0 && <small>同行者：{participantLabel(item.participant_ids)}</small>}<small>{item.provider} · {item.price_cny_cents !== null ? money(item.price_cny_cents) : item.shared_price_contract ? "费用包含在共享组合价中" : "费用未提供"}</small>{item.detail_url && <PlanInlineActionLink url={item.detail_url} label="查看来源" />}</article>)}
       </div>
-      {card.fixed_activities.length > 0 && <div className="final-plan-unresolved"><strong>固定活动</strong>{card.fixed_activities.map((item) => <p key={item.offer_id}>{item.label} · {item.start} → {item.end} · {item.price_cny_cents === null ? "费用未提供" : money(item.price_cny_cents)}</p>)}</div>}
+      {card.shared_components.length > 0 && <div className="final-plan-unresolved"><strong>共同安排</strong>{card.shared_components.map((item) => <p key={item.offer_id}>{item.label} · {participantLabel(item.participant_ids)} · {item.price_cny_cents === null ? "共享合同计价" : money(item.price_cny_cents)}</p>)}</div>}
+      {card.traveler_itineraries.length > 1 && <div className="final-plan-unresolved"><strong>每人行程</strong>{card.traveler_itineraries.map((traveler) => <div key={traveler.traveler_id}><p><b>{traveler.traveler_name}</b> · 从{traveler.origin.name}出发</p>{traveler.components.map((item) => <p key={`${traveler.traveler_id}:${item.offer_id}`}>{item.start} · {item.label}</p>)}</div>)}</div>}
+      {card.traveler_costs.length > 0 && card.total_cny_cents !== null && <div className="final-plan-unresolved"><strong>费用对账</strong><p>共享费用：{money(card.shared_cost_cny_cents)}</p>{card.traveler_costs.map((item) => <p key={item.traveler_id}>{item.traveler_name}：个人费用 {money(item.direct_cny_cents)} + 分摊共享费用 {money(item.allocated_shared_cny_cents)} = {money(item.attributable_total_cny_cents)}</p>)}<small>费用归属仅用于展示对账，不代表实际结算方式。</small></div>}
+      {card.fixed_activities.length > 0 && <div className="final-plan-unresolved"><strong>固定活动</strong>{card.fixed_activities.map((item) => <p key={item.offer_id}>{item.label} · {item.start} → {item.end}{item.participant_ids.length > 0 ? ` · ${participantLabel(item.participant_ids)}` : ""} · {item.price_cny_cents === null ? "费用未提供" : money(item.price_cny_cents)}</p>)}</div>}
       <div className="final-plan-unresolved"><strong>来源状态</strong>{card.source_statuses.map((item) => <p key={item.source_id}>{item.provider} · {item.state} · {item.detail}</p>)}<small>查询时间：{card.query_captured_at}</small></div>
       {card.unresolved_items.map((item) => <p className="claim-boundary" key={item}>{item}</p>)}
       <p className="claim-boundary">{card.source_boundary}</p>

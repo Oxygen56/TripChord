@@ -1429,6 +1429,256 @@ async def test_default_http_composition_runs_current_complex_provider_without_br
 
 
 @pytest.mark.asyncio
+async def test_http_endpoint_solves_group_merge_split_and_reconciles_shared_costs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = (
+        "旅行者甲从杭州、旅行者乙从北京分别于2026-10-02出发到大阪汇合，共住一间房；"
+        "甲参加2026-10-03 19:00-21:30在大阪的已持有演唱会，乙不参加；"
+        "乙2026-10-06从大阪返回北京，甲2026-10-08从大阪返回杭州。"
+        "两人均为成人，交通和酒店总价尽量低，活动前至少留90分钟缓冲，活动费用未提供。"
+    )
+    compiler = PlanningCompiler()
+    intent = compiler.compile(text, reference_year=2026)
+    assert intent is not None
+    assert intent.topology.value == "group_multi_origin"
+    assert [item.name for item in intent.traveler_profiles] == ["甲", "乙"]
+    assert [len(item.participant_ids) for item in intent.stay_requirements] == [2, 1]
+
+    transports: list[TransportOffer] = []
+    stays: list[StayOffer] = []
+    contracts: list[PriceContract] = []
+    base_transport_prices = (120_000, 130_000, 140_000, 110_000)
+    for index, requirement in enumerate(intent.route_legs):
+        assert requirement.departure_date is not None
+        for option, surcharge in enumerate((0, 20_000)):
+            offer_id = f"fixture:transport:{index}:{option}"
+            contract_id = f"fixture:contract:transport:{index}:{option}"
+            departure = datetime.combine(
+                requirement.departure_date,
+                datetime.min.time(),
+            ).replace(hour=9 + option)
+            transports.append(
+                TransportOffer(
+                    id=offer_id,
+                    provider="frozen-fixture",
+                    origin_place_id=requirement.origin_place_id,
+                    destination_place_id=requirement.destination_place_id,
+                    departure=departure,
+                    arrival=departure + timedelta(hours=3),
+                    price_contract_id=contract_id,
+                    detail_url=f"fixture://{offer_id}",
+                    label=(
+                        f"{requirement.origin_place_id}→"
+                        f"{requirement.destination_place_id} 备选{option + 1}"
+                    ),
+                    participant_ids=requirement.participant_ids,
+                    party_capacity_confirmed=True,
+                    available_units=2,
+                )
+            )
+            contracts.append(
+                PriceContract(
+                    id=contract_id,
+                    total_for_party_cents=base_transport_prices[index] + surcharge,
+                    component_ids=(offer_id,),
+                    covered_traveler_ids=requirement.participant_ids,
+                    source="frozen_fixture",
+                )
+            )
+    base_stay_prices = (200_000, 100_000)
+    for index, requirement in enumerate(intent.stay_requirements):
+        for option, surcharge in enumerate((0, 50_000)):
+            offer_id = f"fixture:stay:{index}:{option}"
+            contract_id = f"fixture:contract:stay:{index}:{option}"
+            stays.append(
+                StayOffer(
+                    id=offer_id,
+                    provider="frozen-fixture",
+                    place_id=requirement.place_id,
+                    check_in=requirement.check_in,
+                    check_out=requirement.check_out,
+                    price_contract_id=contract_id,
+                    detail_url=f"fixture://{offer_id}",
+                    label=f"大阪住宿段{index + 1}备选{option + 1}",
+                    participant_ids=requirement.participant_ids,
+                    confirmed_traveler_count=len(requirement.participant_ids),
+                    confirmed_room_count=requirement.room_count,
+                )
+            )
+            contracts.append(
+                PriceContract(
+                    id=contract_id,
+                    total_for_party_cents=base_stay_prices[index] + surcharge,
+                    component_ids=(offer_id,),
+                    covered_traveler_ids=requirement.participant_ids,
+                    shared_between_travelers=len(requirement.participant_ids) > 1,
+                    source="frozen_fixture",
+                )
+            )
+    query_tasks = tuple(
+        [f"fixture:query:leg:{item.id}" for item in intent.route_legs]
+        + [f"fixture:query:stay:{item.id}" for item in intent.stay_requirements]
+    )
+    catalog = OfferCatalog(
+        transports=tuple(transports),
+        stays=tuple(stays),
+        query_tasks=query_tasks,
+        source_statuses=tuple(
+            SourceStatus(
+                source_id=task_id,
+                provider="frozen-fixture",
+                state=SourceState.SUCCEEDED,
+                detail="冻结正式来源合同已返回",
+                query_task_ids=(task_id,),
+                captured_at=NOW,
+            )
+            for task_id in query_tasks
+        ),
+        source_mode="frozen_fixture",
+    )
+    frozen_contracts = tuple(contracts)
+
+    # Small exhaustive oracle proves that shared lodging is charged once.
+    contract_by_id = {item.id: item for item in frozen_contracts}
+    slots = tuple(
+        tuple(
+            offer
+            for offer in transports
+            if offer.origin_place_id == requirement.origin_place_id
+            and offer.destination_place_id == requirement.destination_place_id
+            and offer.participant_ids == requirement.participant_ids
+        )
+        for requirement in intent.route_legs
+    ) + tuple(
+        tuple(
+            offer
+            for offer in stays
+            if offer.check_in == requirement.check_in
+            and offer.check_out == requirement.check_out
+            and offer.participant_ids == requirement.participant_ids
+        )
+        for requirement in intent.stay_requirements
+    )
+    oracle_total = min(
+        sum(
+            contract_by_id[contract_id].total_for_party_cents
+            for contract_id in {item.price_contract_id for item in selected}
+        )
+        for selected in product(*slots)
+    )
+    assert oracle_total == 800_000
+
+    class FrozenGroupProvider:
+        def catalog_for(
+            self,
+            _intent: Any,
+        ) -> tuple[OfferCatalog, tuple[PriceContract, ...]]:
+            return catalog, frozen_contracts
+
+    class ExplodingLegacyParser:
+        async def parse(self, _request: Any) -> Any:
+            raise AssertionError("group requests must not call the legacy parser")
+
+    monkeypatch.setattr(app.state, "complex_offer_provider", FrozenGroupProvider())
+    monkeypatch.setattr(app.state, "package_requirement_agent", ExplodingLegacyParser())
+    monkeypatch.setattr(
+        app.state,
+        "live_run_cache",
+        LiveRunCache(capacity=8, ttl=timedelta(minutes=5), now=lambda: NOW),
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51361)),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=text, max_pairs=1),
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["interpretation"] is None
+    assert body["travel_intent"]["topology"] == "group_multi_origin"
+    card = body["trip_card"]
+    assert card["status"] == "candidate"
+    assert card["total_cny_cents"] == oracle_total
+    assert len(card["components"]) == 6
+    assert len(card["shared_components"]) == 1
+    assert card["shared_cost_cny_cents"] == 200_000
+    assert sum(
+        item["attributable_total_cny_cents"] for item in card["traveler_costs"]
+    ) == card["total_cny_cents"]
+    costs = {item["traveler_name"]: item for item in card["traveler_costs"]}
+    assert costs["甲"]["attributable_total_cny_cents"] == 460_000
+    assert costs["乙"]["attributable_total_cny_cents"] == 340_000
+    itineraries = {
+        item["traveler_name"]: item["components"]
+        for item in card["traveler_itineraries"]
+    }
+    assert any(item["kind"] == "anchor" for item in itineraries["甲"])
+    assert not any(item["kind"] == "anchor" for item in itineraries["乙"])
+    assert [item["kind"] for item in itineraries["甲"]] == [
+        "transport",
+        "stay",
+        "anchor",
+        "stay",
+        "transport",
+    ]
+    assert [item["kind"] for item in itineraries["乙"]] == [
+        "transport",
+        "stay",
+        "transport",
+    ]
+    assert len(
+        [item for item in itineraries["甲"] if item["kind"] == "stay"]
+    ) == 2
+    assert len(
+        [item for item in itineraries["乙"] if item["kind"] == "stay"]
+    ) == 1
+    assert len({item["id"] for item in card["price_contracts"]}) == 6
+
+    capacity_catalog = catalog.model_copy(
+        update={
+            "stays": tuple(
+                item.model_copy(update={"confirmed_traveler_count": 1})
+                if len(item.participant_ids) == 2
+                else item
+                for item in catalog.stays
+            )
+        }
+    )
+    capacity_graph = ComplexCatalogSolver().solve(
+        compiler.compile_problem(
+            intent,
+            offer_catalog=capacity_catalog,
+            price_contracts=frozen_contracts,
+        )
+    )
+    assert capacity_graph.status.value == "no-solution"
+    missing_return_catalog = catalog.model_copy(
+        update={
+            "transports": tuple(
+                item
+                for item in catalog.transports
+                if not (
+                    item.origin_place_id == "大阪"
+                    and item.destination_place_id == "北京"
+                )
+            )
+        }
+    )
+    missing_return_graph = ComplexCatalogSolver().solve(
+        compiler.compile_problem(
+            intent,
+            offer_catalog=missing_return_catalog,
+            price_contracts=frozen_contracts,
+        )
+    )
+    assert missing_return_graph.status.value == "no-solution"
+
+
+@pytest.mark.asyncio
 async def test_http_endpoint_reports_source_gap_without_frozen_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

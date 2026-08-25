@@ -100,8 +100,78 @@ describe("unified trip card", () => {
               detail_url: "",
               price_cny_cents: null,
               shared_price_contract: false,
+              participant_ids: ["traveler:a"],
             },
           ],
+          travelers: [
+            {
+              id: "traveler:a",
+              name: "甲",
+              origin: { id: "杭州", name: "杭州", city: "杭州" },
+              available_window: {
+                start: "2026-10-02T00:00:00",
+                end: "2026-10-08T23:59:59",
+              },
+              age_category: "adult",
+            },
+            {
+              id: "traveler:b",
+              name: "乙",
+              origin: { id: "北京", name: "北京", city: "北京" },
+              available_window: {
+                start: "2026-10-02T00:00:00",
+                end: "2026-10-06T23:59:59",
+              },
+              age_category: "adult",
+            },
+          ],
+          shared_components: [
+            {
+              kind: "stay",
+              offer_id: "shared-stay",
+              label: "共享住宿",
+              provider: "frozen-fixture",
+              start: "2026-10-02",
+              end: "2026-10-06",
+              place_from: "大阪",
+              price_contract_id: "pc-shared-stay",
+              detail_url: "https://example.test/shared-stay",
+              price_cny_cents: 200000,
+              shared_price_contract: false,
+              participant_ids: ["traveler:a", "traveler:b"],
+            },
+          ],
+          traveler_itineraries: [
+            {
+              traveler_id: "traveler:a",
+              traveler_name: "甲",
+              origin: { id: "杭州", name: "杭州", city: "杭州" },
+              components: [],
+            },
+            {
+              traveler_id: "traveler:b",
+              traveler_name: "乙",
+              origin: { id: "北京", name: "北京", city: "北京" },
+              components: [],
+            },
+          ],
+          traveler_costs: [
+            {
+              traveler_id: "traveler:a",
+              traveler_name: "甲",
+              direct_cny_cents: 426000,
+              allocated_shared_cny_cents: 0,
+              attributable_total_cny_cents: 426000,
+            },
+            {
+              traveler_id: "traveler:b",
+              traveler_name: "乙",
+              direct_cny_cents: 426000,
+              allocated_shared_cny_cents: 0,
+              attributable_total_cny_cents: 426000,
+            },
+          ],
+          shared_cost_cny_cents: 0,
           price_contracts: [],
           components: [
             {
@@ -117,6 +187,7 @@ describe("unified trip card", () => {
               detail_url: "https://example.test/hgh-osa",
               price_cny_cents: 148000,
               shared_price_contract: false,
+              participant_ids: ["traveler:a"],
             },
           ],
     } satisfies NonNullable<LiveFlexibleFromTextResponse["trip_card"]>;
@@ -131,6 +202,10 @@ describe("unified trip card", () => {
     expect(html).toContain("大阪 → 京都 → 东京");
     expect(html).toContain("2 人");
     expect(html).toContain("已持有演唱会");
+    expect(html).toContain("共同安排");
+    expect(html).toContain("每人行程");
+    expect(html).toContain("费用对账");
+    expect(html).toContain("不代表实际结算方式");
     expect(html).toContain("frozen-fixture");
     expect(html).toContain("https://example.test/hgh-osa");
     expect(noSolutionHtml).toContain("暂无可行方案");
