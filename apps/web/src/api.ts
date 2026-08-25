@@ -66,6 +66,141 @@ export type PlanDiff = {
   changed_items: Array<{ item_id: string; changed_fields: string[] }>;
 };
 
+/** The durable versioned state for a complex trip.  The card remains the
+ * public presentation contract; the other fields are kept typed enough for
+ * the history/diff view without duplicating the planner's internal graph. */
+export type TripComponentReference = {
+  component_id: string;
+  offer_id: string;
+  name: string;
+  kind: string;
+};
+
+export type TripComponentReplacement = {
+  before: TripComponentReference;
+  after: TripComponentReference;
+};
+
+export type TripTravelerPlanDiff = {
+  traveler_id: string;
+  traveler_name: string;
+  status: string;
+  kept_component_ids: string[];
+  replaced_component_ids: string[];
+  added_component_ids: string[];
+  removed_component_ids: string[];
+};
+
+export type TripRunDiff = {
+  kept: TripComponentReference[];
+  replaced: TripComponentReplacement[];
+  added: TripComponentReference[];
+  removed: TripComponentReference[];
+  traveler_changes: TripTravelerPlanDiff[];
+  before_total_cny_cents: number | null;
+  after_total_cny_cents: number | null;
+  delta_cny_cents: number | null;
+  query_scope: string[];
+  external_query_count: number;
+  elapsed_ms: number;
+};
+
+export type TripRunPlanVersion = {
+  id: string;
+  run_id: string;
+  version: number;
+  parent_version_id: string | null;
+  intent: TravelIntent;
+  selected_plan_graph: unknown | null;
+  selected_trip_card: TripCardProjection | null;
+  candidate_plan_graphs: unknown[];
+  candidate_trip_cards: TripCardProjection[];
+  graph_version: string;
+  catalog_digest: string;
+  offer_catalog: unknown;
+  source_contracts: unknown[];
+  dependencies: unknown[];
+  created_reason: string;
+  created_at: string;
+  diff_from_parent: TripRunDiff | null;
+};
+
+export type TripRunChangeRecord = {
+  id: string;
+  kind: string;
+  status: string;
+  request_text: string | null;
+  target_refs: string[];
+  message: string;
+  impact: {
+    direct_component_ids: string[];
+    affected_component_ids: string[];
+    unaffected_component_ids: string[];
+    traversed_dependency_kinds: string[];
+  };
+  query_scope: string[];
+  external_query_count: number;
+  elapsed_ms: number;
+  created_at: string;
+  resulting_plan_version_id: string | null;
+  needs_scope_expansion: string[];
+};
+
+export type TripRun = {
+  id: string;
+  source_job_id: string | null;
+  original_intent: TravelIntent;
+  initial_catalog: unknown;
+  initial_price_contracts: unknown[];
+  active_plan_version_id: string;
+  plan_versions: TripRunPlanVersion[];
+  change_history: TripRunChangeRecord[];
+  initial_external_query_count: number;
+  initial_planning_elapsed_ms: number;
+  created_at: string;
+  updated_at: string;
+  boundary: string;
+};
+
+export type TripRunMutation = {
+  text: string;
+};
+
+export type TripRunChangeKind =
+  | "natural_language"
+  | "stay_unavailable"
+  | "price_changed"
+  | "transport_schedule_changed"
+  | "traveler_withdrawn";
+
+export type TripRunEvent = {
+  id?: string;
+  kind: TripRunChangeKind;
+  occurred_at?: string;
+  target_offer_id?: string | null;
+  traveler_id?: string | null;
+  new_total_cny_cents?: number | null;
+  new_departure?: string | null;
+  new_arrival?: string | null;
+  source_ref?: string | null;
+};
+
+export type TripRunMutationResult = {
+  status: "applied" | "no_effect" | "needs_scope_expansion" | "clarification_required";
+  trip_run: TripRun;
+  active_plan_version: TripRunPlanVersion;
+  diff: TripRunDiff | null;
+  message: string;
+  needs_scope_expansion: string[];
+  external_query_count: number;
+  elapsed_ms: number;
+};
+
+// Explicit aliases make the domain names discoverable without colliding with
+// the legacy workspace PlanVersion/PlanDiff contracts above.
+export type TripPlanDiff = TripRunDiff;
+export type TripPlanVersion = TripRunPlanVersion;
+
 export type ReplanResult = {
   status: "ready" | "blocked" | "no_effect";
   message: string;
@@ -1014,6 +1149,7 @@ export type LiveFlexibleFromTextResponse = {
   } | null;
   travel_intent?: TravelIntent | null;
   source_statuses?: SourceStatus[];
+  trip_run?: TripRun | null;
 };
 
 export type LiveFlexibleFromTextInput = {
@@ -1907,6 +2043,31 @@ export function revokeAgentPreferenceMemory(
 
 export function loadWorkspace(workspaceId: string): Promise<Workspace> {
   return request(`/api/v1/workspaces/${workspaceId}`);
+}
+
+export function getTripRun(runId: string): Promise<TripRun> {
+  return request(`/api/v1/trip-runs/${encodeURIComponent(runId)}`);
+}
+
+export function modifyTripRun(
+  runId: string,
+  mutation: TripRunMutation | string,
+): Promise<TripRunMutationResult> {
+  const body = typeof mutation === "string" ? { text: mutation } : mutation;
+  return request(`/api/v1/trip-runs/${encodeURIComponent(runId)}/modify`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function applyTripRunEvent(
+  runId: string,
+  event: TripRunEvent,
+): Promise<TripRunMutationResult> {
+  return request(`/api/v1/trip-runs/${encodeURIComponent(runId)}/events`, {
+    method: "POST",
+    body: JSON.stringify(event),
+  });
 }
 
 export function comparePlans(

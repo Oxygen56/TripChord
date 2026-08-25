@@ -91,6 +91,7 @@ from tripchord.providers.quote_normalizer import (
     NormalizedBrowserQuoteResult,
     QuoteNormalizationStatus,
 )
+from tripchord.providers.tripcom_lodging import TripComLodgingCatalogResult
 
 NOW = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
 ORIGINAL_REQUEST = """出发地：杭州
@@ -1247,6 +1248,82 @@ async def test_http_endpoint_solves_multi_city_anchor_from_same_text_entrypoint(
     )
     assert projected_roundtrip["shared"] is True
     assert set(projected_roundtrip["component_ids"]) == {"tr-hgh-osa", "tr-tyo-hgh"}
+
+
+@pytest.mark.asyncio
+async def test_current_complex_provider_queries_only_lodging_for_stay_scope() -> None:
+    intent = PlanningCompiler().compile(
+        "2名成人，2026-08-30 杭州出发到南京，2026-09-01 去上海，"
+        "2026-09-04 从上海返回杭州；2026-08-31 19:00-21:30 "
+        "在南京有已持有活动，活动费用未提供；交通和酒店总价尽量低，"
+        "活动前至少留90分钟缓冲。",
+        reference_year=2026,
+    )
+    assert intent is not None
+    query_task_id = "trip.com:hotel:12:2026-08-30:2026-09-01:2a"
+    stay = StayOffer(
+        id="stay-nanjing",
+        provider="trip.com",
+        place_id="南京",
+        check_in=date(2026, 8, 30),
+        check_out=date(2026, 9, 1),
+        price_contract_id="stay-nanjing:price",
+        detail_url="https://www.trip.com/hotels/nanjing",
+        label="南京酒店",
+        confirmed_traveler_count=2,
+        confirmed_room_count=1,
+    )
+    contract = PriceContract(
+        id="stay-nanjing:price",
+        total_for_party_cents=40_000,
+        component_ids=(stay.id,),
+        source="current:trip.com:test-fixture",
+    )
+    source_status = SourceStatus(
+        source_id="trip.com:hotel:12",
+        provider="trip.com",
+        state=SourceState.SUCCEEDED,
+        detail="当前人民币同行总价已返回",
+        query_task_ids=(query_task_id,),
+        captured_at=NOW,
+    )
+
+    class RailSourceThatMustNotRun:
+        calls = 0
+
+        async def catalog_for(self, _intent: Any) -> Any:
+            self.calls += 1
+            raise AssertionError("住宿局部查询不得调用 12306")
+
+    class FixtureLodgingSource:
+        calls = 0
+
+        async def catalog_for(self, _intent: Any) -> TripComLodgingCatalogResult:
+            self.calls += 1
+            return TripComLodgingCatalogResult(
+                stays=(stay,),
+                contracts=(contract,),
+                source_statuses=(source_status,),
+                query_task_ids=(query_task_id,),
+            )
+
+    rail_source = RailSourceThatMustNotRun()
+    lodging_source = FixtureLodgingSource()
+    provider = CurrentComplexOfferProvider(
+        rail_source=rail_source,  # type: ignore[arg-type]
+        lodging_source=lodging_source,  # type: ignore[arg-type]
+    )
+
+    catalog, contracts = await provider.catalog_for_stays(intent)
+
+    assert rail_source.calls == 0
+    assert lodging_source.calls == 1
+    assert catalog.transports == ()
+    assert catalog.stays == (stay,)
+    assert catalog.query_tasks == (query_task_id,)
+    assert catalog.source_statuses == (source_status,)
+    assert catalog.source_mode == "current"
+    assert contracts == (contract,)
 
 
 @pytest.mark.asyncio

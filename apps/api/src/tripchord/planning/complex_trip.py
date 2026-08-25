@@ -301,6 +301,7 @@ class PlanningProblem(DomainModel):
 
 
 class PlanComponent(DomainModel):
+    component_id: str | None = None
     kind: str
     offer_id: str
     label: str
@@ -769,6 +770,7 @@ def project_trip_card(
 ) -> TripCardProjection:
     activities = tuple(
         PlanComponent(
+            component_id=anchor.id,
             kind="anchor",
             offer_id=anchor.id,
             label=anchor.name,
@@ -1118,6 +1120,29 @@ def validate_plan_graph(
             ):
                 errors.append(f"Bundle组件覆盖不精确:{contract_id}")
     if intent is not None and catalog is not None:
+        stable_component_ids = tuple(item.component_id for item in plan.components)
+        if any(item is None for item in stable_component_ids) or len(
+            stable_component_ids
+        ) != len(
+            set(stable_component_ids)
+        ):
+            errors.append("方案组件稳定标识缺失或重复")
+        expected_stay_component_ids = (
+            {item.id for item in intent.stay_requirements}
+            if intent.stay_requirements
+            else {
+                item.component_id
+                for item in plan.components
+                if item.kind == "stay" and item.component_id is not None
+            }
+        )
+        expected_component_ids = {
+            *(item.id for item in intent.route_legs),
+            *expected_stay_component_ids,
+            *(item.id for item in intent.anchors),
+        }
+        if set(stable_component_ids) != expected_component_ids:
+            errors.append("方案组件稳定标识与需求图不一致")
         known_travelers = set(_all_traveler_ids(intent))
         declared_scopes: set[frozenset[str]] = set()
         if intent.traveler_profiles:
@@ -2148,15 +2173,32 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
     )
     selected_contracts = tuple(by_contract[item] for item in counted_contract_ids)
     transport_components = tuple(
-        _offer_component(item, by_contract[item.price_contract_id])
-        for item in selected_transports
+        _offer_component(
+            item,
+            by_contract[item.price_contract_id],
+            component_id=requirement.id,
+        )
+        for requirement, item in zip(intent.route_legs, selected_transports, strict=True)
+    )
+    stay_component_ids = (
+        tuple(item.id for item in intent.stay_requirements)
+        if intent.stay_requirements
+        else tuple(
+            f"stay-slot:{index}:{item.place_id}"
+            for index, item in enumerate(selected_stays)
+        )
     )
     stay_components = tuple(
-        _offer_component(item, by_contract[item.price_contract_id])
-        for item in selected_stays
+        _offer_component(
+            item,
+            by_contract[item.price_contract_id],
+            component_id=component_id,
+        )
+        for component_id, item in zip(stay_component_ids, selected_stays, strict=True)
     )
     components = transport_components + stay_components + tuple(
         PlanComponent(
+            component_id=item.id,
             kind="anchor",
             offer_id=item.id,
             label=item.name,
@@ -2214,10 +2256,13 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
 def _offer_component(
     offer: TransportOffer | StayOffer,
     contract: PriceContract,
+    *,
+    component_id: str,
 ) -> PlanComponent:
     shared = len(contract.component_ids) > 1
     if isinstance(offer, TransportOffer):
         return PlanComponent(
+            component_id=component_id,
             kind="transport",
             offer_id=offer.id,
             label=offer.label,
@@ -2233,6 +2278,7 @@ def _offer_component(
             participant_ids=offer.participant_ids,
         )
     return PlanComponent(
+        component_id=component_id,
         kind="stay",
         offer_id=offer.id,
         label=offer.label,

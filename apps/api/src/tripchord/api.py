@@ -66,6 +66,7 @@ from tripchord.planning.problem import OptimizationResult, PlanningProblem
 from tripchord.planning.replanner import LocalReplanner, LocalReplanResult
 from tripchord.planning.requirements import RequirementParseResult
 from tripchord.planning.stay_plans import StayPlanCandidateSet
+from tripchord.planning.trip_run import TripRun
 from tripchord.planning.verifier import VerificationContext
 from tripchord.planning.workflow import PlanningWorkflow, WorkflowResult
 from tripchord.providers.base import OfferSearchQuery, OfferSearchResult, ProviderRegistry
@@ -629,6 +630,7 @@ class LiveFlexibleFromTextPlanningResponse(ApiModel):
     personalization: PersonalizationSummary | None = None
     travel_intent: TravelIntent | None = None
     source_statuses: tuple[SourceStatus, ...] = ()
+    trip_run: TripRun | None = None
 
     @model_serializer(mode="wrap")
     def serialize_public(self, handler: Callable[[Any], Any]) -> Any:

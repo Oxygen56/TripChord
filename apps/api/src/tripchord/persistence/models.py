@@ -293,6 +293,22 @@ class EventRow(Base):
     workspace: Mapped[WorkspaceRow] = relationship(back_populates="events")
 
 
+class TripRunRow(Base):
+    """Authoritative versioned state for one complex travel plan."""
+
+    __tablename__ = "trip_runs"
+    __table_args__ = (Index("ix_trip_run_tenant_updated", "tenant_id", "updated_at"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(100), index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
 class JobRow(Base):
     __tablename__ = "jobs"
     __table_args__ = (

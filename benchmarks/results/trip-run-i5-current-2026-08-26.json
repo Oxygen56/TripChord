@@ -1,0 +1,57 @@
+{
+  "db_dir": "/tmp/tripchord-i5-current.DjiTjn",
+  "db_path": "/tmp/tripchord-i5-current.DjiTjn/state.db",
+  "input": "2名成人，2026-08-30 杭州出发到南京，2026-09-01 去上海，2026-09-04 从上海返回杭州；2026-08-31 19:00-21:30 在南京有已持有活动，活动费用未提供；交通和酒店总价尽量低，活动前至少留90分钟缓冲；这次价格优先。",
+  "v1": {
+    "status": "final",
+    "card_status": "final",
+    "total_cny_cents": 162700,
+    "run_id": "trip-run-60f75792-f970-47e2-81c7-8441dccc89c4",
+    "active_version": "trip-run-60f75792-f970-47e2-81c7-8441dccc89c4:plan:v1",
+    "versions": [1],
+    "component_count": 5,
+    "query_count": 5,
+    "elapsed_ms": 5555,
+    "message": null,
+    "request_elapsed_ms": 5579
+  },
+  "run_id": "trip-run-60f75792-f970-47e2-81c7-8441dccc89c4",
+  "v2": {
+    "status": "applied",
+    "card_status": "final",
+    "total_cny_cents": 179900,
+    "run_id": "trip-run-60f75792-f970-47e2-81c7-8441dccc89c4",
+    "active_version": "trip-run-60f75792-f970-47e2-81c7-8441dccc89c4:plan:v2",
+    "versions": [1, 2],
+    "component_count": 5,
+    "query_count": 1,
+    "elapsed_ms": 1276,
+    "message": "已生成新版本并对整趟行程重新复算。",
+    "request_elapsed_ms": 1316
+  },
+  "v3": {
+    "status": "applied",
+    "card_status": "final",
+    "total_cny_cents": 162700,
+    "run_id": "trip-run-60f75792-f970-47e2-81c7-8441dccc89c4",
+    "active_version": "trip-run-60f75792-f970-47e2-81c7-8441dccc89c4:plan:v3",
+    "versions": [1, 2, 3],
+    "component_count": 5,
+    "query_count": 1,
+    "elapsed_ms": 1358,
+    "message": "已生成新版本并对整趟行程重新复算。",
+    "request_elapsed_ms": 1368
+  },
+  "restart_same_process_get": {
+    "status_code": 200,
+    "active_version": "trip-run-60f75792-f970-47e2-81c7-8441dccc89c4:plan:v3",
+    "versions": 3
+  },
+  "restart_process_get": {
+    "status_code": 200,
+    "active_version": "trip-run-60f75792-f970-47e2-81c7-8441dccc89c4:plan:v3",
+    "versions": 3,
+    "active_status": null,
+    "active_card_status": "final"
+  }
+}

@@ -700,11 +700,31 @@ def build_pareto_plans(
             )
             if expected_ids != actual_ids:
                 return
+        stable_component_ids = (
+            *(item.id for item in intent.route_legs),
+            *(
+                (item.id for item in intent.stay_requirements)
+                if intent.stay_requirements
+                else (
+                    f"stay-slot:{index}:{item.place_id}"
+                    for index, item in enumerate(stays)
+                )
+            ),
+        )
         components = tuple(
-            _offer_component(item, by_contract[item.price_contract_id])
-            for item in selected
+            _offer_component(
+                item,
+                by_contract[item.price_contract_id],
+                component_id=component_id,
+            )
+            for component_id, item in zip(
+                stable_component_ids,
+                selected,
+                strict=True,
+            )
         ) + tuple(
             PlanComponent(
+                component_id=anchor.id,
                 kind="anchor",
                 offer_id=anchor.id,
                 label=anchor.name,

@@ -18,6 +18,7 @@ import {
   getLiveMonitor,
   getLivePackage,
   getLiveFlexiblePlanningJob,
+  modifyTripRun,
   type Job,
   type JsonValue,
   type LiveBridgeHealth,
@@ -36,6 +37,9 @@ import {
   type PlanItem,
   type PreferenceMode,
   type ReplanResult,
+  type TripPlanDiff,
+  type TripRun,
+  type TripRunMutationResult,
   normalizeBreakfastWeight,
   requireLiveBridgeAvailability,
   modifyLivePackage,
@@ -1411,6 +1415,14 @@ export function FlexiblePlanningSummary({
 }: {
   response: LiveFlexibleFromTextResponse;
 }) {
+  if (response.trip_run) {
+    return (
+      <TripRunPanel
+        initialRun={response.trip_run}
+        fallbackCard={response.trip_card ?? response.trip_cards?.[0] ?? null}
+      />
+    );
+  }
   if (response.trip_cards && response.trip_cards.length > 0) {
     if (response.trip_cards.length === 1) {
       return <UnifiedTripCard card={response.trip_cards[0]} />;
@@ -1807,6 +1819,243 @@ export function UnifiedTripCard({ card, compact = false }: { card: NonNullable<L
       {card.unresolved_items.map((item) => <p className="claim-boundary" key={item}>{item}</p>)}
       <p className="claim-boundary">{card.source_boundary}</p>
     </section>
+  );
+}
+
+const tripRunStatusLabels: Record<TripRunMutationResult["status"], string> = {
+  applied: "已生成新版本",
+  no_effect: "没有需要改变的内容",
+  needs_scope_expansion: "需要扩大查询范围",
+  clarification_required: "需要补充修改范围",
+};
+
+const tripRunChangeKindLabels: Record<string, string> = {
+  natural_language: "用户修改",
+  stay_unavailable: "住宿不可用",
+  price_changed: "价格变化",
+  transport_schedule_changed: "班次变化",
+  traveler_withdrawn: "同行者变化",
+};
+
+function tripRunReferenceLabel(reference: {
+  name: string;
+  kind: string;
+}): string {
+  const kind =
+    reference.kind === "transport"
+      ? "交通"
+      : reference.kind === "stay"
+        ? "住宿"
+        : reference.kind === "anchor"
+          ? "固定安排"
+          : reference.kind;
+  return `${kind}：${reference.name}`;
+}
+
+function TripRunDiffView({ diff }: { diff: TripPlanDiff | null }) {
+  if (!diff) {
+    return <p className="claim-boundary">当前版本是初始版本，还没有上一版可比较。</p>;
+  }
+  const entries = [
+    `保留 ${diff.kept.length} 项`,
+    `替换 ${diff.replaced.length} 项`,
+    `新增 ${diff.added.length} 项`,
+    `移除 ${diff.removed.length} 项`,
+  ];
+  return (
+    <div className="modification-result" aria-label="中文行程差异">
+      <header>
+        <span>版本差异</span>
+        <strong>{entries.join(" · ")}</strong>
+      </header>
+      <div className="modification-facts">
+        <article>
+          <span>费用变化</span>
+          <strong>
+            {diff.delta_cny_cents === null
+              ? "暂不可比较"
+              : diff.delta_cny_cents === 0
+                ? "总价未变"
+                : `${diff.delta_cny_cents > 0 ? "+" : "−"}${formatCents(Math.abs(diff.delta_cny_cents))}`}
+          </strong>
+        </article>
+        <article>
+          <span>本次补查</span>
+          <strong>{diff.external_query_count} 个来源查询 · {diff.elapsed_ms} ms</strong>
+        </article>
+      </div>
+      {(diff.replaced.length > 0 || diff.added.length > 0 || diff.removed.length > 0) && (
+        <ul>
+          {diff.replaced.map((item) => (
+            <li key={`${item.before.component_id}-${item.after.component_id}`}>
+              替换：{tripRunReferenceLabel(item.before)} → {tripRunReferenceLabel(item.after)}
+            </li>
+          ))}
+          {diff.added.map((item) => (
+            <li key={`added-${item.component_id}`}>新增：{tripRunReferenceLabel(item)}</li>
+          ))}
+          {diff.removed.map((item) => (
+            <li key={`removed-${item.component_id}`}>移除：{tripRunReferenceLabel(item)}</li>
+          ))}
+        </ul>
+      )}
+      {diff.query_scope.length > 0 && (
+        <small className="modification-boundary">查询范围：{diff.query_scope.join("、")}</small>
+      )}
+    </div>
+  );
+}
+
+function TripRunPanel({
+  initialRun,
+  fallbackCard,
+}: {
+  initialRun: TripRun;
+  fallbackCard: NonNullable<LiveFlexibleFromTextResponse["trip_card"]> | null;
+}) {
+  const [run, setRun] = useState(initialRun);
+  const [selectedVersionId, setSelectedVersionId] = useState(
+    initialRun.active_plan_version_id,
+  );
+  const [instruction, setInstruction] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const [mutation, setMutation] = useState<TripRunMutationResult | null>(null);
+
+  useEffect(() => {
+    setRun(initialRun);
+    setSelectedVersionId(initialRun.active_plan_version_id);
+    setMutation(null);
+    setInstruction("");
+    setError("");
+  }, [initialRun]);
+
+  const versions = [...run.plan_versions].sort((left, right) => left.version - right.version);
+  const selectedVersion =
+    versions.find((version) => version.id === selectedVersionId) ??
+    versions.find((version) => version.id === run.active_plan_version_id) ??
+    versions.at(-1);
+  const currentCard =
+    selectedVersion?.selected_trip_card ??
+    selectedVersion?.candidate_trip_cards[0] ??
+    (selectedVersion?.id === run.active_plan_version_id ? fallbackCard : null);
+
+  async function submitModification(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const text = instruction.trim();
+    if (!text) {
+      setError("请先说明想保留什么、修改什么");
+      return;
+    }
+    setSubmitting(true);
+    setError("");
+    setMutation(null);
+    try {
+      const result = await modifyTripRun(run.id, { text });
+      setRun(result.trip_run);
+      setSelectedVersionId(result.active_plan_version.id);
+      setMutation(result);
+      setInstruction("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "修改没有完成，原版本保持不变。");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="flexible-summary">
+      <section className="live-stage live-plan-modifier" aria-label="TripRun 版本行程">
+        <div className="stage-title">
+          <div><span>TripRun</span><h3>当前行程与版本历史</h3></div>
+          <strong>当前版本 v{run.plan_versions.find((item) => item.id === run.active_plan_version_id)?.version ?? "?"}</strong>
+        </div>
+        <div className="version-bar">
+          <div>
+            <strong>{selectedVersion ? `查看 v${selectedVersion.version}` : "暂无版本"}</strong>
+            <span>{selectedVersion?.id === run.active_plan_version_id ? "这是当前生效版本" : "这是历史版本，仅供查看"}</span>
+          </div>
+          <select
+            aria-label="选择行程版本"
+            value={selectedVersion?.id ?? ""}
+            onChange={(event) => setSelectedVersionId(event.target.value)}
+          >
+            {versions.map((version) => (
+              <option key={version.id} value={version.id}>
+                v{version.version} · {version.id === run.active_plan_version_id ? "当前" : "历史"}
+              </option>
+            ))}
+          </select>
+        </div>
+        {currentCard ? (
+          <UnifiedTripCard card={currentCard} />
+        ) : (
+          <div className="issue-box">
+            <strong>该版本暂没有统一方案卡</strong>
+            <p>版本状态仍已保存；TripChord 不会用其他版本的卡片冒充当前结果。</p>
+          </div>
+        )}
+        <details className="result-boundary-details" open={Boolean(selectedVersion?.diff_from_parent)}>
+          <summary>查看这版相对上一版的中文差异</summary>
+          <TripRunDiffView diff={selectedVersion?.diff_from_parent ?? null} />
+        </details>
+        {run.change_history.length > 0 && (
+          <details className="result-boundary-details">
+            <summary>查看修改历史（{run.change_history.length} 次）</summary>
+            <ul>
+              {run.change_history.map((change) => (
+                <li key={change.id}>
+                  {tripRunChangeKindLabels[change.kind] ?? change.kind} · {change.message}
+                  {change.resulting_plan_version_id ? ` · ${change.resulting_plan_version_id}` : ""}
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+      </section>
+
+      <section className="live-stage live-plan-modifier" aria-label="修改当前 TripRun">
+        <div className="stage-title">
+          <div><span>修改</span><h3>用一句话调整当前行程</h3></div>
+          <strong>未提及的部分默认保留</strong>
+        </div>
+        <form className="live-modification-form" onSubmit={(event) => void submitModification(event)}>
+          <label htmlFor={`trip-run-modify-${run.id}`}>自然语言修改</label>
+          <div>
+            <textarea
+              id={`trip-run-modify-${run.id}`}
+              value={instruction}
+              onChange={(event) => setInstruction(event.target.value)}
+              placeholder="例如：保留航班，只把酒店换成另一家交通方便的酒店"
+              rows={3}
+              maxLength={1200}
+              disabled={submitting}
+            />
+            <button type="submit" disabled={submitting || !instruction.trim()}>
+              {submitting ? "正在查询受影响住宿…" : "修改当前方案"}
+            </button>
+          </div>
+          <p>修改会生成新版本；原版本不会被覆盖。TripChord 只查询、比较和建议，不会下单或付款。</p>
+        </form>
+        {error && <div className="error-banner">{error}</div>}
+        {mutation && (
+          <div className={`modification-result status-${mutation.status}`} role="status" aria-live="polite">
+            <header>
+              <span>{tripRunStatusLabels[mutation.status]}</span>
+              <strong>{mutation.message}</strong>
+            </header>
+            <div className="modification-facts">
+              <article><span>新增版本</span><strong>v{mutation.active_plan_version.version}</strong></article>
+              <article><span>本次外部查询</span><strong>{mutation.external_query_count} 个</strong></article>
+            </div>
+            {mutation.diff && <TripRunDiffView diff={mutation.diff} />}
+            {mutation.needs_scope_expansion.length > 0 && (
+              <small className="modification-boundary">还需要扩大：{mutation.needs_scope_expansion.join("、")}</small>
+            )}
+          </div>
+        )}
+      </section>
+    </div>
   );
 }
 

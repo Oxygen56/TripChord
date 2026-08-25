@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 from typing import Annotated, Any, Final, cast
 from uuid import uuid4
 
@@ -200,6 +201,12 @@ from tripchord.persistence.repository import (
     WorkspaceNotFoundError,
     WorkspaceSnapshot,
 )
+from tripchord.persistence.trip_runs import (
+    DbTripRunStore,
+    InMemoryTripRunStore,
+    TripRunConflictError,
+    TripRunStore,
+)
 from tripchord.planning.adaptive import AdaptiveReplanner
 from tripchord.planning.assembler import PlanningProblemAssembler, ReplayPlaceCatalog
 from tripchord.planning.complex_trip import (
@@ -229,6 +236,14 @@ from tripchord.planning.repair import PlanDiff, diff_plans
 from tripchord.planning.replanner import LocalReplanResult
 from tripchord.planning.requirements import RequirementParseResult
 from tripchord.planning.stay_plans import system_stay_plan_candidate_set
+from tripchord.planning.trip_run import (
+    ComplexTripRunReplanner,
+    NaturalLanguageTripModification,
+    StructuredTripChangeEvent,
+    TripRun,
+    TripRunMutationResult,
+    build_initial_trip_run,
+)
 from tripchord.planning.workflow import WorkflowResult
 from tripchord.platform.adapters import (
     default_browser_providers_from_registry,
@@ -1070,6 +1085,7 @@ context_builder = BudgetedAgentContextBuilder(EvidenceRagRetriever(memory_store)
 providers = build_provider_registry(settings)
 amap = build_amap_provider(settings)
 database = Database(settings.database_url)
+durable_trip_run_store = DbTripRunStore(database)
 live_planning_job_store = DurableLivePlanningJobStore(database)
 live_monitor_store = DbLiveMonitorStore(database)
 job_runner = PlanningJobRunner(database)
@@ -1176,6 +1192,7 @@ async def _recover_live_monitors(target_app: FastAPI) -> int:
 @asynccontextmanager
 async def lifespan(target_app: FastAPI) -> AsyncIterator[None]:
     await database.create_schema()
+    target_app.state.trip_run_store = durable_trip_run_store
     await job_runner.recover()
     await _recover_live_monitors(target_app)
     # C-146 hard-stop gate (12e35d45 门 2/门 3): actively recover durable live
@@ -1421,6 +1438,7 @@ app.state.memory_store = memory_store
 app.state.context_builder = context_builder
 app.state.live_planning_job_registry = live_planning_job_registry
 app.state.database = database
+app.state.trip_run_store = InMemoryTripRunStore()
 app.state.provider_registry = build_default_registry()
 app.state.handoff_store = HandoffStore()
 app.state.booking_ledger_store = BookingLedgerStore()
@@ -2858,6 +2876,7 @@ async def _execute_live_flexible_from_text_body(
     cache: LiveRunCache,
     principal: Principal,
     model_trace_scope_sha256: str,
+    trip_run_id: str | None = None,
     report_progress: LiveJobProgressReporter | None = None,
     report_pair_checkpoint: PairCheckpointReporter | None = None,
     checkpoint_request_sha256: str | None = None,
@@ -2885,6 +2904,7 @@ async def _execute_live_flexible_from_text_body(
         ),
     )
     if complex_intent is not None:
+        complex_started = perf_counter()
         complex_intent = apply_effective_preference_policy(
             complex_intent,
             payload.requirement.text,
@@ -2964,8 +2984,10 @@ async def _execute_live_flexible_from_text_body(
             )
             for plan in personalized.plans
         )
+        plan_graphs = tuple(plan.candidate.graph for plan in personalized.plans)
         if not cards:
             graph = ComplexCatalogSolver().solve(problem)
+            plan_graphs = (graph,)
             cards = (
                 project_trip_card(
                     complex_intent,
@@ -2980,6 +3002,24 @@ async def _execute_live_flexible_from_text_body(
         all_execution_ready = bool(cards) and all(
             card.status.value == "final" for card in cards
         )
+        trip_run = build_initial_trip_run(
+            run_id=trip_run_id,
+            source_job_id=trip_run_id,
+            intent=complex_intent,
+            catalog=complex_catalog,
+            source_contracts=tuple(complex_contracts),
+            plan_graphs=plan_graphs,
+            trip_cards=cards,
+            graph_version=personalized.summary.graph_version,
+            catalog_digest=personalized.summary.catalog_digest,
+            initial_planning_elapsed_ms=max(
+                0,
+                round((perf_counter() - complex_started) * 1000),
+            ),
+        )
+        trip_run_store = getattr(target_app.state, "trip_run_store", None)
+        if trip_run_store is not None:
+            await trip_run_store.create(principal.tenant_id, trip_run)
         await report("solving_multi_city_catalog", 90)
         return LiveFlexibleFromTextPlanningResponse(
             interpretation=None,
@@ -3023,6 +3063,7 @@ async def _execute_live_flexible_from_text_body(
             personalization=personalized.summary,
             travel_intent=complex_intent,
             source_statuses=source_statuses,
+            trip_run=trip_run,
         )
     requirement_agent = cast(
         HybridPackageRequirementAgent,
@@ -3335,6 +3376,7 @@ async def _execute_live_flexible_from_text(
                 cache=cache,
                 principal=principal,
                 model_trace_scope_sha256=request_sha256,
+                trip_run_id=model_trace_scope_id,
                 report_progress=report_progress,
                 report_pair_checkpoint=report_pair_checkpoint,
                 checkpoint_request_sha256=(
@@ -3508,6 +3550,25 @@ def _build_live_worker_result_importer(
             if key not in {"worker_runtime_receipt", "model_execution_receipt"}
         }
         response = LiveFlexibleFromTextPlanningResponse.model_validate(public_result)
+        if response.trip_run is not None:
+            try:
+                await durable_trip_run_store.create(tenant_id, response.trip_run)
+            except TripRunConflictError:
+                existing_trip_run = await durable_trip_run_store.get(
+                    tenant_id,
+                    response.trip_run.id,
+                )
+                if existing_trip_run is None:
+                    raise
+                public_result["trip_run"] = existing_trip_run.trip_run.model_dump(
+                    mode="json"
+                )
+                # The importer returns the worker payload below, rather than
+                # ``public_result``.  Keep the same authoritative run in that
+                # payload too; otherwise a retry race would validate the
+                # existing snapshot but publish the worker's stale version.
+                result["trip_run"] = public_result["trip_run"]
+                response = response.model_copy(update={"trip_run": existing_trip_run.trip_run})
         legacy_ready = (
             response.interpretation is not None
             and response.interpretation.state == PackageRequestState.READY
@@ -3787,6 +3848,107 @@ async def start_live_flexible_from_text_job_endpoint(
     )
 
 
+def _trip_run_store_for(target_app: FastAPI) -> TripRunStore:
+    store = getattr(target_app.state, "trip_run_store", None)
+    if store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="复杂行程版本状态暂不可用",
+        )
+    return cast(TripRunStore, store)
+
+
+async def _mutate_trip_run(
+    *,
+    request: Request,
+    principal: Principal,
+    run_id: str,
+    mutation: NaturalLanguageTripModification | StructuredTripChangeEvent,
+) -> TripRunMutationResult:
+    store = _trip_run_store_for(request.app)
+    stored = await store.get(principal.tenant_id, run_id)
+    if stored is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="TripRun不存在")
+    provider = getattr(request.app.state, "complex_offer_provider", None)
+    if provider is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="当前来源查询能力暂不可用，未修改原版本",
+        )
+    replanner = ComplexTripRunReplanner()
+    if isinstance(mutation, NaturalLanguageTripModification):
+        result = await replanner.modify(stored.trip_run, mutation, provider=provider)
+    else:
+        result = await replanner.apply_event(stored.trip_run, mutation, provider=provider)
+    try:
+        saved = await store.save(
+            principal.tenant_id,
+            result.trip_run,
+            expected_revision=stored.revision,
+            expected_active_plan_version_id=stored.trip_run.active_plan_version_id,
+        )
+    except TripRunConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="TripRun在修改期间已发生变化，请重新读取当前版本后再提交",
+        ) from exc
+    return result.model_copy(update={"trip_run": saved.trip_run})
+
+
+@app.get(
+    "/api/v1/trip-runs/{run_id}",
+    response_model=TripRun,
+)
+async def get_trip_run_endpoint(
+    run_id: str,
+    request: Request,
+    principal: PrincipalDep,
+) -> TripRun:
+    await rate_limiter.check(principal.tenant_id, "trip-run-get")
+    stored = await _trip_run_store_for(request.app).get(principal.tenant_id, run_id)
+    if stored is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="TripRun不存在")
+    return stored.trip_run
+
+
+@app.post(
+    "/api/v1/trip-runs/{run_id}/modify",
+    response_model=TripRunMutationResult,
+)
+async def modify_trip_run_endpoint(
+    run_id: str,
+    mutation: NaturalLanguageTripModification,
+    request: Request,
+    principal: PrincipalDep,
+) -> TripRunMutationResult:
+    await rate_limiter.check(principal.tenant_id, "trip-run-modify")
+    return await _mutate_trip_run(
+        request=request,
+        principal=principal,
+        run_id=run_id,
+        mutation=mutation,
+    )
+
+
+@app.post(
+    "/api/v1/trip-runs/{run_id}/events",
+    response_model=TripRunMutationResult,
+)
+async def apply_trip_run_event_endpoint(
+    run_id: str,
+    event: StructuredTripChangeEvent,
+    request: Request,
+    principal: PrincipalDep,
+) -> TripRunMutationResult:
+    await rate_limiter.check(principal.tenant_id, "trip-run-event")
+    return await _mutate_trip_run(
+        request=request,
+        principal=principal,
+        run_id=run_id,
+        mutation=event,
+    )
+
+
 def _with_current_final_plan_projection(
     job: LivePlanningJobSnapshot,
 ) -> LivePlanningJobSnapshot:
@@ -3868,12 +4030,49 @@ def _with_current_final_plan_projection(
     return job.model_copy(update={"result": upgraded_payload})
 
 
+async def _with_current_trip_run_projection(
+    job: LivePlanningJobSnapshot,
+    *,
+    target_app: FastAPI,
+    tenant_id: str,
+) -> LivePlanningJobSnapshot:
+    """Project a completed job from the authoritative TripRun aggregate."""
+
+    projected = _with_current_final_plan_projection(job)
+    if projected.result is None:
+        return projected
+    store = getattr(target_app.state, "trip_run_store", None)
+    if store is None:
+        return projected
+    raw_run = projected.result.get("trip_run")
+    run_id = raw_run.get("id") if isinstance(raw_run, dict) else None
+    if not isinstance(run_id, str):
+        return projected
+    stored = await cast(TripRunStore, store).get(tenant_id, run_id)
+    if stored is None:
+        return projected
+    run = stored.trip_run
+    active = run.active_version()
+    payload = dict(projected.result)
+    payload["trip_run"] = run.model_dump(mode="json")
+    payload["trip_card"] = (
+        active.selected_trip_card.model_dump(mode="json")
+        if active.selected_trip_card is not None
+        else None
+    )
+    payload["trip_cards"] = [
+        item.model_dump(mode="json") for item in active.candidate_trip_cards
+    ]
+    return projected.model_copy(update={"result": payload})
+
+
 @app.get(
     "/api/v1/agents/live-flexible-plan-from-text/jobs/{job_id}",
     response_model=LivePlanningJobSnapshot,
 )
 async def get_live_flexible_from_text_job_endpoint(
     job_id: str,
+    request: Request,
     registry: LivePlanningJobRegistryDep,
     principal: PrincipalDep,
 ) -> LivePlanningJobSnapshot:
@@ -3881,12 +4080,17 @@ async def get_live_flexible_from_text_job_endpoint(
     job = await registry.get(job_id, principal.tenant_id)
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="live job not found")
-    return _with_current_final_plan_projection(job)
+    return await _with_current_trip_run_projection(
+        job,
+        target_app=request.app,
+        tenant_id=principal.tenant_id,
+    )
 
 
 @app.get("/api/v1/agents/live-flexible-plan-from-text/jobs/{job_id}/events")
 async def stream_live_flexible_from_text_job_endpoint(
     job_id: str,
+    request: Request,
     registry: LivePlanningJobRegistryDep,
     principal: PrincipalDep,
 ) -> StreamingResponse:
@@ -3928,10 +4132,12 @@ async def stream_live_flexible_from_text_job_endpoint(
                 job.state in TERMINAL_LIVE_PLANNING_JOB_STATES
                 and job.barrier_released_at is not None
             ):
-                payload = json.dumps(
-                    _with_current_final_plan_projection(job).model_dump(mode="json"),
-                    ensure_ascii=False,
+                current_job = await _with_current_trip_run_projection(
+                    job,
+                    target_app=request.app,
+                    tenant_id=principal.tenant_id,
                 )
+                payload = json.dumps(current_job.model_dump(mode="json"), ensure_ascii=False)
                 yield f"event: result\ndata: {payload}\n\n"
                 return
             payload = json.dumps(

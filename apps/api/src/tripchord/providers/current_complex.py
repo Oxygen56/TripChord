@@ -48,5 +48,22 @@ class CurrentComplexOfferProvider:
             contracts,
         )
 
+    async def catalog_for_stays(
+        self,
+        intent: TravelIntent,
+    ) -> tuple[OfferCatalog, tuple[PriceContract, ...]]:
+        """Return current lodging observations without querying transport sources."""
+
+        lodging = await self._lodging_source.catalog_for(intent)
+        return (
+            OfferCatalog(
+                stays=lodging.stays,
+                query_tasks=lodging.query_task_ids,
+                source_statuses=lodging.source_statuses,
+                source_mode="current",
+            ),
+            lodging.contracts,
+        )
+
 
 __all__ = ["CurrentComplexOfferProvider"]
