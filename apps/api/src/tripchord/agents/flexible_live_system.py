@@ -103,6 +103,7 @@ from tripchord.planning.multiobjective import (
 from tripchord.planning.package import (
     NormalizedFlightQuote,
     NormalizedLodgingQuote,
+    NormalizedQuote,
     PackageDecision,
     PackageDecisionState,
     PackageIntent,
@@ -1556,6 +1557,7 @@ class FlexibleLiveAgentSystem:
         recovered_pair_executions: tuple[FlexiblePairExecution, ...] = (),
         pair_execution_reporter: Callable[[FlexiblePairExecution], Awaitable[None]] | None = None,
         pair_worker_count_override: int | None = None,
+        replay_pair_schedule: tuple[tuple[date, date], ...] = (),
     ) -> FlexibleLiveAgentRun:
         run_started = self._monotonic()
         cpu_started = self._process_cpu_seconds()
@@ -1662,7 +1664,7 @@ class FlexibleLiveAgentSystem:
                 exploration,
                 memory_access=memory_access,
             )
-            if range_calendar is not None:
+            if range_calendar is not None and date_range_screening is not None:
                 calendars = (*calendars, range_calendar)
                 exploration = self._explorer.explore(
                     effective_window,
@@ -1818,6 +1820,28 @@ class FlexibleLiveAgentSystem:
                     *(item for item in query_plan.selected_pair_ids if item != safe_pair.id),
                 )[:effective_exact_pair_budget]
                 query_plan = query_plan.model_copy(update={"selected_pair_ids": selected_ids})
+        if replay_pair_schedule:
+            if len(replay_pair_schedule) != exact_pair_budget:
+                raise ValueError("replay pair schedule must match the exact pair budget")
+            if len(replay_pair_schedule) != len(set(replay_pair_schedule)):
+                raise ValueError("replay pair schedule must contain unique date pairs")
+            pair_id_by_dates = {
+                (item.departure_date, item.return_date): item.id
+                for item in exploration.candidates
+            }
+            if any(item not in pair_id_by_dates for item in replay_pair_schedule):
+                raise ValueError("replay pair schedule contains a date outside the legal universe")
+            query_plan = query_plan.model_copy(
+                update={
+                    "selected_pair_ids": tuple(
+                        pair_id_by_dates[item] for item in replay_pair_schedule
+                    ),
+                    "warnings": (
+                        *query_plan.warnings,
+                        "历史回放显式使用封存日期计划；未重新推导日期选择",
+                    ),
+                }
+            )
         pairs = {item.id: item for item in exploration.candidates}
         effective_constraints = constraints or FlexiblePackageConstraints()
         stay_area_search_profile = system_stay_area_search_profile(effective_window.destination)
@@ -2280,6 +2304,7 @@ class FlexibleLiveAgentSystem:
                     )
                     if enriched.state != FlexiblePairState.COMPLETED or enriched.run is None:
                         return
+                    completed_run = enriched.run
                     # Preserve the cheap, successful flight-screen run.  Full
                     # enrichment may finish with lodging/transfer evidence but
                     # lose the comparison-only flight outcome; ranking and the
@@ -2293,7 +2318,7 @@ class FlexibleLiveAgentSystem:
                         execution.date_pair.id
                     )
                     if search_run_recorder is not None:
-                        await search_run_recorder(enriched.run)
+                        await search_run_recorder(completed_run)
 
                 async with asyncio.TaskGroup() as enrich_group:
                     for enrichment_worker_index, execution in enumerate(frontier):
@@ -2878,38 +2903,43 @@ class FlexibleLiveAgentSystem:
             if date_range_screening is not None
             else set()
         )
+
+        def coverage_status(pair: AuditableDatePair) -> DatePairCoverageStatus:
+            coverage_execution = executed_by_id.get(pair.id)
+            if coverage_execution is not None:
+                return (
+                    DatePairCoverageStatus.EXACT_COMPLETED
+                    if coverage_execution.state == FlexiblePairState.COMPLETED
+                    else DatePairCoverageStatus.EXACT_FAILED
+                )
+            if pair.id in priced_range_ids:
+                return DatePairCoverageStatus.RANGE_PRICE_HINT
+            if pair.id in observed_range_ids:
+                return DatePairCoverageStatus.RANGE_NO_VISIBLE_PRICE
+            return DatePairCoverageStatus.RANGE_NOT_OBSERVED
+
+        def coverage_reason(pair: AuditableDatePair) -> str:
+            coverage_execution = executed_by_id.get(pair.id)
+            if coverage_execution is not None:
+                return (
+                    "已执行该日期对的精确查询"
+                    if coverage_execution.state == FlexiblePairState.COMPLETED
+                    else "该日期对精确查询失败，已保留失败状态"
+                )
+            if pair.id in priced_range_ids:
+                return "批量日期栏显示人民币起价，已进入精确查询队列"
+            if pair.id in observed_range_ids:
+                return "批量日期栏观察到该组合，但未显示可用人民币价格"
+            return "批量来源本轮未观察到该组合，按来源失败记录；不代表全网无价"
+
         date_pair_coverage = tuple(
             DatePairCoverageRecord(
                 date_pair_id=pair.id,
                 departure_date=pair.departure_date,
                 return_date=pair.return_date,
-                status=(
-                    DatePairCoverageStatus.EXACT_COMPLETED
-                    if execution.state == FlexiblePairState.COMPLETED
-                    else DatePairCoverageStatus.EXACT_FAILED
-                )
-                if (execution := executed_by_id.get(pair.id)) is not None
-                else (
-                    DatePairCoverageStatus.RANGE_PRICE_HINT
-                    if pair.id in priced_range_ids
-                    else (
-                        DatePairCoverageStatus.RANGE_NO_VISIBLE_PRICE
-                        if pair.id in observed_range_ids
-                        else DatePairCoverageStatus.RANGE_NOT_OBSERVED
-                    )
-                ),
+                status=coverage_status(pair),
                 source_refs=pair.evidence_refs,
-                reason=(
-                    "已执行该日期对的精确查询"
-                    if execution is not None and execution.state == FlexiblePairState.COMPLETED
-                    else "该日期对精确查询失败，已保留失败状态"
-                    if execution is not None
-                    else "批量日期栏显示人民币起价，已进入精确查询队列"
-                    if pair.id in priced_range_ids
-                    else "批量日期栏观察到该组合，但未显示可用人民币价格"
-                    if pair.id in observed_range_ids
-                    else "批量来源本轮未观察到该组合，按来源失败记录；不代表全网无价"
-                ),
+                reason=coverage_reason(pair),
             )
             for pair in exploration.candidates
         )
@@ -4172,6 +4202,30 @@ class FlexibleLiveAgentSystem:
     ) -> tuple[FlexibleRankedOption, ...]:
         if require_exploration_seal and require_publication_refresh:
             raise ValueError("ranking cannot require exploration and publication simultaneously")
+
+        def reference_cny_if_comparable(quote: NormalizedQuote) -> int | None:
+            if quote.taxes_and_fees_included is not True:
+                return None
+            if quote.currency == "CNY":
+                amount = quote.total_for_party_cents
+                return amount if amount is not None and amount > 0 else None
+            response_sha = quote.reference_rate_response_sha256
+            if (
+                quote.reference_total_cents is None
+                or quote.reference_total_cents <= 0
+                or quote.reference_currency != "CNY"
+                or not quote.reference_rate_source
+                or quote.reference_rate_date is None
+                or quote.reference_usd_to_cny is None
+                or quote.reference_usd_to_cny <= 0
+                or response_sha is None
+                or len(response_sha) != 64
+                or any(char not in "0123456789abcdef" for char in response_sha)
+                or quote.reference_rate_captured_at is None
+            ):
+                return None
+            return quote.reference_total_cents
+
         provisional: list[FlexibleRankedOption] = []
         complete_cny_ids: set[str] = set()
         for execution in executions:
@@ -4275,7 +4329,7 @@ class FlexibleLiveAgentSystem:
                             transfer.total_for_party_cents
                             if transfer.currency == "CNY"
                             and transfer.taxes_and_fees_included is True
-                            else lodging_reference_cny_if_comparable(transfer, "CNY")
+                            else reference_cny_if_comparable(transfer)
                         )
                         if amount is None:
                             transfer_unknown = True

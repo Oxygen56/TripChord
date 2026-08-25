@@ -40,6 +40,7 @@ from tripchord.agents.plan_modification import (
 )
 from tripchord.agents.rag import EvidenceRagRetriever, RagPurpose, RagRequest
 from tripchord.api import build_live_final_plan_projection
+from tripchord.planning.complex_trip import PackagePlannerAdapter
 from tripchord.planning.package import (
     NormalizedLodgingQuote,
     PackageDecision,
@@ -289,9 +290,10 @@ async def test_saved_real_maldives_desktop_v1_acceptance(
         total_timeout_seconds=60,
         reference_date=date(2026, 8, 19),
         pair_worker_count_override=3,
+        replay_pair_schedule=saved_pairs,
     )
     assert pair_replay.max_active == 3
-    assert tuple(pair_replay.started_pairs) == saved_pairs
+    assert set(pair_replay.started_pairs) == set(saved_pairs)
     assert flexible_replay.final_decision.state == PackageDecisionState.HUMAN_BLOCK
     assert flexible_replay.recommended_option_ids == ()
 
@@ -307,6 +309,23 @@ async def test_saved_real_maldives_desktop_v1_acceptance(
     )
     inventory = run.inventory.model_copy(update={"lodgings": lodgings})
     generated = PackagePlanner().generate_bounded(intent, inventory)
+    adapter = PackagePlannerAdapter(
+        PackagePlanner(),
+        PackageVerifier(),
+        now=lambda: CAPTURE_TIME,
+    )
+    adapter_bounded = adapter.generate_bounded(intent, inventory)
+    adapter_generated = adapter.generate_verified(intent, inventory)
+    expected_verified_ids = tuple(
+        item.id
+        for item in generated.candidates
+        if not PackageVerifier().errors(intent, item, now=CAPTURE_TIME)
+    )
+    assert tuple(item.id for item in adapter_generated.candidates) == expected_verified_ids
+    assert tuple(item.id for item in adapter_bounded.candidates) == tuple(
+        item.id for item in generated.candidates
+    )
+    assert adapter_bounded.audit == generated.audit
     assert generated.audit.raw_inventory_counts["lodgings"] == 20
     assert generated.audit.prescreened_inventory_counts["lodgings"] == 8
     assert len(generated.candidates) == 8

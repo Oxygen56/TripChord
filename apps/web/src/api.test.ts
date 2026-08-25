@@ -362,7 +362,7 @@ describe("real multi-platform API boundary", () => {
     expect(path).toBe("/api/v1/agents/live-flexible-plan-from-text");
     expect(init.method).toBe("POST");
     expect(JSON.parse(String(init.body))).toEqual(request);
-    expect(response.interpretation.state).toBe("human_block");
+    expect(response.interpretation?.state).toBe("human_block");
     expect(response.run).toBeNull();
     expect(getBreakfastPreferenceApplication(response)).toMatchObject({
       state: "not_ranked",

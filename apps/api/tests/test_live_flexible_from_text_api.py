@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from itertools import product
 from typing import Any
 
 import httpx
@@ -38,6 +39,17 @@ from tripchord.main import (
     app,
     package_requirement_agent,
     settings,
+)
+from tripchord.planning.complex_trip import (
+    BundleOffer,
+    ComplexCatalogSolver,
+    OfferCatalog,
+    PlanningCompiler,
+    PriceContract,
+    StayOffer,
+    TransportOffer,
+    parse_complex_intent,
+    validate_plan_graph,
 )
 from tripchord.planning.package import (
     LodgingLocationConvenience,
@@ -707,6 +719,564 @@ async def test_http_endpoint_projects_and_ranks_two_complete_decision_candidates
     assert blocked["interpretation"]["window"]["latest_arrival_date"] == "2026-09-09"
     assert blocked["decision_candidates"] == []
     assert blocked["best_available_plan"] is None
+
+
+@pytest.mark.asyncio
+async def test_http_endpoint_solves_multi_city_anchor_from_same_text_entrypoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = (
+        "2名成人，2026-10-02 杭州出发到大阪，2026-10-05 去京都，"
+        "2026-10-08 从东京返回杭州；2026-10-03 19:00-21:30 在大阪有已持有演唱会，"
+        "活动费用未提供；交通和酒店总价尽量低，活动前至少留90分钟缓冲。"
+    )
+    fixture_intent = parse_complex_intent(text)
+    assert fixture_intent is not None
+    short_intent = parse_complex_intent(
+        "2名成人从杭州出发，2026-10-02 到大阪，10/5 去京都，10/8 从东京返回杭州；"
+        "10/3 19:00-21:30 在大阪有演唱会，活动前至少留90分钟缓冲。"
+    )
+    assert short_intent is not None
+    assert short_intent.origin.id == "杭州"
+    assert short_intent.route_legs[-1].destination_place_id == "杭州"
+    assert short_intent.route_legs[-1].departure_date == date(2026, 10, 8)
+    fixture_contracts = tuple(
+        PriceContract(
+            id=cid,
+            total_for_party_cents=amount,
+            component_ids=(component,),
+            source="frozen_fixture",
+        )
+        for cid, amount, component in (
+            ("pc-hgh-osa", 148_000, "tr-hgh-osa"),
+            ("pc-osa-kyo", 44_000, "tr-osa-kyo"),
+            ("pc-kyo-bundle", 184_000, "tr-kyo-tyo"),
+            ("pc-tyo-hgh", 176_000, "tr-tyo-hgh"),
+            ("pc-osa-stay", 168_000, "stay-osa"),
+            ("pc-tyo-stay", 132_000, "stay-tyo"),
+        )
+    )
+    fixture_contracts = tuple(
+        item.model_copy(
+            update={
+                "component_ids": ("tr-kyo-tyo", "stay-kyo"),
+                "shared": True,
+            }
+        )
+        if item.id == "pc-kyo-bundle"
+        else item
+        for item in fixture_contracts
+    )
+
+    def transport(
+        offer_id: str,
+        origin: str,
+        destination: str,
+        departure: str,
+        arrival: str,
+        contract: str,
+        label: str,
+    ) -> TransportOffer:
+        return TransportOffer(
+            id=offer_id,
+            provider="frozen-fixture",
+            origin_place_id=origin,
+            destination_place_id=destination,
+            departure=datetime.fromisoformat(departure),
+            arrival=datetime.fromisoformat(arrival),
+            price_contract_id=contract,
+            detail_url=f"fixture://{offer_id}",
+            label=label,
+        )
+
+    fixture_catalog = OfferCatalog(
+        source_mode="frozen_fixture",
+        bundles=(
+            BundleOffer(
+                id="bundle-kyo-rail-stay",
+                label="京都交通住宿组合",
+                component_offer_ids=("tr-kyo-tyo", "stay-kyo"),
+                price_contract_id="pc-kyo-bundle",
+            ),
+        ),
+        query_tasks=(
+            "query:transport:杭州-大阪",
+            "query:transport:大阪-京都",
+            "query:transport:京都-东京",
+            "query:transport:东京-杭州",
+            "query:stay:大阪",
+            "query:stay:京都",
+            "query:stay:东京",
+        ),
+        transports=(
+            transport(
+                "tr-hgh-osa",
+                "杭州",
+                "大阪",
+                "2026-10-02T09:00:00",
+                "2026-10-02T13:00:00",
+                "pc-hgh-osa",
+                "杭州→大阪",
+            ),
+            transport(
+                "tr-osa-kyo",
+                "大阪",
+                "京都",
+                "2026-10-05T10:00:00",
+                "2026-10-05T11:00:00",
+                "pc-osa-kyo",
+                "大阪→京都",
+            ),
+            transport(
+                "tr-kyo-tyo",
+                "京都",
+                "东京",
+                "2026-10-06T10:00:00",
+                "2026-10-06T12:30:00",
+                "pc-kyo-bundle",
+                "京都→东京",
+            ),
+            transport(
+                "tr-tyo-hgh",
+                "东京",
+                "杭州",
+                "2026-10-08T14:00:00",
+                "2026-10-08T18:00:00",
+                "pc-tyo-hgh",
+                "东京→杭州",
+            ),
+        ),
+        stays=(
+            StayOffer(
+                id="stay-osa",
+                provider="frozen-fixture",
+                place_id="大阪",
+                check_in=date(2026, 10, 2),
+                check_out=date(2026, 10, 5),
+                price_contract_id="pc-osa-stay",
+                detail_url="fixture://stay-osa",
+                label="大阪住宿",
+            ),
+            StayOffer(
+                id="stay-kyo",
+                provider="frozen-fixture",
+                place_id="京都",
+                check_in=date(2026, 10, 5),
+                check_out=date(2026, 10, 6),
+                price_contract_id="pc-kyo-bundle",
+                detail_url="fixture://stay-kyo",
+                label="京都住宿",
+            ),
+            StayOffer(
+                id="stay-kyo-invalid",
+                provider="frozen-fixture",
+                place_id="京都",
+                check_in=date(2026, 10, 5),
+                check_out=date(2026, 10, 5),
+                price_contract_id="pc-kyo-bundle",
+                detail_url="fixture://stay-kyo-invalid",
+                label="京都住宿（日期不足，不应入选）",
+            ),
+            StayOffer(
+                id="stay-tyo",
+                provider="frozen-fixture",
+                place_id="东京",
+                check_in=date(2026, 10, 6),
+                check_out=date(2026, 10, 8),
+                price_contract_id="pc-tyo-stay",
+                detail_url="fixture://stay-tyo",
+                label="东京住宿",
+            ),
+        ),
+    )
+    # Small exhaustive oracle: CP-SAT must match the exact minimum without
+    # using this Cartesian enumeration in production.
+    contracts_by_id = {item.id: item for item in fixture_contracts}
+    oracle_totals: list[int] = []
+    stay_slots = tuple(
+        tuple(item for item in fixture_catalog.stays if item.place_id == place)
+        for place in ("大阪", "京都", "东京")
+    )
+    for stays in product(*stay_slots):
+        transport_dates = (
+            fixture_catalog.transports[0].arrival.date(),
+            fixture_catalog.transports[1].arrival.date(),
+            fixture_catalog.transports[2].arrival.date(),
+        )
+        departure_dates = (
+            fixture_catalog.transports[1].departure.date(),
+            fixture_catalog.transports[2].departure.date(),
+            fixture_catalog.transports[3].departure.date(),
+        )
+        if not all(
+            stay.check_in <= arrival and stay.check_out >= departure
+            for stay, arrival, departure in zip(
+                stays, transport_dates, departure_dates, strict=True
+            )
+        ):
+            continue
+        contract_ids = {
+            *(item.price_contract_id for item in fixture_catalog.transports),
+            *(item.price_contract_id for item in stays),
+        }
+        oracle_totals.append(
+            sum(contracts_by_id[item].total_for_party_cents for item in contract_ids)
+        )
+    assert min(oracle_totals) == 852_000
+
+    class FrozenComplexProvider:
+        def catalog_for(self, _intent: Any) -> tuple[OfferCatalog, tuple[PriceContract, ...]]:
+            return fixture_catalog, fixture_contracts
+
+    class ExplodingLegacyParser:
+        async def parse(self, _request: Any) -> Any:
+            raise AssertionError("complex requests must not call the legacy parser")
+
+    monkeypatch.setattr(app.state, "complex_offer_provider", FrozenComplexProvider(), raising=False)
+    monkeypatch.setattr(app.state, "package_requirement_agent", ExplodingLegacyParser())
+    monkeypatch.setattr(
+        app.state,
+        "live_run_cache",
+        LiveRunCache(capacity=8, ttl=timedelta(minutes=5), now=lambda: NOW),
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51354)),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=text, max_pairs=1),
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["interpretation"] is None
+    assert "complex_plan" not in body
+    intent = body["travel_intent"]
+    card = body["trip_card"]
+    assert card["status"] == "candidate"
+    assert card["total_cny_cents"] == 852_000
+    assert card["city_order"] == ["大阪", "京都", "东京"]
+    assert card["traveler_count"] == 2
+    assert intent["window"]["start"].startswith("2026-10-02")
+    assert intent["window"]["end"].startswith("2026-10-08")
+    assert intent["anchors"][0]["traveler_count"] == 2
+    assert len(card["components"]) == 7
+    assert len(card["fixed_activities"]) == 1
+    assert "stay-kyo-invalid" not in {
+        item["offer_id"] for item in card["components"]
+    }
+    bundle_contract = next(
+        item for item in card["price_contracts"] if item["id"] == "pc-kyo-bundle"
+    )
+    assert bundle_contract["shared"] is True
+    assert set(bundle_contract["component_ids"]) == {"tr-kyo-tyo", "stay-kyo"}
+    assert body["source_statuses"][0]["state"] == "succeeded"
+    assert "报价目录" in body["execution_boundary"]
+
+    provided_activity_text = text.replace(
+        "活动费用未提供", "活动已支付总费用1000元"
+    )
+    arrow_text = (
+        "2名成人从杭州出发，2026-10-02 杭州→大阪，2026-10-05 去京都，"
+        "2026-10-08 从东京返杭；2026-10-03 19:00-21:30 在大阪有演唱会，"
+        "活动费用未提供；活动前至少留90分钟缓冲。"
+    )
+    shorthand_text = (
+        "2名成人从杭州出发，10/2 到大阪，10/5 去京都，"
+        "10/8 从东京返回杭州；10/3 19:00-21:30 在大阪有演唱会，"
+        "活动费用未提供；活动前至少留90分钟缓冲。"
+    )
+    no_space_chinese_date_text = (
+        "2名成人，2026年10月2日杭州出发到大阪，2026年10月5日去京都，"
+        "2026年10月8日从东京返回杭州；2026年10月3日19:00-21:30在大阪有演唱会，"
+        "活动费用未提供；活动前至少留90分钟缓冲。"
+    )
+    chinese_short_date_text = (
+        "2名成人，10月2日杭州出发到大阪，10月5日去京都，"
+        "10月8日从东京返回杭州；10月3日19:00-21:30在大阪有演唱会，"
+        "活动费用未提供；活动前至少留90分钟缓冲。"
+    )
+    reversed_activity_text = text.replace("19:00-21:30", "21:30-19:00")
+    start_only_activity_text = text.replace("19:00-21:30", "19:00")
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51356)),
+        base_url="http://test",
+    ) as client:
+        provided_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=provided_activity_text, max_pairs=1),
+        )
+        arrow_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=arrow_text, max_pairs=1),
+        )
+        start_only_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=start_only_activity_text, max_pairs=1),
+        )
+        shorthand_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=shorthand_text, max_pairs=1),
+        )
+        no_space_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=no_space_chinese_date_text, max_pairs=1),
+        )
+        chinese_short_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=chinese_short_date_text, max_pairs=1),
+        )
+        reversed_activity_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=reversed_activity_text, max_pairs=1),
+        )
+    assert provided_response.status_code == 200, provided_response.text
+    provided_card = provided_response.json()["trip_card"]
+    assert provided_card["total_cny_cents"] == 952_000
+    assert provided_card["activity_price_included"] is True
+    assert any(
+        item["id"].startswith("user-activity:")
+        for item in provided_card["price_contracts"]
+    )
+    assert arrow_response.status_code == 200, arrow_response.text
+    arrow_intent = arrow_response.json()["travel_intent"]
+    assert arrow_intent["route_legs"][-1]["origin_place_id"] == "东京"
+    assert arrow_intent["route_legs"][-1]["destination_place_id"] == "杭州"
+    assert start_only_response.status_code == 200, start_only_response.text
+    start_only_card = start_only_response.json()["trip_card"]
+    assert start_only_card["total_cny_cents"] is None
+    assert start_only_card["activity_price_included"] is False
+    assert any("结束时间待确认" in item for item in start_only_card["unresolved_items"])
+    assert shorthand_response.status_code == 200, shorthand_response.text
+    shorthand_body = shorthand_response.json()
+    assert shorthand_body["interpretation"] is None
+    assert shorthand_body["trip_card"]["total_cny_cents"] == 852_000
+    assert shorthand_body["travel_intent"]["window"]["start"].startswith("2026-10-02")
+    assert shorthand_body["travel_intent"]["route_legs"][-1][
+        "departure_date"
+    ] == "2026-10-08"
+    for chinese_date_response in (no_space_response, chinese_short_response):
+        assert chinese_date_response.status_code == 200, chinese_date_response.text
+        chinese_date_body = chinese_date_response.json()
+        assert chinese_date_body["interpretation"] is None
+        assert chinese_date_body["trip_card"]["total_cny_cents"] == 852_000
+        assert chinese_date_body["travel_intent"]["origin"]["id"] == "杭州"
+    assert reversed_activity_response.status_code == 200
+    reversed_activity_card = reversed_activity_response.json()["trip_card"]
+    assert reversed_activity_card["status"] == "no_solution"
+    assert reversed_activity_card["total_cny_cents"] is None
+    assert len(reversed_activity_card["fixed_activities"]) == 1
+
+    invalid_return = next(
+        item for item in fixture_catalog.transports if item.id == "tr-tyo-hgh"
+    ).model_copy(
+        update={
+            "departure": datetime.fromisoformat("2026-10-09T14:00:00"),
+            "arrival": datetime.fromisoformat("2026-10-09T18:00:00"),
+        }
+    )
+    invalid_catalog = fixture_catalog.model_copy(
+        update={
+            "transports": tuple(
+                invalid_return if item.id == "tr-tyo-hgh" else item
+                for item in fixture_catalog.transports
+            )
+        }
+    )
+
+    class OutOfWindowProvider:
+        def catalog_for(self, _intent: Any) -> tuple[OfferCatalog, tuple[PriceContract, ...]]:
+            return invalid_catalog, fixture_contracts
+
+    monkeypatch.setattr(app.state, "complex_offer_provider", OutOfWindowProvider())
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51357)),
+        base_url="http://test",
+    ) as client:
+        invalid_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=text, max_pairs=1),
+        )
+    assert invalid_response.status_code == 200, invalid_response.text
+    invalid_card = invalid_response.json()["trip_card"]
+    assert invalid_card["status"] == "no_solution"
+    assert invalid_card["total_cny_cents"] is None
+    assert len(invalid_card["fixed_activities"]) == 1
+    assert "满足全部约束" in invalid_card["source_boundary"]
+
+    reversed_transport = next(
+        item for item in fixture_catalog.transports if item.id == "tr-kyo-tyo"
+    ).model_copy(update={"arrival": datetime.fromisoformat("2026-10-06T09:00:00")})
+    reversed_transport_catalog = fixture_catalog.model_copy(
+        update={
+            "transports": tuple(
+                reversed_transport if item.id == "tr-kyo-tyo" else item
+                for item in fixture_catalog.transports
+            )
+        }
+    )
+    overlapping_transport = next(
+        item for item in fixture_catalog.transports if item.id == "tr-kyo-tyo"
+    ).model_copy(
+        update={
+            "departure": datetime.fromisoformat("2026-10-08T10:00:00"),
+            "arrival": datetime.fromisoformat("2026-10-08T15:00:00"),
+        }
+    )
+    overlapping_catalog = fixture_catalog.model_copy(
+        update={
+            "transports": tuple(
+                overlapping_transport if item.id == "tr-kyo-tyo" else item
+                for item in fixture_catalog.transports
+            )
+        }
+    )
+
+    class ReversedTransportProvider:
+        def catalog_for(self, _intent: Any) -> tuple[OfferCatalog, tuple[PriceContract, ...]]:
+            return reversed_transport_catalog, fixture_contracts
+
+    class OverlappingTransportProvider:
+        def catalog_for(self, _intent: Any) -> tuple[OfferCatalog, tuple[PriceContract, ...]]:
+            return overlapping_catalog, fixture_contracts
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51358)),
+        base_url="http://test",
+    ) as client:
+        monkeypatch.setattr(app.state, "complex_offer_provider", ReversedTransportProvider())
+        reversed_transport_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=text, max_pairs=1),
+        )
+        monkeypatch.setattr(app.state, "complex_offer_provider", OverlappingTransportProvider())
+        overlapping_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=text, max_pairs=1),
+        )
+    assert reversed_transport_response.status_code == 200
+    assert reversed_transport_response.json()["trip_card"]["status"] == "no_solution"
+    assert overlapping_response.status_code == 200
+    assert overlapping_response.json()["trip_card"]["status"] == "no_solution"
+
+    compiler = PlanningCompiler()
+    successful_graph = ComplexCatalogSolver().solve(
+        compiler.compile_problem(
+            fixture_intent,
+            offer_catalog=fixture_catalog,
+            price_contracts=fixture_contracts,
+        )
+    )
+    reverse_errors = validate_plan_graph(
+        successful_graph,
+        fixture_contracts,
+        intent=fixture_intent,
+        catalog=reversed_transport_catalog,
+    )
+    overlap_errors = validate_plan_graph(
+        successful_graph,
+        fixture_contracts,
+        intent=fixture_intent,
+        catalog=overlapping_catalog,
+    )
+    reversed_activity_intent = parse_complex_intent(reversed_activity_text)
+    assert reversed_activity_intent is not None
+    activity_errors = validate_plan_graph(
+        successful_graph,
+        fixture_contracts,
+        intent=reversed_activity_intent,
+        catalog=fixture_catalog,
+    )
+    assert any("到达时间" in item for item in reverse_errors)
+    assert any("相邻交通时间倒置" in item for item in overlap_errors)
+    assert any("活动结束时间" in item for item in activity_errors)
+
+    roundtrip_contract = PriceContract(
+        id="pc-roundtrip",
+        total_for_party_cents=324_000,
+        component_ids=("tr-hgh-osa", "tr-tyo-hgh"),
+        shared=True,
+        source="frozen_fixture",
+    )
+    roundtrip_contracts = (
+        *(
+            item
+            for item in fixture_contracts
+            if item.id not in {"pc-hgh-osa", "pc-tyo-hgh"}
+        ),
+        roundtrip_contract,
+    )
+    roundtrip_catalog = fixture_catalog.model_copy(
+        update={
+            "transports": tuple(
+                item.model_copy(update={"price_contract_id": "pc-roundtrip"})
+                if item.id in {"tr-hgh-osa", "tr-tyo-hgh"}
+                else item
+                for item in fixture_catalog.transports
+            )
+        }
+    )
+
+    class SharedRoundtripProvider:
+        def catalog_for(self, _intent: Any) -> tuple[OfferCatalog, tuple[PriceContract, ...]]:
+            return roundtrip_catalog, roundtrip_contracts
+
+    monkeypatch.setattr(app.state, "complex_offer_provider", SharedRoundtripProvider())
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51359)),
+        base_url="http://test",
+    ) as client:
+        roundtrip_response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=text, max_pairs=1),
+        )
+    assert roundtrip_response.status_code == 200, roundtrip_response.text
+    roundtrip_card = roundtrip_response.json()["trip_card"]
+    assert roundtrip_card["status"] == "candidate"
+    assert roundtrip_card["total_cny_cents"] == 852_000
+    projected_roundtrip = next(
+        item for item in roundtrip_card["price_contracts"] if item["id"] == "pc-roundtrip"
+    )
+    assert projected_roundtrip["shared"] is True
+    assert set(projected_roundtrip["component_ids"]) == {"tr-hgh-osa", "tr-tyo-hgh"}
+
+
+@pytest.mark.asyncio
+async def test_http_endpoint_reports_source_gap_without_frozen_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = (
+        "2名成人，2026-10-02 杭州出发到大阪，2026-10-05 去京都，"
+        "2026-10-08 从东京返回杭州；2026-10-03 19:00-21:30 在大阪有演唱会，"
+        "活动费用未提供；活动前至少留90分钟缓冲。"
+    )
+    monkeypatch.setattr(app.state, "package_requirement_agent", package_requirement_agent)
+    monkeypatch.setattr(
+        app.state,
+        "live_run_cache",
+        LiveRunCache(capacity=8, ttl=timedelta(minutes=5), now=lambda: NOW),
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51355)),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=text, max_pairs=1),
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["interpretation"] is None
+    assert "complex_plan" not in body
+    assert body["trip_card"]["status"] == "source_gap"
+    assert body["trip_card"]["total_cny_cents"] is None
+    assert body["trip_card"]["activity_price_included"] is False
+    assert len(body["trip_card"]["fixed_activities"]) == 1
+    assert body["trip_card"]["fixed_activities"][0]["label"] == "已持有演唱会"
+    assert body["source_statuses"][0]["state"] == "not_queried"
+    assert body["source_statuses"][0]["query_task_ids"]
 
 
 @pytest.mark.asyncio

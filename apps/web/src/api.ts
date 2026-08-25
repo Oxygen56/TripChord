@@ -855,8 +855,73 @@ export type BestAvailablePlanProjection = FinalPlanProjection & {
   advisory_note: string;
 };
 
+export type TripCardProjection = {
+  status: "final" | "candidate" | "source_gap" | "no_solution";
+  title: string;
+  start_date: string;
+  end_date: string;
+  city_order: string[];
+  traveler_count: number;
+  total_cny_cents: number | null;
+  activity_price_included: boolean;
+  unresolved_items: string[];
+  source_boundary: string;
+  query_captured_at: string;
+  source_statuses: SourceStatus[];
+  fixed_activities: TripCardComponent[];
+  price_contracts: Array<{
+    id: string;
+    currency: string;
+    total_for_party_cents: number;
+    component_ids: string[];
+    shared: boolean;
+    taxes_and_fees_included: boolean;
+    source: string;
+  }>;
+  components: TripCardComponent[];
+};
+
+export type TripCardComponent = {
+  kind: string;
+  offer_id: string;
+  label: string;
+  provider: string;
+  start: string;
+  end: string;
+  place_from?: string | null;
+  place_to?: string | null;
+  price_contract_id: string;
+  detail_url: string;
+  price_cny_cents: number | null;
+  shared_price_contract: boolean;
+};
+
+export type SourceStatus = {
+  source_id: string;
+  provider: string;
+  state: "pending" | "succeeded" | "failed" | "not_queried";
+  detail: string;
+  query_task_ids: string[];
+  captured_at: string;
+};
+
+export type TravelIntent = {
+  topology: "single_destination" | "multi_city";
+  travelers: number;
+  origin: { id: string; name: string; city: string };
+  places: Array<{ id: string; name: string; city: string }>;
+  window: { start: string; end: string };
+  route_legs: Array<{
+    origin_place_id: string;
+    destination_place_id: string;
+    departure_date: string | null;
+    earliest_departure_date: string | null;
+    latest_departure_date: string | null;
+  }>;
+};
+
 export type LiveFlexibleFromTextResponse = {
-  interpretation: PackageRequirementInterpretation;
+  interpretation: PackageRequirementInterpretation | null;
   run: FlexibleLiveAgentRun | null;
   final_plan?: FinalPlanProjection | null;
   best_available_plan?: BestAvailablePlanProjection | null;
@@ -866,6 +931,9 @@ export type LiveFlexibleFromTextResponse = {
   model_trace_success_count?: number;
   model_trace_failure_count?: number;
   execution_boundary: string;
+  trip_card?: TripCardProjection | null;
+  travel_intent?: TravelIntent | null;
+  source_statuses?: SourceStatus[];
 };
 
 export type LiveFlexibleFromTextInput = {
@@ -925,6 +993,14 @@ export type BreakfastPreferenceApplication = {
 export function getBreakfastPreferenceApplication(
   response: LiveFlexibleFromTextResponse,
 ): BreakfastPreferenceApplication {
+  if (!response.interpretation) {
+    return {
+      state: "unconfirmed",
+      mode: null,
+      weight: null,
+      reason: "该请求使用统一多城市意图，不适用旧单目的地早餐解析。",
+    };
+  }
   const rule = response.interpretation.preferences.rules.find(
     (candidate) => candidate.key === "hotel_breakfast",
   );

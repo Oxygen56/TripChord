@@ -45,6 +45,11 @@ from tripchord.jobs import JobSnapshot
 from tripchord.persistence.repository import WorkspaceSnapshot
 from tripchord.planning import ChineseRequirementParser, ItineraryOptimizer, PlanVerifier
 from tripchord.planning.adaptive import AdaptiveReplanResult
+from tripchord.planning.complex_trip import (
+    SourceStatus,
+    TravelIntent,
+    TripCardProjection,
+)
 from tripchord.planning.flexible_dates import FlexibleTravelWindow, PlatformFareCalendar
 from tripchord.planning.impact import PlanDependency
 from tripchord.planning.package import (
@@ -600,7 +605,7 @@ def _lodging_location_evidence_summary(
 
 
 class LiveFlexibleFromTextPlanningResponse(ApiModel):
-    interpretation: HybridPackageRequirementResult
+    interpretation: HybridPackageRequirementResult | None = None
     run: FlexibleLiveAgentRun | None = None
     final_plan: FinalPlanProjection | None = None
     recommendation_plan: BestAvailablePlanProjection | None = None
@@ -617,6 +622,9 @@ class LiveFlexibleFromTextPlanningResponse(ApiModel):
         "不保存或返回 prompt、模型响应正文、推理内容、Cookie、令牌或 API Key。"
     )
     execution_boundary: str = LIVE_FLEXIBLE_FROM_TEXT_EXECUTION_BOUNDARY
+    trip_card: TripCardProjection | None = None
+    travel_intent: TravelIntent | None = None
+    source_statuses: tuple[SourceStatus, ...] = ()
 
     @model_serializer(mode="wrap")
     def serialize_public(self, handler: Callable[[Any], Any]) -> Any:

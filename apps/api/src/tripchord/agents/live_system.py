@@ -108,6 +108,7 @@ from tripchord.agents.stay_area import (
 )
 from tripchord.agents.tools import ToolCall, ToolRegistry, ToolSpec
 from tripchord.domain.common import DomainModel
+from tripchord.planning.complex_trip import PackagePlannerAdapter
 from tripchord.planning.event_contracts import (
     EventDisposition,
     OfferEventResolution,
@@ -2006,6 +2007,11 @@ class LivePackageAgentSystem:
         self._kaani_lodging_provider = kaani_lodging_provider
         self._planner = PackagePlanner()
         self._verifier = PackageVerifier()
+        self._planner_adapter = PackagePlannerAdapter(
+            self._planner,
+            self._verifier,
+            now=self._now,
+        )
         self._package_reverifier = DeclarativePackageReVerifier()
         self._repairer = PackageRepairer(self._planner, self._verifier)
         self._orchestrator = PackageOrchestrator(self._verifier, self._repairer)
@@ -2685,11 +2691,10 @@ class LivePackageAgentSystem:
             lodgings=state.inventory.lodgings,
             transfers=state.inventory.transfers,
         )
-        planner = PackagePlanner()
         candidates = tuple(
             candidate
             for flight in comparison_flights
-            for candidate in planner.build_decision_only_candidates(
+            for candidate in self._planner.build_decision_only_candidates(
                 intent,
                 flight,
                 inventory,
@@ -2738,7 +2743,7 @@ class LivePackageAgentSystem:
         candidates = tuple(
             candidate
             for flight in comparison_flights
-            for candidate in PackagePlanner().build_decision_only_candidates(
+            for candidate in self._planner.build_decision_only_candidates(
                 intent,
                 flight,
                 inventory,
@@ -9257,7 +9262,10 @@ class LivePackageAgentSystem:
             _: ContextEngine,
             __: ToolRegistry,
         ) -> AgentTaskResult:
-            generation = self._planner.generate_bounded(intent, state.inventory)
+            # The live pipeline owns risk review, repair, and reverification.
+            # Preserve every bounded candidate here so those later stages can
+            # still repair a candidate that initially fails verification.
+            generation = self._planner_adapter.generate_bounded(intent, state.inventory)
             generated = generation.candidates
             state.candidate_generation_audit = generation.audit
             if state.stay_plan_candidate_set is not None:

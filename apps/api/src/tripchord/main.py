@@ -201,6 +201,15 @@ from tripchord.persistence.repository import (
 )
 from tripchord.planning.adaptive import AdaptiveReplanner
 from tripchord.planning.assembler import PlanningProblemAssembler, ReplayPlaceCatalog
+from tripchord.planning.complex_trip import (
+    ComplexCatalogSolver,
+    OfferCatalog,
+    PlanningCompiler,
+    SourceState,
+    SourceStatus,
+    project_package_result_trip_card,
+    project_trip_card,
+)
 from tripchord.planning.flexible_dates import (
     FlexibleDateExplorer,
     FlexibleQueryPlanBuilder,
@@ -2841,6 +2850,86 @@ async def _execute_live_flexible_from_text_body(
             await report_progress(stage, progress)
 
     await report("interpreting_requirement", 10)
+    compiler = PlanningCompiler()
+    complex_intent = compiler.compile(
+        payload.requirement.text,
+        reference_year=(
+            payload.requirement.reference_date.year
+            if payload.requirement.reference_date is not None
+            else None
+        ),
+    )
+    if complex_intent is not None:
+        captured_at = datetime.now(UTC)
+        complex_provider = getattr(target_app.state, "complex_offer_provider", None)
+        if complex_provider is not None:
+            complex_catalog, complex_contracts = complex_provider.catalog_for(complex_intent)
+            source_statuses = complex_catalog.source_statuses or (
+                SourceStatus(
+                    source_id=f"provider:{complex_provider.__class__.__name__}",
+                    provider=complex_provider.__class__.__name__,
+                    state=SourceState.SUCCEEDED,
+                    detail="来源目录已返回冻结或注入报价",
+                    query_task_ids=complex_catalog.query_tasks,
+                    captured_at=captured_at,
+                ),
+            )
+        else:
+            query_tasks = tuple(
+                f"query:transport:{leg.origin_place_id}-{leg.destination_place_id}"
+                for leg in complex_intent.route_legs
+            ) + tuple(f"query:stay:{place.id}" for place in complex_intent.places)
+            source_statuses = (
+                SourceStatus(
+                    source_id="complex-current-provider",
+                    provider="current-provider",
+                    state=SourceState.NOT_QUERIED,
+                    detail="当前多城市实时来源尚未接入",
+                    query_task_ids=query_tasks,
+                    captured_at=captured_at,
+                ),
+            )
+            complex_catalog = OfferCatalog(
+                query_tasks=query_tasks,
+                source_statuses=source_statuses,
+            )
+            complex_contracts = ()
+        graph = ComplexCatalogSolver().solve(
+            compiler.compile_problem(
+                complex_intent,
+                offer_catalog=complex_catalog,
+                price_contracts=complex_contracts,
+                captured_at=captured_at,
+            )
+        )
+        trip_card = project_trip_card(
+            complex_intent,
+            graph,
+            graph.price_contracts,
+            source_statuses,
+            captured_at=captured_at,
+        )
+        await report("solving_multi_city_catalog", 90)
+        return LiveFlexibleFromTextPlanningResponse(
+            interpretation=None,
+            final_plan=None,
+            recommendation_plan=None,
+            best_available_plan=None,
+            decision_candidates=(),
+            model_enhancement_enabled=False,
+            model_trace_scope_sha256=model_trace_scope_sha256,
+            model_trace_count=0,
+            model_trace_success_count=0,
+            model_trace_failure_count=0,
+            execution_boundary=(
+                "本次使用注入的有界报价目录完成约束求解；结果仅是目录内候选。"
+                if any(item.state == SourceState.SUCCEEDED for item in source_statuses)
+                else "多城市需求已结构化，当前实时来源尚未接入，未生成候选。"
+            ),
+            trip_card=trip_card,
+            travel_intent=complex_intent,
+            source_statuses=source_statuses,
+        )
     requirement_agent = cast(
         HybridPackageRequirementAgent,
         target_app.state.package_requirement_agent,
@@ -2888,6 +2977,7 @@ async def _execute_live_flexible_from_text_body(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="ready requirement interpretation did not provide executable constraints",
         )
+    travel_intent = compiler.from_package_interpretation(interpretation)
     # The parser builds the template before durable memory is loaded.  Project
     # the already-resolved effective constitution now, so long-term rules are
     # executable while current-trip explicit rules retain their precedence.
@@ -3076,12 +3166,26 @@ async def _execute_live_flexible_from_text_body(
         )
         execution_boundary = f"{execution_boundary}{assumption}"
     await report("assembling_result", 95)
+    final_projection = build_final_plan_projection(run)
+    recommendation_projection = build_best_available_plan_projection(run)
+    public_projection = final_projection or recommendation_projection
+    result_captured_at = datetime.now(UTC)
+    single_trip_card = (
+        project_package_result_trip_card(
+            travel_intent,
+            public_projection,
+            captured_at=result_captured_at,
+            execution_ready=final_projection is not None,
+        )
+        if public_projection is not None
+        else None
+    )
     return LiveFlexibleFromTextPlanningResponse(
         interpretation=interpretation,
         run=run,
-        final_plan=build_final_plan_projection(run),
-        recommendation_plan=build_best_available_plan_projection(run),
-        best_available_plan=build_best_available_plan_projection(run),
+        final_plan=final_projection,
+        recommendation_plan=recommendation_projection,
+        best_available_plan=recommendation_projection,
         decision_candidates=tuple(
             candidate
             for pair in run.pair_runs
@@ -3096,6 +3200,11 @@ async def _execute_live_flexible_from_text_body(
         model_trace_success_count=model_trace_success_count,
         model_trace_failure_count=model_trace_failure_count,
         execution_boundary=execution_boundary,
+        trip_card=single_trip_card,
+        travel_intent=travel_intent,
+        source_statuses=(
+            single_trip_card.source_statuses if single_trip_card is not None else ()
+        ),
     )
 
 
@@ -3295,9 +3404,12 @@ def _build_live_worker_result_importer(
             if key not in {"worker_runtime_receipt", "model_execution_receipt"}
         }
         response = LiveFlexibleFromTextPlanningResponse.model_validate(public_result)
-        if (response.interpretation.state == PackageRequestState.READY) != (
-            response.run is not None
-        ):
+        legacy_ready = (
+            response.interpretation is not None
+            and response.interpretation.state == PackageRequestState.READY
+        )
+        complex_ready = response.interpretation is None and response.travel_intent is not None
+        if not complex_ready and legacy_ready != (response.run is not None):
             raise RuntimeError("live planning worker result readiness is invalid")
         expected_pair_runs = (
             tuple(
