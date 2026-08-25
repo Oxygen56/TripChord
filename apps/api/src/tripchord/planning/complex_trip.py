@@ -11,7 +11,7 @@ from collections.abc import Awaitable
 from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 from itertools import pairwise
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import Field
 
@@ -113,6 +113,22 @@ class TripAnchor(DomainModel):
     provided_price_cny_cents: int | None = Field(default=None, ge=0)
 
 
+class ActivityRequirement(DomainModel):
+    """A user-requested, externally bookable activity slot.
+
+    ``TripAnchor`` remains the contract for an activity the traveler already
+    owns.  This separate requirement lets a provider offer a current activity
+    without treating a provider fact as if the user had already booked it.
+    """
+
+    id: str
+    place_id: str
+    activity_date: date
+    participant_ids: tuple[str, ...] = ()
+    name_hint: str = ""
+    required: bool = True
+
+
 class TripLegRequirement(DomainModel):
     id: str
     origin_place_id: str
@@ -140,6 +156,7 @@ class TravelIntent(DomainModel):
     window: TripWindow
     route_legs: tuple[TripLegRequirement, ...]
     anchors: tuple[TripAnchor, ...] = ()
+    activity_requirements: tuple[ActivityRequirement, ...] = ()
     traveler_profiles: tuple[Traveler, ...] = ()
     traveler_groups: tuple[TravelerGroup, ...] = ()
     stay_requirements: tuple[StayRequirement, ...] = ()
@@ -214,6 +231,14 @@ class PriceContract(DomainModel):
     shared_between_travelers: bool = False
     taxes_and_fees_included: bool = True
     source: str = "current"
+    # ``reference`` is an auditable display conversion (for example an iCom
+    # USD fare converted with ECB); it is never execution-ready.  Keeping the
+    # distinction in the shared contract prevents a provider adapter from
+    # silently upgrading an estimate to a payable CNY quote.
+    price_basis: Literal["confirmed", "reference", "unknown"] = "confirmed"
+    original_currency: str | None = None
+    original_total_for_party_cents: int | None = Field(default=None, ge=0)
+    price_boundary: str = ""
 
 
 class TransportOffer(DomainModel):
@@ -230,6 +255,7 @@ class TransportOffer(DomainModel):
     party_capacity_confirmed: bool = False
     available_units: int | None = Field(default=None, ge=0)
     transfer_count: int = Field(default=0, ge=0)
+    mode: str = "rail"
 
 
 class StayOffer(DomainModel):
@@ -246,6 +272,26 @@ class StayOffer(DomainModel):
     confirmed_room_count: int | None = Field(default=None, ge=1)
 
 
+class ActivityOffer(DomainModel):
+    """One dated provider activity option in the bounded offer catalog."""
+
+    id: str
+    provider: str
+    place_id: str
+    start: datetime
+    end: datetime
+    price_contract_id: str
+    detail_url: str
+    label: str
+    participant_ids: tuple[str, ...] = ()
+    party_capacity_confirmed: bool = False
+    available_units: int | None = Field(default=None, ge=0)
+    mode: str = "activity"
+    original_currency: str | None = None
+    original_price_for_party_cents: int | None = Field(default=None, ge=0)
+    price_boundary: str = ""
+
+
 class BundleOffer(DomainModel):
     id: str
     label: str
@@ -256,6 +302,7 @@ class BundleOffer(DomainModel):
 class OfferCatalog(DomainModel):
     transports: tuple[TransportOffer, ...] = ()
     stays: tuple[StayOffer, ...] = ()
+    activities: tuple[ActivityOffer, ...] = ()
     bundles: tuple[BundleOffer, ...] = ()
     query_tasks: tuple[str, ...] = ()
     source_statuses: tuple[SourceStatus, ...] = ()
@@ -278,6 +325,7 @@ class RequirementGraph(DomainModel):
     stay_requirements: tuple[StayRequirement, ...] = ()
     traveler_ids: tuple[str, ...] = ()
     anchor_ids: tuple[str, ...]
+    activity_requirement_ids: tuple[str, ...] = ()
     minimum_anchor_buffer_minutes: int
 
 
@@ -286,6 +334,7 @@ class OfferGraph(DomainModel):
 
     transport_offer_ids: tuple[str, ...] = ()
     stay_offer_ids: tuple[str, ...] = ()
+    activity_offer_ids: tuple[str, ...] = ()
     price_contract_ids: tuple[str, ...] = ()
 
 
@@ -315,6 +364,10 @@ class PlanComponent(DomainModel):
     price_cny_cents: int | None = None
     shared_price_contract: bool = False
     participant_ids: tuple[str, ...] = ()
+    price_basis: Literal["confirmed", "reference", "unknown"] = "confirmed"
+    original_currency: str | None = None
+    original_price_cents: int | None = Field(default=None, ge=0)
+    price_boundary: str = ""
 
 
 class PlanStatus(StrEnum):
@@ -505,11 +558,15 @@ class PlanningCompiler:
                 stay_requirements=intent.stay_requirements,
                 traveler_ids=_all_traveler_ids(intent),
                 anchor_ids=tuple(item.id for item in intent.anchors),
+                activity_requirement_ids=tuple(
+                    item.id for item in intent.activity_requirements
+                ),
                 minimum_anchor_buffer_minutes=intent.minimum_anchor_buffer_minutes,
             ),
             offer_graph=OfferGraph(
                 transport_offer_ids=tuple(item.id for item in catalog.transports),
                 stay_offer_ids=tuple(item.id for item in catalog.stays),
+                activity_offer_ids=tuple(item.id for item in catalog.activities),
                 price_contract_ids=tuple(item.id for item in price_contracts),
             ),
             offer_catalog=catalog,
@@ -790,8 +847,20 @@ def project_trip_card(
         for anchor in intent.anchors
     )
     components = tuple(item for item in graph.components if item.kind != "anchor")
-    activity_price_included = bool(intent.anchors) and all(
+    fixed_activity_price_included = bool(intent.anchors) and all(
         item.provided_price_cny_cents is not None for item in intent.anchors
+    )
+    online_activity_components = tuple(
+        item for item in components if item.kind == "activity"
+    )
+    activity_price_included = bool(intent.anchors or intent.activity_requirements) and (
+        not intent.anchors or fixed_activity_price_included
+    ) and (
+        not intent.activity_requirements
+        or (
+            bool(online_activity_components)
+            and all(item.price_basis == "confirmed" for item in online_activity_components)
+        )
     )
     source_gap = graph.status == PlanStatus.NO_SOLUTION and not any(
         item.state == SourceState.SUCCEEDED for item in source_statuses
@@ -839,9 +908,14 @@ def project_trip_card(
             *intent.unresolved_critical,
             *unresolved_items,
             *(
-                ("活动费用未提供，未计入总价。",)
-                if intent.anchors and not activity_price_included
+                ("已持有活动费用未提供，未计入总价。",)
+                if intent.anchors and not fixed_activity_price_included
                 else ()
+            ),
+            *tuple(
+                f"{item.label}价格为{item.price_basis}口径：{item.price_boundary}"
+                for item in online_activity_components
+                if item.price_basis != "confirmed"
             ),
         ),
         source_statuses=source_statuses,
@@ -1064,6 +1138,58 @@ def _stay_leg_indexes(
     return inbound[-1], outbound[0]
 
 
+def _activity_leg_indexes(
+    intent: TravelIntent,
+    requirement: ActivityRequirement,
+    traveler_id: str,
+) -> tuple[int, int] | None:
+    """Return the route legs bracketing a requested activity.
+
+    A provider activity is not a free-floating calendar item: each participant
+    must be able to arrive at its place and leave it again.  Route-leg order is
+    the authoritative topology; selected offer timestamps are checked by the
+    caller.  Keeping this lookup shared by the solver and the independent
+    validator prevents either side from silently accepting an unconnected
+    activity.
+    """
+
+    indexes = _traveler_leg_indexes(intent).get(traveler_id, ())
+    inbound = tuple(
+        index
+        for index in indexes
+        if intent.route_legs[index].destination_place_id == requirement.place_id
+    )
+    if not inbound:
+        return None
+    inbound_index = inbound[-1]
+    outbound = tuple(
+        index
+        for index in indexes
+        if index > inbound_index
+        and intent.route_legs[index].origin_place_id == requirement.place_id
+    )
+    if not outbound:
+        return None
+    return inbound_index, outbound[0]
+
+
+def _activity_stay_covers(
+    stay: StayOffer,
+    activity: ActivityOffer,
+    required_scope: set[str],
+    intent: TravelIntent,
+) -> bool:
+    """Whether a selected stay keeps the participants at the activity place."""
+
+    return (
+        stay.place_id == activity.place_id
+        and stay.check_in <= activity.start.date() < stay.check_out
+        and required_scope.issubset(
+            set(_participant_scope(stay.participant_ids, intent))
+        )
+    )
+
+
 def validate_plan_graph(
     plan: PlanGraph,
     contracts: tuple[PriceContract, ...],
@@ -1091,7 +1217,10 @@ def validate_plan_graph(
         component_contract = by_id[component.price_contract_id]
         if component_contract.currency != "CNY":
             errors.append(f"价格合同非人民币:{component_contract.id}")
-        if not component_contract.taxes_and_fees_included:
+        if (
+            not component_contract.taxes_and_fees_included
+            and component_contract.price_basis == "confirmed"
+        ):
             errors.append(f"价格合同税费未闭合:{component_contract.id}")
     components_by_contract: dict[str, set[str]] = {}
     for component in priced_components:
@@ -1140,6 +1269,7 @@ def validate_plan_graph(
             *(item.id for item in intent.route_legs),
             *expected_stay_component_ids,
             *(item.id for item in intent.anchors),
+            *(item.id for item in intent.activity_requirements),
         }
         if set(stable_component_ids) != expected_component_ids:
             errors.append("方案组件稳定标识与需求图不一致")
@@ -1341,6 +1471,97 @@ def validate_plan_graph(
                     stay_offer.check_out < outbound.departure.date()
                 ):
                     errors.append(f"住宿日期未覆盖:{stay.offer_id}")
+        activities = tuple(item for item in plan.components if item.kind == "activity")
+        activity_offers = {item.id: item for item in catalog.activities}
+        if len(activities) != len(intent.activity_requirements):
+            errors.append("在线活动数量与需求不一致")
+        for index, activity_requirement in enumerate(intent.activity_requirements):
+            if index >= len(activities):
+                break
+            activity_component = activities[index]
+            activity_offer = activity_offers.get(activity_component.offer_id)
+            if activity_offer is None:
+                errors.append(f"在线活动报价不存在:{activity_component.offer_id}")
+                continue
+            required_scope = set(
+                _participant_scope(activity_requirement.participant_ids, intent)
+            )
+            if (
+                activity_offer.place_id != activity_requirement.place_id
+                or activity_offer.start.date() != activity_requirement.activity_date
+                or set(_participant_scope(activity_offer.participant_ids, intent))
+                != required_scope
+                or set(_participant_scope(activity_component.participant_ids, intent))
+                != required_scope
+            ):
+                errors.append(f"在线活动地点、日期或同行者范围不匹配:{activity_offer.id}")
+            if _datetime_not_after(activity_offer.end, activity_offer.start):
+                errors.append(f"在线活动结束时间不得早于或等于开始:{activity_offer.id}")
+            if (
+                activity_offer.party_capacity_confirmed
+                and activity_offer.available_units is not None
+                and activity_offer.available_units < len(required_scope)
+            ):
+                errors.append(f"在线活动余位不足:{activity_offer.id}")
+            # A dated activity must be reachable from, and return to, the
+            # selected itinerary.  Checking only the activity's own date and
+            # place would incorrectly accept an activity that starts before
+            # the inbound transport arrives (or after the outbound transport
+            # has departed).
+            activity_buffer = timedelta(
+                minutes=intent.minimum_anchor_buffer_minutes
+            )
+            for traveler_id in required_scope:
+                leg_indexes = _activity_leg_indexes(
+                    intent,
+                    activity_requirement,
+                    traveler_id,
+                )
+                if leg_indexes is None:
+                    errors.append(
+                        f"在线活动同行者路线不完整:"
+                        f"{activity_offer.id}:{traveler_id}"
+                    )
+                    continue
+                inbound = selected_transport_offers[leg_indexes[0]]
+                outbound = selected_transport_offers[leg_indexes[1]]
+                if inbound is None or outbound is None:
+                    continue
+                if inbound.destination_place_id != activity_offer.place_id:
+                    errors.append(
+                        f"在线活动入场地点不连续:{activity_offer.id}:{traveler_id}"
+                    )
+                if outbound.origin_place_id != activity_offer.place_id:
+                    errors.append(
+                        f"在线活动离场地点不连续:{activity_offer.id}:{traveler_id}"
+                    )
+                if _datetime_after(inbound.arrival + activity_buffer, activity_offer.start):
+                    errors.append(
+                        f"在线活动早于到达或缓冲不足:{activity_offer.id}:{traveler_id}"
+                    )
+                if _datetime_after(
+                    activity_offer.end + activity_buffer,
+                    outbound.departure,
+                ):
+                    errors.append(
+                        f"在线活动晚于离开或缓冲不足:{activity_offer.id}:{traveler_id}"
+                    )
+                if stays and not any(
+                    stay_offer is not None
+                    and _activity_stay_covers(
+                        stay_offer,
+                        activity_offer,
+                        {traveler_id},
+                        intent,
+                    )
+                    for stay_offer in (
+                        stay_offers.get(stay_component.offer_id)
+                        for stay_component in stays
+                    )
+                ):
+                    errors.append(
+                        f"在线活动住宿地点或日期不可达:{activity_offer.id}:{traveler_id}"
+                    )
         for anchor in intent.anchors:
             if _datetime_not_after(anchor.end, anchor.start):
                 errors.append(f"固定活动结束时间不得早于或等于开始:{anchor.id}")
@@ -1411,6 +1632,9 @@ def current_complex_plan_execution_ready(
         item for item in graph.components if item.kind == "transport"
     )
     selected_stays = tuple(item for item in graph.components if item.kind == "stay")
+    selected_activities = tuple(
+        item for item in graph.components if item.kind == "activity"
+    )
     expected_stay_count = (
         len(intent.stay_requirements)
         if intent.stay_requirements
@@ -1419,10 +1643,21 @@ def current_complex_plan_execution_ready(
     if (
         len(selected_transports) != len(intent.route_legs)
         or len(selected_stays) != expected_stay_count
+        or len(selected_activities) != len(intent.activity_requirements)
     ):
         return False
     transport_by_id = {item.id: item for item in catalog.transports}
     stay_by_id = {item.id: item for item in catalog.stays}
+    activity_by_id = {item.id: item for item in catalog.activities}
+    contract_by_id = {item.id: item for item in graph.price_contracts}
+    if any(
+        contract_by_id.get(component.price_contract_id) is None
+        or contract_by_id[component.price_contract_id].price_basis != "confirmed"
+        or not contract_by_id[component.price_contract_id].taxes_and_fees_included
+        for component in graph.components
+        if component.price_contract_id != "user-provided-not-priced"
+    ):
+        return False
     for component in selected_transports:
         offer = transport_by_id.get(component.offer_id)
         required_capacity = len(_participant_scope(component.participant_ids, intent))
@@ -1455,6 +1690,20 @@ def current_complex_plan_execution_ready(
             or stay_offer.confirmed_room_count < required_rooms
             or set(_participant_scope(stay_offer.participant_ids, intent))
             != set(_participant_scope(component.participant_ids, intent))
+        ):
+            return False
+    for index, activity_component in enumerate(selected_activities):
+        activity = activity_by_id.get(activity_component.offer_id)
+        activity_requirement = intent.activity_requirements[index]
+        if (
+            activity is None
+            or activity.place_id != activity_requirement.place_id
+            or activity.start.date() != activity_requirement.activity_date
+            or not activity.party_capacity_confirmed
+            or activity.available_units is None
+            or activity.available_units < len(
+                _participant_scope(activity_requirement.participant_ids, intent)
+            )
         ):
             return False
     return not validate_plan_graph(
@@ -1703,7 +1952,17 @@ def is_complex_multi_city_request(text: str) -> bool:
     if return_match:
         stops.append(return_match.group(1))
     fixed_time = re.search(r"\d{1,2}:\d{2}", text)
-    return len(dates) >= 3 and len(stops) >= 2 and fixed_time is not None
+    if len(dates) >= 3 and len(stops) >= 2 and fixed_time is not None:
+        return True
+    # A single destination can still require the complex graph when the user
+    # explicitly asks for a provider activity or a non-rail transfer.  This
+    # keeps the new component types on the same formal path instead of routing
+    # them through the legacy package model.
+    return (
+        len(dates) >= 2
+        and len(stops) >= 1
+        and bool(re.search(r"在线|安排|浮潜|出海|轮渡|快船", text, re.IGNORECASE))
+    )
 
 
 def parse_complex_intent(text: str, *, reference_year: int | None = None) -> TravelIntent | None:
@@ -1729,6 +1988,15 @@ def parse_complex_intent(text: str, *, reference_year: int | None = None) -> Tra
         r"(?:^|[，,；。\s])(?:\d+\s*名?成人)?从?"
         r"([\u4e00-\u9fff]{2,12}?)(?=出发)",
         text,
+    ) or re.search(
+        # A non-flight leg may be written as “从机场乘轮渡到岛上”.  Keep the
+        # transport verb outside the place capture so the normalized identity
+        # remains usable by the provider adapters.
+        r"(?:^|[，,；。\s])(?:\d+\s*名?成人)?\s*从"
+        r"(?P<origin>[\u4e00-\u9fff]{2,12}?)"
+        r"(?:乘(?:轮渡|渡轮|快船|船|飞机|火车|高铁)[^，,；。]{0,8})?"
+        r"(?:出发)?(?:到|去)",
+        text,
     )
     if origin_match is None:
         return None
@@ -1736,10 +2004,18 @@ def parse_complex_intent(text: str, *, reference_year: int | None = None) -> Tra
         id=origin_match.group(1), name=origin_match.group(1), city=origin_match.group(1)
     )
     stop_names = re.findall(r"(?:出发到|到|去|→)([\u4e00-\u9fff]{2,12})", text)
-    return_match = re.search(r"从([\u4e00-\u9fff]{2,12})返回([\u4e00-\u9fff]{2,12})", text)
+    return_match = re.search(
+        r"从(?P<return_origin>[\u4e00-\u9fff]{2,12}?)"
+        r"(?:乘(?:轮渡|渡轮|快船|船|飞机|火车|高铁)[^，,；。]{0,8})?"
+        r"返回(?P<return_destination>[\u4e00-\u9fff]{2,12})",
+        text,
+    )
+    return_destination = (
+        return_match.group("return_destination") if return_match is not None else origin.id
+    )
     if return_match:
-        if not stop_names or stop_names[-1] != return_match.group(1):
-            stop_names.append(return_match.group(1))
+        if not stop_names or stop_names[-1] != return_match.group("return_origin"):
+            stop_names.append(return_match.group("return_origin"))
     else:
         short_return_place = re.search(
             r"从([\u4e00-\u9fff]{2,12}?)返(?:回)?[\u4e00-\u9fff]{1,8}", text
@@ -1747,10 +2023,10 @@ def parse_complex_intent(text: str, *, reference_year: int | None = None) -> Tra
         if short_return_place:
             stop_names.append(short_return_place.group(1))
     unique_stops = tuple(dict.fromkeys(stop_names))
-    if len(unique_stops) < 2:
+    if len(unique_stops) < 1:
         return None
     places = tuple(PlaceRef(id=name, name=name, city=name) for name in unique_stops)
-    route_places = (origin.id, *stop_names, origin.id)
+    route_places = (origin.id, *stop_names, return_destination)
     route_event_dates = [
         date(int(y), int(m), int(d))
         for y, m, d, _verb, _place in re.findall(
@@ -1759,6 +2035,23 @@ def parse_complex_intent(text: str, *, reference_year: int | None = None) -> Tra
             text,
         )
     ]
+    # “从X乘轮渡返回Y” is a return leg, but the generic event pattern above
+    # intentionally does not treat every “从” as a new stop.  Capture its
+    # explicit date separately and retain the order in the route contract.
+    return_date_match = re.search(
+        r"(?P<date>\d{4}[-年]\d{1,2}[-月]\d{1,2})[^，,；。]{0,16}?"
+        r"从[\u4e00-\u9fff]{2,12}?"
+        r"(?:乘(?:轮渡|渡轮|快船|船|飞机|火车|高铁)[^，,；。]{0,8})?"
+        r"返回[\u4e00-\u9fff]{2,12}",
+        text,
+    )
+    if return_date_match is not None:
+        raw_return_date = return_date_match.group("date")
+        match_parts = re.fullmatch(r"(\d{4})[-年](\d{1,2})[-月](\d{1,2})", raw_return_date)
+        if match_parts is not None:
+            parsed_return_date = date(*(int(item) for item in match_parts.groups()))
+            if not route_event_dates or route_event_dates[-1] != parsed_return_date:
+                route_event_dates.append(parsed_return_date)
     return_short_match = re.search(
         r"(\d{4})[-年](\d{1,2})[-月](\d{1,2}).{0,10}?返(?:回)?[\u4e00-\u9fff]{1,8}",
         text,
@@ -1836,6 +2129,65 @@ def parse_complex_intent(text: str, *, reference_year: int | None = None) -> Tra
                 }
             ),
         )
+    activity_requirements: tuple[ActivityRequirement, ...] = ()
+    # Only an explicit request to find/arrange an activity creates a provider
+    # requirement.  A fixed "已持有活动" remains a TripAnchor.
+    online_marker = re.search(
+        r"(?:在线|安排|参加|查询|预订).{0,24}(?:活动|浮潜|出海|海豚|潜水)",
+        text,
+        re.IGNORECASE,
+    )
+    if online_marker is not None:
+        marker_end = online_marker.start() + len(online_marker.group(0))
+        place_matches = re.findall(
+            r"(?:在|于)([A-Za-z\u4e00-\u9fff]{2,24})",
+            text[:marker_end],
+        )
+        place_ids = {item.id for item in places}
+        activity_place = next(
+            (value for value in reversed(place_matches) if value in place_ids),
+            places[-1].id if places else origin.id,
+        )
+        date_tokens = list(
+            re.finditer(r"(\d{4})[-年](\d{1,2})[-月](\d{1,2})", text)
+        )
+        preceding_dates = [
+            date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            for match in date_tokens
+            if match.start() < online_marker.start()
+        ]
+        # Prefer an explicit date in the same punctuation-delimited clause as
+        # the requested activity.  A route's later return date may occur before
+        # the marker in the full sentence, so taking max()/last global date can
+        # silently move the activity to the wrong day.
+        activity_clause = next(
+            (
+                clause
+                for clause in re.split(r"[；;。！？,，]", text)
+                if re.search(
+                    r"(?:在线|安排|参加|查询|预订).{0,24}(?:活动|浮潜|出海|海豚|潜水)",
+                    clause,
+                    re.IGNORECASE,
+                )
+            ),
+            "",
+        )
+        clause_date_match = re.search(
+            r"(\d{4})[-年](\d{1,2})[-月](\d{1,2})", activity_clause
+        )
+        if clause_date_match is not None:
+            activity_date = date(*(int(item) for item in clause_date_match.groups()))
+        else:
+            activity_date = preceding_dates[-1] if preceding_dates else parsed_dates[0]
+        activity_name = online_marker.group(0)
+        activity_requirements = (
+            ActivityRequirement(
+                id=f"activity-requirement:{activity_place}:{activity_date.isoformat()}",
+                place_id=activity_place,
+                activity_date=activity_date,
+                name_hint=activity_name,
+            ),
+        )
     buffer_match = re.search(r"至少留(\d+)分钟", text)
     return TravelIntent(
         travelers=traveler_count,
@@ -1847,6 +2199,7 @@ def parse_complex_intent(text: str, *, reference_year: int | None = None) -> Tra
         ),
         route_legs=route_legs,
         anchors=anchors,
+        activity_requirements=activity_requirements,
         minimum_anchor_buffer_minutes=int(buffer_match.group(1)) if buffer_match else 0,
         preference_summary="",
         unresolved_critical=unresolved_critical,
@@ -1889,15 +2242,49 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
                 source="user-provided",
             )
         )
+    known_contract_ids = {item.id for item in effective_contracts}
+    # Providers may expose an activity with no payable price contract yet.  A
+    # zero-valued advisory contract keeps the selected component visible while
+    # making the missing amount explicit; final execution readiness still
+    # rejects ``price_basis=unknown``.
+    for unpriced_activity in (*problem.offer_catalog.activities,):
+        if unpriced_activity.price_contract_id in known_contract_ids:
+            continue
+        if not unpriced_activity.price_contract_id.startswith("unpriced:"):
+            continue
+        effective_contracts.append(
+            PriceContract(
+                id=unpriced_activity.price_contract_id,
+                total_for_party_cents=0,
+                component_ids=(unpriced_activity.id,),
+                covered_traveler_ids=_participant_scope(
+                    unpriced_activity.participant_ids, intent
+                ),
+                shared_between_travelers=len(
+                    _participant_scope(unpriced_activity.participant_ids, intent)
+                ) > 1,
+                taxes_and_fees_included=False,
+                price_basis="unknown",
+                source=unpriced_activity.provider,
+                price_boundary=(
+                    unpriced_activity.price_boundary
+                    or "活动当前价格未形成可计价合同"
+                ),
+            )
+        )
+        known_contract_ids.add(unpriced_activity.price_contract_id)
     contracts = tuple(effective_contracts)
     by_contract = {item.id: item for item in contracts}
     bundle_by_contract = {item.price_contract_id: item for item in catalog.bundles}
-    all_offer_by_id: dict[str, TransportOffer | StayOffer] = {
+    all_offer_by_id: dict[str, TransportOffer | StayOffer | ActivityOffer] = {
         item.id: item for item in catalog.transports
     }
     all_offer_by_id.update({item.id: item for item in catalog.stays})
+    all_offer_by_id.update({item.id: item for item in catalog.activities})
 
-    def contract_for_offer(offer: TransportOffer | StayOffer) -> PriceContract | None:
+    def contract_for_offer(
+        offer: TransportOffer | StayOffer | ActivityOffer,
+    ) -> PriceContract | None:
         contract = by_contract.get(offer.price_contract_id)
         if contract is None or offer.id not in contract.component_ids:
             return None
@@ -1914,7 +2301,12 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
                 )
             ):
                 return None
-        if contract.currency != "CNY" or not contract.taxes_and_fees_included:
+        if contract.currency != "CNY":
+            return None
+        if (
+            not contract.taxes_and_fees_included
+            and contract.price_basis not in {"reference", "unknown"}
+        ):
             return None
         if intent.traveler_profiles:
             expected_covered = {
@@ -1939,6 +2331,10 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
         item.id: model.NewBoolVar(f"stay:{item.id}")  # type: ignore[attr-defined]
         for item in catalog.stays
     }
+    activity_vars = {
+        item.id: model.NewBoolVar(f"activity:{item.id}")  # type: ignore[attr-defined]
+        for item in catalog.activities
+    }
     contract_by_offer = {
         offer_id: contract_for_offer(offer)
         for offer_id, offer in all_offer_by_id.items()
@@ -1948,7 +2344,9 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
             variable = (
                 transport_vars[offer_id]
                 if offer_id in transport_vars
-                else stay_vars.get(offer_id)
+                else stay_vars[offer_id]
+                if offer_id in stay_vars
+                else activity_vars.get(offer_id)
             )
             if variable is not None:
                 model.Add(variable == 0)  # type: ignore[attr-defined]
@@ -1959,21 +2357,22 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
             _participant_scope(leg_requirement.participant_ids, intent)
         )
         leg_slot = tuple(
-            offer
-            for offer in catalog.transports
-            if (offer.origin_place_id, offer.destination_place_id)
+            transport_option
+            for transport_option in catalog.transports
+            if (transport_option.origin_place_id, transport_option.destination_place_id)
             == (
                 leg_requirement.origin_place_id,
                 leg_requirement.destination_place_id,
             )
-            and set(_participant_scope(offer.participant_ids, intent)) == required_scope
+            and set(_participant_scope(transport_option.participant_ids, intent))
+            == required_scope
         )
         if not leg_slot:
             return _no_solution_graph(contracts, "当前来源缺少至少一个必要交通段")
         leg_options.append(leg_slot)
         model.Add(sum(transport_vars[item.id] for item in leg_slot) == 1)  # type: ignore[attr-defined]
-        for offer in leg_slot:
-            departure_date = offer.departure.date()
+        for transport_option in leg_slot:
+            departure_date = transport_option.departure.date()
             valid = (
                 (
                     leg_requirement.departure_date is None
@@ -1987,21 +2386,27 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
                     leg_requirement.latest_departure_date is None
                     or departure_date <= leg_requirement.latest_departure_date
                 )
-                and _datetime_not_before(offer.departure, intent.window.start)
-                and not _datetime_after(offer.arrival, intent.window.end)
-                and _datetime_after(offer.arrival, offer.departure)
+                and _datetime_not_before(transport_option.departure, intent.window.start)
+                and not _datetime_after(transport_option.arrival, intent.window.end)
+                and _datetime_after(transport_option.arrival, transport_option.departure)
                 and (
                     not intent.traveler_profiles
                     or all(
-                        _datetime_not_before(offer.departure, traveler.available_window.start)
-                        and not _datetime_after(offer.arrival, traveler.available_window.end)
+                        _datetime_not_before(
+                            transport_option.departure,
+                            traveler.available_window.start,
+                        )
+                        and not _datetime_after(
+                            transport_option.arrival,
+                            traveler.available_window.end,
+                        )
                         for traveler in _intent_travelers(intent)
                         if traveler.id in required_scope
                     )
                 )
             )
             if not valid:
-                model.Add(transport_vars[offer.id] == 0)  # type: ignore[attr-defined]
+                model.Add(transport_vars[transport_option.id] == 0)  # type: ignore[attr-defined]
 
     stay_options: list[tuple[StayOffer, ...]] = []
     if intent.stay_requirements:
@@ -2102,6 +2507,110 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
                         model.Add(  # type: ignore[attr-defined]
                             stay_vars[stay.id] + transport_vars[outbound.id] <= 1
                         )
+    activity_options: list[tuple[ActivityOffer, ...]] = []
+    for requirement in intent.activity_requirements:
+        required_scope = set(_participant_scope(requirement.participant_ids, intent))
+        activity_options_for_requirement = tuple(
+            activity_option
+            for activity_option in catalog.activities
+            if activity_option.place_id == requirement.place_id
+            and activity_option.start.date() == requirement.activity_date
+            and set(_participant_scope(activity_option.participant_ids, intent))
+            == required_scope
+            and _datetime_after(activity_option.end, activity_option.start)
+            and _datetime_not_before(activity_option.start, intent.window.start)
+            and not _datetime_after(activity_option.end, intent.window.end)
+            and (
+                not requirement.name_hint
+                or any(
+                    token.lower() in activity_option.label.lower()
+                    for token in _activity_hint_tokens(requirement.name_hint)
+                )
+            )
+        )
+        if not activity_options_for_requirement and requirement.required:
+            return _no_solution_graph(
+                contracts,
+                f"当前来源缺少必要在线活动:{requirement.id}",
+            )
+        activity_options.append(activity_options_for_requirement)
+        if activity_options_for_requirement:
+            activity_selection = sum(
+                activity_vars[item.id] for item in activity_options_for_requirement
+            )
+            model.Add(activity_selection == 1)  # type: ignore[attr-defined]
+            for activity in activity_options_for_requirement:
+                if (
+                    activity.party_capacity_confirmed
+                    and activity.available_units is not None
+                    and activity.available_units < len(required_scope)
+                ):
+                    model.Add(activity_vars[activity.id] == 0)  # type: ignore[attr-defined]
+                activity_buffer = timedelta(
+                    minutes=intent.minimum_anchor_buffer_minutes
+                )
+                for traveler_id in required_scope:
+                    leg_indexes = _activity_leg_indexes(
+                        intent,
+                        requirement,
+                        traveler_id,
+                    )
+                    if leg_indexes is None:
+                        model.Add(activity_vars[activity.id] == 0)  # type: ignore[attr-defined]
+                        continue
+                    inbound_options = leg_options[leg_indexes[0]]
+                    outbound_options = leg_options[leg_indexes[1]]
+                    for inbound in inbound_options:
+                        if (
+                            inbound.destination_place_id != activity.place_id
+                            or _datetime_after(
+                                inbound.arrival + activity_buffer,
+                                activity.start,
+                            )
+                        ):
+                            model.Add(  # type: ignore[attr-defined]
+                                activity_vars[activity.id]
+                                + transport_vars[inbound.id]
+                                <= 1
+                            )
+                    for outbound in outbound_options:
+                        if (
+                            outbound.origin_place_id != activity.place_id
+                            or _datetime_after(
+                                activity.end + activity_buffer,
+                                outbound.departure,
+                            )
+                        ):
+                            model.Add(  # type: ignore[attr-defined]
+                                activity_vars[activity.id]
+                                + transport_vars[outbound.id]
+                                <= 1
+                            )
+                    if stay_options:
+                        compatible_stays = {
+                            stay.id
+                            for options in stay_options
+                            for stay in options
+                            if _activity_stay_covers(
+                                stay,
+                                activity,
+                                {traveler_id},
+                                intent,
+                            )
+                        }
+                        if not compatible_stays:
+                            model.Add(  # type: ignore[attr-defined]
+                                activity_vars[activity.id] == 0
+                            )
+                        else:
+                            for options in stay_options:
+                                for stay in options:
+                                    if stay.id not in compatible_stays:
+                                        model.Add(  # type: ignore[attr-defined]
+                                            activity_vars[activity.id]
+                                            + stay_vars[stay.id]
+                                            <= 1
+                                        )
     for anchor in intent.anchors:
         if not any(place.id == anchor.place_id for place in intent.places):
             return _no_solution_graph(contracts, f"固定活动地点不在路线中:{anchor.place_id}")
@@ -2140,8 +2649,10 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
             transport_vars[item]
             if item in transport_vars
             else stay_vars[item]
+            if item in stay_vars
+            else activity_vars[item]
             for item in contract.component_ids
-            if item in transport_vars or item in stay_vars
+            if item in transport_vars or item in stay_vars or item in activity_vars
         ]
         if len(component_vars) != len(contract.component_ids):
             model.Add(variable == 0)  # type: ignore[attr-defined]
@@ -2167,6 +2678,11 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
     selected_stays = tuple(
         next(item for item in options if solver.Value(stay_vars[item.id]))
         for options in stay_options
+    )
+    selected_activities = tuple(
+        next(item for item in options if solver.Value(activity_vars[item.id]))
+        for options in activity_options
+        if options
     )
     counted_contract_ids = tuple(
         item.id for item in contracts if solver.Value(contract_vars[item.id])
@@ -2196,7 +2712,19 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
         )
         for component_id, item in zip(stay_component_ids, selected_stays, strict=True)
     )
-    components = transport_components + stay_components + tuple(
+    activity_components = tuple(
+        _offer_component(
+            item,
+            by_contract[item.price_contract_id],
+            component_id=requirement.id,
+        )
+        for requirement, item in zip(
+            intent.activity_requirements,
+            selected_activities,
+            strict=True,
+        )
+    )
+    components = transport_components + stay_components + activity_components + tuple(
         PlanComponent(
             component_id=item.id,
             kind="anchor",
@@ -2217,9 +2745,14 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
         )
         for item in intent.anchors
     )
+    selected_has_advisory_price = any(
+        item.price_basis != "confirmed" for item in selected_contracts
+    )
     graph = PlanGraph(
         status=(
-            PlanStatus.OPTIMAL_IN_CATALOG
+            PlanStatus.FEASIBLE
+            if selected_has_advisory_price
+            else PlanStatus.OPTIMAL_IN_CATALOG
             if status == cp_model.OPTIMAL
             else PlanStatus.FEASIBLE
         ),
@@ -2234,10 +2767,14 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
             "交通时间连续",
             "住宿覆盖",
             "固定活动缓冲",
+            "在线活动与交通/住宿时间地点连续",
             "Bundle与价格合同唯一计价",
         ),
         claim_boundary=(
-            "仅对当前有界来源目录求得最优；不是实时全网最低价或锁价"
+            "当前目录含参考或未闭合价格，不能作为可订总价；"
+            "仅用于候选比较，不是锁价"
+            if selected_has_advisory_price
+            else "仅对当前有界来源目录求得最优；不是实时全网最低价或锁价"
             if status == cp_model.OPTIMAL
             else "当前有界来源目录内找到可行解，但未证明目录内最优；不是锁价"
         ),
@@ -2254,7 +2791,7 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
 
 
 def _offer_component(
-    offer: TransportOffer | StayOffer,
+    offer: TransportOffer | StayOffer | ActivityOffer,
     contract: PriceContract,
     *,
     component_id: str,
@@ -2273,9 +2810,44 @@ def _offer_component(
             place_to=offer.destination_place_id,
             price_contract_id=contract.id,
             detail_url=offer.detail_url,
-            price_cny_cents=None if shared else contract.total_for_party_cents,
+            price_cny_cents=(
+                None
+                if shared or contract.price_basis != "confirmed"
+                else contract.total_for_party_cents
+            ),
             shared_price_contract=shared,
             participant_ids=offer.participant_ids,
+            price_basis=contract.price_basis,
+            original_currency=contract.original_currency,
+            original_price_cents=contract.original_total_for_party_cents,
+            price_boundary=contract.price_boundary,
+        )
+    if isinstance(offer, ActivityOffer):
+        return PlanComponent(
+            component_id=component_id,
+            kind="activity",
+            offer_id=offer.id,
+            label=offer.label,
+            provider=offer.provider,
+            start=offer.start,
+            end=offer.end,
+            place_from=offer.place_id,
+            price_contract_id=contract.id,
+            detail_url=offer.detail_url,
+            price_cny_cents=(
+                None
+                if contract.price_basis != "confirmed"
+                else contract.total_for_party_cents
+            ),
+            shared_price_contract=shared,
+            participant_ids=offer.participant_ids,
+            price_basis=contract.price_basis,
+            original_currency=offer.original_currency or contract.original_currency,
+            original_price_cents=(
+                offer.original_price_for_party_cents
+                or contract.original_total_for_party_cents
+            ),
+            price_boundary=offer.price_boundary or contract.price_boundary,
         )
     return PlanComponent(
         component_id=component_id,
@@ -2288,9 +2860,17 @@ def _offer_component(
         place_from=offer.place_id,
         price_contract_id=contract.id,
         detail_url=offer.detail_url,
-        price_cny_cents=None if shared else contract.total_for_party_cents,
+        price_cny_cents=(
+            None
+            if shared or contract.price_basis != "confirmed"
+            else contract.total_for_party_cents
+        ),
         shared_price_contract=shared,
         participant_ids=offer.participant_ids,
+        price_basis=contract.price_basis,
+        original_currency=contract.original_currency,
+        original_price_cents=contract.original_total_for_party_cents,
+        price_boundary=contract.price_boundary,
     )
 
 
@@ -2303,3 +2883,11 @@ def _no_solution_graph(
         price_contracts=contracts,
         claim_boundary=boundary,
     )
+
+
+def _activity_hint_tokens(value: str) -> tuple[str, ...]:
+    normalized = re.sub(r"在线|安排|参加|查询|预订|活动", "", value, flags=re.IGNORECASE)
+    pieces = [item for item in re.findall(r"[A-Za-z]{2,}|[\u4e00-\u9fff]{2,}", normalized)]
+    if not pieces and normalized.strip():
+        pieces = [normalized.strip()]
+    return tuple(dict.fromkeys(pieces))

@@ -21,6 +21,7 @@ from pydantic import Field, JsonValue
 from tripchord.agents.models import AgentRole, PreferenceConstitution, PreferenceMode
 from tripchord.domain.common import DomainModel
 from tripchord.planning.complex_trip import (
+    ActivityOffer,
     OfferCatalog,
     PlanComponent,
     PlanDecisionMetrics,
@@ -35,6 +36,9 @@ from tripchord.planning.complex_trip import (
     StayOffer,
     TransportOffer,
     TravelIntent,
+    _activity_hint_tokens,
+    _activity_leg_indexes,
+    _activity_stay_covers,
     _anchor_leg_indexes,
     _datetime_after,
     _datetime_not_after,
@@ -489,17 +493,19 @@ def build_pareto_plans(
         )
     effective_contracts = tuple(contracts)
     by_contract = {item.id: item for item in effective_contracts}
-    all_offer_by_id: dict[str, TransportOffer | StayOffer] = {
+    all_offer_by_id: dict[str, TransportOffer | StayOffer | ActivityOffer] = {
         item.id: item for item in catalog.transports
     }
     all_offer_by_id.update({item.id: item for item in catalog.stays})
+    all_offer_by_id.update({item.id: item for item in catalog.activities})
 
-    def valid_contract(offer: TransportOffer | StayOffer) -> bool:
+    def valid_contract(offer: TransportOffer | StayOffer | ActivityOffer) -> bool:
         contract = by_contract.get(offer.price_contract_id)
         if (
             contract is None
             or offer.id not in contract.component_ids
             or contract.currency != "CNY"
+            or contract.price_basis != "confirmed"
             or not contract.taxes_and_fees_included
         ):
             return False
@@ -596,14 +602,65 @@ def build_pareto_plans(
                 return (), 0, 0, True
             stay_slots.append(stay_options)
 
-    slots: tuple[tuple[TransportOffer | StayOffer, ...], ...] = (
+    activity_slots: list[tuple[ActivityOffer, ...]] = []
+    for activity_requirement in intent.activity_requirements:
+        scope = set(
+            _participant_scope(activity_requirement.participant_ids, intent)
+        )
+        hint_tokens = _activity_hint_tokens(activity_requirement.name_hint)
+        activity_options = tuple(
+            offer
+            for offer in catalog.activities
+            if valid_contract(offer)
+            and offer.place_id == activity_requirement.place_id
+            and offer.start.date() == activity_requirement.activity_date
+            and set(_participant_scope(offer.participant_ids, intent)) == scope
+            and _datetime_after(offer.end, offer.start)
+            and _datetime_not_before(offer.start, intent.window.start)
+            and not _datetime_after(offer.end, intent.window.end)
+            and (
+                not hint_tokens
+                or any(
+                    token.lower() in offer.label.lower()
+                    for token in hint_tokens
+                )
+            )
+            and (
+                not offer.party_capacity_confirmed
+                or (
+                    offer.available_units is not None
+                    and offer.available_units >= len(scope)
+                )
+            )
+        )
+        if not activity_options:
+            return (), 0, 0, True
+        activity_slots.append(activity_options)
+
+    slots: tuple[tuple[TransportOffer | StayOffer | ActivityOffer, ...], ...] = (
         *transport_slots,
         *stay_slots,
+        *activity_slots,
     )
     theoretical = prod(len(item) for item in slots)
     if theoretical > enumeration_limit:
         graph = solve_complex_catalog(problem)
         if graph.status == PlanStatus.NO_SOLUTION:
+            return (), theoretical, 0, False
+        if any(
+            (
+                (contract := by_contract.get(component.price_contract_id)) is None
+                or contract.currency != "CNY"
+                or contract.price_basis != "confirmed"
+                or not contract.taxes_and_fees_included
+            )
+            for component in graph.components
+            if component.kind != "anchor"
+        ):
+            # The bounded fallback solver can intentionally return an advisory
+            # graph for reference-currency sources.  Such a graph belongs to
+            # the current-catalog candidate path, never to confirmed Pareto
+            # selection.
             return (), theoretical, 0, False
         metrics = _plan_metrics(graph, catalog, intent.preference_policy)
         return (
@@ -625,7 +682,9 @@ def build_pareto_plans(
     metrics_seen: set[tuple[int, int, int, int]] = set()
     feasible_count = 0
 
-    def complete_selection(selected: tuple[TransportOffer | StayOffer, ...]) -> None:
+    def complete_selection(
+        selected: tuple[TransportOffer | StayOffer | ActivityOffer, ...]
+    ) -> None:
         nonlocal feasible_count, frontier
         transports = tuple(
             item
@@ -634,10 +693,21 @@ def build_pareto_plans(
         )
         stays = tuple(
             item
-            for item in selected[len(transport_slots) :]
+            for item in selected[
+                len(transport_slots) : len(transport_slots) + len(stay_slots)
+            ]
             if isinstance(item, StayOffer)
         )
-        if len(transports) != len(transport_slots) or len(stays) != len(stay_slots):
+        activities = tuple(
+            item
+            for item in selected[len(transport_slots) + len(stay_slots) :]
+            if isinstance(item, ActivityOffer)
+        )
+        if (
+            len(transports) != len(transport_slots)
+            or len(stays) != len(stay_slots)
+            or len(activities) != len(activity_slots)
+        ):
             return
         for traveler_leg_indexes in traveler_indexes.values():
             for left, right in pairwise(traveler_leg_indexes):
@@ -683,6 +753,49 @@ def build_pareto_plans(
                     transports[anchor_leg_pair[1]].departure,
                 ):
                     return
+        for activity_requirement, activity in zip(
+            intent.activity_requirements,
+            activities,
+            strict=True,
+        ):
+            required_scope = set(
+                _participant_scope(activity_requirement.participant_ids, intent)
+            )
+            for traveler_id in required_scope:
+                activity_leg_pair = _activity_leg_indexes(
+                    intent,
+                    activity_requirement,
+                    traveler_id,
+                )
+                if activity_leg_pair is None:
+                    return
+                inbound = transports[activity_leg_pair[0]]
+                outbound = transports[activity_leg_pair[1]]
+                if (
+                    inbound.destination_place_id != activity.place_id
+                    or outbound.origin_place_id != activity.place_id
+                    or _datetime_after(
+                        inbound.arrival
+                        + timedelta(minutes=intent.minimum_anchor_buffer_minutes),
+                        activity.start,
+                    )
+                    or _datetime_after(
+                        activity.end
+                        + timedelta(minutes=intent.minimum_anchor_buffer_minutes),
+                        outbound.departure,
+                    )
+                ):
+                    return
+                if not any(
+                    _activity_stay_covers(
+                        stay,
+                        activity,
+                        {traveler_id},
+                        intent,
+                    )
+                    for stay in stays
+                ):
+                    return
         counted_ids = {item.price_contract_id for item in selected}
         counted_ids.update(activity_contract_ids)
         for contract_id in counted_ids:
@@ -710,6 +823,7 @@ def build_pareto_plans(
                     for index, item in enumerate(stays)
                 )
             ),
+            *(item.id for item in intent.activity_requirements),
         )
         components = tuple(
             _offer_component(
@@ -756,6 +870,7 @@ def build_pareto_plans(
                 "逐段地点、日期与人员范围",
                 "每位同行者时间连续",
                 "住宿覆盖与活动缓冲",
+                "在线活动与交通/住宿时间地点连续",
                 "价格合同唯一计价",
                 "当前有界目录精确Pareto枚举",
             ),
@@ -799,7 +914,7 @@ def build_pareto_plans(
 
     def visit(
         index: int,
-        selected: tuple[TransportOffer | StayOffer, ...],
+        selected: tuple[TransportOffer | StayOffer | ActivityOffer, ...],
     ) -> None:
         if index == len(slots):
             complete_selection(selected)

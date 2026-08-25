@@ -57,6 +57,12 @@ _TRIPCOM_CITIES = (
         city_name_en="Shanghai",
         aliases=frozenset({"上海", "shanghai"}),
     ),
+    TripComCityIdentity(
+        city_id=35851,
+        city_name="马富施",
+        city_name_en="Maafushi",
+        aliases=frozenset({"马富施", "马富士", "maafushi"}),
+    ),
 )
 
 

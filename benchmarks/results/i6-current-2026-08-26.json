@@ -1,0 +1,140 @@
+{
+  "schema_version": "tripchord-i6-current-e2e-v1",
+  "captured_at": "2026-08-25T21:48:29.665051Z",
+  "entrypoint": "POST /api/v1/agents/live-flexible-plan-from-text",
+  "response_status": 200,
+  "elapsed_seconds": 2.808,
+  "input": "2名成人，2026-08-30 从马累机场乘轮渡到马富施；2026-08-31 在马富施安排在线浮潜活动；2026-09-02 从马富施乘轮渡返回马累机场；住宿3晚，价格优先。",
+  "model_calls": 0,
+  "travel_intent": {
+    "origin": "马累机场",
+    "places": ["马富施"],
+    "route_legs": [
+      {"origin": "马累机场", "destination": "马富施", "departure_date": "2026-08-30"},
+      {"origin": "马富施", "destination": "马累机场", "departure_date": "2026-09-02"}
+    ],
+    "activity_requirements": [
+      {"place": "马富施", "date": "2026-08-31", "name_hint": "安排在线浮潜活动"}
+    ]
+  },
+  "trip_card": {
+    "status": "candidate",
+    "total_cny_cents": 311915,
+    "components": [
+      {
+        "kind": "transport",
+        "label": "Airport→Maafushi iCom Brown 07:30-08:15（轮渡）",
+        "provider": "icom-public-transfer",
+        "original_currency": "USD",
+        "original_price_cents": 6000,
+        "detail_url": "https://sfs-api.icomtours.com/api/v1/public/trips/schedules?date=2026-08-30"
+      },
+      {
+        "kind": "transport",
+        "label": "Maafushi→Airport iCom Brown 06:30-07:15（轮渡）",
+        "provider": "icom-public-transfer",
+        "original_currency": "USD",
+        "original_price_cents": 6000,
+        "detail_url": "https://sfs-api.icomtours.com/api/v1/public/trips/schedules?date=2026-09-02"
+      },
+      {
+        "kind": "stay",
+        "label": "Kuredhi Beach Inn｜Deluxe Double Room with Island View",
+        "provider": "trip.com",
+        "price_cny_cents": 137200,
+        "detail_url": "https://www.trip.com/hotels/list?city=35851&checkin=2026-08-30&checkout=2026-09-02&adult=2&children=0&crn=1&curr=CNY"
+      },
+      {
+        "kind": "activity",
+        "label": "Fish Tank（Maafushi出发，9:30-14:45）",
+        "provider": "icom-public-activity",
+        "start": "2026-08-31T09:30:00+05:00",
+        "end": "2026-08-31T14:45:00+05:00",
+        "original_currency": "USD",
+        "original_price_cents": 14000,
+        "detail_url": "https://www.icomtours.com/excursions/fish-tank"
+      }
+    ],
+    "source_boundary": "当前目录含参考或未闭合价格，不能作为可订总价；仅用于候选比较，不是锁价"
+  },
+  "source_statuses": [
+    {"source_id": "12306:bounded-current", "state": "not_queried", "detail": "12306当前参考路线尚不支持某个城市", "captured_at": "2026-08-25T21:48:27.581200Z"},
+    {"source_id": "trip.com:hotel:35851:2026-08-30:2026-09-02:2a", "state": "succeeded", "captured_at": "2026-08-25T21:48:28.826458Z"},
+    {"source_id": "icom:complex:leg:0", "state": "succeeded", "captured_at": "2026-08-25T21:48:29.648575Z"},
+    {"source_id": "icom:complex:leg:1", "state": "succeeded", "captured_at": "2026-08-25T21:48:29.665051Z"},
+    {"source_id": "icom:activity:activity-requirement:马富施:2026-08-31", "state": "succeeded", "captured_at": "2026-08-25T21:48:29.658701Z"}
+  ],
+  "query_task_count": 4,
+  "claims": [
+    "轮渡和活动的美元基础价按ECB参考汇率换算，仅用于候选比较",
+    "iCom税费、锁位与最终可订性未确认",
+    "结果不是全网最低价，也未付款或下单"
+  ],
+  "post_fix_connectivity_recheck": {
+    "captured_at": "2026-08-25T22:03:59.549996Z",
+    "elapsed_seconds": 3.065,
+    "response_status": 200,
+    "trip_card_status": "candidate",
+    "total_cny_cents": 311915,
+    "model_calls": 0,
+    "activity_date": "2026-08-31",
+    "activity_start": "2026-08-31T09:30:00+05:00",
+    "activity_end": "2026-08-31T14:45:00+05:00",
+    "connectivity_claim": "正式当前入口重跑通过；活动与入港轮渡、住宿和离港轮渡均满足统一连接校验",
+    "source_states": {
+      "12306:bounded-current": "not_queried",
+      "trip.com lodging": "succeeded",
+      "icom ferry outbound": "succeeded",
+      "icom ferry return": "succeeded",
+      "icom activity": "succeeded"
+    }
+  },
+  "post_pareto_activity_recheck": {
+    "captured_at": "2026-08-25T22:16:01.476230Z",
+    "elapsed_seconds": 3.477,
+    "response_status": 200,
+    "trip_card_status": "candidate",
+    "total_cny_cents": 311915,
+    "personalization": {
+      "selection_mode": "no_solution",
+      "pareto_candidate_count": 0,
+      "model_calls": 0
+    },
+    "components": [
+      "transport:Airport→Maafushi iCom Brown 07:30-08:15",
+      "transport:Maafushi→Airport iCom Brown 06:30-07:15",
+      "stay:Kuredhi Beach Inn｜Deluxe Double Room with Island View",
+      "activity:Fish Tank（Maafushi出发，9:30-14:45）"
+    ],
+    "activity_date": "2026-08-31",
+    "activity_start": "2026-08-31T09:30:00+05:00",
+    "activity_end": "2026-08-31T14:45:00+05:00",
+    "source_states": {
+      "12306": "not_queried",
+      "trip.com lodging": "succeeded",
+      "icom ferry outbound": "succeeded",
+      "icom ferry return": "succeeded",
+      "icom activity": "succeeded"
+    },
+    "boundary": "当前活动/轮渡为美元参考价或税费未闭合，因此未进入 confirmed Pareto；正式卡仍由统一复杂求解器输出 candidate，未锁价、未下单。"
+  },
+  "frozen_confirmed_activity_pareto_recheck": {
+    "captured_at": "2026-08-25T22:24:51.154947Z",
+    "elapsed_seconds": 0.0214,
+    "response_status": 200,
+    "trip_card_status": "final",
+    "total_cny_cents": 252277,
+    "personalization": {
+      "selection_mode": "single",
+      "pareto_candidate_count": 1,
+      "model_calls": 0
+    },
+    "components": [
+      ["transport", "f-out", "f-out:price"],
+      ["transport", "f-back", "f-back:price"],
+      ["stay", "stay", "stay:price"],
+      ["activity", "activity-fish-tank", "activity:price"]
+    ],
+    "boundary": "冻结确认合同只证明统一 Pareto 路径选择含在线活动的方案，不代表当前实时来源价格。"
+  }
+}
