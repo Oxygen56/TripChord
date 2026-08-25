@@ -1,5 +1,6 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
+from tripchord import __version__
 from tripchord.main import app
 
 
@@ -14,6 +15,7 @@ async def test_health() -> None:
 
     assert response.status_code == 200
     assert response.json()["service"] == "tripchord"
+    assert response.json()["version"] == __version__
     assert response.headers["X-Request-ID"] == "test-request-1"
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert "tripchord_http_requests_total" in metrics.text
