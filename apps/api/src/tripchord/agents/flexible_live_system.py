@@ -47,6 +47,7 @@ from tripchord.agents.live_jobs import (
 )
 from tripchord.agents.live_system import (
     ExactQuoteComparisonCoverage,
+    FlightSearchOutcomeState,
     LiveCoverageMode,
     LiveEvidenceScope,
     LiveFinalizationState,
@@ -77,6 +78,8 @@ from tripchord.planning.flexible_dates import (
     AuditableDatePair,
     DateExplorationResult,
     DateOptimalityStatus,
+    DatePairCoverageRecord,
+    DatePairCoverageStatus,
     FareDateHint,
     FlexibleDateExplorer,
     FlexibleQueryPlan,
@@ -160,7 +163,11 @@ INTERNAL_BENCHMARK_TOTAL_TIMEOUT_SECONDS = 530
 _FULL_WINDOW_PAIR_WORKERS = 30
 _FULL_WINDOW_FLIGHT_SCREEN_TIMEOUT_SECONDS = 60
 _FULL_WINDOW_ENRICHMENT_RESERVE_SECONDS = 150
-_FULL_WINDOW_RANGE_EXACT_PAIR_LIMIT = 3
+# A range calendar is a screening source, not a reason to silently discard
+# priced dates.  Once the calendar is complete enough to provide hints, the
+# exact frontier contains every priced cell; the global timeout remains the
+# only execution budget.
+_FULL_WINDOW_RANGE_EXACT_PAIR_LIMIT = 400
 _CTRIP_RANGE_MAX_VISIBLE_PAIRS = 7
 _CTRIP_RANGE_TASK_TIMEOUT_SECONDS = 180
 
@@ -904,6 +911,8 @@ class DateRangeScreeningReport(DomainModel):
     task_count: int = Field(ge=1)
     complete_visible_coverage: bool
     selected_pair_ids: tuple[str, ...] = ()
+    observed_pair_ids: tuple[str, ...] = ()
+    priced_pair_ids: tuple[str, ...] = ()
     receipt_sha256: tuple[str, ...] = ()
     captured_at: datetime
     warnings: tuple[str, ...] = ()
@@ -930,6 +939,13 @@ class FlexibleRankedOption(DomainModel):
     return_date: date
     decision_state: PackageDecisionState
     recommendable: bool
+    # Decision readiness is intentionally independent from the executable
+    # recommendation gate above.  A comparison quote may be useful for a
+    # human decision while still being unsuitable for booking/publication.
+    decision_ready: bool = False
+    decision_total_cny_cents: int | None = Field(default=None, ge=0)
+    decision_price_basis: str | None = None
+    bookability_status: str = "not_bookable"
     complete_cny_party_total: bool = False
     total_budget_cents: int | None = Field(default=None, ge=0)
     evidence_completeness: Decimal = Field(ge=0, le=1)
@@ -986,6 +1002,8 @@ class FlexibleLiveAgentRun(DomainModel):
     ranked_options: tuple[FlexibleRankedOption, ...] = Field(min_length=1)
     refinement_trace: tuple[AdaptiveRefinementDecision, ...] = ()
     recommended_option_ids: tuple[str, ...] = ()
+    recommendation_option_ids: tuple[str, ...] = ()
+    recommendation_status: str = "blocked"
     final_decision: PackageDecision
     query_strategy: QueryStrategyProposal | None = None
     query_agentic: AgenticRunSummary = Field(
@@ -1007,6 +1025,7 @@ class FlexibleLiveAgentRun(DomainModel):
     claim_boundary: str = Field(min_length=1)
     performance_report: FlexiblePerformanceReport | None = None
     date_range_screening: DateRangeScreeningReport | None = None
+    date_pair_coverage: tuple[DatePairCoverageRecord, ...] = ()
 
     @model_validator(mode="after")
     def validate_adaptive_control_audit(self) -> FlexibleLiveAgentRun:
@@ -1119,6 +1138,22 @@ class FlexibleLiveAgentRun(DomainModel):
             )
             if selected is None or not selected.complete_cny_party_total:
                 raise ValueError("the final recommendation must be a complete CNY party total")
+        if len(self.recommendation_option_ids) > 1:
+            raise ValueError("a run may expose at most one decision recommendation")
+        for option_id in self.recommendation_option_ids:
+            selected = next(
+                (option for option in self.ranked_options if option.option_id == option_id),
+                None,
+            )
+            if selected is None or not selected.decision_ready:
+                raise ValueError("decision recommendation must be marked decision_ready")
+        if self.recommendation_status not in {
+            "advisory_ready",
+            "decision_ready",
+            "execution_ready",
+            "blocked",
+        }:
+            raise ValueError("unknown recommendation status")
         unsafe = tuple(
             option.option_id
             for option in self.ranked_options
@@ -1452,8 +1487,15 @@ class FlexibleLiveAgentSystem:
             )
             priced.append((total_for_party_cents, pair_dates, pair_id_by_dates[pair_dates]))
         priced.sort(key=lambda item: (item[0], item[1][0], item[1][1]))
-        selected_pair_ids = tuple(item[2] for item in priced[:_FULL_WINDOW_RANGE_EXACT_PAIR_LIMIT])
+        selected_pair_ids = tuple(item[2] for item in priced)
         observed_pair_count = len(requested_pairs & set(cells_by_pair))
+        observed_pair_ids = tuple(
+            sorted(
+                pair_id_by_dates[pair_dates]
+                for pair_dates in cells_by_pair
+                if pair_dates in requested_pairs
+            )
+        )
         report = DateRangeScreeningReport(
             provider=TravelPlatform.CTRIP,
             requested_pair_count=len(requested_pairs),
@@ -1462,6 +1504,8 @@ class FlexibleLiveAgentSystem:
             task_count=len(submissions),
             complete_visible_coverage=observed_pair_count == len(requested_pairs),
             selected_pair_ids=selected_pair_ids,
+            observed_pair_ids=observed_pair_ids,
+            priced_pair_ids=tuple(item[2] for item in priced),
             receipt_sha256=tuple(receipts),
             captured_at=captured_at,
             warnings=(
@@ -1626,7 +1670,7 @@ class FlexibleLiveAgentSystem:
                     now=self._utc_now(),
                 )
                 exact_pair_budget = min(
-                    _FULL_WINDOW_RANGE_EXACT_PAIR_LIMIT,
+                    len(date_range_screening.selected_pair_ids),
                     exploration.universe_size,
                 )
                 range_screened_frontier = True
@@ -2133,7 +2177,7 @@ class FlexibleLiveAgentSystem:
                     canary_execution = await execute_pair(
                         canary_pair,
                         worker_index=0 if worker_pool_enabled else None,
-                        flight_screen_only=True,
+                        flight_screen_only=bulk_exploration,
                     )
                     await record_execution(canary_pair, canary_execution)
             batch = tuple(
@@ -2167,54 +2211,95 @@ class FlexibleLiveAgentSystem:
                 for worker_index in range(pair_worker_count):
                     task_group.create_task(worker(worker_index))
             if bulk_exploration:
+                # Every priced date receives an exact flight query.  Only the
+                # small, price-ranked frontier then receives the expensive
+                # lodging/transfer enrichment, in parallel, so a wide date
+                # window remains below the ten-minute product budget.
+                def qunar_comparison_flight(execution: FlexiblePairExecution) -> bool:
+                    """Prefer dates with an auditable Qunar comparison outcome.
 
-                def decision_total(execution: FlexiblePairExecution) -> tuple[int, str]:
-                    live_run = execution.run or execution.exploration_run
-                    decision = live_run.decision_only_candidate if live_run is not None else None
-                    if decision is None or live_run is None:
-                        return (10**18, execution.date_pair.id)
-                    foreign_lodging_cents = sum(
-                        lodging_reference_cny_if_comparable(
-                            lodging,
-                            decision.candidate.currency,
+                    The lightweight screen deliberately emits ``comparison_price_only``
+                    when the page exposes a dated, party-sized comparison fare but
+                    cannot establish bookability.  Looking only at normalized quotes
+                    (and requiring ``party_total_known``) silently discarded these
+                    useful dates and let Ctrip no-price hints crowd the enrichment
+                    frontier.
+                    """
+                    run = execution.run
+                    return bool(
+                        run is not None
+                        and any(
+                            outcome.provider == BrowserProvider.QUNAR
+                            and outcome.state == FlightSearchOutcomeState.COMPARISON_PRICE_ONLY
+                            and outcome.price_bearing_candidate_count > 0
+                            for outcome in run.flight_search_outcomes
                         )
-                        or 10**18
-                        for lodging in decision.candidate.lodgings
-                        if lodging.currency != decision.candidate.currency
-                    )
-                    transfer_cents = (
-                        live_run.icom_cny_reference_estimate.estimated_cny_cents
-                        if live_run.icom_cny_reference_estimate is not None
-                        else 10**18
-                    )
-                    return (
-                        decision.budget.confirmed_subtotal_cents
-                        + foreign_lodging_cents
-                        + transfer_cents,
-                        execution.date_pair.id,
                     )
 
-                enrichment_target = min(
-                    execution_by_pair.values(),
-                    key=decision_total,
-                    default=None,
-                )
-                elapsed_seconds = self._monotonic() - schedule_started
-                if (
-                    enrichment_target is not None
-                    and decision_total(enrichment_target)[0] < 10**18
-                    and total_timeout_seconds - elapsed_seconds
-                    >= _FULL_WINDOW_ENRICHMENT_RESERVE_SECONDS
-                ):
-                    enriched = await execute_pair(
-                        enrichment_target.date_pair,
-                        worker_index=0 if worker_pool_enabled else None,
+                def qunar_comparison_total(execution: FlexiblePairExecution) -> int:
+                    run = execution.run
+                    if run is None:
+                        return execution.date_pair.best_total_for_party_cents or 10**18
+                    return next(
+                        (
+                            result.quote.total_for_party_cents
+                            for result in run.normalization_results
+                            if result.usable
+                            and isinstance(result.quote, NormalizedFlightQuote)
+                            and result.quote.provider == BrowserProvider.QUNAR.value
+                            and result.quote.total_for_party_cents is not None
+                        ),
+                        execution.date_pair.best_total_for_party_cents or 10**18,
                     )
-                    if enriched.state == FlexiblePairState.COMPLETED and enriched.run is not None:
-                        execution_by_pair[enrichment_target.date_pair.id] = enriched
-                        full_window_enriched_pair_id = enrichment_target.date_pair.id
-                        if search_run_recorder is not None:
-                            await search_run_recorder(enriched.run)
+
+                frontier = tuple(
+                    sorted(
+                        (
+                            execution
+                            for execution in execution_by_pair.values()
+                            if execution.run is not None
+                        ),
+                        key=lambda execution: (
+                            0 if qunar_comparison_flight(execution) else 1,
+                            qunar_comparison_total(execution),
+                            execution.date_pair.id,
+                        ),
+                    )[:3]
+                )
+
+                async def enrich(
+                    execution: FlexiblePairExecution,
+                    enrichment_worker_index: int,
+                ) -> None:
+                    nonlocal full_window_enriched_pair_id
+                    enriched = await execute_pair(
+                        execution.date_pair,
+                        worker_index=(
+                            enrichment_worker_index if worker_pool_enabled else None
+                        ),
+                    )
+                    if enriched.state != FlexiblePairState.COMPLETED or enriched.run is None:
+                        return
+                    # Preserve the cheap, successful flight-screen run.  Full
+                    # enrichment may finish with lodging/transfer evidence but
+                    # lose the comparison-only flight outcome; ranking and the
+                    # user-facing recommendation can still use the audited
+                    # exploration evidence without pretending it is bookable.
+                    enriched = enriched.model_copy(
+                        update={"exploration_run": execution.run}
+                    )
+                    execution_by_pair[execution.date_pair.id] = enriched
+                    full_window_enriched_pair_id = full_window_enriched_pair_id or (
+                        execution.date_pair.id
+                    )
+                    if search_run_recorder is not None:
+                        await search_run_recorder(enriched.run)
+
+                async with asyncio.TaskGroup() as enrich_group:
+                    for enrichment_worker_index, execution in enumerate(frontier):
+                        enrich_group.create_task(
+                            enrich(execution, enrichment_worker_index)
+                        )
         while len(execution_by_pair) < effective_exact_pair_budget:
             refinement = self._date_refiner.next_pair(
                 planned_pairs,
@@ -2279,13 +2364,18 @@ class FlexibleLiveAgentSystem:
                 json.dumps(
                     {
                         "execution_mode": (
-                            "ctrip_range_screen_then_exact_frontier_then_best_date_enrichment"
+                            "ctrip_range_screen_then_parallel_exact_frontier"
                             if range_screened_frontier
                             else "full_window_flight_screen_then_best_date_enrichment"
                         ),
                         "tasks": [task.model_dump(mode="json") for task in actual_tasks],
                         "selected_pair_ids": [execution.date_pair.id for execution in executions],
-                        "enriched_pair_id": full_window_enriched_pair_id,
+                        "enriched_pair_ids": [
+                            execution.date_pair.id
+                            for execution in executions
+                            if execution.run is not None
+                            and execution.run.evidence_scope == LiveEvidenceScope.FULL_SEARCH
+                        ],
                     },
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -2293,9 +2383,8 @@ class FlexibleLiveAgentSystem:
                 ).encode()
             ).hexdigest()
             enrichment_warning = (
-                "已对当前基线最优日期补查 OTA 住宿；不声明其他日期已完成 OTA 住宿比价"
-                if full_window_enriched_pair_id is not None
-                else "本次未完成 OTA 住宿补查，住宿仅使用酒店官方来源比较"
+                "已对少量价格前沿日期并行执行完整住宿/接驳查询；其余日期仅完成航班精查，"
+                "未富化日期不得视为完整行程已核价"
             )
             query_plan = query_plan.model_copy(
                 update={
@@ -2533,6 +2622,12 @@ class FlexibleLiveAgentSystem:
         # carries exactly one final recommendation.  Publication refresh may
         # still re-check an explicitly requested second option for diagnostics.
         recommended = tuple(option.option_id for option in ranked if option.recommendable)[:1]
+        # A decision card is a separate product output: it may use a clearly
+        # labelled comparison/FX estimate even when the executable publication
+        # gate remains blocked by availability or unknown transfer taxes.
+        decision_recommendations = tuple(
+            option.option_id for option in ranked if option.decision_ready
+        )[:1]
         publication_refreshed = tuple(
             option.option_id
             for option in ranked
@@ -2577,11 +2672,7 @@ class FlexibleLiveAgentSystem:
                     else "本轮日期排序只比较各日期实际形成的同口径基线："
                     "实时航班结果、Kaani/Arena 酒店官方来源与 iCom 公开接驳；"
                 )
-                + (
-                    f"仅对基线最优日期 {full_window_enriched_pair_id} 补查 OTA 住宿。"
-                    if full_window_enriched_pair_id is not None
-                    else "本轮剩余时间不足，未补查任何日期的 OTA 住宿。"
-                )
+                + "随后仅对少量价格前沿日期并行执行完整住宿/接驳查询，其余日期保留航班筛选结果。"
                 + (
                     "批量栏起价只用于选候选，最终方案使用候选日期的精确结果；"
                     "不能声明所有平台逐日精确穷举后的全局最低价。"
@@ -2776,6 +2867,52 @@ class FlexibleLiveAgentSystem:
                 "internal flexible benchmark exceeded its 530s wall-clock budget: "
                 f"{performance_report.wall_time_seconds:.3f}s"
             )
+        executed_by_id = {item.date_pair.id: item for item in executions}
+        observed_range_ids = (
+            set(date_range_screening.observed_pair_ids)
+            if date_range_screening is not None
+            else set()
+        )
+        priced_range_ids = (
+            set(date_range_screening.priced_pair_ids)
+            if date_range_screening is not None
+            else set()
+        )
+        date_pair_coverage = tuple(
+            DatePairCoverageRecord(
+                date_pair_id=pair.id,
+                departure_date=pair.departure_date,
+                return_date=pair.return_date,
+                status=(
+                    DatePairCoverageStatus.EXACT_COMPLETED
+                    if execution.state == FlexiblePairState.COMPLETED
+                    else DatePairCoverageStatus.EXACT_FAILED
+                )
+                if (execution := executed_by_id.get(pair.id)) is not None
+                else (
+                    DatePairCoverageStatus.RANGE_PRICE_HINT
+                    if pair.id in priced_range_ids
+                    else (
+                        DatePairCoverageStatus.RANGE_NO_VISIBLE_PRICE
+                        if pair.id in observed_range_ids
+                        else DatePairCoverageStatus.RANGE_NOT_OBSERVED
+                    )
+                ),
+                source_refs=pair.evidence_refs,
+                reason=(
+                    "已执行该日期对的精确查询"
+                    if execution is not None and execution.state == FlexiblePairState.COMPLETED
+                    else "该日期对精确查询失败，已保留失败状态"
+                    if execution is not None
+                    else "批量日期栏显示人民币起价，已进入精确查询队列"
+                    if pair.id in priced_range_ids
+                    else "批量日期栏观察到该组合，但未显示可用人民币价格"
+                    if pair.id in observed_range_ids
+                    else "批量来源本轮未观察到该组合，按来源失败记录；不代表全网无价"
+                ),
+            )
+            for pair in exploration.candidates
+        )
         return FlexibleLiveAgentRun(
             requested_window=window,
             effective_window=effective_window,
@@ -2785,6 +2922,12 @@ class FlexibleLiveAgentSystem:
             ranked_options=ranked,
             refinement_trace=tuple(refinement_trace),
             recommended_option_ids=recommended,
+            recommendation_option_ids=decision_recommendations,
+            recommendation_status=(
+                "execution_ready"
+                if recommended
+                else ("decision_ready" if decision_recommendations else "blocked")
+            ),
             final_decision=final_decision,
             query_strategy=query_strategy,
             query_agentic=query_agentic,
@@ -2806,6 +2949,7 @@ class FlexibleLiveAgentSystem:
             claim_boundary=claim_boundary,
             performance_report=performance_report,
             date_range_screening=date_range_screening,
+            date_pair_coverage=date_pair_coverage,
         )
 
     async def _refresh_execution_for_publication(
@@ -4041,6 +4185,7 @@ class FlexibleLiveAgentSystem:
                         return_date=execution.date_pair.return_date,
                         decision_state=PackageDecisionState.HUMAN_BLOCK,
                         recommendable=False,
+                        decision_ready=False,
                         complete_cny_party_total=False,
                         evidence_completeness=Decimal(0),
                         all_platforms_complete=False,
@@ -4063,6 +4208,94 @@ class FlexibleLiveAgentSystem:
                 continue
             package = live_run.package
             total = package.budget.total_cents if package is not None else None
+            pricing_run = (
+                live_run
+                if package is not None or live_run.decision_only_candidate is not None
+                else (execution.exploration_run or live_run)
+            )
+            if (
+                pricing_run.decision_only_candidate is None
+                and execution.exploration_run is not None
+            ):
+                pricing_run = execution.exploration_run
+            decision_candidate = (
+                package.final_candidate
+                if package is not None
+                else (
+                    pricing_run.decision_only_candidate.candidate
+                    if pricing_run.decision_only_candidate is not None
+                    else None
+                )
+            )
+            decision_total: int | None = None
+            decision_basis: str | None = None
+            if decision_candidate is not None:
+                flight = decision_candidate.flight
+                flight_cny = (
+                    flight.total_for_party_cents
+                    if flight.currency == "CNY"
+                    and flight.party_total_known
+                    and flight.total_for_party_cents is not None
+                    else None
+                )
+                lodging_cny: list[int] = []
+                for lodging in decision_candidate.lodgings:
+                    amount = (
+                        lodging.total_for_party_cents
+                        if lodging.currency == "CNY"
+                        and lodging.total_for_party_cents is not None
+                        and lodging.total_for_party_cents > 0
+                        and lodging.taxes_and_fees_included is True
+                        else lodging_reference_cny_if_comparable(lodging, "CNY")
+                    )
+                    if amount is None:
+                        lodging_cny = []
+                        break
+                    lodging_cny.append(amount)
+                if flight_cny is not None and lodging_cny:
+                    # The API exposes the same audited projection as
+                    # ``estimated_total_cny_cents``.  Reconstruct that exact
+                    # contract first; component-level heuristics below only
+                    # handle the uncommon case where no projection exists.
+                    if (
+                        pricing_run.decision_only_candidate is not None
+                        and pricing_run.icom_cny_reference_estimate is not None
+                    ):
+                        foreign_reference = sum(lodging_cny)
+                        decision_total = (
+                            pricing_run.decision_only_candidate.budget.confirmed_subtotal_cents
+                            + foreign_reference
+                            + pricing_run.icom_cny_reference_estimate.estimated_cny_cents
+                        )
+                        decision_basis = "indicative_cny_total_plus_icom_reference"
+                    transfer_cny = 0
+                    transfer_unknown = False
+                    for transfer in decision_candidate.transfers:
+                        amount = (
+                            transfer.total_for_party_cents
+                            if transfer.currency == "CNY"
+                            and transfer.taxes_and_fees_included is True
+                            else lodging_reference_cny_if_comparable(transfer, "CNY")
+                        )
+                        if amount is None:
+                            transfer_unknown = True
+                            break
+                        transfer_cny += amount
+                    if decision_total is None and not transfer_unknown:
+                        decision_total = flight_cny + sum(lodging_cny) + transfer_cny
+                        decision_basis = "indicative_cny_total"
+                        if pricing_run.icom_cny_reference_estimate is not None:
+                            decision_total += (
+                                pricing_run.icom_cny_reference_estimate.estimated_cny_cents
+                            )
+                            decision_basis = "indicative_cny_total_plus_icom_reference"
+                    elif pricing_run.icom_cny_reference_estimate is not None:
+                        decision_total = (
+                            flight_cny
+                            + sum(lodging_cny)
+                            + pricing_run.icom_cny_reference_estimate.estimated_cny_cents
+                        )
+                        decision_basis = "indicative_cny_total_plus_icom_reference"
             completed_sources_by_platform = tuple(
                 (platform.terminal_outcome_source_ids or platform.successful_source_ids)
                 for platform in live_run.coverage
@@ -4092,6 +4325,17 @@ class FlexibleLiveAgentSystem:
                 and package.budget.is_all_in_total
                 and package.final_candidate.currency == "CNY"
                 and package.final_candidate.flight.party_total_known
+            )
+            decision_ready = bool(
+                decision_total is not None
+                and decision_candidate is not None
+                and len(
+                    {
+                        decision_candidate.flight.provider,
+                        *(item.provider for item in decision_candidate.lodgings),
+                    }
+                )
+                >= 2
             )
             recommendable = (
                 live_run.decision.state == PackageDecisionState.ACCEPT
@@ -4145,6 +4389,10 @@ class FlexibleLiveAgentSystem:
                     return_date=execution.date_pair.return_date,
                     decision_state=live_run.decision.state,
                     recommendable=recommendable,
+                    decision_ready=decision_ready,
+                    decision_total_cny_cents=decision_total,
+                    decision_price_basis=decision_basis,
+                    bookability_status=("bookable" if recommendable else "not_bookable"),
                     complete_cny_party_total=complete_cny_party_total,
                     total_budget_cents=total,
                     evidence_completeness=completeness,

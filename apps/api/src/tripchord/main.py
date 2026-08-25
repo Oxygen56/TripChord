@@ -2735,10 +2735,12 @@ async def live_flexible_agent_plan_endpoint(
             detail=str(exc),
         ) from exc
     run = await _attach_flexible_pair_icom_reference_estimates(run)
+    run = _attach_decision_recommendation_projection(run)
     handles = await _cache_flexible_pair_runs(run, cache, principal.tenant_id)
     return LiveFlexibleAgentPlanningResponse(
         run=run,
         final_plan=build_final_plan_projection(run),
+        recommendation_plan=build_best_available_plan_projection(run),
         cached_pair_runs=handles,
     )
 
@@ -3019,6 +3021,7 @@ async def _execute_live_flexible_from_text_body(
             detail=str(exc),
         ) from exc
     run = await _attach_flexible_pair_icom_reference_estimates(run)
+    run = _attach_decision_recommendation_projection(run)
     await report("caching_pair_runs", 90)
     if report_progress is not None:
         barrier_released_at = datetime.now(UTC)
@@ -3077,6 +3080,7 @@ async def _execute_live_flexible_from_text_body(
         interpretation=interpretation,
         run=run,
         final_plan=build_final_plan_projection(run),
+        recommendation_plan=build_best_available_plan_projection(run),
         best_available_plan=build_best_available_plan_projection(run),
         decision_candidates=tuple(
             candidate
@@ -3582,11 +3586,18 @@ def _with_current_final_plan_projection(
         return job
     final_payload = payload.get("final_plan")
     best_payload = payload.get("best_available_plan")
-    legacy_plan = final_payload if isinstance(final_payload, dict) else best_payload
+    recommendation_payload = payload.get("recommendation_plan")
+    legacy_plan = (
+        final_payload
+        if isinstance(final_payload, dict)
+        else (recommendation_payload if isinstance(recommendation_payload, dict) else best_payload)
+    )
     if not isinstance(legacy_plan, dict):
         return job
-    if legacy_plan.get("projection_schema_version") == "final-plan-projection-v2":
-        return job
+    # Always reproject a completed saved run: older versions could have placed
+    # a decision-only candidate in ``final_plan`` even when the strict package
+    # gate was blocked.  Schema compatibility alone cannot distinguish that
+    # semantic error from a genuine executable final plan.
     try:
         response = LiveFlexibleFromTextPlanningResponse.model_validate(payload)
     except ValidationError:
@@ -3594,17 +3605,50 @@ def _with_current_final_plan_projection(
     if response.run is None:
         return job
 
-    target_field = "final_plan" if isinstance(final_payload, dict) else "best_available_plan"
-    rebuilt = (
-        build_final_plan_projection(response.run)
-        if target_field == "final_plan"
-        else build_best_available_plan_projection(response.run)
-    )
-    if rebuilt is None or rebuilt.option_id != legacy_plan.get("option_id"):
+    if hasattr(response.run, "model_copy"):
+        advisory_run = response.run.model_copy(
+            update={
+                "recommendation_option_ids": (),
+                "recommendation_status": "advisory_ready",
+            }
+        )
+        rebuilt_final = build_final_plan_projection(advisory_run)
+        rebuilt_recommendation = build_best_available_plan_projection(advisory_run)
+    else:  # lightweight legacy projection test doubles
+        advisory_run = response.run
+        rebuilt_final = None
+        rebuilt_recommendation = build_best_available_plan_projection(advisory_run)
+    if (
+        rebuilt_final is not None
+        and isinstance(final_payload, dict)
+        and rebuilt_final.option_id != final_payload.get("option_id")
+    ):
+        return job
+    if (
+        rebuilt_recommendation is not None
+        and not isinstance(final_payload, dict)
+        and rebuilt_recommendation.option_id != legacy_plan.get("option_id")
+    ):
         return job
 
     upgraded_payload = dict(payload)
-    upgraded_payload[target_field] = rebuilt.model_dump(mode="json")
+    if hasattr(advisory_run, "model_dump"):
+        upgraded_payload["run"] = advisory_run.model_dump(mode="json")
+    upgraded_payload["final_plan"] = (
+        rebuilt_final.model_dump(mode="json") if rebuilt_final is not None else None
+    )
+    upgraded_payload["recommendation_plan"] = (
+        rebuilt_recommendation.model_dump(mode="json")
+        if rebuilt_recommendation is not None
+        else None
+    )
+    # Keep the old field as a compatibility alias, but never let it become the
+    # strict final plan. New clients should read recommendation_plan.
+    upgraded_payload["best_available_plan"] = (
+        rebuilt_recommendation.model_dump(mode="json")
+        if rebuilt_recommendation is not None
+        else None
+    )
     return job.model_copy(update={"result": upgraded_payload})
 
 
@@ -3774,6 +3818,40 @@ async def _attach_flexible_pair_icom_reference_estimates(
             )
         )
     return run.model_copy(update={"pair_runs": tuple(updated_pairs)})
+
+
+def _attach_decision_recommendation_projection(
+    run: FlexibleLiveAgentRun,
+) -> FlexibleLiveAgentRun:
+    """Copy the audited response projection into the diagnostic ranking.
+
+    The flexible runtime ranks before the API attaches the iCom FX estimate, so
+    its option-level decision total can be empty even though the response layer
+    has already produced a complete, auditable best-available projection.  Keep
+    the strict ``recommended_option_ids``/``final_plan`` gate untouched; this
+    only records that an advisory card is available.  It deliberately does not
+    mark the ranked option ``decision_ready`` because comparison-only/FX-
+    estimated data belongs to the advisory surface.
+    """
+    projection = build_best_available_plan_projection(run)
+    if projection is None or projection.estimated_total_cny_cents is None:
+        return run
+    option = next(
+        (
+            item
+            for item in run.ranked_options
+            if item.date_pair_id == projection.date_pair_id
+        ),
+        None,
+    )
+    if option is None:
+        return run
+    return run.model_copy(
+        update={
+            "recommendation_option_ids": (),
+            "recommendation_status": "advisory_ready",
+        }
+    )
 
 
 @app.post("/api/v1/agents/live-plan", response_model=LiveAgentPlanningResponse)

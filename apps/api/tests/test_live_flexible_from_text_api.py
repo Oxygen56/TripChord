@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 import pytest
+import tripchord.main as main_module
 from httpx import ASGITransport, AsyncClient
 from tripchord.agents.flexible_live_system import FlexibleLiveAgentSystem
 from tripchord.agents.live_system import (
@@ -87,6 +88,21 @@ FIXED_DATE_REQUEST = """出发地：杭州
 人数：2名成人
 酒店：1间房
 偏好：提供几个方案对比一下预算"""
+
+
+def _fixture_icom_cny_reference_estimate() -> IComCnyReferenceEstimate:
+    return IComCnyReferenceEstimate(
+        rate_date=date(2026, 8, 22),
+        captured_at=NOW,
+        usd_per_eur=Decimal("1"),
+        cny_per_eur=Decimal("6.720583"),
+        usd_to_cny_reference_rate=Decimal("6.720583"),
+        source_usd_base_fare_cents=12_000,
+        estimated_cny_cents=80_647,
+        price_contract_ids=("icom-contract-outbound", "icom-contract-return"),
+        transfer_ids=("icom-outbound", "icom-return"),
+        response_sha256="c" * 64,
+    )
 
 
 def _source_ids() -> tuple[str, ...]:
@@ -565,6 +581,11 @@ async def test_http_endpoint_projects_and_ranks_two_complete_decision_candidates
     """The public route must expose both candidates, not only a helper result."""
 
     pair_runner = _TwoCandidatePairRunner()
+    fixture_icom_estimate = _fixture_icom_cny_reference_estimate()
+
+    async def fixture_fetch_icom_estimate(**_: object) -> IComCnyReferenceEstimate:
+        return fixture_icom_estimate
+
     flexible = FlexibleLiveAgentSystem(
         pair_runner,
         now=lambda: NOW,
@@ -577,6 +598,11 @@ async def test_http_endpoint_projects_and_ranks_two_complete_decision_candidates
     monkeypatch.setattr(settings, "browser_bridge_require_all_providers", True)
     monkeypatch.setattr(settings, "browser_bridge_task_timeout_seconds", 60)
     monkeypatch.setattr(settings, "browser_bridge_flexible_timeout_seconds", 300)
+    monkeypatch.setattr(
+        main_module,
+        "fetch_icom_cny_reference_estimate",
+        fixture_fetch_icom_estimate,
+    )
 
     async with AsyncClient(
         transport=ASGITransport(app=app, client=("127.0.0.1", 51351)),
@@ -688,6 +714,11 @@ async def test_http_endpoint_does_not_rank_foreign_candidate_without_ecb_evidenc
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pair_runner = _TwoCandidatePairRunner(kaani_reference_complete=False)
+    fixture_icom_estimate = _fixture_icom_cny_reference_estimate()
+
+    async def fixture_fetch_icom_estimate(**_: object) -> IComCnyReferenceEstimate:
+        return fixture_icom_estimate
+
     flexible = FlexibleLiveAgentSystem(
         pair_runner,
         now=lambda: NOW,
@@ -703,6 +734,11 @@ async def test_http_endpoint_does_not_rank_foreign_candidate_without_ecb_evidenc
     monkeypatch.setattr(settings, "browser_bridge_require_all_providers", True)
     monkeypatch.setattr(settings, "browser_bridge_task_timeout_seconds", 60)
     monkeypatch.setattr(settings, "browser_bridge_flexible_timeout_seconds", 300)
+    monkeypatch.setattr(
+        main_module,
+        "fetch_icom_cny_reference_estimate",
+        fixture_fetch_icom_estimate,
+    )
 
     async with AsyncClient(
         transport=ASGITransport(app=app, client=("127.0.0.1", 51352)),

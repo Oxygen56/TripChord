@@ -63,6 +63,27 @@ class DateOptimalityStatus(StrEnum):
     BEST_VERIFIED_IN_EVALUATED_SET = "best_verified_in_evaluated_set"
 
 
+class DatePairCoverageStatus(StrEnum):
+    """Terminal accounting for every legal date pair in one request."""
+
+    EXACT_COMPLETED = "exact_completed"
+    EXACT_FAILED = "exact_failed"
+    RANGE_PRICE_HINT = "range_price_hint"
+    RANGE_NO_VISIBLE_PRICE = "range_no_visible_price"
+    RANGE_NOT_OBSERVED = "range_not_observed"
+
+
+class DatePairCoverageRecord(DomainModel):
+    """Make date coverage explicit instead of inferring it from Top-K runs."""
+
+    date_pair_id: str = Field(min_length=1)
+    departure_date: date
+    return_date: date
+    status: DatePairCoverageStatus
+    source_refs: tuple[str, ...] = ()
+    reason: str = Field(min_length=1)
+
+
 class AdmissibleCostBound(DomainModel):
     """A safe lower bound for branch-and-bound date pruning."""
 

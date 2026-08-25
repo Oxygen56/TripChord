@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import tripchord.agents.live_system as live_system_module
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
@@ -28,6 +29,7 @@ from tripchord.agents.live_system import (
     LiveEventReplanRun,
     LiveFinalizationState,
     LivePackageAgentRun,
+    LivePackageAgentSystem,
     LivePackageEvent,
     LiveRunPurpose,
     PlatformSearchCoverage,
@@ -87,6 +89,7 @@ from tripchord.providers.browser_bridge import (
     LIVE_V5_BROWSER_PROVIDERS,
     BrowserProvider,
     BrowserSearchQuery,
+    BrowserTaskBridge,
     BrowserVertical,
 )
 from tripchord.providers.icom_transfer import IComCnyReferenceEstimate
@@ -1849,3 +1852,51 @@ def test_decision_only_response_projection_contract_fixture() -> None:
     assert response.lodging_source_comparisons[1].source_type == "hotel_official"
     assert response.lodging_source_comparisons[1].eligible is False
     assert "位置依据不足" in response.lodging_source_comparisons[1].reason
+
+
+def test_ocean_grand_room_text_does_not_invent_transfer_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A room label is not evidence for a route, fare, schedule, or reservation."""
+    captured_at = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        live_system_module,
+        "_capture_ocean_grand_official_fact",
+        lambda: (captured_at, "a" * 64, "Free Airport Transfer; Hulhumale beachfront"),
+    )
+    lodging = NormalizedLodgingQuote(
+        id="ctrip:ocean-grand:room-label",
+        provider="ctrip",
+        currency="CNY",
+        total_for_party_cents=65_800,
+        taxes_and_fees_included=True,
+        captured_at=captured_at,
+        expires_at=captured_at + timedelta(minutes=10),
+        availability=QuoteAvailability.AVAILABLE,
+        evidence_refs=("https://example.test/ctrip/ocean-grand",),
+        property_name="Hotel Ocean Grand at Hulhumale",
+        area=PackageArea.AIRPORT_ISLAND,
+        check_in=date(2026, 9, 3),
+        check_out=date(2026, 9, 6),
+        adults=2,
+        rooms=1,
+        room_name="免费机场往返接送 30 分钟",
+        cancellation_policy="免费取消",
+    )
+    result = NormalizedBrowserQuoteResult(
+        provider="ctrip",
+        kind=BrowserVertical.LODGING,
+        status=QuoteNormalizationStatus.USABLE,
+        quote=lodging,
+    )
+    system = LivePackageAgentSystem(
+        BrowserTaskBridge(now=lambda: captured_at), now=lambda: captured_at
+    )
+
+    inventory = system._inventory_from_results((result,))
+
+    assert len(inventory.lodgings) == 1
+    assert inventory.lodgings[0].location_convenience == (
+        LodgingLocationConvenience.CONFIRMED_NOT_REMOTE
+    )
+    assert inventory.transfers == ()

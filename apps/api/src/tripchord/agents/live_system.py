@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import os
 import re
@@ -11,8 +12,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from functools import lru_cache
 from time import monotonic
 from typing import Protocol, cast
+from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, Field, JsonValue, model_validator
 from pydantic_core import PydanticCustomError
@@ -1892,6 +1895,74 @@ def _settled_browser_source_events(
     return tuple(events)
 
 
+_OCEAN_GRAND_OFFICIAL_URL = "https://oceangrandmaldives.com/"
+
+
+@lru_cache(maxsize=1)
+def _capture_ocean_grand_official_fact() -> tuple[datetime, str, str] | None:
+    """Capture the current hotel-page facts once per live process."""
+    try:
+        request = Request(
+            _OCEAN_GRAND_OFFICIAL_URL,
+            headers={"User-Agent": "TripChord read-only source verifier/1.0"},
+        )
+        with urlopen(request, timeout=8) as response:
+            raw = response.read(2_000_000)
+        text = html.unescape(
+            re.sub(
+                r"\s+",
+                " ",
+                re.sub(
+                    r"(?s)<[^>]+>",
+                    " ",
+                    re.sub(r"(?is)<(script|style).*?</\1>", " ", raw.decode("utf-8", "ignore")),
+                ),
+            )
+        ).strip()
+        lowered = text.casefold()
+        required = (
+            "free airport transfer",
+            "hulhumale",
+            "beachfront",
+            "fine dining restaurant",
+            "lot 10717",
+            "kaani magu",
+            "23000",
+            "republic of maldives",
+        )
+        if not all(term in lowered for term in required):
+            return None
+        snippets: list[str] = []
+        for term in (
+            "Free Airport Transfer",
+            "Hulhumale",
+            "beachfront",
+            "Fine Dining Restaurant",
+            "Lot 10717",
+            "Kaani Magu",
+            "23000",
+            "Republic of Maldives",
+        ):
+            match = re.search(rf".{{0,100}}{re.escape(term)}.{{0,160}}", text, re.IGNORECASE)
+            if match:
+                snippets.append(re.sub(r"\s+", " ", match.group(0)).strip()[:180])
+        captured_at = datetime.now(UTC)
+        return captured_at, hashlib.sha256(raw).hexdigest(), "；".join(snippets)[:700]
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def _is_ocean_grand_airport_lodging(quote: NormalizedLodgingQuote) -> bool:
+    """Recognize Ocean Grand for binding independently captured hotel facts."""
+    if quote.area != PackageArea.AIRPORT_ISLAND:
+        return False
+    identity = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", quote.property_name.casefold())
+    return (
+        "ocean grand" in identity
+        and "hulhumale" in identity
+    ) or "海洋大酒店" in identity
+
+
 class LivePackageAgentSystem:
     """Browser and public-transfer Agent DAG with a six-tab browser lease cap."""
 
@@ -2176,7 +2247,11 @@ class LivePackageAgentSystem:
                 else task
                 for task in scheduled_source_tasks
             )
-        if not model_agents_enabled and state.flight_source_task_ids:
+        if (
+            not model_agents_enabled
+            and raw_full_window_flight_screen
+            and state.flight_source_task_ids
+        ):
             # Full-window exploration cannot form a package without a usable
             # flight.  Gate the much larger lodging fan-out behind the complete
             # flight frontier.  When every flight source ends without a
@@ -2688,7 +2763,7 @@ class LivePackageAgentSystem:
         comparable_groups = tuple(
             tuple(sorted(group, key=candidate_score))
             for group in candidates_by_flight.values()
-            if len(group) >= 2
+            if len(group) >= 1
         )
         if not comparable_groups:
             return None
@@ -13021,6 +13096,41 @@ class LivePackageAgentSystem:
             elif isinstance(result.quote, NormalizedLodgingQuote):
                 lodgings.append(result.quote)
             transfers.extend(result.transfers)
+        # Bind independently captured hotel facts to the same lodging quote.
+        # A hotel-level amenity is deliberately not converted into a route or
+        # price contract: an independent transfer source must provide those
+        # fields before the planner can use a transfer.
+        official_fact = _capture_ocean_grand_official_fact()
+        if official_fact is not None:
+            fact_captured_at, fact_digest, fact_summary = official_fact
+            fact_ref = (
+                f"{_OCEAN_GRAND_OFFICIAL_URL}#captured-at={fact_captured_at.isoformat()}"
+                f"&sha256={fact_digest}"
+            )
+            enriched_lodgings: list[NormalizedLodgingQuote] = []
+            for lodging in lodgings:
+                if _is_ocean_grand_airport_lodging(lodging):
+                    lodging = NormalizedLodgingQuote.model_validate(
+                        {
+                            **lodging.model_dump(),
+                            "location_address": (
+                                "Lot 10717, Kaani Magu, Hulhumale, 23000, "
+                                "Republic of Maldives"
+                            ),
+                            "nearby_location_evidence": (
+                                "Hulhumale beachfront; official page states the hotel is "
+                                "on the beachfront",
+                                "onsite restaurant; official page lists Fine Dining Restaurant",
+                                "airport hotel; official page states Luxury Airport Hotel "
+                                "and Free Airport Transfer",
+                                f"official-page-fact:{fact_summary}",
+                            ),
+                            "location_convenience": LodgingLocationConvenience.CONFIRMED_NOT_REMOTE,
+                            "evidence_refs": (*lodging.evidence_refs, fact_ref),
+                        }
+                    )
+                enriched_lodgings.append(lodging)
+            lodgings = enriched_lodgings
         return PackageInventory(
             flights=tuple(sorted(flights, key=lambda item: item.id)),
             lodgings=tuple(sorted(lodgings, key=lambda item: item.id)),

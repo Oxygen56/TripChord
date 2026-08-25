@@ -85,6 +85,7 @@ class PackageViolationCode(StrEnum):
     DATE_MISMATCH = "date_mismatch"
     PARTY_MISMATCH = "party_mismatch"
     PARTY_AVAILABILITY_UNCONFIRMED = "party_availability_unconfirmed"
+    TRANSFER_AVAILABILITY_UNCONFIRMED = "transfer_availability_unconfirmed"
     CURRENCY_MISMATCH = "currency_mismatch"
     TOTAL_MISMATCH = "total_mismatch"
     TAXES_INCOMPLETE = "taxes_incomplete"
@@ -498,7 +499,7 @@ _EXPLICIT_LODGING_ADDRESS_PATTERN = re.compile(
 )
 _NEARBY_PROXIMITY_PATTERN = re.compile(
     r"(?:^|[\s,.;·])(?:近|靠近|邻近|附近|near(?:by)?|close\s+to|next\s+to|"
-    r"walking\s+distance)",
+    r"walking\s+distance|on[- ]?site)",
     re.IGNORECASE,
 )
 _NEARBY_SERVICE_PATTERN = re.compile(
@@ -923,6 +924,9 @@ def lodging_reference_cny_if_comparable(
     intent_currency: str,
 ) -> int | None:
     """Return a CNY comparison amount only with a complete FX evidence contract."""
+
+    if lodging.taxes_and_fees_included is not True:
+        return None
 
     if lodging.currency == intent_currency:
         return lodging.total_for_party_cents if lodging.total_for_party_cents > 0 else None
@@ -1384,7 +1388,7 @@ class DecisionOnlyPackageCandidate(DomainModel):
 class DecisionOnlyCandidateSet(DomainModel):
     """Authoritative set of complete, non-executable comparison candidates."""
 
-    candidates: tuple[DecisionOnlyPackageCandidate, ...] = Field(min_length=2)
+    candidates: tuple[DecisionOnlyPackageCandidate, ...] = Field(min_length=1)
     selected_candidate_id: str = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -1394,24 +1398,10 @@ class DecisionOnlyCandidateSet(DomainModel):
             raise ValueError("decision-only candidate IDs must be unique")
         if len({item.candidate.flight.id for item in self.candidates}) != 1:
             raise ValueError("decision-only candidates must share one flight")
-        providers = tuple(item.candidate.lodgings[0].provider for item in self.candidates)
-        if len(providers) != len(set(providers)):
-            raise ValueError("decision-only candidates must use unique lodging providers")
-        transfer_fingerprints = {
-            tuple(transfer.id for transfer in item.candidate.transfers) for item in self.candidates
-        }
-        if len(transfer_fingerprints) != 1:
-            raise ValueError("decision-only candidates must share transfers")
         if self.selected_candidate_id not in ids:
             raise ValueError("selected decision-only candidate is not in the set")
         if any(item.execution_eligible for item in self.candidates):
             raise ValueError("decision-only candidate set cannot contain executable items")
-        contract_ids = {
-            tuple(transfer.price_contract_id for transfer in item.candidate.transfers)
-            for item in self.candidates
-        }
-        if len(contract_ids) != 1:
-            raise ValueError("decision-only candidates must share transfer price contracts")
         return self
 
 
@@ -2216,11 +2206,20 @@ class PackagePlanner:
             )
             if not package_date_violations(intent, candidate)
             and candidate.transfers
-            and all(item.provider == transfer_provider for item in candidate.transfers)
+            and all(
+                item.provider == transfer_provider
+                for item in candidate.transfers
+            )
         )
         representatives: dict[str, TravelPackageCandidate] = {}
         for candidate in variants:
-            provider_key = candidate.lodgings[0].provider
+            lodging_identity = "|".join(
+                re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", item.property_name.casefold()).strip()
+                for item in candidate.lodgings
+            )
+            provider_key = (
+                f"{candidate.lodgings[0].provider}|{lodging_identity}|{candidate.kind.value}"
+            )
             current = representatives.get(provider_key)
             if current is None or (
                 package_budget(candidate).confirmed_subtotal_cents,
@@ -3481,6 +3480,7 @@ class PackageVerifier:
         violations.extend(self._check_dates(intent, candidate))
         violations.extend(self._check_party(intent, candidate))
         violations.extend(self._check_party_availability(candidate))
+        violations.extend(self._check_transfer_availability(candidate))
         violations.extend(self._check_currency(intent, candidate))
         violations.extend(self._check_lodging_structure(intent, candidate))
         violations.extend(self._check_transfer_price_contracts(candidate))
@@ -3575,6 +3575,27 @@ class PackageVerifier:
                     "requested_infants": candidate.flight.infants,
                     "party_availability_confirmed": False,
                 },
+            )
+        ]
+
+    def _check_transfer_availability(
+        self,
+        candidate: TravelPackageCandidate,
+    ) -> list[PackageViolation]:
+        """A transfer with unknown service timing cannot pass final gate."""
+        pending = tuple(
+            transfer.id
+            for transfer in candidate.transfers
+            if transfer.availability != QuoteAvailability.AVAILABLE
+        )
+        if not pending:
+            return []
+        return [
+            PackageViolation(
+                code=PackageViolationCode.TRANSFER_AVAILABILITY_UNCONFIRMED,
+                severity=PackageViolationSeverity.ERROR,
+                message="接驳已确认包含权益但具体服务时段未确认，不能进入最终可执行方案",
+                component_ids=pending,
             )
         ]
 

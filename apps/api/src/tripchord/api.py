@@ -569,6 +569,7 @@ LiveAgentPlanningResponse.model_rebuild(
 class LiveFlexibleAgentPlanningResponse(ApiModel):
     run: FlexibleLiveAgentRun
     final_plan: FinalPlanProjection | None = None
+    recommendation_plan: BestAvailablePlanProjection | None = None
     cached_pair_runs: tuple[LiveFlexiblePairRunHandle, ...] = ()
 
 
@@ -602,6 +603,7 @@ class LiveFlexibleFromTextPlanningResponse(ApiModel):
     interpretation: HybridPackageRequirementResult
     run: FlexibleLiveAgentRun | None = None
     final_plan: FinalPlanProjection | None = None
+    recommendation_plan: BestAvailablePlanProjection | None = None
     best_available_plan: BestAvailablePlanProjection | None = None
     decision_candidates: tuple[DecisionCandidateProjection, ...] = ()
     cached_pair_runs: tuple[LiveFlexiblePairRunHandle, ...] = ()
@@ -730,6 +732,9 @@ def build_final_plan_projection(
 ) -> FinalPlanProjection | None:
     if isinstance(run, LivePackageAgentRun):
         return build_live_final_plan_projection(run)
+    # ``final_plan`` is reserved for the strict executable/publication gate.
+    # Decision-only candidates are returned separately as ``recommendation_plan``
+    # and must never be promoted by this function.
     option_id = next(iter(run.recommended_option_ids), None)
     if option_id is None:
         return None
@@ -759,17 +764,22 @@ def build_final_plan_projection(
         for coverage in (execution.run.coverage if execution and execution.run else ())
         for source_id in coverage.failed_source_ids
     )
+    decision_ready = option.decision_ready
     price_comparability = (
         "complete_cny"
         if package_run is not None
         and package_run.budget.is_all_in_total
         and candidate is not None
         and candidate.currency == "CNY"
-        else "total_not_comparable"
+        else (option.decision_price_basis if decision_ready else "total_not_comparable")
     )
     unresolved_items: list[str] = []
     if price_comparability != "complete_cny":
-        unresolved_items.append("尚未获得全部人数、税费和币种一致的可比总价")
+        unresolved_items.append(
+            "这是用于行程决策的参考合计，不是可订/锁价；接驳税费或平台余位仍需下单前复核。"
+            if decision_ready
+            else "尚未获得全部人数、税费和币种一致的可比总价"
+        )
     if failed_source_ids:
         unresolved_items.append("部分已连接来源未返回可用结果：" + "、".join(failed_source_ids))
     if run.optimality_status.value != "optimality_proven":
@@ -784,7 +794,9 @@ def build_final_plan_projection(
         departure_date=option.departure_date,
         return_date=option.return_date,
         total_budget_cents=(
-            option.total_budget_cents if price_comparability == "complete_cny" else None
+            option.total_budget_cents
+            if price_comparability == "complete_cny"
+            else option.decision_total_cny_cents
         ),
         optimality_status=run.optimality_status.value,
         claim_boundary=run.claim_boundary,
@@ -1260,6 +1272,31 @@ def build_best_available_plan_projection(
             source_id
             for coverage in live_run.coverage
             for source_id in coverage.successful_source_ids
+        )
+        # Comparison-only flight outcomes and deterministic official/public
+        # components are still real read-only sources for a decision card even
+        # though they cannot pass the strict booking gate.
+        covered_source_ids = tuple(
+            dict.fromkeys(
+                (
+                    *covered_source_ids,
+                    *(
+                        outcome.source_task_id
+                        for outcome in live_run.flight_search_outcomes
+                        if outcome.price_bearing_candidate_count > 0
+                    ),
+                    *(
+                        "source-kaani-official-lodging"
+                        for item in candidate.lodgings
+                        if item.provider == "kaani_official"
+                    ),
+                    *(
+                        "source-icom-public-transfer"
+                        for item in candidate.transfers
+                        if item.provider == "icom-public-transfer"
+                    ),
+                )
+            )
         )
         if any(item.provider == "arena_official" for item in source_comparisons):
             covered_source_ids = (*covered_source_ids, "source-arena-official-lodging")
