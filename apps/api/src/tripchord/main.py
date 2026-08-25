@@ -218,6 +218,11 @@ from tripchord.planning.flexible_dates import (
 )
 from tripchord.planning.frozen_graph import frozen_v4_window_for_run
 from tripchord.planning.package import PackageDecisionState, PackageEventKind
+from tripchord.planning.personalization import (
+    BoundedPersonalizationAgent,
+    apply_effective_preference_policy,
+    personalize_complex_problem,
+)
 from tripchord.planning.policy import ReplanPolicySelector
 from tripchord.planning.problem import PlanningInfeasible
 from tripchord.planning.repair import PlanDiff, diff_plans
@@ -2865,6 +2870,12 @@ async def _execute_live_flexible_from_text_body(
 
     await report("interpreting_requirement", 10)
     compiler = PlanningCompiler()
+    # Load durable preferences before topology dispatch so single- and
+    # multi-city paths share the same current-request-over-memory precedence.
+    durable_preferences = confirmed_preference_constitution(
+        memory_store,
+        _memory_access(principal, "preference-context"),
+    )
     complex_intent = compiler.compile(
         payload.requirement.text,
         reference_year=(
@@ -2874,6 +2885,11 @@ async def _execute_live_flexible_from_text_body(
         ),
     )
     if complex_intent is not None:
+        complex_intent = apply_effective_preference_policy(
+            complex_intent,
+            payload.requirement.text,
+            durable_preferences,
+        )
         captured_at = datetime.now(UTC)
         complex_provider = getattr(target_app.state, "complex_offer_provider", None)
         if complex_provider is not None:
@@ -2913,26 +2929,56 @@ async def _execute_live_flexible_from_text_body(
                 source_statuses=source_statuses,
             )
             complex_contracts = ()
-        graph = ComplexCatalogSolver().solve(
-            compiler.compile_problem(
-                complex_intent,
-                offer_catalog=complex_catalog,
-                price_contracts=complex_contracts,
-                captured_at=captured_at,
-            )
-        )
-        complex_execution_ready = current_complex_plan_execution_ready(
+        problem = compiler.compile_problem(
             complex_intent,
-            graph,
-            complex_catalog,
-        )
-        trip_card = project_trip_card(
-            complex_intent,
-            graph,
-            graph.price_contracts,
-            source_statuses,
+            offer_catalog=complex_catalog,
+            price_contracts=complex_contracts,
             captured_at=captured_at,
-            execution_ready=complex_execution_ready,
+        )
+        personalization_agent = cast(
+            BoundedPersonalizationAgent | None,
+            getattr(target_app.state, "personalization_agent", None),
+        )
+        personalized = personalize_complex_problem(
+            problem,
+            agent=personalization_agent,
+            provider_query_count=1 if complex_provider is not None else 0,
+        )
+        cards = tuple(
+            project_trip_card(
+                complex_intent,
+                plan.candidate.graph,
+                plan.candidate.graph.price_contracts,
+                source_statuses,
+                captured_at=captured_at,
+                execution_ready=current_complex_plan_execution_ready(
+                    complex_intent,
+                    plan.candidate.graph,
+                    complex_catalog,
+                ),
+                representative_kind=plan.representative_kind,
+                selection_reason=plan.selection_reason,
+                decision_metrics=plan.candidate.metrics,
+                participating_agent_roles=plan.participating_agent_roles,
+                applied_skill_ids=plan.applied_skill_ids,
+            )
+            for plan in personalized.plans
+        )
+        if not cards:
+            graph = ComplexCatalogSolver().solve(problem)
+            cards = (
+                project_trip_card(
+                    complex_intent,
+                    graph,
+                    graph.price_contracts,
+                    source_statuses,
+                    captured_at=captured_at,
+                    execution_ready=False,
+                ),
+            )
+        trip_card = cards[0] if len(cards) == 1 else None
+        all_execution_ready = bool(cards) and all(
+            card.status.value == "final" for card in cards
         )
         await report("solving_multi_city_catalog", 90)
         return LiveFlexibleFromTextPlanningResponse(
@@ -2941,17 +2987,23 @@ async def _execute_live_flexible_from_text_body(
             recommendation_plan=None,
             best_available_plan=None,
             decision_candidates=(),
-            model_enhancement_enabled=False,
+            model_enhancement_enabled=personalization_agent is not None,
             model_trace_scope_sha256=model_trace_scope_sha256,
-            model_trace_count=0,
-            model_trace_success_count=0,
-            model_trace_failure_count=0,
+            model_trace_count=personalized.summary.model_call_count,
+            model_trace_success_count=sum(
+                item.model_called and item.applied
+                for item in personalized.summary.agent_runs
+            ),
+            model_trace_failure_count=sum(
+                item.model_called and not item.applied
+                for item in personalized.summary.agent_runs
+            ),
             execution_boundary=(
-                "本次使用当前只读交通与住宿来源的有界报价目录生成完整方案；"
+                "本次使用当前只读交通与住宿来源的同一份有界报价目录生成完整方案；"
                 "所有必要组件已按同行人数和人民币总价复算，"
                 "仍未锁票、未下单，也不代表全网最低价。"
                 if complex_catalog.source_mode == "current"
-                and complex_execution_ready
+                and all_execution_ready
                 else
                 "本次使用当前只读交通与住宿来源的有界报价目录完成约束求解；"
                 "所有组件按同行人数和人民币总价复算，结果仅为当前目录候选，"
@@ -2967,6 +3019,8 @@ async def _execute_live_flexible_from_text_body(
                 else "多城市需求已结构化，当前实时来源尚未接入，未生成候选。"
             ),
             trip_card=trip_card,
+            trip_cards=cards,
+            personalization=personalized.summary,
             travel_intent=complex_intent,
             source_statuses=source_statuses,
         )
@@ -2979,10 +3033,6 @@ async def _execute_live_flexible_from_text_body(
     # merged after current-trip parsing.  The domain constitution gives
     # explicit current text precedence over long-term memory; model-inferred
     # preferences never become durable and cannot silently override either.
-    durable_preferences = confirmed_preference_constitution(
-        memory_store,
-        _memory_access(principal, "preference-context"),
-    )
     if durable_preferences.rules:
         interpretation = interpretation.model_copy(
             update={
@@ -3273,6 +3323,7 @@ async def _execute_live_flexible_from_text(
         InMemoryModelTraceSink,
         target_app.state.model_trace_sink,
     )
+    response: LiveFlexibleFromTextPlanningResponse | None = None
     with trace_sink.trace_scope(
         request_sha256,
         scope_id=model_trace_scope_id,
@@ -3294,19 +3345,32 @@ async def _execute_live_flexible_from_text(
             )
         finally:
             trace_summary = trace_sink.scope_summary(trace_scope)
+            combined_trace_count = max(
+                trace_summary.trace_count,
+                response.model_trace_count if response is not None else 0,
+            )
+            combined_success_count = max(
+                trace_summary.success_count,
+                response.model_trace_success_count if response is not None else 0,
+            )
+            combined_failure_count = max(
+                trace_summary.failure_count,
+                response.model_trace_failure_count if response is not None else 0,
+            )
             if report_model_trace_summary is not None:
                 await report_model_trace_summary(
                     trace_summary.scope_id,
                     trace_summary.scope_request_digest,
-                    trace_summary.trace_count,
-                    trace_summary.success_count,
-                    trace_summary.failure_count,
+                    combined_trace_count,
+                    combined_success_count,
+                    combined_failure_count,
                 )
+        assert response is not None
         return response.model_copy(
             update={
-                "model_trace_count": trace_summary.trace_count,
-                "model_trace_success_count": trace_summary.success_count,
-                "model_trace_failure_count": trace_summary.failure_count,
+                "model_trace_count": combined_trace_count,
+                "model_trace_success_count": combined_success_count,
+                "model_trace_failure_count": combined_failure_count,
             }
         )
 

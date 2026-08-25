@@ -60,6 +60,7 @@ from tripchord.planning.package import (
     PackageIntent,
     lodging_reference_cny_if_comparable,
 )
+from tripchord.planning.personalization import PersonalizationSummary
 from tripchord.planning.policy import ReplanPreference
 from tripchord.planning.problem import OptimizationResult, PlanningProblem
 from tripchord.planning.replanner import LocalReplanner, LocalReplanResult
@@ -302,6 +303,7 @@ class ConfirmPreferenceMemoryRequest(ApiModel):
 
     @model_validator(mode="after")
     def validate_bounded_preference(self) -> "ConfirmPreferenceMemoryRequest":
+        self.key = self.key.strip()
         self.value = normalize_confirmed_preference_value(self.key, self.value)
         serialized = json.dumps(
             self.value,
@@ -623,6 +625,8 @@ class LiveFlexibleFromTextPlanningResponse(ApiModel):
     )
     execution_boundary: str = LIVE_FLEXIBLE_FROM_TEXT_EXECUTION_BOUNDARY
     trip_card: TripCardProjection | None = None
+    trip_cards: tuple[TripCardProjection, ...] = ()
+    personalization: PersonalizationSummary | None = None
     travel_intent: TravelIntent | None = None
     source_statuses: tuple[SourceStatus, ...] = ()
 

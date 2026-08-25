@@ -36,6 +36,8 @@ class AgentRole(StrEnum):
     SAFETY_GATE = "safety_gate"
     EXPLANATION = "explanation"
     MEMORY_CURATOR = "memory_curator"
+    DECISION_AGENT = "decision_agent"
+    EXPERIENCE_SPECIALIST = "experience_specialist"
     EXECUTOR = "executor"
     RECEIPT_VERIFIER = "receipt_verifier"
 

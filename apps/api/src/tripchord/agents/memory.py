@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from threading import RLock
@@ -83,6 +84,7 @@ _SUPPORTED_PREFERENCE_KEYS = frozenset(
         "lodging_zone_comparison",
         "price_sensitivity",
         "budget_sensitivity",
+        "elder_trip_comfort",
     }
 )
 _PREFERENCE_EXPECTED_VALUES: dict[str, frozenset[JsonValue]] = {
@@ -99,6 +101,38 @@ _PREFERENCE_EXPECTED_VALUES: dict[str, frozenset[JsonValue]] = {
     "price_sensitivity": frozenset({"low", "balanced", "high", "price_first"}),
     "budget_sensitivity": frozenset({"low", "balanced", "high", "price_first"}),
 }
+
+
+def _normalize_elder_trip_comfort(value: JsonValue) -> dict[str, JsonValue]:
+    if not isinstance(value, dict):
+        raise ValueError("elder_trip_comfort expected 必须是结构化条件偏好")
+    allowed = {
+        "condition",
+        "avoid_transfers",
+        "avoid_departures_before",
+        "max_comfort_premium_cny_cents",
+    }
+    if set(value) != allowed:
+        raise ValueError("elder_trip_comfort expected 字段不完整或超出允许范围")
+    if value.get("condition") != "traveling_with_elders":
+        raise ValueError("elder_trip_comfort 只能用于 traveling_with_elders 条件")
+    if not isinstance(value.get("avoid_transfers"), bool):
+        raise ValueError("elder_trip_comfort avoid_transfers 必须是布尔值")
+    departure_before = value.get("avoid_departures_before")
+    if not isinstance(departure_before, str) or not re.fullmatch(
+        r"(?:[01]\d|2[0-3]):[0-5]\d",
+        departure_before,
+    ):
+        raise ValueError("elder_trip_comfort avoid_departures_before 必须是 HH:MM")
+    premium = value.get("max_comfort_premium_cny_cents")
+    if isinstance(premium, bool) or not isinstance(premium, int) or not 0 <= premium <= 1_000_000:
+        raise ValueError("elder_trip_comfort 可接受溢价必须是 0–10000 元的意愿阈值")
+    return {
+        "condition": "traveling_with_elders",
+        "avoid_transfers": value["avoid_transfers"],
+        "avoid_departures_before": departure_before,
+        "max_comfort_premium_cny_cents": premium,
+    }
 
 
 def _is_dynamic_preference_key(key: str) -> bool:
@@ -181,11 +215,14 @@ def normalize_confirmed_preference_value(key: str, value: JsonValue) -> dict[str
     if mode == PreferenceMode.INDIFFERENT:
         expected = None
         weight = 0.0
-    allowed_expected = _PREFERENCE_EXPECTED_VALUES[normalized_key]
-    if expected is not None and isinstance(expected, (dict, list)):
-        raise ValueError("长期偏好 expected 只能是受控布尔值或枚举值")
-    if expected is not None and expected not in allowed_expected:
-        raise ValueError(f"长期偏好 {normalized_key} 的 expected 不在允许枚举内")
+    if normalized_key == "elder_trip_comfort":
+        expected = _normalize_elder_trip_comfort(expected)
+    else:
+        allowed_expected = _PREFERENCE_EXPECTED_VALUES[normalized_key]
+        if expected is not None and isinstance(expected, (dict, list)):
+            raise ValueError("长期偏好 expected 只能是受控布尔值或枚举值")
+        if expected is not None and expected not in allowed_expected:
+            raise ValueError(f"长期偏好 {normalized_key} 的 expected 不在允许枚举内")
     return {"mode": mode.value, "expected": expected, "weight": weight}
 
 
@@ -217,7 +254,7 @@ def confirmed_preference_constitution(
                 continue
             rules.append(
                 PreferenceRule(
-                    key=key,
+                    key=key.strip(),
                     mode=PreferenceMode(str(normalized["mode"])),
                     expected=normalized["expected"],
                     weight=float(normalized_weight),

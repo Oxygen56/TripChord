@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import {
+  FlexiblePlanningSummary,
   UnifiedTripCard,
   formatTravelLocalDateTime,
   livePlanModificationHeading,
@@ -73,6 +74,18 @@ describe("unified trip card", () => {
           city_order: ["大阪", "京都", "东京"],
           traveler_count: 2,
           total_cny_cents: 852000,
+          representative_kind: "balanced",
+          selection_reason: "在当前目录中兼顾价格与交通便利性。",
+          decision_metrics: {
+            total_cny_cents: 852000,
+            transport_duration_minutes: 420,
+            early_departure_penalty_minutes: 0,
+            late_arrival_penalty_minutes: 30,
+            schedule_inconvenience_minutes: 30,
+            transfer_count: 1,
+          },
+          participating_agent_roles: ["candidate_curator"],
+          applied_skill_ids: ["balanced-routing"],
           activity_price_included: false,
           unresolved_items: ["活动费用未提供，未计入总价。"],
           source_boundary: "仅对当前有界来源目录求得最优",
@@ -197,6 +210,26 @@ describe("unified trip card", () => {
         card={{ ...card, status: "no_solution", total_cny_cents: null, components: [] }}
       />,
     );
+    const multiCardHtml = renderToStaticMarkup(
+      <FlexiblePlanningSummary
+        response={{
+          execution_boundary: "同一当前有界目录",
+          trip_cards: [
+            { ...card, representative_kind: "saver", total_cny_cents: 800000 },
+            card,
+            { ...card, representative_kind: "experience", total_cny_cents: 900000 },
+          ],
+        } as unknown as LiveFlexibleFromTextResponse}
+      />,
+    );
+    const singleCardHtml = renderToStaticMarkup(
+      <FlexiblePlanningSummary
+        response={{
+          execution_boundary: "同一当前有界目录",
+          trip_cards: [{ ...card, representative_kind: "personalized" }],
+        } as unknown as LiveFlexibleFromTextResponse}
+      />,
+    );
 
     expect(html).toContain("¥8,520.00");
     expect(html).toContain("大阪 → 京都 → 东京");
@@ -208,7 +241,19 @@ describe("unified trip card", () => {
     expect(html).toContain("不代表实际结算方式");
     expect(html).toContain("frozen-fixture");
     expect(html).toContain("https://example.test/hgh-osa");
+    expect(html).toContain("均衡代表");
+    expect(html).toContain("选择理由：在当前目录中兼顾价格与交通便利性。");
+    expect(html).toContain("交通耗时 420 分钟");
+    expect(html).toContain("不便利 30 分钟");
+    expect(html).toContain("Agent：candidate_curator");
+    expect(html).toContain("Skill：balanced-routing");
     expect(noSolutionHtml).toContain("暂无可行方案");
     expect(noSolutionHtml).toContain("已持有演唱会");
+    expect(multiCardHtml).toContain("3 个代表方案");
+    expect(multiCardHtml).toContain("省钱代表");
+    expect(multiCardHtml).toContain("均衡代表");
+    expect(multiCardHtml).toContain("体验代表");
+    expect(singleCardHtml).toContain("个性化代表");
+    expect(singleCardHtml).not.toContain("1 个代表方案");
   });
 });

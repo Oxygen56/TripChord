@@ -1406,11 +1406,22 @@ function FinalTripCard({
   );
 }
 
-function FlexiblePlanningSummary({
+export function FlexiblePlanningSummary({
   response,
 }: {
   response: LiveFlexibleFromTextResponse;
 }) {
+  if (response.trip_cards && response.trip_cards.length > 0) {
+    if (response.trip_cards.length === 1) {
+      return <UnifiedTripCard card={response.trip_cards[0]} />;
+    }
+    return (
+      <TripCardsSummary
+        cards={response.trip_cards}
+        personalization={response.personalization}
+      />
+    );
+  }
   if (response.trip_card) {
     return <UnifiedTripCard card={response.trip_card} />;
   }
@@ -1709,15 +1720,81 @@ function FlexiblePlanningSummary({
   );
 }
 
-export function UnifiedTripCard({ card }: { card: NonNullable<LiveFlexibleFromTextResponse["trip_card"]> }) {
+const representativeLabels: Record<NonNullable<NonNullable<LiveFlexibleFromTextResponse["trip_card"]>["representative_kind"]>, string> = {
+  saver: "省钱代表",
+  balanced: "均衡代表",
+  experience: "体验代表",
+  personalized: "个性化代表",
+};
+
+function TripCardsSummary({
+  cards,
+  personalization,
+}: {
+  cards: NonNullable<LiveFlexibleFromTextResponse["trip_cards"]>;
+  personalization: LiveFlexibleFromTextResponse["personalization"];
+}) {
+  return (
+    <section className="final-trip-card" aria-label="多方案旅行决策卡">
+      <div className="interpretation-head">
+        <div>
+          <p className="eyebrow">TripChord 方案对比</p>
+          <h2>当前代表方案</h2>
+        </div>
+        <strong>{cards.length} 个代表方案</strong>
+      </div>
+      <p className="claim-boundary">
+        以下方案都来自同一次查询的当前有界目录；价格、交通耗时和便利性只在这个目录内比较，未锁票或下单。
+      </p>
+      <div className="trip-card-options">
+        {cards.map((card) => (
+          <UnifiedTripCard key={`${card.representative_kind ?? "plan"}-${card.title}`} card={card} compact />
+        ))}
+      </div>
+      {personalization && (
+        <details className="result-boundary-details">
+          <summary>查看个性化决策记录</summary>
+          <p>{personalization.boundary}</p>
+          {personalization.agent_runs.some((run) => run.applied) && (
+            <p>参与的 Agent：{personalization.agent_runs.filter((run) => run.applied).map((run) => run.role).join("、")}</p>
+          )}
+          {personalization.skill_applications.some((skill) => skill.applicable) && (
+            <p>应用的 Skill：{personalization.skill_applications.filter((skill) => skill.applicable).map((skill) => skill.skill_id).join("、")}</p>
+          )}
+        </details>
+      )}
+    </section>
+  );
+}
+
+export function UnifiedTripCard({ card, compact = false }: { card: NonNullable<LiveFlexibleFromTextResponse["trip_card"]>; compact?: boolean }) {
   const money = (value: number) =>
     `¥${(value / 100).toLocaleString("zh-CN", { minimumFractionDigits: 2 })}`;
   const travelerNames = new Map(card.travelers.map((item) => [item.id, item.name]));
   const participantLabel = (participantIds: string[]) =>
     participantIds.map((item) => travelerNames.get(item) || item).join("、");
   return (
-    <section className="final-trip-card" aria-label="统一旅行方案卡">
+    <section className={compact ? "final-trip-card trip-card-option" : "final-trip-card"} aria-label="统一旅行方案卡">
       <div className="interpretation-head"><div><p className="eyebrow">TripChord 方案</p><h2>{card.title}</h2></div><strong>{card.status === "final" ? "最终方案" : card.status === "candidate" ? "当前候选" : card.status === "no_solution" ? "暂无可行方案" : "等待来源"}</strong></div>
+      {(card.representative_kind || card.selection_reason || card.decision_metrics) && (
+        <div className="trip-card-decision" aria-label="方案选择依据">
+          <strong>{card.representative_kind ? representativeLabels[card.representative_kind] : "方案选择依据"}</strong>
+          {card.selection_reason && <p>选择理由：{card.selection_reason}</p>}
+          {card.decision_metrics && (
+            <p>
+              目录内指标：{money(card.decision_metrics.total_cny_cents)} · 交通耗时 {card.decision_metrics.transport_duration_minutes} 分钟 ·
+              不便利 {card.decision_metrics.schedule_inconvenience_minutes} 分钟 · 换乘 {card.decision_metrics.transfer_count} 次
+            </p>
+          )}
+          {(card.participating_agent_roles?.length || card.applied_skill_ids?.length) ? (
+            <p>
+              {card.participating_agent_roles?.length ? `Agent：${card.participating_agent_roles.join("、")}` : ""}
+              {card.participating_agent_roles?.length && card.applied_skill_ids?.length ? " · " : ""}
+              {card.applied_skill_ids?.length ? `Skill：${card.applied_skill_ids.join("、")}` : ""}
+            </p>
+          ) : null}
+        </div>
+      )}
       <div className="window-summary"><strong>{card.total_cny_cents === null ? "当前没有可用总价" : money(card.total_cny_cents)}</strong><span>{card.start_date} 至 {card.end_date} · {card.city_order.join(" → ")} · {card.traveler_count} 人</span></div>
       <div className="complex-trip-components">
         {card.components.map((item) => <article key={item.offer_id}><strong>{item.label}</strong><span>{item.place_from || ""}{item.place_to ? ` → ${item.place_to}` : ""} · {item.start} → {item.end}</span>{item.participant_ids.length > 0 && <small>同行者：{participantLabel(item.participant_ids)}</small>}<small>{item.provider} · {item.price_cny_cents !== null ? money(item.price_cny_cents) : item.shared_price_contract ? "费用包含在共享组合价中" : "费用未提供"}</small>{item.detail_url && <PlanInlineActionLink url={item.detail_url} label="查看来源" />}</article>)}

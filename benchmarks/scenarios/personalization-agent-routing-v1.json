@@ -1,0 +1,71 @@
+{
+  "benchmark_id": "personalization-agent-routing-v1",
+  "input_classification": {
+    "kind": "synthetic_personalization_decision",
+    "live": false,
+    "model_calls": false,
+    "browser_calls": false
+  },
+  "shared_fixture": {
+    "model": "scripted:bounded-personalization-v1",
+    "allowed_tools": ["inspect_personalization_candidates"],
+    "token_usage_per_call": 96,
+    "latency_ms_per_call": 8,
+    "budget": {
+      "max_model_calls": 12,
+      "max_total_tokens": 1152,
+      "max_model_wait_ms": 96
+    },
+    "source_refs": ["fixture://shared-offer-catalog-v1"],
+    "candidates": [
+      {
+        "id": "saver",
+        "total_cny_cents": 160000,
+        "transport_duration_minutes": 360,
+        "schedule_inconvenience_minutes": 150
+      },
+      {
+        "id": "balanced",
+        "total_cny_cents": 165000,
+        "transport_duration_minutes": 270,
+        "schedule_inconvenience_minutes": 0
+      },
+      {
+        "id": "experience",
+        "total_cny_cents": 172000,
+        "transport_duration_minutes": 210,
+        "schedule_inconvenience_minutes": 0
+      }
+    ]
+  },
+  "scenarios": [
+    {
+      "id": "simple_unique",
+      "kind": "simple",
+      "candidate_ids": ["saver"],
+      "expected_candidate_id": "saver",
+      "conditional_model_calls": 0
+    },
+    {
+      "id": "ambiguous_tradeoff",
+      "kind": "ambiguity",
+      "candidate_ids": ["saver", "balanced", "experience"],
+      "expected_candidate_id": "balanced",
+      "conditional_model_calls": 1
+    },
+    {
+      "id": "explicit_experience_tradeoff",
+      "kind": "tradeoff",
+      "candidate_ids": ["saver", "balanced", "experience"],
+      "expected_candidate_id": "experience",
+      "conditional_model_calls": 0
+    },
+    {
+      "id": "elder_comfort_risk",
+      "kind": "special_risk",
+      "candidate_ids": ["saver", "balanced", "experience"],
+      "expected_candidate_id": "experience",
+      "conditional_model_calls": 1
+    }
+  ]
+}

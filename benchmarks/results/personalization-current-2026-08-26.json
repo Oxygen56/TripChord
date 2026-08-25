@@ -1,0 +1,54 @@
+{
+  "evidence_id": "personalization-current-2026-08-26",
+  "evidence_tier": "current_public_read_only_sources",
+  "job_id": "live-job-a772e124-ec15-4fb7-849f-8ca32efe0e80",
+  "request": "旅行者甲从杭州、旅行者乙从南京分别于2026-08-30出发到上海汇合，共住一间房；甲参加2026-08-31 19:00-21:00在上海的已持有活动，乙不参加；乙2026-09-02从上海返回南京，甲2026-09-04从上海返回杭州。两人均为成人，活动前至少留90分钟缓冲，活动费用未提供。",
+  "created_at": "2026-08-25T19:38:48.158501Z",
+  "completed_at": "2026-08-25T19:38:58.360422Z",
+  "elapsed_seconds": 10.201921,
+  "provider_query_count": 1,
+  "source_status_count": 6,
+  "source_providers": [
+    "12306",
+    "trip.com"
+  ],
+  "all_required_sources_succeeded": true,
+  "theoretical_combination_count": 124416,
+  "enumerated_feasible_count": 124416,
+  "pareto_candidate_count": 27,
+  "pareto_complete_in_catalog": true,
+  "model_call_count": 0,
+  "external_model_used": false,
+  "cards": [
+    {
+      "representative_kind": "saver",
+      "status": "final",
+      "total_cny_cents": 140500,
+      "transport_duration_minutes": 374,
+      "schedule_inconvenience_minutes": 140,
+      "component_count": 6
+    },
+    {
+      "representative_kind": "balanced",
+      "status": "final",
+      "total_cny_cents": 143000,
+      "transport_duration_minutes": 314,
+      "schedule_inconvenience_minutes": 0,
+      "component_count": 6
+    },
+    {
+      "representative_kind": "experience",
+      "status": "final",
+      "total_cny_cents": 155000,
+      "transport_duration_minutes": 237,
+      "schedule_inconvenience_minutes": 0,
+      "component_count": 6
+    }
+  ],
+  "durable_snapshot": {
+    "database": "tripchord.db",
+    "table": "live_planning_jobs",
+    "lookup_key": "live-job-a772e124-ec15-4fb7-849f-8ca32efe0e80"
+  },
+  "claim_boundary": "本记录证明同一次当前12306与Trip.com公开只读来源查询产生了三种不同取舍方案，并在当前有界目录内完成Pareto筛选。它不是全网最低价、锁价、余位保留或下单证明；用户已持有活动的未提供费用未计入总价。"
+}

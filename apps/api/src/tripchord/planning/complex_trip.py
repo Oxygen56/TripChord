@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 from itertools import pairwise
 from typing import Any, Protocol
@@ -37,6 +37,33 @@ class TravelTopology(StrEnum):
     SINGLE_DESTINATION = "single_destination"
     MULTI_CITY = "multi_city"
     GROUP_MULTI_ORIGIN = "group_multi_origin"
+
+
+class PlanPreferenceMode(StrEnum):
+    UNSPECIFIED = "unspecified"
+    PRICE_FIRST = "price_first"
+    BALANCED = "balanced"
+    EXPERIENCE_FIRST = "experience_first"
+    AMBIGUOUS = "ambiguous"
+
+
+class PlanPreferenceSource(StrEnum):
+    NONE = "none"
+    CURRENT_REQUEST = "current_request"
+    CONFIRMED_LONG_TERM = "confirmed_long_term"
+
+
+class PlanPreferencePolicy(DomainModel):
+    """Executable decision policy, separate from live quote facts."""
+
+    mode: PlanPreferenceMode = PlanPreferenceMode.UNSPECIFIED
+    source: PlanPreferenceSource = PlanPreferenceSource.NONE
+    traveling_with_elders: bool = False
+    avoid_transfers: bool = False
+    avoid_departures_before: time = time(8, 0)
+    max_comfort_premium_cny_cents: int | None = Field(default=None, ge=0)
+    current_request_override: bool = False
+    reason: str = "本次尚未表达价格与体验的取舍"
 
 
 class SourceState(StrEnum):
@@ -118,6 +145,7 @@ class TravelIntent(DomainModel):
     stay_requirements: tuple[StayRequirement, ...] = ()
     minimum_anchor_buffer_minutes: int = Field(default=0, ge=0)
     preference_summary: str = ""
+    preference_policy: PlanPreferencePolicy = PlanPreferencePolicy()
     unresolved_critical: tuple[str, ...] = ()
 
     @classmethod
@@ -201,6 +229,7 @@ class TransportOffer(DomainModel):
     participant_ids: tuple[str, ...] = ()
     party_capacity_confirmed: bool = False
     available_units: int | None = Field(default=None, ge=0)
+    transfer_count: int = Field(default=0, ge=0)
 
 
 class StayOffer(DomainModel):
@@ -290,6 +319,7 @@ class PlanComponent(DomainModel):
 class PlanStatus(StrEnum):
     FEASIBLE = "feasible"
     OPTIMAL_IN_CATALOG = "optimal-in-catalog"
+    PARETO_OPTIMAL_IN_CATALOG = "pareto-optimal-in-catalog"
     NO_SOLUTION = "no-solution"
 
 
@@ -301,6 +331,22 @@ class PlanGraph(DomainModel):
     price_contracts: tuple[PriceContract, ...] = ()
     checked_constraints: tuple[str, ...] = ()
     claim_boundary: str
+
+
+class PlanRepresentativeKind(StrEnum):
+    SAVER = "saver"
+    BALANCED = "balanced"
+    EXPERIENCE = "experience"
+    PERSONALIZED = "personalized"
+
+
+class PlanDecisionMetrics(DomainModel):
+    total_cny_cents: int = Field(ge=0)
+    transport_duration_minutes: int = Field(ge=0)
+    early_departure_penalty_minutes: int = Field(ge=0)
+    late_arrival_penalty_minutes: int = Field(ge=0)
+    schedule_inconvenience_minutes: int = Field(ge=0)
+    transfer_count: int = Field(ge=0)
 
 
 class TripCardStatus(StrEnum):
@@ -335,6 +381,11 @@ class TripCardProjection(DomainModel):
     city_order: tuple[str, ...]
     traveler_count: int = Field(ge=1)
     total_cny_cents: int | None = None
+    representative_kind: PlanRepresentativeKind | None = None
+    selection_reason: str = ""
+    decision_metrics: PlanDecisionMetrics | None = None
+    participating_agent_roles: tuple[str, ...] = ()
+    applied_skill_ids: tuple[str, ...] = ()
     components: tuple[PlanComponent, ...] = ()
     fixed_activities: tuple[PlanComponent, ...] = ()
     price_contracts: tuple[PriceContract, ...] = ()
@@ -710,6 +761,11 @@ def project_trip_card(
     captured_at: datetime,
     execution_ready: bool = False,
     unresolved_items: tuple[str, ...] = (),
+    representative_kind: PlanRepresentativeKind | None = None,
+    selection_reason: str = "",
+    decision_metrics: PlanDecisionMetrics | None = None,
+    participating_agent_roles: tuple[str, ...] = (),
+    applied_skill_ids: tuple[str, ...] = (),
 ) -> TripCardProjection:
     activities = tuple(
         PlanComponent(
@@ -763,6 +819,11 @@ def project_trip_card(
         city_order=tuple(item.name for item in intent.places),
         traveler_count=intent.travelers,
         total_cny_cents=graph.total_cny_cents,
+        representative_kind=representative_kind,
+        selection_reason=selection_reason,
+        decision_metrics=decision_metrics,
+        participating_agent_roles=participating_agent_roles,
+        applied_skill_ids=applied_skill_ids,
         components=components,
         fixed_activities=activities,
         price_contracts=contracts,
@@ -1302,7 +1363,11 @@ def current_complex_plan_execution_ready(
 
     if (
         catalog.source_mode != "current"
-        or graph.status != PlanStatus.OPTIMAL_IN_CATALOG
+        or graph.status
+        not in {
+            PlanStatus.OPTIMAL_IN_CATALOG,
+            PlanStatus.PARETO_OPTIMAL_IN_CATALOG,
+        }
         or graph.total_cny_cents is None
         or not catalog.query_tasks
         or not catalog.source_statuses
@@ -1600,7 +1665,7 @@ def parse_group_intent(
         minimum_anchor_buffer_minutes=(
             int(buffer_match.group(1)) if buffer_match else 0
         ),
-        preference_summary="交通和酒店总价尽量低",
+        preference_summary="",
         unresolved_critical=unresolved,
     )
 
@@ -1758,7 +1823,7 @@ def parse_complex_intent(text: str, *, reference_year: int | None = None) -> Tra
         route_legs=route_legs,
         anchors=anchors,
         minimum_anchor_buffer_minutes=int(buffer_match.group(1)) if buffer_match else 0,
-        preference_summary="交通和酒店总价尽量低",
+        preference_summary="",
         unresolved_critical=unresolved_critical,
     )
 

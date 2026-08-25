@@ -1,0 +1,140 @@
+{
+  "benchmark_id": "personalization-agent-routing-v1",
+  "checks": {
+    "all_architectures_return_feasible_fixture_candidate": true,
+    "conditional_matches_target_preferences": true,
+    "conditional_not_worse_than_fixed_team": true,
+    "conditional_uses_fewer_calls_than_fixed_team": true,
+    "no_source_fact_errors": true,
+    "simple_unique_skips_conditional_model": true
+  },
+  "claim_boundary": "仅证明条件路由在这4个预先冻结场景中与固定完整团队取得相同的偏好符合率，同时减少脚本模型调用、token和等待；未使用外部模型或实时供应商，不能外推为普遍优于单Agent。",
+  "evidence_tier": "scripted_frozen_decision_protocol",
+  "fairness_contract": {
+    "allowed_tools": [
+      "inspect_personalization_candidates"
+    ],
+    "budget": {
+      "max_model_calls": 12,
+      "max_model_wait_ms": 96,
+      "max_total_tokens": 1152
+    },
+    "model": "scripted:bounded-personalization-v1",
+    "same_candidate_set_per_scenario": true,
+    "same_model_fixture": true,
+    "same_source_snapshot": true,
+    "same_tool_permissions": true,
+    "same_total_budget": true
+  },
+  "metrics": {
+    "conditional_multi_agent": {
+      "final_feasible_rate": 1.0,
+      "model_call_count": 2,
+      "model_wait_ms": 16,
+      "preference_match_rate": 1.0,
+      "scenario_count": 4,
+      "source_fact_error_count": 0,
+      "token_usage": 192
+    },
+    "fixed_full_team": {
+      "final_feasible_rate": 1.0,
+      "model_call_count": 12,
+      "model_wait_ms": 96,
+      "preference_match_rate": 1.0,
+      "scenario_count": 4,
+      "source_fact_error_count": 0,
+      "token_usage": 1152
+    },
+    "no_decision_model": {
+      "final_feasible_rate": 1.0,
+      "model_call_count": 0,
+      "model_wait_ms": 0,
+      "preference_match_rate": 0.25,
+      "scenario_count": 4,
+      "source_fact_error_count": 0,
+      "token_usage": 0
+    },
+    "single_generic_agent": {
+      "final_feasible_rate": 1.0,
+      "model_call_count": 4,
+      "model_wait_ms": 32,
+      "preference_match_rate": 1.0,
+      "scenario_count": 4,
+      "source_fact_error_count": 0,
+      "token_usage": 384
+    }
+  },
+  "passed": true,
+  "result_sha256": "c16dbcce8db801d6c8e7d38e77dee03b88ae7886a7d6c929e3b50b59da2a8eea",
+  "rows": [
+    {
+      "expected_candidate_id": "saver",
+      "kind": "simple",
+      "model_calls": {
+        "conditional_multi_agent": 0,
+        "fixed_full_team": 3,
+        "no_decision_model": 0,
+        "single_generic_agent": 1
+      },
+      "scenario_id": "simple_unique",
+      "selections": {
+        "conditional_multi_agent": "saver",
+        "fixed_full_team": "saver",
+        "no_decision_model": "saver",
+        "single_generic_agent": "saver"
+      }
+    },
+    {
+      "expected_candidate_id": "balanced",
+      "kind": "ambiguity",
+      "model_calls": {
+        "conditional_multi_agent": 1,
+        "fixed_full_team": 3,
+        "no_decision_model": 0,
+        "single_generic_agent": 1
+      },
+      "scenario_id": "ambiguous_tradeoff",
+      "selections": {
+        "conditional_multi_agent": "balanced",
+        "fixed_full_team": "balanced",
+        "no_decision_model": "saver",
+        "single_generic_agent": "balanced"
+      }
+    },
+    {
+      "expected_candidate_id": "experience",
+      "kind": "tradeoff",
+      "model_calls": {
+        "conditional_multi_agent": 0,
+        "fixed_full_team": 3,
+        "no_decision_model": 0,
+        "single_generic_agent": 1
+      },
+      "scenario_id": "explicit_experience_tradeoff",
+      "selections": {
+        "conditional_multi_agent": "experience",
+        "fixed_full_team": "experience",
+        "no_decision_model": "saver",
+        "single_generic_agent": "experience"
+      }
+    },
+    {
+      "expected_candidate_id": "experience",
+      "kind": "special_risk",
+      "model_calls": {
+        "conditional_multi_agent": 1,
+        "fixed_full_team": 3,
+        "no_decision_model": 0,
+        "single_generic_agent": 1
+      },
+      "scenario_id": "elder_comfort_risk",
+      "selections": {
+        "conditional_multi_agent": "experience",
+        "fixed_full_team": "experience",
+        "no_decision_model": "saver",
+        "single_generic_agent": "experience"
+      }
+    }
+  ],
+  "scenario_sha256": "67bb59a729e659ece53124585ec5968de52d37bbc470b30f784304d1b9c4fac4"
+}

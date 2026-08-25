@@ -863,6 +863,18 @@ export type TripCardProjection = {
   city_order: string[];
   traveler_count: number;
   total_cny_cents: number | null;
+  representative_kind?: "saver" | "balanced" | "experience" | "personalized" | null;
+  selection_reason?: string;
+  decision_metrics?: {
+    total_cny_cents: number;
+    transport_duration_minutes: number;
+    early_departure_penalty_minutes: number;
+    late_arrival_penalty_minutes: number;
+    schedule_inconvenience_minutes: number;
+    transfer_count: number;
+  } | null;
+  participating_agent_roles?: string[];
+  applied_skill_ids?: string[];
   activity_price_included: boolean;
   unresolved_items: string[];
   source_boundary: string;
@@ -982,6 +994,24 @@ export type LiveFlexibleFromTextResponse = {
   model_trace_failure_count?: number;
   execution_boundary: string;
   trip_card?: TripCardProjection | null;
+  trip_cards?: TripCardProjection[];
+  personalization?: {
+    selection_mode: string;
+    preference_policy: Record<string, JsonValue>;
+    graph_version: string;
+    catalog_digest: string;
+    provider_query_count: number;
+    theoretical_combination_count: number;
+    enumerated_feasible_count: number;
+    pareto_candidate_count: number;
+    pareto_complete_in_catalog: boolean;
+    agent_runs: Array<{ role: string; applied: boolean; model_called: boolean }>;
+    skill_applications: Array<{ skill_id: string; applicable: boolean; reason: string }>;
+    model_call_count: number;
+    total_token_usage: number;
+    total_agent_latency_ms: number;
+    boundary: string;
+  } | null;
   travel_intent?: TravelIntent | null;
   source_statuses?: SourceStatus[];
 };
