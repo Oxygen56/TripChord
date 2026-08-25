@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -207,6 +208,7 @@ from tripchord.planning.complex_trip import (
     PlanningCompiler,
     SourceState,
     SourceStatus,
+    current_complex_plan_execution_ready,
     project_package_result_trip_card,
     project_trip_card,
 )
@@ -248,6 +250,7 @@ from tripchord.providers.browser_bridge import (
     formal_worker_source_token,
     is_loopback_client,
 )
+from tripchord.providers.current_complex import CurrentComplexOfferProvider
 from tripchord.providers.factory import build_amap_provider, build_provider_registry
 from tripchord.providers.icom_transfer import (
     IComTransferProvider,
@@ -754,6 +757,16 @@ class LiveRunCache:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
+
+
+def _install_current_complex_offer_provider(
+    target_app: FastAPI,
+) -> CurrentComplexOfferProvider:
+    """Install public read-only multi-city sources independently of Chrome."""
+
+    provider = CurrentComplexOfferProvider()
+    target_app.state.complex_offer_provider = provider
+    return provider
 
 
 def _install_browser_bridge(
@@ -1408,6 +1421,7 @@ app.state.handoff_store = HandoffStore()
 app.state.booking_ledger_store = BookingLedgerStore()
 app.state.provider_cooldown_overlay = {}
 app.state.provider_adapter_registry = {}
+complex_offer_provider = _install_current_complex_offer_provider(app)
 # Inject a quote-source factory in tests/fixtures to exercise the reprice chain
 # without a real OTA session; absent it, the endpoint reports live-unavailable.
 app.state.reprice_quote_source_factory = None
@@ -2863,7 +2877,10 @@ async def _execute_live_flexible_from_text_body(
         captured_at = datetime.now(UTC)
         complex_provider = getattr(target_app.state, "complex_offer_provider", None)
         if complex_provider is not None:
-            complex_catalog, complex_contracts = complex_provider.catalog_for(complex_intent)
+            catalog_result = complex_provider.catalog_for(complex_intent)
+            if inspect.isawaitable(catalog_result):
+                catalog_result = await catalog_result
+            complex_catalog, complex_contracts = catalog_result
             source_statuses = complex_catalog.source_statuses or (
                 SourceStatus(
                     source_id=f"provider:{complex_provider.__class__.__name__}",
@@ -2874,6 +2891,8 @@ async def _execute_live_flexible_from_text_body(
                     captured_at=captured_at,
                 ),
             )
+            if source_statuses:
+                captured_at = max(item.captured_at for item in source_statuses)
         else:
             query_tasks = tuple(
                 f"query:transport:{leg.origin_place_id}-{leg.destination_place_id}"
@@ -2902,12 +2921,18 @@ async def _execute_live_flexible_from_text_body(
                 captured_at=captured_at,
             )
         )
+        complex_execution_ready = current_complex_plan_execution_ready(
+            complex_intent,
+            graph,
+            complex_catalog,
+        )
         trip_card = project_trip_card(
             complex_intent,
             graph,
             graph.price_contracts,
             source_statuses,
             captured_at=captured_at,
+            execution_ready=complex_execution_ready,
         )
         await report("solving_multi_city_catalog", 90)
         return LiveFlexibleFromTextPlanningResponse(
@@ -2922,7 +2947,22 @@ async def _execute_live_flexible_from_text_body(
             model_trace_success_count=0,
             model_trace_failure_count=0,
             execution_boundary=(
-                "本次使用注入的有界报价目录完成约束求解；结果仅是目录内候选。"
+                "本次使用当前只读交通与住宿来源的有界报价目录生成完整方案；"
+                "所有必要组件已按同行人数和人民币总价复算，"
+                "仍未锁票、未下单，也不代表全网最低价。"
+                if complex_catalog.source_mode == "current"
+                and complex_execution_ready
+                else
+                "本次使用当前只读交通与住宿来源的有界报价目录完成约束求解；"
+                "所有组件按同行人数和人民币总价复算，结果仅为当前目录候选，"
+                "未锁票、未下单。"
+                if complex_catalog.source_mode == "current"
+                and any(item.state == SourceState.SUCCEEDED for item in source_statuses)
+                else "多城市需求已结构化；当前来源未形成可查询且"
+                "费用口径完整的全部必要组件，因此没有生成方案。"
+                if complex_catalog.source_mode == "current"
+                else "本次使用注入的有界报价目录完成约束求解；"
+                "结果仅是目录内候选。"
                 if any(item.state == SourceState.SUCCEEDED for item in source_statuses)
                 else "多城市需求已结构化，当前实时来源尚未接入，未生成候选。"
             ),

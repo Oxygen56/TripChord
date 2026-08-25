@@ -7,6 +7,7 @@ price, or URL.  Frozen catalogs belong to tests/replay providers.
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from itertools import pairwise
@@ -165,6 +166,8 @@ class TransportOffer(DomainModel):
     price_contract_id: str
     detail_url: str
     label: str
+    party_capacity_confirmed: bool = False
+    available_units: int | None = Field(default=None, ge=0)
 
 
 class StayOffer(DomainModel):
@@ -176,6 +179,8 @@ class StayOffer(DomainModel):
     price_contract_id: str
     detail_url: str
     label: str
+    confirmed_traveler_count: int | None = Field(default=None, ge=1)
+    confirmed_room_count: int | None = Field(default=None, ge=1)
 
 
 class BundleOffer(DomainModel):
@@ -197,7 +202,10 @@ class OfferCatalog(DomainModel):
 class ComplexOfferProvider(Protocol):
     def catalog_for(
         self, intent: TravelIntent
-    ) -> tuple[OfferCatalog, tuple[PriceContract, ...]]:
+    ) -> (
+        tuple[OfferCatalog, tuple[PriceContract, ...]]
+        | Awaitable[tuple[OfferCatalog, tuple[PriceContract, ...]]]
+    ):
         """Return a bounded catalog and its source-backed contracts."""
 
 
@@ -288,6 +296,45 @@ class TripCardProjection(DomainModel):
 class PlanSolver(Protocol):
     def solve(self, problem: PlanningProblem) -> PlanGraph:
         """Solve one compiled travel problem."""
+
+
+def _comparable_datetimes(
+    left: datetime,
+    right: datetime,
+) -> tuple[datetime, datetime]:
+    """Compare source-local times without erasing an explicit source timezone.
+
+    Existing frozen catalogs use local wall-clock datetimes, while current
+    providers carry explicit offsets.  A naive request time is therefore
+    interpreted in the adjacent source offer's timezone; two aware values keep
+    their own offsets and compare as absolute instants.
+    """
+
+    if left.tzinfo is None and right.tzinfo is not None:
+        left = left.replace(tzinfo=right.tzinfo)
+    elif left.tzinfo is not None and right.tzinfo is None:
+        right = right.replace(tzinfo=left.tzinfo)
+    return left, right
+
+
+def _datetime_before(left: datetime, right: datetime) -> bool:
+    left, right = _comparable_datetimes(left, right)
+    return left < right
+
+
+def _datetime_after(left: datetime, right: datetime) -> bool:
+    left, right = _comparable_datetimes(left, right)
+    return left > right
+
+
+def _datetime_not_after(left: datetime, right: datetime) -> bool:
+    left, right = _comparable_datetimes(left, right)
+    return left <= right
+
+
+def _datetime_not_before(left: datetime, right: datetime) -> bool:
+    left, right = _comparable_datetimes(left, right)
+    return left >= right
 
 
 class PlanningCompiler:
@@ -512,7 +559,7 @@ def project_trip_card(
             else TripCardStatus.CANDIDATE
         ),
         title=(
-            "多城市异地进出与固定活动方案"
+            "多城市与固定活动方案"
             if intent.topology == TravelTopology.MULTI_CITY
             else "单目的地完整行程方案"
         ),
@@ -760,7 +807,7 @@ def validate_plan_graph(
                 requirement.destination_place_id,
             ):
                 errors.append(f"交通地点不匹配:{component.offer_id}")
-            if offer.arrival <= offer.departure:
+            if _datetime_not_after(offer.arrival, offer.departure):
                 errors.append(f"交通段到达时间不得早于或等于出发:{component.offer_id}")
             departure_date = offer.departure.date()
             if requirement.departure_date and departure_date != requirement.departure_date:
@@ -776,13 +823,19 @@ def validate_plan_graph(
             ):
                 errors.append(f"交通晚于日期窗:{component.offer_id}")
         for previous, current in pairwise(selected_transport_offers):
-            if previous.arrival > current.departure:
+            if _datetime_after(previous.arrival, current.departure):
                 errors.append(
                     f"相邻交通时间倒置:{previous.id}->{current.id}"
                 )
-        if transports and (
-            transports[0].start < intent.window.start
-            or transports[-1].end > intent.window.end
+        if selected_transport_offers and (
+            _datetime_before(
+                selected_transport_offers[0].departure,
+                intent.window.start,
+            )
+            or _datetime_after(
+                selected_transport_offers[-1].arrival,
+                intent.window.end,
+            )
         ):
             errors.append("交通超出全程时间窗")
         stays = tuple(item for item in plan.components if item.kind == "stay")
@@ -804,7 +857,7 @@ def validate_plan_graph(
             ):
                 errors.append(f"住宿日期未覆盖:{stay.offer_id}")
         for anchor in intent.anchors:
-            if anchor.end <= anchor.start:
+            if _datetime_not_after(anchor.end, anchor.start):
                 errors.append(f"固定活动结束时间不得早于或等于开始:{anchor.id}")
                 continue
             anchor_index = next(
@@ -815,11 +868,15 @@ def validate_plan_graph(
                 errors.append(f"活动地点不存在:{anchor.place_id}")
                 continue
             if (
-                transports[anchor_index].end
-                + timedelta(minutes=intent.minimum_anchor_buffer_minutes)
-                > anchor.start
-                or anchor.end + timedelta(minutes=intent.minimum_anchor_buffer_minutes)
-                > transports[anchor_index + 1].start
+                _datetime_after(
+                    selected_transport_offers[anchor_index].arrival
+                    + timedelta(minutes=intent.minimum_anchor_buffer_minutes),
+                    anchor.start,
+                )
+                or _datetime_after(
+                    anchor.end + timedelta(minutes=intent.minimum_anchor_buffer_minutes),
+                    selected_transport_offers[anchor_index + 1].departure,
+                )
             ):
                 errors.append(f"活动缓冲不足:{anchor.id}")
         if intent.unresolved_critical:
@@ -833,6 +890,67 @@ def validate_plan_graph(
         if calculated != plan.total_cny_cents:
             errors.append("总价与价格合同不一致")
     return tuple(errors)
+
+
+def current_complex_plan_execution_ready(
+    intent: TravelIntent,
+    graph: PlanGraph,
+    catalog: OfferCatalog,
+) -> bool:
+    """Return true only for a complete, independently verified current plan."""
+
+    if (
+        catalog.source_mode != "current"
+        or graph.status != PlanStatus.OPTIMAL_IN_CATALOG
+        or graph.total_cny_cents is None
+        or not catalog.query_tasks
+        or not catalog.source_statuses
+        or any(item.state != SourceState.SUCCEEDED for item in catalog.source_statuses)
+    ):
+        return False
+    succeeded_query_tasks = {
+        task_id
+        for status in catalog.source_statuses
+        for task_id in status.query_task_ids
+    }
+    if set(catalog.query_tasks) != succeeded_query_tasks:
+        return False
+
+    selected_transports = tuple(
+        item for item in graph.components if item.kind == "transport"
+    )
+    selected_stays = tuple(item for item in graph.components if item.kind == "stay")
+    if (
+        len(selected_transports) != len(intent.route_legs)
+        or len(selected_stays) != len(intent.places)
+    ):
+        return False
+    transport_by_id = {item.id: item for item in catalog.transports}
+    stay_by_id = {item.id: item for item in catalog.stays}
+    for component in selected_transports:
+        offer = transport_by_id.get(component.offer_id)
+        if (
+            offer is None
+            or not offer.party_capacity_confirmed
+            or offer.available_units is None
+            or offer.available_units < intent.travelers
+        ):
+            return False
+    for component in selected_stays:
+        stay_offer = stay_by_id.get(component.offer_id)
+        if (
+            stay_offer is None
+            or stay_offer.confirmed_traveler_count != intent.travelers
+            or stay_offer.confirmed_room_count is None
+            or stay_offer.confirmed_room_count < 1
+        ):
+            return False
+    return not validate_plan_graph(
+        graph,
+        graph.price_contracts,
+        intent=intent,
+        catalog=catalog,
+    )
 
 
 def is_complex_multi_city_request(text: str) -> bool:
@@ -878,7 +996,8 @@ def parse_complex_intent(text: str, *, reference_year: int | None = None) -> Tra
     stop_names = re.findall(r"(?:出发到|到|去|→)([\u4e00-\u9fff]{2,12})", text)
     return_match = re.search(r"从([\u4e00-\u9fff]{2,12})返回([\u4e00-\u9fff]{2,12})", text)
     if return_match:
-        stop_names.append(return_match.group(1))
+        if not stop_names or stop_names[-1] != return_match.group(1):
+            stop_names.append(return_match.group(1))
     else:
         short_return_place = re.search(
             r"从([\u4e00-\u9fff]{2,12}?)返(?:回)?[\u4e00-\u9fff]{1,8}", text
@@ -889,7 +1008,7 @@ def parse_complex_intent(text: str, *, reference_year: int | None = None) -> Tra
     if len(unique_stops) < 2:
         return None
     places = tuple(PlaceRef(id=name, name=name, city=name) for name in unique_stops)
-    route_places = (origin.id, *unique_stops, origin.id)
+    route_places = (origin.id, *stop_names, origin.id)
     route_event_dates = [
         date(int(y), int(m), int(d))
         for y, m, d, _verb, _place in re.findall(
@@ -1003,7 +1122,9 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
             problem.price_contracts,
             "关键需求待确认：" + "；".join(intent.unresolved_critical),
         )
-    if any(anchor.end <= anchor.start for anchor in intent.anchors):
+    if any(
+        _datetime_not_after(anchor.end, anchor.start) for anchor in intent.anchors
+    ):
         return _no_solution_graph(
             problem.price_contracts,
             "固定活动结束时间必须晚于开始时间",
@@ -1099,9 +1220,9 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
                     requirement.latest_departure_date is None
                     or departure_date <= requirement.latest_departure_date
                 )
-                and offer.departure >= intent.window.start
-                and offer.arrival <= intent.window.end
-                and offer.arrival > offer.departure
+                and _datetime_not_before(offer.departure, intent.window.start)
+                and not _datetime_after(offer.arrival, intent.window.end)
+                and _datetime_after(offer.arrival, offer.departure)
             )
             if not valid:
                 model.Add(transport_vars[offer.id] == 0)  # type: ignore[attr-defined]
@@ -1117,7 +1238,7 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
     for left_options, right_options in pairwise(leg_options):
         for left in left_options:
             for right in right_options:
-                if left.arrival > right.departure:
+                if _datetime_after(left.arrival, right.departure):
                     model.Add(  # type: ignore[attr-defined]
                         transport_vars[left.id] + transport_vars[right.id] <= 1
                     )
@@ -1144,15 +1265,20 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
             return _no_solution_graph(contracts, f"固定活动地点不在路线中:{anchor.place_id}")
         for inbound in leg_options[place_index]:
             if (
-                inbound.arrival
-                + timedelta(minutes=intent.minimum_anchor_buffer_minutes)
-                > anchor.start
+                _datetime_after(
+                    inbound.arrival
+                    + timedelta(minutes=intent.minimum_anchor_buffer_minutes),
+                    anchor.start,
+                )
             ):
                 model.Add(transport_vars[inbound.id] == 0)  # type: ignore[attr-defined]
         for outbound in leg_options[place_index + 1]:
             if (
-                anchor.end + timedelta(minutes=intent.minimum_anchor_buffer_minutes)
-                > outbound.departure
+                _datetime_after(
+                    anchor.end
+                    + timedelta(minutes=intent.minimum_anchor_buffer_minutes),
+                    outbound.departure,
+                )
             ):
                 model.Add(transport_vars[outbound.id] == 0)  # type: ignore[attr-defined]
 
@@ -1200,6 +1326,7 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
     counted_contract_ids = tuple(
         item.id for item in contracts if solver.Value(contract_vars[item.id])
     )
+    selected_contracts = tuple(by_contract[item] for item in counted_contract_ids)
     transport_components = tuple(
         _offer_component(item, by_contract[item.price_contract_id])
         for item in selected_transports
@@ -1238,7 +1365,7 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
             by_contract[item].total_for_party_cents for item in counted_contract_ids
         ),
         counted_price_contract_ids=counted_contract_ids,
-        price_contracts=contracts,
+        price_contracts=selected_contracts,
         checked_constraints=(
             "逐段地点与日期窗",
             "交通时间连续",
@@ -1252,7 +1379,12 @@ def solve_complex_catalog(problem: PlanningProblem) -> PlanGraph:
             else "当前有界来源目录内找到可行解，但未证明目录内最优；不是锁价"
         ),
     )
-    errors = validate_plan_graph(graph, contracts, intent=intent, catalog=catalog)
+    errors = validate_plan_graph(
+        graph,
+        selected_contracts,
+        intent=intent,
+        catalog=catalog,
+    )
     if errors:
         return _no_solution_graph(contracts, "最终校验未通过：" + "；".join(errors))
     return graph

@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 import pytest
 import tripchord.main as main_module
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from tripchord.agents.flexible_live_system import FlexibleLiveAgentSystem
 from tripchord.agents.live_system import (
@@ -32,9 +33,12 @@ from tripchord.agents.models import (
     TaskGraph,
 )
 from tripchord.agents.runtime import SchedulerOutcome
+from tripchord.config import Settings
 from tripchord.main import (
     LiveRunCache,
     _flexible_total_timeout_seconds,
+    _install_browser_bridge,
+    _install_current_complex_offer_provider,
     _live_timeout_seconds,
     app,
     package_requirement_agent,
@@ -46,6 +50,8 @@ from tripchord.planning.complex_trip import (
     OfferCatalog,
     PlanningCompiler,
     PriceContract,
+    SourceState,
+    SourceStatus,
     StayOffer,
     TransportOffer,
     parse_complex_intent,
@@ -79,6 +85,7 @@ from tripchord.providers.browser_bridge import (
     BrowserSearchQuery,
     BrowserVertical,
 )
+from tripchord.providers.current_complex import CurrentComplexOfferProvider
 from tripchord.providers.icom_transfer import IComCnyReferenceEstimate
 from tripchord.providers.quote_normalizer import (
     NormalizedBrowserQuoteResult,
@@ -1243,6 +1250,185 @@ async def test_http_endpoint_solves_multi_city_anchor_from_same_text_entrypoint(
 
 
 @pytest.mark.asyncio
+async def test_default_http_composition_runs_current_complex_provider_without_browser_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Public HTTP sources remain installed when the optional Chrome bridge is off."""
+
+    current_app = FastAPI()
+    installed_provider = _install_current_complex_offer_provider(current_app)
+    bridge, live_system = _install_browser_bridge(
+        current_app,
+        Settings(_env_file=None),
+    )
+    assert bridge is None
+    assert live_system is None
+    assert current_app.state.complex_offer_provider is installed_provider
+
+    query_tasks = (
+        "12306:2026-08-30:HGH-NKH",
+        "12306:2026-09-01:NKH-AOH",
+        "12306:2026-09-04:AOH-HGH",
+        "trip.com:hotel:12:2026-08-30:2026-09-01:2a",
+        "trip.com:hotel:2:2026-09-01:2026-09-04:2a",
+    )
+
+    def transport(
+        offer_id: str,
+        origin: str,
+        destination: str,
+        departure: str,
+        arrival: str,
+        amount: int,
+    ) -> tuple[TransportOffer, PriceContract]:
+        contract_id = f"{offer_id}:price"
+        return (
+            TransportOffer(
+                id=offer_id,
+                provider="12306",
+                origin_place_id=origin,
+                destination_place_id=destination,
+                departure=datetime.fromisoformat(departure),
+                arrival=datetime.fromisoformat(arrival),
+                price_contract_id=contract_id,
+                detail_url=f"https://www.12306.cn/{offer_id}",
+                label=offer_id,
+                party_capacity_confirmed=True,
+                available_units=2,
+            ),
+            PriceContract(
+                id=contract_id,
+                total_for_party_cents=amount,
+                component_ids=(offer_id,),
+                source="current:12306:test-fixture",
+            ),
+        )
+
+    transports_and_contracts = (
+        transport(
+            "rail-hgh-nkh",
+            "杭州",
+            "南京",
+            "2026-08-30T09:00:00+08:00",
+            "2026-08-30T10:30:00+08:00",
+            20_000,
+        ),
+        transport(
+            "rail-nkh-aoh",
+            "南京",
+            "上海",
+            "2026-09-01T09:00:00+08:00",
+            "2026-09-01T10:30:00+08:00",
+            30_000,
+        ),
+        transport(
+            "rail-aoh-hgh",
+            "上海",
+            "杭州",
+            "2026-09-04T09:00:00+08:00",
+            "2026-09-04T10:30:00+08:00",
+            20_000,
+        ),
+    )
+    stays = (
+        StayOffer(
+            id="stay-nanjing",
+            provider="trip.com",
+            place_id="南京",
+            check_in=date(2026, 8, 30),
+            check_out=date(2026, 9, 1),
+            price_contract_id="stay-nanjing:price",
+            detail_url="https://www.trip.com/hotels/nanjing",
+            label="南京酒店",
+            confirmed_traveler_count=2,
+            confirmed_room_count=1,
+        ),
+        StayOffer(
+            id="stay-shanghai",
+            provider="trip.com",
+            place_id="上海",
+            check_in=date(2026, 9, 1),
+            check_out=date(2026, 9, 4),
+            price_contract_id="stay-shanghai:price",
+            detail_url="https://www.trip.com/hotels/shanghai",
+            label="上海酒店",
+            confirmed_traveler_count=2,
+            confirmed_room_count=1,
+        ),
+    )
+    contracts = (
+        *(item[1] for item in transports_and_contracts),
+        PriceContract(
+            id="stay-nanjing:price",
+            total_for_party_cents=40_000,
+            component_ids=("stay-nanjing",),
+            source="current:trip.com:test-fixture",
+        ),
+        PriceContract(
+            id="stay-shanghai:price",
+            total_for_party_cents=50_000,
+            component_ids=("stay-shanghai",),
+            source="current:trip.com:test-fixture",
+        ),
+    )
+    catalog = OfferCatalog(
+        transports=tuple(item[0] for item in transports_and_contracts),
+        stays=stays,
+        query_tasks=query_tasks,
+        source_statuses=tuple(
+            SourceStatus(
+                source_id=f"source:{index}",
+                provider="12306" if index < 3 else "trip.com",
+                state=SourceState.SUCCEEDED,
+                detail="当前人民币同行总价已返回",
+                query_task_ids=(task_id,),
+                captured_at=NOW,
+            )
+            for index, task_id in enumerate(query_tasks)
+        ),
+        source_mode="current",
+    )
+
+    async def fixture_catalog_for(
+        _self: CurrentComplexOfferProvider,
+        _intent: Any,
+    ) -> tuple[OfferCatalog, tuple[PriceContract, ...]]:
+        return catalog, contracts
+
+    monkeypatch.setattr(CurrentComplexOfferProvider, "catalog_for", fixture_catalog_for)
+    monkeypatch.setattr(app.state, "complex_offer_provider", installed_provider)
+    monkeypatch.setattr(app.state, "package_requirement_agent", package_requirement_agent)
+    monkeypatch.setattr(
+        app.state,
+        "live_run_cache",
+        LiveRunCache(capacity=8, ttl=timedelta(minutes=5), now=lambda: NOW),
+    )
+    text = (
+        "2名成人，2026-08-30 杭州出发到南京，2026-09-01 去上海，"
+        "2026-09-04 从上海返回杭州；2026-08-31 19:00-21:30 "
+        "在南京有已持有活动，活动费用未提供；交通和酒店总价尽量低，"
+        "活动前至少留90分钟缓冲。"
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("127.0.0.1", 51360)),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/v1/agents/live-flexible-plan-from-text",
+            json=_payload(text=text, max_pairs=1),
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["interpretation"] is None
+    assert body["trip_card"]["status"] == "final"
+    assert body["trip_card"]["total_cny_cents"] == 160_000
+    assert len(body["trip_card"]["components"]) == 5
+    assert {item["state"] for item in body["source_statuses"]} == {"succeeded"}
+    assert "生成完整方案" in body["execution_boundary"]
+
+
+@pytest.mark.asyncio
 async def test_http_endpoint_reports_source_gap_without_frozen_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1275,8 +1461,12 @@ async def test_http_endpoint_reports_source_gap_without_frozen_catalog(
     assert body["trip_card"]["activity_price_included"] is False
     assert len(body["trip_card"]["fixed_activities"]) == 1
     assert body["trip_card"]["fixed_activities"][0]["label"] == "已持有演唱会"
-    assert body["source_statuses"][0]["state"] == "not_queried"
-    assert body["source_statuses"][0]["query_task_ids"]
+    assert {item["provider"] for item in body["source_statuses"]} == {
+        "12306",
+        "trip.com",
+    }
+    assert {item["state"] for item in body["source_statuses"]} == {"not_queried"}
+    assert "当前来源未形成可查询" in body["execution_boundary"]
 
 
 @pytest.mark.asyncio
