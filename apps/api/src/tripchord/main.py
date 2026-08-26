@@ -229,6 +229,10 @@ from tripchord.planning.personalization import (
     BoundedPersonalizationAgent,
     apply_effective_preference_policy,
     personalize_complex_problem,
+    personalize_complex_problem_async,
+)
+from tripchord.planning.personalization_model_adapter import (
+    ModelRouterPersonalizationAgent,
 )
 from tripchord.planning.policy import ReplanPolicySelector
 from tripchord.planning.problem import PlanningInfeasible
@@ -1022,6 +1026,8 @@ def _build_model_router(
         AgentRole.CANDIDATE_CURATOR,
         AgentRole.EXPLANATION,
         AgentRole.MEMORY_CURATOR,
+        AgentRole.BUDGET,
+        AgentRole.EXPERIENCE_SPECIALIST,
     }
     return ModelRouter(
         {role: fast for role in fast_roles},
@@ -1432,6 +1438,8 @@ app.middleware("http")(observe_request)
 app.state.live_run_cache = live_run_cache
 app.state.package_requirement_agent = package_requirement_agent
 app.state.model_router = model_router
+if model_router is not None:
+    app.state.personalization_agent = ModelRouterPersonalizationAgent(model_router)
 app.state.model_http_runtime = model_http_runtime
 app.state.model_trace_sink = model_trace_sink
 app.state.memory_store = memory_store
@@ -2959,11 +2967,27 @@ async def _execute_live_flexible_from_text_body(
             BoundedPersonalizationAgent | None,
             getattr(target_app.state, "personalization_agent", None),
         )
-        personalized = personalize_complex_problem(
-            problem,
-            agent=personalization_agent,
-            provider_query_count=1 if complex_provider is not None else 0,
+        use_multi_agent_panel = bool(
+            personalization_agent is not None
+            and getattr(personalization_agent, "multi_agent_panel", False)
         )
+        if use_multi_agent_panel:
+            # A configured model provider activates the bounded three-role
+            # personalization panel.  Source facts and final arithmetic still
+            # remain in the deterministic solver; the panel only nominates
+            # existing candidates from this immutable catalog.
+            personalized = await personalize_complex_problem_async(
+                problem,
+                agent=personalization_agent,
+                provider_query_count=1 if complex_provider is not None else 0,
+                force_multi_agent=True,
+            )
+        else:
+            personalized = personalize_complex_problem(
+                problem,
+                agent=personalization_agent,
+                provider_query_count=1 if complex_provider is not None else 0,
+            )
         cards = tuple(
             project_trip_card(
                 complex_intent,

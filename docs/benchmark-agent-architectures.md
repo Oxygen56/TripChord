@@ -1,5 +1,7 @@
 # 单 LLM Agent 与多 Agent 公平基准
 
+> **历史工具链实验，不是当前产品的 Multi-Agent 验收，也不是面试主证据。** 当前复杂个性化主路径已经改为真实三角色面板：价格与体验 Agent 并行提案，综合决策 Agent 通过 typed handoff 接收提案，程序最终仲裁。本文保留用于说明早期调度指标和预算测量为何不能被误读为质量结论；当前运行证据请先看 [Multi-Agent 当前面板证据](../benchmarks/results/multi-agent-panel-current-2026-08-26.json) 和 [D008 架构决策](architecture-decisions.md#d008复杂个性化选择采用真实三角色-multi-agent-面板)。
+
 ## 这个基准解决什么问题
 
 旧的 `benchmarks/evaluate_agents.py` 中，`single` 是“只保留一个候选再跑确定性

@@ -224,6 +224,48 @@ class ScriptedBoundedAgent:
         )
 
 
+class PanelScriptedAgent(ScriptedBoundedAgent):
+    """Small endpoint double for the real three-role panel contract."""
+
+    @property
+    def multi_agent_panel(self) -> bool:
+        return True
+
+    async def propose_async(
+        self, manifest: AgentContextManifest
+    ) -> AgentProposalResult:
+        self.manifests.append(manifest)
+        if manifest.role == AgentRole.BUDGET:
+            selected = min(
+                manifest.candidates,
+                key=lambda item: item.metrics.total_cny_cents,
+            )
+        elif manifest.role == AgentRole.EXPERIENCE_SPECIALIST:
+            selected = min(
+                manifest.candidates,
+                key=lambda item: item.metrics.schedule_inconvenience_minutes,
+            )
+        else:
+            nominated = {
+                str(item.get("candidate_id")) for item in manifest.peer_proposals
+            }
+            selected = next(
+                item for item in manifest.candidates if item.candidate_id in nominated
+            )
+        return AgentProposalResult(
+            proposal=AgentSelectionProposal(
+                graph_version=manifest.graph_version,
+                role=manifest.role,
+                candidate_id=selected.candidate_id,
+                reason=f"{manifest.role.value} 在同一候选目录中提出可核对取舍",
+                source_refs=selected.source_refs,
+            ),
+            model=f"fixture-{manifest.role.value}",
+            token_usage=64,
+            latency_ms=5,
+        )
+
+
 class UniqueWinnerProvider(CountingTradeoffProvider):
     def catalog_for(
         self,
@@ -337,6 +379,60 @@ async def test_formal_entry_reuses_one_catalog_for_distinct_pareto_cards(
         experience_card["decision_metrics"]["transport_duration_minutes"]
         < price_card["decision_metrics"]["transport_duration_minutes"]
     )
+
+
+@pytest.mark.asyncio
+async def test_formal_entry_runs_three_role_panel_and_hands_off_peer_proposals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = CountingTradeoffProvider()
+    agent = PanelScriptedAgent()
+    monkeypatch.setattr(app.state, "complex_offer_provider", provider)
+    monkeypatch.setattr(app.state, "personalization_agent", agent, raising=False)
+    monkeypatch.setattr(
+        app.state,
+        "live_run_cache",
+        LiveRunCache(capacity=4, ttl=timedelta(minutes=5), now=lambda: NOW),
+    )
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        tenant_id="personalization-panel-user",
+        auth_mode="static-token",
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, client=("127.0.0.1", 52004)),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/v1/agents/live-flexible-plan-from-text",
+                json=_payload(BASE_TEXT + "价格和舒适都重要。"),
+            )
+    finally:
+        app.dependency_overrides.pop(get_principal, None)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    personalization = body["personalization"]
+    assert provider.calls == 1
+    assert personalization["model_call_count"] == 3
+    assert personalization["arbitration"]["enabled"] is True
+    assert personalization["arbitration"]["valid_agent_roles"] == [
+        "budget",
+        "experience_specialist",
+        "decision_agent",
+    ]
+    assert body["trip_card"]["participating_agent_roles"] == [
+        "budget",
+        "experience_specialist",
+        "decision_agent",
+    ]
+    decision_manifest = next(
+        item
+        for item in agent.manifests
+        if item.role == AgentRole.DECISION_AGENT
+    )
+    assert len(decision_manifest.peer_proposals) == 2
+    assert all(item["candidate_id"] for item in decision_manifest.peer_proposals)
 
 
 @pytest.mark.asyncio

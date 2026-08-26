@@ -60,7 +60,7 @@ Round 17 又记录 job-bound 47/47 成功模型调用和三个 checkpoint，但 
 | 模型失败后是不是偷偷走规则还声称用了模型？ | `MODEL_AGENTS_REQUIRED=true` 时失败关闭；可选模式才允许带 fallback 原因的确定性降级。 | 已实现；`agents/model_gateway.py`、`agents/live_advisory.py` |
 | Safety Gate 后的解释/记忆 Agent 失败会不会漏出接受结果？ | 不会。最终 deterministic Publication Gate 依赖 Explanation 和 Memory Curator；required-model 模式下任一必需阶段失败都转为阻塞。 | 已实现/晚失败反例测试；`agents/live_system.py`、`tests/test_live_agent_system.py` |
 | 解释 Agent 会不会编造“含早/免费取消”？ | 选择理由、权衡和权益陈述必须逐条绑定最终组件 ID 与 evidence_ref；运行时还会对早餐、行李、免费取消和含税等结构化权益做确定性对账。 | 已实现/未知组件与虚假含早反例测试 |
-| 多 Agent 一定比单 Agent 好吗？ | 没有这个结论。当前公平 scripted 对照不能证明架构质量优势；可证价值是权限隔离、并发等待重叠、阶段化复核和可审计 handoff。同一 Router/进程仍有 common-mode failure。 | 声明边界；`docs/benchmark-agent-architectures.md` |
+| 多 Agent 一定比单 Agent 好吗？ | 不做这种普遍化结论。当前主证据是 D008 的真实三角色面板：价格/体验并行提案，综合决策 typed handoff，程序仲裁；旧 scripted 对照只验证合同、预算和指标实现。同一 Router/进程仍有 common-mode failure。 | 当前主证据：`benchmarks/results/multi-agent-panel-current-2026-08-26.json`；历史工具链：`docs/benchmark-agent-architectures.md` |
 | 用的是 LangGraph 吗？ | 没有依赖 LangGraph。项目实现的是 typed Dynamic DAG runtime，因此简历只能写 “LangGraph-style”，不能写“基于 LangGraph”。 | 已实现自研 runtime；`agents/runtime.py` |
 | 用了 MCP 吗？ | 已实现一个只暴露四个粗粒度能力的 stdio MCP 适配器：`create_plan`、`get_plan_status`、`get_plan`、`modify_plan`。Claude Code 2.1.245 已完成创建、断开恢复和局部修改，官方 Python MCP SDK 1.29.1 也读取了同一 `TripRun`；TripChord 的 REST/求解/最终校验仍是唯一事实源。 | 范围受控当前来源证据；DeepSeek Harness GUI 与 Oh My Pi 未声称已接通 |
 | LLM 如何调用工具？ | 模型先返回受 schema 约束的 tool call；runtime 校验 Agent role、工具 allowlist、权限级别、参数和调用上限，执行后把回执作为不可信数据放回同一 Context 预算，再进行下一轮模型请求。 | 已实现；`agents/model_agent.py`、`agents/tools.py` |
@@ -164,7 +164,7 @@ resolved 证据，不能把原风险静默清零。具体 schema 在 `agents/liv
 |---|---|---|
 | 240 条是不是自己生成、自己判？ | 是固定种子合成任务，只证明合同内机制；不能外推真人满意度。 | 声明边界 |
 | 预算基准四组全过，能否证明动态 Agent 更强？ | 不能。`adaptive-agent-budget-v1` 没有模型、浏览器或 OTA 调用，只冻结 Flexible 规划口径的 8/19/57/143→8/19/57/96、2/6/8/12 ceiling、Chrome 6、去哪儿住宿 1 与同输入复现；不含文本 Requirement admission。 | 只允许“确定性预算回归通过”；不允许全请求 Agent 数、质量、延迟、覆盖或 SLA 结论 |
-| 单 Agent 对照公平吗？ | 历史 75% 是单候选确定性代理，不是 one-shot LLM；新的同输入/同最终 Safety Audit scripted 对照两者都 100%，所以不宣称多 Agent 质量胜出。 | 已修正 |
+| 单 Agent 对照公平吗？ | 历史 75% 是单候选确定性代理，不是 one-shot LLM；新的同输入/同最终 Safety Audit scripted 对照只说明两套合同和指标可复现。当前 Multi-Agent 的面试主证据改为真实三角色提案、handoff 和程序仲裁，不把旧对照当质量胜负。 | 已修正；当前证据见 D008 |
 | 95% reranker 是否标签泄漏？ | 特征与 deterministic oracle 公式耦合，属于公式蒸馏；报告显式给出 closed-form oracle 100%，不包装成新规律发现。 | 已审计 |
 | SFT/DPO 数据是否把答案塞进 prompt？ | 当前数据合同检查 rejection、label_source、oracle_action 等泄漏字段，跨 split 做 template overlap 和 tokenizer 长度审计。 | 已实现 |
 | LoRA 真训练了吗？ | 两类 135M 模型各跑通 3 optimizer-step SFT→DPO 和 adapter reload；只算训练管线 smoke，未接 live。 | 已实现但不声明质量收益 |

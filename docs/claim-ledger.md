@@ -25,6 +25,7 @@
 | 声明 | 可复现证据 | 允许表述 | 边界 |
 |---|---|---|---|
 | 模型 Agent 真正影响执行 | `apps/api/src/tripchord/agents/flexible_live_system.py`、`apps/api/src/tripchord/agents/live_system.py`、相关 Agent tests | Query Strategist 改变精查顺序；Search Supervisor 改变 Source waves/dependencies；Candidate Curator 或 Candidate Scouts + 唯一 Merger、Repair Strategist、Event Diagnoser 可改变候选或返工路径 | 提案须经确定性 envelope；不能创造日期、Source、报价或 candidate ID |
+| 当前三角色 Multi-Agent 面板 | `benchmarks/results/multi-agent-panel-current-2026-08-26.json`、`apps/api/src/tripchord/planning/personalization_model_adapter.py`、`apps/api/tests/test_personalization_api.py` | 同一冻结候选目录上，价格与体验 Agent 并行提案，综合决策 Agent 接收两份 typed handoff；真实模型完成 3 次逻辑调用后，程序在提名集合内仲裁最终候选 | 证明角色分工、结构化交接和程序仲裁；不证明实时 OTA、全网最低价、自动预订或 Multi-Agent 普遍优于单模型 |
 | Search Supervisor | `apps/api/src/tripchord/agents/search_supervisor.py`、`apps/api/tests/test_search_supervisor.py` | 先读只读 capability tool，再提出 waves；校验后物化为真实 DAG 依赖；非法提案原子拒绝 | 不能修改查询、扩大预算、读取 Cookie、绕验证码或交易 |
 | Agent / 硬规则分工 | `apps/api/src/tripchord/agents/live_system.py`、`apps/api/src/tripchord/planning/package.py`、`apps/api/src/tripchord/agents/tools.py` | Agent 负责语义、工具计划、取舍、软风险和修复策略；确定性代码负责事实、金额、权限、Verifier/ReVerifier、Repair Executor 和 Safety Gate | 不能包装“所有逻辑都由 LLM 自主完成” |
 | 上下文预算 | `apps/api/src/tripchord/agents/context_budget.py`、`apps/api/tests/test_memory_rag_context.py` | Query/Planner/Repair 分别使用 2400/4000/3000 token 预算，工具回执与历史记忆共用预算；关键证据放不下时失败关闭 | token 近似估算不是供应商精确 tokenizer 证明 |
@@ -201,7 +202,7 @@
 - “启用外部 LLM 也不会发送任何行程内容，或者项目已经提供企业级 DLP/数据驻留合规。”
 - “所有逻辑都交给 Agent，Verifier 也是 LLM。”
 - “自适应日期搜索比 Top-K 更好。”
-- “公平评测证明多 Agent 比单 Agent 准确。”
+- “旧 scripted 公平评测证明多 Agent 比单 Agent 准确。”（旧评测只验证合同和指标；当前 Multi-Agent 主证据见三角色面板记录。）
 - “系统监听到了平台自然涨价推送。”
 - “2026-08-03 Done-Gate 是 DeepSeek 驱动的完整 OTA E2E。”
 - “历史 v3/canary 通过，所以当前 strict v4 也已经通过。”

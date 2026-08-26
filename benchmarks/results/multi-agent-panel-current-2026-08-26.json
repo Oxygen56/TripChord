@@ -1,0 +1,45 @@
+{
+  "evidence_version": "multi-agent-panel-v1",
+  "observed_on": "2026-08-26",
+  "entrypoint": "/api/v1/agents/live-flexible-plan-from-text",
+  "request_text": "2名成人，2026-08-30 杭州出发到南京，2026-09-01 去上海，2026-09-04 从上海返回杭州；2026-08-31 19:00-21:30 在南京有已持有活动，活动费用未提供；活动前至少留90分钟缓冲。价格和舒适都重要。",
+  "source_mode": "frozen_fixture_catalog",
+  "live_ota_proof": false,
+  "http_status": 200,
+  "same_catalog_snapshot": true,
+  "catalog_digest": "aa6449d3ced613e225f9a92057083578d8bc79a7a35ced9667fde4c0eed3fdce",
+  "graph_version": "graph:146688834bcc0774531a314298a213cbf270eea0f743df3fa5925dc26952b3fb",
+  "panel": {
+    "parallel_roles": ["budget", "experience_specialist"],
+    "handoff_role": "decision_agent",
+    "roles": ["budget", "experience_specialist", "decision_agent"],
+    "models": {
+      "budget": "deepseek-chat",
+      "experience_specialist": "deepseek-chat",
+      "decision_agent": "deepseek-v4-pro"
+    },
+    "model_call_count": 3,
+    "total_token_usage": 2652,
+    "total_agent_latency_ms": 31489,
+    "nominations": {
+      "budget": {
+        "candidate_id": "pareto:c2462bea7a5121347e3169f5",
+        "total_cny_cents": 160000
+      },
+      "experience_specialist": {
+        "candidate_id": "pareto:108c85118ca1052aee008684",
+        "total_cny_cents": 165000
+      },
+      "decision_agent": {
+        "candidate_id": "pareto:108c85118ca1052aee008684",
+        "received_peer_proposals": true
+      }
+    },
+    "deterministic_arbiter": {
+      "selected_candidate_id": "pareto:108c85118ca1052aee008684",
+      "selected_total_cny_cents": 165000,
+      "validated_same_graph_and_source_refs": true
+    }
+  },
+  "claim_boundary": "本记录证明真实模型三角色面板在同一份有界报价目录上完成并行提案、结构化交接和程序仲裁；报价目录为注入的冻结来源，不证明实时 OTA 价格、全网最低价、锁票或下单。"
+}

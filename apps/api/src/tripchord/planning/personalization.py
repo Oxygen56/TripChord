@@ -7,14 +7,16 @@ select only an existing, independently validated candidate.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
+from collections.abc import Awaitable, Callable
 from datetime import time, timedelta
 from enum import StrEnum
 from itertools import pairwise
 from math import prod
-from typing import Protocol
+from typing import Protocol, cast
 
 from pydantic import Field, JsonValue
 
@@ -66,6 +68,7 @@ class PersonalizationSelectionMode(StrEnum):
 class AgentNeedReason(StrEnum):
     AMBIGUOUS_TRADEOFF = "ambiguous_tradeoff"
     ELDER_COMFORT = "elder_comfort"
+    PRICE_TRADEOFF = "price_tradeoff"
 
 
 class CandidateContextProjection(DomainModel):
@@ -89,6 +92,7 @@ class AgentContextManifest(DomainModel):
     skill_id: str | None = None
     skill_version: str | None = None
     skill_rule_boundary: str | None = None
+    peer_proposals: tuple[dict[str, JsonValue], ...] = ()
     source_refs: tuple[str, ...] = ()
     boundary: str = (
         "仅包含本职责相关的旅行子图、有限候选、程序检查、适用偏好、"
@@ -124,6 +128,16 @@ class AgentDecisionTrace(DomainModel):
     proposal: AgentSelectionProposal | None = None
     applied: bool = False
     rejected_reason: str | None = None
+
+
+class AgentPanelArbitration(DomainModel):
+    """Deterministic receipt for a real multi-role personalization panel."""
+
+    enabled: bool = False
+    candidate_ids: tuple[str, ...] = ()
+    valid_agent_roles: tuple[str, ...] = ()
+    selected_candidate_id: str | None = None
+    rule: str
 
 
 class SkillApplication(DomainModel):
@@ -165,6 +179,7 @@ class PersonalizationSummary(DomainModel):
     model_call_count: int = Field(default=0, ge=0)
     total_token_usage: int = Field(default=0, ge=0)
     total_agent_latency_ms: int = Field(default=0, ge=0)
+    arbitration: AgentPanelArbitration | None = None
     boundary: str = (
         "多个方案复用同一次来源查询和同一OfferCatalog；"
         "价格、时间、人数与可行性由程序复算，Agent只能建议已存在的候选。"
@@ -181,6 +196,13 @@ class BoundedPersonalizationAgent(Protocol):
         """Return one bounded proposal; it has no authority until validated."""
 
 
+class AsyncBoundedPersonalizationAgent(Protocol):
+    async def propose_async(
+        self, manifest: AgentContextManifest
+    ) -> AgentProposalResult:
+        """Return one bounded proposal without granting it authority."""
+
+
 class AgentNeedRouter:
     """Route semantic work; query volume never creates additional roles."""
 
@@ -188,9 +210,24 @@ class AgentNeedRouter:
         self,
         policy: PlanPreferencePolicy,
         candidates: tuple[ParetoPlan, ...],
+        *,
+        force_multi_agent: bool = False,
     ) -> tuple[tuple[AgentRole, AgentNeedReason], ...]:
         if len(candidates) <= 1:
             return ()
+        if force_multi_agent:
+            return (
+                (AgentRole.BUDGET, AgentNeedReason.PRICE_TRADEOFF),
+                (
+                    AgentRole.EXPERIENCE_SPECIALIST,
+                    (
+                        AgentNeedReason.ELDER_COMFORT
+                        if policy.traveling_with_elders
+                        else AgentNeedReason.AMBIGUOUS_TRADEOFF
+                    ),
+                ),
+                (AgentRole.DECISION_AGENT, AgentNeedReason.AMBIGUOUS_TRADEOFF),
+            )
         if (
             policy.traveling_with_elders
             and policy.max_comfort_premium_cny_cents is not None
@@ -627,6 +664,7 @@ def build_pareto_plans(
             )
             and (
                 not offer.party_capacity_confirmed
+                or offer.mode == "walk_in"
                 or (
                     offer.available_units is not None
                     and offer.available_units >= len(scope)
@@ -939,7 +977,14 @@ def personalize_complex_problem(
     *,
     agent: BoundedPersonalizationAgent | None = None,
     provider_query_count: int = 1,
+    force_multi_agent: bool = False,
+    proposal_results: tuple[AgentProposalResult, ...] | None = None,
+    proposal_manifests: tuple[AgentContextManifest, ...] | None = None,
 ) -> PersonalizationResult:
+    if agent is not None and proposal_results is not None:
+        raise ValueError("agent and proposal_results are mutually exclusive")
+    if proposal_manifests is not None and proposal_results is None:
+        raise ValueError("proposal_manifests require proposal_results")
     frontier, theoretical, feasible_count, complete = build_pareto_plans(problem)
     graph_version, catalog_digest = personalization_graph_version(problem)
     policy = problem.intent.preference_policy
@@ -967,23 +1012,46 @@ def personalize_complex_problem(
     reason = ""
     applied_roles: tuple[str, ...] = ()
     applied_skills: tuple[str, ...] = ()
-    needs = AgentNeedRouter().route(policy, decision_frontier)
+    arbitration: AgentPanelArbitration | None = None
+    needs = AgentNeedRouter().route(
+        policy,
+        decision_frontier,
+        force_multi_agent=force_multi_agent,
+    )
+    valid_proposals: list[tuple[AgentRole, ParetoPlan, str]] = []
     if needs:
-        role, trigger = needs[0]
-        skill_application: SkillApplication | None = None
-        if role == AgentRole.EXPERIENCE_SPECIALIST:
-            skill_application = ElderComfortSkill().apply(decision_frontier, policy)
-            skills.append(skill_application)
-        manifest = _context_manifest(
-            problem,
-            graph_version,
-            decision_frontier,
-            role=role,
-            trigger=trigger,
-            skill=skill_application,
-        )
-        if agent is not None:
-            result = agent.propose(manifest)
+        results_by_role = {
+            result.proposal.role: result for result in (proposal_results or ())
+        }
+        for role, trigger in needs:
+            skill_application: SkillApplication | None = None
+            if role == AgentRole.EXPERIENCE_SPECIALIST:
+                applied_skill = ElderComfortSkill().apply(decision_frontier, policy)
+                skills.append(applied_skill)
+                skill_application = applied_skill if applied_skill.applicable else None
+            manifest = (
+                next(
+                    (
+                        item
+                        for item in (proposal_manifests or ())
+                        if item.role == role
+                    ),
+                    None,
+                )
+                or _context_manifest(
+                    problem,
+                    graph_version,
+                    decision_frontier,
+                    role=role,
+                    trigger=trigger,
+                    skill=skill_application,
+                )
+            )
+            result = results_by_role.get(role)
+            if result is None and agent is not None:
+                result = agent.propose(manifest)
+            if result is None:
+                continue
             rejection = validate_agent_selection_proposal(manifest, result.proposal)
             if (
                 rejection is None
@@ -1007,27 +1075,66 @@ def personalize_complex_problem(
             )
             traces.append(trace)
             if rejection is None:
-                selected = next(
+                candidate = next(
                     item
                     for item in decision_frontier
                     if item.candidate_id == result.proposal.candidate_id
                 )
-                reason = result.proposal.reason
-                applied_roles = (role.value,)
-                if skill_application is not None:
-                    applied_skills = (skill_application.skill_id,)
-        if (
-            selected is None
-            and skill_application is not None
-            and skill_application.selected_candidate_id is not None
-        ):
-            selected = next(
-                item
-                for item in decision_frontier
-                if item.candidate_id == skill_application.selected_candidate_id
+                valid_proposals.append((role, candidate, result.proposal.reason))
+
+        if force_multi_agent and valid_proposals:
+            panel_selected, panel_reason = _arbitrate_agent_panel(
+                tuple(valid_proposals), policy
             )
-            reason = skill_application.reason
-            applied_skills = (skill_application.skill_id,)
+            # With no stated preference the product contract is to show
+            # multiple useful answers.  The panel still runs and records its
+            # recommendation, but it must not collapse the three cards into a
+            # silent single choice.
+            if policy.mode != PlanPreferenceMode.UNSPECIFIED:
+                selected, reason = panel_selected, panel_reason
+            applied_roles = tuple(item[0].value for item in valid_proposals)
+            arbitration = AgentPanelArbitration(
+                enabled=True,
+                candidate_ids=tuple(
+                    dict.fromkeys(item[1].candidate_id for item in valid_proposals)
+                ),
+                valid_agent_roles=applied_roles,
+                selected_candidate_id=panel_selected.candidate_id,
+                rule=(
+                    "仅在各角色已通过同一graph_version、候选ID和来源引用校验后，"
+                    "显式偏好按程序指标仲裁，价格/体验未明确时采用综合决策提名；"
+                    "不读取模型理由中的事实"
+                ),
+            )
+        elif valid_proposals:
+            role, selected, reason = valid_proposals[0]
+            applied_roles = (role.value,)
+            arbitration = AgentPanelArbitration(
+                enabled=False,
+                candidate_ids=(selected.candidate_id,),
+                valid_agent_roles=(role.value,),
+                selected_candidate_id=selected.candidate_id,
+                rule="单角色兼容路径：采用首个通过校验的候选提议",
+            )
+        if valid_proposals and any(
+            role == AgentRole.EXPERIENCE_SPECIALIST for role, _, _ in valid_proposals
+        ):
+            applied_skills = tuple(
+                dict.fromkeys(item.skill_id for item in skills if item.applicable)
+            )
+
+        if selected is None and not force_multi_agent:
+            for skill_application in skills:
+                if skill_application.selected_candidate_id is None:
+                    continue
+                selected = next(
+                    item
+                    for item in decision_frontier
+                    if item.candidate_id == skill_application.selected_candidate_id
+                )
+                reason = skill_application.reason
+                applied_skills = (skill_application.skill_id,)
+                break
 
     if selected is None and policy.mode == PlanPreferenceMode.PRICE_FIRST:
         selected = saver
@@ -1082,6 +1189,8 @@ def personalize_complex_problem(
                     candidate=candidate,
                     representative_kind=kind,
                     selection_reason=explanation,
+                    participating_agent_roles=applied_roles,
+                    applied_skill_ids=applied_skills,
                 )
             )
         plans = tuple(plans_list)
@@ -1105,6 +1214,7 @@ def personalize_complex_problem(
             model_call_count=len(model_runs),
             total_token_usage=sum(item.token_usage for item in model_runs),
             total_agent_latency_ms=sum(item.latency_ms for item in model_runs),
+            arbitration=arbitration,
         ),
     )
 
@@ -1161,6 +1271,201 @@ def _representatives(
         ),
     )
     return saver, balanced, experience
+
+
+def _arbitrate_agent_panel(
+    proposals: tuple[tuple[AgentRole, ParetoPlan, str], ...],
+    policy: PlanPreferencePolicy,
+) -> tuple[ParetoPlan, str]:
+    """Merge role proposals without trusting model-supplied facts.
+
+    The panel can only nominate candidates already present in the shared
+    frontier.  Explicit price/experience policies are still recomputed from
+    typed metrics; for a genuine balanced/ambiguous trade-off the decision
+    role may nominate one of the peer candidates, but the program verifies
+    the identity and Pareto membership before accepting it.  A model's prose
+    cannot manufacture price, time, risk, or feasibility facts.
+    """
+
+    unique = tuple({item[1].candidate_id: item[1] for item in proposals}.values())
+    if len(unique) == 1:
+        return unique[0], "三个角色对同一已验证候选达成一致"
+    if policy.mode == PlanPreferenceMode.PRICE_FIRST:
+        selected = min(
+            unique,
+            key=lambda item: (
+                item.metrics.total_cny_cents,
+                item.metrics.transport_duration_minutes,
+                item.candidate_id,
+            ),
+        )
+        return selected, "价格优先：在三个角色提名的候选中确定性选择总价最低者"
+    if policy.mode == PlanPreferenceMode.EXPERIENCE_FIRST:
+        selected = min(
+            unique,
+            key=lambda item: (
+                item.metrics.schedule_inconvenience_minutes,
+                item.metrics.transfer_count if policy.avoid_transfers else 0,
+                item.metrics.transport_duration_minutes,
+                item.metrics.total_cny_cents,
+                item.candidate_id,
+            ),
+        )
+        return selected, "体验优先：在三个角色提名的候选中确定性选择不便度最低者"
+
+    decision_proposal = next(
+        (item for item in proposals if item[0] == AgentRole.DECISION_AGENT),
+        None,
+    )
+    if decision_proposal is not None:
+        return (
+            decision_proposal[1],
+            "综合决策 Agent 在收到价格与体验提案后提出候选；程序确认其来自同一已验证Pareto集合",
+        )
+
+    minima = {
+        "cost": min(item.metrics.total_cny_cents for item in unique),
+        "duration": min(item.metrics.transport_duration_minutes for item in unique),
+        "schedule": min(item.metrics.schedule_inconvenience_minutes for item in unique),
+    }
+    maxima = {
+        "cost": max(item.metrics.total_cny_cents for item in unique),
+        "duration": max(item.metrics.transport_duration_minutes for item in unique),
+        "schedule": max(item.metrics.schedule_inconvenience_minutes for item in unique),
+    }
+
+    def loss(value: int, name: str) -> float:
+        span = maxima[name] - minima[name]
+        return 0.0 if span == 0 else (value - minima[name]) / span
+
+    selected = min(
+        unique,
+        key=lambda item: (
+            (
+                loss(item.metrics.total_cny_cents, "cost")
+                + loss(item.metrics.transport_duration_minutes, "duration")
+                + loss(item.metrics.schedule_inconvenience_minutes, "schedule")
+            )
+            / 3,
+            item.metrics.total_cny_cents,
+            item.candidate_id,
+        ),
+    )
+    return selected, "取舍未明确：在三个角色提名集合内按价格、耗时和时刻不便度等权仲裁"
+
+
+def _agent_manifests_for_problem(
+    problem: PlanningProblem,
+    *,
+    force_multi_agent: bool,
+) -> tuple[AgentContextManifest, ...]:
+    """Build role manifests from one deterministic catalog snapshot."""
+
+    frontier, _, _, _ = build_pareto_plans(problem)
+    if not frontier:
+        return ()
+    graph_version, _ = personalization_graph_version(problem)
+    decision_frontier = _preference_eligible_candidates(
+        frontier, problem.intent.preference_policy
+    )
+    manifests: list[AgentContextManifest] = []
+    for role, trigger in AgentNeedRouter().route(
+        problem.intent.preference_policy,
+        decision_frontier,
+        force_multi_agent=force_multi_agent,
+    ):
+        skill = (
+            ElderComfortSkill().apply(
+                decision_frontier, problem.intent.preference_policy
+            )
+            if role == AgentRole.EXPERIENCE_SPECIALIST
+            else None
+        )
+        if skill is not None and not skill.applicable:
+            skill = None
+        manifests.append(
+            _context_manifest(
+                problem,
+                graph_version,
+                decision_frontier,
+                role=role,
+                trigger=trigger,
+                skill=skill,
+            )
+        )
+    return tuple(manifests)
+
+
+async def personalize_complex_problem_async(
+    problem: PlanningProblem,
+    *,
+    agent: AsyncBoundedPersonalizationAgent | BoundedPersonalizationAgent | None = None,
+    provider_query_count: int = 1,
+    force_multi_agent: bool = False,
+) -> PersonalizationResult:
+    """Async panel entry; all role calls share one catalog and run concurrently.
+
+    The synchronous entry remains the compatibility path for existing fixtures.
+    A synchronous test double is run in a worker thread, while a real adapter
+    may expose ``propose_async`` and use the application's model gateway.
+    """
+
+    if agent is None:
+        return personalize_complex_problem(
+            problem,
+            provider_query_count=provider_query_count,
+            force_multi_agent=force_multi_agent,
+        )
+    manifests = _agent_manifests_for_problem(
+        problem,
+        force_multi_agent=force_multi_agent,
+    )
+
+    async def invoke(manifest: AgentContextManifest) -> AgentProposalResult:
+        propose_async = getattr(agent, "propose_async", None)
+        if propose_async is not None:
+            callback = cast(
+                Callable[[AgentContextManifest], Awaitable[AgentProposalResult]],
+                propose_async,
+            )
+            return await callback(manifest)
+        propose = getattr(agent, "propose", None)
+        if propose is None:
+            raise TypeError("personalization agent must define propose or propose_async")
+        sync_callback = cast(Callable[[AgentContextManifest], AgentProposalResult], propose)
+        return await asyncio.to_thread(sync_callback, manifest)
+
+    # Price and experience scouts are independent.  The final decision role
+    # receives their typed nominations as a handoff, so the panel is genuinely
+    # collaborative rather than three unrelated model calls.
+    used_manifests = manifests
+    if force_multi_agent and len(manifests) >= 3:
+        scout_manifests = manifests[:-1]
+        scout_results = tuple(
+            await asyncio.gather(*(invoke(item) for item in scout_manifests))
+        )
+        peer_proposals = tuple(
+            {
+                "role": result.proposal.role.value,
+                "candidate_id": result.proposal.candidate_id,
+                "reason": result.proposal.reason,
+            }
+            for result in scout_results
+        )
+        final_manifest = manifests[-1].model_copy(
+            update={"peer_proposals": peer_proposals}
+        )
+        used_manifests = (*scout_manifests, final_manifest)
+        results = (*scout_results, await invoke(final_manifest))
+    else:
+        results = tuple(await asyncio.gather(*(invoke(item) for item in manifests)))
+    return personalize_complex_problem(
+        problem,
+        provider_query_count=provider_query_count,
+        force_multi_agent=force_multi_agent,
+        proposal_results=results,
+        proposal_manifests=used_manifests,
+    )
 
 
 def _preference_eligible_candidates(
@@ -1250,6 +1555,7 @@ def _context_manifest(
     role: AgentRole,
     trigger: AgentNeedReason,
     skill: SkillApplication | None,
+    peer_proposals: tuple[dict[str, JsonValue], ...] = (),
 ) -> AgentContextManifest:
     bounded = tuple(frontier[:24])
     source_refs = tuple(
@@ -1297,6 +1603,7 @@ def _context_manifest(
         skill_id=skill.skill_id if skill is not None else None,
         skill_version=skill.skill_version if skill is not None else None,
         skill_rule_boundary=skill.rule_boundary if skill is not None else None,
+        peer_proposals=peer_proposals,
         source_refs=source_refs,
     )
 
@@ -1305,8 +1612,10 @@ __all__ = [
     "AgentContextManifest",
     "AgentDecisionTrace",
     "AgentNeedRouter",
+    "AgentPanelArbitration",
     "AgentProposalResult",
     "AgentSelectionProposal",
+    "AsyncBoundedPersonalizationAgent",
     "BoundedPersonalizationAgent",
     "ElderComfortSkill",
     "PersonalizationResult",
@@ -1317,5 +1626,6 @@ __all__ = [
     "build_pareto_plans",
     "personalization_graph_version",
     "personalize_complex_problem",
+    "personalize_complex_problem_async",
     "validate_agent_selection_proposal",
 ]
