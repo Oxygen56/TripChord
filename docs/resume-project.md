@@ -8,9 +8,9 @@
 
 ### TripChord（旅弦）——LLM 与确定性系统协作的 Multi-Agent 旅行决策系统
 
-**Agent 技术栈：** 自研 Typed Multi-Agent Runtime / DAG、Context Engineering、Tool Calling、角色级工具白名单、Structured Output、Typed Handoff、Model Routing & Tracing、BM25 Preference RAG、Agent Evaluation、Deterministic Verifier / Publication Gate
+**Agent 核心技术：** 自研 Typed Multi-Agent Runtime / DAG（角色级 Context Pack、Typed Handoff、Structured Output）、Tool Calling 与角色级工具权限、Model Routing & Tracing、Preference RAG、Agent Evaluation、MCP、Deterministic Verifier / Publication Gate
 
-**工程实现：** Python、FastAPI、Pydantic、SQLAlchemy/PostgreSQL、React/TypeScript、Chrome Extension
+**基础设施：** Python、FastAPI、Pydantic、SQLAlchemy/PostgreSQL、React/TypeScript、Chrome Extension
 
 - 自研 Typed Multi-Agent Runtime / DAG，以角色级 Context Pack、工具白名单、Structured Output、Typed Handoff 和类型化失败语义，编排证据仲裁、候选选择、独立审查与修复；模型网关统一 Tool Calling、路由与追踪，BM25 RAG 检索经审计的非实时记忆，其中用户偏好须确认后写入且可撤销、可过期，实时价格、库存和班次禁止进入。
 - 划分 LLM 与确定性系统的决策权：LLM 只处理语言歧义、偏好权衡、软风险与有界修复建议；程序负责日期空间、同行人数、价格计算、产品身份、行程衔接、修改执行和最终发布。涉及报价和方案的模型结论必须绑定本轮工具结果，并经过独立 Verifier 复算；任务执行成功不等于业务方案可以发布。

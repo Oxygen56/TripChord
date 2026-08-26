@@ -8,6 +8,10 @@
 
 **面向个人或多人复杂自由行，把可在线查询的交通、住宿、接驳和活动组合成更适合你的完整方案。**
 
+**Agent 技术栈：** Typed Multi-Agent Runtime / DAG、Context Engineering、Tool Calling、Structured Output、Typed Handoff、角色级工具权限、Model Routing & Tracing、Preference RAG、Agent Evaluation、MCP、Deterministic Verifier。
+
+**实现基础：** Python、FastAPI、Pydantic、SQLAlchemy/PostgreSQL、React/TypeScript、Chrome Extension。
+
 TripChord 是一个主要在用户自己电脑上运行的旅行决策 Agent。它理解自然语言中的出发地、目的地、同行者、日期、固定安排、预算和体验偏好，把当前可查询的飞机、铁路、轮渡、住宿、接驳与活动组成一份时间、人数、总费用和体验都能成立的完整行程。它既处理普通往返，也能表达多城市、异地进出、不同地点出发后汇合、亲子或长辈同行，以及“保留航班，只换酒店”一类后续修改。
 
 **当前 2.0** 是七轮范围受控功能形态的完成版本：在同一条旅行状态、报价合同、确定性求解和中文行程卡链路上，已经覆盖单目的地、多城市、分地出发与汇合、复杂候选上的三角色 Multi-Agent 面板、复杂修改、新交通与活动，以及外部 MCP 宿主接入。单目的地往返仍保留为最快的兼容路径；每种复杂结构都只在明确记录的来源范围内声明。
